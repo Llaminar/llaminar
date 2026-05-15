@@ -73,6 +73,12 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
     EXPECT_FALSE(config.dry_run);
+    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ExpertParallel);
+    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
+    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
+    EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+    EXPECT_EQ(config.moe_rebalance.window_size, 256);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_DryRun)
@@ -688,9 +694,9 @@ tp_weights: [0.73, 0.27]
 
 TEST(Test__OrchestrationConfigParser, ParseYamlString_NamedDomainLists)
 {
-        OrchestrationConfigParser parser;
+    OrchestrationConfigParser parser;
 
-        std::string yaml = R"(
+    std::string yaml = R"(
 domains:
     - "rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"
     - "cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"
@@ -699,23 +705,23 @@ pp_stages:
     - "1=cpu_sockets:14-27"
 )";
 
-        auto config = parser.parseYamlString(yaml);
+    auto config = parser.parseYamlString(yaml);
 
-        ASSERT_EQ(config.domain_definitions.size(), 2u);
-        EXPECT_EQ(config.domain_definitions[0].name, "rocm_socket0");
-        EXPECT_EQ(config.domain_definitions[0].scope, TPScope::LOCAL);
-        ASSERT_TRUE(config.domain_definitions[0].owner_rank.has_value());
-        EXPECT_EQ(*config.domain_definitions[0].owner_rank, 0);
-        EXPECT_EQ(config.domain_definitions[0].backend, CollectiveBackendType::RCCL);
-        EXPECT_EQ(config.domain_definitions[1].scope, TPScope::NODE_LOCAL);
-        ASSERT_EQ(config.domain_definitions[1].explicit_ranks.size(), 2u);
-        EXPECT_EQ(config.domain_definitions[1].explicit_ranks[1], 1);
+    ASSERT_EQ(config.domain_definitions.size(), 2u);
+    EXPECT_EQ(config.domain_definitions[0].name, "rocm_socket0");
+    EXPECT_EQ(config.domain_definitions[0].scope, TPScope::LOCAL);
+    ASSERT_TRUE(config.domain_definitions[0].owner_rank.has_value());
+    EXPECT_EQ(*config.domain_definitions[0].owner_rank, 0);
+    EXPECT_EQ(config.domain_definitions[0].backend, CollectiveBackendType::RCCL);
+    EXPECT_EQ(config.domain_definitions[1].scope, TPScope::NODE_LOCAL);
+    ASSERT_EQ(config.domain_definitions[1].explicit_ranks.size(), 2u);
+    EXPECT_EQ(config.domain_definitions[1].explicit_ranks[1], 1);
 
-        ASSERT_EQ(config.pp_stage_definitions.size(), 2u);
-        EXPECT_EQ(config.pp_stage_definitions[0].domain_name, "rocm_socket0");
-        EXPECT_EQ(config.pp_stage_definitions[1].domain_name, "cpu_sockets");
-        EXPECT_EQ(config.pp_stage_definitions[1].first_layer, 14);
-        EXPECT_EQ(config.pp_stage_definitions[1].last_layer, 27);
+    ASSERT_EQ(config.pp_stage_definitions.size(), 2u);
+    EXPECT_EQ(config.pp_stage_definitions[0].domain_name, "rocm_socket0");
+    EXPECT_EQ(config.pp_stage_definitions[1].domain_name, "cpu_sockets");
+    EXPECT_EQ(config.pp_stage_definitions[1].first_layer, 14);
+    EXPECT_EQ(config.pp_stage_definitions[1].last_layer, 27);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseYamlString_AllIntrospectionFlags)
@@ -808,6 +814,64 @@ TEST(Test__OrchestrationConfigParser, ParseYamlString_EmptyString_ReturnsDefault
 
     EXPECT_EQ(config.tp_degree, 1);
     EXPECT_EQ(config.pp_degree, 1);
+    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ExpertParallel);
+    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
+    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseYamlString_MoENestedBlock)
+{
+    OrchestrationConfigParser parser;
+
+    std::string yaml = R"(
+moe:
+    expert_mode: replicated
+    hot_expert_cache: 12
+    rebalance: observe
+    rebalance_window: 64
+    rebalance_max_window: 512
+    rebalance_window_growth: 2.5
+    release_raw_expert_weights: true
+    )";
+
+    auto config = parser.parseYamlString(yaml);
+
+    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::Replicated);
+    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Count);
+    EXPECT_EQ(config.moe_hot_expert_cache.count, 12);
+    EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 12);
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Observe);
+    EXPECT_EQ(config.moe_rebalance.window_size, 64);
+    EXPECT_EQ(config.moe_rebalance.max_window_size, 512);
+    EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.5f);
+    EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseYamlString_MoEFlatKeys)
+{
+    OrchestrationConfigParser parser;
+
+    std::string yaml = R"(
+moe_expert_mode: expert-parallel
+moe_hot_expert_cache: 25%
+moe_rebalance: off
+moe_rebalance_window: 128
+moe_rebalance_max_window: 1024
+moe_rebalance_window_growth: 1.25
+moe_release_raw_expert_weights: false
+    )";
+
+    auto config = parser.parseYamlString(yaml);
+
+    EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::ExpertParallel);
+    EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
+    EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 25.0f);
+    EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 64);
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Off);
+    EXPECT_EQ(config.moe_rebalance.window_size, 128);
+    EXPECT_EQ(config.moe_rebalance.max_window_size, 1024);
+    EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 1.25f);
+    EXPECT_FALSE(config.moe_rebalance.release_raw_expert_weights);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseYamlString_QuotedValues)
@@ -848,6 +912,8 @@ TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsKeyOptions)
     EXPECT_TRUE(help.find("--pp-stage") != std::string::npos);
     EXPECT_TRUE(help.find("--backend") != std::string::npos);
     EXPECT_TRUE(help.find("--config") != std::string::npos);
+    EXPECT_TRUE(help.find("--moe-expert-mode") != std::string::npos);
+    EXPECT_TRUE(help.find("--moe-hot-expert-cache") != std::string::npos);
 }
 // ============================================================================
 // CLI Parsing - Model Configuration
@@ -1289,6 +1355,102 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoESparseCPU)
     auto config = parser.parseArgs(args.argc(), args.argv());
 
     EXPECT_TRUE(config.moe_sparse_experts_cpu);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoEExpertMode)
+{
+    {
+        ArgvHelper args{"llaminar2", "--moe-expert-mode", "replicated"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::Replicated);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-expert-mode", "tensor-parallel"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_expert_mode, MoEExpertMode::TensorParallel);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoEHotExpertCache)
+{
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "10%"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Percent);
+        EXPECT_FLOAT_EQ(config.moe_hot_expert_cache.percent, 10.0f);
+        EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "24"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Count);
+        EXPECT_EQ(config.moe_hot_expert_cache.count, 24);
+        EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 24);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "off"};
+        OrchestrationConfigParser parser;
+
+        auto config = parser.parseArgs(args.argc(), args.argv());
+
+        EXPECT_EQ(config.moe_hot_expert_cache.kind, MoEHotExpertCacheConfig::Kind::Off);
+        EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 0);
+    }
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
+{
+    ArgvHelper args{"llaminar2",
+                    "--moe-rebalance", "observe",
+                    "--moe-rebalance-window", "128",
+                    "--moe-rebalance-max-window", "2048",
+                    "--moe-rebalance-window-growth", "2.0",
+                    "--moe-release-raw-expert-weights"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Observe);
+    EXPECT_EQ(config.moe_rebalance.window_size, 128);
+    EXPECT_EQ(config.moe_rebalance.max_window_size, 2048);
+    EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.0f);
+    EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
+}
+
+TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
+{
+    {
+        ArgvHelper args{"llaminar2", "--moe-expert-mode", "mystery"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "101%"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-hot-expert-cache", "-1"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-rebalance", "mystery"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
 }
 
 // ============================================================================
@@ -1750,11 +1912,16 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_NYIFlags_StillAccepted)
     // All NYI flags must still be parseable so existing scripts don't break.
     ArgvHelper args({
         "llaminar2",
-        "--topology", "PP(a)",
-        "--topology-file", "topo.yaml",
-        "--max-gpu-memory", "8192",
-        "--max-cpu-memory", "16384",
-        "--cpu-layers", "4",
+        "--topology",
+        "PP(a)",
+        "--topology-file",
+        "topo.yaml",
+        "--max-gpu-memory",
+        "8192",
+        "--max-cpu-memory",
+        "16384",
+        "--cpu-layers",
+        "4",
         "--cpu-layers-first",
     });
     auto parser = createOrchestrationConfigParser();

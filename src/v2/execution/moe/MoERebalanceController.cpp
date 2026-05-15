@@ -21,12 +21,12 @@ namespace llaminar2
     // =========================================================================
 
     void ExpertReplicaSet::assignForToken(
-        const int* expert_indices,
-        const float* /*expert_weights*/,
+        const int *expert_indices,
+        const float * /*expert_weights*/,
         int top_k,
         int my_socket_id,
-        const std::vector<bool>& expert_mask,
-        bool* compute_here) const
+        const std::vector<bool> &expert_mask,
+        bool *compute_here) const
     {
         if (num_replicated == 0)
         {
@@ -37,7 +37,7 @@ namespace llaminar2
         }
 
         // Phase 1: Count fixed assignments (non-replicated experts go to owner)
-        int load[8] = {}; // Per-socket load counter (max 8 sockets)
+        int load[8] = {};  // Per-socket load counter (max 8 sockets)
         bool is_fixed[16]; // Stack-allocated, max top_k
 
         for (int k = 0; k < top_k; ++k)
@@ -58,7 +58,8 @@ namespace llaminar2
         // Process in index order for determinism (both ranks see same routing).
         for (int k = 0; k < top_k; ++k)
         {
-            if (is_fixed[k]) continue;
+            if (is_fixed[k])
+                continue;
 
             int e = expert_indices[k];
             int owner = owner_socket[e];
@@ -89,7 +90,7 @@ namespace llaminar2
         }
     }
 
-    void ExpertReplicaSet::buildPrefillMask(int my_socket_id, const std::vector<bool>& expert_mask)
+    void ExpertReplicaSet::buildPrefillMask(int my_socket_id, const std::vector<bool> &expert_mask)
     {
         prefill_mask.resize(expert_mask.size());
         for (size_t e = 0; e < expert_mask.size(); ++e)
@@ -97,8 +98,46 @@ namespace llaminar2
             // During prefill, only the owner socket processes replicated experts.
             // Non-replicated experts use the standard expert_mask.
             prefill_mask[e] = expert_mask[e] &&
-                (!is_replicated[e] || owner_socket[e] == my_socket_id);
+                              (!is_replicated[e] || owner_socket[e] == my_socket_id);
         }
+    }
+
+    bool ExpertReplicaSet::sameReplicaPlacement(const ExpertReplicaSet &other) const
+    {
+        return num_replicated == other.num_replicated &&
+               num_sockets == other.num_sockets &&
+               is_replicated == other.is_replicated &&
+               owner_socket == other.owner_socket;
+    }
+
+    ExpertReplicaSet ExpertReplicaSet::arrivalsSince(const ExpertReplicaSet &previous) const
+    {
+        ExpertReplicaSet arrivals;
+        arrivals.is_replicated.assign(is_replicated.size(), false);
+        arrivals.owner_socket = owner_socket;
+        arrivals.num_sockets = num_sockets;
+
+        for (size_t expert = 0; expert < is_replicated.size(); ++expert)
+        {
+            if (!is_replicated[expert])
+                continue;
+
+            const bool previously_resident =
+                previous.num_sockets == num_sockets &&
+                expert < previous.is_replicated.size() &&
+                previous.is_replicated[expert] &&
+                expert < previous.owner_socket.size() &&
+                expert < owner_socket.size() &&
+                previous.owner_socket[expert] == owner_socket[expert];
+
+            if (!previously_resident)
+            {
+                arrivals.is_replicated[expert] = true;
+                ++arrivals.num_replicated;
+            }
+        }
+
+        return arrivals;
     }
 
     MoERebalanceController::MoERebalanceController(Config config)
@@ -136,9 +175,7 @@ namespace llaminar2
 
     bool MoERebalanceController::shouldRebalance() const
     {
-        return config_.mode == MoERebalanceMode::DYNAMIC
-               && histogram_
-               && histogram_->windowFull();
+        return config_.mode == MoERebalanceMode::DYNAMIC && histogram_ && histogram_->windowFull();
     }
 
     std::vector<int> MoERebalanceController::rebalance()
@@ -169,9 +206,17 @@ namespace llaminar2
         total_swaps_ += proposal.numSwaps();
 
         LOG_INFO("[MoERebalanceController] Rebalance #" << total_rebalances_
-                 << ": " << proposal.summary());
+                                                        << ": " << proposal.summary());
 
         return new_placement;
+    }
+
+    void MoERebalanceController::resetRebalanceWindow()
+    {
+        if (!histogram_)
+            return;
+        histogram_->resetWindow();
+        growWindowIfAdaptive();
     }
 
     void MoERebalanceController::logHistogramSummary() const
@@ -253,7 +298,8 @@ namespace llaminar2
         for (int s = 0; s < num_sockets; ++s)
             masks_by_socket[s].assign(num_layers, std::vector<bool>(num_experts, false));
 
-        auto fallback = [&]() {
+        auto fallback = [&]()
+        {
             for (int s = 0; s < num_sockets; ++s)
                 masks_by_socket[s] = computeExpertMasks(s);
             return masks_by_socket;
@@ -284,7 +330,8 @@ namespace llaminar2
             std::vector<int> experts(num_experts);
             std::iota(experts.begin(), experts.end(), 0);
             std::sort(experts.begin(), experts.end(),
-                      [&](int a, int b) {
+                      [&](int a, int b)
+                      {
                           if (counts[a] != counts[b])
                               return counts[a] > counts[b];
                           return a < b;
@@ -297,8 +344,9 @@ namespace llaminar2
                 gpu_cached[expert] = true;
             }
 
-            auto assign_lpt = [&](const std::vector<int>& socket_ids,
-                                  const std::vector<int>& expert_ids) {
+            auto assign_lpt = [&](const std::vector<int> &socket_ids,
+                                  const std::vector<int> &expert_ids)
+            {
                 std::vector<uint64_t> loads(socket_ids.size(), 0);
                 std::vector<int> expert_counts(socket_ids.size(), 0);
                 for (int expert : expert_ids)
@@ -380,14 +428,15 @@ namespace llaminar2
             old_loads[current_placement_[e]] += total_counts[e];
         auto [old_min_it, old_max_it] = std::minmax_element(old_loads.begin(), old_loads.end());
         float imbalance_before = (*old_min_it > 0)
-            ? static_cast<float>(*old_max_it) / static_cast<float>(*old_min_it)
-            : 1.0f;
+                                     ? static_cast<float>(*old_max_it) / static_cast<float>(*old_min_it)
+                                     : 1.0f;
 
         // LPT: sort experts by total activation count descending
         std::vector<int> sorted(num_experts);
         std::iota(sorted.begin(), sorted.end(), 0);
         std::sort(sorted.begin(), sorted.end(),
-                  [&](int a, int b) { return total_counts[a] > total_counts[b]; });
+                  [&](int a, int b)
+                  { return total_counts[a] > total_counts[b]; });
 
         // Greedy assign to least-loaded socket
         std::vector<uint64_t> loads(num_sockets, 0);
@@ -409,8 +458,8 @@ namespace llaminar2
         // Compute imbalance after
         auto [new_min_it, new_max_it] = std::minmax_element(loads.begin(), loads.end());
         float imbalance_after = (*new_min_it > 0)
-            ? static_cast<float>(*new_max_it) / static_cast<float>(*new_min_it)
-            : 1.0f;
+                                    ? static_cast<float>(*new_max_it) / static_cast<float>(*new_min_it)
+                                    : 1.0f;
 
         // Count how many experts changed socket
         int experts_moved = 0;
@@ -439,7 +488,11 @@ namespace llaminar2
             float imb_a = (*la_min > 0) ? float(*la_max) / float(*la_min) : 1.0f;
             per_layer_before += imb_b;
             per_layer_after += imb_a;
-            if (imb_b > worst_before) { worst_before = imb_b; worst_layer_before = l; }
+            if (imb_b > worst_before)
+            {
+                worst_before = imb_b;
+                worst_layer_before = l;
+            }
         }
         per_layer_before /= num_layers;
         per_layer_after /= num_layers;
@@ -518,14 +571,17 @@ namespace llaminar2
             }
 
             std::sort(candidates.begin(), candidates.end(),
-                      [&](int a, int b) { return total_counts[a] > total_counts[b]; });
+                      [&](int a, int b)
+                      { return total_counts[a] > total_counts[b]; });
 
             // Mark the top-K as replicated
             int replicated = 0;
             for (int e : candidates)
             {
-                if (replicated >= max_replicas_per_socket) break;
-                if (result.is_replicated[e]) continue; // Already marked by another socket
+                if (replicated >= max_replicas_per_socket)
+                    break;
+                if (result.is_replicated[e])
+                    continue; // Already marked by another socket
                 result.is_replicated[e] = true;
                 result.num_replicated++;
                 replicated++;
@@ -536,7 +592,7 @@ namespace llaminar2
         current_replicas_ = result;
 
         LOG_INFO("[MoERebalanceController] Proposed " << result.num_replicated
-                 << " expert replicas (max " << max_replicas_per_socket << " per socket)");
+                                                      << " expert replicas (max " << max_replicas_per_socket << " per socket)");
 
         // Log the top replicas per socket
         for (int s = 0; s < num_sockets; ++s)
@@ -549,7 +605,8 @@ namespace llaminar2
                 // Expert replicated on socket s = expert NOT owned by s but is_replicated
                 if (result.is_replicated[e] && result.owner_socket[e] != s)
                 {
-                    if (count > 0) oss << ", ";
+                    if (count > 0)
+                        oss << ", ";
                     oss << "e" << e << "(" << total_counts[e] << ")";
                     count++;
                 }
@@ -571,7 +628,8 @@ namespace llaminar2
             title << "MOE EXPERT REBALANCE PROFILING" << fort::endr;
             title[0][0].set_cell_text_align(fort::text_align::center);
             title.row(0).set_cell_row_type(fort::row_type::header);
-            oss << "\n" << title.to_string();
+            oss << "\n"
+                << title.to_string();
         }
 
         // ── Config table ───────────────────────────────────────────
@@ -582,8 +640,9 @@ namespace llaminar2
             t.column(0).set_cell_text_align(fort::text_align::left);
             t.column(1).set_cell_text_align(fort::text_align::right);
 
-            t << "Mode" << (config_.mode == MoERebalanceMode::OBSERVE ? "OBSERVE"
-                           : config_.mode == MoERebalanceMode::DYNAMIC ? "DYNAMIC" : "OFF") << fort::endr;
+            t << "Mode" << (config_.mode == MoERebalanceMode::OBSERVE ? "OBSERVE" : config_.mode == MoERebalanceMode::DYNAMIC ? "DYNAMIC"
+                                                                                                                              : "OFF")
+              << fort::endr;
             t << "Experts" << config_.num_experts << fort::endr;
             t << "Sockets" << config_.sockets.size() << fort::endr;
             t << "Top-K" << config_.top_k << fort::endr;
@@ -658,7 +717,8 @@ namespace llaminar2
             int num_sockets = static_cast<int>(config_.sockets.size());
 
             // Collect per-layer imbalance data
-            struct LayerImbalance {
+            struct LayerImbalance
+            {
                 int layer;
                 float imbalance;
                 std::vector<uint64_t> socket_loads;
@@ -674,7 +734,11 @@ namespace llaminar2
                 float imb = histogram_->socketImbalanceRatio(l);
                 auto loads = histogram_->socketLoads(l);
                 avg_imbalance += imb;
-                if (imb > worst_imbalance) { worst_imbalance = imb; worst_layer = l; }
+                if (imb > worst_imbalance)
+                {
+                    worst_imbalance = imb;
+                    worst_layer = l;
+                }
                 layer_data.push_back({l, imb, std::move(loads)});
             }
             avg_imbalance /= std::max(1, num_layers);
@@ -690,7 +754,8 @@ namespace llaminar2
             std::vector<int> sorted(config_.num_experts);
             std::iota(sorted.begin(), sorted.end(), 0);
             std::sort(sorted.begin(), sorted.end(),
-                      [&](int a, int b) { return global_counts[a] > global_counts[b]; });
+                      [&](int a, int b)
+                      { return global_counts[a] > global_counts[b]; });
 
             // Per-socket stats
             std::vector<int> socket_expert_counts(num_sockets, 0);
@@ -709,7 +774,8 @@ namespace llaminar2
                 }
             }
             uint64_t total_load = 0;
-            for (int s = 0; s < num_sockets; ++s) total_load += socket_total_load[s];
+            for (int s = 0; s < num_sockets; ++s)
+                total_load += socket_total_load[s];
 
             // Histogram overview table
             {
@@ -736,7 +802,8 @@ namespace llaminar2
                     int show = std::min(5, config_.num_experts);
                     for (int i = 0; i < show; ++i)
                     {
-                        if (i > 0) val << ", ";
+                        if (i > 0)
+                            val << ", ";
                         val << "e" << sorted[i] << "(" << global_counts[sorted[i]] << ")";
                     }
                     t << "Top-5 hottest" << val.str() << fort::endr;
@@ -745,7 +812,8 @@ namespace llaminar2
                     std::ostringstream val;
                     for (int s = 0; s < num_sockets; ++s)
                     {
-                        if (s > 0) val << ", ";
+                        if (s > 0)
+                            val << ", ";
                         val << "s" << s << "=" << socket_expert_counts[s];
                     }
                     t << "Experts/socket" << val.str() << fort::endr;
@@ -754,7 +822,8 @@ namespace llaminar2
                     std::ostringstream val;
                     for (int s = 0; s < num_sockets; ++s)
                     {
-                        if (s > 0) val << ", ";
+                        if (s > 0)
+                            val << ", ";
                         double pct = total_load > 0 ? 100.0 * socket_total_load[s] / total_load : 0;
                         val << "s" << s << "=" << std::fixed << std::setprecision(1) << pct << "%";
                     }
@@ -768,7 +837,8 @@ namespace llaminar2
             {
                 auto sorted_layers = layer_data;
                 std::sort(sorted_layers.begin(), sorted_layers.end(),
-                          [](const auto &a, const auto &b) { return a.imbalance > b.imbalance; });
+                          [](const auto &a, const auto &b)
+                          { return a.imbalance > b.imbalance; });
 
                 int show_layers = std::min(5, num_layers);
 
@@ -797,7 +867,8 @@ namespace llaminar2
                     for (int s = 0; s < num_sockets; ++s)
                     {
                         uint64_t load = (s < static_cast<int>(ld.socket_loads.size()))
-                                            ? ld.socket_loads[s] : 0;
+                                            ? ld.socket_loads[s]
+                                            : 0;
                         t << load;
                     }
                     t << fort::endr;

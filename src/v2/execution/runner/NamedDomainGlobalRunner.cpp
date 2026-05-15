@@ -38,8 +38,10 @@ namespace llaminar2
 
     bool NamedDomainGlobalRunner::shouldUse(const OrchestrationConfig &config)
     {
-        if (!config.usesNamedDomains()) return false;
-        if (config.pp_stage_definitions.empty()) return false;
+        if (!config.usesNamedDomains())
+            return false;
+        if (config.pp_stage_definitions.empty())
+            return false;
 
         for (const auto &domain : config.domain_definitions)
         {
@@ -97,7 +99,8 @@ namespace llaminar2
 
     bool NamedDomainGlobalRunner::initialize()
     {
-        if (initialized_) return true;
+        if (initialized_)
+            return true;
 
         try
         {
@@ -113,7 +116,7 @@ namespace llaminar2
             const int world_size = mpi_ctx->world_size();
 
             LOG_INFO("NamedDomainGlobalRunner: initializing on rank " << my_rank
-                     << " of " << world_size);
+                                                                      << " of " << world_size);
 
             // ----------------------------------------------------------
             // Step 2: Read model metadata for layer count
@@ -186,7 +189,8 @@ namespace llaminar2
                 if (!errs.empty())
                 {
                     std::string msg = "GlobalPPTopology validation failed:";
-                    for (const auto &e : errs) msg += "\n  - " + e;
+                    for (const auto &e : errs)
+                        msg += "\n  - " + e;
                     return setError(msg);
                 }
             }
@@ -208,7 +212,11 @@ namespace llaminar2
                 bool has_global_tp = false;
                 for (const auto &s : topology.stages)
                 {
-                    if (s.is_global_tp) { has_global_tp = true; break; }
+                    if (s.is_global_tp)
+                    {
+                        has_global_tp = true;
+                        break;
+                    }
                 }
                 if (has_global_tp)
                 {
@@ -235,12 +243,20 @@ namespace llaminar2
             auto runtime_cfg = RuntimeConfig::fromOrchestrationConfig(
                 config_.max_seq_len,
                 config_.activation_precision,
-                config_.kv_cache_precision);
+                config_.kv_cache_precision,
+                config_.fused_attention_backend,
+                config_.moe_expert_mode,
+                config_.moe_hot_expert_cache,
+                config_.moe_rebalance);
             InferenceRunnerConfig base_runner_cfg;
             base_runner_cfg.max_seq_len = runtime_cfg.max_seq_len;
             base_runner_cfg.batch_size = config_.batch_size;
             base_runner_cfg.activation_precision = runtime_cfg.activation_precision;
             base_runner_cfg.kv_cache_precision = runtime_cfg.kv_cache_precision;
+            base_runner_cfg.fused_attention_backend = runtime_cfg.fused_attention_backend;
+            base_runner_cfg.moe_expert_mode = runtime_cfg.moe_expert_mode;
+            base_runner_cfg.moe_hot_expert_cache = runtime_cfg.moe_hot_expert_cache;
+            base_runner_cfg.moe_rebalance = runtime_cfg.moe_rebalance;
 
             // Load model context once; each stage runner slices its own weight plan
             std::shared_ptr<ModelContext> model_ctx;
@@ -281,15 +297,21 @@ namespace llaminar2
             std::vector<StageRunnerEntry> stage_runners;
             for (const auto &step : rank_plan.steps)
             {
-                if (step.type != GlobalPPRankPlan::Step::Type::EXECUTE_STAGE) continue;
+                if (step.type != GlobalPPRankPlan::Step::Type::EXECUTE_STAGE)
+                    continue;
                 const auto &action = step.stage_action;
-                if (action.role != RankStageAction::Role::EXECUTE) continue;
+                if (action.role != RankStageAction::Role::EXECUTE)
+                    continue;
 
                 // Find matching stage spec
                 const GlobalPPStageSpec *spec_ptr = nullptr;
                 for (const auto &s : topology.stages)
                 {
-                    if (s.stage_id == action.stage_id) { spec_ptr = &s; break; }
+                    if (s.stage_id == action.stage_id)
+                    {
+                        spec_ptr = &s;
+                        break;
+                    }
                 }
                 if (!spec_ptr)
                 {
@@ -363,7 +385,8 @@ namespace llaminar2
 
     void NamedDomainGlobalRunner::shutdown()
     {
-        if (inner_) inner_->shutdown();
+        if (inner_)
+            inner_->shutdown();
         inner_.reset();
         initialized_ = false;
     }
@@ -374,7 +397,8 @@ namespace llaminar2
 
     bool NamedDomainGlobalRunner::prefill(const std::vector<int32_t> &tokens)
     {
-        if (!initialized_ || !inner_) return setError("Not initialized");
+        if (!initialized_ || !inner_)
+            return setError("Not initialized");
         return inner_->prefill(tokens);
     }
 
@@ -439,7 +463,8 @@ namespace llaminar2
 
     void NamedDomainGlobalRunner::clearCache()
     {
-        if (inner_) inner_->clearCache();
+        if (inner_)
+            inner_->clearCache();
     }
 
     const float *NamedDomainGlobalRunner::lastLogits() const
@@ -449,7 +474,8 @@ namespace llaminar2
 
     void NamedDomainGlobalRunner::setStopTokens(const std::vector<int32_t> &stop_tokens)
     {
-        if (inner_) inner_->setStopTokens(stop_tokens);
+        if (inner_)
+            inner_->setStopTokens(stop_tokens);
     }
 
     std::shared_ptr<ITokenizer> NamedDomainGlobalRunner::tokenizer() const
@@ -465,29 +491,34 @@ namespace llaminar2
 
     void NamedDomainGlobalRunner::enableSnapshotCapture(const std::string &output_dir)
     {
-        if (inner_) inner_->enableSnapshotCapture(output_dir);
+        if (inner_)
+            inner_->enableSnapshotCapture(output_dir);
     }
 
     void NamedDomainGlobalRunner::disableSnapshotCapture()
     {
-        if (inner_) inner_->disableSnapshotCapture();
+        if (inner_)
+            inner_->disableSnapshotCapture();
     }
 
     void NamedDomainGlobalRunner::clearSnapshots()
     {
-        if (inner_) inner_->clearSnapshots();
+        if (inner_)
+            inner_->clearSnapshots();
     }
 
     const float *NamedDomainGlobalRunner::getSnapshot(const std::string &key, size_t &out_size) const
     {
-        if (inner_) return inner_->getSnapshot(key, out_size);
+        if (inner_)
+            return inner_->getSnapshot(key, out_size);
         out_size = 0;
         return nullptr;
     }
 
     std::vector<std::string> NamedDomainGlobalRunner::getSnapshotKeys() const
     {
-        if (inner_) return inner_->getSnapshotKeys();
+        if (inner_)
+            return inner_->getSnapshotKeys();
         return {};
     }
 

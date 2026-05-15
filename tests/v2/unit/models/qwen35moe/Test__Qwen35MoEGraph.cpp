@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include "models/qwen35moe/Qwen35MoEGraph.h"
+#include "models/qwen35moe/Qwen35MoESchema.h"
 #include "mocks/MockLocalTPContext.h"
 #include "utils/TestTensorFactory.h"
 
@@ -54,14 +55,14 @@ namespace
     public:
         FP32Tensor *fp32(std::vector<size_t> shape)
         {
-            auto tensor = std::make_unique<FP32Tensor>(std::move(shape));
+            auto tensor = std::make_shared<FP32Tensor>(std::move(shape));
             auto *ptr = tensor.get();
             tensors_.push_back(std::move(tensor));
             return ptr;
         }
 
     private:
-        std::vector<std::unique_ptr<TensorBase>> tensors_;
+        std::vector<std::shared_ptr<TensorBase>> tensors_;
     };
 
     LayerWeights makeMoELayerWeights(TensorArena &arena)
@@ -105,6 +106,8 @@ TEST(Test__Qwen35MoEGraph, ReplicatedRoutedExpertOutputFeedsCombineDirectlyUnder
     tp_ctx->setBackend(CollectiveBackendType::HOST);
 
     GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.moe.expert_mode = MoEExpertMode::Replicated;
+    config.moe.local_expert_count = -1;
     Qwen35MoEGraph graph_builder(config, nullptr);
 
     TensorArena arena;
@@ -119,4 +122,41 @@ TEST(Test__Qwen35MoEGraph, ReplicatedRoutedExpertOutputFeedsCombineDirectlyUnder
     ASSERT_NE(graph.getNode("layer0_moe_combine"), nullptr);
 
     EXPECT_TRUE(hasDependency(graph, "layer0_moe_combine", "layer0_moe_expert_ffn"));
+}
+
+TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices({GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()});
+    tp_ctx->setBackend(CollectiveBackendType::HOST);
+
+    GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.moe.expert_mode = MoEExpertMode::ExpertParallel;
+    config.moe.local_expert_start = 0;
+    config.moe.local_expert_count = 1;
+    Qwen35MoEGraph graph_builder(config, nullptr);
+
+    TensorArena arena;
+    auto layer = makeMoELayerWeights(arena);
+    auto buffers = makeActivationBuffers(arena, /*tokens=*/2, config.d_model, config.moe.num_experts, config.moe.top_k);
+
+    ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, /*layer_idx=*/0, /*seq_len=*/2, /*batch_size=*/1, DeviceId::cpu());
+
+    ASSERT_NE(graph.getNode("layer0_moe_expert_ffn"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_moe_expert_allreduce"), nullptr)
+        << "Expert-parallel MoE owns only a local expert range, so routed output is partial until allreduce";
+    ASSERT_NE(graph.getNode("layer0_moe_combine"), nullptr);
+
+    EXPECT_TRUE(hasDependency(graph, "layer0_moe_expert_allreduce", "layer0_moe_expert_ffn"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_moe_combine", "layer0_moe_expert_allreduce"));
+}
+
+TEST(Test__Qwen35MoEGraph, SchemaDefaultsRoutedExpertWeightsToExpertParallel)
+{
+    Qwen35MoESchemaFactory factory;
+    WeightShardingConfig sharding = factory.getWeightShardingConfig();
+
+    EXPECT_EQ(sharding.getMode("blk.0.ffn_gate_exps.weight"), WeightShardingMode::ExpertParallel);
+    EXPECT_EQ(sharding.getMode("blk.0.ffn_up_exps.weight"), WeightShardingMode::ExpertParallel);
+    EXPECT_EQ(sharding.getMode("blk.0.ffn_down_exps.weight"), WeightShardingMode::ExpertParallel);
 }

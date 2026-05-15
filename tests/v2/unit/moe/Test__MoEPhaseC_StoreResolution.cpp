@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include "execution/moe/MoEExpertWeightService.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ExpertSlabTypes.h"
 #include "tensors/TensorKernels.h"
@@ -61,7 +62,8 @@ namespace
     }
 
     /// Helper: set up a PreparedWeightStore with 3 fully-populated slabs for one layer.
-    struct SlabFixture {
+    struct SlabFixture
+    {
         PreparedWeightStore store{ModelContextId{99}};
         ExpertSlabRef gate_ref;
         ExpertSlabRef up_ref;
@@ -133,6 +135,130 @@ TEST(Test__MoEPhaseC_StoreResolution, EnsureCache_LocalExpertSubset)
         EXPECT_EQ(store.expertGemmKernel(gate_ref, e), nullptr) << "expert " << e << " not local";
 }
 
+TEST(Test__MoEPhaseC_StoreResolution, PrepareGemmEngines_ReusesExistingCPUSlabs)
+{
+    constexpr int num_experts = 8;
+    constexpr int layer_idx = 5;
+    SlabFixture f(layer_idx, num_experts);
+
+    std::vector<bool> expert_mask;
+    std::vector<std::shared_ptr<TensorBase>> gate_views(num_experts);
+    std::vector<std::shared_ptr<TensorBase>> up_views(num_experts);
+    std::vector<std::shared_ptr<TensorBase>> down_views(num_experts);
+    std::vector<ITensorGemm *> gate_gemm;
+    std::vector<ITensorGemm *> up_gemm;
+    std::vector<ITensorGemm *> down_gemm;
+    std::vector<std::shared_ptr<ITensorGemm>> owned_kernels;
+    std::shared_ptr<void> gate_lifetime;
+    std::shared_ptr<void> up_lifetime;
+    std::shared_ptr<void> down_lifetime;
+
+    MoEWeightContext ctx{
+        DeviceId::cpu(),
+        num_experts,
+        2048,
+        896,
+        0,
+        -1,
+        layer_idx,
+        expert_mask,
+        nullptr,
+        nullptr,
+        nullptr,
+        gate_views,
+        up_views,
+        down_views,
+        gate_gemm,
+        up_gemm,
+        down_gemm,
+        owned_kernels,
+        gate_lifetime,
+        up_lifetime,
+        down_lifetime,
+        nullptr,
+        &f.store,
+        nullptr,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt};
+
+    ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+
+    EXPECT_EQ(f.store.expertSlabCount(), 3u);
+    ASSERT_TRUE(ctx.gate_slab_ref.has_value());
+    ASSERT_TRUE(ctx.up_slab_ref.has_value());
+    ASSERT_TRUE(ctx.down_slab_ref.has_value());
+    EXPECT_EQ(ctx.gate_slab_ref->slab_id, f.gate_ref.slab_id);
+    EXPECT_EQ(ctx.up_slab_ref->slab_id, f.up_ref.slab_id);
+    EXPECT_EQ(ctx.down_slab_ref->slab_id, f.down_ref.slab_id);
+
+    for (int e = 0; e < num_experts; ++e)
+    {
+        EXPECT_EQ(gate_gemm[e], fakeEngine(e)) << "gate expert " << e;
+        EXPECT_EQ(up_gemm[e], fakeEngine(e + 100)) << "up expert " << e;
+        EXPECT_EQ(down_gemm[e], fakeEngine(e + 200)) << "down expert " << e;
+    }
+}
+
+TEST(Test__MoEPhaseC_StoreResolution, PrepareGemmEngines_IncompleteExistingSlabsFailNoRepack)
+{
+    constexpr int num_experts = 8;
+    constexpr int layer_idx = 5;
+
+    PreparedWeightStore store(ModelContextId{51});
+    auto gate_ref = store.registerExpertSlab(makeDesc(layer_idx, WeightRole::MoEExpertGate, num_experts));
+    auto up_ref = store.registerExpertSlab(makeDesc(layer_idx, WeightRole::MoEExpertUp, num_experts));
+    auto down_ref = store.registerExpertSlab(makeDesc(layer_idx, WeightRole::MoEExpertDown, num_experts));
+    populateExperts(store, gate_ref, 0, 2, 0);
+    populateExperts(store, up_ref, 0, 2, 100);
+    populateExperts(store, down_ref, 0, 2, 200);
+
+    std::vector<bool> expert_mask;
+    std::vector<std::shared_ptr<TensorBase>> gate_views(num_experts);
+    std::vector<std::shared_ptr<TensorBase>> up_views(num_experts);
+    std::vector<std::shared_ptr<TensorBase>> down_views(num_experts);
+    std::vector<ITensorGemm *> gate_gemm;
+    std::vector<ITensorGemm *> up_gemm;
+    std::vector<ITensorGemm *> down_gemm;
+    std::vector<std::shared_ptr<ITensorGemm>> owned_kernels;
+    std::shared_ptr<void> gate_lifetime;
+    std::shared_ptr<void> up_lifetime;
+    std::shared_ptr<void> down_lifetime;
+
+    MoEWeightContext ctx{
+        DeviceId::cpu(),
+        num_experts,
+        2048,
+        896,
+        0,
+        -1,
+        layer_idx,
+        expert_mask,
+        nullptr,
+        nullptr,
+        nullptr,
+        gate_views,
+        up_views,
+        down_views,
+        gate_gemm,
+        up_gemm,
+        down_gemm,
+        owned_kernels,
+        gate_lifetime,
+        up_lifetime,
+        down_lifetime,
+        nullptr,
+        &store,
+        nullptr,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt};
+
+    EXPECT_FALSE(MoEExpertWeightService::prepareGemmEngines(ctx));
+    EXPECT_EQ(store.expertSlabCount(), 3u);
+    EXPECT_TRUE(owned_kernels.empty());
+}
+
 TEST(Test__MoEPhaseC_StoreResolution, EnsureCache_RespectsExpertMask)
 {
     constexpr int num_experts = 8;
@@ -144,7 +270,8 @@ TEST(Test__MoEPhaseC_StoreResolution, EnsureCache_RespectsExpertMask)
     std::vector<ITensorGemm *> cache(num_experts, nullptr);
     for (int e = 0; e < num_experts; ++e)
     {
-        if (!mask[e]) continue;
+        if (!mask[e])
+            continue;
         cache[e] = f.store.expertGemmKernel(f.gate_ref, e);
     }
 
@@ -341,14 +468,17 @@ TEST(Test__MoEPhaseC_StoreResolution, GPURegistration_EngineLifetimePreservation
     auto gate_ref = store.registerExpertSlab(makeDesc(0, WeightRole::MoEExpertGate, num_experts));
 
     // Simulate GPU path: engines have shared_ptr lifetimes (moe_owned_kernels)
-    struct FakeGemm : ITensorGemm {
+    struct FakeGemm : ITensorGemm
+    {
         int id;
         explicit FakeGemm(int i) : id(i) {}
         bool supports_device(int) const override { return true; }
-        bool multiply_tensor(const TensorBase*, TensorBase*, int, int, int,
-                             bool, float, float, const TensorBase*,
-                             const IMPIContext*, int, DeviceWorkspaceManager*, int) override
-        { return false; }
+        bool multiply_tensor(const TensorBase *, TensorBase *, int, int, int,
+                             bool, float, float, const TensorBase *,
+                             const IMPIContext *, int, DeviceWorkspaceManager *, int) override
+        {
+            return false;
+        }
     };
 
     auto owned_0 = std::make_shared<FakeGemm>(0);
@@ -450,7 +580,8 @@ TEST(Test__MoEPhaseC_StoreResolution, FullLifecycle_RegisterResolveDepartRebalan
     EXPECT_NE(store.expertGemmKernel(gate_ref, 2), nullptr);
 
     // Step 5: Rebalance — new engines for departed experts
-    auto rebalance = [&](const ExpertSlabRef &ref, int e, int offset) {
+    auto rebalance = [&](const ExpertSlabRef &ref, int e, int offset)
+    {
         std::vector<ExpertArrival> arr;
         ExpertArrival a;
         a.expert_id = e;

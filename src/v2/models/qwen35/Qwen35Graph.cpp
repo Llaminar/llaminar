@@ -83,6 +83,46 @@ namespace llaminar2
         }
     }
 
+    int Qwen35Graph::resolveGDNGlobalVHeadOffset(
+        const WeightBinding *value_projection_binding,
+        int d_v,
+        int n_v_heads,
+        int n_v_heads_full,
+        const GraphConfig &config,
+        const IMPIContext *mpi_ctx)
+    {
+        if (n_v_heads >= n_v_heads_full || d_v <= 0)
+            return 0;
+
+        if (value_projection_binding)
+        {
+            const auto &slice = value_projection_binding->slice;
+            if (slice.row_count > 0 && slice.row_start % static_cast<size_t>(d_v) == 0)
+            {
+                return static_cast<int>(slice.row_start / static_cast<size_t>(d_v));
+            }
+        }
+
+        if (config.tp_config)
+        {
+            const auto *assignment = config.getAssignment();
+            const int total_heads = config.n_heads;
+            if (assignment && total_heads > 0)
+            {
+                return static_cast<int>(
+                    static_cast<int64_t>(n_v_heads_full) * assignment->head_start / total_heads);
+            }
+        }
+
+        if (mpi_ctx && mpi_ctx->world_size() > 1)
+            return mpi_ctx->rank() * n_v_heads;
+
+        if (config.tp_ctx && config.tp_ctx->degree() > 1)
+            return config.tp_ctx->myIndex() * n_v_heads;
+
+        return 0;
+    }
+
     // =========================================================================
     // Constructors
     // =========================================================================
@@ -463,11 +503,13 @@ namespace llaminar2
         // the wrong K-heads for its V-head slice.
         if (n_v_heads < n_v_heads_full)
         {
-            rec_params.global_v_head_offset = config_.qkv_column_parallel
-                                                  ? config_.head_start
-                                                  : ((mpi_ctx_ && mpi_ctx_->world_size() > 1)
-                                                         ? mpi_ctx_->rank() * n_v_heads
-                                                         : 0);
+            rec_params.global_v_head_offset = resolveGDNGlobalVHeadOffset(
+                layer_bindings.attn_gate,
+                d_v,
+                n_v_heads,
+                n_v_heads_full,
+                config_,
+                mpi_ctx_.get());
         }
 
         rec_params.output_buffer_id = BufferId::ATTN_OUTPUT;

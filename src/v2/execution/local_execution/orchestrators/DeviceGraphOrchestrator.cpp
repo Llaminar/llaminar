@@ -766,6 +766,54 @@ namespace llaminar2
     {
         auto session = buildGraph().forInput(input);
 
+        auto finalize = [&](GraphBuildResult result) -> GraphBuildResult
+        {
+            if (!result || raw_expert_weights_released_after_graph_build_ || !graph_builder_)
+                return result;
+
+            const auto &cfg = graph_builder_->config();
+            const bool release_enabled = cfg.moe.rebalance_config.release_raw_expert_weights ||
+                                         debugEnv().moe_rebalance.release_raw_weights;
+            if (!release_enabled || cfg.default_device.is_gpu())
+                return result;
+
+            size_t total_freed = 0;
+            int stage_count = 0;
+            PreparedWeightStore *summary_store = prepared_weight_store_.get();
+            for (const auto &node_name : result.graph().getExecutionOrder())
+            {
+                ComputeNode *node = result.graph().getNode(node_name);
+                if (!node || !node->stage || node->stage->type() != ComputeStageType::MOE_EXPERT_FFN)
+                    continue;
+                auto *moe = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
+                if (!moe)
+                    continue;
+                if (!summary_store)
+                    summary_store = moe->buildWeightContext().prepared_store;
+                total_freed += moe->releaseRawExpertWeights();
+                ++stage_count;
+            }
+
+            raw_expert_weights_released_after_graph_build_ = true;
+
+            size_t cached_freed = 0;
+            if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
+            {
+                cached_freed = concrete_weight_manager->releaseMoEExpertHostWeightData();
+                concrete_weight_manager->logHostMemorySummary("after eager graph build raw release");
+            }
+
+            if (summary_store)
+                summary_store->logMemorySummary("after eager graph build");
+            {
+                LOG_INFO("[DGO] Released raw expert weights after eager graph build across "
+                         << stage_count << " MoE stages: " << (total_freed >> 20)
+                         << " MB stage-owned + " << (cached_freed >> 20)
+                         << " MB WeightManager-cached freed");
+            }
+            return result;
+        };
+
         if (pipeline_config_ && pipeline_config_->hasPP())
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] Building UNIFIED PIPELINE graph: "
@@ -784,9 +832,9 @@ namespace llaminar2
             for (const auto &[name, ctx] : domain_tp_contexts_)
                 session.withTPContext(name, ctx.get());
 
-            return session
-                .withPipelineConfig(pipeline_config_)
-                .buildUnified();
+            return finalize(session
+                                .withPipelineConfig(pipeline_config_)
+                                .buildUnified());
         }
         else if (pp_stage_config_.has_value())
         {
@@ -796,15 +844,15 @@ namespace llaminar2
                       << "has_embedding=" << pp.has_embedding
                       << " has_lm_head=" << pp.has_lm_head);
 
-            return session
-                .forPPStage(pp.first_layer, pp.last_layer,
-                            pp.has_embedding, pp.has_lm_head)
-                .buildPartial();
+            return finalize(session
+                                .forPPStage(pp.first_layer, pp.last_layer,
+                                            pp.has_embedding, pp.has_lm_head)
+                                .buildPartial());
         }
         else
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] Building FULL forward graph...");
-            return session.buildForward();
+            return finalize(session.buildForward());
         }
     }
 
@@ -2478,6 +2526,9 @@ namespace llaminar2
         LOG_INFO("[DGO] Prepared weight store initialized with "
                  << prepared_weight_store_->size() << " entries for device " << device.toString()
                  << " (new=" << registered << ")");
+        prepared_weight_store_->logMemorySummary("after base preparation");
+        if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
+            concrete_weight_manager->logHostMemorySummary("after base preparation");
 
         // Phase 10: Wire prepared weight store to graph builder so stages
         // can resolve kernels through the store instead of KernelFactory fallbacks.
@@ -2508,6 +2559,8 @@ namespace llaminar2
         std::vector<StageInfo> moe_stages;
 
         if (forward_engine_)
+            if (prepared_weight_store_)
+                prepared_weight_store_->logMemorySummary("after eager graph build");
         {
             forward_engine_->forEachCachedStage(
                 ComputeStageType::MOE_EXPERT_FFN,
@@ -2568,6 +2621,13 @@ namespace llaminar2
                 applied.fetch_add(1, std::memory_order_relaxed);
         }
 
+        if (applied.load(std::memory_order_relaxed) != n)
+        {
+            LOG_ERROR("[DGO] Failed to prepare " << (n - applied.load(std::memory_order_relaxed))
+                                                 << " MoEExpertComputeStages during expert mask application");
+            throw std::runtime_error("MoE expert mask application failed: missing prepared expert weights");
+        }
+
         // ── Step 5: Phase 3 — apply masks (fast, no heavy ops) ─────────
         for (auto &[stage, layer] : moe_stages)
             stage->applyExpertMask(masks[layer]);
@@ -2624,9 +2684,6 @@ namespace llaminar2
     void DeviceGraphOrchestrator::setExpertReplicaSet(
         const ExpertReplicaSet &replicas, int socket_id)
     {
-        if (replicas.num_replicated == 0)
-            return;
-
         int count = 0;
         if (forward_engine_)
         {
@@ -2651,6 +2708,7 @@ namespace llaminar2
     {
         size_t total_freed = 0;
         int stage_count = 0;
+        PreparedWeightStore *summary_store = prepared_weight_store_.get();
 
         if (forward_engine_)
         {
@@ -2661,6 +2719,8 @@ namespace llaminar2
                     auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
                     if (moe)
                     {
+                        if (!summary_store)
+                            summary_store = moe->buildWeightContext().prepared_store;
                         total_freed += moe->releaseRawExpertWeights();
                         ++stage_count;
                     }
@@ -2669,7 +2729,91 @@ namespace llaminar2
 
         LOG_INFO("[DGO] Released raw expert weights across " << stage_count
                                                              << " MoE stages: " << (total_freed >> 20) << " MB freed");
+        if (summary_store)
+            summary_store->logMemorySummary("after rebalance raw release");
+        if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
+            concrete_weight_manager->logHostMemorySummary("after rebalance raw release");
         return total_freed;
+    }
+
+    bool DeviceGraphOrchestrator::materializeForwardGraphForShape(int seq_len, int batch_size)
+    {
+        if (!state_.isInitialized())
+        {
+            LOG_ERROR("[DGO] Cannot materialize forward graph before inference state initialization");
+            return false;
+        }
+        if (!hasGlobalWeights())
+        {
+            LOG_ERROR("[DGO] Cannot materialize forward graph before weights are configured");
+            return false;
+        }
+        if (seq_len <= 0 || batch_size <= 0)
+        {
+            LOG_ERROR("[DGO] Invalid materialization shape: seq_len=" << seq_len
+                                                                      << " batch_size=" << batch_size);
+            return false;
+        }
+        if (batch_size > state_.batch_size)
+        {
+            LOG_ERROR("[DGO] Materialization batch size " << batch_size
+                                                          << " exceeds initialized batch size " << state_.batch_size);
+            return false;
+        }
+
+        const int total_tokens = batch_size * seq_len;
+        if (total_tokens > state_.batch_size * state_.max_seq_len)
+        {
+            LOG_ERROR("[DGO] Materialization token count " << total_tokens
+                                                           << " exceeds buffer capacity "
+                                                           << (state_.batch_size * state_.max_seq_len));
+            return false;
+        }
+
+        if (pp_stage_config_.has_value() && !pp_stage_config_->has_embedding)
+        {
+            LOG_DEBUG("[DGO] Skipping eager graph materialization for non-embedding PP stage");
+            return true;
+        }
+
+        std::vector<int> token_ids(static_cast<size_t>(total_tokens), 0);
+        std::vector<int> position_ids(static_cast<size_t>(total_tokens));
+        for (int i = 0; i < total_tokens; ++i)
+            position_ids[static_cast<size_t>(i)] = i % seq_len;
+
+        ModelBuffers model_buffers = state_.toModelBuffers();
+        setBuffers(model_buffers);
+
+        ForwardInput input;
+        input.token_ids = token_ids.data();
+        input.position_ids = position_ids.data();
+        input.batch_size = batch_size;
+        input.seq_len = seq_len;
+        input.position_offset = 0;
+        input.device = state_.device_id;
+        input.kv_cache = state_.kv_cache.get();
+
+        std::unordered_map<DeviceId, IKVCache *> pp_kv_cache_ptrs;
+        if (!state_.pp_kv_caches.empty())
+        {
+            for (const auto &[device, cache] : state_.pp_kv_caches)
+                pp_kv_cache_ptrs[device] = cache.get();
+            input.pp_kv_caches = &pp_kv_cache_ptrs;
+        }
+
+        auto result = buildForwardGraph(input);
+        if (!result)
+        {
+            LOG_ERROR("[DGO] Eager forward graph materialization failed: " << result.error());
+            return false;
+        }
+
+        const size_t stage_count = result.graph().size();
+        LOG_INFO("[DGO] Eagerly materialized forward graph for "
+                 << (graph_builder_ ? graph_builder_->architectureName() : std::string("unknown"))
+                 << " shape=[batch=" << batch_size << ", seq=" << seq_len << "]"
+                 << " stages=" << stage_count);
+        return true;
     }
 
     ReceivedWeightsMap DeviceGraphOrchestrator::transferExpertWeights(

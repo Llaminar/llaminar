@@ -752,34 +752,34 @@ namespace llaminar2
         void initializePreparedWeightStore(DeviceId device);
 
         /// Get prepared weight store (may be null if no GEMM weights prepared)
-        PreparedWeightStore* preparedWeightStore() const { return prepared_weight_store_.get(); }
+        PreparedWeightStore *preparedWeightStore() const { return prepared_weight_store_.get(); }
 
         /// Get frozen model weight set (may be null before setWeights is called)
-        const FrozenModelWeightSet* frozenWeightSet() const { return frozen_weight_set_.get(); }
+        const FrozenModelWeightSet *frozenWeightSet() const { return frozen_weight_set_.get(); }
 
         /// Get expert weight payload provider (may be null for non-MoE models)
-        ExpertWeightPayloadProvider* expertPayloadProvider() const { return expert_payload_provider_.get(); }
+        ExpertWeightPayloadProvider *expertPayloadProvider() const { return expert_payload_provider_.get(); }
 
         /// Get MoE rebalance controller (for post-decode logging)
-        MoERebalanceController* moeRebalanceController() const { return moe_rebalance_controller_.get(); }
+        MoERebalanceController *moeRebalanceController() const { return moe_rebalance_controller_.get(); }
 
         /// Apply expert masks to all MoEExpertComputeStages in cached FFN graphs.
         /// Called after rebalancing to update which experts each rank computes.
         /// @param masks Per-layer expert masks (masks[layer][expert] == true means active)
         /// @param received_weights Optional transferred packed weights from MPI transfer
         void applyExpertMasks(
-            const std::vector<std::vector<bool>>& masks,
-            const ReceivedWeightsMap& received_weights = {});
+            const std::vector<std::vector<bool>> &masks,
+            const ReceivedWeightsMap &received_weights = {});
 
         /// Non-destructively collect packed expert weights for experts requested
         /// by masks. Used for intra-rank migration between composed TP domains
         /// without falling back to raw GGUF host tensors.
         ReceivedWeightsMap collectExpertWeightsForMasks(
-            const std::vector<std::vector<bool>>& masks) const;
+            const std::vector<std::vector<bool>> &masks) const;
 
         /// Set expert replica info on all MoE stages for per-token dispatch.
         /// Call after applyExpertMasks() so GEMM engines are already prepared.
-        void setExpertReplicaSet(const ExpertReplicaSet& replicas, int socket_id);
+        void setExpertReplicaSet(const ExpertReplicaSet &replicas, int socket_id);
 
         /// Release raw expert weight data from all MoE stages after initial VNNI packing.
         /// For mmap: confirms DONTNEED already applied. For heap: frees raw_data_ vectors.
@@ -788,10 +788,15 @@ namespace llaminar2
         /// @return Total bytes freed (or already DONTNEED'd)
         size_t releaseRawExpertWeights();
 
+        /// Build and discard a forward graph for the requested shape without executing it.
+        /// This is used to force graph-build-time weight materialization, including
+        /// Qwen3.5 MoE expert GEMM preparation, before host weight data is released.
+        bool materializeForwardGraphForShape(int seq_len, int batch_size = 1);
+
         /// Transfer packed weights for migrating experts via MPI.
         /// Returns received weights map: [layer_idx][expert_id] → blobs.
         ReceivedWeightsMap transferExpertWeights(
-            const std::vector<ExpertMigration>& manifest,
+            const std::vector<ExpertMigration> &manifest,
             int num_layers);
 
         /// Transfer packed weights for replicated experts via MPI.
@@ -801,7 +806,7 @@ namespace llaminar2
         /// @param num_layers Number of MoE layers
         /// @return Received weights map for this rank's new replicas
         ReceivedWeightsMap transferReplicaWeights(
-            const ExpertReplicaSet& replicas,
+            const ExpertReplicaSet &replicas,
             int num_layers);
 
         /**
@@ -1609,7 +1614,7 @@ namespace llaminar2
          * @brief Apply sparse logit penalties on device
          */
         bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
-                                     int vocab_size) override;
+                                    int vocab_size) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)
@@ -2155,6 +2160,9 @@ namespace llaminar2
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;
         bool release_host_resident_after_forward_ = true;
+
+        /// Whether raw MoE expert tensors were released after eager graph-build packing.
+        bool raw_expert_weights_released_after_graph_build_ = false;
 
         // =========================================================================
         // MoE Expert Rebalance Controller

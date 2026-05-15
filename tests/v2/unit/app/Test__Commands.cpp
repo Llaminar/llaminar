@@ -323,3 +323,26 @@ TEST(Test__Commands, OneshotRejectsBenchmarkFlag)
                      "-p", "Hello");
     EXPECT_EQ(oneshot.execute(args.argc(), args.argv()), 1);
 }
+
+TEST(Test__Commands, OneshotRejectsTensorParallelMoEBeforeRuntime)
+{
+    OneshotCommand oneshot;
+    ArgvBuilder args("llaminar2", "--moe-expert-mode", "tensor-parallel",
+                     "-m", "/tmp/does-not-need-to-exist.gguf", "-p", "test");
+    EXPECT_EQ(oneshot.execute(args.argc(), args.argv()), 1);
+}
+
+TEST(Test__Commands, OneshotValidateOnlyReturns0BeforeRuntime)
+{
+    OneshotCommand oneshot;
+    ArgvBuilder args("llaminar2", "--validate-only", "--moe-expert-mode", "expert-parallel");
+    EXPECT_EQ(oneshot.execute(args.argc(), args.argv()), 0);
+}
+
+TEST(Test__Commands, ServeRejectsTensorParallelMoEBeforeRuntime)
+{
+    ServeCommand serve;
+    ArgvBuilder args("llaminar2", "--moe-expert-mode", "tensor-parallel",
+                     "-m", "/tmp/does-not-need-to-exist.gguf");
+    EXPECT_EQ(serve.execute(args.argc(), args.argv()), 1);
+}

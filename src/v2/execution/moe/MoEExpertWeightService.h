@@ -57,7 +57,8 @@ struct MoEWeightContext {
     std::vector<ITensorGemm*>& prepared_up_gemm;
     std::vector<ITensorGemm*>& prepared_down_gemm;
 
-    // GPU lifetime management
+    // Engine lifetime management. For store-backed CPU initial prep, ownership
+    // is handed to PreparedWeightStore and this vector is cleared after registration.
     std::vector<std::shared_ptr<ITensorGemm>>& moe_owned_kernels;
     std::shared_ptr<void>& moe_packed_gate_lifetime;
     std::shared_ptr<void>& moe_packed_up_lifetime;
@@ -67,8 +68,8 @@ struct MoEWeightContext {
     // When non-null, used instead of raw GGUF host data for GPU repack.
     ExpertWeightPayloadProvider* payload_provider = nullptr;
 
-    // Phase B: dual-path registration target. When non-null, engines are
-    // registered in BOTH KernelFactory AND this PreparedWeightStore.
+    // Prepared expert lifetime store. When non-null, store-backed initial CPU
+    // prep hands engine ownership to this store so cached graphs only keep raw refs.
     PreparedWeightStore* prepared_store = nullptr;
 
     // ExpertGemmRegistry for dynamic rebalancing registry updates.

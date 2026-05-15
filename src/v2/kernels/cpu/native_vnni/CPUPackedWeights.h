@@ -7,16 +7,10 @@
  *
  * ## Clone Semantics
  *
- * clone() deep-copies all packed data buffers (native_interleaved, payload,
- * int8_flat, native_blocks). The new buffers are allocated on the calling
- * thread's NUMA node via first-touch policy, ensuring NUMA locality for
- * the destination socket.
- *
- * ## Deferred Packing
- *
- * If the source kernel uses deferred packing (native blocks stored separately,
- * interleaved data generated on-demand), the clone preserves the native blocks
- * and deferred packing state. The cloned kernel will also use deferred packing.
+ * clone() deep-copies all eager packed data buffers (native_interleaved,
+ * payload, int8_flat). The new buffers are allocated on the calling thread's
+ * NUMA node via first-touch policy, ensuring NUMA locality for the destination
+ * socket.
  */
 
 #pragma once
@@ -68,9 +62,7 @@ namespace llaminar2::cpu::native_vnni
 
         size_t sizeBytes() const override
         {
-            return packed_.native_interleaved.size()
-                 + packed_.payload.size()
-                 + packed_.int8_flat.size();
+            return packed_.native_interleaved.size() + packed_.payload.size() + packed_.int8_flat.size();
         }
 
         std::unique_ptr<IPackedWeights> clone() const override
@@ -132,8 +124,8 @@ namespace llaminar2::cpu::native_vnni
         std::unique_ptr<IPackedWeights> clone() const override
         {
             auto cloned = std::make_unique<CPUPackedWeightsWithNativeBlocks>(
-                CPUNativeVNNIPackedWeights(packed()),   // copy packed
-                std::vector<uint8_t>(native_blocks_),   // copy native blocks
+                CPUNativeVNNIPackedWeights(packed()), // copy packed
+                std::vector<uint8_t>(native_blocks_), // copy native blocks
                 native_block_size_);
             return cloned;
         }

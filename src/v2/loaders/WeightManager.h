@@ -288,6 +288,17 @@ namespace llaminar2
         size_t releaseHostResidentWeightData() override;
 
         /**
+         * @brief Release cached MoE expert parent tensors after eager expert packing.
+         *
+         * CPU MoE execution uses PreparedWeightStore-owned VNNI engines after graph
+         * materialization. Dynamic transfer serializes those packed engines, so the
+         * raw 3D *_exps.weight cache entries must not remain as a fallback source.
+         *
+         * @return Bytes of raw expert tensor data released
+         */
+        size_t releaseMoEExpertHostWeightData();
+
+        /**
          * @brief Advise the OS to reclaim mmap physical pages.
          *
          * Delegates to the loader's adviseMmapDontneed(). Safe to call
@@ -313,6 +324,14 @@ namespace llaminar2
          * @brief Get number of cached weights
          */
         size_t cacheSize() const;
+
+        /**
+         * @brief Log live host tensor bytes held by WeightManager caches.
+         *
+         * This is diagnostic accounting only. Borrowed views are counted as
+         * objects but not as owned bytes.
+         */
+        void logHostMemorySummary(const char *context) const;
 
         /**
          * @brief Clear weight cache (frees memory)

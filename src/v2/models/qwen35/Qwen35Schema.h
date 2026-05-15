@@ -108,11 +108,11 @@ namespace llaminar2
                 // GDN fused QKV and gate are column-parallel (split output dim)
                 {"attn_qkv.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FusedQKVHeads,
                  "GDN fused QKV projection - 3 sub-blocks [Q|K|V] each split by heads"},
-                {"attn_gate.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN output gate Z - split output dim"},
+                {"attn_gate.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::ProportionalHeads,
+                 "GDN output gate Z - split output dim by GDN value heads"},
                 // SSM output projection is row-parallel (split input dim)
-                {"ssm_out.weight", WeightShardingMode::InputParallel, WeightDimensionType::Heads,
-                 "GDN output projection - split input dim, allreduce after"},
+                {"ssm_out.weight", WeightShardingMode::InputParallel, WeightDimensionType::ProportionalHeads,
+                 "GDN output projection - split input dim by GDN value heads, allreduce after"},
                 // SSM alpha/beta: column-parallel to match local head count in recurrence.
                 // Uses ProportionalHeads because output dim is n_v_heads (time_step_rank),
                 // which may differ from n_heads (e.g. 4B: n_v_heads=32 vs n_heads=36).

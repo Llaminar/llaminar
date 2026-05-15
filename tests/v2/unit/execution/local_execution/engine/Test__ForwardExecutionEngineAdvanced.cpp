@@ -551,10 +551,10 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, ClearCache_ForcesRebuild)
 }
 
 // =========================================================================
-// Multiple Seq Lengths Have Separate Cache Entries
+// Prefill is not cached; decode is cached
 // =========================================================================
 
-TEST_F(Test__ForwardExecutionEngineAdvanced, DifferentSeqLens_SeparateCacheEntries)
+TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillRebuilds_DecodeCaches)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
     TrackingHost host(&mock_ctx_);
@@ -567,20 +567,22 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, DifferentSeqLens_SeparateCacheEntri
     engine.execute(prefill.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
 
+    // Same prefill shape should rebuild. Caching prefill graphs retains large
+    // per-prompt activation state and causes server memory growth across
+    // different chat requests.
+    TestInput prefill2(100);
+    engine.execute(prefill2.input, output, host);
+    EXPECT_EQ(host.build_calls, 2) << "Prefill graphs should not be cached";
+
     // Decode with 1 token
     TestInput decode(1);
     engine.execute(decode.input, output, host);
-    EXPECT_EQ(host.build_calls, 2);
-
-    // Prefill again with 100 tokens — should hit cache
-    TestInput prefill2(100);
-    engine.execute(prefill2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2) << "Same prefill shape should hit cache";
+    EXPECT_EQ(host.build_calls, 3);
 
     // Decode again — should hit cache
     TestInput decode2(1);
     engine.execute(decode2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2) << "Same decode shape should hit cache";
+    EXPECT_EQ(host.build_calls, 3) << "Same decode shape should hit cache";
 }
 
 // =========================================================================

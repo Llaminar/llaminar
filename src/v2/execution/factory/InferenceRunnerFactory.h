@@ -123,6 +123,15 @@ namespace llaminar2
         // AUTO preserves legacy behavior (derived from activation precision mode).
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+        /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+        /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+        MoEHotExpertCacheConfig moe_hot_expert_cache;
+
+        /// Decode histogram / dynamic rebalance settings.
+        MoERebalanceRuntimeConfig moe_rebalance;
+
         // Use mapped memory for GPU tensor allocation (zero-copy host access)
         // When true, FP32 activation buffers are allocated using cudaHostAllocMapped /
         // hipHostMallocMapped, enabling direct host access without memcpy.
@@ -206,6 +215,9 @@ namespace llaminar2
             config.fused_attention_backend = plan.runtime.fused_attention_backend;
             config.kv_cache_scale_k = plan.runtime.kv_cache_scale_k;
             config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
+            config.moe_expert_mode = plan.runtime.moe_expert_mode;
+            config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
+            config.moe_rebalance = plan.runtime.moe_rebalance;
             return config;
         }
     };

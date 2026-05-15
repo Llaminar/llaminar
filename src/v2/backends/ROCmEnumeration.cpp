@@ -9,6 +9,7 @@
  */
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h> // For hipDevicePrimaryCtxRelease, hipDevicePrimaryCtxGetState
 #include <hipblas/hipblas.h>
 #include <vector>
 #include <string>
@@ -49,6 +50,25 @@ namespace llaminar2
             // Save the current device so we can restore it after enumeration
             int saved_device = 0;
             hipGetDevice(&saved_device);
+
+            // Track which devices already had an active primary context before
+            // we touch them.  We will release contexts we created so that
+            // enumeration-only processes don't keep GPU memory alive.
+            std::vector<bool> had_context(device_count, false);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            for (int i = 0; i < device_count; ++i)
+            {
+                unsigned int flags = 0;
+                int active = 0;
+                hipDevice_t hip_dev;
+                if (hipDeviceGet(&hip_dev, i) == hipSuccess &&
+                    hipDevicePrimaryCtxGetState(hip_dev, &flags, &active) == hipSuccess)
+                {
+                    had_context[i] = (active != 0);
+                }
+            }
+#pragma GCC diagnostic pop
 
             for (int i = 0; i < device_count; ++i)
             {
@@ -143,6 +163,25 @@ namespace llaminar2
 
             // Restore the original device to avoid side effects on callers
             hipSetDevice(saved_device);
+
+            // Release primary contexts that we created during enumeration.
+            // hipSetDevice() implicitly retains the primary context; if we
+            // don't release it, each enumerated device keeps GPU memory
+            // allocated even when the process never uses that GPU.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+            for (int i = 0; i < device_count; ++i)
+            {
+                if (!had_context[i])
+                {
+                    hipDevice_t hip_dev;
+                    if (hipDeviceGet(&hip_dev, i) == hipSuccess)
+                    {
+                        (void)hipDevicePrimaryCtxRelease(hip_dev);
+                    }
+                }
+            }
+#pragma GCC diagnostic pop
 
             return devices;
         }

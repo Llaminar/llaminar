@@ -212,6 +212,15 @@ namespace llaminar2
             /// Explicit KV cache precision mode (AUTO preserves legacy behavior)
             KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+            /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
+            MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+            /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+            MoEHotExpertCacheConfig moe_hot_expert_cache;
+
+            /// Decode histogram / dynamic rebalance settings.
+            MoERebalanceRuntimeConfig moe_rebalance;
+
             /// Use mapped memory for GPU tensors (zero-copy host access)
             /// Required for correct coherence with column-parallel LM head
             bool use_mapped_memory = false;

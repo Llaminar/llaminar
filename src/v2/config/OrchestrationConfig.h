@@ -110,12 +110,12 @@ namespace llaminar2
     // =========================================================================
 
     /**
-    * @brief Named domain definition for complex TP configurations
-    *
-    * Migration note: this is a compatibility wrapper for the canonical
-    * ExecutionDomainDefinition contract. New orchestration code should convert
-    * through toExecutionDomainDefinition() and keep PP layer ownership in
-    * PPStageDefinition rather than extending this legacy wrapper.
+     * @brief Named domain definition for complex TP configurations
+     *
+     * Migration note: this is a compatibility wrapper for the canonical
+     * ExecutionDomainDefinition contract. New orchestration code should convert
+     * through toExecutionDomainDefinition() and keep PP layer ownership in
+     * PPStageDefinition rather than extending this legacy wrapper.
      *
      * Format: "name=device1,device2,...[;weights=w1,w2,...][;backend=type][;scope=local|node_local|global][;owner=N][;ranks=0,1,...]"
      *
@@ -135,9 +135,9 @@ namespace llaminar2
         ExecutionDomainComputeKind compute_kind = ExecutionDomainComputeKind::UNSPECIFIED;
 
         // Phase 5: domain scope and rank ownership
-        TPScope scope = TPScope::AUTO;     ///< Domain scope (local=single-rank, node_local/global=multi-rank)
-        std::optional<int> owner_rank;     ///< Explicit owner MPI rank for local domains (;owner=N)
-        std::vector<int> explicit_ranks;   ///< Explicit participating ranks for node_local/global (;ranks=0,1,...)
+        TPScope scope = TPScope::AUTO;   ///< Domain scope (local=single-rank, node_local/global=multi-rank)
+        std::optional<int> owner_rank;   ///< Explicit owner MPI rank for local domains (;owner=N)
+        std::vector<int> explicit_ranks; ///< Explicit participating ranks for node_local/global (;ranks=0,1,...)
 
         ExecutionDomainDefinition toExecutionDomainDefinition() const;
         static DomainDefinition fromExecutionDomainDefinition(const ExecutionDomainDefinition &domain);
@@ -429,6 +429,15 @@ namespace llaminar2
 
         bool moe_shared_experts_gpu = true; ///< Place shared experts on GPU
         bool moe_sparse_experts_cpu = true; ///< Place sparse experts on CPU
+
+        /// Routed MoE expert execution mode for the standard Qwen3.5 MoE path.
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+        /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+        MoEHotExpertCacheConfig moe_hot_expert_cache;
+
+        /// Decode histogram / dynamic rebalance settings promoted from env knobs.
+        MoERebalanceRuntimeConfig moe_rebalance;
 
         /// Optional same-layer MoE expert overlay / expert-parallel plan.
         std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;

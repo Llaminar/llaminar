@@ -76,9 +76,9 @@ namespace llaminar2
         BenchmarkRunner benchmark(adapter, tokenizer, mpi_ctx);
 
         // Set up MoE expert rebalancing (incremental, during decode)
-        if (auto* orch_runner = dynamic_cast<OrchestrationRunner*>(runner.get()))
+        if (auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner.get()))
         {
-            if (auto* controller = orch_runner->moeRebalanceController())
+            if (auto *controller = orch_runner->moeRebalanceController())
             {
                 if (controller->mode() == MoERebalanceMode::DYNAMIC)
                 {
@@ -86,102 +86,16 @@ namespace llaminar2
                     // the 128-token histogram, then run benchmark with zero
                     // ongoing overhead. Per-step callback only tracks histogram
                     // (no rebalancing) for profiling summary.
-                    benchmark.setPostWarmupCallback([orch_runner, controller, &mpi_ctx]() {
-                        controller->logHistogramSummary();
-
-                        std::vector<std::vector<std::vector<bool>>> gpu_cache_masks;
-                        const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
-                        const bool gpu_cache_enabled = gpu_cache_experts > 0;
-                        if (gpu_cache_enabled)
-                            gpu_cache_masks = controller->computeGpuCacheExpertMasks(gpu_cache_experts);
-
-                        // Propose replicas BEFORE rebalance (which resets the histogram window)
-                        int max_replicas = gpu_cache_enabled ? 0 : debugEnv().moe_rebalance.max_replicas;
-                        if (max_replicas > 0)
-                        {
-                            auto replicas = controller->proposeReplicas(max_replicas);
-                            if (replicas.num_replicated > 0 && mpi_ctx->rank() == 0)
-                            {
-                                LOG_INFO("[MoE] Expert replication: " << replicas.num_replicated
-                                         << " experts replicated for per-token dispatch");
-                            }
-                        }
-
-                        auto old_placement = controller->currentPlacement();
-                        auto new_placement = controller->rebalance();
-
-                        // Sync replica owner_socket to post-rebalance placement.
-                        // Without this, assignForToken() uses stale ownership
-                        // and dispatches experts to sockets without GEMM engines.
-                        controller->syncReplicaPlacement();
-
-                        if (new_placement.empty())
-                        {
-                            if (mpi_ctx->rank() == 0)
-                                LOG_INFO("[MoE] Post-warmup: no beneficial swaps found");
-                        }
-                        else
-                        {
-                            int moved = 0;
-                            for (int e = 0; e < static_cast<int>(old_placement.size()); ++e)
-                                if (old_placement[e] != new_placement[e]) moved++;
-
-                            if (mpi_ctx->rank() == 0)
-                                LOG_INFO("[MoE] Post-warmup rebalance: "
-                                         << moved << " experts moved");
-                        }
-
-                        // Transfer pre-packed weights for replicas via MPI
-                        // (avoids VNNI repacking from raw on the non-owner socket)
-                        ReceivedWeightsMap received;
-                        if (controller->hasReplicas())
-                        {
-                            received = orch_runner->transferReplicaWeights(
-                                controller->currentReplicas(),
-                                controller->numLayers());
-                        }
-
-                        int socket_id = mpi_ctx->rank();
-
-                        // Apply masks (includes replicas if active)
-                        if (!gpu_cache_masks.empty())
-                        {
-                            if (!orch_runner->applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks))
-                            {
-                                if (socket_id >= 0 && socket_id < static_cast<int>(gpu_cache_masks.size()))
-                                    orch_runner->applyMoEExpertMasks(gpu_cache_masks[socket_id], received);
-                            }
-                        }
-                        else if (!orch_runner->applyMoEExpertMasksForAllLocalDevices(*controller))
-                        {
-                            auto masks = controller->computeExpertMasks(socket_id);
-                            orch_runner->applyMoEExpertMasks(masks, received);
-                        }
-
-                        // Set replica dispatch info on stages
-                        if (controller->hasReplicas())
-                        {
-                            orch_runner->setExpertReplicaSet(
-                                controller->currentReplicas(), socket_id);
-                        }
-
-                        // Release raw expert weight data (env: LLAMINAR_MOE_RELEASE_RAW_WEIGHTS=1)
-                        // Safe because all engines are prepared and prepacked transfer is available.
-                        if (debugEnv().moe_rebalance.release_raw_weights)
-                        {
-                            size_t freed = orch_runner->releaseRawExpertWeights();
-                            if (mpi_ctx->rank() == 0)
-                                LOG_INFO("[MoE] Released " << (freed >> 20) << " MB raw expert weights");
-                        }
-
+                    benchmark.setPostWarmupCallback([orch_runner, controller, &mpi_ctx]()
+                                                    {
+                        orch_runner->applyMoERebalanceWithReplicas(/*log_histogram_summary=*/true);
                         if (mpi_ctx->rank() == 0)
                         {
                             LOG_INFO("[MoE] Post-warmup setup complete"
                                      << (controller->hasReplicas()
                                          ? " (with per-token replica dispatch)"
-                                         : " (local repack only)"));
-                        }
-                    });
+                                         : " (local rebalance only)"));
+                        } });
                     // No per-step rebalancing — the post-warmup placement
                     // is used for all benchmark iterations.
                 }
@@ -193,9 +107,9 @@ namespace llaminar2
         MoEExpertOverlayProfiler::flush();
 
         // Log MoE histogram if controller is active
-        if (auto* orch_runner = dynamic_cast<OrchestrationRunner*>(runner.get()))
+        if (auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner.get()))
         {
-            if (auto* controller = orch_runner->moeRebalanceController())
+            if (auto *controller = orch_runner->moeRebalanceController())
             {
                 controller->logHistogramSummary();
 

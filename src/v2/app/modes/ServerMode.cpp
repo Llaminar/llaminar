@@ -73,6 +73,11 @@ namespace llaminar2
         return config.serve_mode;
     }
 
+    std::unique_ptr<httplib::TaskQueue> createSerializedInferenceTaskQueue()
+    {
+        return std::make_unique<httplib::ThreadPool>(1);
+    }
+
     int ServerMode::execute(AppContext &ctx)
     try
     {
@@ -114,6 +119,11 @@ namespace llaminar2
 
         httplib::Server svr;
         g_server_ptr = &svr;
+
+        // Inference is serialized on a single model instance. Keep HTTP handling
+        // on one stable worker so OpenMP does not initialize per-request teams
+        // on a large rotating httplib thread pool.
+        svr.new_task_queue = [] { return createSerializedInferenceTaskQueue().release(); };
 
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);

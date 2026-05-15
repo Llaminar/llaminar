@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <future>
 #include <sstream>
 #include <thread>
@@ -498,8 +499,28 @@ namespace llaminar2
         const GraphConfig &graph_config,
         bool include_tp_config)
     {
+        const WeightShardingMode expert_mode =
+            graph_config.moe.expert_mode == MoEExpertMode::Replicated
+                ? WeightShardingMode::Replicate
+                : WeightShardingMode::ExpertParallel;
+
         WeightManagerConfig wm_config;
         wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(architecture);
+        if (architecture == "qwen35moe")
+        {
+            for (auto &pattern : wm_config.sharding.patterns)
+            {
+                if (pattern.pattern == "ffn_gate_exps.weight" ||
+                    pattern.pattern == "ffn_up_exps.weight" ||
+                    pattern.pattern == "ffn_down_exps.weight")
+                {
+                    pattern.mode = expert_mode;
+                    pattern.description = graph_config.moe.expert_mode == MoEExpertMode::Replicated
+                                              ? "MoE routed expert weights - replicated"
+                                              : "MoE routed expert weights - expert-id parallel";
+                }
+            }
+        }
         if (graph_config.n_heads > 0 && graph_config.head_dim > 0)
         {
             wm_config.dimensions.n_heads = graph_config.n_heads;
@@ -819,6 +840,46 @@ namespace llaminar2
         return requested;
     }
 
+    static MoERebalanceMode toControllerRebalanceMode(MoERebalanceRuntimeMode mode)
+    {
+        switch (mode)
+        {
+        case MoERebalanceRuntimeMode::Observe:
+            return MoERebalanceMode::OBSERVE;
+        case MoERebalanceRuntimeMode::Dynamic:
+            return MoERebalanceMode::DYNAMIC;
+        case MoERebalanceRuntimeMode::Off:
+        default:
+            return MoERebalanceMode::OFF;
+        }
+    }
+
+    static MoERebalanceRuntimeConfig effectiveMoERebalanceConfig(
+        const InferenceRunnerConfig &config)
+    {
+        MoERebalanceRuntimeConfig result = config.moe_rebalance;
+        const auto &env = debugEnv();
+
+        if (std::getenv("LLAMINAR_MOE_REBALANCE"))
+        {
+            if (auto parsed = parseMoERebalanceRuntimeMode(env.moe_rebalance.mode))
+                result.mode = *parsed;
+            else
+                LOG_WARN("[InferenceRunner] Ignoring invalid LLAMINAR_MOE_REBALANCE='"
+                         << env.moe_rebalance.mode << "'");
+        }
+        if (std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW"))
+            result.window_size = env.moe_rebalance.window_size;
+        if (std::getenv("LLAMINAR_MOE_REBALANCE_MAX_WINDOW"))
+            result.max_window_size = env.moe_rebalance.max_window_size;
+        if (std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH"))
+            result.window_growth_factor = env.moe_rebalance.window_growth_factor;
+        result.release_raw_expert_weights = result.release_raw_expert_weights ||
+                                            env.moe_rebalance.release_raw_weights;
+
+        return result;
+    }
+
     // =========================================================================
     // Helper: Set full (non-TP) dimensions on graph config
     // =========================================================================
@@ -842,6 +903,68 @@ namespace llaminar2
 
         graph_config.vocab_local = graph_config.vocab_size;
         graph_config.lm_head_column_parallel = false;
+    }
+
+    static bool configureStaticMoEExpertRange(GraphConfig &graph_config)
+    {
+        graph_config.moe.local_expert_start = 0;
+        graph_config.moe.local_expert_count = -1;
+
+        if (!graph_config.moe.enabled())
+            return true;
+
+        if (graph_config.moe.expert_mode == MoEExpertMode::TensorParallel)
+        {
+            LOG_ERROR("[InferenceRunner] Not Implemented: MoE tensor-parallel expert mode is not implemented for the standard Qwen3.5 MoE path.");
+            return false;
+        }
+
+        if (graph_config.moe.expert_mode != MoEExpertMode::ExpertParallel)
+            return true;
+
+        int participants = 1;
+        int participant_index = 0;
+        if (graph_config.tp_config && graph_config.tp_config->worldSize() > 1)
+        {
+            participants = graph_config.tp_config->worldSize();
+            participant_index = graph_config.local_rank;
+        }
+        else if (graph_config.tp_ctx && graph_config.tp_ctx->degree() > 1)
+        {
+            participants = graph_config.tp_ctx->degree();
+            participant_index = graph_config.tp_ctx->myIndex();
+        }
+
+        if (participants <= 1)
+            return true;
+
+        if (graph_config.moe.num_experts < participants)
+        {
+            LOG_ERROR("[InferenceRunner] Cannot expert-shard " << graph_config.moe.num_experts
+                                                               << " routed experts across " << participants << " TP participants");
+            return false;
+        }
+        if (participant_index < 0 || participant_index >= participants)
+        {
+            LOG_ERROR("[InferenceRunner] Invalid MoE expert participant index " << participant_index
+                                                                                << " for " << participants << " participants");
+            return false;
+        }
+
+        const int base = graph_config.moe.num_experts / participants;
+        const int remainder = graph_config.moe.num_experts % participants;
+        const int count = base + (participant_index < remainder ? 1 : 0);
+        const int start = participant_index * base + std::min(participant_index, remainder);
+
+        graph_config.moe.local_expert_start = start;
+        graph_config.moe.local_expert_count = count;
+
+        LOG_INFO("[InferenceRunner] MoE expert mode="
+                 << moeExpertModeToString(graph_config.moe.expert_mode)
+                 << " participant=" << participant_index << "/" << participants
+                 << " expert_range=[" << start << ", " << (start + count) << ")"
+                 << " count=" << count << "/" << graph_config.moe.num_experts);
+        return true;
     }
 
     // =========================================================================
@@ -1246,6 +1369,9 @@ namespace llaminar2
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
+        graph_config.moe.expert_mode = config.moe_expert_mode;
+        graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
+        graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
         DomainLocalTPContextMap owned_domain_tp_contexts;
         if (!applyMoEExpertOverlayConfigToGraph(
                 *model_ctx,
@@ -1399,6 +1525,10 @@ namespace llaminar2
         {
             return nullptr;
         }
+        if (!configureStaticMoEExpertRange(graph_config))
+        {
+            return nullptr;
+        }
 
         // =====================================================================
         // Create GlobalTPContext for cross-MPI-rank tensor parallelism
@@ -1463,16 +1593,10 @@ namespace llaminar2
         // propagates into MoEExpertComputeStage params during graph construction.
         std::unique_ptr<MoERebalanceController> moe_controller;
         {
-            const auto &env = debugEnv();
-            if (env.moe_rebalance.mode != "off" && graph_config.moe.enabled())
+            const auto rebalance_config = graph_config.moe.rebalance_config;
+            const MoERebalanceMode mode = toControllerRebalanceMode(rebalance_config.mode);
+            if (mode != MoERebalanceMode::OFF && graph_config.moe.enabled())
             {
-                MoERebalanceMode mode = MoERebalanceMode::OFF;
-                if (env.moe_rebalance.mode == "observe")
-                    mode = MoERebalanceMode::OBSERVE;
-                else if (env.moe_rebalance.mode == "dynamic")
-                    mode = MoERebalanceMode::DYNAMIC;
-
-                if (mode != MoERebalanceMode::OFF)
                 {
                     int world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
                     std::vector<DeviceId> sockets;
@@ -1498,13 +1622,15 @@ namespace llaminar2
                     ctrl_config.num_layers = graph_config.n_layers;
                     ctrl_config.num_experts = graph_config.moe.num_experts;
                     ctrl_config.top_k = graph_config.moe.top_k;
-                    ctrl_config.window_size = env.moe_rebalance.window_size;
-                    ctrl_config.max_window_size = env.moe_rebalance.max_window_size;
-                    ctrl_config.window_growth_factor = env.moe_rebalance.window_growth_factor;
-                    // Auto-compute max_replicas: 0 means 2×top_k (active experts)
-                    int effective_replicas = env.moe_rebalance.max_replicas;
-                    if (effective_replicas == 0 && mode == MoERebalanceMode::DYNAMIC)
-                        effective_replicas = 2 * graph_config.moe.top_k;
+                    ctrl_config.window_size = rebalance_config.window_size;
+                    ctrl_config.max_window_size = rebalance_config.max_window_size;
+                    ctrl_config.window_growth_factor = rebalance_config.window_growth_factor;
+                    int effective_replicas = graph_config.moe.hot_expert_cache.resolveCap(
+                        graph_config.moe.num_experts,
+                        mode == MoERebalanceMode::DYNAMIC);
+                    const auto &env = debugEnv();
+                    if (std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS"))
+                        effective_replicas = std::max(0, env.moe_rebalance.max_replicas);
                     ctrl_config.max_replicas = effective_replicas;
                     ctrl_config.sockets = std::move(sockets);
                     ctrl_config.initial_expert_to_socket = std::move(initial_placement);
@@ -1514,10 +1640,10 @@ namespace llaminar2
                     graph_config.moe.rebalance_mode = moe_controller->mode();
 
                     LOG_INFO("[InferenceRunner] MoE rebalance controller: mode="
-                             << env.moe_rebalance.mode
+                             << moeRebalanceRuntimeModeToString(rebalance_config.mode)
                              << " max_replicas=" << effective_replicas
-                             << (env.moe_rebalance.max_replicas == 0 ? " (auto: 2×top_k)" : " (explicit)")
-                             << " window=" << env.moe_rebalance.window_size
+                             << " hot_cache=" << graph_config.moe.hot_expert_cache.toString()
+                             << " window=" << rebalance_config.window_size
                              << " experts=" << graph_config.moe.num_experts);
                 }
             }
@@ -1704,6 +1830,17 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[InferenceRunner] DeviceGraphOrchestrator created successfully");
+
+        if (device.is_cpu() && architecture == "qwen35moe" && graph_config.moe.num_experts > 0)
+        {
+            ScopedWeightLoadDetailTimer timer("graph.build.eager_moe_expert_materialization");
+            if (!orchestrator->materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
+            {
+                LOG_ERROR("[InferenceRunner] Failed eager Qwen35 MoE expert graph materialization on "
+                          << device.to_string());
+                return nullptr;
+            }
+        }
 
         // DeviceGraphOrchestrator implements IInferenceRunner directly
         return orchestrator;
@@ -2474,6 +2611,8 @@ namespace llaminar2
         // PP stages don't use tensor parallelism (TP) - they use full dimensions
         // Inter-stage communication is handled by the PP orchestrator, not MPI collectives
         setFullDimensions(graph_config);
+        if (!configureStaticMoEExpertRange(graph_config))
+            return nullptr;
 
         LOG_DEBUG("[PPStageRunner] GraphConfig (no TP): "
                   << "vocab=" << graph_config.vocab_size
@@ -2593,6 +2732,9 @@ namespace llaminar2
         auto config_builder = createGraphConfigBuilder(architecture);
         GraphConfig graph_config;
         config_builder->populateFromModelContext(*model_ctx, graph_config);
+        graph_config.moe.expert_mode = config.moe_expert_mode;
+        graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
+        graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
         DomainLocalTPContextMap owned_domain_tp_contexts;
         const auto overlay_runner_mpi_ctx = config.moe_expert_overlay_mpi_ctx;
         if (!applyMoEExpertOverlayConfigToGraph(
@@ -2670,6 +2812,10 @@ namespace llaminar2
         {
             // Single rank configuration (testable runner doesn't use MPI by default)
             setFullDimensions(graph_config);
+        }
+        if (!configureStaticMoEExpertRange(graph_config))
+        {
+            return nullptr;
         }
 
         installTPExecutorCancellation(graph_config, graph_config.tp_ctx, "[InferenceRunner] Testable");
@@ -2929,6 +3075,16 @@ namespace llaminar2
 
                 orchestrator->setWeights(weights);
                 orchestrator->initializePreparedWeightStore(device);
+            }
+        }
+
+        if (device.is_cpu() && architecture == "qwen35moe" && graph_config.moe.num_experts > 0)
+        {
+            if (!orchestrator->materializeForwardGraphForShape(/*seq_len=*/1, config.batch_size))
+            {
+                LOG_ERROR("[InferenceRunner] Failed eager Qwen35 MoE expert graph materialization on "
+                          << device.to_string());
+                return nullptr;
             }
         }
 

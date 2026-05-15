@@ -57,16 +57,18 @@ namespace llaminar2
             Qwen35SchemaFactory dense_factory;
             auto config = dense_factory.getWeightShardingConfig();
 
-            // MoE expert weights are replicated (each device processes all local experts)
+            // Routed MoE expert weights default to expert-id parallelism in TP.
+            // InferenceRunnerFactory can override this to Replicate for explicit
+            // --moe-expert-mode replicated compatibility/debug runs.
             config.patterns.push_back(
-                {"ffn_gate_exps.weight", WeightShardingMode::Replicate, WeightDimensionType::FFNHidden,
-                 "MoE expert gate weights - replicated"});
+                {"ffn_gate_exps.weight", WeightShardingMode::ExpertParallel, WeightDimensionType::FFNHidden,
+                 "MoE expert gate weights - expert-id parallel"});
             config.patterns.push_back(
-                {"ffn_up_exps.weight", WeightShardingMode::Replicate, WeightDimensionType::FFNHidden,
-                 "MoE expert up weights - replicated"});
+                {"ffn_up_exps.weight", WeightShardingMode::ExpertParallel, WeightDimensionType::FFNHidden,
+                 "MoE expert up weights - expert-id parallel"});
             config.patterns.push_back(
-                {"ffn_down_exps.weight", WeightShardingMode::Replicate, WeightDimensionType::FFNHidden,
-                 "MoE expert down weights - replicated"});
+                {"ffn_down_exps.weight", WeightShardingMode::ExpertParallel, WeightDimensionType::FFNHidden,
+                 "MoE expert down weights - expert-id parallel"});
             config.patterns.push_back(
                 {"ffn_gate_inp.weight", WeightShardingMode::Replicate, WeightDimensionType::FFNHidden,
                  "MoE router weights - replicated"});
@@ -100,29 +102,23 @@ namespace llaminar2
             // Add MoE-specific activation buffers
             // Routing outputs: expert indices and weights for top-k selection
             schema.layer_buffers.push_back(
-                {"moe_expert_indices", {"seq_len", "moe_top_k"}, "fp32", BufferSemantic::Scratch,
-                 "moe_scratch", 10, "MoE top-k expert indices per token (as float)"});
+                {"moe_expert_indices", {"seq_len", "moe_top_k"}, "fp32", BufferSemantic::Scratch, "moe_scratch", 10, "MoE top-k expert indices per token (as float)"});
             schema.layer_buffers.push_back(
-                {"moe_expert_weights", {"seq_len", "moe_top_k"}, "fp32", BufferSemantic::Scratch,
-                 "moe_scratch", 9, "MoE top-k routing weights per token"});
+                {"moe_expert_weights", {"seq_len", "moe_top_k"}, "fp32", BufferSemantic::Scratch, "moe_scratch", 9, "MoE top-k routing weights per token"});
 
             // Expert compute output: combined weighted expert output
             schema.layer_buffers.push_back(
-                {"moe_combined_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch,
-                 "moe_output_scratch", 10, "Combined routed expert FFN output"});
+                {"moe_combined_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_output_scratch", 10, "Combined routed expert FFN output"});
 
             // Shared expert output
             schema.layer_buffers.push_back(
-                {"moe_shared_expert_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch,
-                 "moe_output_scratch", 5, "Shared expert FFN output"});
+                {"moe_shared_expert_output", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "moe_output_scratch", 5, "Shared expert FFN output"});
 
             // Expert GEMM scratch buffers (for gate/up projections)
             schema.layer_buffers.push_back(
-                {"moe_gate_scratch", {"seq_len", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch,
-                 "moe_gemm_scratch", 10, "Expert gate projection scratch"});
+                {"moe_gate_scratch", {"seq_len", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 10, "Expert gate projection scratch"});
             schema.layer_buffers.push_back(
-                {"moe_up_scratch", {"seq_len", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch,
-                 "moe_gemm_scratch", 5, "Expert up projection scratch"});
+                {"moe_up_scratch", {"seq_len", "moe_expert_intermediate"}, "fp32", BufferSemantic::Scratch, "moe_gemm_scratch", 5, "Expert up projection scratch"});
 
             return schema;
         }

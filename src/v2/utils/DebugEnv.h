@@ -2724,10 +2724,9 @@ namespace llaminar2
             /// Routed experts per layer to cache on GPU in mixed CPU/GPU MoE domains.
             /// 0 disables cross-domain GPU-cache placement. (from LLAMINAR_MOE_GPU_EXPERT_CACHE)
             int gpu_cache_experts_per_layer = 0;
-            /// Release raw expert weight data after VNNI packing (from LLAMINAR_MOE_RELEASE_RAW_WEIGHTS)
-            /// Frees heap-allocated raw data and confirms mmap DONTNEED for mmap-backed data.
-            /// Only safe when prepacked MPI transfer is available (replicas > 0).
-            bool release_raw_weights = false;
+            /// Release raw expert weight data after eager packed-weight preparation.
+            /// Enabled by default; set LLAMINAR_MOE_RELEASE_RAW_WEIGHTS=0 to opt out.
+            bool release_raw_weights = true;
         } moe_rebalance;
 
         /// MoE expert overlay transfer/debug bridge configuration.
@@ -2971,7 +2970,7 @@ namespace llaminar2
                 moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
             if (moe_gpu_cache)
                 moe_rebalance.gpu_cache_experts_per_layer = std::atoi(moe_gpu_cache);
-            moe_rebalance.release_raw_weights = false;
+            moe_rebalance.release_raw_weights = true;
             const char *moe_reb_release = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release)
                 moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release) != 0);

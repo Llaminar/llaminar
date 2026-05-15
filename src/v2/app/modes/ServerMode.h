@@ -7,8 +7,17 @@
 
 #include "app/modes/IExecutionMode.h"
 
+#include <memory>
+
+namespace httplib
+{
+    class TaskQueue;
+}
+
 namespace llaminar2
 {
+
+    std::unique_ptr<httplib::TaskQueue> createSerializedInferenceTaskQueue();
 
     class ServerMode : public IExecutionMode
     {

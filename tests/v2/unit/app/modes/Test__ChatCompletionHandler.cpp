@@ -21,6 +21,8 @@ using namespace llaminar2;
 using namespace llaminar2::test;
 using json = nlohmann::json;
 using ::testing::_;
+using ::testing::AnyNumber;
+using ::testing::AtLeast;
 using ::testing::Invoke;
 using ::testing::Return;
 using ::testing::Throw;
@@ -39,6 +41,16 @@ protected:
 
         // Default: runner is initialized
         runner_->simulateInitialized();
+        EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+            .Times(AnyNumber())
+            .WillRepeatedly(Return(true));
+
+        ON_CALL(*tokenizer_, encodeChat(_, _, _, _))
+            .WillByDefault(Invoke([this](const std::vector<ChatMessage> &messages,
+                                         bool add_generation_prompt,
+                                         const std::string &tools_json,
+                                         bool /*enable_thinking*/)
+                                  { return tokenizer_->encodeChat(messages, add_generation_prompt, tools_json); }));
     }
 
     /// Build a handler using the current mocks
@@ -327,8 +339,11 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_SetsSamplingParams_BeforePrefi
                          { call_order.push_back("setSamplingParams"); }));
 
     EXPECT_CALL(*runner_, clearCache())
+        .Times(2)
         .WillOnce(Invoke([&]()
-                         { call_order.push_back("clearCache"); }));
+                         { call_order.push_back("clearCache"); }))
+        .WillOnce(Invoke([&]()
+                         { call_order.push_back("cleanupClearCache"); }));
 
     EXPECT_CALL(*runner_, prefill(_))
         .WillOnce(Invoke([&](const std::vector<int32_t> &) -> bool
@@ -677,6 +692,37 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_StopsAtMaxTokens)
     EXPECT_EQ(body["usage"]["completion_tokens"], 3);
 }
 
+TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterDecodeSteps)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Return("x"));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, setSamplingParams(_)).Times(1);
+    EXPECT_CALL(*runner_, decodeStep())
+        .Times(3)
+        .WillRepeatedly(Return(makeToken(42, false)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+        .Times(3)
+        .WillRepeatedly(Return(true));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "Hello")};
+    request.max_tokens = 3;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+}
+
 TEST_F(Test__ChatCompletionHandler, HandleRequest_EmptyDecode_StopsGracefully)
 {
     auto handler = makeHandler();
@@ -704,7 +750,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_EmptyDecode_StopsGracefully)
 // Cache clearing test
 // =============================================================================
 
-TEST_F(Test__ChatCompletionHandler, HandleRequest_ClearsCacheBeforeEachRequest)
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ClearsCacheBeforeAndAfterRequest)
 {
     auto handler = makeHandler();
 
@@ -713,7 +759,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ClearsCacheBeforeEachRequest)
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
 
-    EXPECT_CALL(*runner_, clearCache()).Times(1);
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(0, true)));
     ON_CALL(*tokenizer_, is_stop_token(_))
@@ -736,7 +782,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ConsecutiveRequestsResetCacheA
     ON_CALL(*runner_, getRecommendedSamplingParams())
         .WillByDefault(Return(SamplingParams{}));
 
-    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, clearCache()).Times(4);
     EXPECT_CALL(*runner_, setSamplingParams(_)).Times(2);
     EXPECT_CALL(*runner_, prefill(_)).Times(2).WillRepeatedly(Return(true));
     EXPECT_CALL(*runner_, decodeStep()).Times(2).WillRepeatedly(Return(makeToken(0, true)));
@@ -756,7 +802,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ExceptionAfterBoundaryReturns5
 {
     auto handler = makeHandler();
 
-    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, clearCache()).Times(AtLeast(2));
     EXPECT_CALL(*runner_, setSamplingParams(_))
         .WillOnce(Throw(std::runtime_error("sampling setup exploded")));
     EXPECT_CALL(*runner_, prefill(_)).Times(0);
@@ -771,6 +817,39 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ExceptionAfterBoundaryReturns5
     auto body = json::parse(response.json_body);
     EXPECT_EQ(body["error"]["type"], "server_error");
     EXPECT_NE(body["error"]["message"].get<std::string>().find("sampling setup exploded"), std::string::npos);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ForwardsThinkingModeToTokenizer)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(4);
+    EXPECT_CALL(*tokenizer_, encodeChat(_, true, "", false))
+        .WillOnce(Return(std::vector<int>{1}));
+    EXPECT_CALL(*tokenizer_, encodeChat(_, true, "", true))
+        .WillOnce(Return(std::vector<int>{1}));
+    EXPECT_CALL(*runner_, decodeStep())
+        .Times(2)
+        .WillRepeatedly(Return(makeToken(0, true)));
+
+    ChatCompletionRequest non_thinking;
+    non_thinking.messages = {ChatMessage("user", "test")};
+    non_thinking.enable_thinking = false;
+    non_thinking.max_tokens = 1;
+
+    ChatCompletionRequest thinking = non_thinking;
+    thinking.enable_thinking = true;
+
+    auto first = handler->handleRequest(non_thinking);
+    auto second = handler->handleRequest(thinking);
+
+    EXPECT_TRUE(first.ok);
+    EXPECT_TRUE(second.ok);
 }
 
 // =============================================================================
@@ -2057,6 +2136,39 @@ TEST_F(Test__ChatCompletionHandler, Streaming_PrefillFailure_ReturnsError)
     EXPECT_TRUE(chunks.empty());
 }
 
+TEST_F(Test__ChatCompletionHandler, Streaming_ClearsCacheBeforeAndAfterRequest)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(1, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    ASSERT_FALSE(chunks.empty());
+    EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
+}
+
 TEST_F(Test__ChatCompletionHandler, Streaming_ChunkObjectType)
 {
     auto handler = makeHandler();
@@ -2381,10 +2493,10 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_InjectsStopSequ
     // Then inject 92 (runner decodeStep called for KV cache)
     // Then normal decode returns complete
     EXPECT_CALL(*runner_, decodeStep())
-        .WillOnce(Return(makeToken(10)))   // Thinking token 1
-        .WillOnce(Return(makeToken(11)))   // Thinking token 2 → budget exhausted, inject 90
-        .WillOnce(Return(makeToken(99)))   // KV cache forward for 91 (result discarded)
-        .WillOnce(Return(makeToken(99)))   // KV cache forward for 92 (result discarded)
+        .WillOnce(Return(makeToken(10)))       // Thinking token 1
+        .WillOnce(Return(makeToken(11)))       // Thinking token 2 → budget exhausted, inject 90
+        .WillOnce(Return(makeToken(99)))       // KV cache forward for 91 (result discarded)
+        .WillOnce(Return(makeToken(99)))       // KV cache forward for 92 (result discarded)
         .WillOnce(Return(makeToken(0, true))); // Normal completion
 
     ChatCompletionRequest request;

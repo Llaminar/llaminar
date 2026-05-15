@@ -159,6 +159,15 @@ namespace llaminar2
             int max_new_tokens,
             const SamplingParams &sampling) = 0;
 
+        /**
+         * @brief Apply any decode-boundary maintenance after a successful token step.
+         *
+         * Server and streaming paths drive decodeStep() directly instead of using
+         * generate(), so they call this hook to share maintenance such as dynamic
+         * MoE hot-expert replica updates.
+         */
+        virtual bool maybeApplyMoERebalance() { return true; }
+
         // =====================================================================
         // Configuration
         // =====================================================================

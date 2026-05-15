@@ -73,6 +73,85 @@ TEST(Test__PreparedWeightStore_ExpertSlab, RegisterSlab_InvalidLayerIdx_Throws)
     EXPECT_EQ(store.expertSlabCount(), 0u);
 }
 
+TEST(Test__PreparedWeightStore_ExpertSlab, FindExpertSlab_ReturnsMatchingDescriptor)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto desc = makeDescriptor(2, WeightRole::MoEExpertGate, 8);
+    desc.local_expert_start = 4;
+    desc.local_expert_count = 4;
+    desc.rows_per_expert = 2048;
+    desc.cols_per_expert = 896;
+
+    auto ref = store.registerExpertSlab(desc);
+    auto found = store.findExpertSlab(desc);
+
+    ASSERT_TRUE(found.has_value());
+    EXPECT_EQ(found->slab_id, ref.slab_id);
+    EXPECT_EQ(found->layer_idx, ref.layer_idx);
+    EXPECT_EQ(found->role, ref.role);
+    EXPECT_EQ(found->device, ref.device);
+}
+
+TEST(Test__PreparedWeightStore_ExpertSlab, FindExpertSlab_DistinguishesDescriptorFields)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto desc = makeDescriptor(2, WeightRole::MoEExpertGate, 8);
+    desc.local_expert_start = 4;
+    desc.local_expert_count = 4;
+    desc.rows_per_expert = 2048;
+    desc.cols_per_expert = 896;
+    store.registerExpertSlab(desc);
+
+    auto expect_no_match = [&](ExpertSlabDescriptor candidate, const char *field)
+    {
+        EXPECT_FALSE(store.findExpertSlab(candidate).has_value()) << field;
+    };
+
+    auto wrong_layer = desc;
+    wrong_layer.layer_idx = 3;
+    expect_no_match(wrong_layer, "layer_idx");
+
+    auto wrong_role = desc;
+    wrong_role.role = WeightRole::MoEExpertUp;
+    expect_no_match(wrong_role, "role");
+
+    auto wrong_device = desc;
+    wrong_device.device = DeviceId::cuda(0);
+    expect_no_match(wrong_device, "device");
+
+    auto wrong_num_experts = desc;
+    wrong_num_experts.num_experts = 16;
+    expect_no_match(wrong_num_experts, "num_experts");
+
+    auto wrong_local_start = desc;
+    wrong_local_start.local_expert_start = 0;
+    expect_no_match(wrong_local_start, "local_expert_start");
+
+    auto wrong_local_count = desc;
+    wrong_local_count.local_expert_count = 8;
+    expect_no_match(wrong_local_count, "local_expert_count");
+
+    auto wrong_rows = desc;
+    wrong_rows.rows_per_expert = 4096;
+    expect_no_match(wrong_rows, "rows_per_expert");
+
+    auto wrong_cols = desc;
+    wrong_cols.cols_per_expert = 1024;
+    expect_no_match(wrong_cols, "cols_per_expert");
+}
+
+TEST(Test__PreparedWeightStore_ExpertSlab, FindExpertSlab_ReleasedSlabNoLongerMatches)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto desc = makeDescriptor(0, WeightRole::MoEExpertDown, 4);
+    auto ref = store.registerExpertSlab(desc);
+
+    ASSERT_TRUE(store.findExpertSlab(desc).has_value());
+    store.releaseExpertSlab(ref);
+
+    EXPECT_FALSE(store.findExpertSlab(desc).has_value());
+}
+
 // ---------------------------------------------------------------------------
 // 2. Lookup before population
 // ---------------------------------------------------------------------------
@@ -288,6 +367,44 @@ TEST(Test__PreparedWeightStore_ExpertSlab, ReleaseExpertSlab_RemovesSlab)
     EXPECT_EQ(store.totalPopulatedExperts(), 0u);
     EXPECT_EQ(store.expertGemmKernel(ref, 0), nullptr);
     EXPECT_TRUE(store.expertAvailabilityMask(ref).empty());
+}
+
+TEST(Test__PreparedWeightStore_ExpertSlab, Clear_ReleasesExpertSlabs)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto desc = makeDescriptor(0, WeightRole::MoEExpertGate, 4);
+    auto ref = store.registerExpertSlab(desc);
+
+    auto *eng = reinterpret_cast<ITensorGemm *>(0x1000);
+    store.registerArrivedExperts(ref, {makeArrival(0, eng)});
+    ASSERT_EQ(store.expertSlabCount(), 1u);
+    ASSERT_EQ(store.totalPopulatedExperts(), 1u);
+
+    store.clear();
+
+    EXPECT_EQ(store.expertSlabCount(), 0u);
+    EXPECT_EQ(store.totalPopulatedExperts(), 0u);
+    EXPECT_EQ(store.expertGemmKernel(ref, 0), nullptr);
+    EXPECT_FALSE(store.findExpertSlab(desc).has_value());
+}
+
+TEST(Test__PreparedWeightStore_ExpertSlab, ReleaseAllPreparedState_ReleasesExpertSlabs)
+{
+    PreparedWeightStore store(ModelContextId{1});
+    auto desc = makeDescriptor(0, WeightRole::MoEExpertUp, 4);
+    auto ref = store.registerExpertSlab(desc);
+
+    auto *eng = reinterpret_cast<ITensorGemm *>(0x1000);
+    store.registerArrivedExperts(ref, {makeArrival(1, eng)});
+    ASSERT_EQ(store.expertSlabCount(), 1u);
+    ASSERT_EQ(store.totalPopulatedExperts(), 1u);
+
+    store.releaseAllPreparedState();
+
+    EXPECT_EQ(store.expertSlabCount(), 0u);
+    EXPECT_EQ(store.totalPopulatedExperts(), 0u);
+    EXPECT_EQ(store.expertGemmKernel(ref, 1), nullptr);
+    EXPECT_FALSE(store.findExpertSlab(desc).has_value());
 }
 
 // ---------------------------------------------------------------------------

@@ -45,7 +45,7 @@ static MoERebalanceController::Config makeConfig(
 }
 
 /// Fill the histogram window with balanced routing across all experts
-static void fillWindowBalanced(DecodeExpertHistogram& hist, int window_size,
+static void fillWindowBalanced(DecodeExpertHistogram &hist, int window_size,
                                int num_layers, int num_experts, int top_k)
 {
     for (int t = 0; t < window_size; ++t)
@@ -65,7 +65,7 @@ static void fillWindowBalanced(DecodeExpertHistogram& hist, int window_size,
 }
 
 /// Fill the histogram window with heavily skewed routing (all to experts 0,1)
-static void fillWindowSkewed(DecodeExpertHistogram& hist, int window_size,
+static void fillWindowSkewed(DecodeExpertHistogram &hist, int window_size,
                              int num_layers, int top_k)
 {
     for (int t = 0; t < window_size; ++t)
@@ -301,8 +301,8 @@ TEST(Test__MoERebalanceController, LogHistogramSummary_NoThrow)
 // ── Helper for targeted expert routing ────────────────
 
 /// Fill histogram with routing that always activates the given experts
-static void fillWindowWithExperts(DecodeExpertHistogram& hist, int window_size,
-                                  int num_layers, const std::vector<int>& active_experts)
+static void fillWindowWithExperts(DecodeExpertHistogram &hist, int window_size,
+                                  int num_layers, const std::vector<int> &active_experts)
 {
     int top_k = static_cast<int>(active_experts.size());
     for (int t = 0; t < window_size; ++t)
@@ -315,27 +315,176 @@ static void fillWindowWithExperts(DecodeExpertHistogram& hist, int window_size,
     }
 }
 
-static void recordExpertHits(DecodeExpertHistogram& hist, int layer,
-                             const std::vector<std::pair<int, int>>& expert_counts)
+static void recordExpertHits(DecodeExpertHistogram &hist, int layer,
+                             const std::vector<std::pair<int, int>> &expert_counts)
 {
     constexpr float weight = 1.0f;
-    for (const auto& [expert, count] : expert_counts)
+    for (const auto &[expert, count] : expert_counts)
     {
         for (int i = 0; i < count; ++i)
             hist.record(layer, &expert, &weight, 1);
     }
 }
 
-static bool anyGpuSocketHas(const std::vector<std::vector<std::vector<bool>>>& masks,
+static bool anyGpuSocketHas(const std::vector<std::vector<std::vector<bool>>> &masks,
                             int layer, int expert)
 {
     return masks[0][layer][expert] || masks[1][layer][expert];
 }
 
-static bool anyCpuSocketHas(const std::vector<std::vector<std::vector<bool>>>& masks,
+static bool anyCpuSocketHas(const std::vector<std::vector<std::vector<bool>>> &masks,
                             int layer, int expert)
 {
     return masks[2][layer][expert] || masks[3][layer][expert];
+}
+
+TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
+                          /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
+    for (int e = 0; e < 8; ++e)
+        cfg.initial_expert_to_socket[e] = (e < 4) ? 0 : 1;
+
+    MoERebalanceController ctrl(cfg);
+    const auto initial_placement = ctrl.currentPlacement();
+
+    fillWindowWithExperts(*ctrl.histogram(), 16, 2, {0, 4});
+    ASSERT_TRUE(ctrl.shouldRebalance());
+
+    auto replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    ASSERT_EQ(replicas.num_replicated, 2);
+    EXPECT_TRUE(replicas.is_replicated[0]);
+    EXPECT_TRUE(replicas.is_replicated[4]);
+    EXPECT_EQ(ctrl.currentPlacement(), initial_placement);
+
+    auto socket0_masks = ctrl.computeExpertMasks(0);
+    auto socket1_masks = ctrl.computeExpertMasks(1);
+    ASSERT_EQ(static_cast<int>(socket0_masks.size()), 2);
+    ASSERT_EQ(static_cast<int>(socket1_masks.size()), 2);
+
+    for (int layer = 0; layer < 2; ++layer)
+    {
+        EXPECT_TRUE(socket0_masks[layer][0]);
+        EXPECT_TRUE(socket1_masks[layer][0]);
+        EXPECT_TRUE(socket0_masks[layer][4]);
+        EXPECT_TRUE(socket1_masks[layer][4]);
+
+        EXPECT_TRUE(socket0_masks[layer][1]);
+        EXPECT_FALSE(socket1_masks[layer][1]);
+        EXPECT_FALSE(socket0_masks[layer][5]);
+        EXPECT_TRUE(socket1_masks[layer][5]);
+    }
+
+    ctrl.resetRebalanceWindow();
+    EXPECT_FALSE(ctrl.shouldRebalance());
+    EXPECT_FALSE(ctrl.histogram()->windowFull());
+    EXPECT_EQ(ctrl.currentPlacement(), initial_placement);
+}
+
+TEST(Test__MoERebalanceController, ReplicaPrefillMaskKeepsReplicatedExpertsOnOwnerOnly)
+{
+    ExpertReplicaSet replicas;
+    replicas.is_replicated = {true, false, false, false, true, false, false, false};
+    replicas.owner_socket = {0, 0, 0, 0, 1, 1, 1, 1};
+    replicas.num_replicated = 2;
+    replicas.num_sockets = 2;
+
+    std::vector<bool> socket0_mask = {true, true, true, true, true, false, false, false};
+    std::vector<bool> socket1_mask = {true, false, false, false, true, true, true, true};
+
+    auto socket0_replicas = replicas;
+    socket0_replicas.buildPrefillMask(0, socket0_mask);
+    EXPECT_TRUE(socket0_replicas.prefill_mask[0]);
+    EXPECT_FALSE(socket0_replicas.prefill_mask[4]);
+    EXPECT_TRUE(socket0_replicas.prefill_mask[1]);
+    EXPECT_FALSE(socket0_replicas.prefill_mask[5]);
+
+    auto socket1_replicas = replicas;
+    socket1_replicas.buildPrefillMask(1, socket1_mask);
+    EXPECT_FALSE(socket1_replicas.prefill_mask[0]);
+    EXPECT_TRUE(socket1_replicas.prefill_mask[4]);
+    EXPECT_FALSE(socket1_replicas.prefill_mask[1]);
+    EXPECT_TRUE(socket1_replicas.prefill_mask[5]);
+}
+
+TEST(Test__MoERebalanceController, ReplicaPlacementComparisonIgnoresPrefillMask)
+{
+    ExpertReplicaSet a;
+    a.is_replicated = {true, false, true, false};
+    a.owner_socket = {0, 0, 1, 1};
+    a.num_replicated = 2;
+    a.num_sockets = 2;
+    a.prefill_mask = {true, true, false, false};
+
+    ExpertReplicaSet b = a;
+    b.prefill_mask = {false, false, true, true};
+    EXPECT_TRUE(a.sameReplicaPlacement(b));
+
+    b.is_replicated[1] = true;
+    b.num_replicated = 3;
+    EXPECT_FALSE(a.sameReplicaPlacement(b));
+}
+
+TEST(Test__MoERebalanceController, ReplicaArrivalsSinceReturnsOnlyNewResidentExperts)
+{
+    ExpertReplicaSet previous;
+    previous.is_replicated = {true, false, true, false, false, false};
+    previous.owner_socket = {0, 0, 1, 1, 0, 1};
+    previous.num_replicated = 2;
+    previous.num_sockets = 2;
+
+    ExpertReplicaSet current;
+    current.is_replicated = {true, true, true, false, true, false};
+    current.owner_socket = {0, 0, 0, 1, 0, 1};
+    current.num_replicated = 4;
+    current.num_sockets = 2;
+
+    auto arrivals = current.arrivalsSince(previous);
+    EXPECT_EQ(arrivals.num_replicated, 3);
+    EXPECT_FALSE(arrivals.is_replicated[0]); // unchanged owner/socket residency
+    EXPECT_TRUE(arrivals.is_replicated[1]);  // new replica
+    EXPECT_TRUE(arrivals.is_replicated[2]);  // owner changed, must resend
+    EXPECT_FALSE(arrivals.is_replicated[3]);
+    EXPECT_TRUE(arrivals.is_replicated[4]); // new replica
+    EXPECT_FALSE(arrivals.is_replicated[5]);
+    EXPECT_EQ(arrivals.owner_socket, current.owner_socket);
+    EXPECT_EQ(arrivals.num_sockets, current.num_sockets);
+}
+
+TEST(Test__MoERebalanceController, ReplicaDecodeDispatchAssignsEachRoutedExpertToExactlyOneSocket)
+{
+    ExpertReplicaSet replicas;
+    replicas.is_replicated = {true, true, false, false};
+    replicas.owner_socket = {0, 1, 0, 1};
+    replicas.num_replicated = 2;
+    replicas.num_sockets = 2;
+
+    const int expert_indices[] = {0, 1, 2, 3};
+    const float expert_weights[] = {0.4f, 0.3f, 0.2f, 0.1f};
+    const std::vector<bool> socket0_mask = {true, true, true, false};
+    const std::vector<bool> socket1_mask = {true, true, false, true};
+
+    bool socket0_compute[4] = {};
+    bool socket1_compute[4] = {};
+    replicas.assignForToken(expert_indices, expert_weights, 4, 0, socket0_mask, socket0_compute);
+    replicas.assignForToken(expert_indices, expert_weights, 4, 1, socket1_mask, socket1_compute);
+
+    int socket0_count = 0;
+    int socket1_count = 0;
+    for (int k = 0; k < 4; ++k)
+    {
+        EXPECT_NE(socket0_compute[k], socket1_compute[k]) << "expert " << expert_indices[k]
+                                                          << " must be computed by exactly one socket";
+        socket0_count += socket0_compute[k] ? 1 : 0;
+        socket1_count += socket1_compute[k] ? 1 : 0;
+    }
+
+    EXPECT_EQ(socket0_count, 2);
+    EXPECT_EQ(socket1_count, 2);
+    EXPECT_TRUE(socket0_compute[0]);
+    EXPECT_TRUE(socket1_compute[1]);
+    EXPECT_TRUE(socket0_compute[2]);
+    EXPECT_TRUE(socket1_compute[3]);
 }
 
 TEST(Test__MoERebalanceController, GpuCacheMasks_AssignsHottestExpertsToGpuDomain)
@@ -434,13 +583,15 @@ TEST(Test__MoERebalanceController, RebalanceLPT_BalancedInput_NearPerfectBalance
     // Re-fill histogram to measure post-LPT imbalance
     fillWindowBalanced(*ctrl.histogram(), 16, 2, 8, 2);
 
-    const auto& placement = ctrl.currentPlacement();
+    const auto &placement = ctrl.currentPlacement();
     // Count experts per socket
     int count_s0 = 0, count_s1 = 0;
     for (int e = 0; e < 8; ++e)
     {
-        if (placement[e] == 0) count_s0++;
-        else count_s1++;
+        if (placement[e] == 0)
+            count_s0++;
+        else
+            count_s1++;
     }
     // With balanced input, LPT should assign 4 experts per socket
     EXPECT_EQ(count_s0, 4);
@@ -464,11 +615,12 @@ TEST(Test__MoERebalanceController, RebalanceLPT_SkewedInput_ImproveBalance)
     ctrl.rebalanceLPT();
 
     // LPT should move one of {0,1} to socket 1 for better balance
-    const auto& placement = ctrl.currentPlacement();
+    const auto &placement = ctrl.currentPlacement();
     int hot_on_s0 = 0;
     for (int e : {0, 1})
     {
-        if (placement[e] == 0) hot_on_s0++;
+        if (placement[e] == 0)
+            hot_on_s0++;
     }
     // Expect at most 1 hot expert per socket (LPT splits them)
     EXPECT_LE(hot_on_s0, 1);
@@ -488,7 +640,7 @@ TEST(Test__MoERebalanceController, RebalanceLPT_UpdatesPlacement)
     fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
     ctrl.rebalanceLPT();
 
-    const auto& updated = ctrl.currentPlacement();
+    const auto &updated = ctrl.currentPlacement();
     ASSERT_EQ(static_cast<int>(updated.size()), 8);
 
     // At least one expert should have moved
@@ -544,13 +696,15 @@ TEST(Test__MoERebalanceController, RebalanceLPT_ContiguousPartition_SkewedRoutin
 
     ctrl.rebalanceLPT();
 
-    const auto& placement = ctrl.currentPlacement();
+    const auto &placement = ctrl.currentPlacement();
     // LPT should distribute experts 0-3 across both sockets
     int hot_on_s0 = 0, hot_on_s1 = 0;
     for (int e = 0; e < 4; ++e)
     {
-        if (placement[e] == 0) hot_on_s0++;
-        else hot_on_s1++;
+        if (placement[e] == 0)
+            hot_on_s0++;
+        else
+            hot_on_s1++;
     }
     // At least one of experts 0-3 should now be on socket 1
     EXPECT_GT(hot_on_s1, 0);
@@ -571,7 +725,7 @@ TEST(Test__MoERebalanceController, RebalanceLPT_MultiSocket)
 
     ctrl.rebalanceLPT();
 
-    const auto& placement = ctrl.currentPlacement();
+    const auto &placement = ctrl.currentPlacement();
     // LPT should spread experts 0-3 across all 4 sockets
     std::vector<int> socket_for_hot(4);
     for (int e = 0; e < 4; ++e)
@@ -596,7 +750,7 @@ TEST(Test__MoERebalanceController, RebalanceLPT_ZeroCountExperts)
 
     ctrl.rebalanceLPT();
 
-    const auto& placement = ctrl.currentPlacement();
+    const auto &placement = ctrl.currentPlacement();
 
     // All 8 experts should still have valid placements (0 or 1)
     for (int e = 0; e < 8; ++e)
@@ -610,8 +764,10 @@ TEST(Test__MoERebalanceController, RebalanceLPT_ZeroCountExperts)
     int hot_on_s0 = 0, hot_on_s1 = 0;
     for (int e : {0, 1})
     {
-        if (placement[e] == 0) hot_on_s0++;
-        else hot_on_s1++;
+        if (placement[e] == 0)
+            hot_on_s0++;
+        else
+            hot_on_s1++;
     }
     EXPECT_EQ(hot_on_s0, 1);
     EXPECT_EQ(hot_on_s1, 1);
@@ -636,20 +792,20 @@ TEST(Test__MoERebalanceController, ComputeExpertMasks_InitialPartition)
     auto masks_s0 = ctrl.computeExpertMasks(0);
     auto masks_s1 = ctrl.computeExpertMasks(1);
 
-    ASSERT_EQ(static_cast<int>(masks_s0.size()), 2); // num_layers
+    ASSERT_EQ(static_cast<int>(masks_s0.size()), 2);    // num_layers
     ASSERT_EQ(static_cast<int>(masks_s0[0].size()), 8); // num_experts
 
     // Check socket 0 mask matches round-robin
     for (int l = 0; l < 2; ++l)
     {
-        EXPECT_TRUE(masks_s0[l][0]);   // expert 0 → socket 0
-        EXPECT_FALSE(masks_s0[l][1]);  // expert 1 → socket 1
-        EXPECT_TRUE(masks_s0[l][2]);   // expert 2 → socket 0
-        EXPECT_FALSE(masks_s0[l][3]);  // expert 3 → socket 1
-        EXPECT_TRUE(masks_s0[l][4]);   // expert 4 → socket 0
-        EXPECT_FALSE(masks_s0[l][5]);  // expert 5 → socket 1
-        EXPECT_TRUE(masks_s0[l][6]);   // expert 6 → socket 0
-        EXPECT_FALSE(masks_s0[l][7]);  // expert 7 → socket 1
+        EXPECT_TRUE(masks_s0[l][0]);  // expert 0 → socket 0
+        EXPECT_FALSE(masks_s0[l][1]); // expert 1 → socket 1
+        EXPECT_TRUE(masks_s0[l][2]);  // expert 2 → socket 0
+        EXPECT_FALSE(masks_s0[l][3]); // expert 3 → socket 1
+        EXPECT_TRUE(masks_s0[l][4]);  // expert 4 → socket 0
+        EXPECT_FALSE(masks_s0[l][5]); // expert 5 → socket 1
+        EXPECT_TRUE(masks_s0[l][6]);  // expert 6 → socket 0
+        EXPECT_FALSE(masks_s0[l][7]); // expert 7 → socket 1
     }
 
     // Check socket 1 is the complement
@@ -678,7 +834,7 @@ TEST(Test__MoERebalanceController, ComputeExpertMasks_AfterLPT)
     fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
     ctrl.rebalanceLPT();
 
-    const auto& placement = ctrl.currentPlacement();
+    const auto &placement = ctrl.currentPlacement();
     auto masks_s0 = ctrl.computeExpertMasks(0);
 
     // Masks should reflect the updated LPT placement

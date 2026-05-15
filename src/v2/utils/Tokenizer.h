@@ -160,6 +160,16 @@ namespace llaminar2
             bool add_generation_prompt = true,
             const std::string &tools_json = "") const = 0;
 
+        virtual std::vector<int> encodeChat(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt,
+            const std::string &tools_json,
+            bool enable_thinking) const
+        {
+            (void)enable_thinking;
+            return encodeChat(messages, add_generation_prompt, tools_json);
+        }
+
         /**
          * @brief Format messages using chat template (without encoding)
          *
@@ -174,6 +184,16 @@ namespace llaminar2
             const std::vector<ChatMessage> &messages,
             bool add_generation_prompt = true,
             const std::string &tools_json = "") const = 0;
+
+        virtual std::string applyTemplate(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt,
+            const std::string &tools_json,
+            bool enable_thinking) const
+        {
+            (void)enable_thinking;
+            return applyTemplate(messages, add_generation_prompt, tools_json);
+        }
     };
 
     /**
@@ -228,10 +248,20 @@ namespace llaminar2
             const std::vector<ChatMessage> &messages,
             bool add_generation_prompt = true,
             const std::string &tools_json = "") const override;
+        std::vector<int> encodeChat(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt,
+            const std::string &tools_json,
+            bool enable_thinking) const override;
         std::string applyTemplate(
             const std::vector<ChatMessage> &messages,
             bool add_generation_prompt = true,
             const std::string &tools_json = "") const override;
+        std::string applyTemplate(
+            const std::vector<ChatMessage> &messages,
+            bool add_generation_prompt,
+            const std::string &tools_json,
+            bool enable_thinking) const override;
 
     private:
         /**

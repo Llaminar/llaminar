@@ -8,6 +8,7 @@
 
 #include "app/commands/ServeCommand.h"
 #include "app/AppContext.h"
+#include "app/commands/CommandValidation.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/RuntimeInitPhase.h"
 #include "app/Splash.h"
@@ -47,6 +48,17 @@ namespace llaminar2
         // Force serve mode — 'llaminar serve' implies --serve
         config.serve_mode = true;
 
+        if (!command_validation::printConfigErrors(config))
+        {
+            return 1;
+        }
+
+        if (config.validate_only)
+        {
+            command_validation::printValidateOnlySuccess(config);
+            return 0;
+        }
+
         // SubcommandRouter strips argv[1] ("serve") before calling us.
         // Re-inject it so MPIBootstrapPhase's selfLaunchMPI re-creates
         // the correct command line: llaminar2 serve <flags...>
@@ -68,7 +80,7 @@ namespace llaminar2
         RuntimeInitPhase init;
         auto ctx_opt = init.execute(config, argc, argv);
         if (!ctx_opt)
-            return 1;
+            return config.dry_run ? 0 : 1;
         auto ctx = std::move(*ctx_opt);
 
         // Run server directly

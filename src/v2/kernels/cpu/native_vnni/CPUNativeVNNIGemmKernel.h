@@ -70,78 +70,30 @@ namespace llaminar2::cpu::native_vnni
             }
             valid_ = true;
 
-            // Store the native block size for this format
+            // Store the native block size for this format. VNNI engines are
+            // fully eager: the packed interleaved representation stays owned
+            // by the engine and is never rebuilt from raw tensor storage.
             native_block_size_ = native_block_bytes_for_codebook(packed_.codebook_id);
 
-            // ---------------------------------------------------------------
-            // Store native blocks for deferred VNNI packing (all formats).
-            //
-            // This enables memory-efficient operation: instead of keeping the
-            // VNNI-interleaved data permanently (~1.1 B/elem overhead), we store
-            // only the native quantized blocks (~0.5-1.06 B/elem) and repack
-            // into a shared workspace on demand for each GEMM/GEMV call.
-            //
-            // Q4_K superblocks: synthesize Q4_1-compatible elementary blocks
-            // from the superblock structure, enabling deferred packing. Each
-            // 256-element superblock is decomposed into 8 × 32-element blocks
-            // with FP16 scale + min + 16-byte nibble payload = 20 bytes each.
-            //
-            // Other superblock formats (Q6_K, Q3_K, etc.) and rotation paths
-            // retain permanent interleaved data since repacking from native
-            // blocks is not supported.
-            // ---------------------------------------------------------------
-            const bool is_superblock = packed_.is_superblock;
-            const bool is_q4k_superblock = is_superblock && packed_.codebook_id == 5;
-            // TEMPORARILY DISABLED: Q4_K deferred packing saves only ~2GB but costs -30% decode.
-            // TODO: Share engines between prefill/decode graphs to reduce memory.
-            const bool can_defer = !is_superblock
-                                   && !activation_rotation_ && native_block_size_ > 0;
-
-            if (can_defer)
-            {
-                if (is_q4k_superblock)
-                {
-                    // Q4_K: synthesize Q4_1 elementary blocks from superblocks
-                    synthesizeElementaryBlocksFromSuperblock(weights, row_start, row_end);
-                }
-                else
-                {
-                    // Non-superblock: store native blocks directly
-                    storeNativeBlocks(weights, row_start, row_end);
-                }
-            }
-
-            // Release the permanent interleaved data if deferred packing is active.
-            // The workspace will be populated on demand before each GEMM/GEMV call.
-            if (can_defer && native_blocks_ptr_ != nullptr)
-            {
-                packed_.releaseInterleavedData();
-                deferred_packing_ = true;
-
-                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Deferred packing: "
-                          << packed_.N << "×" << packed_.K
-                          << " (codebook=" << (int)packed_.codebook_id
-                          << ", block_size=" << native_block_size_
-                          << ", owned=" << (!native_blocks_owned_.empty() ? "yes" : "mmap")
-                          << ", saved ~" << (interleavedWorkspaceSize(packed_) / (1024 * 1024)) << " MB)");
-            }
-            else
-            {
-                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Packed "
-                          << packed_.N << "×" << packed_.K
-                          << " weights (codebook=" << (int)packed_.codebook_id
-                          << ", payload=" << packed_.payload_bytes << " B/block"
-                          << ", asymmetric=" << packed_.is_asymmetric
-                          << ", rotation=" << (activation_rotation_ != nullptr)
-                          << ", permanent_interleaved=true)");
-            }
+            LOG_DEBUG("[CPUNativeVNNIGemmKernel] Packed "
+                      << packed_.N << "×" << packed_.K
+                      << " weights (codebook=" << (int)packed_.codebook_id
+                      << ", payload=" << packed_.payload_bytes << " B/block"
+                      << ", asymmetric=" << packed_.is_asymmetric
+                      << ", rotation=" << (activation_rotation_ != nullptr)
+                      << ", permanent_interleaved=true)");
         }
 
         /**
          * @brief Construct from pre-packed weights (move).
          */
         explicit CPUNativeVNNIGemmKernel(CPUNativeVNNIPackedWeights &&packed)
-            : packed_(std::move(packed)), valid_(true) {}
+            : packed_(std::move(packed)), valid_(packed_.hasInterleavedData())
+        {
+            native_block_size_ = native_block_bytes_for_codebook(packed_.codebook_id);
+            if (!valid_)
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] Pre-packed CPU_NATIVE_VNNI weights are missing eager interleaved data");
+        }
 
         ~CPUNativeVNNIGemmKernel() override = default;
 
@@ -204,7 +156,8 @@ namespace llaminar2::cpu::native_vnni
                     C_data[i] *= beta;
             }
 
-            // For deferred packing: repack native blocks into shared workspace
+            // Legacy deferred-packing guard. New CPU VNNI engines are eager and
+            // transferred blobs with native-block deferred payloads are rejected.
             if (deferred_packing_)
             {
                 if (m == 1 && packed_.codebook_id == 19)
@@ -271,20 +224,7 @@ namespace llaminar2::cpu::native_vnni
             if (!valid_)
                 return nullptr;
 
-            std::unique_ptr<IPackedWeights> result;
-            if (deferred_packing_ && !native_blocks_owned_.empty())
-            {
-                // Deferred packing: transfer both packed metadata and native blocks
-                result = std::make_unique<CPUPackedWeightsWithNativeBlocks>(
-                    std::move(packed_),
-                    std::move(native_blocks_owned_),
-                    native_block_size_);
-            }
-            else
-            {
-                // Permanent interleaved: transfer the packed data
-                result = std::make_unique<CPUPackedWeights>(std::move(packed_));
-            }
+            auto result = std::make_unique<CPUPackedWeights>(std::move(packed_));
 
             // Invalidate kernel
             packed_ = CPUNativeVNNIPackedWeights{};
@@ -300,19 +240,6 @@ namespace llaminar2::cpu::native_vnni
             if (!valid_)
                 return nullptr;
 
-            if (deferred_packing_ && native_blocks_ptr_ != nullptr && native_block_size_ > 0)
-            {
-                const size_t native_bytes = static_cast<size_t>(packed_.N)
-                                          * static_cast<size_t>(packed_.blocks_per_row)
-                                          * native_block_size_;
-                const auto *src = static_cast<const uint8_t *>(native_blocks_ptr_);
-                std::vector<uint8_t> native_blocks(src, src + native_bytes);
-                return std::make_unique<CPUPackedWeightsWithNativeBlocks>(
-                    CPUNativeVNNIPackedWeights(packed_),
-                    std::move(native_blocks),
-                    native_block_size_);
-            }
-
             return std::make_unique<CPUPackedWeights>(packed_);
         }
 
@@ -321,26 +248,27 @@ namespace llaminar2::cpu::native_vnni
             if (!weights || weights->format() != PackedWeightsFormat::CPU_NATIVE_VNNI)
                 return false;
 
-            // Check if it includes native blocks (deferred packing)
-            auto *with_native = dynamic_cast<CPUPackedWeightsWithNativeBlocks *>(weights.get());
-            if (with_native)
+            if (dynamic_cast<CPUPackedWeightsWithNativeBlocks *>(weights.get()))
             {
-                packed_ = with_native->takePacked();
-                native_blocks_owned_ = std::vector<uint8_t>(with_native->nativeBlocks());
-                native_block_size_ = with_native->nativeBlockSize();
-                native_blocks_ptr_ = native_blocks_owned_.data();
-                deferred_packing_ = true;
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] Deferred/native-block weight attachment is disabled; expected eager interleaved CPU_NATIVE_VNNI weights");
+                return false;
             }
-            else
+
+            auto *cpu_packed = dynamic_cast<CPUPackedWeights *>(weights.get());
+            if (!cpu_packed)
+                return false;
+
+            packed_ = cpu_packed->takePacked();
+            if (!packed_.hasInterleavedData())
             {
-                auto *cpu_packed = dynamic_cast<CPUPackedWeights *>(weights.get());
-                if (!cpu_packed)
-                    return false;
-                packed_ = cpu_packed->takePacked();
-                native_blocks_owned_.clear();
-                native_blocks_ptr_ = nullptr;
-                deferred_packing_ = false;
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] Attached CPU_NATIVE_VNNI weights have no eager interleaved data");
+                packed_ = CPUNativeVNNIPackedWeights{};
+                return false;
             }
+
+            native_blocks_owned_.clear();
+            native_blocks_ptr_ = nullptr;
+            deferred_packing_ = false;
 
             valid_ = true;
             return true;
@@ -348,7 +276,10 @@ namespace llaminar2::cpu::native_vnni
 
         void releaseWeights() override
         {
-            { CPUNativeVNNIPackedWeights empty; packed_ = std::move(empty); }
+            {
+                CPUNativeVNNIPackedWeights empty;
+                packed_ = std::move(empty);
+            }
             native_blocks_owned_.clear();
             native_blocks_owned_.shrink_to_fit();
             native_blocks_ptr_ = nullptr;
@@ -357,6 +288,13 @@ namespace llaminar2::cpu::native_vnni
         }
 
         bool hasWeights() const override { return valid_; }
+
+        size_t packedWeightBytes() const override
+        {
+            if (!valid_)
+                return 0;
+            return packed_.native_interleaved.size() + packed_.payload.size() + packed_.int8_flat.size() + native_blocks_owned_.size();
+        }
 
         // -------------------------------------------------------------------
         // Accessors
@@ -418,7 +356,7 @@ namespace llaminar2::cpu::native_vnni
             // Apply activation rotation for kurtosis reduction (if configured)
             const float *gemm_input = maybe_rotate_activation(swiglu_scratch_.data(), m, k);
 
-            // Prepare workspace for deferred packing if needed
+            // Legacy deferred-packing guard; eager engines should never enter it.
             if (deferred_packing_)
             {
                 if (m == 1 && packed_.codebook_id == 19)
@@ -811,7 +749,8 @@ namespace llaminar2::cpu::native_vnni
 
         /// Owned copy of native quantized blocks for all weight formats.
         /// Layout: [N × blocks_per_row × block_size] contiguous bytes.
-        /// Used for deferred VNNI repacking.
+        /// Legacy deferred-packing storage. Kept only for defensive cleanup paths;
+        /// new CPU VNNI engines keep eager interleaved packed weights.
         std::vector<uint8_t> native_blocks_owned_;
 
         /// Pointer to native block data — either into native_blocks_owned_
@@ -821,7 +760,7 @@ namespace llaminar2::cpu::native_vnni
         /// Size in bytes of a single native quantized block (34 for Q8_0, 18 for Q4_0, etc.)
         size_t native_block_size_ = 0;
 
-        /// Whether deferred packing is active (interleaved data released, repack on demand)
+        /// Legacy flag. New CPU VNNI engine construction never sets this true.
         bool deferred_packing_ = false;
 
         // Cached scratch buffer for fused SwiGLU+GEMM (avoids malloc per decode token)
@@ -904,10 +843,10 @@ namespace llaminar2::cpu::native_vnni
         /// repacked by the standard repackNativeBlocksToInterleaved() function
         /// since packed_.codebook_id == 5 (Q4_1).
         ///
-        /// This enables MoE expert weights to use deferred packing instead of
-        /// permanent VNNI interleaved buffers, saving ~33 GB for 256-expert MoE.
+        /// Legacy deferred-packing helper retained for experiments only; normal
+        /// CPU VNNI engine construction does not call it.
         void synthesizeElementaryBlocksFromSuperblock(const TensorBase *weights,
-                                                       int row_start, int row_end)
+                                                      int row_start, int row_end)
         {
             if (row_start < 0)
                 row_start = 0;

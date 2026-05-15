@@ -135,6 +135,9 @@ namespace llaminar2
         /// Register a new expert slab (one weight group × one layer × one device).
         ExpertSlabRef registerExpertSlab(const ExpertSlabDescriptor &desc);
 
+        /// Find an existing expert slab with the same layer/role/device/dimensions.
+        std::optional<ExpertSlabRef> findExpertSlab(const ExpertSlabDescriptor &desc) const;
+
         /// Get the GEMM engine for a specific expert within a slab.
         ITensorGemm *expertGemmKernel(const ExpertSlabRef &slab, int expert_id) const;
 
@@ -159,6 +162,31 @@ namespace llaminar2
 
         /// Total number of populated expert engines across all slabs.
         size_t totalPopulatedExperts() const;
+
+        struct MemoryStats
+        {
+            size_t gemm_entries = 0;
+            size_t gemm_bytes = 0;
+            size_t sliced_entries = 0;
+            size_t sliced_bytes = 0;
+            size_t expert_slabs = 0;
+            size_t expert_engines = 0;
+            size_t expert_bytes = 0;
+            size_t expert_view_lifetimes = 0;
+            size_t expert_borrowed_views = 0;
+            size_t expert_view_raw_live = 0;
+            size_t embedding_entries = 0;
+            size_t embedding_bytes = 0;
+
+            size_t totalBytes() const
+            {
+                return gemm_bytes + sliced_bytes + expert_bytes + embedding_bytes;
+            }
+        };
+
+        /// Non-mutating prepared-weight memory accounting for diagnostics.
+        MemoryStats memoryStats() const;
+        void logMemorySummary(const char *context) const;
 
     private:
         struct Entry
@@ -270,7 +298,7 @@ namespace llaminar2
         {
             ExpertSlabDescriptor descriptor;
             ExpertSlabRef ref;
-            std::vector<ExpertEntry> experts; // Indexed by expert_id
+            std::vector<ExpertEntry> experts;     // Indexed by expert_id
             mutable std::shared_mutex slab_mutex; // Per-slab: shared for reads, exclusive for writes
         };
 

@@ -21,6 +21,32 @@ using json = nlohmann::json;
 
 namespace llaminar2
 {
+    namespace
+    {
+        class RequestCacheCleanup
+        {
+        public:
+            explicit RequestCacheCleanup(IOrchestrationRunner &runner) : runner_(runner) {}
+            ~RequestCacheCleanup() noexcept
+            {
+                try
+                {
+                    runner_.clearCache();
+                }
+                catch (const std::exception &e)
+                {
+                    LOG_WARN("[ChatCompletion] request cleanup failed: " << e.what());
+                }
+                catch (...)
+                {
+                    LOG_WARN("[ChatCompletion] request cleanup failed with unknown exception");
+                }
+            }
+
+        private:
+            IOrchestrationRunner &runner_;
+        };
+    }
 
     // =========================================================================
     // StreamingThinkSplitter
@@ -168,7 +194,7 @@ namespace llaminar2
         ChatCompletionResponse response;
         response.ok = false;
         response.http_status = 500;
-        json err = { {"error", {{"message", std::string("Request failed: ") + detail}, {"type", "server_error"}}} };
+        json err = {{"error", {{"message", std::string("Request failed: ") + detail}, {"type", "server_error"}}}};
         response.json_body = err.dump();
         return response;
     }
@@ -441,7 +467,7 @@ namespace llaminar2
         if (request.tools.is_array() && !request.tools.empty())
             tools_json = request.tools.dump();
         auto token_ids = tokenizer_.encodeChat(request.messages, /*add_generation_prompt=*/true,
-                                               tools_json);
+                                               tools_json, request.enable_thinking);
 
         if (token_ids.empty())
         {
@@ -487,6 +513,7 @@ namespace llaminar2
     try
     {
         ChatCompletionResponse response;
+        RequestCacheCleanup request_cleanup(runner_);
         std::vector<int32_t> input_ids;
 
         int prompt_tokens = setupInference(request, response, input_ids);
@@ -524,6 +551,14 @@ namespace llaminar2
             }
         }
 
+        auto rebalance_error = [&]() -> ChatCompletionResponse
+        {
+            response.http_status = 500;
+            json err = {{"error", {{"message", "MoE rebalance failed"}, {"type", "server_error"}}}};
+            response.json_body = err.dump();
+            return response;
+        };
+
         for (int i = 0; i < effective_max_tokens; ++i)
         {
             int32_t next_token;
@@ -534,7 +569,14 @@ namespace llaminar2
                 // Inject next token from stop-thinking sequence
                 next_token = stop_thinking_tokens[stop_thinking_idx++];
                 // Feed the injected token through the model (for KV cache consistency)
-                runner_.decodeStep(); // Run forward pass but discard the sampled token
+                GenerationResult result = runner_.decodeStep(); // Run forward pass but discard the sampled token
+                if (!result.success())
+                {
+                    response.http_status = 500;
+                    json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
+                    response.json_body = err.dump();
+                    return response;
+                }
             }
             else
             {
@@ -587,6 +629,9 @@ namespace llaminar2
                     }
                 }
             }
+
+            if (!runner_.maybeApplyMoERebalance())
+                return rebalance_error();
 
             completion_tokens++;
             generated_text += tokenizer_.decode_token(next_token);
@@ -684,6 +729,7 @@ namespace llaminar2
     try
     {
         ChatCompletionResponse response;
+        RequestCacheCleanup request_cleanup(runner_);
         std::vector<int32_t> input_ids;
 
         int prompt_tokens = setupInference(request, response, input_ids);
@@ -771,6 +817,18 @@ namespace llaminar2
             }
         }
 
+        auto emit_rebalance_error = [&]() -> ChatCompletionResponse
+        {
+            json error_data = {{"error", "MoE rebalance failed"}};
+            emit_chunk(error_data, "stop");
+            chunk_cb("data: [DONE]\n\n");
+            response.ok = false;
+            response.http_status = 500;
+            json err = {{"error", {{"message", "MoE rebalance failed"}, {"type", "server_error"}}}};
+            response.json_body = err.dump();
+            return response;
+        };
+
         for (int i = 0; i < effective_max_tokens; ++i)
         {
             int32_t next_token;
@@ -780,7 +838,18 @@ namespace llaminar2
             if (stop_thinking_idx > 0 && stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
             {
                 next_token = stop_thinking_tokens[stop_thinking_idx++];
-                runner_.decodeStep(); // Keep model state consistent
+                GenerationResult result = runner_.decodeStep(); // Keep model state consistent
+                if (!result.success())
+                {
+                    json error_data = {{"error", result.error}};
+                    emit_chunk(error_data, "stop");
+                    chunk_cb("data: [DONE]\n\n");
+                    response.ok = false;
+                    response.http_status = 500;
+                    json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
+                    response.json_body = err.dump();
+                    return response;
+                }
             }
             else
             {
@@ -815,6 +884,9 @@ namespace llaminar2
                 finish_reason = "stop";
                 break;
             }
+
+            if (!runner_.maybeApplyMoERebalance())
+                return emit_rebalance_error();
 
             std::string token_text = tokenizer_.decode_token(next_token);
 

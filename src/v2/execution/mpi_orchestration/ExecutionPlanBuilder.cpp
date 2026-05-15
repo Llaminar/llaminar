@@ -742,7 +742,10 @@ namespace llaminar2
             config.max_seq_len,
             config.activation_precision,
             config.kv_cache_precision,
-            config.fused_attention_backend);
+            config.fused_attention_backend,
+            config.moe_expert_mode,
+            config.moe_hot_expert_cache,
+            config.moe_rebalance);
 
         return plan;
     }
@@ -1006,7 +1009,10 @@ namespace llaminar2
             config.max_seq_len,
             config.activation_precision,
             config.kv_cache_precision,
-            config.fused_attention_backend);
+            config.fused_attention_backend,
+            config.moe_expert_mode,
+            config.moe_hot_expert_cache,
+            config.moe_rebalance);
 
         return plan;
     }
@@ -1331,7 +1337,8 @@ namespace llaminar2
             bool first = true;
             for (int sid : stage_ids)
             {
-                if (!first) oss << ", ";
+                if (!first)
+                    oss << ", ";
                 first = false;
                 oss << "stage" << sid;
                 for (const auto &s : topo.stages)

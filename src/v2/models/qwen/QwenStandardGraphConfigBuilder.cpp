@@ -411,18 +411,19 @@ namespace llaminar2
         // up to ~417. The Qwen2 defaults (K=512, V=32) cause severe clipping:
         //   V: 13.5% clip rate at layer 25, 8 of 28 layers clip
         //   K: layer 0 clips at 0.3%
-        const std::string &arch = ctx.architecture();
-        const bool is_qwen3_family = (arch == "qwen3" || arch == "Qwen3");
-        if (is_qwen3_family)
-        {
-            config.kv_cache_scale_k = 1024.0f; // K: ±512 representable (covers absmax ~417)
-            config.kv_cache_scale_v = 256.0f;   // V: ±128 representable (covers absmax ~64)
-        }
-        else
-        {
-            config.kv_cache_scale_k = 512.0f; // K: ±256 representable after VNNI headroom
-            config.kv_cache_scale_v = 32.0f;  // V: ±16 representable, excellent precision
-        }
+        // KV cache scales for Q16_1 quantization.
+        // K has large post-RoPE outliers in low-frequency dimensions; V values
+        // are typically smaller but grow in later layers of larger models.
+        //
+        // Previous Qwen2 defaults (K=512/V=32) caused clipping in prefill:
+        //   Qwen2.5-1.5B: K clips 3.7% at kv_cache_scale=512
+        //   Qwen2.5-7B:   K clips 1.6%, V clips 1.0% at kv_cache_scale=32
+        // Use the same scales across all Qwen variants — the activation
+        // magnitudes are architecture-dependent (RoPE frequencies, QK-norm)
+        // and these values provide ample headroom without measurable quality
+        // loss.
+        config.kv_cache_scale_k = 1024.0f; // K: ±512 representable (covers absmax ~417)
+        config.kv_cache_scale_v = 256.0f;  // V: ±128 representable (covers absmax ~64)
 
         return true;
     }

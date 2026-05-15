@@ -32,9 +32,11 @@
 #include "execution/compute_stages/stages/GatedRMSNormStage.h"
 #include "execution/compute_stages/stages/AttentionOutputGateStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
+#include "config/TensorParallelConfig.h"
 #include "kernels/IKVCache.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/HybridKVCacheConfig.h"
+#include "loaders/WeightPlan.h"
 #include "tensors/TensorKernels.h"
 #include "memory/BufferId.h"
 #include "../../../utils/TestTensorFactory.h"
@@ -241,6 +243,71 @@ TEST(Test__Qwen35Schema, CreatesValidSchema)
     EXPECT_EQ(schema.name, "qwen35");
     EXPECT_EQ(schema.version, "1.0");
     EXPECT_FALSE(schema.required_params.empty());
+}
+
+TEST(Test__Qwen35Schema, GDNValueHeadWeightsUseProportionalHeadSharding)
+{
+    Qwen35SchemaFactory factory;
+    WeightShardingConfig sharding = factory.getWeightShardingConfig();
+
+    EXPECT_EQ(sharding.getMode("blk.0.attn_gate.weight"),
+              WeightShardingMode::ColumnParallel);
+    EXPECT_EQ(sharding.getDimensionType("blk.0.attn_gate.weight"),
+              WeightDimensionType::ProportionalHeads);
+
+    EXPECT_EQ(sharding.getMode("blk.0.ssm_out.weight"),
+              WeightShardingMode::InputParallel);
+    EXPECT_EQ(sharding.getDimensionType("blk.0.ssm_out.weight"),
+              WeightDimensionType::ProportionalHeads);
+}
+
+TEST(Test__Qwen35Schema, GDNGlobalVHeadOffsetPrefersValueProjectionSlice)
+{
+    // Qwen3.5-4B dense GDN has 36 FA/Q heads but 32 GDN V heads.
+    // TP=2 rank 1 therefore starts at Q-head 18, but V-head 16.
+    GraphConfig config;
+    config.n_heads = 36;
+    config.head_start = 18;
+    config.local_rank = 1;
+    config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(2, 36, 4, 9216, 151936));
+
+    WeightBinding value_projection_binding;
+    value_projection_binding.slice.source_rows = 4096;
+    value_projection_binding.slice.row_start = 16 * 128;
+    value_projection_binding.slice.row_count = 16 * 128;
+
+    const int offset = Qwen35Graph::resolveGDNGlobalVHeadOffset(
+        &value_projection_binding,
+        128,
+        16,
+        32,
+        config,
+        nullptr);
+
+    EXPECT_EQ(offset, 16);
+    EXPECT_NE(offset, config.head_start);
+}
+
+TEST(Test__Qwen35Schema, GDNGlobalVHeadOffsetFallbackMapsQHeadsToVHeads)
+{
+    GraphConfig config;
+    config.n_heads = 36;
+    config.local_rank = 1;
+    config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(2, 36, 4, 9216, 151936));
+
+    const int offset = Qwen35Graph::resolveGDNGlobalVHeadOffset(
+        nullptr,
+        128,
+        16,
+        32,
+        config,
+        nullptr);
+
+    EXPECT_EQ(config.tp_config->forRank(1).head_start, 18);
+    EXPECT_EQ(offset, 16);
+    EXPECT_NE(offset, config.tp_config->forRank(1).head_start);
 }
 
 TEST(Test__Qwen35Schema, HasNamedTemplates)

@@ -76,7 +76,7 @@ extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 #include "rocm/attention/ROCmFlashAttentionKernelT.h"  // Flash Attention
 #include "rocm/gdn/ROCmGatedDeltaNet.h"                // GDN recurrence
 #include "rocm/gdn/ROCmShortConvolution.h"             // GDN short conv1d
-#include "rocm/moe/ROCmMoEKernel.h"                   // MoE routing/gather/scatter/gate/swiglu
+#include "rocm/moe/ROCmMoEKernel.h"                    // MoE routing/gather/scatter/gate/swiglu
 #endif
 
 namespace llaminar
@@ -2552,8 +2552,8 @@ namespace llaminar
                 moe_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
-                                                            << ":" << target_device.ordinal
-                                                            << " kernel=" << static_cast<const void *>(raw_ptr));
+                                                             << ":" << target_device.ordinal
+                                                             << " kernel=" << static_cast<const void *>(raw_ptr));
                 return raw_ptr;
             }
 
@@ -2972,7 +2972,6 @@ namespace llaminar
                         ++it;
                     }
                 }
-
             }
 
             void KernelFactory::clearCache()
@@ -3437,7 +3436,8 @@ namespace llaminar
                 if (!packed_weights)
                 {
                     LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
-                              "Failed to deserialize transferred blob (" << blob.size() << " bytes)");
+                              "Failed to deserialize transferred blob ("
+                              << blob.size() << " bytes)");
                     return nullptr;
                 }
 
@@ -3450,8 +3450,22 @@ namespace llaminar
                     return nullptr;
                 }
 
+                if (dynamic_cast<llaminar2::cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *>(
+                        packed_weights.get()))
+                {
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                              "Deferred/native-block CPU VNNI blobs are no longer accepted; expected eager interleaved packed weights");
+                    return nullptr;
+                }
+
                 auto kernel = std::make_shared<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
                     cpu_pw->takePacked());
+                if (!kernel->isValid())
+                {
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                              "Transferred CPU VNNI blob did not contain eager interleaved weights");
+                    return nullptr;
+                }
                 return kernel;
             }
 
@@ -3787,10 +3801,18 @@ namespace llaminar
                 std::string prec_str;
                 switch (precision)
                 {
-                case ::llaminar2::ActivationPrecision::FP32:   prec_str = "fp32"; break;
-                case ::llaminar2::ActivationPrecision::FP16:   prec_str = "fp16"; break;
-                case ::llaminar2::ActivationPrecision::Q8_1:   prec_str = "q8_1"; break;
-                default:                                       prec_str = "fp16"; break;
+                case ::llaminar2::ActivationPrecision::FP32:
+                    prec_str = "fp32";
+                    break;
+                case ::llaminar2::ActivationPrecision::FP16:
+                    prec_str = "fp16";
+                    break;
+                case ::llaminar2::ActivationPrecision::Q8_1:
+                    prec_str = "q8_1";
+                    break;
+                default:
+                    prec_str = "fp16";
+                    break;
                 }
 
                 return ::llaminar2::KVCacheMemoryEstimator::estimate(

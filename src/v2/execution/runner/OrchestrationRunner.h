@@ -161,6 +161,7 @@ namespace llaminar2
             const std::vector<int32_t> &prompt_tokens,
             int max_new_tokens,
             const SamplingParams &sampling) override;
+        bool maybeApplyMoERebalance() override;
 
         // =====================================================================
         // IOrchestrationRunner: Configuration
@@ -205,32 +206,35 @@ namespace llaminar2
         void resetExecutorStats() override;
 
         /// Get MoE rebalance controller from the underlying DGO (if any)
-        MoERebalanceController* moeRebalanceController() const;
+        MoERebalanceController *moeRebalanceController() const;
 
         /// Apply rebalanced expert masks to DGO's cached MoEExpertComputeStages
         void applyMoEExpertMasks(
-            const std::vector<std::vector<bool>>& masks,
-            const ReceivedWeightsMap& received = {});
+            const std::vector<std::vector<bool>> &masks,
+            const ReceivedWeightsMap &received = {});
 
         /// Apply MoE masks to every local device runner when the underlying
         /// runner is a RankOrchestrator. Returns true if handled.
-        bool applyMoEExpertMasksForAllLocalDevices(const MoERebalanceController& controller);
+        bool applyMoEExpertMasksForAllLocalDevices(const MoERebalanceController &controller);
 
         /// Apply precomputed MoE masks to every local device runner when the
         /// underlying runner is a RankOrchestrator. Returns true if handled.
         bool applyMoEExpertMasksForAllLocalDevices(
-            const std::vector<std::vector<std::vector<bool>>>& masks_by_socket);
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_socket);
 
         /// Set expert replica info for per-token dynamic dispatch
-        void setExpertReplicaSet(const ExpertReplicaSet& replicas, int socket_id);
+        void setExpertReplicaSet(const ExpertReplicaSet &replicas, int socket_id);
+
+        /// Apply one dynamic MoE rebalance cycle, including bounded hot replicas.
+        bool applyMoERebalanceWithReplicas(bool log_histogram_summary = false);
 
         /// Transfer packed weights for migrating experts via MPI.
         ReceivedWeightsMap transferExpertWeights(
-            const std::vector<ExpertMigration>& manifest, int num_layers);
+            const std::vector<ExpertMigration> &manifest, int num_layers);
 
         /// Transfer pre-packed weights for replicated experts via MPI (non-destructive).
         ReceivedWeightsMap transferReplicaWeights(
-            const ExpertReplicaSet& replicas, int num_layers);
+            const ExpertReplicaSet &replicas, int num_layers);
 
         /// Release raw expert weight data after initial VNNI packing.
         /// @return Total bytes freed/released
@@ -264,12 +268,13 @@ namespace llaminar2
          */
         enum class MPICommand : int32_t
         {
-            CLEAR_CACHE = 1,       ///< Clear KV cache
-            SET_SAMPLING = 2,      ///< Set sampling parameters (followed by SamplingParams broadcast)
-            PREFILL = 3,           ///< Prefill (followed by token count + tokens)
-            DECODE_STEP = 4,       ///< Run one decode step
-            SKIP_LOGITS_DECODE = 5, ///< Set skip-logits-gather for decode
-            SHUTDOWN = 99          ///< Exit the worker loop
+            CLEAR_CACHE = 1,         ///< Clear KV cache
+            SET_SAMPLING = 2,        ///< Set sampling parameters (followed by SamplingParams broadcast)
+            PREFILL = 3,             ///< Prefill (followed by token count + tokens)
+            DECODE_STEP = 4,         ///< Run one decode step
+            SKIP_LOGITS_DECODE = 5,  ///< Set skip-logits-gather for decode
+            APPLY_MOE_REBALANCE = 6, ///< Apply dynamic MoE rebalance/hot replicas
+            SHUTDOWN = 99            ///< Exit the worker loop
         };
 
         /**
@@ -464,13 +469,13 @@ namespace llaminar2
         // Inference state
         std::vector<int32_t> stop_tokens_;
         Sampler sampler_;
-        SamplingParams active_sampling_params_;      // Current sampling params for decodeStep()
-        SamplingParams recommended_sampling_params_; // Model-specific defaults
-        std::string stop_thinking_prompt_;            // Model-specific stop-thinking prompt
+        SamplingParams active_sampling_params_;                         // Current sampling params for decodeStep()
+        SamplingParams recommended_sampling_params_;                    // Model-specific defaults
+        std::string stop_thinking_prompt_;                              // Model-specific stop-thinking prompt
         ToolCallFormat tool_call_format_{ToolCallFormat::HERMES_2_PRO}; // Model-specific tool call format
-        int32_t last_token_{0};                      // Last token for decode step
-        bool prefill_logits_ready_{false};           // True after prefill(); first decodeStep() samples from existing logits
-        bool mpi_coordinated_mode_{false};           // When true, rank 0 broadcasts commands for worker loop
+        int32_t last_token_{0};                                         // Last token for decode step
+        bool prefill_logits_ready_{false};                              // True after prefill(); first decodeStep() samples from existing logits
+        bool mpi_coordinated_mode_{false};                              // When true, rank 0 broadcasts commands for worker loop
         std::shared_ptr<ITokenizer> tokenizer_;
     };
 

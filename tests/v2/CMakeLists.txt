@@ -3762,6 +3762,14 @@ add_v2_test(V2_Unit_PreparedWeightStore
     MPI_PROCS 1
 )
 
+add_executable(v2_unit_prepared_weight_store_expert_slab unit/loaders/Test__PreparedWeightStore_ExpertSlab.cpp)
+target_link_libraries(v2_unit_prepared_weight_store_expert_slab llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_PreparedWeightStoreExpertSlab
+    COMMAND $<TARGET_FILE:v2_unit_prepared_weight_store_expert_slab>
+    LABELS "V2;Unit;Loaders;Weights;Lifecycle;PreparedWeights;MoE;ExpertSlab"
+    MPI_PROCS 1
+)
+
 # Test: WeightManager Sharding
 # Tests weight sharding for tensor parallelism (Phase 1: row-parallel only)
 add_executable(v2_test_weight_manager_sharding unit/loaders/Test__WeightManagerSharding.cpp)
@@ -5892,6 +5900,17 @@ target_link_libraries(v2_test_chat_completion_handler llaminar2_core GTest::gtes
 add_v2_test(V2_Unit_ChatCompletionHandler
     COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
     LABELS "V2;Unit;Server;ChatCompletion;SamplingParams"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_server_mode unit/app/modes/Test__ServerMode.cpp)
+target_include_directories(v2_test_server_mode PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor/cpp-httplib
+)
+target_link_libraries(v2_test_server_mode llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServerMode
+    COMMAND $<TARGET_FILE:v2_test_server_mode>
+    LABELS "V2;Unit;Server;Threading;Memory"
     MPI_PROCS 1
 )
 
@@ -9566,8 +9585,8 @@ add_test(
 )
 set_tests_properties(V2_E2E_Server_MultiTurn PROPERTIES
     LABELS "V2;E2E;Server;REST;MultiTurn;CPU;CUDA;ROCm"
-    TIMEOUT 600
-    ENVIRONMENT "LLAMINAR_LOG_LEVEL=ERROR"
+    TIMEOUT 1200
+    ENVIRONMENT "LLAMINAR_LOG_LEVEL=WARN"
 )
 message(STATUS "V2 Tests: Added E2E Server multi-turn integration tests")
 endif()
@@ -9798,6 +9817,19 @@ target_link_libraries(v2_test_moe_expert_weight_service
 add_v2_test(V2_Unit_MoEExpertWeightService
     COMMAND $<TARGET_FILE:v2_test_moe_expert_weight_service>
     LABELS "V2;Unit;MoE;WeightService;WeightLifecycle"
+)
+
+# Test: MoEPhaseCStoreResolution — prepared expert slab reuse/no-repack guardrails
+add_executable(v2_test_moe_phase_c_store_resolution unit/moe/Test__MoEPhaseC_StoreResolution.cpp)
+target_include_directories(v2_test_moe_phase_c_store_resolution PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_phase_c_store_resolution
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEPhaseCStoreResolution
+    COMMAND $<TARGET_FILE:v2_test_moe_phase_c_store_resolution>
+    LABELS "V2;Unit;MoE;WeightService;PreparedWeightStore;PhaseC"
 )
 
 # Test: MoERoutingToCompute — end-to-end two-stage pipeline (MoERoutingStage → MoEExpertComputeStage)

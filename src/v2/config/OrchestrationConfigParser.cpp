@@ -109,6 +109,116 @@ namespace llaminar2
             throw std::invalid_argument("Invalid boolean value: '" + value + "'");
         }
 
+        MoEExpertMode parseMoEExpertModeValue(const std::string &value)
+        {
+            auto parsed = parseMoEExpertMode(value);
+            if (!parsed)
+            {
+                throw std::invalid_argument(
+                    "Invalid MoE expert mode: '" + value +
+                    "' (valid: expert-parallel, tensor-parallel, replicated)");
+            }
+            return *parsed;
+        }
+
+        MoERebalanceRuntimeMode parseMoERebalanceModeValue(const std::string &value)
+        {
+            auto parsed = parseMoERebalanceRuntimeMode(value);
+            if (!parsed)
+            {
+                throw std::invalid_argument(
+                    "Invalid MoE rebalance mode: '" + value +
+                    "' (valid: off, observe, dynamic)");
+            }
+            return *parsed;
+        }
+
+        MoEHotExpertCacheConfig parseMoEHotExpertCacheValue(const std::string &value)
+        {
+            const std::string normalized = normalizeToken(value);
+            MoEHotExpertCacheConfig config;
+
+            if (normalized == "off" || normalized == "disabled" || normalized == "none" || normalized == "false")
+            {
+                config.kind = MoEHotExpertCacheConfig::Kind::Off;
+                config.count = 0;
+                config.percent = 0.0f;
+                return config;
+            }
+
+            std::string trimmed_value = trim(value);
+            if (!trimmed_value.empty() && trimmed_value.back() == '%')
+            {
+                const std::string number = trim(trimmed_value.substr(0, trimmed_value.size() - 1));
+                try
+                {
+                    config.kind = MoEHotExpertCacheConfig::Kind::Percent;
+                    config.percent = std::stof(number);
+                }
+                catch (const std::exception &)
+                {
+                    throw std::invalid_argument("Invalid percent value for --moe-hot-expert-cache: '" + value + "'");
+                }
+                if (config.percent < 0.0f || config.percent > 100.0f)
+                {
+                    throw std::invalid_argument("--moe-hot-expert-cache percent must be in [0, 100], got '" + value + "'");
+                }
+                return config;
+            }
+
+            try
+            {
+                config.kind = MoEHotExpertCacheConfig::Kind::Count;
+                config.count = std::stoi(trimmed_value);
+            }
+            catch (const std::exception &)
+            {
+                throw std::invalid_argument(
+                    "Invalid value for --moe-hot-expert-cache: '" + value +
+                    "' (expected count, percent like 10%, or off)");
+            }
+            if (config.count < 0)
+            {
+                throw std::invalid_argument("--moe-hot-expert-cache count must be >= 0");
+            }
+            return config;
+        }
+
+        void applyMoEYamlKey(OrchestrationConfig &config,
+                             const std::string &key,
+                             const std::string &value)
+        {
+            const std::string normalized_key = normalizeToken(key);
+            if (normalized_key == "expert_mode")
+            {
+                config.moe_expert_mode = parseMoEExpertModeValue(value);
+            }
+            else if (normalized_key == "hot_expert_cache")
+            {
+                config.moe_hot_expert_cache = parseMoEHotExpertCacheValue(value);
+            }
+            else if (normalized_key == "rebalance")
+            {
+                config.moe_rebalance.mode = parseMoERebalanceModeValue(value);
+            }
+            else if (normalized_key == "rebalance_window")
+            {
+                config.moe_rebalance.window_size = std::stoi(value);
+            }
+            else if (normalized_key == "rebalance_max_window")
+            {
+                config.moe_rebalance.max_window_size = std::stoi(value);
+            }
+            else if (normalized_key == "rebalance_window_growth")
+            {
+                config.moe_rebalance.window_growth_factor = std::stof(value);
+            }
+            else if (normalized_key == "release_raw_expert_weights")
+            {
+                config.moe_rebalance.release_raw_expert_weights = parseBoolValue(value);
+            }
+        }
+
         std::shared_ptr<MoEExpertParallelPlan> ensureMoEExpertParallelPlan(OrchestrationConfig &config)
         {
             if (!config.moe_expert_parallel_plan)
@@ -1059,6 +1169,84 @@ namespace llaminar2
             .setter = setters::assignBoolTrue(&OrchestrationConfig::moe_sparse_experts_cpu),
         });
         spec.add({
+            .long_name = "--moe-expert-mode",
+            .category = "MoE Configuration",
+            .value_label = "<mode>",
+            .description = "Routed expert execution: expert-parallel (default), tensor-parallel, replicated",
+            .valid_values = {"expert-parallel", "tensor-parallel", "replicated"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_expert_mode = parseMoEExpertModeValue(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-hot-expert-cache",
+            .category = "MoE Configuration",
+            .value_label = "<count|percent|off>",
+            .description = "Remote hot expert replica cap per rank/device (default: 10%)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_hot_expert_cache = parseMoEHotExpertCacheValue(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-rebalance",
+            .category = "MoE Configuration",
+            .value_label = "<mode>",
+            .description = "MoE decode rebalance mode: off, observe, dynamic (default)",
+            .valid_values = {"off", "observe", "dynamic"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.mode = parseMoERebalanceModeValue(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-rebalance-window",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Decode histogram window size for MoE rebalance (default: 256)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.window_size = std::stoi(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-rebalance-max-window",
+            .category = "MoE Configuration",
+            .value_label = "<tokens>",
+            .description = "Maximum adaptive MoE rebalance window (default: 4096; 0 disables growth)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.max_window_size = std::stoi(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-rebalance-window-growth",
+            .category = "MoE Configuration",
+            .value_label = "<factor>",
+            .description = "Adaptive MoE rebalance window growth factor (default: 1.5)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.window_growth_factor = std::stof(v);
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-release-raw-expert-weights",
+            .category = "MoE Configuration",
+            .description = "Release raw routed expert tensors after prepared weights are resident",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.moe_rebalance.release_raw_expert_weights = true;
+                }),
+        });
+        spec.add({
             .long_name = "--moe-expert-overlay",
             .category = "MoE Configuration",
             .value_label = "<kind>",
@@ -1556,6 +1744,14 @@ namespace llaminar2
                 value = value.substr(1, value.size() - 2);
             }
 
+            const std::string normalized_section = normalizeToken(current_section);
+            const std::string normalized_key = normalizeToken(key);
+            if (normalized_section == "moe")
+            {
+                applyMoEYamlKey(config, normalized_key, value);
+                continue;
+            }
+
             // Map YAML keys to config fields
             if (key == "dry_run")
             {
@@ -1697,6 +1893,34 @@ namespace llaminar2
             else if (key == "kv_cache_precision")
             {
                 config.kv_cache_precision = value;
+            }
+            else if (normalized_key == "moe_expert_mode")
+            {
+                config.moe_expert_mode = parseMoEExpertModeValue(value);
+            }
+            else if (normalized_key == "moe_hot_expert_cache")
+            {
+                config.moe_hot_expert_cache = parseMoEHotExpertCacheValue(value);
+            }
+            else if (normalized_key == "moe_rebalance")
+            {
+                config.moe_rebalance.mode = parseMoERebalanceModeValue(value);
+            }
+            else if (normalized_key == "moe_rebalance_window")
+            {
+                config.moe_rebalance.window_size = std::stoi(value);
+            }
+            else if (normalized_key == "moe_rebalance_max_window")
+            {
+                config.moe_rebalance.max_window_size = std::stoi(value);
+            }
+            else if (normalized_key == "moe_rebalance_window_growth")
+            {
+                config.moe_rebalance.window_growth_factor = std::stof(value);
+            }
+            else if (normalized_key == "moe_release_raw_expert_weights")
+            {
+                config.moe_rebalance.release_raw_expert_weights = parseBoolValue(value);
             }
             else if (key == "mpi_profile" || key == "mpi-profile")
             {

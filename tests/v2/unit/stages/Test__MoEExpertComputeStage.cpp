@@ -143,20 +143,21 @@ protected:
     }
     /// Compute routing results and return as FP32 tensors for MoEExpertComputeStage input.
     /// Runs IMoEKernel::route() directly, converts indices to float.
-    struct RoutingResult {
-        std::shared_ptr<FP32Tensor> indices;  // float-cast expert IDs [seq_len * top_k]
-        std::shared_ptr<FP32Tensor> weights;  // normalized weights [seq_len * top_k]
+    struct RoutingResult
+    {
+        std::shared_ptr<FP32Tensor> indices; // float-cast expert IDs [seq_len * top_k]
+        std::shared_ptr<FP32Tensor> weights; // normalized weights [seq_len * top_k]
     };
 
-    RoutingResult computeRouting(TensorBase* input, TensorBase* gate_weights,
+    RoutingResult computeRouting(TensorBase *input, TensorBase *gate_weights,
                                  int seq_len, int d_model, int num_experts, int top_k,
                                  bool norm_topk_prob = true)
     {
         using KernelFactory = llaminar::v2::kernels::KernelFactory;
-        auto* kernel = KernelFactory::getOrCreateMoEKernel(DeviceId::cpu());
+        auto *kernel = KernelFactory::getOrCreateMoEKernel(DeviceId::cpu());
         MoERoutingResult routing;
         kernel->route(input->data(), gate_weights->data(), seq_len, d_model,
-                     num_experts, top_k, norm_topk_prob, routing);
+                      num_experts, top_k, norm_topk_prob, routing);
 
         const size_t n = static_cast<size_t>(seq_len) * top_k;
         auto indices = std::make_shared<FP32Tensor>(std::vector<size_t>{n, 1});
@@ -164,7 +165,7 @@ protected:
         for (size_t i = 0; i < n; ++i)
             indices->mutable_data()[i] = static_cast<float>(routing.expert_indices[i]);
         std::copy(routing.expert_weights.begin(), routing.expert_weights.end(),
-                 weights->mutable_data());
+                  weights->mutable_data());
         return {indices, weights};
     }
 };
@@ -624,6 +625,49 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_NullWeightsReturnsError)
     params.num_experts = NUM_EXPERTS;
     params.top_k = TOP_K;
     params.expert_intermediate = INTERMEDIATE;
+
+    MoEExpertComputeStage stage(params);
+    EXPECT_FALSE(stage.execute(cpu_ctx_.get()));
+}
+
+TEST_F(MoEExpertComputeStageTest, MoEFFN_CPUActiveExpertWithoutPreparedEngineReturnsError)
+{
+    const int d = 256;
+    const int inter = 256;
+    const int seq = 2;
+    const int experts = 4;
+    const int topk = 1;
+
+    auto input = TestTensorFactory::createFP32Random({seq, d}, -0.5f, 0.5f, 260);
+    auto output = TestTensorFactory::createFP32({seq, d});
+    auto gate_exps = createExpertQ4K(experts, inter, d, 261);
+    auto up_exps = createExpertQ4K(experts, inter, d, 262);
+    auto down_exps = createExpertQ4K(experts, d, inter, 263);
+
+    auto routing_indices = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq * topk), 1});
+    auto routing_weights = std::make_shared<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(seq * topk), 1});
+    for (int i = 0; i < seq * topk; ++i)
+    {
+        routing_indices->mutable_data()[i] = 0.0f;
+        routing_weights->mutable_data()[i] = 1.0f;
+    }
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.routing_indices = routing_indices.get();
+    params.routing_weights = routing_weights.get();
+    params.gate_exps = gate_exps.get();
+    params.up_exps = up_exps.get();
+    params.down_exps = down_exps.get();
+    params.output = output.get();
+    params.seq_len = seq;
+    params.d_model = d;
+    params.num_experts = experts;
+    params.top_k = topk;
+    params.expert_intermediate = inter;
+
+    ASSERT_TRUE(MoEExpertComputeStage::extractExpertViews(params));
 
     MoEExpertComputeStage stage(params);
     EXPECT_FALSE(stage.execute(cpu_ctx_.get()));

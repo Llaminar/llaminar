@@ -89,6 +89,21 @@ namespace llaminar2
             DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr) override;
 
+            /**
+             * @brief Resolve the global GDN value-head offset for a local TP shard.
+             *
+             * GDN value heads can have a different count from FA/Q attention heads,
+             * so recurrence state indexing must follow the actual value-projection
+             * shard rather than GraphConfig::head_start when slice metadata exists.
+             */
+            static int resolveGDNGlobalVHeadOffset(
+                const WeightBinding *value_projection_binding,
+                int d_v,
+                int n_v_heads,
+                int n_v_heads_full,
+                const GraphConfig &config,
+                const IMPIContext *mpi_ctx);
+
     private:
         // =====================================================================
         // FA (Full Attention) Sub-Graph Building

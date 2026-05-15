@@ -92,6 +92,7 @@ namespace llaminar2
             (is_pp_non_embedding_stage && (input.position_ids != nullptr));
         const bool forward_cache_eligible =
             config_.cache_config.enabled &&
+            is_decode &&
             !has_unified_pp &&
             has_stable_forward_inputs &&
             (is_standard_path || is_partial_pp_path);

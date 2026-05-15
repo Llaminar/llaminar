@@ -4,6 +4,7 @@
 #include "../tensors/TensorKernels.h"
 
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace llaminar2
@@ -58,8 +59,10 @@ namespace llaminar2
 
     PreparedWeightKind PreparedWeightStore::inferPreparedKind(DeviceId device) const
     {
-        if (device.is_cuda()) return PreparedWeightKind::CudaInt8PackedGemm;
-        if (device.is_rocm()) return PreparedWeightKind::RocmInt8PackedGemm;
+        if (device.is_cuda())
+            return PreparedWeightKind::CudaInt8PackedGemm;
+        if (device.is_rocm())
+            return PreparedWeightKind::RocmInt8PackedGemm;
         return PreparedWeightKind::CpuPackedGemm;
     }
 
@@ -360,9 +363,9 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = entries_.find(ref.binding_id);
         if (it != entries_.end())
-                {
+        {
             return samePreparedRef(it->second.ref, ref);
-                }
+        }
 
         auto emb_it = embedding_entries_.find(ref.binding_id);
         if (emb_it == embedding_entries_.end())
@@ -396,9 +399,9 @@ namespace llaminar2
         for (const auto &[id, entry] : entries_)
         {
             LOG_ERROR(prefix << "   id=" << id
-                      << " name='" << entry.binding.identity.canonical_name << "'"
-                      << " tensor_ptr=" << (void *)entry.binding.tensor
-                      << " has_handle=" << (entry.activeHandle() != nullptr));
+                             << " name='" << entry.binding.identity.canonical_name << "'"
+                             << " tensor_ptr=" << (void *)entry.binding.tensor
+                             << " has_handle=" << (entry.activeHandle() != nullptr));
         }
     }
 
@@ -409,6 +412,7 @@ namespace llaminar2
         fused_cache_.clear();
         embedding_entries_.clear();
         sliced_cache_.clear();
+        expert_slabs_.clear();
     }
 
     PreparedWeightStore::~PreparedWeightStore()
@@ -423,16 +427,19 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
 
         if (entries_.empty() && fused_cache_.empty() &&
-            embedding_entries_.empty() && sliced_cache_.empty())
+            embedding_entries_.empty() && sliced_cache_.empty() &&
+            expert_slabs_.empty())
             return;
 
         // This store owns prepared handles directly via shared_ptr. Clearing entries_
-        // releases owned kernels through PreparedGemmWeights::owned_kernel.
+        // releases owned kernels through PreparedGemmWeights::owned_kernel. Expert
+        // slabs own MoE expert GEMM engines through ExpertEntry::engine_lifetime.
 
         entries_.clear();
         fused_cache_.clear();
         embedding_entries_.clear();
         sliced_cache_.clear();
+        expert_slabs_.clear();
     }
 
     // =========================================================================
@@ -461,6 +468,27 @@ namespace llaminar2
         entry->ref = ref;
         expert_slabs_[ref.slab_id] = std::move(entry);
         return ref;
+    }
+
+    std::optional<ExpertSlabRef> PreparedWeightStore::findExpertSlab(const ExpertSlabDescriptor &desc) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &[_, entry] : expert_slabs_)
+        {
+            const auto &candidate = entry->descriptor;
+            if (candidate.layer_idx == desc.layer_idx &&
+                candidate.role == desc.role &&
+                candidate.device == desc.device &&
+                candidate.num_experts == desc.num_experts &&
+                candidate.local_expert_start == desc.local_expert_start &&
+                candidate.local_expert_count == desc.local_expert_count &&
+                candidate.rows_per_expert == desc.rows_per_expert &&
+                candidate.cols_per_expert == desc.cols_per_expert)
+            {
+                return entry->ref;
+            }
+        }
+        return std::nullopt;
     }
 
     ITensorGemm *PreparedWeightStore::expertGemmKernel(const ExpertSlabRef &slab, int expert_id) const
@@ -589,5 +617,80 @@ namespace llaminar2
             }
         }
         return count;
+    }
+
+    PreparedWeightStore::MemoryStats PreparedWeightStore::memoryStats() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        MemoryStats stats;
+
+        for (const auto &[_, entry] : entries_)
+        {
+            const auto *handle = entry.activeHandle();
+            auto *kernel = (handle && handle->prepared_weights) ? handle->prepared_weights->kernel : nullptr;
+            if (!kernel && handle && handle->prepared_weights && handle->prepared_weights->owned_kernel)
+                kernel = handle->prepared_weights->owned_kernel.get();
+            if (!kernel)
+                continue;
+            ++stats.gemm_entries;
+            stats.gemm_bytes += kernel->packedWeightBytes();
+        }
+
+        for (const auto &[_, kernel] : sliced_cache_)
+        {
+            if (!kernel)
+                continue;
+            ++stats.sliced_entries;
+            stats.sliced_bytes += kernel->packedWeightBytes();
+        }
+
+        stats.expert_slabs = expert_slabs_.size();
+        for (const auto &[_, entry] : expert_slabs_)
+        {
+            std::shared_lock<std::shared_mutex> slab_lock(entry->slab_mutex);
+            for (const auto &expert : entry->experts)
+            {
+                if (!expert.available)
+                    continue;
+                ++stats.expert_engines;
+                if (expert.engine)
+                    stats.expert_bytes += expert.engine->packedWeightBytes();
+                if (expert.view_lifetime)
+                {
+                    ++stats.expert_view_lifetimes;
+                    if (expert.view_lifetime->is_view())
+                        ++stats.expert_borrowed_views;
+                    else if (!expert.view_lifetime->is_raw_data_released())
+                        ++stats.expert_view_raw_live;
+                }
+            }
+        }
+
+        for (const auto &[_, entry] : embedding_entries_)
+        {
+            const auto *handle = entry.activeHandle();
+            if (!handle || !handle->weights)
+                continue;
+            ++stats.embedding_entries;
+            stats.embedding_bytes += handle->weights->byte_size;
+        }
+
+        return stats;
+    }
+
+    void PreparedWeightStore::logMemorySummary(const char *context) const
+    {
+        const auto stats = memoryStats();
+        LOG_INFO("[PreparedWeightStore] Memory summary"
+                 << (context ? std::string(" (") + context + ")" : std::string{})
+                 << ": total=" << (stats.totalBytes() >> 20) << " MB"
+                 << " gemm=" << (stats.gemm_bytes >> 20) << " MB/" << stats.gemm_entries
+                 << " sliced=" << (stats.sliced_bytes >> 20) << " MB/" << stats.sliced_entries
+                 << " experts=" << (stats.expert_bytes >> 20) << " MB/" << stats.expert_engines
+                 << " slabs=" << stats.expert_slabs
+                 << " expert_views=" << stats.expert_view_lifetimes
+                 << " borrowed_views=" << stats.expert_borrowed_views
+                 << " raw_live_views=" << stats.expert_view_raw_live
+                 << " embeddings=" << (stats.embedding_bytes >> 20) << " MB/" << stats.embedding_entries);
     }
 }

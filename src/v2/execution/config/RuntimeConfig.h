@@ -15,6 +15,9 @@
 #include "../../utils/Logger.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <optional>
+#include <sstream>
 #include <string>
 
 namespace llaminar2
@@ -380,6 +383,143 @@ namespace llaminar2
     }
 
     /**
+     * @brief Routed MoE expert execution mode for the standard Qwen3.5 MoE path.
+     */
+    enum class MoEExpertMode
+    {
+        ExpertParallel, ///< Split whole expert ids across TP participants
+        TensorParallel, ///< Shard every selected expert internally (not implemented yet)
+        Replicated      ///< Keep routed expert tensors/execution fully replicated
+    };
+
+    inline const char *moeExpertModeToString(MoEExpertMode mode)
+    {
+        switch (mode)
+        {
+        case MoEExpertMode::ExpertParallel:
+            return "expert-parallel";
+        case MoEExpertMode::TensorParallel:
+            return "tensor-parallel";
+        case MoEExpertMode::Replicated:
+            return "replicated";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MoEExpertMode> parseMoEExpertMode(const std::string &value)
+    {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        std::replace(lower.begin(), lower.end(), '_', '-');
+
+        if (lower == "expert-parallel" || lower == "ep")
+            return MoEExpertMode::ExpertParallel;
+        if (lower == "tensor-parallel" || lower == "tp" || lower == "tensor-parallel-experts")
+            return MoEExpertMode::TensorParallel;
+        if (lower == "replicated" || lower == "replicate" || lower == "full")
+            return MoEExpertMode::Replicated;
+        return std::nullopt;
+    }
+
+    /**
+     * @brief User-facing bounded hot expert cache configuration.
+     */
+    struct MoEHotExpertCacheConfig
+    {
+        enum class Kind
+        {
+            Percent,
+            Count,
+            Off
+        };
+
+        Kind kind = Kind::Percent;
+        int count = 0;
+        float percent = 10.0f;
+
+        bool enabled() const { return kind != Kind::Off; }
+
+        int resolveCap(int num_experts, bool dynamic_rebalance_enabled) const
+        {
+            if (kind == Kind::Off || num_experts <= 0)
+                return 0;
+            if (kind == Kind::Count)
+                return std::max(0, std::min(count, num_experts));
+
+            const float clamped = std::max(0.0f, std::min(percent, 100.0f));
+            int resolved = static_cast<int>(std::floor(static_cast<float>(num_experts) * clamped / 100.0f));
+            if (dynamic_rebalance_enabled && clamped > 0.0f && resolved == 0)
+                resolved = 1;
+            return std::max(0, std::min(resolved, num_experts));
+        }
+
+        std::string toString() const
+        {
+            if (kind == Kind::Off)
+                return "off";
+            if (kind == Kind::Count)
+                return std::to_string(count);
+            std::ostringstream oss;
+            oss << percent << "%";
+            return oss.str();
+        }
+    };
+
+    /**
+     * @brief MoE decode histogram and dynamic rebalance configuration.
+     */
+    enum class MoERebalanceRuntimeMode
+    {
+        Off,
+        Observe,
+        Dynamic
+    };
+
+    inline const char *moeRebalanceRuntimeModeToString(MoERebalanceRuntimeMode mode)
+    {
+        switch (mode)
+        {
+        case MoERebalanceRuntimeMode::Off:
+            return "off";
+        case MoERebalanceRuntimeMode::Observe:
+            return "observe";
+        case MoERebalanceRuntimeMode::Dynamic:
+            return "dynamic";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MoERebalanceRuntimeMode> parseMoERebalanceRuntimeMode(const std::string &value)
+    {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        std::replace(lower.begin(), lower.end(), '_', '-');
+
+        if (lower == "off" || lower == "disabled" || lower == "false")
+            return MoERebalanceRuntimeMode::Off;
+        if (lower == "observe" || lower == "observer")
+            return MoERebalanceRuntimeMode::Observe;
+        if (lower == "dynamic" || lower == "on" || lower == "true")
+            return MoERebalanceRuntimeMode::Dynamic;
+        return std::nullopt;
+    }
+
+    struct MoERebalanceRuntimeConfig
+    {
+        MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::Dynamic;
+        int window_size = 256;
+        int max_window_size = 4096;
+        float window_growth_factor = 1.5f;
+        bool release_raw_expert_weights = false;
+    };
+
+    /**
      * @brief Canonical runtime configuration carried through the config chain
      *
      * RuntimeConfig holds pre-parsed runtime parameters that flow from
@@ -413,6 +553,15 @@ namespace llaminar2
         /// Explicit KV cache precision (AUTO defaults to FP16)
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+        /// Routed MoE expert execution mode.
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+        /// Bounded remote hot-expert cache configuration for dynamic EP.
+        MoEHotExpertCacheConfig moe_hot_expert_cache;
+
+        /// MoE rebalance runtime configuration.
+        MoERebalanceRuntimeConfig moe_rebalance;
+
         RuntimeConfig() = default;
 
         explicit RuntimeConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
@@ -424,13 +573,19 @@ namespace llaminar2
             int max_seq_len,
             const std::string &activation_precision_str,
             const std::string &kv_cache_precision_str,
-            FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT)
+            FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT,
+            MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel,
+            MoEHotExpertCacheConfig moe_hot_expert_cache = {},
+            MoERebalanceRuntimeConfig moe_rebalance = {})
         {
             RuntimeConfig rc;
             rc.max_seq_len = max_seq_len;
             rc.activation_precision = parseActivationPrecision(activation_precision_str);
             rc.kv_cache_precision = parseKVCachePrecision(kv_cache_precision_str);
             rc.fused_attention_backend = fused_backend;
+            rc.moe_expert_mode = moe_expert_mode;
+            rc.moe_hot_expert_cache = moe_hot_expert_cache;
+            rc.moe_rebalance = moe_rebalance;
             return rc;
         }
     };

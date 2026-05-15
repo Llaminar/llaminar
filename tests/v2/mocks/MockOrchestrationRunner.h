@@ -59,6 +59,7 @@ namespace llaminar2::test
                      int max_new_tokens,
                      const SamplingParams &sampling),
                     (override));
+        MOCK_METHOD(bool, maybeApplyMoERebalance, (), (override));
 
         // Configuration
         MOCK_METHOD(const RankExecutionPlan &, executionPlan, (), (const, override));

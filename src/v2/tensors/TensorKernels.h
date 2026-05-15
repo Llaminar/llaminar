@@ -570,10 +570,10 @@ namespace llaminar2
          */
         struct FusedExpertDownDesc
         {
-            ITensorGemm *kernel;   ///< Down projection GEMM engine (with packed weights)
-            const float *input;    ///< Per-expert FP32 input [k]
-            float *output;         ///< Per-expert FP32 output [n]
-            int n;                 ///< Output dimension (d_model)
+            ITensorGemm *kernel; ///< Down projection GEMM engine (with packed weights)
+            const float *input;  ///< Per-expert FP32 input [k]
+            float *output;       ///< Per-expert FP32 output [n]
+            int n;               ///< Output dimension (d_model)
         };
 
         /**
@@ -1238,6 +1238,14 @@ namespace llaminar2
          * @return true if kernel has valid weights and can compute
          */
         virtual bool hasWeights() const { return true; }
+
+        /**
+         * @brief Bytes of owned packed/prepared weight data held by this engine.
+         *
+         * This is a non-mutating accounting hook. Implementations should not
+         * clone, detach, or materialize lazy state just to answer this query.
+         */
+        virtual size_t packedWeightBytes() const { return 0; }
 
         // =============================================================================
         // Weight Dimension Accessors (for Tensor Parallelism)

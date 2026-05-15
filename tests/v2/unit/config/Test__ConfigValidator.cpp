@@ -135,6 +135,33 @@ TEST(Test__ConfigValidator, DefaultConfig_NoErrors)
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
+TEST(Test__ConfigValidator, MoE_DefaultExpertParallel_NoErrors)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+    EXPECT_TRUE(noErrors(v, cfg));
+}
+
+TEST(Test__ConfigValidator, MoE_ReplicatedExperts_NoErrors)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.moe_expert_mode = MoEExpertMode::Replicated;
+
+    EXPECT_TRUE(noErrors(v, cfg));
+}
+
+TEST(Test__ConfigValidator, MoE_TensorParallelExperts_NotImplemented)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.moe_expert_mode = MoEExpertMode::TensorParallel;
+
+    EXPECT_TRUE(ruleFiresFor(v, "moe-tensor-parallel-experts-not-implemented", cfg));
+}
+
 TEST(Test__ConfigValidator, StandardValidator_HasRules)
 {
     auto v = ConfigValidator::createStandard();

@@ -362,10 +362,24 @@ namespace llaminar2
             int shared_intermediate_size = 0; ///< Shared expert FFN intermediate dim
             bool shared_expert_gate = false;  ///< Has sigmoid gating on shared expert
 
+            /// Routed expert execution mode for the standard graph path.
+            MoEExpertMode expert_mode = MoEExpertMode::ExpertParallel;
+
+            /// Static contiguous expert-id range owned by this TP participant.
+            /// count < 0 means the routed expert output is full/replicated.
+            int local_expert_start = 0;
+            int local_expert_count = -1;
+
+            /// Bounded remote hot-expert cache configuration for dynamic EP.
+            MoEHotExpertCacheConfig hot_expert_cache;
+
+            /// Runtime rebalance config carried for diagnostics and controller setup.
+            MoERebalanceRuntimeConfig rebalance_config;
+
             /// Optional histogram for decode expert tracking.
             /// Set by the orchestrator when MoE rebalancing is enabled.
             /// Lifetime managed by MoERebalanceController. Not owned.
-            DecodeExpertHistogram* decode_histogram = nullptr;
+            DecodeExpertHistogram *decode_histogram = nullptr;
 
             /// MoE rebalancing mode (OFF / OBSERVE / DYNAMIC).
             /// Set by InferenceRunnerFactory from MoERebalanceController.
@@ -694,7 +708,8 @@ namespace llaminar2
         weights.lm_head = legacyTensor(bindings.lm_head);
         if (bindings.get_layer_weights)
         {
-            weights.get_layer_weights = [get_layer_weights = bindings.get_layer_weights](int layer_idx) {
+            weights.get_layer_weights = [get_layer_weights = bindings.get_layer_weights](int layer_idx)
+            {
                 return toLegacyLayerWeights(get_layer_weights(layer_idx));
             };
         }
@@ -721,9 +736,11 @@ namespace llaminar2
         bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
         bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");
         bindings.lm_head = optionalGlobalBinding(weight_set, "output.weight");
-        bindings.get_layer_weights = [&weight_set](int layer_idx) {
+        bindings.get_layer_weights = [&weight_set](int layer_idx)
+        {
             LayerWeightBindings layer;
-            auto get = [&weight_set, layer_idx](const std::string &suffix) {
+            auto get = [&weight_set, layer_idx](const std::string &suffix)
+            {
                 return weight_set.optionalLayer(layer_idx, suffix);
             };
 

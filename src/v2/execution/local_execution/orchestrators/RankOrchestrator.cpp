@@ -247,6 +247,9 @@ namespace llaminar2
         config.batch_size = plan.runtime.batch_size;
         config.activation_precision = plan.runtime.activation_precision;
         config.kv_cache_precision = plan.runtime.kv_cache_precision;
+        config.moe_expert_mode = plan.runtime.moe_expert_mode;
+        config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
+        config.moe_rebalance = plan.runtime.moe_rebalance;
 
         if (plan.usesLocalPP())
         {
@@ -710,6 +713,9 @@ namespace llaminar2
                                                  runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
                                                  runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                                                  runner_config.kv_cache_precision = config_.kv_cache_precision;
+                                                 runner_config.moe_expert_mode = config_.moe_expert_mode;
+                                                 runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
+                                                 runner_config.moe_rebalance = config_.moe_rebalance;
                                                  runner_config.use_mapped_memory = config_.use_mapped_memory;
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
                                                  runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
@@ -981,6 +987,9 @@ namespace llaminar2
             runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
             runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
             runner_config.kv_cache_precision = config_.kv_cache_precision;
+            runner_config.moe_expert_mode = config_.moe_expert_mode;
+            runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
+            runner_config.moe_rebalance = config_.moe_rebalance;
             runner_config.use_mapped_memory = config_.use_mapped_memory;
             runner_config.prepared_weight_store = config_.prepared_weight_store;
             runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
@@ -1019,6 +1028,9 @@ namespace llaminar2
                 nested_config.kv_cache_scale_k = config_.kv_cache_scale_k;
                 nested_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                 nested_config.kv_cache_precision = config_.kv_cache_precision;
+                nested_config.moe_expert_mode = config_.moe_expert_mode;
+                nested_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
+                nested_config.moe_rebalance = config_.moe_rebalance;
                 nested_config.use_mapped_memory = config_.use_mapped_memory;
                 nested_config.prepared_weight_store = config_.prepared_weight_store;
                 nested_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;

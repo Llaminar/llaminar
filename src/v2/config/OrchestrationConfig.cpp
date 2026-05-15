@@ -236,7 +236,8 @@ namespace llaminar2
             const ExecutionDomainDefinition &lhs,
             const ExecutionDomainDefinition &rhs)
         {
-            auto normalizedScope = [](const ExecutionDomainDefinition &domain) {
+            auto normalizedScope = [](const ExecutionDomainDefinition &domain)
+            {
                 if (domain.scope == ExecutionDomainScope::SINGLE && domain.participants.size() == 1)
                     return ExecutionDomainScope::AUTO;
                 return domain.scope;
@@ -466,7 +467,8 @@ namespace llaminar2
                         (moe_expert_parallel_plan ? moe_expert_parallel_plan->domains.size() : 0));
 
         std::unordered_map<std::string, size_t> index_by_name;
-        auto appendIfNew = [&](const ExecutionDomainDefinition &domain) {
+        auto appendIfNew = [&](const ExecutionDomainDefinition &domain)
+        {
             if (index_by_name.find(domain.name) != index_by_name.end())
                 return;
             index_by_name.emplace(domain.name, domains.size());
@@ -496,7 +498,8 @@ namespace llaminar2
         std::vector<ExecutionDomainDefinition> inventory;
         std::unordered_map<std::string, size_t> index_by_name;
 
-        auto addDomain = [&](const ExecutionDomainDefinition &domain, const std::string &source) {
+        auto addDomain = [&](const ExecutionDomainDefinition &domain, const std::string &source)
+        {
             if (domain.name.empty())
             {
                 errors.push_back(source + " defines an execution domain with an empty name");
@@ -614,7 +617,8 @@ namespace llaminar2
                              ". Overlay base/non-expert placement is explicit; remove -d or disable overlay");
         }
 
-        auto domainByName = [&](const std::string &name) -> const ExpertComputeDomain * {
+        auto domainByName = [&](const std::string &name) -> const ExpertComputeDomain *
+        {
             auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
                                    [&](const auto &domain)
                                    {
@@ -803,6 +807,29 @@ namespace llaminar2
             errors.insert(errors.end(), overlay_errors.begin(), overlay_errors.end());
         }
 
+        if (moe_hot_expert_cache.kind == MoEHotExpertCacheConfig::Kind::Count &&
+            moe_hot_expert_cache.count < 0)
+        {
+            errors.push_back("MoE hot expert cache count must be >= 0");
+        }
+        if (moe_hot_expert_cache.kind == MoEHotExpertCacheConfig::Kind::Percent &&
+            (moe_hot_expert_cache.percent < 0.0f || moe_hot_expert_cache.percent > 100.0f))
+        {
+            errors.push_back("MoE hot expert cache percent must be in [0, 100]");
+        }
+        if (moe_rebalance.window_size <= 0)
+        {
+            errors.push_back("MoE rebalance window must be > 0");
+        }
+        if (moe_rebalance.max_window_size < 0)
+        {
+            errors.push_back("MoE rebalance max window must be >= 0");
+        }
+        if (moe_rebalance.window_growth_factor <= 0.0f)
+        {
+            errors.push_back("MoE rebalance window growth factor must be > 0");
+        }
+
         // Validate precision strings
         {
             const std::string act = toLower(activation_precision);
@@ -911,6 +938,16 @@ namespace llaminar2
                 }
             }
         }
+
+        oss << "  moe:\n";
+        oss << "    expert_mode: " << moeExpertModeToString(moe_expert_mode) << "\n";
+        oss << "    rebalance: " << moeRebalanceRuntimeModeToString(moe_rebalance.mode) << "\n";
+        oss << "    hot_expert_cache: " << moe_hot_expert_cache.toString() << "\n";
+        oss << "    rebalance_window: " << moe_rebalance.window_size << "\n";
+        oss << "    rebalance_max_window: " << moe_rebalance.max_window_size << "\n";
+        oss << "    rebalance_window_growth: " << moe_rebalance.window_growth_factor << "\n";
+        oss << "    release_raw_expert_weights: "
+            << (moe_rebalance.release_raw_expert_weights ? "true" : "false") << "\n";
 
         // Simple TP
         oss << "  tp_degree: " << tp_degree << "\n";
