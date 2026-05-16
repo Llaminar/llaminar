@@ -16,7 +16,6 @@
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/IRankOrchestrator.h"
-#include "execution/moe/MoEExpertOverlayLocalTPExecutor.h"
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/moe/MoEExpertParallelPlanner.h"
 #include "collective/ILocalTPContext.h"
@@ -425,78 +424,6 @@ namespace
         {
             EXPECT_THAT(std::string(e.what()), HasSubstr("Disabled residency policy"));
         }
-    }
-
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, PreservesInjectedDomainTPContextForActiveRocmLocalTPTier)
-    {
-        GraphConfig graph_config;
-        graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPOverlayPlan();
-        graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-            graph_config.moe.expert_parallel_plan);
-
-        MockLocalTPContext injected_context(
-            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
-            {0.5f, 0.5f});
-        graph_config.domain_tp_contexts["rocm_hot"] = &injected_context;
-
-        DomainLocalTPContextMap owned_contexts;
-        ASSERT_TRUE(populateMoEExpertOverlayDomainTPContextsForGraph(
-            graph_config, owned_contexts, "[InferenceRunnerFactoryTest]"));
-
-        EXPECT_TRUE(owned_contexts.empty());
-        ASSERT_NE(graph_config.domain_tp_contexts.find("rocm_hot"), graph_config.domain_tp_contexts.end());
-        EXPECT_EQ(graph_config.domain_tp_contexts["rocm_hot"], &injected_context);
-    }
-
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, ReusesRunnerLocalTPContextForMatchingActiveRocmLocalTPTier)
-    {
-        GraphConfig graph_config;
-        graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPOverlayPlan();
-        graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-            graph_config.moe.expert_parallel_plan);
-
-        MockLocalTPContext runner_context(
-            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
-            {0.5f, 0.5f},
-            CollectiveBackendType::RCCL);
-
-        InferenceRunnerConfig runner_config;
-        runner_config.tp_ctx = &runner_context;
-
-        DomainLocalTPContextMap owned_contexts;
-        ASSERT_TRUE(populateMoEExpertOverlayDomainTPContextsForGraph(
-            graph_config, owned_contexts, "[InferenceRunnerFactoryTest]", &runner_config));
-
-        EXPECT_TRUE(owned_contexts.empty());
-        ASSERT_NE(graph_config.domain_tp_contexts.find("rocm_hot"), graph_config.domain_tp_contexts.end());
-        EXPECT_EQ(graph_config.domain_tp_contexts["rocm_hot"], &runner_context);
-    }
-
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, CreatesOwnedDomainTPContextForActiveRocmLocalTPTier)
-    {
-        GraphConfig graph_config;
-        graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPOverlayPlan();
-        graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-            graph_config.moe.expert_parallel_plan);
-
-        DomainLocalTPContextMap owned_contexts;
-        if (!populateMoEExpertOverlayDomainTPContextsForGraph(
-                graph_config, owned_contexts, "[InferenceRunnerFactoryTest]"))
-        {
-            GTEST_SKIP() << "RCCL LocalTPContext is not available on this host";
-        }
-
-        auto context_it = graph_config.domain_tp_contexts.find("rocm_hot");
-        ASSERT_NE(context_it, graph_config.domain_tp_contexts.end());
-        ASSERT_NE(context_it->second, nullptr);
-        ASSERT_EQ(owned_contexts.count("rocm_hot"), 1u);
-
-        const auto *domain = graph_config.moe.expert_overlay_runtime_plan->domainForName("rocm_hot");
-        ASSERT_NE(domain, nullptr);
-
-        std::string reason;
-        EXPECT_TRUE(MoEExpertOverlayLocalTPExecutor::canExecute(*domain, *context_it->second, &reason))
-            << reason;
     }
 
     // =============================================================================

@@ -5,8 +5,6 @@
 
 #include "MoEExpertOverlayProfiler.h"
 
-#include "MoEExpertOverlayCPUFallback.h"
-#include "MoEExpertOverlayLocalTPExecutor.h"
 #include "MoEExpertOverlayRuntimePlan.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
 #include "execution/compute_stages/stages/MoEExpertParallelReduceStage.h"
@@ -27,144 +25,147 @@
 
 namespace llaminar2
 {
-namespace
-{
-    struct ProfilerState
+    namespace
     {
-        std::mutex mutex;
-        std::vector<MoEExpertOverlayProfileRow> rows;
-        size_t version = 0;
-        size_t printed_version = 0;
-        size_t csv_version = 0;
-    };
-
-    ProfilerState &state()
-    {
-        static ProfilerState instance;
-        return instance;
-    }
-
-    bool sameKey(const MoEExpertOverlayProfileRow &lhs, const MoEExpertOverlayProfileRow &rhs)
-    {
-        return lhs.phase == rhs.phase && lhs.layer == rhs.layer && lhs.domain == rhs.domain;
-    }
-
-    void mergeTextField(std::string &target, const std::string &value)
-    {
-        if (value.empty() || value == "unknown")
-            return;
-        if (target.empty() || target == "unknown")
+        struct ProfilerState
         {
-            target = value;
-            return;
-        }
-        if (target.find(value) == std::string::npos)
-            target += "+" + value;
-    }
+            std::mutex mutex;
+            std::vector<MoEExpertOverlayProfileRow> rows;
+            size_t version = 0;
+            size_t printed_version = 0;
+            size_t csv_version = 0;
+        };
 
-    void mergeRow(MoEExpertOverlayProfileRow &target, const MoEExpertOverlayProfileRow &row)
-    {
-        mergeTextField(target.domain_kind, row.domain_kind);
-        mergeTextField(target.backend, row.backend);
-        target.assigned_experts = std::max(target.assigned_experts, row.assigned_experts);
-        target.resident_experts = std::max(target.resident_experts, row.resident_experts);
-        target.routed_entries += row.routed_entries;
-        target.selected_rows += row.selected_rows;
-        target.transfer_bytes += row.transfer_bytes;
-        target.outbound_bytes += row.outbound_bytes;
-        target.return_bytes += row.return_bytes;
-        target.compute_ms += row.compute_ms;
-        target.domain_reduce_ms += row.domain_reduce_ms;
-        target.cross_domain_reduce_ms += row.cross_domain_reduce_ms;
-        target.participant_count = std::max(target.participant_count, row.participant_count);
-        mergeTextField(target.executed_experts, row.executed_experts);
-        mergeTextField(target.transport_mode, row.transport_mode);
-        mergeTextField(target.final_reduce_mode, row.final_reduce_mode);
-        mergeTextField(target.accumulation_path, row.accumulation_path);
-    }
-
-    std::string csvEscape(const std::string &value)
-    {
-        if (value.find_first_of(",\"\n\r") == std::string::npos)
-            return value;
-        std::string escaped = "\"";
-        for (char ch : value)
+        ProfilerState &state()
         {
-            if (ch == '"')
-                escaped += "\"\"";
-            else
-                escaped += ch;
+            static ProfilerState instance;
+            return instance;
         }
-        escaped += "\"";
-        return escaped;
-    }
 
-    std::string formatDouble(double value)
-    {
-        std::ostringstream out;
-        out.setf(std::ios::fixed, std::ios::floatfield);
-        out.precision(3);
-        out << value;
-        return out.str();
-    }
-
-    std::string joinInts(std::vector<int> values)
-    {
-        if (values.empty())
-            return "unknown";
-        std::sort(values.begin(), values.end());
-        values.erase(std::unique(values.begin(), values.end()), values.end());
-        std::ostringstream out;
-        for (size_t i = 0; i < values.size(); ++i)
+        bool sameKey(const MoEExpertOverlayProfileRow &lhs, const MoEExpertOverlayProfileRow &rhs)
         {
-            if (i > 0)
-                out << ";";
-            out << values[i];
+            return lhs.phase == rhs.phase && lhs.layer == rhs.layer && lhs.domain == rhs.domain;
         }
-        return out.str();
-    }
 
-    int countAssignedExperts(const ExpertLayerPlacement &placement, int tier_index)
-    {
-        return static_cast<int>(std::count(
-            placement.routed_expert_tier.begin(),
-            placement.routed_expert_tier.end(),
-            tier_index));
-    }
-
-    std::string backendString(CollectiveBackendType backend)
-    {
-        return collectiveBackendTypeToString(backend);
-    }
-
-    std::string finalReduceTransportMode(const MoEExpertParallelReduceDiagnostics &diagnostics)
-    {
-        if (diagnostics.host_staged)
-            return "host-staged";
-        if (diagnostics.output_resident_on_continuation)
-            return "continuation-device";
-        return "direct";
-    }
-
-    std::string accumulationPathSummary(const MoEExpertParallelReduceDiagnostics &diagnostics)
-    {
-        std::set<std::string> paths;
-        for (const auto &partial : diagnostics.partials)
-            paths.insert(toString(partial.accumulation_path));
-        if (paths.empty())
-            return diagnostics.host_staged ? "HostSummedCorrectnessFallback" : "unknown";
-        std::ostringstream out;
-        bool first = true;
-        for (const auto &path : paths)
+        void mergeTextField(std::string &target, const std::string &value)
         {
-            if (!first)
-                out << ";";
-            out << path;
-            first = false;
+            if (value.empty() || value == "unknown")
+                return;
+            if (target.empty() || target == "unknown")
+            {
+                target = value;
+                return;
+            }
+            if (target.find(value) == std::string::npos)
+                target += "+" + value;
         }
-        return out.str();
-    }
-} // namespace
+
+        void mergeRow(MoEExpertOverlayProfileRow &target, const MoEExpertOverlayProfileRow &row)
+        {
+            mergeTextField(target.domain_kind, row.domain_kind);
+            mergeTextField(target.backend, row.backend);
+            target.assigned_experts = std::max(target.assigned_experts, row.assigned_experts);
+            target.resident_experts = std::max(target.resident_experts, row.resident_experts);
+            target.routed_entries += row.routed_entries;
+            target.selected_rows += row.selected_rows;
+            target.transfer_bytes += row.transfer_bytes;
+            target.outbound_bytes += row.outbound_bytes;
+            target.return_bytes += row.return_bytes;
+            target.compute_ms += row.compute_ms;
+            target.domain_reduce_ms += row.domain_reduce_ms;
+            target.cross_domain_reduce_ms += row.cross_domain_reduce_ms;
+            target.participant_count = std::max(target.participant_count, row.participant_count);
+            mergeTextField(target.executed_experts, row.executed_experts);
+            mergeTextField(target.transport_mode, row.transport_mode);
+            mergeTextField(target.final_reduce_mode, row.final_reduce_mode);
+            mergeTextField(target.accumulation_path, row.accumulation_path);
+            target.inbound_rows += row.inbound_rows;
+            target.compact_dispatch_bytes += row.compact_dispatch_bytes;
+            target.compact_return_bytes += row.compact_return_bytes;
+            target.dense_bytes_avoided += row.dense_bytes_avoided;
+            target.cpu_fallback_rows += row.cpu_fallback_rows;
+            target.gpu_cached_rows += row.gpu_cached_rows;
+            target.scatter_ms += row.scatter_ms;
+            target.import_broadcast_ms += row.import_broadcast_ms;
+        }
+
+        std::string csvEscape(const std::string &value)
+        {
+            if (value.find_first_of(",\"\n\r") == std::string::npos)
+                return value;
+            std::string escaped = "\"";
+            for (char ch : value)
+            {
+                if (ch == '"')
+                    escaped += "\"\"";
+                else
+                    escaped += ch;
+            }
+            escaped += "\"";
+            return escaped;
+        }
+
+        std::string formatDouble(double value)
+        {
+            std::ostringstream out;
+            out.setf(std::ios::fixed, std::ios::floatfield);
+            out.precision(3);
+            out << value;
+            return out.str();
+        }
+
+        std::string joinInts(std::vector<int> values)
+        {
+            if (values.empty())
+                return "unknown";
+            std::sort(values.begin(), values.end());
+            values.erase(std::unique(values.begin(), values.end()), values.end());
+            std::ostringstream out;
+            for (size_t i = 0; i < values.size(); ++i)
+            {
+                if (i > 0)
+                    out << ";";
+                out << values[i];
+            }
+            return out.str();
+        }
+
+        int countAssignedExperts(const ExpertLayerPlacement &placement, int tier_index)
+        {
+            return static_cast<int>(std::count(
+                placement.routed_expert_tier.begin(),
+                placement.routed_expert_tier.end(),
+                tier_index));
+        }
+
+        std::string finalReduceTransportMode(const MoEExpertParallelReduceDiagnostics &diagnostics)
+        {
+            if (diagnostics.host_staged)
+                return "host-staged";
+            if (diagnostics.output_resident_on_continuation)
+                return "continuation-device";
+            return "direct";
+        }
+
+        std::string accumulationPathSummary(const MoEExpertParallelReduceDiagnostics &diagnostics)
+        {
+            std::set<std::string> paths;
+            for (const auto &partial : diagnostics.partials)
+                paths.insert(toString(partial.accumulation_path));
+            if (paths.empty())
+                return diagnostics.host_staged ? "HostSummedCorrectnessFallback" : "unknown";
+            std::ostringstream out;
+            bool first = true;
+            for (const auto &path : paths)
+            {
+                if (!first)
+                    out << ";";
+                out << path;
+                first = false;
+            }
+            return out.str();
+        }
+    } // namespace
 
     bool MoEExpertOverlayProfiler::isEnabled()
     {
@@ -197,9 +198,8 @@ namespace
 
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
-        auto existing = std::find_if(s.rows.begin(), s.rows.end(), [&](const auto &candidate) {
-            return sameKey(candidate, row);
-        });
+        auto existing = std::find_if(s.rows.begin(), s.rows.end(), [&](const auto &candidate)
+                                     { return sameKey(candidate, row); });
         if (existing != s.rows.end())
             mergeRow(*existing, row);
         else
@@ -226,7 +226,10 @@ namespace
               << "Phase" << "Layer" << "Domain" << "Kind" << "Backend"
               << "Assigned" << "Resident" << "Routed" << "Rows" << "Bytes"
               << "Compute ms" << "Local reduce ms" << "Final reduce ms"
-              << "Participants" << "Transport" << "Accumulation" << fort::endr;
+              << "Participants" << "Transport" << "Accumulation"
+              << "In rows" << "CPU rows" << "GPU rows" << "Dense saved"
+              << "Dispatch B" << "Return B" << "Scatter ms" << "Import ms"
+              << fort::endr;
 
         for (const auto &row : snapshot)
         {
@@ -246,11 +249,20 @@ namespace
                   << row.participant_count
                   << row.transport_mode
                   << row.accumulation_path
+                  << row.inbound_rows
+                  << row.cpu_fallback_rows
+                  << row.gpu_cached_rows
+                  << row.dense_bytes_avoided
+                  << row.compact_dispatch_bytes
+                  << row.compact_return_bytes
+                  << formatDouble(row.scatter_ms)
+                  << formatDouble(row.import_broadcast_ms)
                   << fort::endr;
         }
 
         std::ostringstream out;
-        out << "\nMOE EXPERT OVERLAY PROFILING SUMMARY\n" << table.to_string();
+        out << "\nMOE EXPERT OVERLAY PROFILING SUMMARY\n"
+            << table.to_string();
         return out.str();
     }
 
@@ -261,7 +273,9 @@ namespace
         out << "phase,layer,domain,domain_kind,backend,assigned_experts,resident_experts,"
             << "routed_entries,selected_rows,transfer_bytes,outbound_bytes,return_bytes,"
             << "compute_ms,domain_reduce_ms,cross_domain_reduce_ms,participant_count,"
-            << "executed_experts,transport_mode,final_reduce_mode,accumulation_path\n";
+            << "executed_experts,transport_mode,final_reduce_mode,accumulation_path,"
+            << "inbound_rows,compact_dispatch_bytes,compact_return_bytes,dense_bytes_avoided,"
+            << "cpu_fallback_rows,gpu_cached_rows,scatter_ms,import_broadcast_ms\n";
 
         for (const auto &row : snapshot)
         {
@@ -284,7 +298,15 @@ namespace
                 << csvEscape(row.executed_experts) << ','
                 << csvEscape(row.transport_mode) << ','
                 << csvEscape(row.final_reduce_mode) << ','
-                << csvEscape(row.accumulation_path) << '\n';
+                << csvEscape(row.accumulation_path) << ','
+                << row.inbound_rows << ','
+                << row.compact_dispatch_bytes << ','
+                << row.compact_return_bytes << ','
+                << row.dense_bytes_avoided << ','
+                << row.cpu_fallback_rows << ','
+                << row.gpu_cached_rows << ','
+                << formatDouble(row.scatter_ms) << ','
+                << formatDouble(row.import_broadcast_ms) << '\n';
         }
         return out.str();
     }
@@ -392,84 +414,6 @@ namespace
         }
     }
 
-    void MoEExpertOverlayProfiler::recordLocalTP(
-        int layer,
-        const MoEOverlayRuntimeDomain &domain,
-        int resident_experts,
-        const MoEExpertOverlayLocalTPDiagnostics &diagnostics)
-    {
-        if (!isEnabled())
-            return;
-
-        std::vector<int> executed_experts;
-        for (const auto &participant : diagnostics.participants)
-            executed_experts.insert(executed_experts.end(), participant.executed_expert_ids.begin(), participant.executed_expert_ids.end());
-
-        MoEExpertOverlayProfileRow row;
-        row.phase = "localtp";
-        row.layer = layer;
-        row.domain = diagnostics.domain_name.empty() ? domain.name : diagnostics.domain_name;
-        row.domain_kind = toString(domain.kind);
-        row.backend = backendString(diagnostics.backend);
-        row.assigned_experts = resident_experts;
-        row.resident_experts = resident_experts;
-        row.routed_entries = static_cast<size_t>(std::max(0, diagnostics.total_routed_entries));
-        row.selected_rows = diagnostics.selected_token_rows.size();
-        row.transfer_bytes = diagnostics.transfer_volume.totalBytes();
-        row.outbound_bytes = diagnostics.transfer_volume.outbound_bytes;
-        row.return_bytes = diagnostics.transfer_volume.return_bytes;
-        row.compute_ms = diagnostics.compute_ms;
-        row.domain_reduce_ms = diagnostics.domain_reduce_ms;
-        row.participant_count = diagnostics.degree > 0 ? diagnostics.degree : static_cast<int>(diagnostics.participants.size());
-        row.executed_experts = joinInts(std::move(executed_experts));
-        row.transport_mode = toString(diagnostics.transfer_mode);
-        recordRow(std::move(row));
-    }
-
-    void MoEExpertOverlayProfiler::recordCPUFallback(
-        int layer,
-        const ExpertComputeDomain &domain,
-        int resident_experts,
-        size_t routed_entries,
-        size_t selected_rows,
-        const MoECPUFallbackTransferStats *transfer_stats,
-        const MoECPUFallbackTensorParallelStats *tensor_parallel_stats,
-        double compute_ms)
-    {
-        if (!isEnabled())
-            return;
-
-        MoEExpertOverlayProfileRow row;
-        row.phase = "cpu_fallback";
-        row.layer = layer;
-        row.domain = domain.name;
-        row.domain_kind = toString(domain.kind);
-        row.backend = backendString(domain.backend);
-        row.assigned_experts = resident_experts;
-        row.resident_experts = resident_experts;
-        row.routed_entries = routed_entries;
-        row.selected_rows = selected_rows;
-        row.compute_ms = compute_ms;
-        row.participant_count = static_cast<int>(domain.participants.size());
-
-        if (transfer_stats)
-        {
-            row.transfer_bytes = transfer_stats->volume.totalBytes();
-            row.outbound_bytes = transfer_stats->volume.outbound_bytes;
-            row.return_bytes = transfer_stats->volume.return_bytes;
-            row.transport_mode = toString(transfer_stats->mode);
-            if (row.selected_rows == 0)
-                row.selected_rows = transfer_stats->token_rows.size();
-        }
-        if (tensor_parallel_stats)
-        {
-            row.domain_reduce_ms = 0.0;
-            row.participant_count = tensor_parallel_stats->domain_degree;
-            row.executed_experts = joinInts(tensor_parallel_stats->processed_expert_ids);
-        }
-        recordRow(std::move(row));
-    }
-
     void MoEExpertOverlayProfiler::recordFinalReduce(
         int layer,
         const MoEExpertParallelReduceDiagnostics &diagnostics)
@@ -489,6 +433,109 @@ namespace
         row.transport_mode = finalReduceTransportMode(diagnostics);
         row.final_reduce_mode = toString(diagnostics.mode);
         row.accumulation_path = accumulationPathSummary(diagnostics);
+        recordRow(std::move(row));
+    }
+
+    void MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
+        int layer,
+        const std::string &domain_key,
+        int source_participant,
+        int target_participant,
+        size_t outbound_rows,
+        size_t outbound_entries,
+        size_t inbound_rows,
+        size_t compact_dispatch_bytes,
+        size_t dense_dispatch_bytes,
+        double wait_ms)
+    {
+        if (!isEnabled())
+            return;
+
+        MoEExpertOverlayProfileRow row;
+        row.phase = "gn_sparse_dispatch";
+        row.layer = layer;
+        row.domain = domain_key.empty() ? "unknown" : domain_key;
+        row.participant_count = 2;
+        row.selected_rows = outbound_rows;
+        row.inbound_rows = inbound_rows;
+        row.routed_entries = outbound_entries;
+        row.outbound_bytes = compact_dispatch_bytes;
+        row.transfer_bytes = compact_dispatch_bytes;
+        row.compact_dispatch_bytes = compact_dispatch_bytes;
+        row.dense_bytes_avoided = dense_dispatch_bytes > compact_dispatch_bytes
+                                      ? dense_dispatch_bytes - compact_dispatch_bytes
+                                      : 0;
+        row.domain_reduce_ms = wait_ms;
+        row.transport_mode = "compact";
+        row.accumulation_path = source_participant == target_participant ? "local" : "remote";
+        recordRow(std::move(row));
+    }
+
+    void MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+        int layer,
+        const std::string &device_key,
+        bool is_cpu,
+        size_t input_rows,
+        size_t output_rows,
+        std::vector<int> unique_expert_ids,
+        double compute_ms)
+    {
+        if (!isEnabled())
+            return;
+
+        MoEExpertOverlayProfileRow row;
+        row.phase = "gn_local_expert";
+        row.layer = layer;
+        row.domain = device_key.empty() ? "unknown" : device_key;
+        row.domain_kind = is_cpu ? "CPU" : "GPU";
+        row.selected_rows = input_rows;
+        row.inbound_rows = output_rows;
+        row.assigned_experts = static_cast<int>(unique_expert_ids.size());
+        row.resident_experts = row.assigned_experts;
+        row.compute_ms = compute_ms;
+        row.transport_mode = "local";
+        row.cpu_fallback_rows = is_cpu ? input_rows : 0;
+        row.gpu_cached_rows = is_cpu ? 0 : input_rows;
+        row.executed_experts = joinInts(std::move(unique_expert_ids));
+        row.accumulation_path = is_cpu ? "CPU" : "GPU";
+        recordRow(std::move(row));
+    }
+
+    void MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
+        int layer,
+        const std::string &domain_key,
+        int source_participant,
+        int target_participant,
+        size_t outbound_rows,
+        size_t inbound_rows,
+        size_t compact_return_bytes,
+        size_t dense_return_bytes,
+        double return_wait_ms,
+        double scatter_ms,
+        double import_broadcast_ms)
+    {
+        if (!isEnabled())
+            return;
+
+        MoEExpertOverlayProfileRow row;
+        row.phase = "gn_return_reduce";
+        row.layer = layer;
+        row.domain = domain_key.empty() ? "unknown" : domain_key;
+        row.participant_count = 2;
+        row.selected_rows = inbound_rows;
+        row.inbound_rows = inbound_rows;
+        row.routed_entries = outbound_rows;
+        row.outbound_bytes = compact_return_bytes;
+        row.transfer_bytes = compact_return_bytes;
+        row.compact_return_bytes = compact_return_bytes;
+        row.dense_bytes_avoided = dense_return_bytes > compact_return_bytes
+                                      ? dense_return_bytes - compact_return_bytes
+                                      : 0;
+        row.domain_reduce_ms = return_wait_ms;
+        row.scatter_ms = scatter_ms;
+        row.import_broadcast_ms = import_broadcast_ms;
+        row.transport_mode = "compact";
+        row.accumulation_path = source_participant == target_participant ? "local" : "remote";
         recordRow(std::move(row));
     }
 

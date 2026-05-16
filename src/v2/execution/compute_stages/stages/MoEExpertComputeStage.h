@@ -109,7 +109,7 @@ namespace llaminar2
             // at graph build time so that execute() never triggers weight repacking.
             std::vector<ITensorGemm *> prepared_gate_gemm; ///< [num_experts] GEMM engines
             std::vector<ITensorGemm *> prepared_up_gemm;   ///< [num_experts] GEMM engines
-            std::vector<ITensorGemm *> prepared_down_gemm;  ///< [num_experts] GEMM engines
+            std::vector<ITensorGemm *> prepared_down_gemm; ///< [num_experts] GEMM engines
 
             // MoE batch-packed GPU lifetime management:
             // owned_kernels keeps MoE batch-constructed kernels alive,
@@ -121,7 +121,7 @@ namespace llaminar2
 
             // ExpertGemmRegistry for dynamic rebalancing registry updates.
             // Set by graph builder when model_ctx is available.
-            ExpertGemmRegistry* expert_registry = nullptr;
+            ExpertGemmRegistry *expert_registry = nullptr;
 
             // Scratch buffers for GPU expert execution
             TensorBase *gate_scratch = nullptr; ///< [seq_len, intermediate] FP32 scratch
@@ -173,10 +173,10 @@ namespace llaminar2
 
         /// Update expert mask for dynamic rebalancing (runtime, no rebuild needed).
         /// mask.size() must == num_experts. Returns false on size mismatch.
-        bool updateExpertMask(const std::vector<bool>& mask);
+        bool updateExpertMask(const std::vector<bool> &mask);
 
         /// Set replica info for per-token dynamic dispatch.
-        void setReplicaSet(const ExpertReplicaSet& replicas, int socket_id)
+        void setReplicaSet(const ExpertReplicaSet &replicas, int socket_id)
         {
             params_.replica_set = replicas;
             params_.my_socket_id = socket_id;
@@ -205,18 +205,18 @@ namespace llaminar2
         /// Releases packed weights and nulls engine pointers for experts that are
         /// NOT in new_mask but currently prepared.  Does NOT touch KernelFactory
         /// caches — the caller must batch-evict the returned pointers.
-        std::vector<const TensorBase*> releaseDepartedExperts(
-            const std::vector<bool>& new_mask);
+        std::vector<const TensorBase *> releaseDepartedExperts(
+            const std::vector<bool> &new_mask);
 
         /// Phase 2: Register transferred weights and prepare GEMM engines for
         /// newly-acquired experts.  Call AFTER batch cache eviction of departed
         /// tensor views.
         bool registerAndPrepareNewExperts(
-            const std::vector<bool>& new_mask,
-            const std::unordered_map<int, ExpertWeightBlobs>* received_weights);
+            const std::vector<bool> &new_mask,
+            const std::unordered_map<int, ExpertWeightBlobs> *received_weights);
 
         /// Phase 3: Apply the new expert mask and invalidate cached engine vectors.
-        void applyExpertMask(const std::vector<bool>& new_mask);
+        void applyExpertMask(const std::vector<bool> &new_mask);
 
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
@@ -262,8 +262,8 @@ namespace llaminar2
 
     private:
         Params params_;
-        bool raw_weights_released_ = false; ///< Set by releaseRawExpertWeights()
-        DeviceWorkspaceManager *bound_workspace_ = nullptr; ///< Workspace for expert GEMM engines
+        bool raw_weights_released_ = false;                       ///< Set by releaseRawExpertWeights()
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;       ///< Workspace for expert GEMM engines
         ExpertWeightPayloadProvider *payload_provider_ = nullptr; ///< Model-context owned
 
         /// Cached GEMM engines per expert (resolved on first execute)
@@ -299,9 +299,8 @@ namespace llaminar2
         /// and per-expert heap allocations. Uses routing results directly.
         bool executeSingleToken(IDeviceContext *ctx);
 
-
         void ensureGemmEnginesCached();
-        bool ensureGemmEnginesForExperts(const std::vector<int>& expert_ids);
+        bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
         void ensureScratchBuffers(int max_batch) const;
         IMoEKernel *ensureMoEKernel() const;
     };

@@ -4,7 +4,6 @@
 #include "../tensors/TensorKernels.h"
 
 #include <stdexcept>
-#include <string>
 #include <utility>
 
 namespace llaminar2
@@ -617,80 +616,5 @@ namespace llaminar2
             }
         }
         return count;
-    }
-
-    PreparedWeightStore::MemoryStats PreparedWeightStore::memoryStats() const
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        MemoryStats stats;
-
-        for (const auto &[_, entry] : entries_)
-        {
-            const auto *handle = entry.activeHandle();
-            auto *kernel = (handle && handle->prepared_weights) ? handle->prepared_weights->kernel : nullptr;
-            if (!kernel && handle && handle->prepared_weights && handle->prepared_weights->owned_kernel)
-                kernel = handle->prepared_weights->owned_kernel.get();
-            if (!kernel)
-                continue;
-            ++stats.gemm_entries;
-            stats.gemm_bytes += kernel->packedWeightBytes();
-        }
-
-        for (const auto &[_, kernel] : sliced_cache_)
-        {
-            if (!kernel)
-                continue;
-            ++stats.sliced_entries;
-            stats.sliced_bytes += kernel->packedWeightBytes();
-        }
-
-        stats.expert_slabs = expert_slabs_.size();
-        for (const auto &[_, entry] : expert_slabs_)
-        {
-            std::shared_lock<std::shared_mutex> slab_lock(entry->slab_mutex);
-            for (const auto &expert : entry->experts)
-            {
-                if (!expert.available)
-                    continue;
-                ++stats.expert_engines;
-                if (expert.engine)
-                    stats.expert_bytes += expert.engine->packedWeightBytes();
-                if (expert.view_lifetime)
-                {
-                    ++stats.expert_view_lifetimes;
-                    if (expert.view_lifetime->is_view())
-                        ++stats.expert_borrowed_views;
-                    else if (!expert.view_lifetime->is_raw_data_released())
-                        ++stats.expert_view_raw_live;
-                }
-            }
-        }
-
-        for (const auto &[_, entry] : embedding_entries_)
-        {
-            const auto *handle = entry.activeHandle();
-            if (!handle || !handle->weights)
-                continue;
-            ++stats.embedding_entries;
-            stats.embedding_bytes += handle->weights->byte_size;
-        }
-
-        return stats;
-    }
-
-    void PreparedWeightStore::logMemorySummary(const char *context) const
-    {
-        const auto stats = memoryStats();
-        LOG_INFO("[PreparedWeightStore] Memory summary"
-                 << (context ? std::string(" (") + context + ")" : std::string{})
-                 << ": total=" << (stats.totalBytes() >> 20) << " MB"
-                 << " gemm=" << (stats.gemm_bytes >> 20) << " MB/" << stats.gemm_entries
-                 << " sliced=" << (stats.sliced_bytes >> 20) << " MB/" << stats.sliced_entries
-                 << " experts=" << (stats.expert_bytes >> 20) << " MB/" << stats.expert_engines
-                 << " slabs=" << stats.expert_slabs
-                 << " expert_views=" << stats.expert_view_lifetimes
-                 << " borrowed_views=" << stats.expert_borrowed_views
-                 << " raw_live_views=" << stats.expert_view_raw_live
-                 << " embeddings=" << (stats.embedding_bytes >> 20) << " MB/" << stats.embedding_entries);
     }
 }

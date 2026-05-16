@@ -15,10 +15,10 @@
 #include "stages/KVCacheGatherStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/MoEExpertDispatchStage.h"
-#include "stages/MoEExpertOverlayCPUFallbackStage.h"
-#include "stages/MoEExpertOverlayLocalTPStage.h"
-#include "stages/MoEOverlayDomainRuntimeStage.h"
 #include "stages/MoEExpertParallelReduceStage.h"
+#include "stages/MoELocalExpertStage.h"
+#include "stages/MoESparseDispatchStage.h"
+#include "stages/MoESparseReturnReduceStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/ResidualAddStage.h"
@@ -124,28 +124,28 @@ namespace llaminar2
         return std::make_unique<MoEExpertDispatchStage>(params);
     }
 
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertOverlayCPUFallback(
-        const MoEExpertOverlayCPUFallbackStage::Params &params)
-    {
-        return std::make_unique<MoEExpertOverlayCPUFallbackStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertOverlayLocalTP(
-        const MoEExpertOverlayLocalTPStage::Params &params)
-    {
-        return std::make_unique<MoEExpertOverlayLocalTPStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEOverlayDomainRuntime(
-        const MoEOverlayDomainRuntimeStage::Params &params)
-    {
-        return std::make_unique<MoEOverlayDomainRuntimeStage>(params);
-    }
-
     std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertParallelReduce(
         const MoEExpertParallelReduceStage::Params &params)
     {
         return std::make_unique<MoEExpertParallelReduceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoESparseDispatch(
+        const MoESparseDispatchStage::Params &params)
+    {
+        return std::make_unique<MoESparseDispatchStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoELocalExpert(
+        const MoELocalExpertStage::Params &params)
+    {
+        return std::make_unique<MoELocalExpertStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoESparseReturnReduce(
+        const MoESparseReturnReduceStage::Params &params)
+    {
+        return std::make_unique<MoESparseReturnReduceStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertFFN(

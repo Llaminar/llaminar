@@ -460,6 +460,52 @@ Production overlay execution should stop using:
 
 During the big-bang branch, these can remain temporarily for tests or reference, but the Qwen3.5 MoE production graph must not lower to them.
 
+## Test Gate Policy And Earliest MVP
+
+Every phase below has to land with a real CTest gate. Do not advance the architecture by several phases on paper and discover at Phase 8 that the graph contract is unworkable. The intended workflow is:
+
+1. Add or update the unit/integration test first, with the legacy runtime path disabled or clearly isolated.
+2. Implement the smallest code slice required for that phase.
+3. Run the phase gate in `build_v2_integration` with full CTest parallelism.
+4. Keep the previous phase gates passing, especially the earliest graph-native MoE MVP.
+
+The earliest MVP must be model-light and mathematically strict. It should not require loading the 35B GGUF or running server mode. Use deterministic FP32 toy weights, fixed routing indices/weights, small dimensions, and compare the graph-native tiered result against a single-domain `MoEExpertComputeStage` reference with `EXPECT_NEAR` tolerance on every output element.
+
+### MVP Integration Test: `rocm_hot + cpu_cold`
+
+Add a new registered CTest target as soon as the new sparse workspace, dispatch, local expert, and return/reduce stages can execute one layer end to end:
+
+```text
+tests/v2/integration/moe/Test__MoEGraphNative_RocmHotCpuCold_MVP.cpp
+CTest: V2_Integration_MoEGraphNative_RocmHotCpuCold_MVP
+Labels: V2;Integration;MoE;GraphNative;ExpertParallel;ROCm;CPU;MPI;MVP
+MPI_PROCS: 2
+```
+
+Topology:
+
+- rank 0: continuation root plus `rocm_hot` participant on `rocm:0`;
+- rank 1: `cpu_cold` participant;
+- routed expert owner map: some experts owned by `rocm_hot`, the remaining experts owned by `cpu_cold`;
+- no `TensorParallelExperts`, no routed expert allreduce, no `MoEOverlayDomainRuntimeStage`, no `MoEExpertOverlayLocalTPStage`, no `MoEOverlayCPUFallbackParticipantRunner`.
+
+Math contract:
+
+- build hidden rows, top-k routing, route weights, and gate/up/down expert weights deterministically;
+- compute full reference output with all experts on CPU via `MoEExpertComputeStage`;
+- dispatch only rows required by each owner tier;
+- run `MoELocalExpertStage` locally on `rocm_hot` and `cpu_cold`;
+- return compact rows and scatter-add on the continuation root;
+- compare final `MOE_COMBINED_OUTPUT` against the full CPU reference element-by-element.
+
+Hardware handling:
+
+- the test may `GTEST_SKIP()` when the build lacks `HAVE_ROCM` or no ROCm device is visible;
+- the CI/hardware lane for this project must include a non-skipped run before the refactor is considered feasible;
+- a CPU-only graph-native MVP should exist earlier for fast developer feedback, but it is not a substitute for the `rocm_hot + cpu_cold` MVP.
+
+Existing tests are useful reference material but not sufficient gates by themselves. `tests/v2/integration/moe/Test__MoEExpertOverlay_CPUFallback_MPI.cpp` already has sparse CPU fallback math and MPI transfer assertions, and `tests/v2/integration/moe/Test__MoEExpertOverlay_MultiAcceleratorTiers.cpp` has deterministic tiered FP32 reference math. Reuse those fixtures and expectations, but move the MVP onto graph-native stages and register it directly in `tests/v2/CMakeLists.txt` instead of relying on legacy filtered bridge tests.
+
 ## Implementation Plan
 
 ### Phase 0: Stop The Bleeding
@@ -478,6 +524,11 @@ Acceptance:
 - Qwen3.5 overlay configs fail fast unless the new graph-native path is selected.
 - No production graph contains `MoEOverlayDomainRuntimeStage`.
 
+Test gate:
+
+- Update `tests/v2/unit/config/Test__MoEExpertOverlayConfig.cpp` and `tests/v2/unit/models/qwen35moe/Test__Qwen35MoEExpertOverlayGraph.cpp` so overlay-domain-runtime lowering is rejected unless an explicit legacy test flag is set.
+- Run `ctest --test-dir build_v2_integration -R "V2_Unit_(MoEExpertOverlayConfig|Qwen35MoEExpertOverlayGraph)" --output-on-failure --parallel`.
+
 ### Phase 1: Participant Planning And Role Runner
 
 Goal: all overlay ranks/devices become graph participants.
@@ -494,6 +545,12 @@ Acceptance:
 
 - Non-root CPU ranks can run an empty/no-op participant graph for a step and report completion.
 - The role runner cannot carry tensor payloads by type or API.
+
+Test gate:
+
+- Add `V2_Unit_MoEGraphRoleRunner_NoTensorPayloadAPI` to assert the role runner only moves scalar step headers/status and owns participant graph runners.
+- Add `V2_Integration_MoEGraphRoleRunner_NoOpMPI` with at least 2 MPI ranks where continuation and non-continuation participants enter matching no-op MoE keys and complete a step.
+- Run `ctest --test-dir build_v2_integration -R "V2_(Unit_MoEGraphRoleRunner|Integration_MoEGraphRoleRunner_NoOpMPI)" --output-on-failure --parallel`.
 
 ### Phase 2: MoE Collective Workspace And Host-Staged Transport
 
@@ -514,6 +571,13 @@ Acceptance:
 - Stale key reuse is rejected.
 - No per-token heap allocation occurs after workspace initialization.
 
+Test gate:
+
+- Add `V2_Unit_MoEOverlayCollectiveWorkspace` for capacity reuse, live-prefix reset, stale key rejection, and no-op payloads.
+- Add or replace `V2_Unit_MoEOverlayDispatchCollective` coverage so it moves `MoEOverlaySparseRows` / `MoEOverlayReturnRows`, not only control headers.
+- Add `V2_Integration_MoEOverlaySparseTransport_MPI` with 2 MPI ranks exchanging compact rows and return rows by key.
+- Run `ctest --test-dir build_v2_integration -R "V2_(Unit_MoEOverlayCollectiveWorkspace|Unit_MoEOverlayDispatchCollective|Integration_MoEOverlaySparseTransport_MPI)" --output-on-failure --parallel`.
+
 ### Phase 3: New Graph Stages
 
 Goal: replace domain runtime stages with explicit graph stages.
@@ -530,6 +594,12 @@ Acceptance:
 - A CPU-only overlay fixture routes rows, computes local expert output, returns compact partials, and accumulates into dense MoE output.
 - A participant with no routed rows enters all collective stages and produces no contribution.
 - Stage params for local expert compute contain no peer participant vectors.
+
+Test gate:
+
+- Add `V2_Integration_MoEGraphNative_CPUOnly_MVP` using deterministic FP32 toy weights, fixed routing, graph-native sparse dispatch/local compute/return-reduce, and a full `MoEExpertComputeStage` CPU reference.
+- Add a unit guard that `MoELocalExpertStage::Params` has no peer participant vector, runtime pointer, or runner pointer dependency.
+- Run `ctest --test-dir build_v2_integration -R "V2_(Integration_MoEGraphNative_CPUOnly_MVP|Unit_MoELocalExpertStage_Params)" --output-on-failure --parallel`.
 
 ### Phase 4: Split Accelerator Expert-Parallel Tiers
 
@@ -552,6 +622,13 @@ Acceptance:
 - Routed expert compute requires no RCCL/NCCL allreduce and no domain-scoped `ILocalTPContext`.
 - No stage allocates peer workspaces or resolves peer streams.
 
+Test gate:
+
+- Add `V2_Integration_MoEGraphNative_RocmHotCpuCold_MVP` described in the MVP section. This is the first required heterogeneous feasibility gate.
+- Add `V2_Unit_MoEExpertOwnerMap_DisjointAcceleratorParticipants` proving multi-device accelerator tiers lower to disjoint whole-expert owners, not to `TensorParallelExperts`.
+- Run `ctest --test-dir build_v2_integration -R "V2_(Integration_MoEGraphNative_RocmHotCpuCold_MVP|Unit_MoEExpertOwnerMap_DisjointAcceleratorParticipants)" --output-on-failure --parallel`.
+- A skipped ROCm MVP is acceptable for a developer laptop but not for declaring Phase 4 complete on the project hardware lane.
+
 ### Phase 5: Retire CPU Sidecar Fallback
 
 Goal: CPU experts run through normal graph stages.
@@ -568,6 +645,13 @@ Acceptance:
 - CPU expert ranks are normal participant graphs.
 - CPU participants consume dispatch payloads and produce return payloads.
 - No CPU participant infers layer progress from endpoint messages.
+
+Test gate:
+
+- Replace the production-path dependency in `V2_Integration_MoEExpertOverlay_CPUFallback_MPI` with `V2_Integration_MoEGraphNative_CPUCold_MPI`, preserving its sparse-row masked-reference math.
+- Add a guard test that production graph construction contains no `MoEOverlayCPUFallbackParticipantRunner` or endpoint receive-pump dependency.
+- Re-run `V2_Integration_MoEGraphNative_RocmHotCpuCold_MVP` after CPU sidecar removal.
+- Run `ctest --test-dir build_v2_integration -R "V2_(Integration_MoEGraphNative_CPUCold_MPI|Integration_MoEGraphNative_RocmHotCpuCold_MVP|Unit_MoEOverlayNoCPUFallbackSidecar)" --output-on-failure --parallel`.
 
 ### Phase 6: Cleanup And Hardening
 
@@ -586,6 +670,13 @@ Acceptance:
 - Search for `MoEOverlayDomainRuntimeStage` finds no production graph lowering.
 - Search for `prepared_participants` finds no graph-native local expert stage params.
 - One-token decode does not perform full hidden-state D2H except under explicit diagnostics.
+
+Test gate:
+
+- Add `V2_Unit_MoEGraphNative_ForbiddenDependencyScan` that inspects graph-native stage params or graph lowering helpers for forbidden runtime/peer dependencies.
+- Add `V2_Integration_MoEGraphNative_TransferCounters` proving compact bytes moved are less than dense bytes for a routed sparse fixture.
+- Re-run the CPU-only MVP, the `rocm_hot + cpu_cold` MVP, and the CPU-cold MPI graph-native test.
+- Run `ctest --test-dir build_v2_integration -R "V2_(Unit_MoEGraphNative_ForbiddenDependencyScan|Integration_MoEGraphNative_TransferCounters|Integration_MoEGraphNative_(CPUOnly_MVP|RocmHotCpuCold_MVP|CPUCold_MPI))" --output-on-failure --parallel`.
 
 ### Phase 7: Generic Continuation Domain TP Contract
 
@@ -607,6 +698,13 @@ Acceptance:
 - Routed tier validation still guarantees one canonical whole-expert execution owner per routed expert.
 - No graph-native routed expert stage requires `domain_tp_contexts` or `ILocalTPContext`.
 
+Test gate:
+
+- Add `V2_Unit_MoEContinuationDomainSpec` for `SINGLE`, `LOCAL`, `NODE_LOCAL`, and `GLOBAL` continuation validation.
+- Add `V2_Unit_MoEContinuationTPContextPlumbing` proving named continuation/base/shared domains expose polymorphic `ITPContext*` to graph builders.
+- Add config-only integration tests for LocalTP and GlobalTP continuation plans that still reject routed-tier `TensorParallelExperts` by default.
+- Run `ctest --test-dir build_v2_integration -R "V2_(Unit_MoEContinuationDomainSpec|Unit_MoEContinuationTPContextPlumbing|Integration_MoEContinuation.*Config)" --output-on-failure --parallel`.
+
 ### Phase 8: Continuation TP MoE Boundary Stages
 
 Goal: connect dense TP continuation execution to sparse ExpertParallel dispatch without duplicating routed work.
@@ -627,6 +725,13 @@ Acceptance:
 - After return/reduce, every continuation TP participant has the correct activation layout for the next dense graph stage.
 - Shared expert dense TP and routed expert sparse dispatch can coexist in the same MoE layer without sharing collective contexts.
 
+Test gate:
+
+- Add `V2_Integration_MoEGraphNative_LocalTPContinuation_RocmHotCpuCold_MVP` for replicated-hidden export/import with a LocalTP continuation domain and sparse routed tiers.
+- Add `V2_Integration_MoEGraphNative_GlobalTPContinuation_CPUCold_MVP` with 2 MPI ranks proving GlobalTP dense continuation collectives can coexist with sparse expert dispatch.
+- Assert dispatch row count equals the reference routed row count, not routed row count multiplied by continuation TP degree.
+- Run `ctest --test-dir build_v2_integration -R "V2_Integration_MoEGraphNative_(LocalTPContinuation_RocmHotCpuCold_MVP|GlobalTPContinuation_CPUCold_MVP)" --output-on-failure --parallel`.
+
 ### Phase 9: Flexible Routed Tier Planner
 
 Goal: support configurable routed expert tiers around a dense TP continuation domain without hardcoding hot/warm/cold assumptions.
@@ -646,6 +751,13 @@ Acceptance:
 - Removing `cold_cpu` is valid when all routed experts are covered by configured accelerator tiers.
 - No routed-tier combination introduces dense TP allreduce for routed expert compute.
 - Diagnostics print continuation domain, continuation root, tier name, owner participant, device, budget, resident expert count, and fallback coverage.
+
+Test gate:
+
+- Add `V2_Unit_MoERoutedTierPlanner_FlexibleNamesAndBudgets` for arbitrary tier names, GPU-only coverage, optional fallback, cached residency, and exactly-one-owner validation.
+- Add `V2_Integration_MoEGraphNative_GPUOnlyTiers_MVP` showing no `cold_cpu` is required when accelerator tiers cover all routed experts.
+- Add `V2_Integration_MoEGraphNative_MixedCudaRocmCpuTiers_MVP` if hardware is available; otherwise make it a hardware-gated test that is required on the project lane.
+- Run `ctest --test-dir build_v2_integration -R "V2_(Unit_MoERoutedTierPlanner_FlexibleNamesAndBudgets|Integration_MoEGraphNative_(GPUOnlyTiers_MVP|MixedCudaRocmCpuTiers_MVP))" --output-on-failure --parallel`.
 
 ## Testing Strategy
 

@@ -50,7 +50,6 @@ namespace llaminar2
     class TurboQuantContext;
     class ActivationRotation;
     class DecodeExpertHistogram;
-    class IOverlayDomainRuntime;
     struct MoEExpertParallelPlan;
     struct MoEExpertOverlayExecutionPlan;
     class MoEExpertOverlayRuntimePlan;
@@ -245,7 +244,7 @@ namespace llaminar2
         /// TP contexts for each domain (one per domain name).
         /// Each domain may have internal tensor parallelism.
         /// Created by the orchestrator and passed to the graph builder.
-        std::map<std::string, ILocalTPContext *> domain_tp_contexts;
+        std::map<std::string, ITPContext *> domain_tp_contexts;
 
         /// Helper: Check if unified PP mode is enabled
         bool hasUnifiedPP() const;
@@ -392,11 +391,8 @@ namespace llaminar2
             /// Runtime-resolved overlay descriptor for domain devices, ranks, and MVP lowering.
             std::shared_ptr<MoEExpertOverlayRuntimePlan> expert_overlay_runtime_plan = nullptr;
 
-            /// Optional rank-role execution plan used by the overlay domain runtime service.
+            /// Optional rank-role execution plan used by overlay preparation and diagnostics.
             std::shared_ptr<const MoEExpertOverlayExecutionPlan> expert_overlay_execution_plan = nullptr;
-
-            /// Optional production service used by graph stages to submit non-continuation overlay domain work.
-            std::shared_ptr<IOverlayDomainRuntime> overlay_domain_runtime = nullptr;
 
             /// Optional MPI context dedicated to overlay domain-worker commands.
             /// It is intentionally separate from the graph-builder MPI context so

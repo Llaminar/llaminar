@@ -82,13 +82,11 @@ namespace llaminar2
     class ILocalTPContext;
     class IRankOrchestrator;
     class PreparedWeightStore;
-    class IOverlayDomainRuntime;
-    class MoEOverlayMPIDispatchBackend;
     struct GraphConfig;
     struct MoEExpertOverlayExecutionPlan;
     struct MoEExpertParallelPlan;
 
-    using DomainLocalTPContextMap = std::map<std::string, std::shared_ptr<ILocalTPContext>>;
+    using DomainTPContextMap = std::map<std::string, std::shared_ptr<ITPContext>>;
 
     // Note: FactoryPPStageConfig is now defined in FactoryPPStageConfig.h
     // to avoid circular dependencies with RankOrchestrator.h
@@ -184,10 +182,6 @@ namespace llaminar2
         /// Optional MPI context used by MoE overlay domain-worker commands.
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
 
-        /// Optional graph-native MPI dispatch backend shared by root graph
-        /// participants for remote MoE overlay domains such as cpu_cold.
-        std::shared_ptr<MoEOverlayMPIDispatchBackend> moe_overlay_dispatch_backend;
-
         /// Optional graph-level cancellation hook. Queried before each stage,
         /// usually backed by a TP collective abort flag.
         std::function<bool()> cancellation_requested;
@@ -267,11 +261,13 @@ namespace llaminar2
         IModelContext &model_ctx,
         const InferenceRunnerConfig &config);
 
-    bool populateMoEExpertOverlayDomainTPContextsForGraph(
+    bool applyMoEExpertOverlayConfigToGraphForTesting(
+        IModelContext &model_ctx,
+        const InferenceRunnerConfig &config,
+        const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
         GraphConfig &graph_config,
-        DomainLocalTPContextMap &owned_contexts,
-        const std::string &log_prefix = "[InferenceRunner]",
-        const InferenceRunnerConfig *runner_config = nullptr);
+        DomainTPContextMap &owned_domain_tp_contexts,
+        const std::string &log_prefix = "[InferenceRunnerTest]");
 
     /**
      * @brief Factory function to create a unified LOCAL PP runner

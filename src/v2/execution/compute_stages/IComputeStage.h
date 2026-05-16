@@ -285,10 +285,13 @@ namespace llaminar2
         // MoE specific
         MOE_ROUTER,
         MOE_EXPERT_FFN,
-        MOE_SHARED_EXPERT_FFN, ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
-        MOE_SHARED_EXPERT_GATE, ///< Shared expert sigmoid gate
-        MOE_EXPERT_DISPATCH, ///< Host-side dispatch descriptor builder for expert-parallel tiers
+        MOE_SHARED_EXPERT_FFN,      ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
+        MOE_SHARED_EXPERT_GATE,     ///< Shared expert sigmoid gate
+        MOE_EXPERT_DISPATCH,        ///< Host-side dispatch descriptor builder for expert-parallel tiers
         MOE_EXPERT_PARALLEL_REDUCE, ///< Host-side dense partial reduction for expert-parallel tiers
+        MOE_SPARSE_DISPATCH,        ///< Graph-native sparse MoE payload dispatch
+        MOE_LOCAL_EXPERT,           ///< Participant-local sparse MoE expert compute
+        MOE_SPARSE_RETURN_REDUCE,   ///< Graph-native sparse MoE return reduce
 
         // Collective
         ALLREDUCE,

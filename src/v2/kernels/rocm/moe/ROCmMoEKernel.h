@@ -194,10 +194,11 @@ namespace llaminar2
 
         /// Core GPU routing: gate logits GEMM + softmax + top-k.
         /// Returns device buffers (caller must D2H and hipFree).
-        struct DeviceRouteBuffers {
-            float *d_logits = nullptr;   ///< [seq_len * num_experts]
-            int   *d_indices = nullptr;  ///< [seq_len * top_k]
-            float *d_weights = nullptr;  ///< [seq_len * top_k]
+        struct DeviceRouteBuffers
+        {
+            float *d_logits = nullptr;  ///< [seq_len * num_experts]
+            int *d_indices = nullptr;   ///< [seq_len * top_k]
+            float *d_weights = nullptr; ///< [seq_len * top_k]
             size_t logits_count = 0;
             size_t topk_count = 0;
         };
@@ -209,28 +210,28 @@ namespace llaminar2
         std::unique_ptr<rocm::HipBLASGemmKernel> blas_gemm_;
 
         // Phase 2: device-resident histogram and expert mask
-        uint64_t *d_histogram_ = nullptr;  ///< [max_layers_ * max_experts_] on device
-        bool *d_expert_mask_ = nullptr;    ///< [max_experts_] on device
+        uint64_t *d_histogram_ = nullptr; ///< [max_layers_ * max_experts_] on device
+        bool *d_expert_mask_ = nullptr;   ///< [max_experts_] on device
         int max_experts_ = 0;
         int max_layers_ = 0;
 
         // Phase 3: write_heads scratch buffer for token grouping
-        int *d_write_heads_ = nullptr;     ///< [max_write_heads_experts_] on device
+        int *d_write_heads_ = nullptr; ///< [max_write_heads_experts_] on device
         int max_write_heads_experts_ = 0;
 
         // Staging buffers for tensor-aware gather/scatter (H2D of small host arrays)
-        int   *d_staging_indices_ = nullptr;   ///< [staging_capacity_] ints on device
-        float *d_staging_weights_ = nullptr;   ///< [staging_capacity_] floats on device
+        int *d_staging_indices_ = nullptr;   ///< [staging_capacity_] ints on device
+        float *d_staging_weights_ = nullptr; ///< [staging_capacity_] floats on device
         int staging_capacity_ = 0;
 
         // Phase 4: GPU-side expert grouping state (for prepareExpertGroups)
-        int   *d_group_int_indices_ = nullptr;   ///< float→int converted routing indices
-        int   *d_group_offsets_ = nullptr;        ///< [num_experts] exclusive prefix sums
-        int   *d_group_counts_ = nullptr;         ///< [num_experts] per-expert token counts
-        int   *d_group_token_indices_ = nullptr;  ///< [total_slots] grouped token indices
-        float *d_group_weights_ = nullptr;        ///< [total_slots] grouped routing weights
-        int group_slots_cap_ = 0;                 ///< capacity for total_slots buffers
-        int group_experts_cap_ = 0;               ///< capacity for num_experts buffers
+        int *d_group_int_indices_ = nullptr;   ///< float→int converted routing indices
+        int *d_group_offsets_ = nullptr;       ///< [num_experts] exclusive prefix sums
+        int *d_group_counts_ = nullptr;        ///< [num_experts] per-expert token counts
+        int *d_group_token_indices_ = nullptr; ///< [total_slots] grouped token indices
+        float *d_group_weights_ = nullptr;     ///< [total_slots] grouped routing weights
+        int group_slots_cap_ = 0;              ///< capacity for total_slots buffers
+        int group_experts_cap_ = 0;            ///< capacity for num_experts buffers
     };
 
 } // namespace llaminar2

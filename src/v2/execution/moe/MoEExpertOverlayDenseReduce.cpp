@@ -15,33 +15,34 @@
 
 namespace llaminar2
 {
-namespace
-{
-    std::unordered_map<std::string, const ExpertComputeDomain *> domainsByName(
-        const MoEExpertParallelPlan &plan)
+    namespace
     {
-        std::unordered_map<std::string, const ExpertComputeDomain *> result;
-        for (const auto &domain : plan.domains)
-            result.emplace(domain.name, &domain);
-        return result;
-    }
+        std::unordered_map<std::string, const ExpertComputeDomain *> domainsByName(
+            const MoEExpertParallelPlan &plan)
+        {
+            std::unordered_map<std::string, const ExpertComputeDomain *> result;
+            for (const auto &domain : plan.domains)
+                result.emplace(domain.name, &domain);
+            return result;
+        }
 
-    std::unordered_map<std::string, const ExpertRoutedTier *> tiersByName(
-        const MoEExpertParallelPlan &plan)
-    {
-        std::unordered_map<std::string, const ExpertRoutedTier *> result;
-        for (const auto &tier : plan.routed_tiers)
-            result.emplace(tier.name, &tier);
-        return result;
-    }
+        std::unordered_map<std::string, const ExpertRoutedTier *> tiersByName(
+            const MoEExpertParallelPlan &plan)
+        {
+            std::unordered_map<std::string, const ExpertRoutedTier *> result;
+            for (const auto &tier : plan.routed_tiers)
+                result.emplace(tier.name, &tier);
+            return result;
+        }
 
-} // namespace
+    } // namespace
 
     std::vector<std::string> MoEExpertOverlayDenseReduce::validateRequest(
         const MoEExpertOverlayDenseReduceRequest &request)
     {
         std::vector<std::string> errors;
-        auto addError = [&](const std::string &message) {
+        auto addError = [&](const std::string &message)
+        {
             errors.push_back(message);
         };
 
@@ -52,7 +53,9 @@ namespace
         }
 
         const auto &plan = *request.plan;
-        const auto plan_validation = validateMoEExpertParallelPlan(plan);
+        const auto plan_validation = validateMoEExpertParallelPlan(
+            plan,
+            MoEExpertParallelValidationOptions{.allow_routed_tensor_parallel_experts = true});
         for (const auto &error : plan_validation.errors)
             addError("plan: " + error);
 

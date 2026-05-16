@@ -1152,9 +1152,9 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
     execution/compute_stages/stages/MoEExpertParallelReduceStage.cpp
-    execution/compute_stages/stages/MoEExpertOverlayCPUFallbackStage.cpp
-    execution/compute_stages/stages/MoEExpertOverlayLocalTPStage.cpp
-    execution/compute_stages/stages/MoEOverlayDomainRuntimeStage.cpp
+    execution/compute_stages/stages/MoELocalExpertStage.cpp
+    execution/compute_stages/stages/MoESparseDispatchStage.cpp
+    execution/compute_stages/stages/MoESparseReturnReduceStage.cpp
     execution/compute_stages/stages/MoERoutingStage.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
@@ -1171,18 +1171,15 @@ add_library(llaminar2_core STATIC
     execution/moe/ExpertRebalancer.cpp
     execution/moe/DecodeExpertHistogram.cpp
     execution/moe/MoEExpertParallelPlanner.cpp
+    execution/moe/MoEExpertOwnerMap.cpp
     execution/moe/MoEExpertTokenRowTransfer.cpp
     execution/moe/MoEExpertOverlayDenseReduce.cpp
-    execution/moe/MoEExpertOverlayCPUFallback.cpp
     execution/moe/MoEExpertOverlayExecutionPlan.cpp
-    execution/moe/MoEExpertOverlayLocalTPExecutor.cpp
-    execution/moe/MoEOverlayCPUFallbackParticipantRunner.cpp
+    execution/moe/MoEGraphRoleRunner.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
     execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/MoEExpertOverlayRuntimePlan.cpp
-    execution/moe/MoEOverlayDispatchCollective.cpp
-    execution/moe/MoEOverlayMPIDispatchBackend.cpp
-    execution/moe/MoEOverlayDomainRuntime.cpp
+    execution/moe/MoEOverlaySparseCollective.cpp
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoEExpertWeightService.cpp

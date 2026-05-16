@@ -140,7 +140,7 @@ namespace llaminar2
             config_.pp_contexts[{from_stage, to_stage}] = pp_ctx;
         }
 
-        void setTPContext(const std::string &domain_name, ILocalTPContext *tp_ctx) override
+        void setTPContext(const std::string &domain_name, ITPContext *tp_ctx) override
         {
             config_.domain_tp_contexts[domain_name] = tp_ctx;
         }

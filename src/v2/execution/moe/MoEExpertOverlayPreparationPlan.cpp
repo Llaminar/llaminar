@@ -10,181 +10,187 @@
 
 namespace llaminar2
 {
-namespace
-{
-    const char *residencyPolicyName(ExpertResidencyPolicy policy)
+    namespace
     {
-        switch (policy)
+        const char *residencyPolicyName(ExpertResidencyPolicy policy)
         {
-        case ExpertResidencyPolicy::Disabled: return "Disabled";
-        case ExpertResidencyPolicy::StaticById: return "StaticById";
-        case ExpertResidencyPolicy::HistogramTieredCache: return "HistogramTieredCache";
-        case ExpertResidencyPolicy::ExplicitMasks: return "ExplicitMasks";
+            switch (policy)
+            {
+            case ExpertResidencyPolicy::Disabled:
+                return "Disabled";
+            case ExpertResidencyPolicy::StaticById:
+                return "StaticById";
+            case ExpertResidencyPolicy::HistogramTieredCache:
+                return "HistogramTieredCache";
+            case ExpertResidencyPolicy::ExplicitMasks:
+                return "ExplicitMasks";
+            case ExpertResidencyPolicy::RoutedTierRebalanced:
+                return "RoutedTierRebalanced";
+            }
+            return "Unknown";
         }
-        return "Unknown";
-    }
 
-    MoEExpertOverlayDomainPreparationStats &statsFor(
-        MoEExpertOverlayPreparationDiagnostics &diagnostics,
-        const std::string &domain_name,
-        DeviceId device,
-        int participant_index,
-        int participant_world_rank,
-        bool participant_world_rank_known,
-        int owner_world_rank,
-        WeightResidencyCategory residency_category,
-        ExpertResidencyPolicy residency_policy)
-    {
-        auto it = std::find_if(diagnostics.domains.begin(), diagnostics.domains.end(),
-                               [&](const auto &stats)
-                               {
-                                   return stats.domain_name == domain_name &&
-                                          stats.device == device &&
-                                          stats.participant_index == participant_index &&
-                                          stats.participant_world_rank == participant_world_rank &&
-                                          stats.residency_category == residency_category;
-                               });
-        if (it != diagnostics.domains.end())
-            return *it;
+        MoEExpertOverlayDomainPreparationStats &statsFor(
+            MoEExpertOverlayPreparationDiagnostics &diagnostics,
+            const std::string &domain_name,
+            DeviceId device,
+            int participant_index,
+            int participant_world_rank,
+            bool participant_world_rank_known,
+            int owner_world_rank,
+            WeightResidencyCategory residency_category,
+            ExpertResidencyPolicy residency_policy)
+        {
+            auto it = std::find_if(diagnostics.domains.begin(), diagnostics.domains.end(),
+                                   [&](const auto &stats)
+                                   {
+                                       return stats.domain_name == domain_name &&
+                                              stats.device == device &&
+                                              stats.participant_index == participant_index &&
+                                              stats.participant_world_rank == participant_world_rank &&
+                                              stats.residency_category == residency_category;
+                                   });
+            if (it != diagnostics.domains.end())
+                return *it;
 
-        MoEExpertOverlayDomainPreparationStats stats;
-        stats.domain_name = domain_name;
-        stats.device = device;
-        stats.participant_index = participant_index;
-        stats.participant_world_rank = participant_world_rank;
-        stats.participant_world_rank_known = participant_world_rank_known;
-        stats.owner_world_rank = owner_world_rank;
-        stats.residency_category = residency_category;
-        stats.residency_policy = residency_policy;
-        stats.accelerator = device.is_gpu();
-        diagnostics.domains.push_back(std::move(stats));
-        return diagnostics.domains.back();
-    }
+            MoEExpertOverlayDomainPreparationStats stats;
+            stats.domain_name = domain_name;
+            stats.device = device;
+            stats.participant_index = participant_index;
+            stats.participant_world_rank = participant_world_rank;
+            stats.participant_world_rank_known = participant_world_rank_known;
+            stats.owner_world_rank = owner_world_rank;
+            stats.residency_category = residency_category;
+            stats.residency_policy = residency_policy;
+            stats.accelerator = device.is_gpu();
+            diagnostics.domains.push_back(std::move(stats));
+            return diagnostics.domains.back();
+        }
 
-    struct PreparationParticipant
-    {
-        DeviceId device = DeviceId::invalid();
-        int participant_index = -1;
-        int world_rank = -1;
-        bool world_rank_known = false;
-        int owner_rank = -1;
-    };
+        struct PreparationParticipant
+        {
+            DeviceId device = DeviceId::invalid();
+            int participant_index = -1;
+            int world_rank = -1;
+            bool world_rank_known = false;
+            int owner_rank = -1;
+        };
 
-    int effectiveParticipantRank(const MoEOverlayRuntimeDomain &domain, const MoEOverlayDomainParticipant &participant)
-    {
-        if (participant.world_rank_known)
+        int effectiveParticipantRank(const MoEOverlayRuntimeDomain &domain, const MoEOverlayDomainParticipant &participant)
+        {
+            if (participant.world_rank_known)
+                return participant.world_rank;
+            if (domain.kind == ExpertDomainKind::LocalTP && domain.owner_rank >= 0)
+                return domain.owner_rank;
+            if (domain.participants.size() == 1 && domain.owner_rank >= 0)
+                return domain.owner_rank;
             return participant.world_rank;
-        if (domain.kind == ExpertDomainKind::LocalTP && domain.owner_rank >= 0)
-            return domain.owner_rank;
-        if (domain.participants.size() == 1 && domain.owner_rank >= 0)
-            return domain.owner_rank;
-        return participant.world_rank;
-    }
-
-    bool effectiveParticipantRankKnown(const MoEOverlayRuntimeDomain &domain, const MoEOverlayDomainParticipant &participant)
-    {
-        return participant.world_rank_known ||
-               (domain.kind == ExpertDomainKind::LocalTP && domain.owner_rank >= 0) ||
-               (domain.participants.size() == 1 && domain.owner_rank >= 0);
-    }
-
-    std::vector<PreparationParticipant> preparationParticipantsFor(const MoEOverlayRuntimeDomain &domain)
-    {
-        std::vector<PreparationParticipant> participants;
-        for (const auto &participant : domain.participants)
-        {
-            if (!participant.local_device.is_valid())
-                continue;
-
-            PreparationParticipant prepared;
-            prepared.device = participant.local_device;
-            prepared.participant_index = participant.participant_index;
-            prepared.world_rank = effectiveParticipantRank(domain, participant);
-            prepared.world_rank_known = effectiveParticipantRankKnown(domain, participant);
-            prepared.owner_rank = domain.owner_rank;
-            participants.push_back(prepared);
         }
 
-        if (participants.empty() && domain.primary_device.is_valid())
+        bool effectiveParticipantRankKnown(const MoEOverlayRuntimeDomain &domain, const MoEOverlayDomainParticipant &participant)
         {
-            PreparationParticipant prepared;
-            prepared.device = domain.primary_device;
-            prepared.participant_index = 0;
-            prepared.world_rank = domain.primary_world_rank;
-            prepared.world_rank_known = domain.primary_world_rank_known;
-            prepared.owner_rank = domain.owner_rank;
-            participants.push_back(prepared);
+            return participant.world_rank_known ||
+                   (domain.kind == ExpertDomainKind::LocalTP && domain.owner_rank >= 0) ||
+                   (domain.participants.size() == 1 && domain.owner_rank >= 0);
         }
 
-        return participants;
-    }
+        std::vector<PreparationParticipant> preparationParticipantsFor(const MoEOverlayRuntimeDomain &domain)
+        {
+            std::vector<PreparationParticipant> participants;
+            for (const auto &participant : domain.participants)
+            {
+                if (!participant.local_device.is_valid())
+                    continue;
 
-    WeightResidencyCategory routedResidencyCategoryFor(const ExpertRoutedTier &tier, DeviceId device)
-    {
-        if (tier.fallback || device.is_cpu())
-            return WeightResidencyCategory::CpuFallbackExpert;
-        return WeightResidencyCategory::AcceleratorRoutedExpert;
-    }
+                PreparationParticipant prepared;
+                prepared.device = participant.local_device;
+                prepared.participant_index = participant.participant_index;
+                prepared.world_rank = effectiveParticipantRank(domain, participant);
+                prepared.world_rank_known = effectiveParticipantRankKnown(domain, participant);
+                prepared.owner_rank = domain.owner_rank;
+                participants.push_back(prepared);
+            }
 
-    bool requestBelongsToRank(
-        const MoEExpertOverlayPreparationRequest &request,
-        const OverlayRankPlan &rank_plan)
-    {
-        if (!rank_plan.ownsDomain(request.domain_name))
-            return false;
+            if (participants.empty() && domain.primary_device.is_valid())
+            {
+                PreparationParticipant prepared;
+                prepared.device = domain.primary_device;
+                prepared.participant_index = 0;
+                prepared.world_rank = domain.primary_world_rank;
+                prepared.world_rank_known = domain.primary_world_rank_known;
+                prepared.owner_rank = domain.owner_rank;
+                participants.push_back(prepared);
+            }
 
-        if (request.participant_world_rank_known)
-            return request.participant_world_rank == rank_plan.world_rank;
+            return participants;
+        }
 
-        return rank_plan.hasLocalDevice(request.device);
-    }
+        WeightResidencyCategory routedResidencyCategoryFor(const ExpertRoutedTier &tier, DeviceId device)
+        {
+            if (tier.fallback || device.is_cpu())
+                return WeightResidencyCategory::CpuFallbackExpert;
+            return WeightResidencyCategory::AcceleratorRoutedExpert;
+        }
 
-    WeightResidencyCategory categoryForFilteredRank(
-        const MoEExpertOverlayPreparationRequest &request,
-        const OverlayRankPlan &rank_plan)
-    {
-        if (request.fallback && request.device.is_cpu() && !rank_plan.builds_root_graph)
-            return WeightResidencyCategory::WorkerFallbackExpert;
-        return request.residency_category;
-    }
+        bool requestBelongsToRank(
+            const MoEExpertOverlayPreparationRequest &request,
+            const OverlayRankPlan &rank_plan)
+        {
+            if (!rank_plan.ownsDomain(request.domain_name))
+                return false;
 
-    MoEExpertOverlayDomainPreparationStats &recordRequestStats(
-        MoEExpertOverlayPreparationDiagnostics &diagnostics,
-        const MoEExpertOverlayPreparationRequest &request)
-    {
-        auto &stats = statsFor(
-            diagnostics,
-            request.domain_name,
-            request.device,
-            request.participant_index,
-            request.participant_world_rank,
-            request.participant_world_rank_known,
-            request.owner_world_rank,
-            request.residency_category,
-            request.residency_policy);
-        stats.fallback = stats.fallback || request.fallback;
-        stats.memory_budget_bytes = std::max(stats.memory_budget_bytes, request.memory_budget_bytes);
-        ++stats.planned_engine_count;
-        return stats;
-    }
+            if (request.participant_world_rank_known)
+                return request.participant_world_rank == rank_plan.world_rank;
 
-    void sortDiagnostics(MoEExpertOverlayPreparationDiagnostics &diagnostics)
-    {
-        std::sort(diagnostics.domains.begin(), diagnostics.domains.end(),
-                  [](const auto &lhs, const auto &rhs)
-                  {
-                      if (lhs.domain_name != rhs.domain_name)
-                          return lhs.domain_name < rhs.domain_name;
-                      if (lhs.device != rhs.device)
-                          return lhs.device < rhs.device;
-                      if (lhs.participant_world_rank != rhs.participant_world_rank)
-                          return lhs.participant_world_rank < rhs.participant_world_rank;
-                      if (lhs.participant_index != rhs.participant_index)
-                          return lhs.participant_index < rhs.participant_index;
-                      return static_cast<int>(lhs.residency_category) < static_cast<int>(rhs.residency_category);
-                  });
-    }
-} // namespace
+            return rank_plan.hasLocalDevice(request.device);
+        }
+
+        WeightResidencyCategory categoryForFilteredRank(
+            const MoEExpertOverlayPreparationRequest &request,
+            const OverlayRankPlan &rank_plan)
+        {
+            if (request.fallback && request.device.is_cpu() && !rank_plan.builds_root_graph)
+                return WeightResidencyCategory::WorkerFallbackExpert;
+            return request.residency_category;
+        }
+
+        MoEExpertOverlayDomainPreparationStats &recordRequestStats(
+            MoEExpertOverlayPreparationDiagnostics &diagnostics,
+            const MoEExpertOverlayPreparationRequest &request)
+        {
+            auto &stats = statsFor(
+                diagnostics,
+                request.domain_name,
+                request.device,
+                request.participant_index,
+                request.participant_world_rank,
+                request.participant_world_rank_known,
+                request.owner_world_rank,
+                request.residency_category,
+                request.residency_policy);
+            stats.fallback = stats.fallback || request.fallback;
+            stats.memory_budget_bytes = std::max(stats.memory_budget_bytes, request.memory_budget_bytes);
+            ++stats.planned_engine_count;
+            return stats;
+        }
+
+        void sortDiagnostics(MoEExpertOverlayPreparationDiagnostics &diagnostics)
+        {
+            std::sort(diagnostics.domains.begin(), diagnostics.domains.end(),
+                      [](const auto &lhs, const auto &rhs)
+                      {
+                          if (lhs.domain_name != rhs.domain_name)
+                              return lhs.domain_name < rhs.domain_name;
+                          if (lhs.device != rhs.device)
+                              return lhs.device < rhs.device;
+                          if (lhs.participant_world_rank != rhs.participant_world_rank)
+                              return lhs.participant_world_rank < rhs.participant_world_rank;
+                          if (lhs.participant_index != rhs.participant_index)
+                              return lhs.participant_index < rhs.participant_index;
+                          return static_cast<int>(lhs.residency_category) < static_cast<int>(rhs.residency_category);
+                      });
+        }
+    } // namespace
 
     const MoEExpertOverlayDomainPreparationStats *MoEExpertOverlayPreparationDiagnostics::domainStats(
         const std::string &domain_name,
@@ -400,19 +406,22 @@ namespace
     bool MoEExpertOverlayPreparationPlan::hasRequestsForDevice(DeviceId device) const
     {
         return std::any_of(requests_.begin(), requests_.end(),
-                           [&](const auto &request) { return request.device == device; });
+                           [&](const auto &request)
+                           { return request.device == device; });
     }
 
     bool MoEExpertOverlayPreparationPlan::hasAcceleratorRequests() const
     {
         return std::any_of(requests_.begin(), requests_.end(),
-                           [](const auto &request) { return request.device.is_gpu(); });
+                           [](const auto &request)
+                           { return request.device.is_gpu(); });
     }
 
     bool MoEExpertOverlayPreparationPlan::hasCpuRoutedAssignments() const
     {
         return std::any_of(requests_.begin(), requests_.end(),
-                           [](const auto &request) { return request.device.is_cpu(); });
+                           [](const auto &request)
+                           { return request.device.is_cpu(); });
     }
 
     std::vector<DeviceId> MoEExpertOverlayPreparationPlan::acceleratorDevices() const

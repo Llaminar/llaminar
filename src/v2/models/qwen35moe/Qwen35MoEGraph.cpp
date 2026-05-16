@@ -10,12 +10,8 @@
 #include "../../execution/compute_stages/stages/MoERoutingStage.h"
 #include "../../execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "../../execution/moe/MoEExpertParallelPlan.h"
-#include "../../execution/moe/MoEExpertOverlayCPUFallback.h"
 #include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
-#include "../../execution/moe/MoEExpertOverlayLocalTPExecutor.h"
-#include "../../execution/moe/MoEOverlayDomainRuntime.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
-#include "../../loaders/PreparedWeightStore.h"
 #include "../../memory/BufferId.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
 #include "../../tensors/Tensors.h"
@@ -123,18 +119,19 @@ namespace llaminar2
                 resolveMoEExpertOverlayExecutionPlan(config.moe.expert_parallel_plan, current_rank));
         }
 
-        std::shared_ptr<IOverlayDomainRuntime> overlayDomainRuntimeForGraph(
+#if 0
+        std::shared_ptr<DisabledDomainRunner> overlayDomainRuntimeForGraph(
             const GraphConfig &config,
             const std::shared_ptr<MoEExpertOverlayRuntimePlan> &runtime_plan)
         {
             if (config.moe.overlay_domain_runtime)
                 return config.moe.overlay_domain_runtime;
 
-            MoEOverlayDomainRuntime::Config runtime_config;
+            DisabledDomainRunnerImpl::Config runtime_config;
             runtime_config.runtime_plan = runtime_plan;
             runtime_config.execution_plan = executionPlanForGraph(config, runtime_plan);
             runtime_config.enable_compatibility_fallback = true;
-            return makeMoEOverlayDomainRuntime(std::move(runtime_config));
+            return makeDisabledDomainRunner(std::move(runtime_config));
         }
 
         const ExpertComputeDomain *sourceDomainForName(
@@ -199,7 +196,7 @@ namespace llaminar2
             DeviceId participant_device)
         {
             MoEOverlayDispatchGroup group;
-            group.domain_id = MoEExpertOverlayCPUFallback::stableDomainId(runtime_domain.name);
+            group.domain_id = DisabledCpuParticipant::stableDomainId(runtime_domain.name);
             group.layer_id = layer_idx;
             group.dispatch_group_id = stableDispatchGroupId(group.domain_id, layer_idx, tier_index);
             group.participant_count = std::max<int>(1, static_cast<int>(runtime_domain.participants.size()));
@@ -321,7 +318,7 @@ namespace llaminar2
                 failMissingLocalTPContext(tier, domain, tier_index, layer_idx);
 
             std::string reason;
-            if (!MoEExpertOverlayLocalTPExecutor::canExecute(domain, *it->second, &reason))
+            if (!DisabledLocalTPParticipant::canExecute(domain, *it->second, &reason))
             {
                 std::ostringstream message;
                 message << "Bridge Phase 5D LocalTP domain context mismatch for MoE expert overlay routed tier "
@@ -336,6 +333,7 @@ namespace llaminar2
 
             return it->second;
         }
+#endif
     } // namespace
 
     // =========================================================================
@@ -435,12 +433,6 @@ namespace llaminar2
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         auto overlay_runtime_plan = runtimePlanForGraph(config_);
-        auto overlay_execution_plan = overlay_runtime_plan
-                                          ? executionPlanForGraph(config_, overlay_runtime_plan)
-                                          : nullptr;
-        auto overlay_domain_runtime = overlay_runtime_plan
-                                          ? overlayDomainRuntimeForGraph(config_, overlay_runtime_plan)
-                                          : nullptr;
         const auto &overlay_plan = overlay_runtime_plan
                                        ? overlay_runtime_plan->sourcePlanPtr()
                                        : config_.moe.expert_parallel_plan;
@@ -529,7 +521,6 @@ namespace llaminar2
         std::vector<const ITensor *> overlay_reduce_partials;
         std::vector<std::shared_ptr<TensorBase>> overlay_reduce_partial_lifetimes;
         std::vector<MoEExpertParallelReducePartialInfo> overlay_reduce_partial_infos;
-        std::vector<std::shared_ptr<MoEOverlayDomainWorkResult>> overlay_reduce_runtime_results;
         std::vector<TensorBase *> overlay_reduce_sparse_scratch;
         std::vector<std::shared_ptr<TensorBase>> overlay_reduce_sparse_scratch_lifetimes;
         std::vector<std::string> overlay_reduce_dependencies;
@@ -610,102 +601,6 @@ namespace llaminar2
                         return reason;
                     return placement_context + ": " + reason;
                 };
-
-                enum class PreparedResolution
-                {
-                    NotAvailable,
-                    Resolved,
-                    Failed
-                };
-
-                auto tryResolvePreparedCpuExperts = [&]() -> PreparedResolution
-                {
-                    if (stage_device.is_gpu() || !expert_params.prepared_store)
-                        return PreparedResolution::NotAvailable;
-
-                    auto make_desc = [&](WeightRole role)
-                    {
-                        ExpertSlabDescriptor desc;
-                        desc.layer_idx = layer_idx;
-                        desc.role = role;
-                        desc.device = stage_device;
-                        desc.num_experts = expert_params.num_experts;
-                        desc.local_expert_start = expert_params.local_expert_start;
-                        desc.local_expert_count = expert_params.local_expert_count < 0
-                                                      ? expert_params.num_experts
-                                                      : expert_params.local_expert_count;
-                        desc.rows_per_expert = static_cast<size_t>(expert_params.expert_intermediate);
-                        desc.cols_per_expert = static_cast<size_t>(expert_params.d_model);
-                        return desc;
-                    };
-
-                    auto gate_ref = expert_params.prepared_store->findExpertSlab(make_desc(WeightRole::MoEExpertGate));
-                    auto up_ref = expert_params.prepared_store->findExpertSlab(make_desc(WeightRole::MoEExpertUp));
-                    auto down_ref = expert_params.prepared_store->findExpertSlab(make_desc(WeightRole::MoEExpertDown));
-
-                    const bool any_ref = gate_ref.has_value() || up_ref.has_value() || down_ref.has_value();
-                    if (!any_ref)
-                        return PreparedResolution::NotAvailable;
-
-                    if (!gate_ref || !up_ref || !down_ref)
-                    {
-                        LOG_ERROR("[Qwen35MoEGraph] Partial PreparedWeightStore expert slabs for layer "
-                                  << layer_idx << " on " << stage_device.to_string()
-                                  << "; raw expert repack fallback is disabled");
-                        return PreparedResolution::Failed;
-                    }
-
-                    std::vector<int> required_experts;
-                    if (!expert_params.expert_mask.empty())
-                    {
-                        for (int expert = 0; expert < expert_params.num_experts; ++expert)
-                            if (expert_params.expert_mask[expert])
-                                required_experts.push_back(expert);
-                    }
-                    else
-                    {
-                        const int local_start = expert_params.local_expert_start;
-                        const int local_count = expert_params.local_expert_count < 0
-                                                    ? expert_params.num_experts
-                                                    : expert_params.local_expert_count;
-                        for (int expert = local_start; expert < local_start + local_count; ++expert)
-                            required_experts.push_back(expert);
-                    }
-
-                    expert_params.prepared_gate_gemm.assign(expert_params.num_experts, nullptr);
-                    expert_params.prepared_up_gemm.assign(expert_params.num_experts, nullptr);
-                    expert_params.prepared_down_gemm.assign(expert_params.num_experts, nullptr);
-
-                    for (int expert : required_experts)
-                    {
-                        expert_params.prepared_gate_gemm[expert] = expert_params.prepared_store->expertGemmKernel(*gate_ref, expert);
-                        expert_params.prepared_up_gemm[expert] = expert_params.prepared_store->expertGemmKernel(*up_ref, expert);
-                        expert_params.prepared_down_gemm[expert] = expert_params.prepared_store->expertGemmKernel(*down_ref, expert);
-                        if (!expert_params.prepared_gate_gemm[expert] ||
-                            !expert_params.prepared_up_gemm[expert] ||
-                            !expert_params.prepared_down_gemm[expert])
-                        {
-                            LOG_ERROR("[Qwen35MoEGraph] Missing PreparedWeightStore CPU expert engine for layer "
-                                      << layer_idx << " expert " << expert << " on "
-                                      << stage_device.to_string() << "; raw expert repack fallback is disabled");
-                            return PreparedResolution::Failed;
-                        }
-                    }
-
-                    expert_params.gate_slab_ref = *gate_ref;
-                    expert_params.up_slab_ref = *up_ref;
-                    expert_params.down_slab_ref = *down_ref;
-                    LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
-                                                        << ": resolved " << (required_experts.size() * 3)
-                                                        << " CPU expert GEMM engines from PreparedWeightStore without raw tensors");
-                    return PreparedResolution::Resolved;
-                };
-
-                const PreparedResolution prepared_resolution = tryResolvePreparedCpuExperts();
-                if (prepared_resolution == PreparedResolution::Failed)
-                    return false;
-                if (prepared_resolution == PreparedResolution::Resolved)
-                    return true;
 
                 // Extract per-expert 2D views from 3D packed tensors (required)
                 if (!MoEExpertComputeStage::extractExpertViews(expert_params))
@@ -817,23 +712,17 @@ namespace llaminar2
             };
 
             const bool overlay_requested = overlay_plan && overlay_plan->isTieredOverlay();
-            const ExpertLayerPlacement *overlay_placement = overlay_requested
-                                                                ? findExpertOverlayPlacement(*overlay_plan, layer_idx)
-                                                                : nullptr;
-            const bool use_expert_overlay = overlay_requested && overlay_placement &&
-                                            isUsableExpertOverlayPlacement(*overlay_placement,
-                                                                           *overlay_plan,
-                                                                           config_.moe.num_experts,
-                                                                           layer_idx);
+            const bool use_expert_overlay = false;
 
-            if (overlay_requested && !use_expert_overlay)
+            if (overlay_requested)
             {
                 LOG_WARN("[Qwen35MoEGraph] Expert overlay requested for layer " << layer_idx
-                                                                                << " but no usable placement was found; using legacy routed expert path");
+                                                                                << " but sidecar overlay stages were removed; using graph-native routed expert path");
             }
 
             if (use_expert_overlay)
             {
+#if 0
                 auto dispatch_output_lifetime = std::make_shared<MoEExpertDispatchOutput>();
 
                 MoEExpertDispatchStage::Params dispatch_params;
@@ -960,7 +849,7 @@ namespace llaminar2
 
                     auto addRuntimeNode = [&](MoEOverlayDomainWorkRequest request, DeviceId stage_device)
                     {
-                        MoEOverlayDomainRuntimeStage::Params runtime_params;
+                        DisabledDomainRunnerStage::Params runtime_params;
                         runtime_params.device_id = stage_device;
                         runtime_params.mpi_ctx = config_.moe.overlay_mpi_ctx
                                                      ? config_.moe.overlay_mpi_ctx.get()
@@ -971,20 +860,20 @@ namespace llaminar2
                         runtime_params.result = runtime_result.get();
 
                         graph.addNode(tier_node,
-                                      ComputeStageFactory::createMoEOverlayDomainRuntime(runtime_params),
+                                      ComputeStageFactory::createDisabledDomainRunner(runtime_params),
                                       stage_device);
                     };
 
                     if (use_cpu_node_local_fallback)
                     {
-                        MoEExpertOverlayCPUFallbackStage::Params fallback_params;
+                        DisabledCpuParticipantStage::Params fallback_params;
                         fallback_params.device_id = DeviceId::cpu();
                         fallback_params.mpi_ctx = config_.moe.overlay_mpi_ctx
                                                       ? config_.moe.overlay_mpi_ctx.get()
                                                       : mpi_ctx_.get();
                         fallback_params.domain = *source_domain;
                         fallback_params.root_world_rank = continuationRootWorldRank(*overlay_runtime_plan);
-                        fallback_params.domain_id = MoEExpertOverlayCPUFallback::stableDomainId(source_domain->name);
+                        fallback_params.domain_id = DisabledCpuParticipant::stableDomainId(source_domain->name);
                         fallback_params.input = buffers.normalized;
                         fallback_params.seq_len = total_tokens;
                         fallback_params.d_model = config_.d_model;
@@ -1017,7 +906,7 @@ namespace llaminar2
                     }
                     else if (use_accelerator_local_tp)
                     {
-                        MoEExpertOverlayLocalTPStage::Params local_tp_params;
+                        DisabledLocalTPParticipantStage::Params local_tp_params;
                         local_tp_params.device_id = runtime_domain->primary_device;
                         local_tp_params.domain = *runtime_domain;
                         local_tp_params.local_tp_context = local_tp_context;
@@ -1040,7 +929,7 @@ namespace llaminar2
                             local_tp_context->backend() != CollectiveBackendType::HOST;
                         local_tp_params.dispatch_output_lifetime = dispatch_output_lifetime;
                         local_tp_params.dispatch_tier_index = static_cast<int>(tier_index);
-                        local_tp_params.diagnostics_lifetime = std::make_shared<MoEExpertOverlayLocalTPDiagnostics>();
+                        local_tp_params.diagnostics_lifetime = std::make_shared<DisabledLocalTPDiagnostics>();
 
                         if (local_tp_context->backend() != CollectiveBackendType::HOST)
                         {
@@ -1060,7 +949,7 @@ namespace llaminar2
                             for (size_t participant_index = 0; participant_index < runtime_domain->participants.size(); ++participant_index)
                             {
                                 const DeviceId participant_device = runtime_domain->participants[participant_index].local_device;
-                                MoEExpertOverlayLocalTPPreparedParticipant prepared;
+                                DisabledLocalTPPreparedParticipant prepared;
                                 prepared.participant_index = static_cast<int>(participant_index);
                                 prepared.device = participant_device;
 
@@ -1158,6 +1047,7 @@ namespace llaminar2
                     graph.addDependency(tier_node, dispatch_name);
                 }
                 overlay_reduce_dependencies = std::move(tier_node_names);
+#endif
             }
             else
             {
@@ -1293,7 +1183,6 @@ namespace llaminar2
             {
                 const auto &shared_domain = overlay_runtime_plan->sharedExpertDomain();
                 overlay_reduce_partials.push_back(shared_output);
-                overlay_reduce_runtime_results.push_back(nullptr);
                 overlay_reduce_partial_infos.push_back(MoEExpertParallelReducePartialInfo{
                     .name = "shared_expert",
                     .source_domain = shared_domain.name,
@@ -1316,7 +1205,6 @@ namespace llaminar2
             reduce_params.partials = std::move(overlay_reduce_partials);
             reduce_params.partial_lifetimes = std::move(overlay_reduce_partial_lifetimes);
             reduce_params.partial_infos = std::move(overlay_reduce_partial_infos);
-            reduce_params.runtime_partial_results = std::move(overlay_reduce_runtime_results);
             reduce_params.sparse_expansion_scratch = std::move(overlay_reduce_sparse_scratch);
             reduce_params.sparse_expansion_scratch_lifetimes = std::move(overlay_reduce_sparse_scratch_lifetimes);
             reduce_params.output = moe_output;

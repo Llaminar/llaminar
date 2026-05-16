@@ -830,6 +830,7 @@ namespace llaminar2
         hipFree(bufs.d_logits);
         hipFree(bufs.d_indices);
         hipFree(bufs.d_weights);
+
         return true;
     }
 
@@ -841,7 +842,12 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::zeroBuffer] tensor has no device allocation");
             return;
         }
-        hipMemset(ptr, 0, bytes);
+        hipError_t err = hipMemset(ptr, 0, bytes);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::zeroBuffer] hipMemset failed: " << hipGetErrorString(err));
+            return;
+        }
         tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
 

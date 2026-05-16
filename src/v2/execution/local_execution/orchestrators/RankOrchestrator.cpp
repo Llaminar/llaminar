@@ -720,7 +720,6 @@ namespace llaminar2
                                                  runner_config.prepared_weight_store = config_.prepared_weight_store;
                                                  runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
                                                  runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
-                                                 runner_config.moe_overlay_dispatch_backend = config_.moe_overlay_dispatch_backend;
                                                  runner_config.cancellation_requested = [this]()
                                                  {
                                                      return tp_ctx_ && tp_ctx_->isAbortRequested();
@@ -994,8 +993,6 @@ namespace llaminar2
             runner_config.prepared_weight_store = config_.prepared_weight_store;
             runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
             runner_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
-            runner_config.moe_overlay_dispatch_backend = config_.moe_overlay_dispatch_backend;
-
             // =====================================================================
             // Build FactoryPPStageConfig for the createPPStageRunner factory
             // =====================================================================
@@ -1035,8 +1032,6 @@ namespace llaminar2
                 nested_config.prepared_weight_store = config_.prepared_weight_store;
                 nested_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
                 nested_config.moe_expert_overlay_mpi_ctx = config_.moe_expert_overlay_mpi_ctx;
-                nested_config.moe_overlay_dispatch_backend = config_.moe_overlay_dispatch_backend;
-
                 // CRITICAL: Pass PP stage config to nested TP MDO so its DeviceGraphOrchestrators
                 // build partial graphs instead of full graphs. Without this, the TP devices would
                 // build LM_HEAD stages even though this PP stage doesn't own LM_HEAD.

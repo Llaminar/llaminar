@@ -37,6 +37,7 @@ namespace llaminar2
     struct PipelineConfig;
     class ILocalPPContext;
     class ILocalTPContext;
+    class ITPContext;
     class PreparedWeightStore;
     class IModelContext;
 
@@ -279,7 +280,7 @@ namespace llaminar2
         }
 
         /// Register a TP context for a named domain
-        virtual void setTPContext(const std::string &domain_name, ILocalTPContext *tp_ctx)
+        virtual void setTPContext(const std::string &domain_name, ITPContext *tp_ctx)
         {
             (void)domain_name;
             (void)tp_ctx;

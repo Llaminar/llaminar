@@ -163,31 +163,6 @@ namespace llaminar2
         /// Total number of populated expert engines across all slabs.
         size_t totalPopulatedExperts() const;
 
-        struct MemoryStats
-        {
-            size_t gemm_entries = 0;
-            size_t gemm_bytes = 0;
-            size_t sliced_entries = 0;
-            size_t sliced_bytes = 0;
-            size_t expert_slabs = 0;
-            size_t expert_engines = 0;
-            size_t expert_bytes = 0;
-            size_t expert_view_lifetimes = 0;
-            size_t expert_borrowed_views = 0;
-            size_t expert_view_raw_live = 0;
-            size_t embedding_entries = 0;
-            size_t embedding_bytes = 0;
-
-            size_t totalBytes() const
-            {
-                return gemm_bytes + sliced_bytes + expert_bytes + embedding_bytes;
-            }
-        };
-
-        /// Non-mutating prepared-weight memory accounting for diagnostics.
-        MemoryStats memoryStats() const;
-        void logMemorySummary(const char *context) const;
-
     private:
         struct Entry
         {

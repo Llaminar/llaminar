@@ -4234,7 +4234,7 @@ namespace llaminar2
             // so this avoids ~20 unordered_map<string> lookups per GEMM call.
             // (~2260 lookups/token × ~100ns each = ~0.2ms/token savings)
             // =========================================================================
-            if (impl_->validated_workspace == workspace_)
+            if (workspace_ && impl_->validated_workspace == workspace_)
             {
                 return;
             }

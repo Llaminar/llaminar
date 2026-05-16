@@ -130,7 +130,9 @@ namespace llaminar2
                 continue;
             }
 
-            const DeviceId device = node->device;
+            DeviceId device = node->device;
+            if (!device.is_gpu() && node->stage->device().is_gpu())
+                device = node->stage->device();
             if (!device.is_gpu())
             {
                 continue;

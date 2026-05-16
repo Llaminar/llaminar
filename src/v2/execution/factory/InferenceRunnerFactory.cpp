@@ -11,6 +11,7 @@
 #include "../../backends/BackendManager.h"
 #include "../local_execution/collective/CollectiveContext.h"
 #include "../mpi_orchestration/DeviceInventory.h"
+#include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../local_execution/graph/GraphBuilderRegistry.h"
 #include "../../models/IGraphConfigBuilder.h"
 #include "../local_execution/graph/SchemaFactoryRegistry.h" // Model-agnostic sharding config
@@ -22,6 +23,7 @@
 #include "../../loaders/WeightStreamerFactory.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ITPContext.h"
+#include "../../collective/TPContextFactory.h"
 #include "../../collective/GlobalTPContext.h"
 #include "../local_execution/orchestrators/IRankOrchestrator.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
@@ -37,15 +39,15 @@
 #include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../execution/moe/MoEExpertParallelPlanner.h"
-#include "../../execution/moe/MoEOverlayDomainRuntime.h"
-#include "../../execution/moe/MoEOverlayMPIDispatchBackend.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <future>
+#include <functional>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 
 namespace llaminar2
 {
@@ -134,138 +136,79 @@ namespace llaminar2
             return metadata;
         }
 
-        const ExpertComputeDomain *findSourceDomain(
-            const MoEExpertParallelPlan &plan,
-            const std::string &domain_name)
+        int stableContinuationDomainId(const std::string &domain_name)
         {
-            for (const auto &domain : plan.domains)
+            const size_t hashed = std::hash<std::string>{}(domain_name);
+            return static_cast<int>(hashed & 0x3fffffffU);
+        }
+
+        std::vector<std::string> denseMoEDomainNames(const MoEExpertParallelPlan &plan)
+        {
+            std::vector<std::string> names;
+            std::unordered_set<std::string> seen;
+            auto add = [&](const std::string &name)
             {
-                if (domain.name == domain_name)
-                    return &domain;
-            }
-            return nullptr;
-        }
-
-        bool tierHasAssignedExperts(const MoEExpertParallelPlan &plan, size_t tier_index)
-        {
-            if (plan.placements.empty())
-                return true;
-
-            const int tier = static_cast<int>(tier_index);
-            for (const auto &placement : plan.placements)
-            {
-                for (int assigned_tier : placement.routed_expert_tier)
-                {
-                    if (assigned_tier == tier)
-                        return true;
-                }
-            }
-            return false;
-        }
-
-        bool domainNeedsLocalTPContext(const ExpertComputeDomain &domain)
-        {
-            return domain.kind == ExpertDomainKind::LocalTP &&
-                   domain.compute_kind == ExpertDomainComputeKind::TensorParallelExperts &&
-                   domain.participants.size() > 1;
-        }
-
-        std::string describeDeviceList(const std::vector<GlobalDeviceAddress> &devices)
-        {
-            std::ostringstream oss;
-            for (size_t index = 0; index < devices.size(); ++index)
-            {
-                if (index > 0)
-                    oss << ",";
-                oss << devices[index].toString();
-            }
-            return oss.str();
-        }
-
-        ILocalTPContext *localTPContextFromRunnerConfig(const InferenceRunnerConfig *runner_config)
-        {
-            if (!runner_config || !runner_config->tp_ctx || !runner_config->tp_ctx->isLocal())
-                return nullptr;
-            return static_cast<ILocalTPContext *>(runner_config->tp_ctx);
-        }
-
-        bool localTPContextMatchesDomain(
-            const ILocalTPContext &context,
-            const ExpertComputeDomain &domain,
-            std::string *reason = nullptr)
-        {
-            const auto fail = [&](const std::string &message)
-            {
-                if (reason)
-                    *reason = message;
-                return false;
+                if (!name.empty() && seen.insert(name).second)
+                    names.push_back(name);
             };
 
-            if (context.degree() != static_cast<int>(domain.participants.size()))
+            add(plan.continuation_domain);
+            add(plan.effectiveBaseModelDomain());
+            add(plan.shared_expert_domain);
+            for (const auto &domain : plan.dense_domains)
+                add(domain.name);
+            return names;
+        }
+
+        const ExecutionDomainDefinition *findDenseMoEDomain(
+            const MoEExpertParallelPlan &plan,
+            const std::string &name)
+        {
+            auto it = std::find_if(plan.dense_domains.begin(), plan.dense_domains.end(),
+                                   [&](const auto &domain)
+                                   {
+                                       return domain.name == name;
+                                   });
+            return it == plan.dense_domains.end() ? nullptr : &*it;
+        }
+
+        int participantIndexForDenseDomain(
+            const ExecutionDomainDefinition &domain,
+            const std::shared_ptr<IMPIContext> &runner_mpi_ctx)
+        {
+            const int rank = runner_mpi_ctx ? runner_mpi_ctx->rank() : 0;
+            for (size_t index = 0; index < domain.ranks.size(); ++index)
             {
-                std::ostringstream message;
-                message << "degree mismatch: context=" << context.degree()
-                        << " domain=" << domain.participants.size();
-                return fail(message.str());
+                if (domain.ranks[index] == rank)
+                    return static_cast<int>(index);
             }
 
-            if (domain.backend != CollectiveBackendType::AUTO &&
-                context.backend() != CollectiveBackendType::AUTO &&
-                context.backend() != domain.backend)
+            if (domain.owner_rank.has_value() && *domain.owner_rank == rank)
+                return 0;
+
+            return 0;
+        }
+
+        TPDomainParticipation denseDomainParticipation(
+            const ExecutionDomainDefinition &domain,
+            const std::shared_ptr<IMPIContext> &runner_mpi_ctx)
+        {
+            TPDomainParticipation participation;
+            participation.domain_id = stableContinuationDomainId(domain.name);
+            participation.domain_name = domain.name;
+            participation.devices = domain.participants;
+            participation.weights = domain.weights;
+            participation.backend = domain.backend;
+            participation.my_index_in_domain = participantIndexForDenseDomain(domain, runner_mpi_ctx);
+
+            if ((domain.scope == ExecutionDomainScope::NODE_LOCAL ||
+                 domain.scope == ExecutionDomainScope::GLOBAL) &&
+                participation.backend == CollectiveBackendType::AUTO)
             {
-                std::ostringstream message;
-                message << "backend mismatch: context=" << static_cast<int>(context.backend())
-                        << " domain=" << static_cast<int>(domain.backend);
-                return fail(message.str());
+                participation.backend = CollectiveBackendType::UPI;
             }
 
-            const auto &context_devices = context.devices();
-            if (context_devices.size() != domain.participants.size())
-            {
-                std::ostringstream message;
-                message << "device count mismatch: context=" << context_devices.size()
-                        << " domain=" << domain.participants.size();
-                return fail(message.str());
-            }
-
-            for (size_t index = 0; index < context_devices.size(); ++index)
-            {
-                if (!(context_devices[index] == domain.participants[index]))
-                {
-                    std::ostringstream message;
-                    message << "participant mismatch at index " << index
-                            << ": context=" << context_devices[index].toString()
-                            << " domain=" << domain.participants[index].toString();
-                    return fail(message.str());
-                }
-            }
-
-            if (!domain.weights.empty())
-            {
-                const auto &context_weights = context.weights();
-                if (context_weights.size() != domain.weights.size())
-                {
-                    std::ostringstream message;
-                    message << "weight count mismatch: context=" << context_weights.size()
-                            << " domain=" << domain.weights.size();
-                    return fail(message.str());
-                }
-                for (size_t index = 0; index < context_weights.size(); ++index)
-                {
-                    if (std::abs(context_weights[index] - domain.weights[index]) > 1e-4f)
-                    {
-                        std::ostringstream message;
-                        message << "weight mismatch at index " << index
-                                << ": context=" << context_weights[index]
-                                << " domain=" << domain.weights[index];
-                        return fail(message.str());
-                    }
-                }
-            }
-
-            if (reason)
-                reason->clear();
-            return true;
+            return participation;
         }
 
         int overlayRankFor(
@@ -279,15 +222,57 @@ namespace llaminar2
             return 0;
         }
 
-        int overlayWorldSizeFor(
-            const std::shared_ptr<IMPIContext> &overlay_mpi_ctx,
-            const std::shared_ptr<IMPIContext> &runner_mpi_ctx)
+        bool populateMoEContinuationDomainTPContextsForGraph(
+            GraphConfig &graph_config,
+            DomainTPContextMap &owned_domain_tp_contexts,
+            const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+            const std::string &log_prefix,
+            const InferenceRunnerConfig *runner_config)
         {
-            if (overlay_mpi_ctx)
-                return overlay_mpi_ctx->world_size();
-            if (runner_mpi_ctx)
-                return runner_mpi_ctx->world_size();
-            return 1;
+            const auto &plan = graph_config.moe.expert_parallel_plan;
+            if (!plan || !plan->isTieredOverlay())
+                return true;
+
+            ITPContext *injected_tp_context = runner_config ? runner_config->tp_ctx : nullptr;
+            MPI_Comm base_comm = runner_mpi_ctx ? runner_mpi_ctx->communicator() : MPI_COMM_WORLD;
+
+            for (const auto &domain_name : denseMoEDomainNames(*plan))
+            {
+                const auto *domain = findDenseMoEDomain(*plan, domain_name);
+                if (!domain || domain->participants.size() <= 1)
+                    continue;
+
+                if (graph_config.domain_tp_contexts.find(domain_name) != graph_config.domain_tp_contexts.end())
+                    continue;
+
+                if (injected_tp_context && domain_name == plan->continuation_domain &&
+                    injected_tp_context->degree() == static_cast<int>(domain->participants.size()))
+                {
+                    graph_config.domain_tp_contexts[domain_name] = injected_tp_context;
+                    LOG_INFO(log_prefix << " using injected "
+                                        << tpScopeToString(injected_tp_context->scope())
+                                        << " TP context for MoE continuation dense domain '"
+                                        << domain_name << "'");
+                    continue;
+                }
+
+                if (owned_domain_tp_contexts.find(domain_name) == owned_domain_tp_contexts.end())
+                {
+                    auto participation = denseDomainParticipation(*domain, runner_mpi_ctx);
+                    auto ctx = TPContextFactory::createFromDomain(participation, base_comm);
+                    if (!ctx)
+                    {
+                        LOG_WARN(log_prefix << " failed to create TP context for MoE continuation dense domain '"
+                                            << domain_name << "'");
+                        return false;
+                    }
+                    owned_domain_tp_contexts.emplace(domain_name, std::shared_ptr<ITPContext>(std::move(ctx)));
+                }
+
+                graph_config.domain_tp_contexts[domain_name] = owned_domain_tp_contexts.at(domain_name).get();
+            }
+
+            return true;
         }
 
         bool applyMoEExpertOverlayConfigToGraph(
@@ -295,7 +280,7 @@ namespace llaminar2
             const InferenceRunnerConfig &config,
             const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
             GraphConfig &graph_config,
-            DomainLocalTPContextMap &owned_domain_tp_contexts,
+            DomainTPContextMap &owned_domain_tp_contexts,
             const std::string &log_prefix)
         {
             auto plan = resolveMoEExpertParallelPlanForModel(model_ctx, config);
@@ -309,29 +294,14 @@ namespace llaminar2
 
             if (plan->isTieredOverlay())
             {
-                const int rank = overlayRankFor(config.moe_expert_overlay_mpi_ctx, runner_mpi_ctx);
-                const int world_size = overlayWorldSizeFor(config.moe_expert_overlay_mpi_ctx, runner_mpi_ctx);
-                graph_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
-                    plan,
-                    MoEExpertOverlayRuntimeResolverOptions{.current_world_rank = rank});
-                graph_config.moe.expert_overlay_execution_plan = std::make_shared<MoEExpertOverlayExecutionPlan>(
-                    resolveMoEExpertOverlayExecutionPlan(
-                        plan,
-                        MoEExpertOverlayExecutionPlanResolverOptions{
-                            .current_world_rank = rank,
-                            .world_size = world_size,
-                        }));
+                graph_config.moe.expert_overlay_runtime_plan.reset();
+                graph_config.moe.expert_overlay_execution_plan.reset();
+                LOG_INFO(log_prefix << " using graph-native MoE overlay lowering for tiered expert overlay");
 
-                MoEOverlayDomainRuntime::Config runtime_config;
-                runtime_config.runtime_plan = graph_config.moe.expert_overlay_runtime_plan;
-                runtime_config.execution_plan = graph_config.moe.expert_overlay_execution_plan;
-                runtime_config.dispatch_backend = config.moe_overlay_dispatch_backend;
-                runtime_config.enable_compatibility_fallback = true;
-                graph_config.moe.overlay_domain_runtime = makeMoEOverlayDomainRuntime(std::move(runtime_config));
-
-                if (!populateMoEExpertOverlayDomainTPContextsForGraph(
+                if (!populateMoEContinuationDomainTPContextsForGraph(
                         graph_config,
                         owned_domain_tp_contexts,
+                        runner_mpi_ctx,
                         log_prefix,
                         &config))
                 {
@@ -341,42 +311,24 @@ namespace llaminar2
 
             return true;
         }
-
-        DeviceId effectiveMoEOverlayRootDevice(
-            const GraphConfig &graph_config,
-            DeviceId requested_device,
-            const std::string &log_prefix)
-        {
-            const auto &runtime_plan = graph_config.moe.expert_overlay_runtime_plan;
-            if (!runtime_plan)
-                return requested_device;
-
-            const auto &execution_plan = graph_config.moe.expert_overlay_execution_plan;
-            if (execution_plan && !execution_plan->buildsRootGraph())
-                return requested_device;
-
-            DeviceId continuation_device = runtime_plan->continuationDevice();
-            if (!continuation_device.is_valid() || continuation_device == requested_device)
-                return requested_device;
-
-            const auto &continuation_domain = runtime_plan->continuationDomain();
-            const bool requested_is_continuation_participant = std::any_of(
-                continuation_domain.participants.begin(),
-                continuation_domain.participants.end(),
-                [&](const MoEOverlayDomainParticipant &participant)
-                {
-                    return participant.local_device == requested_device;
-                });
-            if (requested_is_continuation_participant)
-                return requested_device;
-
-            LOG_INFO(log_prefix << " using MoE expert overlay continuation device "
-                                << continuation_device.to_string()
-                                << " instead of requested/default "
-                                << requested_device.to_string());
-            return continuation_device;
-        }
     } // namespace
+
+    bool applyMoEExpertOverlayConfigToGraphForTesting(
+        IModelContext &model_ctx,
+        const InferenceRunnerConfig &config,
+        const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+        GraphConfig &graph_config,
+        DomainTPContextMap &owned_domain_tp_contexts,
+        const std::string &log_prefix)
+    {
+        return applyMoEExpertOverlayConfigToGraph(
+            model_ctx,
+            config,
+            runner_mpi_ctx,
+            graph_config,
+            owned_domain_tp_contexts,
+            log_prefix);
+    }
 
     std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
         IModelContext &model_ctx,
@@ -392,73 +344,6 @@ namespace llaminar2
             *plan,
             moEExpertMetadataForModel(model_ctx));
         return std::make_shared<MoEExpertParallelPlan>(std::move(planner_result.planned_plan));
-    }
-
-    bool populateMoEExpertOverlayDomainTPContextsForGraph(
-        GraphConfig &graph_config,
-        DomainLocalTPContextMap &owned_contexts,
-        const std::string &log_prefix,
-        const InferenceRunnerConfig *runner_config)
-    {
-        const auto &plan = graph_config.moe.expert_parallel_plan;
-        if (!plan || !plan->isTieredOverlay())
-            return true;
-
-        ILocalTPContext *runner_local_tp_context = localTPContextFromRunnerConfig(runner_config);
-
-        for (size_t tier_index = 0; tier_index < plan->routed_tiers.size(); ++tier_index)
-        {
-            if (!tierHasAssignedExperts(*plan, tier_index))
-                continue;
-
-            const auto &tier = plan->routed_tiers[tier_index];
-            const auto *domain = findSourceDomain(*plan, tier.domain);
-            if (!domain || !domainNeedsLocalTPContext(*domain))
-                continue;
-
-            if (graph_config.domain_tp_contexts.find(domain->name) != graph_config.domain_tp_contexts.end())
-                continue;
-
-            if (runner_local_tp_context)
-            {
-                std::string reason;
-                if (localTPContextMatchesDomain(*runner_local_tp_context, *domain, &reason))
-                {
-                    graph_config.domain_tp_contexts[domain->name] = runner_local_tp_context;
-                    LOG_INFO(log_prefix << " using injected LOCAL TP context for MoE expert overlay domain '"
-                                        << domain->name << "' devices="
-                                        << describeDeviceList(runner_local_tp_context->devices())
-                                        << " backend=" << static_cast<int>(runner_local_tp_context->backend()));
-                    continue;
-                }
-
-                if (debugEnv().tp_collective_contract_trace)
-                {
-                    LOG_WARN(log_prefix << " [TP_COLLECTIVE_CONTEXT] event=moe_domain_injected_context_mismatch domain='"
-                                        << domain->name << "' reason=\"" << reason << "\""
-                                        << " injected_devices=" << describeDeviceList(runner_local_tp_context->devices())
-                                        << " domain_devices=" << describeDeviceList(domain->participants));
-                }
-            }
-
-            if (owned_contexts.find(domain->name) == owned_contexts.end())
-            {
-                std::vector<float> weights(domain->participants.size(),
-                                           1.0f / static_cast<float>(domain->participants.size()));
-                auto ctx = createLocalTPContext(domain->participants, weights, domain->backend);
-                if (!ctx)
-                {
-                    LOG_WARN(log_prefix << " failed to create LocalTPContext for MoE expert overlay domain '"
-                                        << domain->name << "'");
-                    return false;
-                }
-                owned_contexts.emplace(domain->name, std::shared_ptr<ILocalTPContext>(std::move(ctx)));
-            }
-
-            graph_config.domain_tp_contexts[domain->name] = owned_contexts.at(domain->name).get();
-        }
-
-        return true;
     }
 
     static PreparedWeightKind expectedGemmPreparedKind(DeviceId device)
@@ -1372,7 +1257,7 @@ namespace llaminar2
         graph_config.moe.expert_mode = config.moe_expert_mode;
         graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
         graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
-        DomainLocalTPContextMap owned_domain_tp_contexts;
+        DomainTPContextMap owned_domain_tp_contexts;
         if (!applyMoEExpertOverlayConfigToGraph(
                 *model_ctx,
                 config,
@@ -1383,8 +1268,6 @@ namespace llaminar2
         {
             return nullptr;
         }
-        device = effectiveMoEOverlayRootDevice(graph_config, device, "[InferenceRunner]");
-
         // Apply sharding config + model dimensions in a single call
         // (must be after populateFromModelContext which sets n_heads/n_kv_heads/head_dim)
         if (weight_mgr)
@@ -2079,23 +1962,37 @@ namespace llaminar2
             return false;
         }
 
-        const bool has_overlay_runtime_plan = graph_config.moe.expert_overlay_runtime_plan != nullptr;
+        const bool has_tiered_overlay_plan =
+            graph_config.moe.expert_parallel_plan &&
+            graph_config.moe.expert_parallel_plan->isTieredOverlay();
+        auto overlay_runtime_plan_for_weight_prep = graph_config.moe.expert_overlay_runtime_plan;
+        const MoEExpertOverlayExecutionPlan *overlay_execution_plan_for_weight_prep =
+            graph_config.moe.expert_overlay_execution_plan.get();
+        if (has_tiered_overlay_plan && !overlay_runtime_plan_for_weight_prep)
+        {
+            overlay_runtime_plan_for_weight_prep = resolveMoEExpertOverlayRuntimePlan(
+                graph_config.moe.expert_parallel_plan,
+                MoEExpertOverlayRuntimeResolverOptions{
+                    .current_world_rank = overlayRankFor(graph_config.moe.overlay_mpi_ctx, nullptr),
+                });
+            overlay_execution_plan_for_weight_prep = nullptr;
+        }
+
         if (!weight_mgr->prepareWeightsForDevice(
                 frozen_weights,
                 device,
-                /*include_expert_jobs=*/!has_overlay_runtime_plan))
+                /*include_expert_jobs=*/!overlay_runtime_plan_for_weight_prep))
         {
             LOG_WARN("[InferenceRunner] Binding-driven weight preparation had issues for device "
                      << device.to_string());
         }
 
-        if (graph_config.moe.expert_overlay_runtime_plan)
+        if (overlay_runtime_plan_for_weight_prep)
         {
-            const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
             if (!weight_mgr->prepareMoEExpertOverlayWeights(
-                    *graph_config.moe.expert_overlay_runtime_plan,
+                    *overlay_runtime_plan_for_weight_prep,
                     &frozen_weights,
-                    execution_plan))
+                    overlay_execution_plan_for_weight_prep))
             {
                 LOG_ERROR("[InferenceRunner] Failed to prepare MoE expert overlay weights");
                 return false;
@@ -2735,7 +2632,7 @@ namespace llaminar2
         graph_config.moe.expert_mode = config.moe_expert_mode;
         graph_config.moe.hot_expert_cache = config.moe_hot_expert_cache;
         graph_config.moe.rebalance_config = effectiveMoERebalanceConfig(config);
-        DomainLocalTPContextMap owned_domain_tp_contexts;
+        DomainTPContextMap owned_domain_tp_contexts;
         const auto overlay_runner_mpi_ctx = config.moe_expert_overlay_mpi_ctx;
         if (!applyMoEExpertOverlayConfigToGraph(
                 *model_ctx,
@@ -2747,8 +2644,6 @@ namespace llaminar2
         {
             return nullptr;
         }
-        device = effectiveMoEOverlayRootDevice(graph_config, device, "[InferenceRunner] Testable");
-
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.default_device = device;

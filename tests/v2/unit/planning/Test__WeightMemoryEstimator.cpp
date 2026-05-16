@@ -8,81 +8,82 @@ using namespace llaminar2;
 namespace
 {
 
-ModelMemoryProfile createSimpleProfile()
-{
-    ModelMemoryProfile p;
-    p.architecture = "qwen2";
-    p.n_layers = 2;
-    p.d_model = 896;
-    p.d_ff = 4864;
-    p.n_heads = 14;
-    p.n_kv_heads = 2;
-    p.head_dim = 64;
-    p.vocab_size = 151936;
-    p.max_seq_len = 4096;
-    p.total_native_bytes = 0;
+    ModelMemoryProfile createSimpleProfile()
+    {
+        ModelMemoryProfile p;
+        p.architecture = "qwen2";
+        p.n_layers = 2;
+        p.d_model = 896;
+        p.d_ff = 4864;
+        p.n_heads = 14;
+        p.n_kv_heads = 2;
+        p.head_dim = 64;
+        p.vocab_size = 151936;
+        p.max_seq_len = 4096;
+        p.total_native_bytes = 0;
 
-    auto addTensor = [&](const std::string& name, size_t rows, size_t cols,
-                         const std::string& quant, int layer = -1) {
-        TensorSizeInfo t;
-        t.name = name;
-        t.elements = rows * cols;
-        t.K = cols;
-        t.quant_type = quant;
-        // Q8_0: 34 bytes/32 elements
-        if (quant == "Q8_0")
-            t.native_bytes = rows * cols * 34 / 32;
-        else if (quant == "F32")
-            t.native_bytes = rows * cols * 4;
-        else
-            t.native_bytes = rows * cols;  // Simplified
-        t.layer_index = layer;
-        p.total_native_bytes += t.native_bytes;
-        p.tensors.push_back(t);
-    };
+        auto addTensor = [&](const std::string &name, size_t rows, size_t cols,
+                             const std::string &quant, int layer = -1)
+        {
+            TensorSizeInfo t;
+            t.name = name;
+            t.elements = rows * cols;
+            t.K = cols;
+            t.quant_type = quant;
+            // Q8_0: 34 bytes/32 elements
+            if (quant == "Q8_0")
+                t.native_bytes = rows * cols * 34 / 32;
+            else if (quant == "F32")
+                t.native_bytes = rows * cols * 4;
+            else
+                t.native_bytes = rows * cols; // Simplified
+            t.layer_index = layer;
+            p.total_native_bytes += t.native_bytes;
+            p.tensors.push_back(t);
+        };
 
-    // Non-layer tensors
-    addTensor("token_embd.weight", 896, 151936, "Q8_0");
-    addTensor("output.weight", 896, 151936, "Q8_0");
-    addTensor("output_norm.weight", 1, 896, "F32");
+        // Non-layer tensors
+        addTensor("token_embd.weight", 896, 151936, "Q8_0");
+        addTensor("output.weight", 896, 151936, "Q8_0");
+        addTensor("output_norm.weight", 1, 896, "F32");
 
-    // Layer 0
-    addTensor("blk.0.attn_q.weight", 896, 896, "Q8_0", 0);
-    addTensor("blk.0.attn_k.weight", 128, 896, "Q8_0", 0);
-    addTensor("blk.0.attn_v.weight", 128, 896, "Q8_0", 0);
-    addTensor("blk.0.attn_output.weight", 896, 896, "Q8_0", 0);
-    addTensor("blk.0.ffn_gate.weight", 4864, 896, "Q8_0", 0);
-    addTensor("blk.0.ffn_up.weight", 4864, 896, "Q8_0", 0);
-    addTensor("blk.0.ffn_down.weight", 896, 4864, "Q8_0", 0);
-    addTensor("blk.0.attn_norm.weight", 1, 896, "F32", 0);
-    addTensor("blk.0.ffn_norm.weight", 1, 896, "F32", 0);
+        // Layer 0
+        addTensor("blk.0.attn_q.weight", 896, 896, "Q8_0", 0);
+        addTensor("blk.0.attn_k.weight", 128, 896, "Q8_0", 0);
+        addTensor("blk.0.attn_v.weight", 128, 896, "Q8_0", 0);
+        addTensor("blk.0.attn_output.weight", 896, 896, "Q8_0", 0);
+        addTensor("blk.0.ffn_gate.weight", 4864, 896, "Q8_0", 0);
+        addTensor("blk.0.ffn_up.weight", 4864, 896, "Q8_0", 0);
+        addTensor("blk.0.ffn_down.weight", 896, 4864, "Q8_0", 0);
+        addTensor("blk.0.attn_norm.weight", 1, 896, "F32", 0);
+        addTensor("blk.0.ffn_norm.weight", 1, 896, "F32", 0);
 
-    // Layer 1 (same structure)
-    addTensor("blk.1.attn_q.weight", 896, 896, "Q8_0", 1);
-    addTensor("blk.1.attn_k.weight", 128, 896, "Q8_0", 1);
-    addTensor("blk.1.attn_v.weight", 128, 896, "Q8_0", 1);
-    addTensor("blk.1.attn_output.weight", 896, 896, "Q8_0", 1);
-    addTensor("blk.1.ffn_gate.weight", 4864, 896, "Q8_0", 1);
-    addTensor("blk.1.ffn_up.weight", 4864, 896, "Q8_0", 1);
-    addTensor("blk.1.ffn_down.weight", 896, 4864, "Q8_0", 1);
-    addTensor("blk.1.attn_norm.weight", 1, 896, "F32", 1);
-    addTensor("blk.1.ffn_norm.weight", 1, 896, "F32", 1);
+        // Layer 1 (same structure)
+        addTensor("blk.1.attn_q.weight", 896, 896, "Q8_0", 1);
+        addTensor("blk.1.attn_k.weight", 128, 896, "Q8_0", 1);
+        addTensor("blk.1.attn_v.weight", 128, 896, "Q8_0", 1);
+        addTensor("blk.1.attn_output.weight", 896, 896, "Q8_0", 1);
+        addTensor("blk.1.ffn_gate.weight", 4864, 896, "Q8_0", 1);
+        addTensor("blk.1.ffn_up.weight", 4864, 896, "Q8_0", 1);
+        addTensor("blk.1.ffn_down.weight", 896, 4864, "Q8_0", 1);
+        addTensor("blk.1.attn_norm.weight", 1, 896, "F32", 1);
+        addTensor("blk.1.ffn_norm.weight", 1, 896, "F32", 1);
 
-    return p;
-}
+        return p;
+    }
 
 } // anonymous namespace
 
 TEST(Test__WeightMemoryEstimator, NativeBytesPerWeight_Q8_0)
 {
     float bpw = WeightMemoryEstimator::getNativeBytesPerWeight("Q8_0");
-    EXPECT_NEAR(bpw, 34.0f / 32.0f, 0.001f);  // 1.0625
+    EXPECT_NEAR(bpw, 34.0f / 32.0f, 0.001f); // 1.0625
 }
 
 TEST(Test__WeightMemoryEstimator, NativeBytesPerWeight_Q4_0)
 {
     float bpw = WeightMemoryEstimator::getNativeBytesPerWeight("Q4_0");
-    EXPECT_NEAR(bpw, 18.0f / 32.0f, 0.001f);  // 0.5625
+    EXPECT_NEAR(bpw, 18.0f / 32.0f, 0.001f); // 0.5625
 }
 
 TEST(Test__WeightMemoryEstimator, NativeBytesPerWeight_FP32)
@@ -111,6 +112,18 @@ TEST(Test__WeightMemoryEstimator, CUDAPackedBytesPerWeight_SmallK)
     EXPECT_LT(bpw, 1.3f);
 }
 
+TEST(Test__WeightMemoryEstimator, GPUPackedBytesPerWeight_UsesNativeVNNIFormat)
+{
+    EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("Q4_0", 4096), 18.0f / 32.0f, 0.001f);
+    EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("IQ4_NL", 4096), 18.0f / 32.0f, 0.001f);
+    EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("Q4_K", 4096), 20.0f / 32.0f, 0.001f);
+    EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("Q5_K", 4096), 24.0f / 32.0f, 0.001f);
+    EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("Q6_K", 4096), 28.0f / 32.0f, 0.001f);
+    EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("Q2_K", 4096), 16.0f / 32.0f, 0.001f);
+    EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("F16", 4096), 2.0f, 0.001f);
+    EXPECT_NEAR(WeightMemoryEstimator::getGPUPackedBytesPerWeight("F32", 4096), 4.0f, 0.001f);
+}
+
 TEST(Test__WeightMemoryEstimator, SingleDevice_NativeBytes)
 {
     auto profile = createSimpleProfile();
@@ -131,6 +144,30 @@ TEST(Test__WeightMemoryEstimator, SingleDevice_CUDAPackedBytesGTNative)
     EXPECT_GE(est.device_bytes, est.native_bytes);
 }
 
+TEST(Test__WeightMemoryEstimator, SingleDevice_Q4KUsesCompactGPUPacking)
+{
+    ModelMemoryProfile profile;
+    profile.architecture = "qwen3moe";
+    profile.n_layers = 1;
+
+    TensorSizeInfo q4k_tensor;
+    q4k_tensor.name = "blk.0.ffn_gate.weight";
+    q4k_tensor.elements = 4096 * 4096;
+    q4k_tensor.K = 4096;
+    q4k_tensor.quant_type = "Q4_K";
+    q4k_tensor.native_bytes = static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * (18.0f / 32.0f));
+    q4k_tensor.layer_index = 0;
+    profile.total_native_bytes = q4k_tensor.native_bytes;
+    profile.tensors.push_back(q4k_tensor);
+
+    auto estimate = WeightMemoryEstimator::estimate(profile, DeviceId::cuda(0));
+    auto expected_gpu_bytes = static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * (20.0f / 32.0f));
+
+    EXPECT_EQ(estimate.native_bytes, q4k_tensor.native_bytes);
+    EXPECT_EQ(estimate.device_bytes, expected_gpu_bytes);
+    EXPECT_LT(estimate.device_bytes, static_cast<size_t>(static_cast<float>(q4k_tensor.elements) * 1.0f));
+}
+
 TEST(Test__WeightMemoryEstimator, TPSharded_ReducesDeviceBytes)
 {
     auto profile = createSimpleProfile();
@@ -146,7 +183,7 @@ TEST(Test__WeightMemoryEstimator, TPSharded_ReducesDeviceBytes)
     // Both shards should be roughly equal
     EXPECT_NEAR(static_cast<double>(est_shard0.device_bytes),
                 static_cast<double>(est_shard1.device_bytes),
-                static_cast<double>(est_single.device_bytes) * 0.01);  // Within 1%
+                static_cast<double>(est_single.device_bytes) * 0.01); // Within 1%
 }
 
 TEST(Test__WeightMemoryEstimator, TPSharded_ReplicatesNormWeights)

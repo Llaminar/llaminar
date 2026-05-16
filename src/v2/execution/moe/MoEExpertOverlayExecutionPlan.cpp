@@ -120,7 +120,9 @@ namespace llaminar2
             int world_size)
         {
             std::vector<std::string> errors;
-            const auto validation = validateMoEExpertParallelPlan(plan);
+            const auto validation = validateMoEExpertParallelPlan(
+                plan,
+                MoEExpertParallelValidationOptions{.allow_routed_tensor_parallel_experts = true});
             for (const auto &error : validation.errors)
                 errors.push_back(error);
 

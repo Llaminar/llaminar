@@ -51,6 +51,7 @@
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
 #include "../../../config/PipelineConfig.h"            // For unified PP+TP configuration (Phase 6)
 #include "../../../collective/ILocalPPContext.h"       // For unique_ptr<ILocalPPContext> in maps
+#include "../../../collective/ITPContext.h"            // For polymorphic TP context ownership
 #include "../../../collective/ILocalTPContext.h"       // For unique_ptr<ILocalTPContext> in maps
 #include "../../../collective/IGlobalTPContext.h"      // For shared_ptr<IGlobalTPContext> ownership
 #include <memory>
@@ -401,9 +402,9 @@ namespace llaminar2
             /// Multi-domain TP configuration (heterogeneous TP domains)
             std::shared_ptr<MultiDomainTPConfig> domain_config = nullptr;
 
-            /// Domain-scoped LocalTP contexts whose raw pointers are installed
+            /// Domain-scoped TP contexts whose raw pointers are installed
             /// into GraphConfig / graph builders before graph construction.
-            std::map<std::string, std::shared_ptr<ILocalTPContext>> domain_tp_contexts;
+            std::map<std::string, std::shared_ptr<ITPContext>> domain_tp_contexts;
 
             // ---- Optional: graph caching ----
 
@@ -824,8 +825,8 @@ namespace llaminar2
             global_tp_ctx_ = std::move(ctx);
         }
 
-        /// Retain domain-scoped LocalTP contexts and wire them to the graph builder.
-        void setDomainTPContexts(std::map<std::string, std::shared_ptr<ILocalTPContext>> contexts);
+        /// Retain domain-scoped TP contexts and wire them to the graph builder.
+        void setDomainTPContexts(std::map<std::string, std::shared_ptr<ITPContext>> contexts);
 
         // =========================================================================
         // Weight Manager and Phase-Aware Weight Access (Gap 3)
@@ -1358,7 +1359,7 @@ namespace llaminar2
             GraphBuildSession &forPPStage(int first_layer, int last_layer,
                                           bool has_embedding = false, bool has_lm_head = false);
             GraphBuildSession &withPPContext(int from_stage, int to_stage, ILocalPPContext *context);
-            GraphBuildSession &withTPContext(const std::string &domain_name, ILocalTPContext *context);
+            GraphBuildSession &withTPContext(const std::string &domain_name, ITPContext *context);
 
             // Resource configuration
             GraphBuildSession &withWeights(const ModelWeights &weights);
@@ -1390,7 +1391,7 @@ namespace llaminar2
             };
             std::optional<PPStageSpec> pp_stage_;
             std::map<std::pair<int, int>, ILocalPPContext *> pp_contexts_;
-            std::map<std::string, ILocalTPContext *> tp_contexts_;
+            std::map<std::string, ITPContext *> tp_contexts_;
             std::optional<ModelWeights> weights_;
             std::optional<ModelBuffers> buffers_;
             IKVCache *kv_cache_ = nullptr;
@@ -2145,7 +2146,7 @@ namespace llaminar2
         /// TP contexts for each domain (one per domain name)
         /// Each domain may have internal tensor parallelism
         /// NOTE: Uses shared_ptr because PPStage can hold a reference to the TP context
-        std::map<std::string, std::shared_ptr<ILocalTPContext>> domain_tp_contexts_;
+        std::map<std::string, std::shared_ptr<ITPContext>> domain_tp_contexts_;
 
         /// Whether PP contexts have been initialized
         bool pp_contexts_initialized_ = false;

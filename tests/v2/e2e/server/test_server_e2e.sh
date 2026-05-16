@@ -56,16 +56,6 @@ CPU_GPU_DELTA_LIMIT_MB="${LLAMINAR_E2E_CPU_GPU_DELTA_LIMIT_MB:-128}"
 GPU_ACTIVE_MIN_MB="${LLAMINAR_E2E_GPU_ACTIVE_MIN_MB:-256}"
 THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS:-}"
 
-# Locked process-tree PSS caps for the default regression suite.
-# Values are MiB, tuned from measured E2E runs with ~10% headroom.
-declare -A HOST_PSS_LIMITS_MB=(
-    ["qwen2.5-1.5b-instruct-q8_0.gguf|cpu"]=9129      # measured 8299 MiB
-    ["qwen2.5-1.5b-instruct-q8_0.gguf|cuda"]=2316     # measured 2105 MiB
-    ["qwen2.5-1.5b-instruct-q8_0.gguf|rocm"]=2688     # measured 2443 MiB
-    ["Qwen3.5-4B-Q8_0.gguf|cpu"]=21980                # measured 19981 MiB
-    ["Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf|cpu"]=61849     # measured 56226 MiB
-)
-
 # Model suites: "model_path|backend1,backend2,...[|max_tokens]"
 # Uses '|' as delimiter (not ':') because device names contain colons (cuda:0).
 # Each --suite flag appends to the list. If none given, defaults are used.
@@ -153,28 +143,6 @@ is_thinking_model() {
 is_gpu_backend() {
     local backend="$1"
     [[ "$backend" == cuda:* || "$backend" == rocm:* ]]
-}
-
-backend_family() {
-    local backend="$1"
-    if [[ "$backend" == cuda:* ]]; then
-        echo "cuda"
-    elif [[ "$backend" == rocm:* ]]; then
-        echo "rocm"
-    else
-        echo "$backend"
-    fi
-}
-
-is_qwen35_moe_35b_model() {
-    local model="$1"
-    [[ "$(basename "$model")" == "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf" ]]
-}
-
-is_qwen35_moe_35b_cpu_case() {
-    local model="$1"
-    local backend="$2"
-    [[ "$backend" == "cpu" ]] && is_qwen35_moe_35b_model "$model"
 }
 
 mode_name() {
@@ -518,25 +486,17 @@ check_memory_usage() {
     abs_gpu_delta_mb=${gpu_delta_mb#-}
     model_mb=$(du -m "$model" 2>/dev/null | awk '{print $1}' || echo 0)
 
-    local limit_reason cap_key
-    cap_key="$(basename "$model")|$(backend_family "$backend")"
-    if [[ -n "${HOST_PSS_LIMITS_MB[$cap_key]:-}" ]]; then
-        rss_limit_mb="${HOST_PSS_LIMITS_MB[$cap_key]}"
-        limit_reason="locked suite cap ${cap_key}"
-    elif is_gpu_backend "$backend"; then
+    if is_gpu_backend "$backend"; then
         rss_multiplier="$HOST_RSS_GPU_MODEL_MULTIPLIER"
-        rss_limit_mb=$((model_mb * rss_multiplier + HOST_RSS_EXTRA_MB))
-        limit_reason="fallback model_size*${rss_multiplier}+${HOST_RSS_EXTRA_MB}"
     else
         rss_multiplier="$HOST_RSS_CPU_MODEL_MULTIPLIER"
-        rss_limit_mb=$((model_mb * rss_multiplier + HOST_RSS_EXTRA_MB))
-        limit_reason="fallback model_size*${rss_multiplier}+${HOST_RSS_EXTRA_MB}"
     fi
+    rss_limit_mb=$((model_mb * rss_multiplier + HOST_RSS_EXTRA_MB))
 
     if [ "$ram_mb" -le "$rss_limit_mb" ]; then
-        pass "[${tag}] Memory: RAM ${ram_mb} MiB within limit ${rss_limit_mb} MiB (${limit_reason})"
+        pass "[${tag}] Memory: RAM ${ram_mb} MiB within limit ${rss_limit_mb} MiB"
     else
-        fail "[${tag}] Memory: RAM ${ram_mb} MiB exceeds limit ${rss_limit_mb} MiB (${limit_reason})"
+        fail "[${tag}] Memory: RAM ${ram_mb} MiB exceeds limit ${rss_limit_mb} MiB"
     fi
 
     if is_gpu_backend "$backend"; then
@@ -744,19 +704,9 @@ run_backend_tests() {
     log_path="${LOG_DIR}/$(date +%Y%m%d_%H%M%S)_${safe_tag}_port${port}.log"
     gpu_before_mb=$(get_total_gpu_memory_mb)
 
-    local -a server_extra_args=()
-    if is_qwen35_moe_35b_cpu_case "$model" "$backend"; then
-        server_extra_args=(
-            --moe-expert-mode expert-parallel
-            --moe-hot-expert-cache 10%
-            --moe-rebalance dynamic
-            --moe-rebalance-window 32
-        )
-    fi
-
     # Start server
     LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" serve --port "$port" \
-        "${server_extra_args[@]}" $device_flag -m "$model" >"$log_path" 2>&1 &
+        $device_flag -m "$model" >"$log_path" 2>&1 &
     local server_pid=$!
 
     # Wait for health

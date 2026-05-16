@@ -155,7 +155,7 @@ namespace llaminar2
             {gemm_a, C_a, params_.n_a, nullptr, "alpha"},
             {gemm_b, C_b, params_.n_b, nullptr, "beta"}};
 
-        if (!gemm_qkv->multiply_fused_tensor(A_base, projections, M, K))
+        if (!gemm_qkv->multiply_fused_tensor(A_base, projections, M, K, nullptr, bound_workspace_))
         {
             LOG_ERROR("[GDNProjectionStage] Fused 4-projection GEMM failed");
             return false;

@@ -272,7 +272,9 @@ namespace llaminar2
                 return ExpertResidencyPolicy::HistogramTieredCache;
             if (normalized == "explicit_masks")
                 return ExpertResidencyPolicy::ExplicitMasks;
-            throw std::invalid_argument("Invalid MoE expert overlay residency policy: '" + value + "' (valid: static-by-id, histogram, explicit-masks)");
+            if (normalized == "rebalanced" || normalized == "routed_tier_rebalanced" || normalized == "routed_tier_rebalance")
+                return ExpertResidencyPolicy::RoutedTierRebalanced;
+            throw std::invalid_argument("Invalid MoE expert overlay residency policy: '" + value + "' (valid: static-by-id, histogram, explicit-masks, rebalanced)");
         }
 
         ExpertComputeDomain parseMoEExpertOverlayDomainSpec(const std::string &spec)

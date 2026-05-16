@@ -16,7 +16,6 @@
 #include "../../moe/DecodeExpertHistogram.h"
 
 #include <vector>
-
 namespace llaminar2
 {
 
@@ -56,7 +55,6 @@ namespace llaminar2
             // Outputs (written by this stage)
             TensorBase *output_indices = nullptr; ///< FP32 [seq_len * top_k] expert IDs as float
             TensorBase *output_weights = nullptr; ///< FP32 [seq_len * top_k] normalized weights
-
             // Buffer IDs for coherence
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;

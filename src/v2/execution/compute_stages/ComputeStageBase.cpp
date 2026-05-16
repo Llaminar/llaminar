@@ -78,6 +78,12 @@ namespace llaminar2
             return "MOE_EXPERT_DISPATCH";
         case ComputeStageType::MOE_EXPERT_PARALLEL_REDUCE:
             return "MOE_EXPERT_PARALLEL_REDUCE";
+        case ComputeStageType::MOE_SPARSE_DISPATCH:
+            return "MOE_SPARSE_DISPATCH";
+        case ComputeStageType::MOE_LOCAL_EXPERT:
+            return "MOE_LOCAL_EXPERT";
+        case ComputeStageType::MOE_SPARSE_RETURN_REDUCE:
+            return "MOE_SPARSE_RETURN_REDUCE";
         case ComputeStageType::ALLREDUCE:
             return "ALLREDUCE";
         case ComputeStageType::ALLGATHER:

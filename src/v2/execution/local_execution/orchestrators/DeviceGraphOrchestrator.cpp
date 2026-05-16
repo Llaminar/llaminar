@@ -804,7 +804,6 @@ namespace llaminar2
             }
 
             if (summary_store)
-                summary_store->logMemorySummary("after eager graph build");
             {
                 LOG_INFO("[DGO] Released raw expert weights after eager graph build across "
                          << stage_count << " MoE stages: " << (total_freed >> 20)
@@ -2526,7 +2525,6 @@ namespace llaminar2
         LOG_INFO("[DGO] Prepared weight store initialized with "
                  << prepared_weight_store_->size() << " entries for device " << device.toString()
                  << " (new=" << registered << ")");
-        prepared_weight_store_->logMemorySummary("after base preparation");
         if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
             concrete_weight_manager->logHostMemorySummary("after base preparation");
 
@@ -2560,20 +2558,19 @@ namespace llaminar2
 
         if (forward_engine_)
             if (prepared_weight_store_)
-                prepared_weight_store_->logMemorySummary("after eager graph build");
-        {
-            forward_engine_->forEachCachedStage(
-                ComputeStageType::MOE_EXPERT_FFN,
-                [&](IComputeStage *s)
-                {
-                    auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
-                    if (!moe)
-                        return;
-                    int layer = moe->layerIndex();
-                    if (layer >= 0 && static_cast<size_t>(layer) < masks.size())
-                        moe_stages.push_back({moe, layer});
-                });
-        }
+            {
+                forward_engine_->forEachCachedStage(
+                    ComputeStageType::MOE_EXPERT_FFN,
+                    [&](IComputeStage *s)
+                    {
+                        auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
+                        if (!moe)
+                            return;
+                        int layer = moe->layerIndex();
+                        if (layer >= 0 && static_cast<size_t>(layer) < masks.size())
+                            moe_stages.push_back({moe, layer});
+                    });
+            }
 
         // Fallback: legacy layer_graph_cache_ path
         if (moe_stages.empty())
@@ -2730,9 +2727,8 @@ namespace llaminar2
         LOG_INFO("[DGO] Released raw expert weights across " << stage_count
                                                              << " MoE stages: " << (total_freed >> 20) << " MB freed");
         if (summary_store)
-            summary_store->logMemorySummary("after rebalance raw release");
-        if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
-            concrete_weight_manager->logHostMemorySummary("after rebalance raw release");
+            if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
+                concrete_weight_manager->logHostMemorySummary("after rebalance raw release");
         return total_freed;
     }
 
@@ -3316,7 +3312,7 @@ namespace llaminar2
         }
     }
 
-    void DeviceGraphOrchestrator::setDomainTPContexts(std::map<std::string, std::shared_ptr<ILocalTPContext>> contexts)
+    void DeviceGraphOrchestrator::setDomainTPContexts(std::map<std::string, std::shared_ptr<ITPContext>> contexts)
     {
         domain_tp_contexts_ = std::move(contexts);
         for (auto &[name, ctx] : domain_tp_contexts_)
@@ -3417,9 +3413,41 @@ namespace llaminar2
                                       << domain->name << "' (stage " << s << ")");
                             return false;
                         }
-                        pp_config.stages.push_back(PPStage::fromTPContext(it->second));
-                        LOG_DEBUG("[DeviceGraphOrchestrator] Stage " << s << " → TP domain '"
-                                                                     << domain->name << "' (" << domain->degree() << " devices)");
+                        const auto &tp_context = it->second;
+                        if (!tp_context)
+                        {
+                            LOG_ERROR("[DeviceGraphOrchestrator] Null TP context for domain '"
+                                      << domain->name << "' (stage " << s << ")");
+                            return false;
+                        }
+
+                        if (tp_context->isLocal())
+                        {
+                            auto local_context = std::dynamic_pointer_cast<ILocalTPContext>(tp_context);
+                            if (!local_context)
+                            {
+                                LOG_ERROR("[DeviceGraphOrchestrator] TP context for domain '"
+                                          << domain->name << "' reports LOCAL but is not an ILocalTPContext");
+                                return false;
+                            }
+                            pp_config.stages.push_back(PPStage::fromTPContext(local_context));
+                            LOG_DEBUG("[DeviceGraphOrchestrator] Stage " << s << " → LOCAL TP domain '"
+                                                                         << domain->name << "' (" << domain->degree() << " devices)");
+                        }
+                        else
+                        {
+                            auto global_context = std::dynamic_pointer_cast<IGlobalTPContext>(tp_context);
+                            if (!global_context)
+                            {
+                                LOG_ERROR("[DeviceGraphOrchestrator] TP context for domain '"
+                                          << domain->name << "' is not LOCAL and cannot be used as an IGlobalTPContext");
+                                return false;
+                            }
+                            pp_config.stages.push_back(PPStage::fromGlobalTPContext(global_context));
+                            LOG_DEBUG("[DeviceGraphOrchestrator] Stage " << s << " → "
+                                                                         << (tp_context->isNodeLocal() ? "NODE_LOCAL" : "GLOBAL")
+                                                                         << " TP domain '" << domain->name << "'");
+                        }
                     }
                     else
                     {
@@ -3533,7 +3561,7 @@ namespace llaminar2
                 return false;
             }
 
-            domain_tp_contexts_[domain.name] = std::shared_ptr<ILocalTPContext>(std::move(tp_ctx));
+            domain_tp_contexts_[domain.name] = std::shared_ptr<ITPContext>(std::move(tp_ctx));
 
             LOG_DEBUG("[DeviceGraphOrchestrator] Created TP context for domain '" << domain.name
                                                                                   << "': " << domain.devices.size() << " devices, backend="
@@ -3599,7 +3627,7 @@ namespace llaminar2
     }
 
     DeviceGraphOrchestrator::GraphBuildSession &
-    DeviceGraphOrchestrator::GraphBuildSession::withTPContext(const std::string &domain_name, ILocalTPContext *context)
+    DeviceGraphOrchestrator::GraphBuildSession::withTPContext(const std::string &domain_name, ITPContext *context)
     {
         tp_contexts_[domain_name] = context;
         return *this;

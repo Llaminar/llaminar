@@ -14,12 +14,8 @@ namespace llaminar2
     struct ExpertComputeDomain;
     struct ExpertLayerPlacement;
     struct ExpertRoutedTier;
-    struct MoECPUFallbackTensorParallelStats;
-    struct MoECPUFallbackTransferStats;
     struct MoEExpertDispatchOutput;
-    struct MoEExpertOverlayLocalTPDiagnostics;
     struct MoEExpertParallelReduceDiagnostics;
-    struct MoEOverlayRuntimeDomain;
 
     struct MoEExpertOverlayProfileRow
     {
@@ -43,6 +39,15 @@ namespace llaminar2
         std::string transport_mode = "unknown";
         std::string final_reduce_mode = "unknown";
         std::string accumulation_path = "unknown";
+        // Graph-native phase extensions (Phase 14)
+        size_t inbound_rows = 0; ///< Rows received by the current participant/root
+        size_t compact_dispatch_bytes = 0;
+        size_t compact_return_bytes = 0;
+        size_t dense_bytes_avoided = 0;   ///< Dense bytes minus compact bytes saved
+        size_t cpu_fallback_rows = 0;     ///< Rows handled by CPU expert participants
+        size_t gpu_cached_rows = 0;       ///< Rows handled by GPU expert participants/cache tiers
+        double scatter_ms = 0.0;          ///< Scatter-add time (gn_return_reduce)
+        double import_broadcast_ms = 0.0; ///< TP import/broadcast after scatter
     };
 
     class MoEExpertOverlayProfiler
@@ -66,25 +71,44 @@ namespace llaminar2
             const ExpertLayerPlacement &placement,
             const std::vector<ExpertRoutedTier> &routed_tiers);
 
-        static void recordLocalTP(
-            int layer,
-            const MoEOverlayRuntimeDomain &domain,
-            int resident_experts,
-            const MoEExpertOverlayLocalTPDiagnostics &diagnostics);
-
-        static void recordCPUFallback(
-            int layer,
-            const ExpertComputeDomain &domain,
-            int resident_experts,
-            size_t routed_entries,
-            size_t selected_rows,
-            const MoECPUFallbackTransferStats *transfer_stats,
-            const MoECPUFallbackTensorParallelStats *tensor_parallel_stats,
-            double compute_ms);
-
         static void recordFinalReduce(
             int layer,
             const MoEExpertParallelReduceDiagnostics &diagnostics);
+
+        // Graph-native stage profiling (Phase 14)
+        static void recordGraphNativeSparseDispatch(
+            int layer,
+            const std::string &domain_key,
+            int source_participant,
+            int target_participant,
+            size_t outbound_rows,
+            size_t outbound_entries,
+            size_t inbound_rows,
+            size_t compact_dispatch_bytes,
+            size_t dense_dispatch_bytes,
+            double wait_ms);
+
+        static void recordGraphNativeLocalExpert(
+            int layer,
+            const std::string &device_key,
+            bool is_cpu,
+            size_t input_rows,
+            size_t output_rows,
+            std::vector<int> unique_expert_ids,
+            double compute_ms);
+
+        static void recordGraphNativeReturnReduce(
+            int layer,
+            const std::string &domain_key,
+            int source_participant,
+            int target_participant,
+            size_t outbound_rows,
+            size_t inbound_rows,
+            size_t compact_return_bytes,
+            size_t dense_return_bytes,
+            double return_wait_ms,
+            double scatter_ms,
+            double import_broadcast_ms);
     };
 
 } // namespace llaminar2

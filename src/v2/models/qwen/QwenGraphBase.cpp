@@ -65,7 +65,6 @@ namespace llaminar2
         }
     }
 
-
     // Import graph_utils for cleaner code
     using namespace graph_utils;
 
@@ -1030,7 +1029,7 @@ namespace llaminar2
 
             // Get device and TP context for this stage
             DeviceId stage_device = domain->primaryDevice();
-            ILocalTPContext *stage_tp_ctx = nullptr;
+            ITPContext *stage_tp_ctx = nullptr;
             auto tp_it = config_.domain_tp_contexts.find(pp_stage.domain_name);
             if (tp_it != config_.domain_tp_contexts.end())
             {
@@ -1090,7 +1089,7 @@ namespace llaminar2
                 GraphConfig &cfg;
                 DeviceId original_device;
                 ITPContext *original_tp_ctx;
-                ConfigGuard(GraphConfig &c, DeviceId dev, ILocalTPContext *tp)
+                ConfigGuard(GraphConfig &c, DeviceId dev, ITPContext *tp)
                     : cfg(c), original_device(c.default_device), original_tp_ctx(c.tp_ctx)
                 {
                     cfg.default_device = dev;
@@ -2375,7 +2374,7 @@ namespace llaminar2
             attn_params.read_kv_from_cache = device.is_gpu() &&
                                              (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
                                              (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
-                                                           kv_cache->precision() != ActivationPrecision::TQ4));
+                                                            kv_cache->precision() != ActivationPrecision::TQ4));
             attn_params.position_offset = position_ids ? position_ids[0] : 0;
             attn_params.mpi_ctx = mpi_ctx_.get();
             attn_params.q_buffer_id = BufferId::Q_PROJ;

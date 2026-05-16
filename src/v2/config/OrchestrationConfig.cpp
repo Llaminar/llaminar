@@ -261,12 +261,20 @@ namespace llaminar2
                 names.push_back(name);
         }
 
-        std::vector<std::string> overlayReferencedDomainNames(const MoEExpertParallelPlan &plan)
+        std::vector<std::string> overlayDenseDomainNames(const MoEExpertParallelPlan &plan)
         {
             std::vector<std::string> names;
             addUniqueName(names, plan.continuation_domain);
             addUniqueName(names, plan.effectiveBaseModelDomain());
             addUniqueName(names, plan.shared_expert_domain);
+            for (const auto &domain : plan.dense_domains)
+                addUniqueName(names, domain.name);
+            return names;
+        }
+
+        std::vector<std::string> overlayRoutedDomainNames(const MoEExpertParallelPlan &plan)
+        {
+            std::vector<std::string> names;
             for (const auto &tier : plan.routed_tiers)
                 addUniqueName(names, tier.domain);
             for (const auto &domain : plan.domains)
@@ -464,7 +472,9 @@ namespace llaminar2
     {
         std::vector<ExecutionDomainDefinition> domains;
         domains.reserve(domain_definitions.size() +
-                        (moe_expert_parallel_plan ? moe_expert_parallel_plan->domains.size() : 0));
+                        (moe_expert_parallel_plan ? moe_expert_parallel_plan->dense_domains.size() +
+                                                        moe_expert_parallel_plan->domains.size()
+                                                  : 0));
 
         std::unordered_map<std::string, size_t> index_by_name;
         auto appendIfNew = [&](const ExecutionDomainDefinition &domain)
@@ -477,6 +487,8 @@ namespace llaminar2
 
         if (moe_expert_parallel_plan)
         {
+            for (const auto &domain : moe_expert_parallel_plan->dense_domains)
+                appendIfNew(domain);
             for (const auto &domain : moe_expert_parallel_plan->domains)
                 appendIfNew(domain.toExecutionDomainDefinition());
         }
@@ -509,13 +521,17 @@ namespace llaminar2
             auto existing = index_by_name.find(domain.name);
             if (existing != index_by_name.end())
             {
-                const auto &prior = inventory[existing->second];
+                auto &prior = inventory[existing->second];
                 if (!sameDomainDefinition(prior, domain))
                 {
                     errors.push_back("Conflicting execution domain definition for '" + domain.name +
                                      "'. Define each hardware domain once with --define-domain; "
                                      "--moe-expert-overlay-domain is a strict alias and must not "
                                      "redefine a domain with different devices, scope, backend, ranks, weights, or compute kind");
+                }
+                else if (prior.scope == ExecutionDomainScope::AUTO && domain.scope != ExecutionDomainScope::AUTO)
+                {
+                    prior = domain;
                 }
                 return;
             }
@@ -526,6 +542,9 @@ namespace llaminar2
 
         for (const auto &domain : config.domain_definitions)
             addDomain(domain.toExecutionDomainDefinition(), "--define-domain");
+
+        for (const auto &domain : plan.dense_domains)
+            addDomain(domain, "MoE continuation dense domain");
 
         for (const auto &domain : plan.domains)
             addDomain(domain.toExecutionDomainDefinition(), "--moe-expert-overlay-domain");
@@ -538,8 +557,20 @@ namespace llaminar2
         for (const auto &domain : inventory)
             config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain));
 
+        std::vector<ExecutionDomainDefinition> normalized_dense_domains;
+        for (const auto &name : overlayDenseDomainNames(plan))
+        {
+            auto it = index_by_name.find(name);
+            if (it == index_by_name.end())
+                continue;
+            normalized_dense_domains.push_back(inventory[it->second]);
+        }
+
+        if (!normalized_dense_domains.empty() || !plan.dense_domains.empty())
+            plan.dense_domains = std::move(normalized_dense_domains);
+
         std::vector<ExpertComputeDomain> normalized_plan_domains;
-        for (const auto &name : overlayReferencedDomainNames(plan))
+        for (const auto &name : overlayRoutedDomainNames(plan))
         {
             auto it = index_by_name.find(name);
             if (it == index_by_name.end())
@@ -576,6 +607,8 @@ namespace llaminar2
             !plan.base_model_domain.empty() ||
             !plan.shared_expert_domain.empty() ||
             plan.residency_policy != ExpertResidencyPolicy::Disabled ||
+            !plan.continuation_domain_spec.domain.empty() ||
+            !plan.dense_domains.empty() ||
             !plan.domains.empty() ||
             !plan.routed_tiers.empty() ||
             !plan.placements.empty();
@@ -589,7 +622,8 @@ namespace llaminar2
             return errors;
         }
 
-        auto plan_result = validateMoEExpertParallelPlan(plan);
+        MoEExpertParallelValidationOptions validation_options;
+        auto plan_result = validateMoEExpertParallelPlan(plan, validation_options);
         for (const auto &error : plan_result.errors)
         {
             errors.push_back("MoE expert overlay: " + error);
@@ -916,27 +950,7 @@ namespace llaminar2
         if (moe_expert_parallel_plan && moe_expert_parallel_plan->enabled)
         {
             const auto &plan = *moe_expert_parallel_plan;
-            oss << "  moe_expert_overlay:\n";
-            oss << "    kind: " << llaminar2::toString(plan.execution_kind) << "\n";
-            oss << "    base_model_domain: " << plan.effectiveBaseModelDomain() << "\n";
-            oss << "    continuation_domain: " << plan.continuation_domain << "\n";
-            oss << "    shared_expert_domain: " << plan.shared_expert_domain << "\n";
-            if (!plan.routed_tiers.empty())
-            {
-                oss << "    routed_tiers:\n";
-                for (const auto &tier : plan.routed_tiers)
-                {
-                    oss << "      - " << tier.name << " -> " << tier.domain
-                        << " priority=" << tier.priority;
-                    if (tier.max_experts_per_layer > 0)
-                        oss << " max_experts_per_layer=" << tier.max_experts_per_layer;
-                    if (tier.memory_budget_bytes > 0)
-                        oss << " memory_bytes=" << tier.memory_budget_bytes;
-                    if (tier.fallback)
-                        oss << " fallback=true";
-                    oss << "\n";
-                }
-            }
+            oss << renderMoEExpertParallelPlanExplanation(plan);
         }
 
         oss << "  moe:\n";

@@ -82,6 +82,7 @@ artifacts/**/*
 /*.md
 # But always track README.md
 !/README.md
+!/AGENTS.md
 
 # Package managers
 node_modules/

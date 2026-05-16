@@ -43,6 +43,9 @@
 // MoE stages
 #include "stages/MoEExpertDispatchStage.h"
 #include "stages/MoEExpertParallelReduceStage.h"
+#include "stages/MoELocalExpertStage.h"
+#include "stages/MoESparseDispatchStage.h"
+#include "stages/MoESparseReturnReduceStage.h"
 
 // Qwen 3.5 FA stages
 #include "stages/QGateSplitStage.h"

@@ -27,15 +27,15 @@ namespace llaminar2
             if (!tensor->ensureOnDevice(device))
             {
                 LOG_ERROR("[MoERoutingStage] Failed to make routing output '" << name
-                                                                                << "' available on " << device.to_string());
+                                                                              << "' available on " << device.to_string());
                 return false;
             }
 
             if (!tensor->is_on_device(device))
             {
                 LOG_ERROR("[MoERoutingStage] Routing output '" << name
-                                                                << "' is not resident on " << device.to_string()
-                                                                << " after routing");
+                                                               << "' is not resident on " << device.to_string()
+                                                               << " after routing");
                 return false;
             }
 

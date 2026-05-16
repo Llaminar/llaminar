@@ -57,7 +57,8 @@ namespace llaminar2
             if (domain.kind != ExpertDomainKind::NodeLocalTP || domain.participants.empty())
                 return false;
             return std::all_of(domain.participants.begin(), domain.participants.end(),
-                               [](const auto &participant) {
+                               [](const auto &participant)
+                               {
                                    return participant.address.isCPU();
                                });
         }
@@ -72,7 +73,8 @@ namespace llaminar2
             }
 
             return std::all_of(domain.participants.begin(), domain.participants.end(),
-                               [](const auto &participant) {
+                               [](const auto &participant)
+                               {
                                    return participant.address.isGPU() &&
                                           participant.locally_addressable &&
                                           participant.local_device.is_gpu();
@@ -300,8 +302,7 @@ namespace llaminar2
                 << " multi_participant_execution_pending="
                 << (domain.multi_participant_execution_pending ? "true" : "false")
                 << " collective_context="
-                << (domain.domain_scoped_collective_context_ready ? "ready" :
-                    (domain.requires_domain_scoped_collective_context ? "pending" : "not_required"));
+                << (domain.domain_scoped_collective_context_ready ? "ready" : (domain.requires_domain_scoped_collective_context ? "pending" : "not_required"));
             if (!domain.pending_reason.empty())
                 out << " pending_reason=\"" << domain.pending_reason << "\"";
         }
@@ -325,7 +326,9 @@ namespace llaminar2
         if (!plan || !plan->isTieredOverlay())
             return nullptr;
 
-        const auto validation = validateMoEExpertParallelPlan(*plan);
+        const auto validation = validateMoEExpertParallelPlan(
+            *plan,
+            MoEExpertParallelValidationOptions{.allow_routed_tensor_parallel_experts = true});
         if (!validation.ok())
             throw std::invalid_argument(formatValidationErrors(validation));
 
@@ -338,7 +341,8 @@ namespace llaminar2
         for (const auto &domain : domains)
             domains_by_name.emplace(domain.name, &domain);
 
-        auto requireResolvedDomain = [&](const std::string &domain_name, const char *field_name) -> const MoEOverlayRuntimeDomain & {
+        auto requireResolvedDomain = [&](const std::string &domain_name, const char *field_name) -> const MoEOverlayRuntimeDomain &
+        {
             auto it = domains_by_name.find(domain_name);
             if (it == domains_by_name.end())
                 throw std::runtime_error(std::string("MoE expert overlay ") + field_name +
@@ -375,19 +379,19 @@ namespace llaminar2
             std::move(plan), options.current_world_rank, std::move(domains), std::move(routed_tiers));
 
         LOG_INFO("[MoEExpertOverlayRuntimePlan] Resolved overlay topology: continuation_domain="
-             << runtime_plan->sourcePlan().continuation_domain
-             << " continuation_device=" << runtime_plan->continuationDevice().to_string()
-             << " domains=" << runtime_plan->domains().size()
-             << " routed_tiers=" << runtime_plan->routedTiers().size());
+                 << runtime_plan->sourcePlan().continuation_domain
+                 << " continuation_device=" << runtime_plan->continuationDevice().to_string()
+                 << " domains=" << runtime_plan->domains().size()
+                 << " routed_tiers=" << runtime_plan->routedTiers().size());
         LOG_DEBUG("[MoEExpertOverlayRuntimePlan] " << runtime_plan->diagnostics());
         for (const auto &domain : runtime_plan->domains())
         {
             if (domain.multi_participant_execution_pending)
             {
                 LOG_WARN("[MoEExpertOverlayRuntimePlan] Domain '" << domain.name
-                         << "' requests " << toString(domain.compute_kind)
-                         << " over " << domain.participants.size()
-                         << " participants; " << domain.pending_reason);
+                                                                  << "' requests " << toString(domain.compute_kind)
+                                                                  << " over " << domain.participants.size()
+                                                                  << " participants; " << domain.pending_reason);
             }
         }
 

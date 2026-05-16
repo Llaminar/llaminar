@@ -26,10 +26,10 @@
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/MoEExpertComputeStage.h"
 #include "stages/MoEExpertDispatchStage.h"
-#include "stages/MoEExpertOverlayCPUFallbackStage.h"
-#include "stages/MoEExpertOverlayLocalTPStage.h"
-#include "stages/MoEOverlayDomainRuntimeStage.h"
 #include "stages/MoEExpertParallelReduceStage.h"
+#include "stages/MoELocalExpertStage.h"
+#include "stages/MoESparseDispatchStage.h"
+#include "stages/MoESparseReturnReduceStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/QKNormStage.h"
 #include "stages/FusedResidualNormStage.h"
@@ -200,28 +200,19 @@ namespace llaminar2
             const MoEExpertDispatchStage::Params &params);
 
         /**
-         * @brief Create a graph-integrated NodeLocalTP CPU fallback stage for MoE expert overlays
-         */
-        static std::unique_ptr<IComputeStage> createMoEExpertOverlayCPUFallback(
-            const MoEExpertOverlayCPUFallbackStage::Params &params);
-
-        /**
-         * @brief Create an accelerator LocalTP TensorParallelExperts stage for MoE expert overlays
-         */
-        static std::unique_ptr<IComputeStage> createMoEExpertOverlayLocalTP(
-            const MoEExpertOverlayLocalTPStage::Params &params);
-
-        /**
-         * @brief Create a runtime-service backed MoE overlay domain work stage
-         */
-        static std::unique_ptr<IComputeStage> createMoEOverlayDomainRuntime(
-            const MoEOverlayDomainRuntimeStage::Params &params);
-
-        /**
          * @brief Create a host-side dense partial reduce stage for MoE expert-parallel tiers
          */
         static std::unique_ptr<IComputeStage> createMoEExpertParallelReduce(
             const MoEExpertParallelReduceStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoESparseDispatch(
+            const MoESparseDispatchStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoELocalExpert(
+            const MoELocalExpertStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoESparseReturnReduce(
+            const MoESparseReturnReduceStage::Params &params);
 
         /**
          * @brief Create a shared expert FFN stage (always-active dense SwiGLU)
