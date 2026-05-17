@@ -23,6 +23,7 @@
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/MoEExpertWeightService.h"
+#include "../../moe/MoERuntimeTable.h"
 
 #include <memory>
 #include <vector>
@@ -146,6 +147,10 @@ namespace llaminar2
             // =================================================================
             PreparedWeightStore *prepared_store = nullptr;
 
+            // Stable graph-facing MoE runtime placement state. Owned by the graph/model
+            // layer; stages only cache the per-layer device pointer.
+            IMoERuntimeTable *moe_runtime_table = nullptr;
+
             // Phase C: Cached slab refs for store-based resolution and rebalance
             std::optional<ExpertSlabRef> gate_slab_ref;
             std::optional<ExpertSlabRef> up_slab_ref;
@@ -219,7 +224,7 @@ namespace llaminar2
         void applyExpertMask(const std::vector<bool> &new_mask);
 
         bool supportsBackend(ComputeBackendType backend) const override;
-        bool isGraphCapturable() const override { return false; }
+        bool isGraphCapturable() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -307,6 +312,21 @@ namespace llaminar2
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
         bool ensureGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
+        bool initializeMoERuntimeTableForGroupedDecode();
+        bool initializeMoERuntimeTableForGroupedPrefill();
+        bool initializeFixedTopologyGroupedPrefill();
+        bool runtimeTableHasActiveGroupedDecodeBank() const;
+        bool canUseRuntimePrefillGrouping() const;
+        bool canUseFixedTopologyGroupedPrefill() const;
+        bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const;
+        bool isDeviceRoutedDecodeGraphCapturable() const;
+        bool isFixedTopologyPrefillGraphCapturable() const;
+        bool hasFullLocalExpertOwnership() const;
+        bool expertMaskAllEnabled() const;
+        bool hasAllPreparedExpertGemmEngines() const;
+        bool hasGroupedDecodeDescriptorExportSupport() const;
+        const DeviceMoEPlacementBank *activeRuntimePlacementBank() const;
+        bool runtimeLocalComputeEnabled(const DeviceMoEPlacementBank *bank, int expert_id) const;
         void ensureScratchBuffers(int max_batch) const;
         IMoEKernel *ensureMoEKernel() const;
 
@@ -319,6 +339,11 @@ namespace llaminar2
         mutable int grouped_down_desc_table_num_experts_ = 0;
         mutable int grouped_down_desc_table_d_model_ = 0;
         mutable int grouped_down_desc_table_intermediate_ = 0;
+
+        DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
+        bool moe_runtime_table_initialized_ = false;
+        bool moe_prefill_runtime_grouping_available_ = false;
+        bool moe_prefill_fixed_topology_available_ = false;
     };
 
     /**
@@ -363,6 +388,7 @@ namespace llaminar2
         std::string name() const override { return "shared_expert_ffn"; }
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override { return false; }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -439,6 +465,7 @@ namespace llaminar2
         std::string name() const override { return "shared_expert_gate"; }
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override { return false; }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;

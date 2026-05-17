@@ -877,6 +877,7 @@ namespace llaminar2
                 {
                     addError("routed expert domain '" + domain.name +
                              "' uses TensorParallelExperts, which is unsupported for graph-native whole-expert routed tiers; "
+                             "the TensorParallelExperts routed tier path is disabled by default because "
                              "graph-native MoE overlay has no shadow LocalTP runtime. Use whole-expert ownership or "
                              "enable an explicit future TensorParallelExperts path with its own reduction stage");
                 }

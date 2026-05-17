@@ -125,6 +125,13 @@ namespace llaminar2
                 stage_capturable = collectives_graph_capturable;
             }
 
+            if (node->stage->type() == ComputeStageType::MOE_SHARED_EXPERT_FFN ||
+                node->stage->type() == ComputeStageType::MOE_SHARED_EXPERT_GATE ||
+                name.find("shared_expert") != std::string::npos)
+            {
+                stage_capturable = false;
+            }
+
             if (has_collective_nodes && !segmented_collective_capture_allow.empty())
             {
                 // Explicit allowlist mode: only allowlisted stages are capturable

@@ -333,9 +333,18 @@ namespace llaminar2
             throw std::invalid_argument(formatValidationErrors(validation));
 
         std::vector<MoEOverlayRuntimeDomain> domains;
-        domains.reserve(plan->domains.size());
+        domains.reserve(plan->dense_domains.size() + plan->domains.size());
+        auto addDomainIfAbsent = [&](const ExpertComputeDomain &domain)
+        {
+            const auto exists = std::any_of(domains.begin(), domains.end(), [&](const auto &resolved)
+                                            { return resolved.name == domain.name; });
+            if (!exists)
+                domains.push_back(resolveDomain(domain, options.current_world_rank));
+        };
+        for (const auto &domain : plan->dense_domains)
+            addDomainIfAbsent(ExpertComputeDomain::fromExecutionDomainDefinition(domain));
         for (const auto &domain : plan->domains)
-            domains.push_back(resolveDomain(domain, options.current_world_rank));
+            addDomainIfAbsent(domain);
 
         std::unordered_map<std::string, const MoEOverlayRuntimeDomain *> domains_by_name;
         for (const auto &domain : domains)

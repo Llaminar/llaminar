@@ -8,6 +8,7 @@
 
 #include "ROCmMoEKernel.h"
 #include "../gemm/HipBLASGemmKernel.h"
+#include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../tensors/ITensor.h"
@@ -17,11 +18,15 @@
 #include "../../../utils/ROCmKernelProfiler.h"
 
 #include <hip/hip_runtime.h>
+#include <cstddef>
 #include <cstdio>
 #include <stdexcept>
+#include <utility>
 
 namespace
 {
+    constexpr size_t kGroupedDecodeGateLogitsSharedCapBytes = 48 * 1024;
+
     bool setMoEDevice(int device_ordinal, const char *context)
     {
         hipError_t err = hipSetDevice(device_ordinal);
@@ -68,6 +73,20 @@ namespace
                desc.codebook_id == codebook_id &&
                (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins);
     }
+
+    const int *runtimeTopKExpertIdsDevice(const llaminar2::DeviceMoELayerRuntime *runtime_layer)
+    {
+        const auto *base = reinterpret_cast<const char *>(runtime_layer);
+        return reinterpret_cast<const int *>(
+            base + offsetof(llaminar2::DeviceMoELayerRuntime, topk_expert_ids));
+    }
+
+    const float *runtimeTopKWeightsDevice(const llaminar2::DeviceMoELayerRuntime *runtime_layer)
+    {
+        const auto *base = reinterpret_cast<const char *>(runtime_layer);
+        return reinterpret_cast<const float *>(
+            base + offsetof(llaminar2::DeviceMoELayerRuntime, topk_weights));
+    }
 }
 
 // Forward-declare extern "C" bridge functions (defined in ROCmMoEKernels.hip)
@@ -78,11 +97,38 @@ extern "C"
         int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_gate_logits_single_token_grouped(
+        const float *hidden, const float *gate_weights, float *logits,
+        int d_model, int num_experts, size_t shared_mem_bytes,
+        int device_idx, void *stream);
+
     bool hipMoE_softmax_topk(
         float *logits,
         int *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k,
         bool normalize_weights,
+        int device_idx, void *stream);
+
+    bool hipMoE_softmax_topk_decode_runtime(
+        float *logits,
+        void *runtime,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts, int top_k,
+        bool normalize_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram,
+        int device_idx, void *stream);
+
+    bool hipMoE_decode_route_select_runtime(
+        const int *expert_indices,
+        const float *expert_weights,
+        void *runtime,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts, int top_k,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram,
         int device_idx, void *stream);
 
     bool hipMoE_gather_tokens(
@@ -156,6 +202,26 @@ extern "C"
         const float *d_input, int *d_output, int count,
         int device_idx, void *stream);
 
+    bool hipMoE_group_prefill_routes_runtime(
+        const float *routing_indices, const float *routing_weights,
+        void *runtime,
+        int current_slots, int max_slots, int num_experts, int top_k,
+        int device_idx, void *stream);
+
+    bool hipMoE_prefill_gather_expert_runtime(
+        const void *runtime,
+        const float *hidden,
+        float *batch_buffer,
+        int expert_id, int max_tokens, int d_model,
+        int device_idx, void *stream);
+
+    bool hipMoE_prefill_scatter_expert_runtime(
+        float *output,
+        const float *expert_output,
+        const void *runtime,
+        int expert_id, int max_tokens, int d_model,
+        int device_idx, void *stream);
+
     bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
@@ -202,6 +268,58 @@ extern "C"
         uint8_t codebook_id,
         int device_idx,
         void *stream);
+}
+
+namespace
+{
+    bool tryGroupedDecodeGateLogits(
+        const float *hidden,
+        const float *gate_weights,
+        float *logits,
+        int d_model,
+        int num_experts,
+        int device_ordinal,
+        void *stream)
+    {
+        if (!llaminar2::debugEnv().rocm.moe_grouped_decode_router)
+            return false;
+
+        const size_t shared_mem_bytes = static_cast<size_t>(d_model) * sizeof(float);
+        if (num_experts <= 1 || shared_mem_bytes > kGroupedDecodeGateLogitsSharedCapBytes)
+            return false;
+
+        return hipMoE_gate_logits_single_token_grouped(
+            hidden, gate_weights, logits,
+            d_model, num_experts, shared_mem_bytes,
+            device_ordinal, stream);
+    }
+
+    bool launchDecodeGateLogits(
+        const float *hidden,
+        const float *gate_weights,
+        float *logits,
+        int d_model,
+        int num_experts,
+        int device_ordinal,
+        void *stream,
+        const char *context)
+    {
+        if (tryGroupedDecodeGateLogits(hidden, gate_weights, logits,
+                                       d_model, num_experts,
+                                       device_ordinal, stream))
+        {
+            return true;
+        }
+
+        if (!hipMoE_gate_logits_single_token(hidden, gate_weights, logits,
+                                             d_model, num_experts,
+                                             device_ordinal, stream))
+        {
+            LOG_ERROR("[" << context << "] single-token gate logits kernel failed");
+            return false;
+        }
+        return true;
+    }
 }
 
 namespace llaminar2
@@ -331,6 +449,32 @@ namespace llaminar2
         {
             hipFree(d_route_weights_);
             d_route_weights_ = nullptr;
+        }
+        for (auto &entry : runtime_down_pointer_cache_)
+        {
+            if (entry.d_gate_ptrs)
+            {
+                (void)hipFree(entry.d_gate_ptrs);
+                entry.d_gate_ptrs = nullptr;
+            }
+            if (entry.d_up_ptrs)
+            {
+                (void)hipFree(entry.d_up_ptrs);
+                entry.d_up_ptrs = nullptr;
+            }
+        }
+        for (auto &entry : runtime_gateup_pointer_cache_)
+        {
+            if (entry.d_gate_ptrs)
+            {
+                (void)hipFree(entry.d_gate_ptrs);
+                entry.d_gate_ptrs = nullptr;
+            }
+            if (entry.d_up_ptrs)
+            {
+                (void)hipFree(entry.d_up_ptrs);
+                entry.d_up_ptrs = nullptr;
+            }
         }
         for (auto &table : grouped_down_desc_tables_)
         {
@@ -471,6 +615,9 @@ namespace llaminar2
             route_topk_capacity_ = topk_count;
         }
 
+        if (topk_count == 0)
+            return d_route_logits_ != nullptr;
+
         return d_route_logits_ && d_route_indices_ && d_route_weights_;
     }
 
@@ -495,13 +642,13 @@ namespace llaminar2
         bufs.d_weights = d_route_weights_;
 
         const bool decode_single_token = (seq_len == 1);
-        if (decode_single_token && !debugEnv().rocm.moe_router_decode_blas)
+        if (decode_single_token)
         {
-            if (!hipMoE_gate_logits_single_token(hidden, gate_weights, bufs.d_logits,
-                                                 d_model, num_experts,
-                                                 device_ordinal_, getStream()))
+            if (!launchDecodeGateLogits(hidden, gate_weights, bufs.d_logits,
+                                        d_model, num_experts,
+                                        device_ordinal_, getStream(),
+                                        "ROCmMoEKernel::routeCore"))
             {
-                LOG_ERROR("[ROCmMoEKernel::routeCore] single-token gate logits kernel failed");
                 bufs = {};
                 return false;
             }
@@ -1158,6 +1305,162 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmMoEKernel::ensureRuntimeGateUpPointerArrays(
+        int descriptor_table_id,
+        int top_k,
+        const std::array<float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
+        const std::array<float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &up_ptrs,
+        float ***d_gate_ptrs,
+        float ***d_up_ptrs)
+    {
+        if (!d_gate_ptrs || !d_up_ptrs || descriptor_table_id < 0 || top_k <= 0 ||
+            top_k > static_cast<int>(kRuntimePointerArrayMaxTopK))
+        {
+            return false;
+        }
+
+        for (auto &entry : runtime_gateup_pointer_cache_)
+        {
+            if (entry.descriptor_table_id != descriptor_table_id || entry.top_k != top_k)
+                continue;
+
+            bool matches = true;
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                if (entry.gate_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]) ||
+                    entry.up_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(up_ptrs[slot]))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches && entry.d_gate_ptrs && entry.d_up_ptrs)
+            {
+                *d_gate_ptrs = entry.d_gate_ptrs;
+                *d_up_ptrs = entry.d_up_ptrs;
+                return true;
+            }
+        }
+
+        RuntimeGateUpPointerCacheEntry entry;
+        entry.descriptor_table_id = descriptor_table_id;
+        entry.top_k = top_k;
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            entry.gate_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]);
+            entry.up_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(up_ptrs[slot]);
+        }
+
+        hipError_t err = hipMalloc(&entry.d_gate_ptrs, static_cast<size_t>(top_k) * sizeof(float *));
+        if (err == hipSuccess)
+            err = hipMalloc(&entry.d_up_ptrs, static_cast<size_t>(top_k) * sizeof(float *));
+        if (err == hipSuccess)
+        {
+            hipStream_t stream = static_cast<hipStream_t>(getStream());
+            err = hipMemcpyAsync(entry.d_gate_ptrs, gate_ptrs.data(),
+                                 static_cast<size_t>(top_k) * sizeof(float *),
+                                 hipMemcpyHostToDevice, stream);
+            if (err == hipSuccess)
+                err = hipMemcpyAsync(entry.d_up_ptrs, up_ptrs.data(),
+                                     static_cast<size_t>(top_k) * sizeof(float *),
+                                     hipMemcpyHostToDevice, stream);
+        }
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::ensureRuntimeGateUpPointerArrays] H2D pointer cache upload failed: "
+                      << hipGetErrorString(err));
+            if (entry.d_gate_ptrs)
+                (void)hipFree(entry.d_gate_ptrs);
+            if (entry.d_up_ptrs)
+                (void)hipFree(entry.d_up_ptrs);
+            return false;
+        }
+
+        runtime_gateup_pointer_cache_.push_back(entry);
+        auto &cached = runtime_gateup_pointer_cache_.back();
+        *d_gate_ptrs = cached.d_gate_ptrs;
+        *d_up_ptrs = cached.d_up_ptrs;
+        return true;
+    }
+
+    bool ROCmMoEKernel::ensureRuntimeDownPointerArrays(
+        int descriptor_table_id,
+        int top_k,
+        const std::array<const float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
+        const std::array<const float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &up_ptrs,
+        const float ***d_gate_ptrs,
+        const float ***d_up_ptrs)
+    {
+        if (!d_gate_ptrs || !d_up_ptrs || descriptor_table_id < 0 || top_k <= 0 ||
+            top_k > static_cast<int>(kRuntimePointerArrayMaxTopK))
+        {
+            return false;
+        }
+
+        for (auto &entry : runtime_down_pointer_cache_)
+        {
+            if (entry.descriptor_table_id != descriptor_table_id || entry.top_k != top_k)
+                continue;
+
+            bool matches = true;
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                if (entry.gate_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]) ||
+                    entry.up_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(up_ptrs[slot]))
+                {
+                    matches = false;
+                    break;
+                }
+            }
+            if (matches && entry.d_gate_ptrs && entry.d_up_ptrs)
+            {
+                *d_gate_ptrs = entry.d_gate_ptrs;
+                *d_up_ptrs = entry.d_up_ptrs;
+                return true;
+            }
+        }
+
+        RuntimeDownPointerCacheEntry entry;
+        entry.descriptor_table_id = descriptor_table_id;
+        entry.top_k = top_k;
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            entry.gate_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]);
+            entry.up_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(up_ptrs[slot]);
+        }
+
+        hipError_t err = hipMalloc(&entry.d_gate_ptrs, static_cast<size_t>(top_k) * sizeof(float *));
+        if (err == hipSuccess)
+            err = hipMalloc(&entry.d_up_ptrs, static_cast<size_t>(top_k) * sizeof(float *));
+        if (err == hipSuccess)
+        {
+            hipStream_t stream = static_cast<hipStream_t>(getStream());
+            err = hipMemcpyAsync(entry.d_gate_ptrs, gate_ptrs.data(),
+                                 static_cast<size_t>(top_k) * sizeof(float *),
+                                 hipMemcpyHostToDevice, stream);
+            if (err == hipSuccess)
+                err = hipMemcpyAsync(entry.d_up_ptrs, up_ptrs.data(),
+                                     static_cast<size_t>(top_k) * sizeof(float *),
+                                     hipMemcpyHostToDevice, stream);
+        }
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::ensureRuntimeDownPointerArrays] H2D pointer cache upload failed: "
+                      << hipGetErrorString(err));
+            if (entry.d_gate_ptrs)
+                (void)hipFree(entry.d_gate_ptrs);
+            if (entry.d_up_ptrs)
+                (void)hipFree(entry.d_up_ptrs);
+            return false;
+        }
+
+        runtime_down_pointer_cache_.push_back(entry);
+        auto &cached = runtime_down_pointer_cache_.back();
+        *d_gate_ptrs = cached.d_gate_ptrs;
+        *d_up_ptrs = cached.d_up_ptrs;
+        return true;
+    }
+
     bool ROCmMoEKernel::routeWithTensors(
         ITensor *hidden, ITensor *gate_weights,
         int seq_len, int d_model, int num_experts, int top_k,
@@ -1197,10 +1500,7 @@ namespace llaminar2
 
         float *h_idx = nullptr;
         float *h_wt = nullptr;
-        const bool needs_decode_host_topk =
-            (seq_len == 1) &&
-            !(debugEnv().rocm.moe_grouped_decode &&
-              debugEnv().rocm.moe_device_routed_decode);
+        const bool needs_decode_host_topk = (seq_len == 1);
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         const bool needs_snapshot_host_topk = true;
 #else
@@ -1289,6 +1589,126 @@ namespace llaminar2
             output_weights->transitionTo(TensorCoherenceState::SYNCED);
         }
         else
+        {
+            output_indices->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            output_weights->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        }
+
+        return true;
+    }
+
+    bool ROCmMoEKernel::decodeRouteSelect(
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *hidden, ITensor *gate_weights,
+        int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer || !hidden || !gate_weights)
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] null runtime/input/gate tensor");
+            return false;
+        }
+        if (d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] invalid dimensions d_model=" << d_model
+                                                                                       << " num_experts=" << num_experts
+                                                                                       << " top_k=" << top_k);
+            return false;
+        }
+
+#if LLAMINAR_ASSERTIONS_ACTIVE
+        DeviceMoELayerRuntime runtime_snapshot{};
+        hipError_t runtime_copy_err = hipMemcpy(&runtime_snapshot, runtime_layer,
+                                                sizeof(DeviceMoELayerRuntime),
+                                                hipMemcpyDeviceToHost);
+        if (runtime_copy_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] runtime validation D2H failed: "
+                      << hipGetErrorString(runtime_copy_err));
+            return false;
+        }
+        if (runtime_snapshot.active_bank > 1u ||
+            runtime_snapshot.active_epoch == 0u ||
+            runtime_snapshot.expert_count != static_cast<uint32_t>(num_experts) ||
+            runtime_snapshot.top_k != static_cast<uint32_t>(top_k) ||
+            runtime_snapshot.banks[runtime_snapshot.active_bank].epoch != runtime_snapshot.active_epoch ||
+            runtime_snapshot.banks[runtime_snapshot.active_bank].expert_count != static_cast<uint32_t>(num_experts))
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] invalid runtime layer state"
+                      << " active_bank=" << runtime_snapshot.active_bank
+                      << " active_epoch=" << runtime_snapshot.active_epoch
+                      << " expert_count=" << runtime_snapshot.expert_count
+                      << " top_k=" << runtime_snapshot.top_k);
+            return false;
+        }
+#endif
+
+        const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
+        const float *g = static_cast<const float *>(gate_weights->gpu_data_ptr());
+        if (!h || !g)
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] null device pointer "
+                      "(hidden="
+                      << (const void *)h << " gate=" << (const void *)g << ")");
+            return false;
+        }
+
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), /*topk_count=*/0))
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] route logits scratch allocation failed");
+            return false;
+        }
+
+        float *legacy_indices = nullptr;
+        float *legacy_weights = nullptr;
+        if (write_legacy_outputs)
+        {
+            if (!output_indices || !output_weights)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] legacy outputs requested without tensors");
+                return false;
+            }
+
+            legacy_indices = static_cast<float *>(output_indices->gpu_data_ptr());
+            legacy_weights = static_cast<float *>(output_weights->gpu_data_ptr());
+            if (!legacy_indices || !legacy_weights)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] legacy output tensors have no device allocation");
+                return false;
+            }
+        }
+
+        if (!launchDecodeGateLogits(h, g, d_route_logits_,
+                                    d_model, num_experts,
+                                    device_ordinal_, getStream(),
+                                    "ROCmMoEKernel::decodeRouteSelect"))
+        {
+            return false;
+        }
+
+        if (!hipMoE_softmax_topk_decode_runtime(
+                d_route_logits_,
+                static_cast<void *>(runtime_layer),
+                legacy_indices,
+                legacy_weights,
+                num_experts,
+                top_k,
+                normalize_weights,
+                write_legacy_outputs,
+                update_runtime_histogram,
+                device_ordinal_,
+                getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] decode softmax/top-k runtime kernel failed");
+            return false;
+        }
+
+        if (write_legacy_outputs)
         {
             output_indices->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
             output_weights->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
@@ -1406,7 +1826,6 @@ namespace llaminar2
 
         scatterAddWeighted(o, e, d_staging_indices_, d_staging_weights_,
                            num_tokens, d_model);
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
 
     void ROCmMoEKernel::sharedExpertGateFromTensors(
@@ -1455,7 +1874,6 @@ namespace llaminar2
         }
 
         weightedAdd(o, in, weight, count);
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
 
     int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable(
@@ -1534,7 +1952,6 @@ namespace llaminar2
         }
 
         table.device_descs = device_descs;
-
         grouped_down_desc_tables_.push_back(std::move(table));
         return static_cast<int>(grouped_down_desc_tables_.size() - 1);
     }
@@ -1647,7 +2064,6 @@ namespace llaminar2
 
         table.device_gate_descs = device_gate_descs;
         table.device_up_descs = device_up_descs;
-
         grouped_gateup_desc_tables_.push_back(std::move(table));
         return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
     }
@@ -1899,6 +2315,114 @@ namespace llaminar2
         return ok;
     }
 
+    bool ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime(
+        DeviceMoELayerRuntime *runtime_layer,
+        const TensorBase *input,
+        int descriptor_table_id,
+        int top_k,
+        ITensor *const *gate_outputs,
+        ITensor *const *up_outputs,
+        int d_model,
+        int intermediate)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer || !input || descriptor_table_id < 0 || top_k <= 0 ||
+            !gate_outputs || !up_outputs || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (top_k > static_cast<int>(kDeviceMoEMaxTopK) || (d_model % 32) != 0)
+            return false;
+        if (descriptor_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
+            return false;
+
+        const auto &table = grouped_gateup_desc_tables_[descriptor_table_id];
+        if (!table.device_gate_descs || !table.device_up_descs || table.num_experts <= 0 ||
+            table.d_model != d_model || table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        for (int expert_id = 0; expert_id < table.num_experts; ++expert_id)
+        {
+            if (!validateGroupedGateUpDesc(table.host_gate_descs[expert_id], d_model, intermediate, table.codebook_id) ||
+                !validateGroupedGateUpDesc(table.host_up_descs[expert_id], d_model, intermediate, table.codebook_id))
+            {
+                return false;
+            }
+        }
+
+        if (!ensureGroupedGateUpCapacity(top_k, d_model))
+            return false;
+
+        if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromRuntime"))
+            return false;
+
+        const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        if (!d_hidden)
+        {
+            if (!const_cast<TensorBase *>(input)->ensureOnDevice(DeviceId::rocm(device_ordinal_), getStream()))
+                return false;
+            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        }
+        const int *d_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
+        if (!d_hidden || !d_expert_ids)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] Missing input/runtime device pointer");
+            return false;
+        }
+
+        std::array<float *, kRuntimePointerArrayMaxTopK> gate_output_ptrs = {};
+        std::array<float *, kRuntimePointerArrayMaxTopK> up_output_ptrs = {};
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            gate_output_ptrs[slot] = static_cast<float *>(gate_outputs[slot]->gpu_data_ptr());
+            up_output_ptrs[slot] = static_cast<float *>(up_outputs[slot]->gpu_data_ptr());
+            if (!gate_output_ptrs[slot] || !up_output_ptrs[slot])
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] Null gate/up output pointer for slot "
+                          << slot);
+                return false;
+            }
+        }
+
+        float **d_gate_output_ptrs = nullptr;
+        float **d_up_output_ptrs = nullptr;
+        if (!ensureRuntimeGateUpPointerArrays(
+                descriptor_table_id, top_k, gate_output_ptrs, up_output_ptrs,
+                &d_gate_output_ptrs, &d_up_output_ptrs))
+        {
+            return false;
+        }
+
+        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            d_hidden,
+            table.device_gate_descs,
+            table.device_up_descs,
+            d_expert_ids,
+            d_gate_output_ptrs,
+            d_up_output_ptrs,
+            d_grouped_hidden_int8_,
+            d_grouped_hidden_scales_,
+            top_k,
+            intermediate,
+            d_model,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
+
+        if (ok)
+        {
+            for (int i = 0; i < top_k; ++i)
+            {
+                gate_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                up_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            }
+        }
+        return ok;
+    }
+
     bool ROCmMoEKernel::groupedExpertDownDecodeFromTable(
         ITensor *const *gate_tensors,
         ITensor *const *up_tensors,
@@ -2127,6 +2651,97 @@ namespace llaminar2
         return ok;
     }
 
+    bool ROCmMoEKernel::groupedExpertDownDecodeFromRuntime(
+        ITensor *const *gate_tensors,
+        ITensor *const *up_tensors,
+        DeviceMoELayerRuntime *runtime_layer,
+        int descriptor_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SWIGLU, static_cast<hipStream_t>(getStream()));
+
+        if (!gate_tensors || !up_tensors || !runtime_layer || !output ||
+            descriptor_table_id < 0 || top_k <= 0 || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (top_k > static_cast<int>(kDeviceMoEMaxTopK) || (intermediate % 32) != 0)
+            return false;
+        if (descriptor_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+            return false;
+
+        const auto &table = grouped_down_desc_tables_[descriptor_table_id];
+        if (!table.device_descs || table.num_experts <= 0 ||
+            table.d_model != d_model || table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        for (int expert_id = 0; expert_id < table.num_experts; ++expert_id)
+        {
+            if (!validateGroupedDownDesc(table.host_descs[expert_id], d_model, intermediate, table.codebook_id))
+                return false;
+        }
+
+        if (!ensureGroupedDecodeCapacity(top_k, intermediate))
+            return false;
+
+        std::array<const float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
+        std::array<const float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            gate_ptrs[slot] = static_cast<const float *>(gate_tensors[slot]->gpu_data_ptr());
+            up_ptrs[slot] = static_cast<const float *>(up_tensors[slot]->gpu_data_ptr());
+            if (!gate_ptrs[slot] || !up_ptrs[slot])
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRuntime] Null gate/up device pointer for slot "
+                          << slot);
+                return false;
+            }
+        }
+
+        const int *d_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
+        const float *d_weights = runtimeTopKWeightsDevice(runtime_layer);
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!d_expert_ids || !d_weights || !d_output)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRuntime] Missing runtime/output device pointer");
+            return false;
+        }
+
+        const float **d_gate_ptrs = nullptr;
+        const float **d_up_ptrs = nullptr;
+        if (!ensureRuntimeDownPointerArrays(
+                descriptor_table_id, top_k, gate_ptrs, up_ptrs,
+                &d_gate_ptrs, &d_up_ptrs))
+        {
+            return false;
+        }
+
+        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            d_gate_ptrs,
+            d_up_ptrs,
+            table.device_descs,
+            d_expert_ids,
+            d_weights,
+            d_grouped_swiglu_int8_,
+            d_grouped_swiglu_scales_,
+            d_output,
+            top_k,
+            d_model,
+            intermediate,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
+
+        if (ok)
+            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        return ok;
+    }
+
     bool ROCmMoEKernel::groupedExpertDownDecode(
         ITensor *const *gate_tensors,
         ITensor *const *up_tensors,
@@ -2157,16 +2772,13 @@ namespace llaminar2
                 down_descs[i].n != d_model || down_descs[i].k != intermediate ||
                 down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
                 down_descs[i].codebook_id != codebook_id ||
-                ((down_descs[i].codebook_id == 5 || down_descs[i].codebook_id == 7 ||
-                  down_descs[i].codebook_id == 8) &&
-                 !down_descs[i].mins))
+                (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins))
             {
                 return false;
             }
         }
 
-        if (codebook_id != 0 && codebook_id != 4 && codebook_id != 5 &&
-            codebook_id != 6 && codebook_id != 7 && codebook_id != 8)
+        if (!groupedDecodeSupportsCodebook(codebook_id))
         {
             LOG_DEBUG("[ROCmMoEKernel::groupedExpertDownDecode] Unsupported native-VNNI codebook "
                       << static_cast<int>(codebook_id) << "; using fallback");
@@ -2243,6 +2855,133 @@ namespace llaminar2
     // =========================================================================
     // Phase 4: GPU-side expert dispatch for prefill
     // =========================================================================
+
+    bool ROCmMoEKernel::groupPrefillRoutes(
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *routing_indices, ITensor *routing_weights,
+        int current_tokens, int max_tokens,
+        int num_experts, int top_k)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer || !routing_indices || !routing_weights)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupPrefillRoutes] null runtime or routing tensor");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupPrefillRoutes] invalid dimensions current_tokens=" << current_tokens
+                                                                                               << " max_tokens=" << max_tokens
+                                                                                               << " num_experts=" << num_experts
+                                                                                               << " top_k=" << top_k);
+            return false;
+        }
+
+        const float *d_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const float *d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!d_indices || !d_weights)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupPrefillRoutes] routing tensors have no device pointers");
+            return false;
+        }
+
+        return hipMoE_group_prefill_routes_runtime(
+            d_indices,
+            d_weights,
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            getStream());
+    }
+
+    bool ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime(
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *hidden, ITensor *batch_buffer,
+        int expert_id, int max_tokens, int d_model)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_GATHER, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer || !hidden || !batch_buffer)
+        {
+            LOG_ERROR("[ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime] null runtime/input/output tensor");
+            return false;
+        }
+        if (expert_id < 0 || max_tokens <= 0 || d_model <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime] invalid arguments expert_id=" << expert_id
+                                                                                                          << " max_tokens=" << max_tokens
+                                                                                                          << " d_model=" << d_model);
+            return false;
+        }
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        float *d_batch = static_cast<float *>(batch_buffer->gpu_data_ptr());
+        if (!d_hidden || !d_batch)
+        {
+            LOG_ERROR("[ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime] tensors have no device pointers");
+            return false;
+        }
+
+        const bool ok = hipMoE_prefill_gather_expert_runtime(
+            static_cast<const void *>(runtime_layer),
+            d_hidden,
+            d_batch,
+            expert_id,
+            max_tokens,
+            d_model,
+            device_ordinal_,
+            getStream());
+        if (ok)
+            batch_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        return ok;
+    }
+
+    bool ROCmMoEKernel::scatterPrefillExpertResultsFromRuntime(
+        ITensor *output, ITensor *expert_results,
+        DeviceMoELayerRuntime *runtime_layer,
+        int expert_id, int max_tokens, int d_model)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SCATTER, static_cast<hipStream_t>(getStream()));
+
+        if (!output || !expert_results || !runtime_layer)
+        {
+            LOG_ERROR("[ROCmMoEKernel::scatterPrefillExpertResultsFromRuntime] null runtime/input/output tensor");
+            return false;
+        }
+        if (expert_id < 0 || max_tokens <= 0 || d_model <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::scatterPrefillExpertResultsFromRuntime] invalid arguments expert_id=" << expert_id
+                                                                                                             << " max_tokens=" << max_tokens
+                                                                                                             << " d_model=" << d_model);
+            return false;
+        }
+
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        const float *d_expert_output = static_cast<const float *>(expert_results->gpu_data_ptr());
+        if (!d_output || !d_expert_output)
+        {
+            LOG_ERROR("[ROCmMoEKernel::scatterPrefillExpertResultsFromRuntime] tensors have no device pointers");
+            return false;
+        }
+
+        const bool ok = hipMoE_prefill_scatter_expert_runtime(
+            d_output,
+            d_expert_output,
+            static_cast<const void *>(runtime_layer),
+            expert_id,
+            max_tokens,
+            d_model,
+            device_ordinal_,
+            getStream());
+        if (ok)
+            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        return ok;
+    }
 
     bool ROCmMoEKernel::prepareExpertGroups(
         ITensor *routing_indices, ITensor *routing_weights,
@@ -2343,7 +3082,6 @@ namespace llaminar2
         int offset = host_expert_offsets_[expert_id];
 
         gatherTokenBatch(h, b, d_group_token_indices_ + offset, count, d_model);
-        batch_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
 
     void ROCmMoEKernel::scatterExpertResults(
@@ -2360,7 +3098,6 @@ namespace llaminar2
 
         scatterAddWeighted(o, r, d_group_token_indices_ + offset,
                            d_group_weights_ + offset, count, d_model);
-        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
 
 } // namespace llaminar2

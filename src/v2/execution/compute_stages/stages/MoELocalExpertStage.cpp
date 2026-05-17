@@ -84,6 +84,209 @@ namespace llaminar2
             params_.input_rows = params_.input_rows_lifetime.get();
         if (!params_.output_rows && params_.output_rows_lifetime)
             params_.output_rows = params_.output_rows_lifetime.get();
+        if (params_.moe_runtime_table && params_.layer_idx >= 0)
+            (void)refreshRuntimePlacement();
+    }
+
+    bool MoELocalExpertStage::refreshRuntimePlacement()
+    {
+        if (!params_.moe_runtime_table || params_.layer_idx < 0)
+            return false;
+        moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+        moe_runtime_table_initialized_ = runtimeTableHasActiveOverlayBank() || initializeMoERuntimePlacementBank();
+        return moe_runtime_table_initialized_;
+    }
+
+    bool MoELocalExpertStage::initializeMoERuntimePlacementBank()
+    {
+        if (!params_.moe_runtime_table || params_.layer_idx < 0 || params_.num_experts <= 0)
+            return false;
+
+        try
+        {
+            if (runtimeTableHasActiveOverlayBank())
+                return true;
+
+            const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+            if (state.active_epoch != 0)
+            {
+                LOG_ERROR("[MoELocalExpertStage] Invalid active MoE runtime placement bank for layer "
+                          << params_.layer_idx << "; refusing to overwrite non-zero epoch "
+                          << state.active_epoch);
+                return false;
+            }
+
+            if (!params_.expert_mask.empty() &&
+                params_.expert_mask.size() != static_cast<size_t>(params_.num_experts))
+            {
+                LOG_ERROR("[MoELocalExpertStage] Cannot initialize MoE runtime placement bank: expert_mask size "
+                          << params_.expert_mask.size() << " != num_experts " << params_.num_experts);
+                return false;
+            }
+
+            const bool has_prepared_vectors =
+                params_.prepared_gate_gemm.size() == static_cast<size_t>(params_.num_experts) &&
+                params_.prepared_up_gemm.size() == static_cast<size_t>(params_.num_experts) &&
+                params_.prepared_down_gemm.size() == static_cast<size_t>(params_.num_experts);
+
+            MoEPlacementUpdate update;
+            update.epoch = 1;
+            update.expert_count = static_cast<uint32_t>(params_.num_experts);
+            update.experts.resize(static_cast<size_t>(params_.num_experts));
+            update.local_compute_mask.assign(static_cast<size_t>(params_.num_experts), 0u);
+            update.replica_role.assign(static_cast<size_t>(params_.num_experts),
+                                       static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+
+            const uint32_t local_flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                                          DeviceMoEExpertFlags::Resident |
+                                                          DeviceMoEExpertFlags::PreferredOwner |
+                                                          DeviceMoEExpertFlags::LocalCompute);
+
+            for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+            {
+                const bool local = params_.expert_mask.empty() ||
+                                   params_.expert_mask[static_cast<size_t>(expert_id)];
+                if (!local)
+                    continue;
+
+                if (!has_prepared_vectors ||
+                    !params_.prepared_gate_gemm[static_cast<size_t>(expert_id)] ||
+                    !params_.prepared_up_gemm[static_cast<size_t>(expert_id)] ||
+                    !params_.prepared_down_gemm[static_cast<size_t>(expert_id)])
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Cannot initialize MoE runtime placement bank for layer "
+                              << params_.layer_idx << " expert " << expert_id
+                              << ": prepared gate/up/down GEMM engines are required for local experts");
+                    return false;
+                }
+
+                DeviceMoEExpertDescriptor desc;
+                if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.gate) ||
+                    !params_.prepared_up_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.up) ||
+                    !params_.prepared_down_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.down))
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Cannot initialize MoE runtime placement bank for layer "
+                              << params_.layer_idx << " expert " << expert_id
+                              << ": prepared GEMM engines did not export native-VNNI descriptors");
+                    return false;
+                }
+
+                desc.logical_expert_id = expert_id;
+                desc.owner_participant = params_.runtime_participant_index;
+                desc.local_slot = expert_id;
+                desc.flags = local_flags;
+                update.experts[static_cast<size_t>(expert_id)] = desc;
+                update.local_compute_mask[static_cast<size_t>(expert_id)] = 1u;
+                update.replica_role[static_cast<size_t>(expert_id)] =
+                    static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+            }
+
+            params_.moe_runtime_table->prepareInactiveBank(params_.layer_idx, update);
+            params_.moe_runtime_table->flipActiveBank(params_.layer_idx, update.epoch, nullptr);
+            moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+            return runtimeTableHasActiveOverlayBank();
+        }
+        catch (const std::exception &ex)
+        {
+            LOG_ERROR("[MoELocalExpertStage] Failed to initialize MoE runtime placement bank for layer "
+                      << params_.layer_idx << ": " << ex.what());
+            return false;
+        }
+    }
+
+    bool MoELocalExpertStage::runtimeTableHasActiveOverlayBank() const
+    {
+        if (!params_.moe_runtime_table || params_.layer_idx < 0 || params_.num_experts <= 0)
+            return false;
+
+        const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+        if (state.active_bank > 1 ||
+            state.active_epoch == 0 ||
+            state.expert_count != static_cast<uint32_t>(params_.num_experts) ||
+            state.top_k != static_cast<uint32_t>(params_.top_k))
+        {
+            return false;
+        }
+
+        const auto &bank = state.banks[state.active_bank];
+        if (bank.epoch != state.active_epoch ||
+            bank.expert_count != static_cast<uint32_t>(params_.num_experts))
+        {
+            return false;
+        }
+
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            const auto mask = bank.local_compute_mask[static_cast<size_t>(expert_id)];
+            if (mask > 1u)
+                return false;
+            if (mask != 0u &&
+                !params_.expert_mask.empty() &&
+                params_.expert_mask.size() == static_cast<size_t>(params_.num_experts) &&
+                !params_.expert_mask[static_cast<size_t>(expert_id)])
+            {
+                return false;
+            }
+            if (mask == 0u)
+                continue;
+
+            const auto &expert = bank.experts[static_cast<size_t>(expert_id)];
+            if (expert.logical_expert_id != expert_id ||
+                expert.local_slot < 0 ||
+                !expert.gate.valid() ||
+                !expert.up.valid() ||
+                !expert.down.valid() ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Valid) ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Resident) ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::LocalCompute))
+            {
+                return false;
+            }
+        }
+
+        return moe_runtime_layer_ != nullptr;
+    }
+
+    bool MoELocalExpertStage::runtimeLocalComputeEnabled(int expert_id) const
+    {
+        if (!params_.moe_runtime_table || expert_id < 0 || expert_id >= params_.num_experts)
+            return false;
+        const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+        if (state.active_bank > 1 || state.active_epoch == 0)
+            return false;
+        const auto &bank = state.banks[state.active_bank];
+        return bank.local_compute_mask[static_cast<size_t>(expert_id)] != 0u;
+    }
+
+    bool MoELocalExpertStage::staticExpertMaskDisablesAllExperts() const
+    {
+        return !params_.expert_mask.empty() &&
+               params_.expert_mask.size() == static_cast<size_t>(params_.num_experts) &&
+               std::none_of(params_.expert_mask.begin(), params_.expert_mask.end(),
+                            [](bool enabled)
+                            { return enabled; });
+    }
+
+    bool MoELocalExpertStage::hasRuntimeLocalWorkForInput(const MoEOverlaySparseRows &input) const
+    {
+        for (size_t entry = 0; entry < input.live_entry_count; ++entry)
+        {
+            const int expert_id = input.expert_ids_host[entry];
+            if (expert_id < 0 || expert_id >= params_.num_experts)
+                return true;
+            if (runtimeLocalComputeEnabled(expert_id))
+                return true;
+        }
+        return false;
+    }
+
+    bool MoELocalExpertStage::isExpertActiveForValidation(int expert_id) const
+    {
+        if (params_.moe_runtime_table && moe_runtime_table_initialized_)
+            return runtimeLocalComputeEnabled(expert_id);
+        return params_.expert_mask.empty() ||
+               (static_cast<size_t>(expert_id) < params_.expert_mask.size() &&
+                params_.expert_mask[static_cast<size_t>(expert_id)]);
     }
 
     bool MoELocalExpertStage::ensureCompactCapacity(size_t rows) const
@@ -118,19 +321,6 @@ namespace llaminar2
             return false;
         }
 
-        const bool has_prepared = hasPreparedExpertState(params_);
-        if (!has_prepared && (!params_.gate_exps || !params_.up_exps || !params_.down_exps))
-        {
-            LOG_ERROR("[MoELocalExpertStage] Missing expert weight tensors and no prepared expert state");
-            return false;
-        }
-        std::string prepared_error;
-        if (!validatePreparedWeights(&prepared_error))
-        {
-            LOG_ERROR("[MoELocalExpertStage] Prepared weight validation failed: " << prepared_error);
-            return false;
-        }
-
         if (!params_.expert_mask.empty() && params_.expert_mask.size() != static_cast<size_t>(params_.num_experts))
         {
             LOG_ERROR("[MoELocalExpertStage] expert_mask size " << params_.expert_mask.size()
@@ -153,8 +343,37 @@ namespace llaminar2
         output.target_participant = input.source_participant;
         output.live_row_count = 0;
 
+        if (params_.moe_runtime_table)
+        {
+            if (!moe_runtime_table_initialized_ || !runtimeTableHasActiveOverlayBank())
+            {
+                LOG_ERROR("[MoELocalExpertStage] Invalid or uninitialized MoE runtime placement table for layer "
+                          << params_.layer_idx << " on " << params_.device_id.to_string());
+                return false;
+            }
+        }
+
         if (input.live_row_count == 0)
             return true;
+
+        if (params_.moe_runtime_table && !hasRuntimeLocalWorkForInput(input))
+            return true;
+
+        if (!params_.moe_runtime_table && staticExpertMaskDisablesAllExperts())
+            return true;
+
+        const bool has_prepared = hasPreparedExpertState(params_);
+        if (!has_prepared && (!params_.gate_exps || !params_.up_exps || !params_.down_exps))
+        {
+            LOG_ERROR("[MoELocalExpertStage] Missing expert weight tensors and no prepared expert state");
+            return false;
+        }
+        std::string prepared_error;
+        if (!validatePreparedWeights(&prepared_error))
+        {
+            LOG_ERROR("[MoELocalExpertStage] Prepared weight validation failed: " << prepared_error);
+            return false;
+        }
 
         if (!ensureCompactCapacity(input.live_row_count))
             return false;
@@ -223,6 +442,7 @@ namespace llaminar2
         compute_params.prepared_down_gemm = params_.prepared_down_gemm;
         compute_params.prepared_store = params_.prepared_store;
         compute_params.expert_registry = params_.expert_registry;
+        compute_params.moe_runtime_table = params_.moe_runtime_table;
         compute_params.gate_slab_ref = params_.gate_slab_ref;
         compute_params.up_slab_ref = params_.up_slab_ref;
         compute_params.down_slab_ref = params_.down_slab_ref;
@@ -352,9 +572,7 @@ namespace llaminar2
 
             for (int expert = 0; expert < params_.num_experts; ++expert)
             {
-                const bool active = params_.expert_mask.empty() ||
-                                    (static_cast<size_t>(expert) < params_.expert_mask.size() &&
-                                     params_.expert_mask[static_cast<size_t>(expert)]);
+                const bool active = isExpertActiveForValidation(expert);
                 if (!active)
                     continue;
                 const bool ok = gate_v[expert] && up_v[expert] && down_v[expert];
@@ -408,8 +626,7 @@ namespace llaminar2
 
             for (int expert = 0; expert < params_.num_experts; ++expert)
             {
-                const bool active = params_.expert_mask.empty() ||
-                                    params_.expert_mask[static_cast<size_t>(expert)];
+                const bool active = isExpertActiveForValidation(expert);
                 if (!active)
                     continue;
                 if (!availability[static_cast<size_t>(expert)])

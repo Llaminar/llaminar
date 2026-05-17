@@ -22,6 +22,11 @@
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/PreparedWeightTestHarness.h"
+#include "utils/DebugEnv.h"
+
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#endif
 
 #include <cmath>
 #include <numeric>
@@ -31,6 +36,142 @@
 using namespace llaminar2;
 using namespace llaminar2::test;
 using namespace llaminar2::testing;
+
+namespace
+{
+#ifdef HAVE_ROCM
+    bool hasROCmDeviceForStageTests()
+    {
+        int count = 0;
+        const hipError_t err = hipGetDeviceCount(&count);
+        return err == hipSuccess && count > 0;
+    }
+#endif
+
+    class ScopedRocmMoEFlags
+    {
+    public:
+                ScopedRocmMoEFlags(bool grouped_decode, bool device_routed_decode, bool grouped_prefill = false)
+            : old_grouped_(mutableDebugEnv().rocm.moe_grouped_decode),
+                            old_device_routed_(mutableDebugEnv().rocm.moe_device_routed_decode),
+                            old_grouped_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
+        {
+            mutableDebugEnv().rocm.moe_grouped_decode = grouped_decode;
+            mutableDebugEnv().rocm.moe_device_routed_decode = device_routed_decode;
+                        mutableDebugEnv().rocm.moe_grouped_prefill = grouped_prefill;
+        }
+
+        ~ScopedRocmMoEFlags()
+        {
+            mutableDebugEnv().rocm.moe_grouped_decode = old_grouped_;
+            mutableDebugEnv().rocm.moe_device_routed_decode = old_device_routed_;
+            mutableDebugEnv().rocm.moe_grouped_prefill = old_grouped_prefill_;
+        }
+
+    private:
+        bool old_grouped_;
+        bool old_device_routed_;
+        bool old_grouped_prefill_;
+    };
+
+    class FakePreparedGemm final : public ITensorGemm
+    {
+    public:
+        explicit FakePreparedGemm(DeviceNativeVNNIMatrixDesc desc, bool converted = true)
+            : desc_(desc), converted_(converted)
+        {
+        }
+
+        bool supports_device(int device_idx) const override
+        {
+            return device_idx >= 0;
+        }
+
+        bool multiply_tensor(
+            const TensorBase *A, TensorBase *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const TensorBase *bias = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr,
+            int activation_row_offset = 0) override
+        {
+            (void)A;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)transpose_B;
+            (void)alpha;
+            (void)beta;
+            (void)bias;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)workspace;
+            (void)activation_row_offset;
+            return false;
+        }
+
+        bool weights_converted() const override
+        {
+            return converted_;
+        }
+
+        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        {
+            out = desc_;
+            return converted_ && out.valid();
+        }
+
+    private:
+        DeviceNativeVNNIMatrixDesc desc_;
+        bool converted_;
+    };
+
+    DeviceNativeVNNIMatrixDesc makeNativeVNNIDesc(int n, int k, uint8_t codebook_id = 4)
+    {
+        DeviceNativeVNNIMatrixDesc desc;
+        desc.payload = reinterpret_cast<const uint8_t *>(0x1000);
+        desc.scales = reinterpret_cast<const void *>(0x2000);
+        desc.mins = reinterpret_cast<const void *>(0x3000);
+        desc.n = n;
+        desc.k = k;
+        desc.blocks_per_row = static_cast<uint32_t>(k / 32);
+        desc.codebook_id = codebook_id;
+        return desc;
+    }
+
+    void attachFakePreparedExpertEngines(
+        MoEExpertComputeStage::Params &params,
+        std::vector<std::unique_ptr<FakePreparedGemm>> &owned_gemms,
+        uint8_t gateup_codebook = 4,
+        uint8_t down_codebook = 4,
+        bool converted = true)
+    {
+        params.prepared_gate_gemm.assign(params.num_experts, nullptr);
+        params.prepared_up_gemm.assign(params.num_experts, nullptr);
+        params.prepared_down_gemm.assign(params.num_experts, nullptr);
+        owned_gemms.clear();
+        owned_gemms.reserve(static_cast<size_t>(params.num_experts) * 3);
+
+        for (int expert_id = 0; expert_id < params.num_experts; ++expert_id)
+        {
+            owned_gemms.push_back(std::make_unique<FakePreparedGemm>(
+                makeNativeVNNIDesc(params.expert_intermediate, params.d_model, gateup_codebook), converted));
+            params.prepared_gate_gemm[expert_id] = owned_gemms.back().get();
+
+            owned_gemms.push_back(std::make_unique<FakePreparedGemm>(
+                makeNativeVNNIDesc(params.expert_intermediate, params.d_model, gateup_codebook), converted));
+            params.prepared_up_gemm[expert_id] = owned_gemms.back().get();
+
+            owned_gemms.push_back(std::make_unique<FakePreparedGemm>(
+                makeNativeVNNIDesc(params.d_model, params.expert_intermediate, down_codebook), converted));
+            params.prepared_down_gemm[expert_id] = owned_gemms.back().get();
+        }
+    }
+}
 
 // =========================================================================
 // Test Fixture
@@ -843,6 +984,293 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_TypeAndName)
     EXPECT_GT(stage.estimatedFlops(), 0u);
 }
 
+TEST_F(MoEExpertComputeStageTest, MoEFFN_GraphCapturableRejectsCPUAndPrefill)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+
+    MoEExpertComputeStage cpu_stage(params);
+    EXPECT_FALSE(cpu_stage.isGraphCapturable());
+
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = SEQ_LEN;
+    MoEExpertComputeStage prefill_stage(params);
+    EXPECT_FALSE(prefill_stage.isGraphCapturable());
+}
+
+TEST_F(MoEExpertComputeStageTest, MoEFFN_PrefillRuntimeGroupingFoundationKeepsCaptureDisabled)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto input = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
+    auto output = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
+    auto routing_indices = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
+    auto routing_weights = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.output = output.get();
+    params.routing_indices = routing_indices.get();
+    params.routing_weights = routing_weights.get();
+    params.seq_len = SEQ_LEN;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.local_expert_start = 0;
+    params.local_expert_count = NUM_EXPERTS;
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+
+    MoEExpertComputeStage stage(params);
+    EXPECT_FALSE(stage.isGraphCapturable());
+    EXPECT_FALSE(runtime_table.hasPrefillRouteScratchCapacity(0, SEQ_LEN));
+}
+
+TEST_F(MoEExpertComputeStageTest, MoEFFN_PrefillCaptureRequiresFixedTopologyRuntimeExpertPath)
+{
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    if (!hasROCmDeviceForStageTests())
+        GTEST_SKIP() << "No ROCm GPU available, skipping fixed-topology prefill capture predicate test";
+
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto input = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
+    auto output = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
+    auto routing_indices = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
+    auto routing_weights = TestTensorFactory::createFP32({SEQ_LEN * TOP_K, 1});
+
+    DeviceMoERuntimeTable::Config config;
+    config.device_id = DeviceId::rocm(0);
+    config.num_layers = 1;
+    config.num_experts = NUM_EXPERTS;
+    config.top_k = TOP_K;
+    config.mirror_to_device = true;
+    config.prefill_token_capacity = SEQ_LEN;
+    MoERuntimeTable runtime_table(config);
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.output = output.get();
+    params.routing_indices = routing_indices.get();
+    params.routing_weights = routing_weights.get();
+    params.seq_len = SEQ_LEN;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.local_expert_start = 0;
+    params.local_expert_count = NUM_EXPERTS;
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+
+    MoEExpertComputeStage missing_engines_stage(params);
+    EXPECT_FALSE(missing_engines_stage.isGraphCapturable());
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned_gemms;
+    attachFakePreparedExpertEngines(params, owned_gemms);
+    MoEExpertComputeStage fixed_stage(params);
+    EXPECT_TRUE(fixed_stage.isGraphCapturable());
+
+    mutableDebugEnv().rocm.moe_grouped_prefill = false;
+    MoEExpertComputeStage disabled_stage(params);
+    EXPECT_FALSE(disabled_stage.isGraphCapturable());
+#else
+    GTEST_SKIP() << "ROCm release-style build required for fixed-topology prefill capture predicate";
+#endif
+}
+
+TEST_F(MoEExpertComputeStageTest, MoEFFN_GraphCapturableRocmDecodeHonorsReleaseOnlyGuardAndFlags)
+{
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto output = TestTensorFactory::createFP32({1, D_MODEL});
+    auto routing_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto routing_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.output = output.get();
+    params.routing_indices = routing_indices.get();
+    params.routing_weights = routing_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.local_expert_start = 0;
+    params.local_expert_count = -1;
+    params.layer_idx = 0;
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned_gemms;
+    attachFakePreparedExpertEngines(params, owned_gemms);
+
+    {
+        ScopedRocmMoEFlags flags(false, true);
+        MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        params.moe_runtime_table = &runtime_table;
+        MoEExpertComputeStage stage(params);
+        EXPECT_FALSE(stage.isGraphCapturable());
+    }
+
+    {
+        ScopedRocmMoEFlags flags(true, true);
+        params.moe_runtime_table = nullptr;
+        MoEExpertComputeStage missing_runtime_stage(params);
+        EXPECT_FALSE(missing_runtime_stage.isGraphCapturable());
+
+        MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        params.moe_runtime_table = &runtime_table;
+        MoEExpertComputeStage stage(params);
+        EXPECT_FALSE(stage.isGraphCapturable());
+    }
+}
+
+TEST_F(MoEExpertComputeStageTest, MoEFFN_RuntimeTableBankInitializedFromPreparedDescriptors)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto output = TestTensorFactory::createFP32({1, D_MODEL});
+    auto routing_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto routing_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.output = output.get();
+    params.routing_indices = routing_indices.get();
+    params.routing_weights = routing_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.local_expert_start = 0;
+    params.local_expert_count = NUM_EXPERTS;
+    params.layer_idx = 0;
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned_gemms;
+    attachFakePreparedExpertEngines(params, owned_gemms);
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    params.moe_runtime_table = &runtime_table;
+    MoEExpertComputeStage stage(params);
+
+    const auto &state = runtime_table.hostLayerState(0);
+    ASSERT_EQ(state.active_epoch, 1u);
+    ASSERT_LE(state.active_bank, 1u);
+    const auto &bank = state.banks[state.active_bank];
+    ASSERT_EQ(bank.expert_count, static_cast<uint32_t>(NUM_EXPERTS));
+
+    DeviceNativeVNNIMatrixDesc expected_gate;
+    DeviceNativeVNNIMatrixDesc expected_up;
+    DeviceNativeVNNIMatrixDesc expected_down;
+    ASSERT_TRUE(params.prepared_gate_gemm[1]->exportNativeVNNIMatrixDesc(expected_gate));
+    ASSERT_TRUE(params.prepared_up_gemm[1]->exportNativeVNNIMatrixDesc(expected_up));
+    ASSERT_TRUE(params.prepared_down_gemm[1]->exportNativeVNNIMatrixDesc(expected_down));
+
+    const auto &expert = bank.experts[1];
+    EXPECT_EQ(expert.logical_expert_id, 1);
+    EXPECT_EQ(expert.local_slot, 1);
+    EXPECT_EQ(bank.local_compute_mask[1], 1u);
+    EXPECT_TRUE(hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Valid));
+    EXPECT_TRUE(hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Resident));
+    EXPECT_TRUE(hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::LocalCompute));
+    EXPECT_EQ(expert.gate.payload, expected_gate.payload);
+    EXPECT_EQ(expert.gate.scales, expected_gate.scales);
+    EXPECT_EQ(expert.gate.n, expected_gate.n);
+    EXPECT_EQ(expert.gate.k, expected_gate.k);
+    EXPECT_EQ(expert.up.payload, expected_up.payload);
+    EXPECT_EQ(expert.up.blocks_per_row, expected_up.blocks_per_row);
+    EXPECT_EQ(expert.down.payload, expected_down.payload);
+    EXPECT_EQ(expert.down.n, expected_down.n);
+    EXPECT_EQ(expert.down.k, expected_down.k);
+}
+
+TEST_F(MoEExpertComputeStageTest, MoEFFN_GraphCapturableRejectsMaskedAndReplicaDispatch)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto output = TestTensorFactory::createFP32({1, D_MODEL});
+    auto routing_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto routing_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.output = output.get();
+    params.routing_indices = routing_indices.get();
+    params.routing_weights = routing_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.local_expert_start = 0;
+    params.local_expert_count = NUM_EXPERTS;
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned_gemms;
+    attachFakePreparedExpertEngines(params, owned_gemms);
+
+    params.expert_mask = {true, false, true, true};
+    MoEExpertComputeStage masked_stage(params);
+    EXPECT_FALSE(masked_stage.isGraphCapturable());
+
+    params.expert_mask.assign(NUM_EXPERTS, true);
+    params.replica_set.num_replicated = 1;
+    MoEExpertComputeStage replicated_stage(params);
+    EXPECT_FALSE(replicated_stage.isGraphCapturable());
+}
+
+TEST_F(MoEExpertComputeStageTest, MoEFFN_GraphCapturableRejectsMissingOrUnsupportedPreparedEngines)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto output = TestTensorFactory::createFP32({1, D_MODEL});
+    auto routing_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto routing_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.output = output.get();
+    params.routing_indices = routing_indices.get();
+    params.routing_weights = routing_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.local_expert_start = 0;
+    params.local_expert_count = NUM_EXPERTS;
+
+    MoEExpertComputeStage missing_stage(params);
+    EXPECT_FALSE(missing_stage.isGraphCapturable());
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned_gemms;
+    attachFakePreparedExpertEngines(params, owned_gemms, /*gateup_codebook=*/99);
+    MoEExpertComputeStage unsupported_stage(params);
+    EXPECT_FALSE(unsupported_stage.isGraphCapturable());
+
+    attachFakePreparedExpertEngines(params, owned_gemms, /*gateup_codebook=*/4, /*down_codebook=*/4, /*converted=*/false);
+    MoEExpertComputeStage unconverted_stage(params);
+    EXPECT_FALSE(unconverted_stage.isGraphCapturable());
+}
+
 TEST_F(MoEExpertComputeStageTest, SharedExpert_TypeAndName)
 {
     SharedExpertFFNStage::Params params;
@@ -855,6 +1283,7 @@ TEST_F(MoEExpertComputeStageTest, SharedExpert_TypeAndName)
     EXPECT_EQ(stage.type(), ComputeStageType::MOE_SHARED_EXPERT_FFN);
     EXPECT_EQ(stage.name(), "shared_expert_ffn");
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
+    EXPECT_FALSE(stage.isGraphCapturable());
     EXPECT_GT(stage.estimatedFlops(), 0u);
 }
 
@@ -869,6 +1298,7 @@ TEST_F(MoEExpertComputeStageTest, SharedGate_TypeAndName)
     EXPECT_EQ(stage.type(), ComputeStageType::MOE_SHARED_EXPERT_GATE);
     EXPECT_EQ(stage.name(), "shared_expert_gate");
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
+    EXPECT_FALSE(stage.isGraphCapturable());
 }
 
 // =========================================================================

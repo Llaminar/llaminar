@@ -7,6 +7,7 @@
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../utils/Assertions.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 
 #include <cmath>
@@ -46,6 +47,8 @@ namespace llaminar2
     MoERoutingStage::MoERoutingStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if (params_.moe_runtime_table && params_.layer_idx >= 0)
+            moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
     }
 
     IMoEKernel *MoERoutingStage::ensureMoEKernel() const
@@ -103,6 +106,38 @@ namespace llaminar2
         //      No intermediate H2D transfers.
         IMoEKernel *kernel = ensureMoEKernel();
 
+        if (isDeviceRoutedDecodeGraphCapturable())
+        {
+            // The current grouped expert decode still consumes the legacy routing
+            // tensors, so keep them device-resident while also filling runtime top-k.
+            if (!kernel->decodeRouteSelect(
+                    moe_runtime_layer_,
+                    params_.input,
+                    params_.gate_weights,
+                    d_model,
+                    num_experts,
+                    top_k,
+                    params_.norm_topk_prob,
+                    params_.output_indices,
+                    params_.output_weights,
+                    /*write_legacy_outputs=*/true,
+                    /*update_runtime_histogram=*/true))
+            {
+                LOG_ERROR("[MoERoutingStage] Runtime-table decode routing failed");
+                return false;
+            }
+
+            if (!ensureRoutingOutputOnStageDevice(params_.output_indices, params_.device_id, "output_indices") ||
+                !ensureRoutingOutputOnStageDevice(params_.output_weights, params_.device_id, "output_weights"))
+            {
+                return false;
+            }
+
+            LOG_TRACE("[MoERoutingStage] Runtime-routed single token to top-"
+                      << top_k << " of " << num_experts << " experts");
+            return true;
+        }
+
         if (!kernel->routeWithTensors(
                 params_.input, params_.gate_weights,
                 seq_len, d_model, num_experts, top_k,
@@ -155,6 +190,55 @@ namespace llaminar2
                                      : 0;
         const size_t topk_flops = static_cast<size_t>(params_.seq_len) * params_.num_experts * log2_experts;
         return gate_flops + topk_flops;
+    }
+
+    bool MoERoutingStage::isGraphCapturable() const
+    {
+        return isDeviceRoutedDecodeGraphCapturable();
+    }
+
+    bool MoERoutingStage::isDeviceRoutedDecodeGraphCapturable() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+        return false;
+#else
+        // routeWithTensors() is capture-safe only when ROCm decode keeps top-k
+        // routing tensors device-resident. Snapshots and decode histograms both
+        // require host top-k/logit materialization, so they stay manual.
+        const auto &rocm = debugEnv().rocm;
+        return params_.device_id.is_rocm() &&
+               params_.seq_len == 1 &&
+               params_.d_model > 0 &&
+               params_.num_experts > 0 &&
+               params_.top_k > 0 &&
+               params_.top_k <= params_.num_experts &&
+               params_.top_k <= DecodeExpertHistogram::MAX_TOP_K &&
+               params_.input &&
+               params_.gate_weights &&
+               params_.output_indices &&
+               params_.output_weights &&
+               rocm.moe_grouped_decode &&
+               rocm.moe_device_routed_decode &&
+               params_.moe_runtime_table &&
+               hasInitializedRuntimeTableIfProvided() &&
+               !params_.decode_histogram;
+#endif
+    }
+
+    bool MoERoutingStage::hasInitializedRuntimeTableIfProvided() const
+    {
+        if (!params_.moe_runtime_table)
+            return false;
+        if (!moe_runtime_layer_ || params_.layer_idx < 0)
+            return false;
+
+        const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+        return state.active_bank <= 1 &&
+               state.active_epoch > 0 &&
+               state.expert_count == static_cast<uint32_t>(params_.num_experts) &&
+               state.top_k == static_cast<uint32_t>(params_.top_k) &&
+               state.banks[state.active_bank].epoch == state.active_epoch &&
+               state.banks[state.active_bank].expert_count == static_cast<uint32_t>(params_.num_experts);
     }
 
     bool MoERoutingStage::supportsBackend(ComputeBackendType backend) const

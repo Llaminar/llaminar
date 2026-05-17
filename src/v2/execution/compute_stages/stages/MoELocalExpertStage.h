@@ -9,6 +9,7 @@
 #include "../StageParamsBase.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../moe/MoEOverlaySparseCollective.h"
+#include "../../moe/MoERuntimeTable.h"
 #include "../../../loaders/ExpertSlabTypes.h"
 
 #include <memory>
@@ -49,7 +50,8 @@ namespace llaminar2
 
             // ================================================================
             // Prepared expert state — analogous to MoEExpertComputeStage::Params.
-            // No peer participant / runtime / runner fields.
+            // No peer participant / domain runtime / runner fields. The optional
+            // MoE runtime table below is the graph-facing placement table only.
             // When prepared_gate_gemm is non-empty (size == num_experts), the
             // execute() path skips inline extractExpertViews /
             // prepareExpertGemmEngines and uses these engines directly.
@@ -63,6 +65,11 @@ namespace llaminar2
             PreparedWeightStore *prepared_store = nullptr;
             /// Pointer to model-context-owned ExpertGemmRegistry.  Not owned here.
             ExpertGemmRegistry *expert_registry = nullptr;
+            /// Stable graph-facing MoE runtime placement state for this overlay/local participant.
+            /// Owned by the graph/model layer; stages only cache the per-layer pointer.
+            IMoERuntimeTable *moe_runtime_table = nullptr;
+            /// Optional logical participant id recorded in runtime placement descriptors.
+            int runtime_participant_index = -1;
             /// Cached slab references for PreparedWeightStore-based resolution.
             std::optional<ExpertSlabRef> gate_slab_ref;
             std::optional<ExpertSlabRef> up_slab_ref;
@@ -92,9 +99,16 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
 
         const Params &params() const { return params_; }
+        bool refreshRuntimePlacement();
 
     private:
         bool ensureCompactCapacity(size_t rows) const;
+        bool initializeMoERuntimePlacementBank();
+        bool runtimeTableHasActiveOverlayBank() const;
+        bool runtimeLocalComputeEnabled(int expert_id) const;
+        bool staticExpertMaskDisablesAllExperts() const;
+        bool hasRuntimeLocalWorkForInput(const MoEOverlaySparseRows &input) const;
+        bool isExpertActiveForValidation(int expert_id) const;
 
         Params params_;
         mutable size_t compact_capacity_ = 0;
@@ -103,6 +117,8 @@ namespace llaminar2
         mutable std::shared_ptr<FP32Tensor> compact_routing_weights_;
         mutable std::shared_ptr<FP32Tensor> compact_output_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
+        bool moe_runtime_table_initialized_ = false;
     };
 
 } // namespace llaminar2

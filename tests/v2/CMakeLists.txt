@@ -707,6 +707,21 @@ add_v2_test(V2_Unit_MoEGraphNativeProductionHardening
     MPI_PROCS 1
 )
 
+# Test: MoERuntimeTable - graph-facing runtime table and rebalance epoch foundation
+add_executable(v2_unit_moe_runtime_table
+    unit/execution/moe/Test__MoERuntimeTable.cpp
+)
+target_link_libraries(v2_unit_moe_runtime_table
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoERuntimeTable
+    COMMAND $<TARGET_FILE:v2_unit_moe_runtime_table>
+    LABELS "V2;Unit;Execution;MoE;GraphNative;RuntimeTable;Rebalance"
+    MPI_PROCS 1
+)
+
 # Test: MoE Expert Owner Map - graph-native whole-expert ownership for routed tiers
 add_executable(v2_unit_moe_expert_owner_map unit/execution/moe/Test__MoEExpertOwnerMap.cpp)
 target_link_libraries(v2_unit_moe_expert_owner_map
@@ -721,6 +736,7 @@ add_v2_test(V2_Unit_MoEExpertOwnerMap_DisjointAcceleratorParticipants
 )
 
 add_executable(v2_unit_moe_overlay_collective_workspace unit/execution/moe/Test__MoEOverlayCollectiveWorkspace.cpp)
+target_include_directories(v2_unit_moe_overlay_collective_workspace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_unit_moe_overlay_collective_workspace
     llaminar2_core
     GTest::gtest

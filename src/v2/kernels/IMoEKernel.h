@@ -26,6 +26,8 @@
 namespace llaminar2
 {
 
+    struct DeviceMoELayerRuntime;
+
     /**
      * @brief Routing result from MoE gate computation
      *
@@ -215,6 +217,32 @@ namespace llaminar2
             ITensor *output_indices, ITensor *output_weights,
             MoERoutingResult &host_result);
 
+        /// Decode-only runtime-table routing path. GPU implementations may
+        /// keep top-k results entirely device-resident and optionally fill the
+        /// legacy routing tensors for existing staged consumers.
+        virtual bool decodeRouteSelect(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *hidden, ITensor *gate_weights,
+            int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            bool write_legacy_outputs,
+            bool update_runtime_histogram)
+        {
+            (void)runtime_layer;
+            (void)hidden;
+            (void)gate_weights;
+            (void)d_model;
+            (void)num_experts;
+            (void)top_k;
+            (void)normalize_weights;
+            (void)output_indices;
+            (void)output_weights;
+            (void)write_legacy_outputs;
+            (void)update_runtime_histogram;
+            return false;
+        }
+
         /// Zero a tensor's data buffer on the active device.
         /// GPU: zeros device memory, marks DEVICE_AUTHORITATIVE.
         /// CPU: zeros via mutable_data().
@@ -377,6 +405,34 @@ namespace llaminar2
         }
 
         /**
+         * @brief Grouped single-token gate/up projections from runtime-table top-k state.
+         *
+         * This variant consumes DeviceMoELayerRuntime::topk_expert_ids directly
+         * on device after decodeRouteSelect(), avoiding legacy FP32 routing
+         * tensors and decode-time float-to-int conversion.
+         */
+        virtual bool groupedExpertGateUpDecodeFromRuntime(
+            DeviceMoELayerRuntime *runtime_layer,
+            const TensorBase *input,
+            int descriptor_table_id,
+            int top_k,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            int d_model,
+            int intermediate)
+        {
+            (void)runtime_layer;
+            (void)input;
+            (void)descriptor_table_id;
+            (void)top_k;
+            (void)gate_outputs;
+            (void)up_outputs;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
          * @brief Grouped decode path using a persistent descriptor table.
          *
          * The active expert ids are uploaded as tiny per-call routing metadata;
@@ -427,6 +483,34 @@ namespace llaminar2
             (void)up_tensors;
             (void)routing_indices;
             (void)routing_weights;
+            (void)descriptor_table_id;
+            (void)top_k;
+            (void)output;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
+         * @brief Grouped decode down path from runtime-table top-k state.
+         *
+         * Reads DeviceMoELayerRuntime::topk_expert_ids and topk_weights directly
+         * on device, selecting expert descriptors by runtime expert id without
+         * consuming legacy FP32 routing tensors.
+         */
+        virtual bool groupedExpertDownDecodeFromRuntime(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            DeviceMoELayerRuntime *runtime_layer,
+            int descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate)
+        {
+            (void)gate_tensors;
+            (void)up_tensors;
+            (void)runtime_layer;
             (void)descriptor_table_id;
             (void)top_k;
             (void)output;
@@ -535,6 +619,70 @@ namespace llaminar2
             int *d_expert_counts,
             int *d_grouped_token_indices,
             float *d_grouped_weights) { return false; }
+
+        /**
+         * @brief Populate DeviceMoELayerRuntime prefill grouping scratch from routing tensors.
+         *
+         * routing_indices and routing_weights are FP32 tensors with
+         * current_tokens * top_k entries. GPU implementations should keep all
+         * route/group state device-resident in runtime_layer. The default
+         * returns false so callers can use the established host/grouping path.
+         */
+        virtual bool groupPrefillRoutes(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *routing_indices, ITensor *routing_weights,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k)
+        {
+            (void)runtime_layer;
+            (void)routing_indices;
+            (void)routing_weights;
+            (void)current_tokens;
+            (void)max_tokens;
+            (void)num_experts;
+            (void)top_k;
+            return false;
+        }
+
+        /**
+         * @brief Gather one expert's fixed-capacity prefill batch from runtime grouping.
+         *
+         * The default returns false; GPU implementations can use runtime_layer
+         * scratch without reading counts or routing data back to host.
+         */
+        virtual bool gatherPrefillExpertBatchFromRuntime(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *hidden, ITensor *batch_buffer,
+            int expert_id, int max_tokens, int d_model)
+        {
+            (void)runtime_layer;
+            (void)hidden;
+            (void)batch_buffer;
+            (void)expert_id;
+            (void)max_tokens;
+            (void)d_model;
+            return false;
+        }
+
+        /**
+         * @brief Scatter one expert's fixed-capacity prefill output from runtime grouping.
+         *
+         * The default returns false; GPU implementations can consume runtime
+         * grouped token ids and weights entirely on device.
+         */
+        virtual bool scatterPrefillExpertResultsFromRuntime(
+            ITensor *output, ITensor *expert_results,
+            DeviceMoELayerRuntime *runtime_layer,
+            int expert_id, int max_tokens, int d_model)
+        {
+            (void)output;
+            (void)expert_results;
+            (void)runtime_layer;
+            (void)expert_id;
+            (void)max_tokens;
+            (void)d_model;
+            return false;
+        }
 
         // =================================================================
         // Phase 4: GPU-side expert dispatch for prefill

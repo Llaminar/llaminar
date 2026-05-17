@@ -9,7 +9,10 @@
 #pragma once
 
 #include "../qwen35/Qwen35Graph.h"
+#include "../../execution/moe/MoERuntimeTable.h"
 #include <memory>
+#include <string>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -54,6 +57,13 @@ namespace llaminar2
 
         /// Override resolver config to register MoE buffer IDs and formulas
         GraphResolverConfig getResolverConfig(int seq_len) const override;
+
+    private:
+        IMoERuntimeTable *moeRuntimeTableForDevice(DeviceId device,
+                                                   int prefill_token_capacity = 0,
+                                                   const std::string &key_suffix = {});
+
+        std::unordered_map<std::string, std::unique_ptr<MoERuntimeTable>> moe_runtime_tables_;
     };
 
 } // namespace llaminar2

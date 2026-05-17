@@ -14,8 +14,10 @@
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/DebugEnv.h"
 
 #include <cmath>
+#include <cstdint>
 #include <numeric>
 #include <algorithm>
 #include <vector>
@@ -27,6 +29,72 @@
 using namespace llaminar2;
 using namespace llaminar2::test;
 using namespace llaminar2::testing;
+
+namespace
+{
+    class ScopedRocmMoEFlags
+    {
+    public:
+        ScopedRocmMoEFlags(bool grouped_decode, bool device_routed_decode)
+            : old_grouped_(mutableDebugEnv().rocm.moe_grouped_decode),
+              old_device_routed_(mutableDebugEnv().rocm.moe_device_routed_decode)
+        {
+            mutableDebugEnv().rocm.moe_grouped_decode = grouped_decode;
+            mutableDebugEnv().rocm.moe_device_routed_decode = device_routed_decode;
+        }
+
+        ~ScopedRocmMoEFlags()
+        {
+            mutableDebugEnv().rocm.moe_grouped_decode = old_grouped_;
+            mutableDebugEnv().rocm.moe_device_routed_decode = old_device_routed_;
+        }
+
+    private:
+        bool old_grouped_;
+        bool old_device_routed_;
+    };
+
+    DeviceNativeVNNIMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
+    {
+        DeviceNativeVNNIMatrixDesc desc;
+        desc.payload = reinterpret_cast<const uint8_t *>(base);
+        desc.scales = reinterpret_cast<const void *>(base + 0x1000u);
+        desc.mins = reinterpret_cast<const void *>(base + 0x2000u);
+        desc.n = n;
+        desc.k = k;
+        desc.blocks_per_row = static_cast<uint32_t>(k / 32);
+        desc.codebook_id = 4;
+        return desc;
+    }
+
+    MoEPlacementUpdate routingRuntimeUpdate(uint32_t epoch, int num_experts, int d_model)
+    {
+        MoEPlacementUpdate update;
+        update.epoch = epoch;
+        update.expert_count = static_cast<uint32_t>(num_experts);
+        update.experts.resize(static_cast<size_t>(num_experts));
+        update.local_compute_mask.assign(static_cast<size_t>(num_experts), 1u);
+        update.replica_role.assign(static_cast<size_t>(num_experts),
+                                   static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const uintptr_t base = 0x70000000u + static_cast<uintptr_t>(expert) * 0x10000u;
+            auto &desc = update.experts[static_cast<size_t>(expert)];
+            desc.gate = runtimeDesc(base + 0x0100u, d_model, d_model);
+            desc.up = runtimeDesc(base + 0x0200u, d_model, d_model);
+            desc.down = runtimeDesc(base + 0x0300u, d_model, d_model);
+            desc.logical_expert_id = expert;
+            desc.owner_participant = 0;
+            desc.local_slot = expert;
+            desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                          DeviceMoEExpertFlags::Resident |
+                                          DeviceMoEExpertFlags::LocalCompute);
+        }
+
+        return update;
+    }
+}
 
 // =========================================================================
 // Test Fixture
@@ -180,6 +248,139 @@ TEST_F(MoERoutingStageTest, StageMetadata)
     EXPECT_EQ(stage.name(), "moe_router");
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_GT(stage.estimatedFlops(), 0u);
+}
+
+TEST_F(MoERoutingStageTest, GraphCapturableRejectsCPUAndPrefill)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+
+    MoERoutingStage cpu_stage(params);
+    EXPECT_FALSE(cpu_stage.isGraphCapturable());
+
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = SEQ_LEN;
+    MoERoutingStage prefill_stage(params);
+    EXPECT_FALSE(prefill_stage.isGraphCapturable());
+}
+
+TEST_F(MoERoutingStageTest, GraphCapturableRejectsHistogramDependency)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto gate_weights = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
+    auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 1;
+    histogram_config.num_experts = NUM_EXPERTS;
+    histogram_config.top_k = TOP_K;
+    DecodeExpertHistogram histogram(histogram_config);
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.decode_histogram = &histogram;
+
+    MoERoutingStage stage(params);
+    EXPECT_FALSE(stage.isGraphCapturable());
+}
+
+TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsReleaseOnlyGuardAndFlags)
+{
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto gate_weights = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
+    auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+
+    {
+        ScopedRocmMoEFlags flags(false, true);
+        MoERoutingStage stage(params);
+        EXPECT_FALSE(stage.isGraphCapturable());
+    }
+
+    {
+        ScopedRocmMoEFlags flags(true, true);
+        MoERoutingStage stage(params);
+        EXPECT_FALSE(stage.isGraphCapturable());
+
+        MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+        ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+        params.layer_idx = 0;
+        params.moe_runtime_table = &runtime_table;
+
+        MoERoutingStage runtime_stage(params);
+    #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+        EXPECT_TRUE(runtime_stage.isGraphCapturable());
+    #else
+        EXPECT_FALSE(runtime_stage.isGraphCapturable());
+    #endif
+    }
+}
+
+TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWhenProvided)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto gate_weights = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
+    auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+
+    MoERoutingStage unprepared_stage(params);
+    EXPECT_FALSE(unprepared_stage.isGraphCapturable());
+
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+    MoERoutingStage prepared_stage(params);
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(prepared_stage.isGraphCapturable());
+#else
+    EXPECT_FALSE(prepared_stage.isGraphCapturable());
+#endif
 }
 
 TEST_F(MoERoutingStageTest, OutputDimensions)

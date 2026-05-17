@@ -1182,6 +1182,7 @@ add_library(llaminar2_core STATIC
     execution/moe/MoEOverlaySparseCollective.cpp
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
+    execution/moe/MoERuntimeTable.cpp
     execution/moe/MoEExpertWeightService.cpp
     execution/moe/ExpertWeightPayloadProvider.cpp
     execution/moe/GPUExpertTransfer.cpp

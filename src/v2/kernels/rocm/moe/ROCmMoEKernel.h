@@ -20,6 +20,8 @@
 #include "../../IMoEKernel.h"
 #include "../ROCmKernelBase.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -97,6 +99,15 @@ namespace llaminar2
             ITensor *output_indices, ITensor *output_weights,
             MoERoutingResult &host_result) override;
 
+        bool decodeRouteSelect(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *hidden, ITensor *gate_weights,
+            int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            bool write_legacy_outputs,
+            bool update_runtime_histogram) override;
+
         void zeroBuffer(ITensor *tensor, size_t bytes) override;
 
         void gatherTokenBatchFromTensors(
@@ -161,6 +172,16 @@ namespace llaminar2
             int d_model,
             int intermediate) override;
 
+        bool groupedExpertGateUpDecodeFromRuntime(
+            DeviceMoELayerRuntime *runtime_layer,
+            const TensorBase *input,
+            int descriptor_table_id,
+            int top_k,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            int d_model,
+            int intermediate) override;
+
         bool groupedExpertDownDecodeFromTable(
             ITensor *const *gate_tensors,
             ITensor *const *up_tensors,
@@ -177,6 +198,16 @@ namespace llaminar2
             ITensor *const *up_tensors,
             ITensor *routing_indices,
             ITensor *routing_weights,
+            int descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate) override;
+
+        bool groupedExpertDownDecodeFromRuntime(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            DeviceMoELayerRuntime *runtime_layer,
             int descriptor_table_id,
             int top_k,
             ITensor *output,
@@ -213,6 +244,22 @@ namespace llaminar2
             int *d_expert_counts,
             int *d_grouped_token_indices,
             float *d_grouped_weights) override;
+
+        bool groupPrefillRoutes(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *routing_indices, ITensor *routing_weights,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k) override;
+
+        bool gatherPrefillExpertBatchFromRuntime(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *hidden, ITensor *batch_buffer,
+            int expert_id, int max_tokens, int d_model) override;
+
+        bool scatterPrefillExpertResultsFromRuntime(
+            ITensor *output, ITensor *expert_results,
+            DeviceMoELayerRuntime *runtime_layer,
+            int expert_id, int max_tokens, int d_model) override;
 
         // =================================================================
         // Phase 4: GPU-side expert dispatch for prefill
@@ -255,11 +302,27 @@ namespace llaminar2
         }
 
     private:
+        static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
+
         void syncBlasStream();
         void allocateHistogramBuffers(int num_layers, int num_experts);
         void ensureStagingCapacity(int count);
         bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
         bool ensureGroupedGateUpCapacity(int num_active, int d_model);
+        bool ensureRuntimeGateUpPointerArrays(
+            int descriptor_table_id,
+            int top_k,
+            const std::array<float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
+            const std::array<float *, kRuntimePointerArrayMaxTopK> &up_ptrs,
+            float ***d_gate_ptrs,
+            float ***d_up_ptrs);
+        bool ensureRuntimeDownPointerArrays(
+            int descriptor_table_id,
+            int top_k,
+            const std::array<const float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
+            const std::array<const float *, kRuntimePointerArrayMaxTopK> &up_ptrs,
+            const float ***d_gate_ptrs,
+            const float ***d_up_ptrs);
         bool ensureSharedGateScratchCapacity(int seq_len);
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
 
@@ -299,6 +362,26 @@ namespace llaminar2
             uint8_t codebook_id = 0;
         };
 
+        struct RuntimeGateUpPointerCacheEntry
+        {
+            int descriptor_table_id = -1;
+            int top_k = 0;
+            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> gate_ptr_values = {};
+            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
+            float **d_gate_ptrs = nullptr;
+            float **d_up_ptrs = nullptr;
+        };
+
+        struct RuntimeDownPointerCacheEntry
+        {
+            int descriptor_table_id = -1;
+            int top_k = 0;
+            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> gate_ptr_values = {};
+            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
+            const float **d_gate_ptrs = nullptr;
+            const float **d_up_ptrs = nullptr;
+        };
+
         int device_ordinal_;
         std::unique_ptr<rocm::HipBLASGemmKernel> blas_gemm_;
 
@@ -328,6 +411,7 @@ namespace llaminar2
         int grouped_decode_active_cap_ = 0;
         int grouped_decode_intermediate_cap_ = 0;
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
+        std::vector<RuntimeDownPointerCacheEntry> runtime_down_pointer_cache_;
 
         // Grouped decode staging for ROCm native-VNNI MoE gate/up path.
         float **d_grouped_gate_output_ptrs_ = nullptr;
@@ -338,6 +422,7 @@ namespace llaminar2
         int grouped_gateup_active_cap_ = 0;
         int grouped_gateup_d_model_cap_ = 0;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
+        std::vector<RuntimeGateUpPointerCacheEntry> runtime_gateup_pointer_cache_;
         std::vector<float *> host_grouped_gate_output_ptrs_;
         std::vector<float *> host_grouped_up_output_ptrs_;
         std::vector<int> host_grouped_gateup_expert_ids_;

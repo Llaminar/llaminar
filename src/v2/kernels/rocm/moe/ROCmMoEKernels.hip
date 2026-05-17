@@ -2,7 +2,7 @@
  * @file ROCmMoEKernels.hip
  * @brief HIP __global__ kernels for MoE operations
  *
- * Contains 6 HIP kernels for device-native MoE execution:
+ * Contains HIP kernels for device-native MoE execution:
  * 1. gate_logits_kernel    — GEMV: hidden × gate_weights^T → logits
  * 2. softmax_topk_kernel   — Row-wise softmax + top-k selection
  * 3. gather_tokens_kernel  — Gather token rows into contiguous batch
@@ -21,6 +21,75 @@
 #include <cfloat>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+
+namespace
+{
+    constexpr int kDeviceMoEMaxExperts = 256;
+    constexpr int kDeviceMoEMaxTopK = 16;
+    constexpr int kGateLogitsExpertsPerBlock = 4;
+    constexpr int kGateLogitsGroupedThreads = 256;
+
+    struct DeviceNativeVNNIMatrixDescView
+    {
+        const uint8_t *payload;
+        const void *scales;
+        const void *mins;
+        const void *emins;
+        int n;
+        int k;
+        uint32_t blocks_per_row;
+        uint8_t codebook_id;
+        uint8_t reserved[3];
+    };
+
+    struct DeviceMoEExpertDescriptorView
+    {
+        DeviceNativeVNNIMatrixDescView gate;
+        DeviceNativeVNNIMatrixDescView up;
+        DeviceNativeVNNIMatrixDescView down;
+        int32_t logical_expert_id;
+        int32_t owner_participant;
+        int32_t local_slot;
+        uint32_t flags;
+    };
+
+    struct DeviceMoEPlacementBankView
+    {
+        DeviceMoEExpertDescriptorView experts[kDeviceMoEMaxExperts];
+        uint8_t local_compute_mask[kDeviceMoEMaxExperts];
+        uint8_t replica_role[kDeviceMoEMaxExperts];
+        uint32_t epoch;
+        uint32_t expert_count;
+        uint32_t reserved[2];
+    };
+
+    struct DeviceMoELayerRuntimeView
+    {
+        uint32_t active_bank;
+        uint32_t active_epoch;
+        uint32_t expert_count;
+        uint32_t top_k;
+        DeviceMoEPlacementBankView banks[2];
+        int32_t topk_expert_ids[kDeviceMoEMaxTopK];
+        float topk_weights[kDeviceMoEMaxTopK];
+        uint64_t decode_histogram[kDeviceMoEMaxExperts];
+        int32_t *route_expert_ids;
+        float *route_weights;
+        int32_t *expert_counts;
+        int32_t *expert_offsets;
+        int32_t *grouped_token_ids;
+        float *grouped_route_weights;
+        float *grouped_gate_scratch;
+        float *grouped_up_scratch;
+        float *grouped_output_partials;
+        void *decode_scratch;
+        void *reserved_ptrs[3];
+        uint64_t reserved_u64[4];
+        uint32_t prefill_token_capacity;
+        uint32_t prefill_route_capacity;
+        uint32_t reserved_u32[2];
+    };
+}
 
 // =========================================================================
 // Kernel 1: Single-token Gate Logits
@@ -80,6 +149,81 @@ __global__ void rocm_moe_gate_logits_single_token_kernel(
             sum += __shfl_down(sum, offset);
         if (lane == 0) logits[expert] = sum;
     }
+}
+
+// =========================================================================
+// Kernel 1b: Single-token Gate Logits, Grouped Experts
+//
+// Each CTA handles a contiguous group of experts and loads the decode hidden
+// vector into LDS once. On gfx906 this maps four wave64 waves to four experts,
+// avoiding cross-wave reductions while preserving the original logits layout.
+// =========================================================================
+
+__global__ void rocm_moe_gate_logits_single_token_grouped_kernel(
+    const float *__restrict__ hidden,       // [d_model]
+    const float *__restrict__ gate_weights, // [num_experts, d_model]
+    float *__restrict__ logits,             // [num_experts]
+    int d_model, int num_experts,
+    bool use_vec4)
+{
+    extern __shared__ float4 hidden_shared_vec4[];
+    float *hidden_shared = reinterpret_cast<float *>(hidden_shared_vec4);
+
+    if (use_vec4)
+    {
+        const int vec_count = d_model >> 2;
+        const float4 *hidden4 = reinterpret_cast<const float4 *>(hidden);
+        for (int i = threadIdx.x; i < vec_count; i += blockDim.x)
+        {
+            hidden_shared_vec4[i] = hidden4[i];
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        {
+            hidden_shared[i] = hidden[i];
+        }
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (warp_id >= kGateLogitsExpertsPerBlock)
+        return;
+
+    const int expert = blockIdx.x * kGateLogitsExpertsPerBlock + warp_id;
+    if (expert >= num_experts)
+        return;
+
+    const float *w = gate_weights + expert * d_model;
+    float sum = 0.0f;
+
+    if (use_vec4)
+    {
+        const int vec_count = d_model >> 2;
+        const float4 *hidden4 = reinterpret_cast<const float4 *>(hidden_shared);
+        const float4 *w4 = reinterpret_cast<const float4 *>(w);
+        for (int i = lane; i < vec_count; i += warpSize)
+        {
+            const float4 h = hidden4[i];
+            const float4 ww = w4[i];
+            sum += h.x * ww.x + h.y * ww.y + h.z * ww.z + h.w * ww.w;
+        }
+    }
+    else
+    {
+        for (int i = lane; i < d_model; i += warpSize)
+        {
+            sum += hidden_shared[i] * w[i];
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    if (lane == 0)
+        logits[expert] = sum;
 }
 
 // =========================================================================
@@ -220,6 +364,228 @@ __global__ void rocm_moe_softmax_topk_kernel(
                     out_wt[k] *= inv;
             }
         }
+    }
+}
+
+// =========================================================================
+// Kernel 2b: Decode Softmax + Top-K + Runtime Write
+//
+// Single-token decode variant that keeps routing entirely device-side: it
+// converts logits to probabilities, selects top-k, writes the stable runtime
+// table, optionally mirrors legacy FP32 routing tensors, and updates the
+// decode histogram in one launch.
+// =========================================================================
+
+__global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
+    float *__restrict__ logits,                       // [num_experts] IN/OUT (probabilities)
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    float *__restrict__ legacy_indices,               // optional [top_k]
+    float *__restrict__ legacy_weights,               // optional [top_k]
+    int num_experts, int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram)
+{
+    if (!logits || !runtime || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    {
+        return;
+    }
+
+    float local_max = -FLT_MAX;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        local_max = fmaxf(local_max, logits[expert]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+
+    __shared__ float shared_max[8];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) shared_max[warp_id] = local_max;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        local_max = (lane < num_warps) ? shared_max[lane] : -FLT_MAX;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+            local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+        }
+        if (lane == 0) shared_max[0] = local_max;
+    }
+    __syncthreads();
+    const float max_val = shared_max[0];
+
+    float local_sum = 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        const float value = expf(logits[expert] - max_val);
+        logits[expert] = value;
+        local_sum += value;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        local_sum += __shfl_down(local_sum, offset);
+    }
+
+    __shared__ float shared_sum[8];
+    if (lane == 0) shared_sum[warp_id] = local_sum;
+    __syncthreads();
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        local_sum = (lane < num_warps) ? shared_sum[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+            local_sum += __shfl_down(local_sum, offset);
+        }
+        if (lane == 0) shared_sum[0] = local_sum;
+    }
+    __syncthreads();
+
+    const float inv_sum = (shared_sum[0] > 0.0f) ? 1.0f / shared_sum[0] : 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        logits[expert] *= inv_sum;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0)
+    {
+        int selected_ids[kDeviceMoEMaxTopK];
+        float selected_weights[kDeviceMoEMaxTopK];
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            selected_ids[slot] = -1;
+            selected_weights[slot] = 0.0f;
+        }
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            float best_value = -1.0f;
+            int best_expert = 0;
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                if (logits[expert] > best_value)
+                {
+                    bool already_selected = false;
+                    for (int previous = 0; previous < slot; ++previous)
+                    {
+                        if (selected_ids[previous] == expert)
+                        {
+                            already_selected = true;
+                            break;
+                        }
+                    }
+                    if (!already_selected)
+                    {
+                        best_value = logits[expert];
+                        best_expert = expert;
+                    }
+                }
+            }
+            selected_ids[slot] = best_expert;
+            selected_weights[slot] = best_value;
+        }
+
+        if (normalize_weights)
+        {
+            float topk_sum = 0.0f;
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                topk_sum += selected_weights[slot];
+            }
+            if (topk_sum > 0.0f)
+            {
+                const float inv_topk_sum = 1.0f / topk_sum;
+                for (int slot = 0; slot < top_k; ++slot)
+                {
+                    selected_weights[slot] *= inv_topk_sum;
+                }
+            }
+        }
+
+        const bool runtime_shape_ok =
+            runtime->active_bank <= 1u &&
+            runtime->active_epoch != 0u &&
+            runtime->expert_count == static_cast<uint32_t>(num_experts) &&
+            runtime->top_k == static_cast<uint32_t>(top_k);
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int expert_id = selected_ids[slot];
+            const float weight = selected_weights[slot];
+
+            if (runtime_shape_ok)
+            {
+                runtime->topk_expert_ids[slot] = expert_id;
+                runtime->topk_weights[slot] = weight;
+                if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
+                {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+                }
+            }
+
+            if (write_legacy_outputs && legacy_indices && legacy_weights)
+            {
+                legacy_indices[slot] = static_cast<float>(expert_id);
+                legacy_weights[slot] = weight;
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Kernel 2c: Decode Route Select Runtime Copy
+//
+// Copies single-token top-k ids/weights into the stable device runtime table,
+// optionally mirrors them to legacy routing tensors, and records a device-side
+// decode histogram. The routing tensors remain necessary until the expert
+// decode kernels consume runtime top-k directly.
+// =========================================================================
+
+__global__ void rocm_moe_decode_route_select_runtime_kernel(
+    const int *__restrict__ expert_indices,       // [top_k]
+    const float *__restrict__ expert_weights,     // [top_k]
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    float *__restrict__ legacy_indices,           // optional [top_k]
+    float *__restrict__ legacy_weights,           // optional [top_k]
+    int num_experts, int top_k,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram)
+{
+    const int k = threadIdx.x;
+    if (k >= top_k || k >= kDeviceMoEMaxTopK || !runtime) return;
+
+    const int expert_id = expert_indices[k];
+    const float weight = expert_weights[k];
+
+    const bool runtime_shape_ok =
+        runtime->active_bank <= 1u &&
+        runtime->active_epoch != 0u &&
+        runtime->expert_count == static_cast<uint32_t>(num_experts) &&
+        runtime->top_k == static_cast<uint32_t>(top_k);
+
+    if (runtime_shape_ok)
+    {
+        runtime->topk_expert_ids[k] = expert_id;
+        runtime->topk_weights[k] = weight;
+        if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
+        {
+            atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+        }
+    }
+
+    if (write_legacy_outputs)
+    {
+        legacy_indices[k] = static_cast<float>(expert_id);
+        legacy_weights[k] = weight;
     }
 }
 
@@ -420,6 +786,45 @@ bool hipMoE_gate_logits_single_token(
     return true;
 }
 
+bool hipMoE_gate_logits_single_token_grouped(
+    const float *hidden, const float *gate_weights, float *logits,
+    int d_model, int num_experts, size_t shared_mem_bytes,
+    int device_idx, void *stream)
+{
+    if (!hidden || !gate_weights || !logits || d_model <= 0 || num_experts <= 0)
+    {
+        fprintf(stderr, "HIP MoE grouped gate logits invalid args\n");
+        return false;
+    }
+
+    const size_t required_shared = static_cast<size_t>(d_model) * sizeof(float);
+    if (shared_mem_bytes < required_shared)
+    {
+        fprintf(stderr, "HIP MoE grouped gate logits shared memory too small: requested=%zu required=%zu\n",
+                shared_mem_bytes, required_shared);
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const bool use_vec4 = ((d_model & 3) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(hidden) & 0xfu) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(gate_weights) & 0xfu) == 0);
+    const int blocks = (num_experts + kGateLogitsExpertsPerBlock - 1) / kGateLogitsExpertsPerBlock;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_single_token_grouped_kernel,
+        dim3(blocks), dim3(kGateLogitsGroupedThreads), shared_mem_bytes, static_cast<hipStream_t>(stream),
+        hidden, gate_weights, logits, d_model, num_experts, use_vec4);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE grouped gate_logits_single_token kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 bool hipMoE_softmax_topk(
     float *logits,
     int *expert_indices, float *expert_weights,
@@ -441,6 +846,88 @@ bool hipMoE_softmax_topk(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE softmax_topk kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_softmax_topk_decode_runtime(
+    float *logits,
+    void *runtime,
+    float *legacy_indices,
+    float *legacy_weights,
+    int num_experts, int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!logits || !runtime || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    {
+        return false;
+    }
+    if (write_legacy_outputs && (!legacy_indices || !legacy_weights))
+    {
+        return false;
+    }
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_runtime_kernel,
+        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        logits,
+        static_cast<DeviceMoELayerRuntimeView *>(runtime),
+        legacy_indices, legacy_weights,
+        num_experts, top_k,
+        normalize_weights,
+        write_legacy_outputs,
+        update_runtime_histogram);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE softmax_topk_decode_runtime kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_decode_route_select_runtime(
+    const int *expert_indices,
+    const float *expert_weights,
+    void *runtime,
+    float *legacy_indices,
+    float *legacy_weights,
+    int num_experts, int top_k,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!expert_indices || !expert_weights || !runtime || top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+        return false;
+    if (write_legacy_outputs && (!legacy_indices || !legacy_weights))
+        return false;
+
+    const int threads = 32;
+    hipLaunchKernelGGL(rocm_moe_decode_route_select_runtime_kernel,
+        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        expert_indices, expert_weights,
+        static_cast<DeviceMoELayerRuntimeView *>(runtime),
+        legacy_indices, legacy_weights,
+        num_experts, top_k,
+        write_legacy_outputs,
+        update_runtime_histogram);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE decode_route_select_runtime kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;
@@ -833,6 +1320,156 @@ __global__ void rocm_moe_scatter_tokens_kernel(
     }
 }
 
+__global__ void rocm_moe_prefill_group_clear_kernel(
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int max_slots, int num_experts)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!runtime) return;
+
+    if (idx < num_experts && runtime->expert_counts && runtime->expert_offsets)
+    {
+        runtime->expert_counts[idx] = 0;
+        runtime->expert_offsets[idx] = 0;
+    }
+
+    if (idx < max_slots)
+    {
+        if (runtime->route_expert_ids) runtime->route_expert_ids[idx] = -1;
+        if (runtime->route_weights) runtime->route_weights[idx] = 0.0f;
+        if (runtime->grouped_token_ids) runtime->grouped_token_ids[idx] = -1;
+        if (runtime->grouped_route_weights) runtime->grouped_route_weights[idx] = 0.0f;
+    }
+}
+
+__global__ void rocm_moe_prefill_group_cast_count_kernel(
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    const float *__restrict__ routing_indices,
+    const float *__restrict__ routing_weights,
+    int current_slots, int max_slots, int num_experts)
+{
+    const int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (!runtime || slot >= max_slots) return;
+    if (!runtime->route_expert_ids || !runtime->route_weights || !runtime->expert_counts) return;
+    if (runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots)) return;
+
+    int expert_id = -1;
+    float weight = 0.0f;
+    if (slot < current_slots)
+    {
+        expert_id = static_cast<int>(routing_indices[slot]);
+        weight = routing_weights[slot];
+        if (expert_id < 0 || expert_id >= num_experts)
+        {
+            expert_id = -1;
+            weight = 0.0f;
+        }
+    }
+
+    runtime->route_expert_ids[slot] = expert_id;
+    runtime->route_weights[slot] = weight;
+    if (expert_id >= 0)
+        atomicAdd(&runtime->expert_counts[expert_id], 1);
+}
+
+__global__ void rocm_moe_prefill_group_exclusive_scan_kernel(
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int num_experts)
+{
+    if (!runtime || threadIdx.x != 0) return;
+    if (!runtime->expert_counts || !runtime->expert_offsets) return;
+
+    int running = 0;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const int count = runtime->expert_counts[expert];
+        runtime->expert_offsets[expert] = running;
+        running += count;
+    }
+}
+
+__global__ void rocm_moe_prefill_group_scatter_deterministic_kernel(
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int current_slots, int max_slots, int num_experts, int top_k)
+{
+    const int expert = blockIdx.x;
+    if (!runtime || expert >= num_experts || threadIdx.x != 0) return;
+    if (!runtime->route_expert_ids || !runtime->route_weights ||
+        !runtime->expert_offsets || !runtime->expert_counts ||
+        !runtime->grouped_token_ids || !runtime->grouped_route_weights) return;
+    if (runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots)) return;
+
+    int write = runtime->expert_offsets[expert];
+    const int end = runtime->expert_offsets[expert] + runtime->expert_counts[expert];
+    for (int slot = 0; slot < max_slots; ++slot)
+    {
+        if (slot >= current_slots) continue;
+        if (runtime->route_expert_ids[slot] != expert) continue;
+        if (write < end)
+        {
+            runtime->grouped_token_ids[write] = slot / top_k;
+            runtime->grouped_route_weights[write] = runtime->route_weights[slot];
+            ++write;
+        }
+    }
+}
+
+__global__ void rocm_moe_prefill_gather_expert_runtime_kernel(
+    const DeviceMoELayerRuntimeView *__restrict__ runtime,
+    const float *__restrict__ hidden,
+    float *__restrict__ batch_buffer,
+    int expert_id, int max_tokens, int d_model)
+{
+    const int linear = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = max_tokens * d_model;
+    if (!runtime || !hidden || !batch_buffer || linear >= total) return;
+    if (!runtime->expert_counts || !runtime->expert_offsets || !runtime->grouped_token_ids) return;
+    if (expert_id < 0 || expert_id >= static_cast<int>(runtime->expert_count)) return;
+    if (runtime->prefill_token_capacity < static_cast<uint32_t>(max_tokens)) return;
+
+    const int row = linear / d_model;
+    const int col = linear - row * d_model;
+    const int count = runtime->expert_counts[expert_id];
+    const int offset = runtime->expert_offsets[expert_id];
+
+    float value = 0.0f;
+    if (row < count)
+    {
+        const int token_id = runtime->grouped_token_ids[offset + row];
+        if (token_id >= 0 && token_id < max_tokens)
+            value = hidden[token_id * d_model + col];
+    }
+
+    batch_buffer[linear] = value;
+}
+
+__global__ void rocm_moe_prefill_scatter_expert_runtime_kernel(
+    float *__restrict__ output,
+    const float *__restrict__ expert_output,
+    const DeviceMoELayerRuntimeView *__restrict__ runtime,
+    int expert_id, int max_tokens, int d_model)
+{
+    const int linear = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = max_tokens * d_model;
+    if (!runtime || !output || !expert_output || linear >= total) return;
+    if (!runtime->expert_counts || !runtime->expert_offsets ||
+        !runtime->grouped_token_ids || !runtime->grouped_route_weights) return;
+    if (expert_id < 0 || expert_id >= static_cast<int>(runtime->expert_count)) return;
+    if (runtime->prefill_token_capacity < static_cast<uint32_t>(max_tokens)) return;
+
+    const int row = linear / d_model;
+    const int col = linear - row * d_model;
+    const int count = runtime->expert_counts[expert_id];
+    if (row >= count) return;
+
+    const int offset = runtime->expert_offsets[expert_id];
+    const int token_id = runtime->grouped_token_ids[offset + row];
+    if (token_id < 0 || token_id >= max_tokens) return;
+
+    const float weight = runtime->grouped_route_weights[offset + row];
+    atomicAdd(&output[token_id * d_model + col], weight * expert_output[linear]);
+}
+
 // =========================================================================
 // Phase 3 extern "C" bridge functions
 // =========================================================================
@@ -908,6 +1545,145 @@ bool hipMoE_scatter_tokens(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE scatter_tokens kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_group_prefill_routes_runtime(
+    const float *routing_indices, const float *routing_weights,
+    void *runtime,
+    int current_slots, int max_slots, int num_experts, int top_k,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!runtime || !routing_indices || !routing_weights ||
+        current_slots < 0 || max_slots <= 0 || current_slots > max_slots ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts || top_k <= 0)
+    {
+        fprintf(stderr, "HIP MoE group_prefill_routes invalid arguments\n");
+        return false;
+    }
+
+    auto *runtime_view = static_cast<DeviceMoELayerRuntimeView *>(runtime);
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    const int threads = 256;
+    const int clear_items = (max_slots > num_experts) ? max_slots : num_experts;
+    const int clear_blocks = (clear_items + threads - 1) / threads;
+
+    hipLaunchKernelGGL(rocm_moe_prefill_group_clear_kernel,
+        dim3(clear_blocks), dim3(threads), 0, hip_stream,
+        runtime_view, max_slots, num_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE prefill group clear kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+
+    const int slot_blocks = (max_slots + threads - 1) / threads;
+    hipLaunchKernelGGL(rocm_moe_prefill_group_cast_count_kernel,
+        dim3(slot_blocks), dim3(threads), 0, hip_stream,
+        runtime_view, routing_indices, routing_weights,
+        current_slots, max_slots, num_experts);
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE prefill group cast/count kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(rocm_moe_prefill_group_exclusive_scan_kernel,
+        dim3(1), dim3(1), 0, hip_stream,
+        runtime_view, num_experts);
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE prefill group scan kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+
+    hipLaunchKernelGGL(rocm_moe_prefill_group_scatter_deterministic_kernel,
+        dim3(num_experts), dim3(1), 0, hip_stream,
+        runtime_view, current_slots, max_slots, num_experts, top_k);
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE prefill group scatter kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+
+    return true;
+}
+
+bool hipMoE_prefill_gather_expert_runtime(
+    const void *runtime,
+    const float *hidden,
+    float *batch_buffer,
+    int expert_id, int max_tokens, int d_model,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!runtime || !hidden || !batch_buffer || expert_id < 0 || max_tokens <= 0 || d_model <= 0)
+    {
+        fprintf(stderr, "HIP MoE prefill gather runtime invalid arguments\n");
+        return false;
+    }
+
+    const int threads = 256;
+    const int total = max_tokens * d_model;
+    const int blocks = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(rocm_moe_prefill_gather_expert_runtime_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        static_cast<const DeviceMoELayerRuntimeView *>(runtime),
+        hidden, batch_buffer, expert_id, max_tokens, d_model);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE prefill gather runtime launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_prefill_scatter_expert_runtime(
+    float *output,
+    const float *expert_output,
+    const void *runtime,
+    int expert_id, int max_tokens, int d_model,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!output || !expert_output || !runtime || expert_id < 0 || max_tokens <= 0 || d_model <= 0)
+    {
+        fprintf(stderr, "HIP MoE prefill scatter runtime invalid arguments\n");
+        return false;
+    }
+
+    const int threads = 256;
+    const int total = max_tokens * d_model;
+    const int blocks = (total + threads - 1) / threads;
+    hipLaunchKernelGGL(rocm_moe_prefill_scatter_expert_runtime_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        output, expert_output,
+        static_cast<const DeviceMoELayerRuntimeView *>(runtime),
+        expert_id, max_tokens, d_model);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE prefill scatter runtime launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;

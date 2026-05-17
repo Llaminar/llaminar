@@ -7,17 +7,22 @@
  *   2. validatePreparedWeights() fails when an active expert is missing an engine.
  *   3. validatePreparedWeights() succeeds with slab-refs pointing to a registered store.
  *   4. validatePreparedWeights() fails when a slab is not in the store (empty mask).
- *   5. Params still lacks forbidden runtime/runner/peer fields (reuse type-trait guard).
+ *   5. Params has only the allowed MoE runtime-table hook, not runner/peer fields.
  */
 
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "execution/moe/MoERuntimeTable.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ExpertSlabTypes.h"
+#include "mocks/MockComputeStage.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <type_traits>
+#include <vector>
 
 using namespace llaminar2;
 
@@ -30,6 +35,99 @@ namespace
     {
         // n must be in [1..63] to keep the pointer obviously non-null and distinct.
         return reinterpret_cast<ITensorGemm *>(static_cast<uintptr_t>(n) * 0x1000u);
+    }
+
+    class FakePreparedGemm final : public ITensorGemm
+    {
+    public:
+        explicit FakePreparedGemm(DeviceNativeVNNIMatrixDesc desc)
+            : desc_(desc)
+        {
+        }
+
+        bool supports_device(int device_idx) const override
+        {
+            return device_idx >= 0;
+        }
+
+        bool multiply_tensor(
+            const TensorBase *A, TensorBase *C,
+            int m, int n, int k,
+            bool transpose_B = true,
+            float alpha = 1.0f, float beta = 0.0f,
+            const TensorBase *bias = nullptr,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            DeviceWorkspaceManager *workspace = nullptr,
+            int activation_row_offset = 0) override
+        {
+            (void)A;
+            (void)C;
+            (void)m;
+            (void)n;
+            (void)k;
+            (void)transpose_B;
+            (void)alpha;
+            (void)beta;
+            (void)bias;
+            (void)mpi_ctx;
+            (void)device_idx;
+            (void)workspace;
+            (void)activation_row_offset;
+            return false;
+        }
+
+        bool weights_converted() const override { return true; }
+
+        bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+        {
+            out = desc_;
+            return out.valid();
+        }
+
+    private:
+        DeviceNativeVNNIMatrixDesc desc_;
+    };
+
+    DeviceNativeVNNIMatrixDesc nativeDesc(int expert_id, int role, int n, int k)
+    {
+        const uintptr_t base = 0x10000000u + static_cast<uintptr_t>(expert_id) * 0x10000u +
+                               static_cast<uintptr_t>(role) * 0x1000u;
+        DeviceNativeVNNIMatrixDesc desc;
+        desc.payload = reinterpret_cast<const uint8_t *>(base + 0x0100u);
+        desc.scales = reinterpret_cast<const void *>(base + 0x0200u);
+        desc.mins = reinterpret_cast<const void *>(base + 0x0300u);
+        desc.n = n;
+        desc.k = k;
+        desc.blocks_per_row = static_cast<uint32_t>(std::max(k / 32, 1));
+        desc.codebook_id = 4;
+        return desc;
+    }
+
+    void attachFakePreparedEngines(
+        MoELocalExpertStage::Params &p,
+        std::vector<std::unique_ptr<FakePreparedGemm>> &owned)
+    {
+        p.prepared_gate_gemm.assign(static_cast<size_t>(p.num_experts), nullptr);
+        p.prepared_up_gemm.assign(static_cast<size_t>(p.num_experts), nullptr);
+        p.prepared_down_gemm.assign(static_cast<size_t>(p.num_experts), nullptr);
+        owned.clear();
+        owned.reserve(static_cast<size_t>(p.num_experts) * 3u);
+
+        for (int expert_id = 0; expert_id < p.num_experts; ++expert_id)
+        {
+            owned.push_back(std::make_unique<FakePreparedGemm>(
+                nativeDesc(expert_id, 0, p.expert_intermediate, p.d_model)));
+            p.prepared_gate_gemm[static_cast<size_t>(expert_id)] = owned.back().get();
+
+            owned.push_back(std::make_unique<FakePreparedGemm>(
+                nativeDesc(expert_id, 1, p.expert_intermediate, p.d_model)));
+            p.prepared_up_gemm[static_cast<size_t>(expert_id)] = owned.back().get();
+
+            owned.push_back(std::make_unique<FakePreparedGemm>(
+                nativeDesc(expert_id, 2, p.d_model, p.expert_intermediate)));
+            p.prepared_down_gemm[static_cast<size_t>(expert_id)] = owned.back().get();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -326,14 +424,128 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     EXPECT_FALSE(err.empty());
 }
 
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     RuntimeTableInitializesOverlayPlacementBankForLocalMask)
+{
+    constexpr int kNumExperts = 4;
+    MoERuntimeTable table(DeviceId::cpu(), 1, kNumExperts, 2);
+
+    MoELocalExpertStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.num_experts = kNumExperts;
+    p.top_k = 2;
+    p.d_model = 32;
+    p.expert_intermediate = 64;
+    p.layer_idx = 0;
+    p.expert_mask = {true, false, true, false};
+    p.runtime_participant_index = 3;
+    p.moe_runtime_table = &table;
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned;
+    attachFakePreparedEngines(p, owned);
+
+    MoELocalExpertStage stage(p);
+    EXPECT_FALSE(stage.isGraphCapturable());
+    EXPECT_TRUE(stage.refreshRuntimePlacement());
+
+    const auto &state = table.hostLayerState(0);
+    ASSERT_EQ(state.active_epoch, 1u);
+    ASSERT_LE(state.active_bank, 1u);
+    const auto &bank = state.banks[state.active_bank];
+    EXPECT_EQ(bank.local_compute_mask[0], 1u);
+    EXPECT_EQ(bank.local_compute_mask[1], 0u);
+    EXPECT_EQ(bank.local_compute_mask[2], 1u);
+    EXPECT_EQ(bank.local_compute_mask[3], 0u);
+    EXPECT_EQ(bank.experts[0].logical_expert_id, 0);
+    EXPECT_EQ(bank.experts[0].owner_participant, 3);
+    EXPECT_TRUE(bank.experts[0].gate.valid());
+    EXPECT_TRUE(bank.experts[2].down.valid());
+    EXPECT_TRUE(hasMoEExpertFlag(bank.experts[2].flags, DeviceMoEExpertFlags::LocalCompute));
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     RuntimeTableEmptyMaskNoOpsWithoutPreparedWeights)
+{
+    constexpr int kNumExperts = 4;
+    constexpr int kDModel = 8;
+    constexpr int kTopK = 2;
+
+    MoERuntimeTable table(DeviceId::cpu(), 1, kNumExperts, kTopK);
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(/*max_rows=*/2, /*max_entries=*/4, kDModel, kTopK, DeviceId::cpu());
+
+    auto input = workspace.localExpertInput(0, 0);
+    input.live_row_count = 1;
+    input.live_entry_count = 1;
+    input.row_ids_host[0] = 0;
+    input.entry_offsets_host[0] = 0;
+    input.entry_offsets_host[1] = 1;
+    input.expert_ids_host[0] = 2;
+    input.route_weights_host[0] = 1.0f;
+    for (int col = 0; col < kDModel; ++col)
+        input.hidden_rows_fp32[col] = static_cast<float>(col + 1);
+
+    auto output = workspace.localExpertOutput(0, 0);
+    MoELocalExpertStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.input_rows = &input;
+    p.output_rows = &output;
+    p.num_experts = kNumExperts;
+    p.top_k = kTopK;
+    p.d_model = kDModel;
+    p.expert_intermediate = 32;
+    p.layer_idx = 0;
+    p.expert_mask = {false, false, false, false};
+    p.moe_runtime_table = &table;
+
+    MoELocalExpertStage stage(p);
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
+    ASSERT_TRUE(stage.execute(&ctx));
+    EXPECT_EQ(output.live_row_count, 0u);
+
+    const auto &state = table.hostLayerState(0);
+    const auto &bank = state.banks[state.active_bank];
+    for (int expert = 0; expert < kNumExperts; ++expert)
+        EXPECT_EQ(bank.local_compute_mask[static_cast<size_t>(expert)], 0u);
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     RuntimeTableRejectsActiveBankOutsideStaticExpertMask)
+{
+    constexpr int kNumExperts = 4;
+    MoERuntimeTable table(DeviceId::cpu(), 1, kNumExperts, 2);
+
+    MoELocalExpertStage::Params all_local;
+    all_local.device_id = DeviceId::cpu();
+    all_local.num_experts = kNumExperts;
+    all_local.top_k = 2;
+    all_local.d_model = 32;
+    all_local.expert_intermediate = 64;
+    all_local.layer_idx = 0;
+    all_local.expert_mask = {true, true, true, true};
+    all_local.moe_runtime_table = &table;
+
+    std::vector<std::unique_ptr<FakePreparedGemm>> owned;
+    attachFakePreparedEngines(all_local, owned);
+
+    MoELocalExpertStage all_local_stage(all_local);
+    ASSERT_TRUE(all_local_stage.refreshRuntimePlacement());
+
+    MoELocalExpertStage::Params subset = all_local;
+    subset.expert_mask = {true, false, true, false};
+    MoELocalExpertStage subset_stage(subset);
+    EXPECT_FALSE(subset_stage.refreshRuntimePlacement());
+}
+
 // ---------------------------------------------------------------------------
 // Structural: Params must not have forbidden runtime/peer fields
 // ---------------------------------------------------------------------------
 
-TEST(Test__MoELocalExpertStage_PreparedWeights, ParamsHasNoPreparedParticipantsOrRuntimeFields)
+TEST(Test__MoELocalExpertStage_PreparedWeights, ParamsHasOnlyMoERuntimeTableAndNoRunnerFields)
 {
     using P = MoELocalExpertStage::Params;
     EXPECT_FALSE(has_runtime<P>::value);
+    EXPECT_TRUE((std::is_member_object_pointer_v<decltype(&P::moe_runtime_table)>));
     EXPECT_FALSE(has_peer_participants<P>::value);
     EXPECT_FALSE(has_prepared_participants<P>::value);
 }

@@ -14,6 +14,7 @@
 #include "../../../memory/BufferId.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../moe/DecodeExpertHistogram.h"
+#include "../../moe/MoERuntimeTable.h"
 
 #include <vector>
 namespace llaminar2
@@ -51,6 +52,7 @@ namespace llaminar2
             // Layer info for histogram
             int layer_idx = -1;
             DecodeExpertHistogram *decode_histogram = nullptr;
+            IMoERuntimeTable *moe_runtime_table = nullptr;
 
             // Outputs (written by this stage)
             TensorBase *output_indices = nullptr; ///< FP32 [seq_len * top_k] expert IDs as float
@@ -71,7 +73,7 @@ namespace llaminar2
         int layerIndex() const { return params_.layer_idx; }
 
         bool allowsZeroOutput() const override { return false; }
-        bool isGraphCapturable() const override { return false; }
+        bool isGraphCapturable() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
@@ -90,8 +92,11 @@ namespace llaminar2
 
         /// Pre-allocated routing result (avoids heap allocs per decode token)
         mutable MoERoutingResult cached_routing_;
+        DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
 
         IMoEKernel *ensureMoEKernel() const;
+        bool isDeviceRoutedDecodeGraphCapturable() const;
+        bool hasInitializedRuntimeTableIfProvided() const;
         void stashRoutingResults(
             const std::vector<int> &expert_indices,
             const std::vector<float> &expert_weights,

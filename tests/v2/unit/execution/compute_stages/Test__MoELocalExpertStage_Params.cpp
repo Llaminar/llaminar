@@ -19,6 +19,15 @@ namespace llaminar2::test
         };
 
         template <typename, typename = void>
+        struct has_moe_runtime_table : std::false_type
+        {
+        };
+        template <typename T>
+        struct has_moe_runtime_table<T, std::void_t<decltype(std::declval<T &>().moe_runtime_table)>> : std::true_type
+        {
+        };
+
+        template <typename, typename = void>
         struct has_domain_runtime : std::false_type
         {
         };
@@ -83,7 +92,7 @@ namespace llaminar2::test
 
     } // namespace
 
-    TEST(Test__MoELocalExpertStage_Params, ConstructibleAndNoRuntimeOrPeerParticipantFields)
+    TEST(Test__MoELocalExpertStage_Params, ConstructibleWithOnlyRuntimeTableHookAndNoRunnerFields)
     {
         using Params = MoELocalExpertStage::Params;
 
@@ -92,6 +101,7 @@ namespace llaminar2::test
         EXPECT_TRUE((std::is_constructible_v<MoELocalExpertStage, Params>));
 
         EXPECT_FALSE(has_runtime<Params>::value);
+        EXPECT_TRUE(has_moe_runtime_table<Params>::value);
         EXPECT_FALSE(has_domain_runtime<Params>::value);
         EXPECT_FALSE(has_runtime_service<Params>::value);
         EXPECT_FALSE(has_runner<Params>::value);

@@ -1,4 +1,8 @@
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
+#include "collective/ITPContext.h"
+#include "tensors/Tensors.h"
+#include "mocks/MockComputeStage.h"
 
 #include <gtest/gtest.h>
 
@@ -25,6 +29,36 @@ namespace
         key.direction = MoEOverlayCollectiveDirection::ReturnReduce;
         return key;
     }
+
+    class CountingTPContext final : public ITPContext
+    {
+    public:
+        TPScope scope() const override { return TPScope::LOCAL; }
+        int degree() const override { return 2; }
+        int myIndex() const override { return 0; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::HOST; }
+        bool allreduce(TensorBase *tensor) override
+        {
+            (void)tensor;
+            return true;
+        }
+        bool broadcast(TensorBase *tensor, int source_index = 0) override
+        {
+            (void)tensor;
+            last_source_index = source_index;
+            ++broadcast_calls;
+            return true;
+        }
+        bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override
+        {
+            (void)local_shard;
+            (void)global_tensor;
+            return true;
+        }
+
+        int broadcast_calls = 0;
+        int last_source_index = -1;
+    };
 
 } // namespace
 
@@ -162,4 +196,73 @@ TEST(Test__MoEOverlayCollectiveWorkspace, LocalReturnReduceMovesCompactRowsByKey
     EXPECT_EQ(inbound1.row_ids_host[1], 4);
     EXPECT_FLOAT_EQ(inbound1.output_rows_fp32[0], 200.0f);
     EXPECT_FLOAT_EQ(inbound1.output_rows_fp32[7], 207.0f);
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace, ReturnReduceBroadcastWaitsForCollectiveComplete)
+{
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(16, 32, 4, 2, DeviceId::cpu());
+
+    MoEOverlayLocalSparseCollectiveContext collective({.participant_count = 2, .slot_count = 8});
+    CountingTPContext tp_context;
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
+    auto key = returnKey(35);
+
+    auto outbound0 = workspace.localExpertOutput(3, 1);
+    outbound0.key = key;
+    outbound0.source_participant = 0;
+    outbound0.target_participant = 1;
+    outbound0.live_row_count = 1;
+    outbound0.row_ids_host[0] = 2;
+    for (int col = 0; col < outbound0.d_model; ++col)
+        outbound0.output_rows_fp32[col] = static_cast<float>(10 + col);
+
+    FP32Tensor dense0(std::vector<size_t>{4, 4});
+    auto inbound0 = workspace.returnReceive(3, 1);
+    MoESparseReturnReduceStage::Params first_params;
+    first_params.device_id = DeviceId::cpu();
+    first_params.collective_context = &collective;
+    first_params.key = key;
+    first_params.source_participant = 0;
+    first_params.target_participant = 1;
+    first_params.outbound_rows = &outbound0;
+    first_params.inbound_rows = &inbound0;
+    first_params.dense_output = &dense0;
+    first_params.seq_len = 4;
+    first_params.d_model = 4;
+    first_params.broadcast_after_scatter = true;
+    first_params.continuation_tp_context = &tp_context;
+    first_params.continuation_root_tp_index = 1;
+
+    MoESparseReturnReduceStage first_stage(std::move(first_params));
+    ASSERT_TRUE(first_stage.execute(&ctx));
+    EXPECT_EQ(tp_context.broadcast_calls, 0);
+
+    auto outbound1 = workspace.localExpertOutput(3, 1);
+    outbound1.key = key;
+    outbound1.source_participant = 1;
+    outbound1.target_participant = 0;
+    outbound1.live_row_count = 0;
+
+    FP32Tensor dense1(std::vector<size_t>{4, 4});
+    auto inbound1 = workspace.returnReceive(3, 1);
+    MoESparseReturnReduceStage::Params second_params;
+    second_params.device_id = DeviceId::cpu();
+    second_params.collective_context = &collective;
+    second_params.key = key;
+    second_params.source_participant = 1;
+    second_params.target_participant = 1;
+    second_params.outbound_rows = &outbound1;
+    second_params.inbound_rows = &inbound1;
+    second_params.dense_output = &dense1;
+    second_params.seq_len = 4;
+    second_params.d_model = 4;
+    second_params.broadcast_after_scatter = true;
+    second_params.continuation_tp_context = &tp_context;
+    second_params.continuation_root_tp_index = 1;
+
+    MoESparseReturnReduceStage second_stage(std::move(second_params));
+    ASSERT_TRUE(second_stage.execute(&ctx));
+    EXPECT_EQ(tp_context.broadcast_calls, 1);
+    EXPECT_EQ(tp_context.last_source_index, 1);
 }

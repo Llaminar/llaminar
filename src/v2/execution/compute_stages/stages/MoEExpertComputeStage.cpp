@@ -107,6 +107,20 @@ namespace llaminar2
     MoEExpertComputeStage::MoEExpertComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        if (params_.moe_runtime_table && params_.layer_idx >= 0)
+        {
+            moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+            if (params_.device_id.is_rocm() && params_.seq_len == 1 &&
+                debugEnv().rocm.moe_grouped_decode && debugEnv().rocm.moe_device_routed_decode)
+            {
+                moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank() ||
+                                                 initializeMoERuntimeTableForGroupedDecode();
+            }
+            else
+            {
+                moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank();
+            }
+        }
     }
 
     bool MoEExpertComputeStage::validatePreparedWeights(std::string *error) const
@@ -228,6 +242,7 @@ namespace llaminar2
             grouped_down_desc_table_num_experts_ = 0;
             grouped_down_desc_table_d_model_ = 0;
             grouped_down_desc_table_intermediate_ = 0;
+            moe_runtime_table_initialized_ = false;
         }
         return ok;
     }
@@ -246,6 +261,7 @@ namespace llaminar2
         grouped_down_desc_table_num_experts_ = 0;
         grouped_down_desc_table_d_model_ = 0;
         grouped_down_desc_table_intermediate_ = 0;
+        moe_runtime_table_initialized_ = false;
     }
 
     MoEWeightContext MoEExpertComputeStage::buildWeightContext()
@@ -295,9 +311,9 @@ namespace llaminar2
             return false;
         }
 
-        if (!params_.input || !params_.routing_indices || !params_.routing_weights || !params_.output)
+        if (!params_.input || !params_.output)
         {
-            LOG_ERROR("[MoEExpertComputeStage] Null input/routing_indices/routing_weights/output tensor");
+            LOG_ERROR("[MoEExpertComputeStage] Null input/output tensor");
             return false;
         }
 
@@ -323,6 +339,12 @@ namespace llaminar2
         if (params_.seq_len == 1)
         {
             return executeSingleToken(ctx);
+        }
+
+        if (!params_.routing_indices || !params_.routing_weights)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Null routing_indices or routing_weights");
+            return false;
         }
 
         const int seq_len = params_.seq_len;
@@ -685,11 +707,6 @@ namespace llaminar2
             return false;
         }
 
-        if (!params_.routing_indices || !params_.routing_weights)
-        {
-            LOG_ERROR("[MoEExpertComputeStage] Null routing_indices or routing_weights (single-token)");
-            return false;
-        }
         IMoEKernel *kernel = ensureMoEKernel();
 
         // Zero output via tensor-aware kernel (works for both CPU and GPU)
@@ -724,14 +741,27 @@ namespace llaminar2
         // Use input tensor directly (no gather needed for 1 token)
         const TensorBase *input_tensor = params_.input;
 
-        const bool expert_mask_all_enabled = params_.expert_mask.empty() ||
-                                             std::all_of(params_.expert_mask.begin(), params_.expert_mask.end(),
-                                                         [](bool enabled)
-                                                         { return enabled; });
+        if (params_.device_id.is_rocm() && params_.moe_runtime_table && params_.layer_idx >= 0 && !moe_runtime_layer_)
+            moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+        if (params_.device_id.is_rocm() && !moe_runtime_table_initialized_ &&
+            debugEnv().rocm.moe_grouped_decode && debugEnv().rocm.moe_device_routed_decode)
+        {
+            moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank() ||
+                                             initializeMoERuntimeTableForGroupedDecode();
+        }
+
         const bool can_try_device_routed_decode =
-            is_gpu && debugEnv().rocm.moe_grouped_decode && debugEnv().rocm.moe_device_routed_decode &&
-            top_k > 0 && top_k <= 16 && local_start == 0 && local_count == num_experts &&
-            params_.replica_set.num_replicated == 0 && expert_mask_all_enabled;
+            params_.device_id.is_rocm() &&
+            debugEnv().rocm.moe_grouped_decode &&
+            debugEnv().rocm.moe_device_routed_decode &&
+            params_.moe_runtime_table &&
+            moe_runtime_layer_ &&
+            moe_runtime_table_initialized_ &&
+            runtimeTableHasActiveGroupedDecodeBank() &&
+            top_k > 0 && top_k <= 16 &&
+            params_.replica_set.num_replicated == 0 &&
+            hasFullLocalExpertOwnership() &&
+            expertMaskAllEnabled();
 
         if (can_try_device_routed_decode)
         {
@@ -770,9 +800,9 @@ namespace llaminar2
                     up_outputs[k] = scratch_up_batch_[k].get();
                 }
 
-                const bool gateup_done = kernel->groupedExpertGateUpDecodeFromRouting(
+                const bool gateup_done = kernel->groupedExpertGateUpDecodeFromRuntime(
+                    moe_runtime_layer_,
                     input_tensor,
-                    params_.routing_indices,
                     grouped_gateup_desc_table_id_,
                     top_k,
                     gate_outputs,
@@ -782,11 +812,10 @@ namespace llaminar2
 
                 if (gateup_done)
                 {
-                    device_routed_done = kernel->groupedExpertDownDecodeFromRouting(
+                    device_routed_done = kernel->groupedExpertDownDecodeFromRuntime(
                         gate_outputs,
                         up_outputs,
-                        params_.routing_indices,
-                        params_.routing_weights,
+                        moe_runtime_layer_,
                         grouped_down_desc_table_id_,
                         top_k,
                         params_.output,
@@ -816,7 +845,12 @@ namespace llaminar2
             kernel->zeroBuffer(params_.output, static_cast<size_t>(d_model) * sizeof(float));
         }
 
-        // Host-routed fallback: materialize pre-computed top-k results from MoERoutingStage.
+        if (!params_.routing_indices || !params_.routing_weights)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Null routing_indices or routing_weights (single-token)");
+            return false;
+        }
+
         const float *routing_idx_data = params_.routing_indices->data();
         const float *routing_wt_data = params_.routing_weights->data();
 
@@ -918,60 +952,17 @@ namespace llaminar2
             num_active++;
         }
 
-        // Single-token ROCm grouped gate/up: quantize once, then compute all
-        // active experts from persistent native-VNNI descriptor tables.
+        // Single fused call: quantize once + single OMP region for all gate+up
         if (num_active > 0)
         {
-            bool grouped_gateup_done = false;
-            if (is_gpu && debugEnv().rocm.moe_grouped_decode && num_active <= 16)
+            if (!batch_projections_[0].kernel->multiply_fused_tensor(
+                    input_tensor, batch_projections_, /*m=*/1, d_model))
             {
-                ITensor *gate_outputs[16] = {};
-                ITensor *up_outputs[16] = {};
-                int grouped_expert_ids[16] = {};
-
-                for (int i = 0; i < num_active; ++i)
-                {
-                    const auto &info = active_experts[i];
-                    gate_outputs[i] = scratch_gate_batch_[info.batch_idx].get();
-                    up_outputs[i] = scratch_up_batch_[info.batch_idx].get();
-                    grouped_expert_ids[i] = info.expert_id;
-                }
-
-                if (ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate))
-                {
-                    grouped_gateup_done = kernel->groupedExpertGateUpDecodeFromTable(
-                        input_tensor,
-                        grouped_expert_ids,
-                        grouped_gateup_desc_table_id_,
-                        num_active,
-                        gate_outputs,
-                        up_outputs,
-                        d_model,
-                        intermediate);
-                    if (!grouped_gateup_done)
-                    {
-                        LOG_DEBUG("[MoEExpertComputeStage] Grouped ROCm decode gate/up path unavailable for layer "
-                                  << params_.layer_idx << "; using multiply_fused_tensor fallback");
-                    }
-                }
+                LOG_ERROR("[MoEExpertComputeStage] Decode gate/up batched projection failed for layer "
+                          << params_.layer_idx);
+                return false;
             }
-
-            if (!grouped_gateup_done)
-            {
-                if (!batch_projections_[0].kernel->multiply_fused_tensor(
-                        input_tensor, batch_projections_, /*m=*/1, d_model))
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] Decode gate/up batched projection failed for layer "
-                              << params_.layer_idx);
-                    return false;
-                }
-                if (is_gpu)
-                {
-                    for (const auto &projection : batch_projections_)
-                        markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
-                }
-            }
-            else if (is_gpu)
+            if (is_gpu)
             {
                 for (const auto &projection : batch_projections_)
                     markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
@@ -996,6 +987,8 @@ namespace llaminar2
                 ITensor *up_tensors[16] = {};
                 int grouped_expert_ids[16] = {};
                 float grouped_weights[16] = {};
+                DeviceNativeVNNIMatrixDesc down_descs[16] = {};
+                bool grouped_supported = true;
 
                 for (int i = 0; i < num_active; ++i)
                 {
@@ -1008,20 +1001,29 @@ namespace llaminar2
                         MPI_Abort(MPI_COMM_WORLD, 1);
                     }
 
+                    DeviceNativeVNNIMatrixDesc desc;
+                    if (!down_gemm->exportNativeVNNIMatrixDesc(desc) ||
+                        desc.n != d_model || desc.k != intermediate)
+                    {
+                        grouped_supported = false;
+                        break;
+                    }
+
                     gate_tensors[i] = scratch_gate_batch_[info.batch_idx].get();
                     up_tensors[i] = scratch_up_batch_[info.batch_idx].get();
                     grouped_expert_ids[i] = info.expert_id;
                     grouped_weights[i] = info.weight;
+                    down_descs[i] = desc;
                 }
 
-                if (ensureGroupedDownDescriptorTable(kernel, d_model, intermediate))
+                if (grouped_supported)
                 {
-                    grouped_down_done = kernel->groupedExpertDownDecodeFromTable(
+                    grouped_down_done = kernel->groupedExpertDownDecode(
                         gate_tensors,
                         up_tensors,
                         grouped_expert_ids,
                         grouped_weights,
-                        grouped_down_desc_table_id_,
+                        down_descs,
                         num_active,
                         params_.output,
                         d_model,
@@ -1328,15 +1330,6 @@ namespace llaminar2
             auto ctx = buildWeightContext();
             if (!MoEExpertWeightService::registerAndPrepareNewExperts(ctx, needed, &provider_payloads))
                 return false;
-
-            grouped_gateup_desc_table_id_ = -1;
-            grouped_gateup_desc_table_num_experts_ = 0;
-            grouped_gateup_desc_table_d_model_ = 0;
-            grouped_gateup_desc_table_intermediate_ = 0;
-            grouped_down_desc_table_id_ = -1;
-            grouped_down_desc_table_num_experts_ = 0;
-            grouped_down_desc_table_d_model_ = 0;
-            grouped_down_desc_table_intermediate_ = 0;
         }
 
         cached_gate_gemm_ = params_.prepared_gate_gemm;
@@ -1387,22 +1380,23 @@ namespace llaminar2
             return true;
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(params_.num_experts);
-        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(params_.num_experts);
+        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(params_.num_experts));
+        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(static_cast<size_t>(params_.num_experts));
         int valid_descs = 0;
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
             if (cached_gate_gemm_.size() <= static_cast<size_t>(expert_id) ||
                 cached_up_gemm_.size() <= static_cast<size_t>(expert_id) ||
-                !cached_gate_gemm_[expert_id] || !cached_up_gemm_[expert_id])
+                !cached_gate_gemm_[static_cast<size_t>(expert_id)] ||
+                !cached_up_gemm_[static_cast<size_t>(expert_id)])
             {
                 continue;
             }
 
             DeviceNativeVNNIMatrixDesc gate_desc;
             DeviceNativeVNNIMatrixDesc up_desc;
-            if (!cached_gate_gemm_[expert_id]->exportNativeVNNIMatrixDesc(gate_desc) ||
-                !cached_up_gemm_[expert_id]->exportNativeVNNIMatrixDesc(up_desc) ||
+            if (!cached_gate_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(gate_desc) ||
+                !cached_up_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(up_desc) ||
                 gate_desc.n != intermediate || gate_desc.k != d_model ||
                 up_desc.n != intermediate || up_desc.k != d_model)
             {
@@ -1411,8 +1405,8 @@ namespace llaminar2
                 return false;
             }
 
-            gate_descs[expert_id] = gate_desc;
-            up_descs[expert_id] = up_desc;
+            gate_descs[static_cast<size_t>(expert_id)] = gate_desc;
+            up_descs[static_cast<size_t>(expert_id)] = up_desc;
             ++valid_descs;
         }
 
@@ -1445,18 +1439,18 @@ namespace llaminar2
             return true;
         }
 
-        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(params_.num_experts);
+        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(params_.num_experts));
         int valid_descs = 0;
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
             if (cached_down_gemm_.size() <= static_cast<size_t>(expert_id) ||
-                !cached_down_gemm_[expert_id])
+                !cached_down_gemm_[static_cast<size_t>(expert_id)])
             {
                 continue;
             }
 
             DeviceNativeVNNIMatrixDesc desc;
-            if (!cached_down_gemm_[expert_id]->exportNativeVNNIMatrixDesc(desc) ||
+            if (!cached_down_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc) ||
                 desc.n != d_model || desc.k != intermediate)
             {
                 LOG_DEBUG("[MoEExpertComputeStage] Unable to export grouped down descriptor for expert "
@@ -1464,7 +1458,7 @@ namespace llaminar2
                 return false;
             }
 
-            down_descs[expert_id] = desc;
+            down_descs[static_cast<size_t>(expert_id)] = desc;
             ++valid_descs;
         }
 
@@ -1481,6 +1475,241 @@ namespace llaminar2
         grouped_down_desc_table_d_model_ = d_model;
         grouped_down_desc_table_intermediate_ = intermediate;
         return true;
+    }
+
+    bool MoEExpertComputeStage::initializeMoERuntimeTableForGroupedDecode()
+    {
+        if (!params_.moe_runtime_table || params_.layer_idx < 0 ||
+            params_.num_experts <= 0 || params_.top_k <= 0 ||
+            !params_.device_id.is_rocm())
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!moe_runtime_layer_)
+                moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+            if (runtimeTableHasActiveGroupedDecodeBank())
+                return true;
+
+            const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+            if (state.active_epoch != 0)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Invalid active MoE runtime decode bank for layer "
+                          << params_.layer_idx << "; refusing to overwrite non-zero epoch "
+                          << state.active_epoch);
+                return false;
+            }
+
+            if (!hasFullLocalExpertOwnership() || !expertMaskAllEnabled())
+                return false;
+
+            if (static_cast<int>(all_expert_ids_.size()) != params_.num_experts)
+            {
+                all_expert_ids_.resize(static_cast<size_t>(params_.num_experts));
+                std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
+            }
+            if (!ensureGemmEnginesForExperts(all_expert_ids_))
+                return false;
+
+            MoEPlacementUpdate update;
+            update.epoch = 1;
+            update.expert_count = static_cast<uint32_t>(params_.num_experts);
+            update.experts.resize(static_cast<size_t>(params_.num_experts));
+            update.local_compute_mask.assign(static_cast<size_t>(params_.num_experts), 1u);
+            update.replica_role.assign(static_cast<size_t>(params_.num_experts),
+                                       static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+
+            const uint32_t local_flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                                          DeviceMoEExpertFlags::Resident |
+                                                          DeviceMoEExpertFlags::PreferredOwner |
+                                                          DeviceMoEExpertFlags::LocalCompute);
+
+            for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+            {
+                DeviceMoEExpertDescriptor desc;
+                if (!cached_gate_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.gate) ||
+                    !cached_up_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.up) ||
+                    !cached_down_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.down))
+                {
+                    LOG_DEBUG("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
+                              << params_.layer_idx << " expert " << expert_id
+                              << ": prepared GEMM engines did not export native-VNNI descriptors");
+                    return false;
+                }
+
+                desc.logical_expert_id = expert_id;
+                desc.owner_participant = 0;
+                desc.local_slot = expert_id;
+                desc.flags = local_flags;
+                update.experts[static_cast<size_t>(expert_id)] = desc;
+            }
+
+            params_.moe_runtime_table->prepareInactiveBank(params_.layer_idx, update);
+            params_.moe_runtime_table->flipActiveBank(params_.layer_idx, update.epoch, gpuStream());
+            moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+            return runtimeTableHasActiveGroupedDecodeBank();
+        }
+        catch (const std::exception &ex)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Failed to initialize MoE runtime decode bank for layer "
+                      << params_.layer_idx << ": " << ex.what());
+            return false;
+        }
+    }
+
+    bool MoEExpertComputeStage::initializeMoERuntimeTableForGroupedPrefill()
+    {
+        return false;
+    }
+
+    bool MoEExpertComputeStage::initializeFixedTopologyGroupedPrefill()
+    {
+        return false;
+    }
+
+    bool MoEExpertComputeStage::runtimeTableHasActiveGroupedDecodeBank() const
+    {
+        const DeviceMoEPlacementBank *bank = activeRuntimePlacementBank();
+        if (!bank || !moe_runtime_layer_)
+            return false;
+
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            const auto mask = bank->local_compute_mask[static_cast<size_t>(expert_id)];
+            if (mask != 1u)
+                return false;
+
+            const auto &expert = bank->experts[static_cast<size_t>(expert_id)];
+            if (expert.logical_expert_id != expert_id ||
+                expert.local_slot < 0 ||
+                !expert.gate.valid() ||
+                !expert.up.valid() ||
+                !expert.down.valid() ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Valid) ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Resident) ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::LocalCompute))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool MoEExpertComputeStage::canUseRuntimePrefillGrouping() const
+    {
+        return false;
+    }
+
+    bool MoEExpertComputeStage::canUseFixedTopologyGroupedPrefill() const
+    {
+        return false;
+    }
+
+    bool MoEExpertComputeStage::executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const
+    {
+        (void)kernel;
+        (void)max_tokens;
+        return false;
+    }
+
+    bool MoEExpertComputeStage::isDeviceRoutedDecodeGraphCapturable() const
+    {
+        return false;
+    }
+
+    bool MoEExpertComputeStage::isFixedTopologyPrefillGraphCapturable() const
+    {
+        return false;
+    }
+
+    bool MoEExpertComputeStage::hasFullLocalExpertOwnership() const
+    {
+        const int local_count = params_.local_expert_count < 0 ? params_.num_experts : params_.local_expert_count;
+        return params_.local_expert_start == 0 && local_count == params_.num_experts;
+    }
+
+    bool MoEExpertComputeStage::expertMaskAllEnabled() const
+    {
+        return params_.expert_mask.empty() ||
+               (params_.expert_mask.size() == static_cast<size_t>(params_.num_experts) &&
+                std::all_of(params_.expert_mask.begin(), params_.expert_mask.end(),
+                            [](bool enabled)
+                            { return enabled; }));
+    }
+
+    bool MoEExpertComputeStage::hasAllPreparedExpertGemmEngines() const
+    {
+        if (params_.prepared_gate_gemm.size() != static_cast<size_t>(params_.num_experts) ||
+            params_.prepared_up_gemm.size() != static_cast<size_t>(params_.num_experts) ||
+            params_.prepared_down_gemm.size() != static_cast<size_t>(params_.num_experts))
+        {
+            return false;
+        }
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)] ||
+                !params_.prepared_up_gemm[static_cast<size_t>(expert_id)] ||
+                !params_.prepared_down_gemm[static_cast<size_t>(expert_id)])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool MoEExpertComputeStage::hasGroupedDecodeDescriptorExportSupport() const
+    {
+        if (!hasAllPreparedExpertGemmEngines())
+            return false;
+
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            DeviceNativeVNNIMatrixDesc gate;
+            DeviceNativeVNNIMatrixDesc up;
+            DeviceNativeVNNIMatrixDesc down;
+            if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(gate) ||
+                !params_.prepared_up_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(up) ||
+                !params_.prepared_down_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(down) ||
+                gate.n != params_.expert_intermediate || gate.k != params_.d_model ||
+                up.n != params_.expert_intermediate || up.k != params_.d_model ||
+                down.n != params_.d_model || down.k != params_.expert_intermediate)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    const DeviceMoEPlacementBank *MoEExpertComputeStage::activeRuntimePlacementBank() const
+    {
+        if (!params_.moe_runtime_table || params_.layer_idx < 0 || params_.num_experts <= 0)
+            return nullptr;
+
+        const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+        if (state.active_bank > 1 ||
+            state.active_epoch == 0 ||
+            state.expert_count != static_cast<uint32_t>(params_.num_experts) ||
+            state.top_k != static_cast<uint32_t>(params_.top_k))
+        {
+            return nullptr;
+        }
+
+        const auto &bank = state.banks[state.active_bank];
+        if (bank.epoch != state.active_epoch ||
+            bank.expert_count != static_cast<uint32_t>(params_.num_experts))
+        {
+            return nullptr;
+        }
+        return &bank;
+    }
+
+    bool MoEExpertComputeStage::runtimeLocalComputeEnabled(const DeviceMoEPlacementBank *bank, int expert_id) const
+    {
+        if (!bank || expert_id < 0 || expert_id >= params_.num_experts)
+            return false;
+        return bank->local_compute_mask[static_cast<size_t>(expert_id)] != 0u;
     }
 
     // =========================================================================
@@ -1578,6 +1807,11 @@ namespace llaminar2
         default:
             return false;
         }
+    }
+
+    bool MoEExpertComputeStage::isGraphCapturable() const
+    {
+        return false;
     }
 
     StageBufferRequirements MoEExpertComputeStage::getBufferRequirements() const
