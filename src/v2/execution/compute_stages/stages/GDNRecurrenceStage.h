@@ -97,9 +97,9 @@ namespace llaminar2
             ITensorGatedDeltaNet *kernel = nullptr;
 
             // Optional BufferIds for contract-based coherence
-            std::optional<BufferId> qkv_buffer_id;    ///< Arena: merged QKV tensor
-            std::optional<BufferId> alpha_buffer_id;  ///< Arena: alpha projection
-            std::optional<BufferId> beta_buffer_id;   ///< Arena: beta projection
+            std::optional<BufferId> qkv_buffer_id;   ///< Arena: merged QKV tensor
+            std::optional<BufferId> alpha_buffer_id; ///< Arena: alpha projection
+            std::optional<BufferId> beta_buffer_id;  ///< Arena: beta projection
             std::optional<BufferId> output_buffer_id;
         };
 
@@ -123,8 +123,8 @@ namespace llaminar2
         }
         bool hasDynamicParams() const override { return true; }
 
-        // GDN recurrence operates fully on-device when GPU is active — graph-capturable
-        bool isGraphCapturable() const override { return true; }
+        // HIP graph capture currently rejects the recurrent state update path.
+        bool isGraphCapturable() const override { return false; }
 
         const Params &getParams() const { return params_; }
 

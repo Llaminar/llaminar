@@ -1228,7 +1228,7 @@ namespace llaminar2
                 {
                     for (const auto &gpu : rank_inv.gpus)
                     {
-                        if (gpu.local_device_id == device.ordinal)
+                        if (gpu.type == device.type && gpu.local_device_id == device.ordinal)
                         {
                             memory.first = gpu.memory_bytes;
                             memory.second = gpu.free_memory_bytes;

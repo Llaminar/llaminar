@@ -23,12 +23,48 @@
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
 // =========================================================================
-// Kernel 1: Gate Logits — REMOVED
+// Kernel 1: Single-token Gate Logits
 //
-// Gate logits GEMM is now performed by HipBLASGemmKernel (hipblasSgemm)
-// which is far more optimized than a hand-written dot-product kernel.
-// See ROCmMoEKernel::route() in ROCmMoEKernel.cpp.
+// Decode routes one token at a time. hipBLAS is efficient for prefill GEMM but
+// pays too much fixed overhead for a 1 x d_model by num_experts router GEMV.
+// This path computes one expert logit per block and feeds the existing
+// softmax/top-k kernel.
 // =========================================================================
+
+__global__ void rocm_moe_gate_logits_single_token_kernel(
+    const float *__restrict__ hidden,       // [d_model]
+    const float *__restrict__ gate_weights, // [num_experts, d_model]
+    float *__restrict__ logits,             // [num_experts]
+    int d_model, int num_experts)
+{
+    const int expert = blockIdx.x;
+    if (expert >= num_experts) return;
+
+    const float *w = gate_weights + expert * d_model;
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+    {
+        sum += hidden[i] * w[i];
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int nw = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < nw) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            sum += __shfl_down(sum, offset);
+        if (lane == 0) logits[expert] = sum;
+    }
+}
 
 // =========================================================================
 // Kernel 2: Row-wise Softmax + Top-K Selection
@@ -345,6 +381,28 @@ __global__ void rocm_moe_weighted_add_kernel(
 
 extern "C"
 {
+
+bool hipMoE_gate_logits_single_token(
+    const float *hidden, const float *gate_weights, float *logits,
+    int d_model, int num_experts,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_single_token_kernel,
+        dim3(num_experts), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        hidden, gate_weights, logits, d_model, num_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE gate_logits_single_token kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
 
 bool hipMoE_softmax_topk(
     float *logits,

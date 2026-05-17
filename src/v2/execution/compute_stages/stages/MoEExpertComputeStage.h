@@ -219,6 +219,7 @@ namespace llaminar2
         void applyExpertMask(const std::vector<bool> &new_mask);
 
         bool supportsBackend(ComputeBackendType backend) const override;
+        bool isGraphCapturable() const override { return false; }
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;

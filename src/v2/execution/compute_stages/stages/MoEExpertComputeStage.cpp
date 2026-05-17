@@ -255,7 +255,7 @@ namespace llaminar2
     {
         if (!moe_kernel_)
             moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
-        return moe_kernel_;
+        return bindStageStream(moe_kernel_);
     }
 
     bool MoEExpertComputeStage::execute(IDeviceContext *ctx)
@@ -1125,11 +1125,15 @@ namespace llaminar2
 
         auto bind_if_needed = [this](ITensorGemm *gemm)
         {
-            if (!bound_workspace_ || !gemm)
+            if (!gemm)
                 return;
-            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
-            if (consumer && !consumer->hasWorkspace())
-                consumer->bindWorkspace(bound_workspace_);
+            gemm->setGPUStream(gpuStream());
+            if (bound_workspace_)
+            {
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+                if (consumer && !consumer->hasWorkspace())
+                    consumer->bindWorkspace(bound_workspace_);
+            }
         };
 
         for (int expert_id : expert_ids)
@@ -1461,11 +1465,15 @@ namespace llaminar2
 
         auto bind_if_needed = [this](ITensorGemm *gemm)
         {
-            if (!bound_workspace_ || !gemm)
+            if (!gemm)
                 return;
-            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
-            if (consumer && !consumer->hasWorkspace())
-                consumer->bindWorkspace(bound_workspace_);
+            gemm->setGPUStream(gpuStream());
+            if (bound_workspace_)
+            {
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+                if (consumer && !consumer->hasWorkspace())
+                    consumer->bindWorkspace(bound_workspace_);
+            }
         };
         bind_if_needed(cached_gate_gemm_);
         bind_if_needed(cached_up_gemm_);
@@ -1497,6 +1505,9 @@ namespace llaminar2
             LOG_ERROR("[SharedExpertFFNStage] Missing shared expert GEMM engine");
             return false;
         }
+        cached_gate_gemm_->setGPUStream(gpuStream());
+        cached_up_gemm_->setGPUStream(gpuStream());
+        cached_down_gemm_->setGPUStream(gpuStream());
 
         // Ensure scratch buffers are large enough
         if (seq_len > scratch_seq_len_)
@@ -1538,7 +1549,7 @@ namespace llaminar2
     {
         if (!moe_kernel_)
             moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
-        return moe_kernel_;
+        return bindStageStream(moe_kernel_);
     }
 
     size_t SharedExpertFFNStage::estimatedFlops() const
@@ -1719,7 +1730,7 @@ namespace llaminar2
     {
         if (!moe_kernel_)
             moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
-        return moe_kernel_;
+        return bindStageStream(moe_kernel_);
     }
 
     size_t SharedExpertGateStage::estimatedFlops() const

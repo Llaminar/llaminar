@@ -191,6 +191,8 @@ namespace llaminar2
         void syncBlasStream();
         void allocateHistogramBuffers(int num_layers, int num_experts);
         void ensureStagingCapacity(int count);
+        bool ensureSharedGateScratchCapacity(int seq_len);
+        bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
 
         /// Core GPU routing: gate logits GEMM + softmax + top-k.
         /// Returns device buffers (caller must D2H and hipFree).
@@ -223,6 +225,17 @@ namespace llaminar2
         int *d_staging_indices_ = nullptr;   ///< [staging_capacity_] ints on device
         float *d_staging_weights_ = nullptr; ///< [staging_capacity_] floats on device
         int staging_capacity_ = 0;
+
+        // Reusable scratch for sharedExpertGate() gate values.
+        float *d_shared_gate_scratch_ = nullptr; ///< [shared_gate_scratch_capacity_] floats on device
+        int shared_gate_scratch_capacity_ = 0;
+
+        // Reusable routing buffers for routeCore().
+        float *d_route_logits_ = nullptr;  ///< [route_logits_capacity_] floats on device
+        int *d_route_indices_ = nullptr;   ///< [route_topk_capacity_] ints on device
+        float *d_route_weights_ = nullptr; ///< [route_topk_capacity_] floats on device
+        size_t route_logits_capacity_ = 0;
+        size_t route_topk_capacity_ = 0;
 
         // Phase 4: GPU-side expert grouping state (for prepareExpertGroups)
         int *d_group_int_indices_ = nullptr;   ///< float→int converted routing indices

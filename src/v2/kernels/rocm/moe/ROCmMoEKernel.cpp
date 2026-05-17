@@ -36,6 +36,11 @@ namespace
 // Forward-declare extern "C" bridge functions (defined in ROCmMoEKernels.hip)
 extern "C"
 {
+    bool hipMoE_gate_logits_single_token(
+        const float *hidden, const float *gate_weights, float *logits,
+        int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool hipMoE_softmax_topk(
         float *logits,
         int *expert_indices, float *expert_weights,
@@ -163,6 +168,26 @@ namespace llaminar2
             hipFree(d_staging_weights_);
             d_staging_weights_ = nullptr;
         }
+        if (d_shared_gate_scratch_)
+        {
+            hipFree(d_shared_gate_scratch_);
+            d_shared_gate_scratch_ = nullptr;
+        }
+        if (d_route_logits_)
+        {
+            hipFree(d_route_logits_);
+            d_route_logits_ = nullptr;
+        }
+        if (d_route_indices_)
+        {
+            hipFree(d_route_indices_);
+            d_route_indices_ = nullptr;
+        }
+        if (d_route_weights_)
+        {
+            hipFree(d_route_weights_);
+            d_route_weights_ = nullptr;
+        }
     }
 
     void ROCmMoEKernel::syncBlasStream()
@@ -171,9 +196,122 @@ namespace llaminar2
             blas_gemm_->setStream(ROCmKernelBase::getStream());
     }
 
+    bool ROCmMoEKernel::ensureSharedGateScratchCapacity(int seq_len)
+    {
+        if (seq_len <= shared_gate_scratch_capacity_)
+            return true;
+
+        if (!setMoEDevice(device_ordinal_, "ensureSharedGateScratchCapacity"))
+            return false;
+
+        if (d_shared_gate_scratch_)
+        {
+            hipError_t free_err = hipFree(d_shared_gate_scratch_);
+            if (free_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::ensureSharedGateScratchCapacity] hipFree failed: "
+                          << hipGetErrorString(free_err));
+                return false;
+            }
+            d_shared_gate_scratch_ = nullptr;
+            shared_gate_scratch_capacity_ = 0;
+        }
+
+        hipError_t err = hipMalloc(&d_shared_gate_scratch_, static_cast<size_t>(seq_len) * sizeof(float));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::ensureSharedGateScratchCapacity] hipMalloc scratch failed: "
+                      << hipGetErrorString(err));
+            d_shared_gate_scratch_ = nullptr;
+            return false;
+        }
+
+        shared_gate_scratch_capacity_ = seq_len;
+        return true;
+    }
+
+    bool ROCmMoEKernel::ensureRouteBufferCapacity(size_t logits_count, size_t topk_count)
+    {
+        if (!setMoEDevice(device_ordinal_, "ensureRouteBufferCapacity"))
+            return false;
+
+        if (logits_count > route_logits_capacity_)
+        {
+            if (d_route_logits_)
+            {
+                hipError_t free_err = hipFree(d_route_logits_);
+                if (free_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipFree logits failed: "
+                              << hipGetErrorString(free_err));
+                    return false;
+                }
+            }
+
+            hipError_t err = hipMalloc(&d_route_logits_, logits_count * sizeof(float));
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipMalloc logits failed: "
+                          << hipGetErrorString(err));
+                d_route_logits_ = nullptr;
+                route_logits_capacity_ = 0;
+                return false;
+            }
+            route_logits_capacity_ = logits_count;
+        }
+
+        if (topk_count > route_topk_capacity_)
+        {
+            if (d_route_indices_)
+            {
+                hipError_t free_err = hipFree(d_route_indices_);
+                if (free_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipFree indices failed: "
+                              << hipGetErrorString(free_err));
+                    return false;
+                }
+            }
+            if (d_route_weights_)
+            {
+                hipError_t free_err = hipFree(d_route_weights_);
+                if (free_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipFree weights failed: "
+                              << hipGetErrorString(free_err));
+                    return false;
+                }
+            }
+
+            hipError_t err = hipMalloc(&d_route_indices_, topk_count * sizeof(int));
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipMalloc indices failed: "
+                          << hipGetErrorString(err));
+                d_route_indices_ = nullptr;
+                route_topk_capacity_ = 0;
+                return false;
+            }
+            err = hipMalloc(&d_route_weights_, topk_count * sizeof(float));
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipMalloc weights failed: "
+                          << hipGetErrorString(err));
+                hipFree(d_route_indices_);
+                d_route_indices_ = nullptr;
+                d_route_weights_ = nullptr;
+                route_topk_capacity_ = 0;
+                return false;
+            }
+            route_topk_capacity_ = topk_count;
+        }
+
+        return d_route_logits_ && d_route_indices_ && d_route_weights_;
+    }
+
     // =========================================================================
     // routeCore() — Shared GPU routing logic: gate GEMM + softmax + top-k.
-    // Returns device buffers; caller is responsible for D2H and hipFree.
+    // Returns pointers into persistent device buffers owned by this kernel.
     // =========================================================================
 
     bool ROCmMoEKernel::routeCore(
@@ -184,43 +322,30 @@ namespace llaminar2
         bufs.logits_count = static_cast<size_t>(seq_len) * num_experts;
         bufs.topk_count = static_cast<size_t>(seq_len) * top_k;
 
-        hipError_t err;
-        err = hipMalloc(&bufs.d_logits, bufs.logits_count * sizeof(float));
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::routeCore] hipMalloc d_logits failed: " << hipGetErrorString(err));
+        if (!ensureRouteBufferCapacity(bufs.logits_count, bufs.topk_count))
             return false;
-        }
 
-        err = hipMalloc(&bufs.d_indices, bufs.topk_count * sizeof(int));
-        if (err != hipSuccess)
+        bufs.d_logits = d_route_logits_;
+        bufs.d_indices = d_route_indices_;
+        bufs.d_weights = d_route_weights_;
+
+        const bool decode_single_token = (seq_len == 1);
+        if (decode_single_token)
         {
-            hipFree(bufs.d_logits);
-            bufs.d_logits = nullptr;
-            LOG_ERROR("[ROCmMoEKernel::routeCore] hipMalloc d_indices failed: " << hipGetErrorString(err));
-            return false;
+            if (!hipMoE_gate_logits_single_token(hidden, gate_weights, bufs.d_logits,
+                                                 d_model, num_experts,
+                                                 device_ordinal_, getStream()))
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeCore] single-token gate logits kernel failed");
+                bufs = {};
+                return false;
+            }
         }
-
-        err = hipMalloc(&bufs.d_weights, bufs.topk_count * sizeof(float));
-        if (err != hipSuccess)
-        {
-            hipFree(bufs.d_logits);
-            hipFree(bufs.d_indices);
-            bufs.d_logits = nullptr;
-            bufs.d_indices = nullptr;
-            LOG_ERROR("[ROCmMoEKernel::routeCore] hipMalloc d_weights failed: " << hipGetErrorString(err));
-            return false;
-        }
-
-        // Gate logits via hipBLAS GEMM
-        if (!blas_gemm_->execute(hidden, gate_weights, bufs.d_logits,
-                                 seq_len, num_experts, d_model,
-                                 /*transA=*/false, /*transB=*/true))
+        else if (!blas_gemm_->execute(hidden, gate_weights, bufs.d_logits,
+                                      seq_len, num_experts, d_model,
+                                      /*transA=*/false, /*transB=*/true))
         {
             LOG_ERROR("[ROCmMoEKernel::routeCore] hipBLAS gate logits GEMM failed");
-            hipFree(bufs.d_logits);
-            hipFree(bufs.d_indices);
-            hipFree(bufs.d_weights);
             bufs = {};
             return false;
         }
@@ -231,9 +356,6 @@ namespace llaminar2
                                  normalize_weights,
                                  device_ordinal_, getStream()))
         {
-            hipFree(bufs.d_logits);
-            hipFree(bufs.d_indices);
-            hipFree(bufs.d_weights);
             bufs = {};
             return false;
         }
@@ -274,9 +396,6 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::route] D2H logits failed: " << hipGetErrorString(err));
-            hipFree(bufs.d_logits);
-            hipFree(bufs.d_indices);
-            hipFree(bufs.d_weights);
             return false;
         }
 
@@ -286,9 +405,6 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::route] D2H indices failed: " << hipGetErrorString(err));
-            hipFree(bufs.d_logits);
-            hipFree(bufs.d_indices);
-            hipFree(bufs.d_weights);
             return false;
         }
 
@@ -298,16 +414,10 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::route] D2H weights failed: " << hipGetErrorString(err));
-            hipFree(bufs.d_logits);
-            hipFree(bufs.d_indices);
-            hipFree(bufs.d_weights);
             return false;
         }
 
         hipStreamSynchronize(stream);
-        hipFree(bufs.d_logits);
-        hipFree(bufs.d_indices);
-        hipFree(bufs.d_weights);
         return true;
     }
 
@@ -376,24 +486,15 @@ namespace llaminar2
         if (seq_len <= 0)
             return;
 
-        // Small scratch for per-token gate values
-        float *d_gate_scratch = nullptr;
-        hipError_t err = hipMalloc(&d_gate_scratch, seq_len * sizeof(float));
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::sharedExpertGate] hipMalloc scratch failed: "
-                      << hipGetErrorString(err));
+        if (!ensureSharedGateScratchCapacity(seq_len))
             return;
-        }
 
-        if (!hipMoE_shared_expert_gate(input, gate_inp, shared_output, d_gate_scratch,
+        if (!hipMoE_shared_expert_gate(input, gate_inp, shared_output, d_shared_gate_scratch_,
                                        seq_len, d_model,
                                        device_ordinal_, getStream()))
         {
             LOG_ERROR("[ROCmMoEKernel::sharedExpertGate] kernel launch failed");
         }
-
-        hipFree(d_gate_scratch);
     }
 
     // =========================================================================
@@ -787,10 +888,27 @@ namespace llaminar2
         if (!d_idx || !d_wt)
         {
             LOG_ERROR("[ROCmMoEKernel::routeWithTensors] output tensors have no device allocation");
-            hipFree(bufs.d_logits);
-            hipFree(bufs.d_indices);
-            hipFree(bufs.d_weights);
             return false;
+        }
+
+        float *h_idx = nullptr;
+        float *h_wt = nullptr;
+        const bool needs_decode_host_topk = (seq_len == 1);
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+        const bool needs_snapshot_host_topk = true;
+#else
+        const bool needs_snapshot_host_topk = false;
+#endif
+        const bool needs_host_topk = needs_decode_host_topk || needs_snapshot_host_topk;
+        if (needs_host_topk)
+        {
+            h_idx = static_cast<float *>(output_indices->raw_mutable_data());
+            h_wt = static_cast<float *>(output_weights->raw_mutable_data());
+            if (!h_idx || !h_wt)
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] output tensors have no host storage");
+                return false;
+            }
         }
 
         // int→float conversion kernel (indices are int on device, tensor stores float)
@@ -804,32 +922,70 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2D weights failed: " << hipGetErrorString(err));
-            hipFree(bufs.d_logits);
-            hipFree(bufs.d_indices);
-            hipFree(bufs.d_weights);
             return false;
         }
 
-        output_indices->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-        output_weights->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        host_result.expert_indices.clear();
+        host_result.expert_weights.clear();
+        host_result.router_logits.clear();
 
-        // D2H for host result (needed by CPU-side expert dispatch loop)
-        host_result.expert_indices.resize(bufs.topk_count);
-        host_result.expert_weights.resize(bufs.topk_count);
+        if (needs_host_topk)
+        {
+            err = hipMemcpyAsync(h_idx, d_idx,
+                                 bufs.topk_count * sizeof(float),
+                                 hipMemcpyDeviceToHost, stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2H decode indices failed: " << hipGetErrorString(err));
+                return false;
+            }
+
+            err = hipMemcpyAsync(h_wt, d_wt,
+                                 bufs.topk_count * sizeof(float),
+                                 hipMemcpyDeviceToHost, stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2H decode weights failed: " << hipGetErrorString(err));
+                return false;
+            }
+        }
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
         host_result.router_logits.resize(bufs.logits_count);
+        err = hipMemcpyAsync(host_result.router_logits.data(), bufs.d_logits,
+                             bufs.logits_count * sizeof(float), hipMemcpyDeviceToHost, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::routeWithTensors] D2H snapshot logits failed: " << hipGetErrorString(err));
+            return false;
+        }
+#endif
 
-        hipMemcpyAsync(host_result.router_logits.data(), bufs.d_logits,
-                       bufs.logits_count * sizeof(float), hipMemcpyDeviceToHost, stream);
-        hipMemcpyAsync(host_result.expert_indices.data(), bufs.d_indices,
-                       bufs.topk_count * sizeof(int), hipMemcpyDeviceToHost, stream);
-        hipMemcpyAsync(host_result.expert_weights.data(), bufs.d_weights,
-                       bufs.topk_count * sizeof(float), hipMemcpyDeviceToHost, stream);
+        if (needs_host_topk || !host_result.router_logits.empty())
+        {
+            err = hipStreamSynchronize(stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::routeWithTensors] stream sync failed after routing D2H: " << hipGetErrorString(err));
+                return false;
+            }
+        }
 
-        hipStreamSynchronize(stream);
+        if (needs_host_topk)
+        {
+            host_result.expert_indices.resize(bufs.topk_count);
+            host_result.expert_weights.assign(h_wt, h_wt + bufs.topk_count);
+            for (size_t i = 0; i < bufs.topk_count; ++i)
+                host_result.expert_indices[i] = static_cast<int>(h_idx[i]);
 
-        hipFree(bufs.d_logits);
-        hipFree(bufs.d_indices);
-        hipFree(bufs.d_weights);
+            output_indices->transitionTo(TensorCoherenceState::SYNCED);
+            output_weights->transitionTo(TensorCoherenceState::SYNCED);
+        }
+        else
+        {
+            output_indices->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            output_weights->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        }
 
         return true;
     }
@@ -842,10 +998,10 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::zeroBuffer] tensor has no device allocation");
             return;
         }
-        hipError_t err = hipMemset(ptr, 0, bytes);
+        hipError_t err = hipMemsetAsync(ptr, 0, bytes, static_cast<hipStream_t>(getStream()));
         if (err != hipSuccess)
         {
-            LOG_ERROR("[ROCmMoEKernel::zeroBuffer] hipMemset failed: " << hipGetErrorString(err));
+            LOG_ERROR("[ROCmMoEKernel::zeroBuffer] hipMemsetAsync failed: " << hipGetErrorString(err));
             return;
         }
         tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);

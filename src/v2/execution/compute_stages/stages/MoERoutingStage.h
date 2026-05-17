@@ -71,6 +71,7 @@ namespace llaminar2
         int layerIndex() const { return params_.layer_idx; }
 
         bool allowsZeroOutput() const override { return false; }
+        bool isGraphCapturable() const override { return false; }
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;

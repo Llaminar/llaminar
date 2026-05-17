@@ -52,7 +52,7 @@ namespace llaminar2
     {
         if (!moe_kernel_)
             moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
-        return moe_kernel_;
+        return bindStageStream(moe_kernel_);
     }
 
     void MoERoutingStage::stashRoutingResults(
