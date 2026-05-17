@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace llaminar2
 {
@@ -116,6 +117,72 @@ namespace llaminar2
         void weightedAddFromTensors(
             ITensor *output, ITensor *input, float weight, int count) override;
 
+        bool groupedExpertDownDecode(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            const int *expert_ids,
+            const float *expert_weights,
+            const DeviceNativeVNNIMatrixDesc *down_descs,
+            int num_active,
+            ITensor *output,
+            int d_model,
+            int intermediate) override;
+
+        int uploadGroupedExpertDownDescriptorTable(
+            const DeviceNativeVNNIMatrixDesc *down_descs,
+            int num_experts,
+            int d_model,
+            int intermediate) override;
+
+        int uploadGroupedExpertGateUpDescriptorTables(
+            const DeviceNativeVNNIMatrixDesc *gate_descs,
+            const DeviceNativeVNNIMatrixDesc *up_descs,
+            int num_experts,
+            int d_model,
+            int intermediate) override;
+
+        bool groupedExpertGateUpDecodeFromTable(
+            const TensorBase *input,
+            const int *expert_ids,
+            int descriptor_table_id,
+            int num_active,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            int d_model,
+            int intermediate) override;
+
+        bool groupedExpertGateUpDecodeFromRouting(
+            const TensorBase *input,
+            ITensor *routing_indices,
+            int descriptor_table_id,
+            int top_k,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            int d_model,
+            int intermediate) override;
+
+        bool groupedExpertDownDecodeFromTable(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            const int *expert_ids,
+            const float *expert_weights,
+            int descriptor_table_id,
+            int num_active,
+            ITensor *output,
+            int d_model,
+            int intermediate) override;
+
+        bool groupedExpertDownDecodeFromRouting(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            int descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate) override;
+
         // =================================================================
         // Phase 2: Device-resident histogram + expert mask
         // =================================================================
@@ -191,6 +258,8 @@ namespace llaminar2
         void syncBlasStream();
         void allocateHistogramBuffers(int num_layers, int num_experts);
         void ensureStagingCapacity(int count);
+        bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
+        bool ensureGroupedGateUpCapacity(int num_active, int d_model);
         bool ensureSharedGateScratchCapacity(int seq_len);
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
 
@@ -207,6 +276,28 @@ namespace llaminar2
         bool routeCore(const float *hidden, const float *gate_weights,
                        int seq_len, int d_model, int num_experts, int top_k,
                        bool normalize_weights, DeviceRouteBuffers &bufs);
+
+        struct GroupedDownDescriptorTable
+        {
+            DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+            std::vector<DeviceNativeVNNIMatrixDesc> host_descs;
+            int num_experts = 0;
+            int d_model = 0;
+            int intermediate = 0;
+            uint8_t codebook_id = 0;
+        };
+
+        struct GroupedGateUpDescriptorTable
+        {
+            DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
+            DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+            std::vector<DeviceNativeVNNIMatrixDesc> host_gate_descs;
+            std::vector<DeviceNativeVNNIMatrixDesc> host_up_descs;
+            int num_experts = 0;
+            int d_model = 0;
+            int intermediate = 0;
+            uint8_t codebook_id = 0;
+        };
 
         int device_ordinal_;
         std::unique_ptr<rocm::HipBLASGemmKernel> blas_gemm_;
@@ -225,6 +316,31 @@ namespace llaminar2
         int *d_staging_indices_ = nullptr;   ///< [staging_capacity_] ints on device
         float *d_staging_weights_ = nullptr; ///< [staging_capacity_] floats on device
         int staging_capacity_ = 0;
+
+        // Grouped decode staging for ROCm native-VNNI MoE down path.
+        const float **d_grouped_gate_ptrs_ = nullptr;
+        const float **d_grouped_up_ptrs_ = nullptr;
+        int *d_grouped_expert_ids_ = nullptr;
+        float *d_grouped_decode_weights_ = nullptr;
+        DeviceNativeVNNIMatrixDesc *d_grouped_down_descs_ = nullptr;
+        int8_t *d_grouped_swiglu_int8_ = nullptr;
+        float *d_grouped_swiglu_scales_ = nullptr;
+        int grouped_decode_active_cap_ = 0;
+        int grouped_decode_intermediate_cap_ = 0;
+        std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
+
+        // Grouped decode staging for ROCm native-VNNI MoE gate/up path.
+        float **d_grouped_gate_output_ptrs_ = nullptr;
+        float **d_grouped_up_output_ptrs_ = nullptr;
+        int *d_grouped_gateup_expert_ids_ = nullptr;
+        int8_t *d_grouped_hidden_int8_ = nullptr;
+        float *d_grouped_hidden_scales_ = nullptr;
+        int grouped_gateup_active_cap_ = 0;
+        int grouped_gateup_d_model_cap_ = 0;
+        std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
+        std::vector<float *> host_grouped_gate_output_ptrs_;
+        std::vector<float *> host_grouped_up_output_ptrs_;
+        std::vector<int> host_grouped_gateup_expert_ids_;
 
         // Reusable scratch for sharedExpertGate() gate values.
         float *d_shared_gate_scratch_ = nullptr; ///< [shared_gate_scratch_capacity_] floats on device

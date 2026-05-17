@@ -129,11 +129,15 @@ namespace llaminar2
         // Record routing result in decode histogram (if tracking enabled)
         if (params_.decode_histogram && params_.layer_idx >= 0 && seq_len == 1)
         {
-            params_.decode_histogram->record(
-                params_.layer_idx,
-                cached_routing_.expert_indices.data(),
-                cached_routing_.expert_weights.data(),
-                top_k);
+            if (cached_routing_.expert_indices.size() >= static_cast<size_t>(top_k) &&
+                cached_routing_.expert_weights.size() >= static_cast<size_t>(top_k))
+            {
+                params_.decode_histogram->record(
+                    params_.layer_idx,
+                    cached_routing_.expert_indices.data(),
+                    cached_routing_.expert_weights.data(),
+                    top_k);
+            }
         }
 
         LOG_TRACE("[MoERoutingStage] Routed " << seq_len << " tokens to top-"

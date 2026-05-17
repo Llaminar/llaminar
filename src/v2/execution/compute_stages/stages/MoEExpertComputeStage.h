@@ -293,6 +293,9 @@ namespace llaminar2
         /// Reusable projection descriptor vector (avoids per-call heap alloc)
         mutable std::vector<ITensorGemm::TensorProjectionDesc> batch_projections_;
 
+        /// Reusable expert-id list for full-local grouped decode descriptor preparation.
+        mutable std::vector<int> all_expert_ids_;
+
         /// Cached MoE kernel (gather/scatter, SwiGLU fallback)
         mutable IMoEKernel *moe_kernel_ = nullptr;
 
@@ -302,8 +305,20 @@ namespace llaminar2
 
         void ensureGemmEnginesCached();
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
+        bool ensureGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
+        bool ensureGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         void ensureScratchBuffers(int max_batch) const;
         IMoEKernel *ensureMoEKernel() const;
+
+        mutable int grouped_gateup_desc_table_id_ = -1;
+        mutable int grouped_gateup_desc_table_num_experts_ = 0;
+        mutable int grouped_gateup_desc_table_d_model_ = 0;
+        mutable int grouped_gateup_desc_table_intermediate_ = 0;
+
+        mutable int grouped_down_desc_table_id_ = -1;
+        mutable int grouped_down_desc_table_num_experts_ = 0;
+        mutable int grouped_down_desc_table_d_model_ = 0;
+        mutable int grouped_down_desc_table_intermediate_ = 0;
     };
 
     /**

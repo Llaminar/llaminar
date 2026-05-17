@@ -15,6 +15,7 @@
 #include "../kernels/IPackedWeights.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -26,6 +27,31 @@ namespace llaminar2
     struct PreparedEmbeddingHandle;
     struct Q8_1Block;
     class IDeviceContext; // For kernel execute() interface
+
+    /**
+     * @brief Device-readable native-VNNI matrix descriptor.
+     *
+     * This intentionally carries only raw device pointers and compact format
+     * metadata so MoE grouped kernels can select expert weights by descriptor
+     * without depending on backend-specific GEMM classes.
+     */
+    struct DeviceNativeVNNIMatrixDesc
+    {
+        const uint8_t *payload = nullptr;
+        const void *scales = nullptr;
+        const void *mins = nullptr;
+        const void *emins = nullptr;
+        int n = 0;
+        int k = 0;
+        uint32_t blocks_per_row = 0;
+        uint8_t codebook_id = 0;
+        uint8_t reserved[3] = {0, 0, 0};
+
+        bool valid() const
+        {
+            return payload && scales && n > 0 && k > 0 && blocks_per_row > 0;
+        }
+    };
 
     // =============================================================================
     // Fused Operation Configuration
@@ -475,6 +501,19 @@ namespace llaminar2
          * to detect silent upload failures (prepareWeights() is void).
          */
         virtual bool weights_converted() const { return true; }
+
+        /**
+         * @brief Export a device-readable native-VNNI weight descriptor.
+         *
+         * Backends that store weights in native-VNNI form override this for
+         * grouped MoE decode kernels. Unsupported formats return false so the
+         * caller can use the existing sequential fallback.
+         */
+        virtual bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
+        {
+            out = {};
+            return false;
+        }
 
         // =====================================================================
         // Tensor-aware fused projection API (preferred for GPU execution)

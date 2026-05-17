@@ -1260,6 +1260,414 @@ __global__ void gemv_native_vnni_kernel_t(
     }
 }
 
+struct DeviceNativeVNNIMatrixDesc
+{
+    const uint8_t* payload;
+    const void* scales;
+    const void* mins;
+    const void* emins;
+    int n;
+    int k;
+    uint32_t blocks_per_row;
+    uint8_t codebook_id;
+    uint8_t reserved[3];
+};
+
+__global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
+    const float* const* __restrict__ gate_ptrs,
+    const float* const* __restrict__ up_ptrs,
+    int8_t* __restrict__ A_int8,
+    float* __restrict__ scales_A_blockwise,
+    int num_active,
+    int K)
+{
+    const int slot = blockIdx.x;
+    if (slot >= num_active) return;
+
+    constexpr int BLOCK_SIZE = 32;
+    constexpr int NUM_WARPS = 8;
+    const int blocks_per_row = K / BLOCK_SIZE;
+    const int lane = threadIdx.x & 31;
+    const int warp_id = threadIdx.x >> 5;
+
+    const float* gate = gate_ptrs[slot];
+    const float* up = up_ptrs[slot];
+    int8_t* row_int8 = A_int8 + static_cast<size_t>(slot) * K;
+    float* row_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
+
+    for (int b = warp_id; b < blocks_per_row; b += NUM_WARPS)
+    {
+        const int k_start = b * BLOCK_SIZE;
+        const float g = gate[k_start + lane];
+        const float u = up[k_start + lane];
+        const float val = (g / (1.0f + expf(-g))) * u;
+
+        float abs_val = fabsf(val);
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
+
+        const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
+        const float inv_scale = 1.0f / scale;
+
+        if (lane == 0)
+            row_scales[b] = scale;
+
+        const float qval = val * inv_scale;
+        row_int8[k_start + lane] = static_cast<int8_t>(
+            rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+    }
+}
+
+template <NativeVNNIFormat FMT>
+__device__ __forceinline__ void moe_decode_q4like_groups(
+    const uint8_t* __restrict__ payload,
+    int32_t* packed_groups)
+{
+    if constexpr (FMT == NVNNI_IQ4_NL)
+    {
+        constexpr uint32_t CB_LO_A = 0xBFAD9881u;
+        constexpr uint32_t CB_LO_B = 0xF6EADDCFu;
+        constexpr uint32_t CB_HI_A = 0x26190D01u;
+        constexpr uint32_t CB_HI_B = 0x71594535u;
+        constexpr uint32_t MUX_IDENTITY = 0x03020100u;
+        constexpr uint32_t MUX_BIT3_MASK = 0x04040404u;
+
+        #pragma unroll
+        for (int g = 0; g < 4; ++g)
+        {
+            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
+            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
+            const uint32_t lo_sel = lo_nibs & 0x07070707u;
+            const uint32_t lo_r0 = __builtin_amdgcn_perm(CB_LO_B, CB_LO_A, lo_sel);
+            const uint32_t lo_r1 = __builtin_amdgcn_perm(CB_HI_B, CB_HI_A, lo_sel);
+            const uint32_t lo_mux = MUX_IDENTITY | ((lo_nibs >> 1) & MUX_BIT3_MASK);
+            packed_groups[g] = static_cast<int32_t>(__builtin_amdgcn_perm(lo_r1, lo_r0, lo_mux));
+
+            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
+            const uint32_t hi_sel = hi_nibs & 0x07070707u;
+            const uint32_t hi_r0 = __builtin_amdgcn_perm(CB_LO_B, CB_LO_A, hi_sel);
+            const uint32_t hi_r1 = __builtin_amdgcn_perm(CB_HI_B, CB_HI_A, hi_sel);
+            const uint32_t hi_mux = MUX_IDENTITY | ((hi_nibs >> 1) & MUX_BIT3_MASK);
+            packed_groups[g + 4] = static_cast<int32_t>(__builtin_amdgcn_perm(hi_r1, hi_r0, hi_mux));
+        }
+    }
+    else if constexpr (FMT == NVNNI_Q4_0)
+    {
+        constexpr uint32_t SWAR_ADD = 0x78787878u;
+        constexpr uint32_t SWAR_XOR = 0x80808080u;
+        constexpr uint32_t NIBBLE_MASK = 0x0F0F0F0Fu;
+
+        #pragma unroll
+        for (int g = 0; g < 4; ++g)
+        {
+            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
+            packed_groups[g] = static_cast<int32_t>(((raw & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
+            packed_groups[g + 4] = static_cast<int32_t>((((raw >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
+        }
+    }
+    else if constexpr (NVNNITraits<FMT>::is_5bit)
+    {
+        const uint32_t qh_bits = *reinterpret_cast<const uint32_t*>(payload + 16);
+
+        #pragma unroll
+        for (int g = 0; g < 4; ++g)
+        {
+            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
+
+            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
+            const uint32_t hb4_lo = (qh_bits >> (g * 4)) & 0xFu;
+            const uint32_t hb_lo = ((hb4_lo & 1u) << 4) | ((hb4_lo & 2u) << 11)
+                                 | ((hb4_lo & 4u) << 18) | ((hb4_lo & 8u) << 25);
+            uint32_t val_lo = lo_nibs | hb_lo;
+
+            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
+            const uint32_t hb4_hi = (qh_bits >> (g * 4 + 16)) & 0xFu;
+            const uint32_t hb_hi = ((hb4_hi & 1u) << 4) | ((hb4_hi & 2u) << 11)
+                                 | ((hb4_hi & 4u) << 18) | ((hb4_hi & 8u) << 25);
+            uint32_t val_hi = hi_nibs | hb_hi;
+
+            if constexpr (NVNNITraits<FMT>::center_5bit == 16)
+            {
+                val_lo ^= 0x80808080u;
+                val_lo -= 0x10101010u;
+                val_lo ^= 0x80808080u;
+                val_hi ^= 0x80808080u;
+                val_hi -= 0x10101010u;
+                val_hi ^= 0x80808080u;
+            }
+
+            packed_groups[g] = static_cast<int32_t>(val_lo);
+            packed_groups[g + 4] = static_cast<int32_t>(val_hi);
+        }
+    }
+    else if constexpr (NVNNITraits<FMT>::is_6bit)
+    {
+        const uint8_t* qh_p = payload + 16;
+
+        #pragma unroll
+        for (int g = 0; g < 4; ++g)
+        {
+            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
+            const uint32_t h_lo = qh_p[g];
+            const uint32_t h_hi = qh_p[g + 4];
+
+            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
+            const uint32_t hb_lo = ((h_lo & 0x03u) << 4)  | ((h_lo & 0x0Cu) << 10)
+                                 | ((h_lo & 0x30u) << 16) | ((h_lo & 0xC0u) << 22);
+            uint32_t val_lo = (lo_nibs | hb_lo) ^ 0x80808080u;
+            val_lo -= 0x20202020u;
+            val_lo ^= 0x80808080u;
+            packed_groups[g] = static_cast<int32_t>(val_lo);
+
+            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
+            const uint32_t hb_hi = ((h_hi & 0x03u) << 4)  | ((h_hi & 0x0Cu) << 10)
+                                 | ((h_hi & 0x30u) << 16) | ((h_hi & 0xC0u) << 22);
+            uint32_t val_hi = (hi_nibs | hb_hi) ^ 0x80808080u;
+            val_hi -= 0x20202020u;
+            val_hi ^= 0x80808080u;
+            packed_groups[g + 4] = static_cast<int32_t>(val_hi);
+        }
+    }
+    else
+    {
+        #pragma unroll
+        for (int g = 0; g < 4; ++g)
+        {
+            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
+            packed_groups[g] = static_cast<int32_t>(raw & 0x0F0F0F0Fu);
+            packed_groups[g + 4] = static_cast<int32_t>((raw >> 4) & 0x0F0F0F0Fu);
+        }
+    }
+}
+
+template <NativeVNNIFormat FMT, bool INDEX_BY_EXPERT_ID>
+__global__ void moe_grouped_native_vnni_down_kernel_t(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ descs,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ route_weights,
+    float* __restrict__ output,
+    int num_active,
+    int N,
+    int K)
+{
+    static_assert(FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_Q4_1 ||
+                      FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K,
+                  "Grouped MoE down currently supports Q4/IQ4, Q5, and Q6 native-VNNI descriptors");
+
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    if (n >= N) return;
+
+    const int blocks_per_row = K / 32;
+    float total = 0.0f;
+
+    #pragma unroll 1
+    for (int slot = 0; slot < num_active; ++slot)
+    {
+        int desc_idx = slot;
+        if constexpr (INDEX_BY_EXPERT_ID)
+            desc_idx = expert_ids[slot];
+        const DeviceNativeVNNIMatrixDesc desc = descs[desc_idx];
+        const uint8_t* payload_base = desc.payload;
+        const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
+        const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
+        const int8_t* a_slot = A_int8 + static_cast<size_t>(slot) * K;
+        const float* scale_slot = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
+
+        float expert_acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; ++b)
+        {
+            const int32_t* a4 = reinterpret_cast<const int32_t*>(a_slot + b * 32);
+            int32_t packed_groups[8];
+            const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
+            const uint8_t* payload = payload_base + linear * NVNNITraits<FMT>::payload_bytes;
+            moe_decode_q4like_groups<FMT>(payload, packed_groups);
+
+            const float scale_ab = scale_slot[b];
+            if constexpr (NVNNITraits<FMT>::is_dual_scale)
+            {
+                int32_t acc_lo = 0;
+                int32_t acc_hi = 0;
+                #pragma unroll
+                for (int g = 0; g < 4; ++g)
+                    acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
+                #pragma unroll
+                for (int g = 4; g < 8; ++g)
+                    acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
+
+                const uint16_t scale_lo_bits = scale_base[linear];
+                const uint16_t scale_hi_bits = min_base[linear];
+                const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
+                const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
+                expert_acc += (static_cast<float>(acc_lo) * scale_lo +
+                               static_cast<float>(acc_hi) * scale_hi) * scale_ab;
+            }
+            else
+            {
+                int32_t block_acc = 0;
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                    block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
+
+                const uint16_t scale_bits = scale_base[linear];
+                const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+                expert_acc += static_cast<float>(block_acc) * block_d * scale_ab;
+
+                if constexpr (NVNNITraits<FMT>::is_asymmetric)
+                {
+                    constexpr int32_t ones = 0x01010101;
+                    int32_t sum_a = 0;
+                    #pragma unroll
+                    for (int g = 0; g < 8; ++g)
+                        sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+
+                    const uint16_t min_bits = min_base[linear];
+                    const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
+                    expert_acc += static_cast<float>(sum_a) * block_m * scale_ab;
+                }
+            }
+        }
+
+        total += route_weights[slot] * expert_acc;
+    }
+
+    output[n] = total;
+}
+
+__global__ void moe_grouped_hidden_quantize_blockwise_kernel(
+    const float* __restrict__ hidden,
+    int8_t* __restrict__ A_int8,
+    float* __restrict__ scales_A_blockwise,
+    int K)
+{
+    constexpr int BLOCK_SIZE = 32;
+    const int block_idx = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int k = block_idx * BLOCK_SIZE + lane;
+    if (lane >= BLOCK_SIZE || k >= K) return;
+
+    const float val = hidden[k];
+    float abs_val = fabsf(val);
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
+
+    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+    if (lane == 0)
+        scales_A_blockwise[block_idx] = scale;
+
+    const float qval = val * inv_scale;
+    A_int8[k] = static_cast<int8_t>(
+        rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+}
+
+template <NativeVNNIFormat FMT>
+__device__ __forceinline__ float moe_native_vnni_dot_desc(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int n,
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    int N,
+    int K)
+{
+    const int blocks_per_row = K / 32;
+    const uint8_t* payload_base = desc.payload;
+    const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
+    const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
+    float acc = 0.0f;
+
+    for (int b = 0; b < blocks_per_row; ++b)
+    {
+        const int32_t* a4 = reinterpret_cast<const int32_t*>(A_int8 + b * 32);
+        int32_t packed_groups[8];
+        const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
+        const uint8_t* payload = payload_base + linear * NVNNITraits<FMT>::payload_bytes;
+        moe_decode_q4like_groups<FMT>(payload, packed_groups);
+
+        const float scale_ab = scales_A_blockwise[b];
+        if constexpr (NVNNITraits<FMT>::is_dual_scale)
+        {
+            int32_t acc_lo = 0;
+            int32_t acc_hi = 0;
+            #pragma unroll
+            for (int g = 0; g < 4; ++g)
+                acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
+            #pragma unroll
+            for (int g = 4; g < 8; ++g)
+                acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
+
+            const uint16_t scale_lo_bits = scale_base[linear];
+            const uint16_t scale_hi_bits = min_base[linear];
+            const float scale_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
+            const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
+            acc += (static_cast<float>(acc_lo) * scale_lo +
+                    static_cast<float>(acc_hi) * scale_hi) * scale_ab;
+        }
+        else
+        {
+            int32_t block_acc = 0;
+            #pragma unroll
+            for (int g = 0; g < 8; ++g)
+                block_acc = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], block_acc, false);
+
+            const uint16_t scale_bits = scale_base[linear];
+            const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+            acc += static_cast<float>(block_acc) * block_d * scale_ab;
+
+            if constexpr (NVNNITraits<FMT>::is_asymmetric)
+            {
+                constexpr int32_t ones = 0x01010101;
+                int32_t sum_a = 0;
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                    sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+
+                const uint16_t min_bits = min_base[linear];
+                const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
+                acc += static_cast<float>(sum_a) * block_m * scale_ab;
+            }
+        }
+    }
+
+    return acc;
+}
+
+template <NativeVNNIFormat FMT>
+__global__ void moe_grouped_native_vnni_gate_up_kernel_t(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,
+    const int* __restrict__ expert_ids,
+    float* const* __restrict__ gate_outputs,
+    float* const* __restrict__ up_outputs,
+    int num_active,
+    int N,
+    int K)
+{
+    static_assert(FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_Q4_1 ||
+                      FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K,
+                  "Grouped MoE gate/up currently supports Q4/IQ4, Q5, and Q6 native-VNNI descriptors");
+
+    constexpr int TILE_N = 64;
+    const int n = blockIdx.x * TILE_N + threadIdx.x;
+    const int slot = blockIdx.y;
+    if (slot >= num_active || n >= N) return;
+
+    const int expert_id = expert_ids[slot];
+    const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
+    const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+
+    gate_outputs[slot][n] = moe_native_vnni_dot_desc<FMT>(
+        gate_desc, n, A_int8, scales_A_blockwise, N, K);
+    up_outputs[slot][n] = moe_native_vnni_dot_desc<FMT>(
+        up_desc, n, A_int8, scales_A_blockwise, N, K);
+}
+
 
 // ============================================================================
 // Reduce kernel: sum K-partitions from scatter buffer to final output.
@@ -1400,6 +1808,319 @@ __global__ void gemv_iq_lds_kernel_t(
 
 
 extern "C" {
+
+bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
+    const float* d_hidden,
+    const DeviceNativeVNNIMatrixDesc* d_gate_desc_table,
+    const DeviceNativeVNNIMatrixDesc* d_up_desc_table,
+    const int* d_expert_ids,
+    float* const* d_gate_outputs,
+    float* const* d_up_outputs,
+    int8_t* d_hidden_int8,
+    float* d_hidden_scales,
+    int num_active,
+    int N,
+    int K,
+    uint8_t codebook_id,
+    int device_id,
+    void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
+        !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
+        num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] invalid arguments\n");
+        return false;
+    }
+
+    (void)hipGetLastError();
+    const int blocks_per_row = K / 32;
+    hipLaunchKernelGGL(moe_grouped_hidden_quantize_blockwise_kernel,
+        dim3(blocks_per_row), dim3(32), 0, static_cast<hipStream_t>(stream),
+        d_hidden, d_hidden_int8, d_hidden_scales, K);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] hidden quantize launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    constexpr int TN = 64;
+    dim3 grid((N + TN - 1) / TN, num_active);
+    dim3 block(TN);
+
+    switch (static_cast<NativeVNNIFormat>(codebook_id))
+    {
+    case NVNNI_Q4_0:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q4_0>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
+            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
+        break;
+    case NVNNI_IQ4_NL:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_IQ4_NL>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
+            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
+        break;
+    case NVNNI_Q4_1:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q4_1>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
+            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
+        break;
+    case NVNNI_Q5_0:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q5_0>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
+            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
+        break;
+    case NVNNI_Q5_1:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q5_1>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
+            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
+        break;
+    case NVNNI_Q6_K:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q6_K>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
+            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
+        break;
+    default:
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] unsupported codebook_id=%u\n",
+                static_cast<unsigned>(codebook_id));
+        return false;
+    }
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] gate/up launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
+    const float* const* d_gate_ptrs,
+    const float* const* d_up_ptrs,
+    const DeviceNativeVNNIMatrixDesc* d_descs,
+    const float* d_weights,
+    int8_t* d_swiglu_int8,
+    float* d_swiglu_scales,
+    float* d_output,
+    int num_active,
+    int N,
+    int K,
+    uint8_t codebook_id,
+    int device_id,
+    void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if (!d_gate_ptrs || !d_up_ptrs || !d_descs || !d_weights ||
+        !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
+        num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode] invalid arguments\n");
+        return false;
+    }
+
+    (void)hipGetLastError();
+    constexpr int QUANT_THREADS = 256;
+    hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
+        dim3(num_active), dim3(QUANT_THREADS), 0, static_cast<hipStream_t>(stream),
+        d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
+        num_active, K);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode] quantize launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    constexpr int TN = 64;
+    dim3 grid((N + TN - 1) / TN);
+    dim3 block(TN);
+
+    switch (static_cast<NativeVNNIFormat>(codebook_id))
+    {
+    case NVNNI_Q4_0:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q4_0, false>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_IQ4_NL:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_IQ4_NL, false>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_Q4_1:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q4_1, false>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_Q5_0:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q5_0, false>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_Q5_1:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q5_1, false>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_Q6_K:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q6_K, false>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
+            d_output, num_active, N, K);
+        break;
+    default:
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode] unsupported codebook_id=%u\n",
+                static_cast<unsigned>(codebook_id));
+        return false;
+    }
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode] down launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+    const float* const* d_gate_ptrs,
+    const float* const* d_up_ptrs,
+    const DeviceNativeVNNIMatrixDesc* d_desc_table,
+    const int* d_expert_ids,
+    const float* d_weights,
+    int8_t* d_swiglu_int8,
+    float* d_swiglu_scales,
+    float* d_output,
+    int num_active,
+    int N,
+    int K,
+    uint8_t codebook_id,
+    int device_id,
+    void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
+        !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
+        num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] invalid arguments\n");
+        return false;
+    }
+
+    (void)hipGetLastError();
+    constexpr int QUANT_THREADS = 256;
+    hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
+        dim3(num_active), dim3(QUANT_THREADS), 0, static_cast<hipStream_t>(stream),
+        d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
+        num_active, K);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] quantize launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    constexpr int TN = 64;
+    dim3 grid((N + TN - 1) / TN);
+    dim3 block(TN);
+
+    switch (static_cast<NativeVNNIFormat>(codebook_id))
+    {
+    case NVNNI_Q4_0:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q4_0, true>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_IQ4_NL:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_IQ4_NL, true>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_Q4_1:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q4_1, true>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_Q5_0:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q5_0, true>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_Q5_1:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q5_1, true>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
+            d_output, num_active, N, K);
+        break;
+    case NVNNI_Q6_K:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q6_K, true>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
+            d_output, num_active, N, K);
+        break;
+    default:
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] unsupported codebook_id=%u\n",
+                static_cast<unsigned>(codebook_id));
+        return false;
+    }
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] down launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
 
 // ============================================================================
 // Native-VNNI GEMV dispatch: lossless decode with FP16 per-block scales

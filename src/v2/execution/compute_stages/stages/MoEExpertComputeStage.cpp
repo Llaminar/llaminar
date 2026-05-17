@@ -18,6 +18,7 @@
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../utils/Assertions.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 #include <mpi.h>
@@ -171,6 +172,14 @@ namespace llaminar2
             return false;
         }
         params_.expert_mask = mask;
+        grouped_gateup_desc_table_id_ = -1;
+        grouped_gateup_desc_table_num_experts_ = 0;
+        grouped_gateup_desc_table_d_model_ = 0;
+        grouped_gateup_desc_table_intermediate_ = 0;
+        grouped_down_desc_table_id_ = -1;
+        grouped_down_desc_table_num_experts_ = 0;
+        grouped_down_desc_table_d_model_ = 0;
+        grouped_down_desc_table_intermediate_ = 0;
         return true;
     }
 
@@ -208,7 +217,19 @@ namespace llaminar2
         const std::unordered_map<int, ExpertWeightBlobs> *received_weights)
     {
         auto ctx = buildWeightContext();
-        return MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, received_weights);
+        const bool ok = MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, received_weights);
+        if (ok)
+        {
+            grouped_gateup_desc_table_id_ = -1;
+            grouped_gateup_desc_table_num_experts_ = 0;
+            grouped_gateup_desc_table_d_model_ = 0;
+            grouped_gateup_desc_table_intermediate_ = 0;
+            grouped_down_desc_table_id_ = -1;
+            grouped_down_desc_table_num_experts_ = 0;
+            grouped_down_desc_table_d_model_ = 0;
+            grouped_down_desc_table_intermediate_ = 0;
+        }
+        return ok;
     }
 
     void MoEExpertComputeStage::applyExpertMask(const std::vector<bool> &new_mask)
@@ -217,6 +238,14 @@ namespace llaminar2
         cached_gate_gemm_.clear();
         cached_up_gemm_.clear();
         cached_down_gemm_.clear();
+        grouped_gateup_desc_table_id_ = -1;
+        grouped_gateup_desc_table_num_experts_ = 0;
+        grouped_gateup_desc_table_d_model_ = 0;
+        grouped_gateup_desc_table_intermediate_ = 0;
+        grouped_down_desc_table_id_ = -1;
+        grouped_down_desc_table_num_experts_ = 0;
+        grouped_down_desc_table_d_model_ = 0;
+        grouped_down_desc_table_intermediate_ = 0;
     }
 
     MoEWeightContext MoEExpertComputeStage::buildWeightContext()
@@ -656,15 +685,11 @@ namespace llaminar2
             return false;
         }
 
-        // Read pre-computed routing results from MoERoutingStage.
-        // Routing tensors are small (top_k floats each), so D2H is acceptable.
         if (!params_.routing_indices || !params_.routing_weights)
         {
             LOG_ERROR("[MoEExpertComputeStage] Null routing_indices or routing_weights (single-token)");
             return false;
         }
-        const float *routing_idx_data = params_.routing_indices->data();
-        const float *routing_wt_data = params_.routing_weights->data();
         IMoEKernel *kernel = ensureMoEKernel();
 
         // Zero output via tensor-aware kernel (works for both CPU and GPU)
@@ -698,6 +723,102 @@ namespace llaminar2
 
         // Use input tensor directly (no gather needed for 1 token)
         const TensorBase *input_tensor = params_.input;
+
+        const bool expert_mask_all_enabled = params_.expert_mask.empty() ||
+                                             std::all_of(params_.expert_mask.begin(), params_.expert_mask.end(),
+                                                         [](bool enabled)
+                                                         { return enabled; });
+        const bool can_try_device_routed_decode =
+            is_gpu && debugEnv().rocm.moe_grouped_decode && debugEnv().rocm.moe_device_routed_decode &&
+            top_k > 0 && top_k <= 16 && local_start == 0 && local_count == num_experts &&
+            params_.replica_set.num_replicated == 0 && expert_mask_all_enabled;
+
+        if (can_try_device_routed_decode)
+        {
+            bool device_routed_done = false;
+            const bool have_grouped_tables =
+                grouped_gateup_desc_table_id_ >= 0 &&
+                grouped_gateup_desc_table_num_experts_ == num_experts &&
+                grouped_gateup_desc_table_d_model_ == d_model &&
+                grouped_gateup_desc_table_intermediate_ == intermediate &&
+                grouped_down_desc_table_id_ >= 0 &&
+                grouped_down_desc_table_num_experts_ == num_experts &&
+                grouped_down_desc_table_d_model_ == d_model &&
+                grouped_down_desc_table_intermediate_ == intermediate;
+
+            bool grouped_tables_ready = have_grouped_tables;
+            if (!grouped_tables_ready)
+            {
+                if (static_cast<int>(all_expert_ids_.size()) != num_experts)
+                {
+                    all_expert_ids_.resize(static_cast<size_t>(num_experts));
+                    std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
+                }
+
+                grouped_tables_ready = ensureGemmEnginesForExperts(all_expert_ids_) &&
+                                       ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate) &&
+                                       ensureGroupedDownDescriptorTable(kernel, d_model, intermediate);
+            }
+
+            if (grouped_tables_ready)
+            {
+                ITensor *gate_outputs[16] = {};
+                ITensor *up_outputs[16] = {};
+                for (int k = 0; k < top_k; ++k)
+                {
+                    gate_outputs[k] = scratch_gate_batch_[k].get();
+                    up_outputs[k] = scratch_up_batch_[k].get();
+                }
+
+                const bool gateup_done = kernel->groupedExpertGateUpDecodeFromRouting(
+                    input_tensor,
+                    params_.routing_indices,
+                    grouped_gateup_desc_table_id_,
+                    top_k,
+                    gate_outputs,
+                    up_outputs,
+                    d_model,
+                    intermediate);
+
+                if (gateup_done)
+                {
+                    device_routed_done = kernel->groupedExpertDownDecodeFromRouting(
+                        gate_outputs,
+                        up_outputs,
+                        params_.routing_indices,
+                        params_.routing_weights,
+                        grouped_down_desc_table_id_,
+                        top_k,
+                        params_.output,
+                        d_model,
+                        intermediate);
+                }
+
+                if (!device_routed_done)
+                {
+                    LOG_DEBUG("[MoEExpertComputeStage] Device-routed ROCm decode path unavailable for layer "
+                              << params_.layer_idx << "; using host-routed fallback");
+                }
+            }
+
+            if (device_routed_done)
+            {
+                if (params_.output->needsUpload() &&
+                    !params_.output->ensureOnDevice(params_.device_id, gpuStream()))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Failed to upload device-routed decode output for layer "
+                              << params_.layer_idx);
+                    return false;
+                }
+                return true;
+            }
+
+            kernel->zeroBuffer(params_.output, static_cast<size_t>(d_model) * sizeof(float));
+        }
+
+        // Host-routed fallback: materialize pre-computed top-k results from MoERoutingStage.
+        const float *routing_idx_data = params_.routing_indices->data();
+        const float *routing_wt_data = params_.routing_weights->data();
 
         // ---------------------------------------------------------------
         // Phase 1: Batch all experts' gate+up into ONE fused GEMV call.
@@ -797,17 +918,60 @@ namespace llaminar2
             num_active++;
         }
 
-        // Single fused call: quantize once + single OMP region for all gate+up
+        // Single-token ROCm grouped gate/up: quantize once, then compute all
+        // active experts from persistent native-VNNI descriptor tables.
         if (num_active > 0)
         {
-            if (!batch_projections_[0].kernel->multiply_fused_tensor(
-                    input_tensor, batch_projections_, /*m=*/1, d_model))
+            bool grouped_gateup_done = false;
+            if (is_gpu && debugEnv().rocm.moe_grouped_decode && num_active <= 16)
             {
-                LOG_ERROR("[MoEExpertComputeStage] Decode gate/up batched projection failed for layer "
-                          << params_.layer_idx);
-                return false;
+                ITensor *gate_outputs[16] = {};
+                ITensor *up_outputs[16] = {};
+                int grouped_expert_ids[16] = {};
+
+                for (int i = 0; i < num_active; ++i)
+                {
+                    const auto &info = active_experts[i];
+                    gate_outputs[i] = scratch_gate_batch_[info.batch_idx].get();
+                    up_outputs[i] = scratch_up_batch_[info.batch_idx].get();
+                    grouped_expert_ids[i] = info.expert_id;
+                }
+
+                if (ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate))
+                {
+                    grouped_gateup_done = kernel->groupedExpertGateUpDecodeFromTable(
+                        input_tensor,
+                        grouped_expert_ids,
+                        grouped_gateup_desc_table_id_,
+                        num_active,
+                        gate_outputs,
+                        up_outputs,
+                        d_model,
+                        intermediate);
+                    if (!grouped_gateup_done)
+                    {
+                        LOG_DEBUG("[MoEExpertComputeStage] Grouped ROCm decode gate/up path unavailable for layer "
+                                  << params_.layer_idx << "; using multiply_fused_tensor fallback");
+                    }
+                }
             }
-            if (is_gpu)
+
+            if (!grouped_gateup_done)
+            {
+                if (!batch_projections_[0].kernel->multiply_fused_tensor(
+                        input_tensor, batch_projections_, /*m=*/1, d_model))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Decode gate/up batched projection failed for layer "
+                              << params_.layer_idx);
+                    return false;
+                }
+                if (is_gpu)
+                {
+                    for (const auto &projection : batch_projections_)
+                        markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
+                }
+            }
+            else if (is_gpu)
             {
                 for (const auto &projection : batch_projections_)
                     markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
@@ -825,44 +989,91 @@ namespace llaminar2
 
         if (is_gpu)
         {
-            // GPU Phase 2: sequential per-expert SwiGLU+Down on GPU + GPU accumulate.
-            // fusedSwigluDown uses multiply_tensor_with_fused_swiglu (tensor-based,
-            // executed on GPU by ROCmQuantisedGemmKernel).  No D2H transfers occur.
-            // Scratch for down projection output (reused per expert)
-            if (!scratch_out_)
-                scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
-
-            for (int i = 0; i < num_active; ++i)
+            bool grouped_down_done = false;
+            if (debugEnv().rocm.moe_grouped_decode && num_active > 0 && num_active <= 16)
             {
-                const auto &info = active_experts[i];
-                ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
+                ITensor *gate_tensors[16] = {};
+                ITensor *up_tensors[16] = {};
+                int grouped_expert_ids[16] = {};
+                float grouped_weights[16] = {};
 
-                if (!down_gemm)
+                for (int i = 0; i < num_active; ++i)
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
-                              << info.expert_id << " (layer " << params_.layer_idx << ")");
-                    MPI_Abort(MPI_COMM_WORLD, 1);
+                    const auto &info = active_experts[i];
+                    ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
+                    if (!down_gemm)
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
+                                  << info.expert_id << " (layer " << params_.layer_idx << ")");
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                    }
+
+                    gate_tensors[i] = scratch_gate_batch_[info.batch_idx].get();
+                    up_tensors[i] = scratch_up_batch_[info.batch_idx].get();
+                    grouped_expert_ids[i] = info.expert_id;
+                    grouped_weights[i] = info.weight;
                 }
 
-                // Fused SwiGLU + Down on GPU (tensor-based).
-                // After Phase 1, scratch_gate/up are DEVICE_AUTHORITATIVE.
-                // fusedSwigluDown primary path calls multiply_tensor_with_fused_swiglu
-                // which handles tensor coherence internally.
-                if (!fusedSwigluDown(
-                        scratch_gate_batch_[info.batch_idx].get(),
-                        scratch_up_batch_[info.batch_idx].get(),
-                        scratch_out_.get(),
-                        down_gemm, kernel, /*m=*/1, d_model, intermediate,
-                        params_.device_id, gpuStream()))
+                if (ensureGroupedDownDescriptorTable(kernel, d_model, intermediate))
                 {
-                    LOG_ERROR("[MoEExpertComputeStage] CUDA decode SwiGLU/down projection failed for expert "
-                              << info.expert_id << " layer " << params_.layer_idx);
-                    return false;
+                    grouped_down_done = kernel->groupedExpertDownDecodeFromTable(
+                        gate_tensors,
+                        up_tensors,
+                        grouped_expert_ids,
+                        grouped_weights,
+                        grouped_down_desc_table_id_,
+                        num_active,
+                        params_.output,
+                        d_model,
+                        intermediate);
+                    if (!grouped_down_done)
+                    {
+                        LOG_DEBUG("[MoEExpertComputeStage] Grouped ROCm decode down path unavailable for layer "
+                                  << params_.layer_idx << "; using per-expert fallback");
+                    }
                 }
+            }
 
-                // GPU weighted accumulate: output += weight * scratch_out
-                kernel->weightedAddFromTensors(
-                    params_.output, scratch_out_.get(), info.weight, d_model);
+            if (!grouped_down_done)
+            {
+                // GPU Phase 2 fallback: sequential per-expert SwiGLU+Down on GPU + GPU accumulate.
+                // fusedSwigluDown uses multiply_tensor_with_fused_swiglu (tensor-based,
+                // executed on GPU by ROCmQuantisedGemmKernel).  No D2H transfers occur.
+                if (!scratch_out_)
+                    scratch_out_ = makeScratchFP32(1, d_model, params_.device_id);
+
+                for (int i = 0; i < num_active; ++i)
+                {
+                    const auto &info = active_experts[i];
+                    ITensorGemm *down_gemm = cached_down_gemm_[info.expert_id];
+
+                    if (!down_gemm)
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] FATAL: Null down GEMM engine for expert "
+                                  << info.expert_id << " (layer " << params_.layer_idx << ")");
+                        MPI_Abort(MPI_COMM_WORLD, 1);
+                    }
+
+                    // Fused SwiGLU + Down on GPU (tensor-based).
+                    // After Phase 1, scratch_gate/up are DEVICE_AUTHORITATIVE.
+                    // fusedSwigluDown primary path calls multiply_tensor_with_fused_swiglu
+                    // which handles tensor coherence internally.
+                    if (!fusedSwigluDown(
+                            scratch_gate_batch_[info.batch_idx].get(),
+                            scratch_up_batch_[info.batch_idx].get(),
+                            scratch_out_.get(),
+                            down_gemm, kernel, /*m=*/1, d_model, intermediate,
+                            params_.device_id, gpuStream()))
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] CUDA decode SwiGLU/down projection failed for expert "
+                                  << info.expert_id << " layer " << params_.layer_idx);
+                        return false;
+                    }
+
+                    // GPU weighted accumulate: output += weight * scratch_out
+                    kernel->weightedAddFromTensors(
+                        params_.output, scratch_out_.get(), info.weight, d_model);
+                }
             }
             if (params_.output->needsUpload() &&
                 !params_.output->ensureOnDevice(params_.device_id, gpuStream()))
@@ -1117,6 +1328,15 @@ namespace llaminar2
             auto ctx = buildWeightContext();
             if (!MoEExpertWeightService::registerAndPrepareNewExperts(ctx, needed, &provider_payloads))
                 return false;
+
+            grouped_gateup_desc_table_id_ = -1;
+            grouped_gateup_desc_table_num_experts_ = 0;
+            grouped_gateup_desc_table_d_model_ = 0;
+            grouped_gateup_desc_table_intermediate_ = 0;
+            grouped_down_desc_table_id_ = -1;
+            grouped_down_desc_table_num_experts_ = 0;
+            grouped_down_desc_table_d_model_ = 0;
+            grouped_down_desc_table_intermediate_ = 0;
         }
 
         cached_gate_gemm_ = params_.prepared_gate_gemm;
@@ -1150,6 +1370,116 @@ namespace llaminar2
             bind_if_needed(cached_up_gemm_[expert_id]);
             bind_if_needed(cached_down_gemm_[expert_id]);
         }
+        return true;
+    }
+
+    bool MoEExpertComputeStage::ensureGroupedGateUpDescriptorTable(
+        IMoEKernel *kernel, int d_model, int intermediate)
+    {
+        if (!kernel || params_.num_experts <= 0 || d_model <= 0 || intermediate <= 0)
+            return false;
+
+        if (grouped_gateup_desc_table_id_ >= 0 &&
+            grouped_gateup_desc_table_num_experts_ == params_.num_experts &&
+            grouped_gateup_desc_table_d_model_ == d_model &&
+            grouped_gateup_desc_table_intermediate_ == intermediate)
+        {
+            return true;
+        }
+
+        std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(params_.num_experts);
+        std::vector<DeviceNativeVNNIMatrixDesc> up_descs(params_.num_experts);
+        int valid_descs = 0;
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            if (cached_gate_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                cached_up_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                !cached_gate_gemm_[expert_id] || !cached_up_gemm_[expert_id])
+            {
+                continue;
+            }
+
+            DeviceNativeVNNIMatrixDesc gate_desc;
+            DeviceNativeVNNIMatrixDesc up_desc;
+            if (!cached_gate_gemm_[expert_id]->exportNativeVNNIMatrixDesc(gate_desc) ||
+                !cached_up_gemm_[expert_id]->exportNativeVNNIMatrixDesc(up_desc) ||
+                gate_desc.n != intermediate || gate_desc.k != d_model ||
+                up_desc.n != intermediate || up_desc.k != d_model)
+            {
+                LOG_DEBUG("[MoEExpertComputeStage] Unable to export grouped gate/up descriptor for expert "
+                          << expert_id << " layer " << params_.layer_idx);
+                return false;
+            }
+
+            gate_descs[expert_id] = gate_desc;
+            up_descs[expert_id] = up_desc;
+            ++valid_descs;
+        }
+
+        if (valid_descs == 0)
+            return false;
+
+        const int table_id = kernel->uploadGroupedExpertGateUpDescriptorTables(
+            gate_descs.data(), up_descs.data(), params_.num_experts, d_model, intermediate);
+        if (table_id < 0)
+            return false;
+
+        grouped_gateup_desc_table_id_ = table_id;
+        grouped_gateup_desc_table_num_experts_ = params_.num_experts;
+        grouped_gateup_desc_table_d_model_ = d_model;
+        grouped_gateup_desc_table_intermediate_ = intermediate;
+        return true;
+    }
+
+    bool MoEExpertComputeStage::ensureGroupedDownDescriptorTable(
+        IMoEKernel *kernel, int d_model, int intermediate)
+    {
+        if (!kernel || params_.num_experts <= 0 || d_model <= 0 || intermediate <= 0)
+            return false;
+
+        if (grouped_down_desc_table_id_ >= 0 &&
+            grouped_down_desc_table_num_experts_ == params_.num_experts &&
+            grouped_down_desc_table_d_model_ == d_model &&
+            grouped_down_desc_table_intermediate_ == intermediate)
+        {
+            return true;
+        }
+
+        std::vector<DeviceNativeVNNIMatrixDesc> down_descs(params_.num_experts);
+        int valid_descs = 0;
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            if (cached_down_gemm_.size() <= static_cast<size_t>(expert_id) ||
+                !cached_down_gemm_[expert_id])
+            {
+                continue;
+            }
+
+            DeviceNativeVNNIMatrixDesc desc;
+            if (!cached_down_gemm_[expert_id]->exportNativeVNNIMatrixDesc(desc) ||
+                desc.n != d_model || desc.k != intermediate)
+            {
+                LOG_DEBUG("[MoEExpertComputeStage] Unable to export grouped down descriptor for expert "
+                          << expert_id << " layer " << params_.layer_idx);
+                return false;
+            }
+
+            down_descs[expert_id] = desc;
+            ++valid_descs;
+        }
+
+        if (valid_descs == 0)
+            return false;
+
+        const int table_id = kernel->uploadGroupedExpertDownDescriptorTable(
+            down_descs.data(), params_.num_experts, d_model, intermediate);
+        if (table_id < 0)
+            return false;
+
+        grouped_down_desc_table_id_ = table_id;
+        grouped_down_desc_table_num_experts_ = params_.num_experts;
+        grouped_down_desc_table_d_model_ = d_model;
+        grouped_down_desc_table_intermediate_ = intermediate;
         return true;
     }
 

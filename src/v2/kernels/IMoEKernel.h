@@ -245,6 +245,196 @@ namespace llaminar2
         virtual void weightedAddFromTensors(
             ITensor *output, ITensor *input, float weight, int count);
 
+        /**
+         * @brief Grouped decode path for routed expert down projections.
+         *
+         * Implementations may consume per-active-expert gate/up scratch tensors,
+         * native-VNNI down-weight descriptors, and routing weights to produce the
+         * final weighted MoE output in routing order. The default returns false so
+         * compute stages can fall back to the established per-expert path.
+         */
+        virtual bool groupedExpertDownDecode(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            const int *expert_ids,
+            const float *expert_weights,
+            const DeviceNativeVNNIMatrixDesc *down_descs,
+            int num_active,
+            ITensor *output,
+            int d_model,
+            int intermediate)
+        {
+            (void)gate_tensors;
+            (void)up_tensors;
+            (void)expert_ids;
+            (void)expert_weights;
+            (void)down_descs;
+            (void)num_active;
+            (void)output;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
+         * @brief Upload a persistent all-expert descriptor table for grouped decode.
+         *
+         * Returns an opaque table id owned by the kernel implementation, or -1 if
+         * the backend cannot use a persistent descriptor table. Entries may be
+         * invalid for non-local experts; grouped table decode validates active
+         * expert ids before launching.
+         */
+        virtual int uploadGroupedExpertDownDescriptorTable(
+            const DeviceNativeVNNIMatrixDesc *down_descs,
+            int num_experts,
+            int d_model,
+            int intermediate)
+        {
+            (void)down_descs;
+            (void)num_experts;
+            (void)d_model;
+            (void)intermediate;
+            return -1;
+        }
+
+        /**
+         * @brief Upload persistent all-expert descriptor tables for grouped gate/up decode projections.
+         *
+         * Returns an opaque table id owned by the kernel implementation, or -1 if
+         * the backend cannot use the descriptor tables. Entries may be invalid
+         * for non-local experts; grouped table decode validates active expert ids
+         * before launching.
+         */
+        virtual int uploadGroupedExpertGateUpDescriptorTables(
+            const DeviceNativeVNNIMatrixDesc *gate_descs,
+            const DeviceNativeVNNIMatrixDesc *up_descs,
+            int num_experts,
+            int d_model,
+            int intermediate)
+        {
+            (void)gate_descs;
+            (void)up_descs;
+            (void)num_experts;
+            (void)d_model;
+            (void)intermediate;
+            return -1;
+        }
+
+        /**
+         * @brief Grouped single-token gate/up projections using persistent descriptor tables.
+         *
+         * Implementations should write gate_outputs[i] and up_outputs[i] for each
+         * active expert slot i. The default returns false so stages can fall back
+         * to multiply_fused_tensor().
+         */
+        virtual bool groupedExpertGateUpDecodeFromTable(
+            const TensorBase *input,
+            const int *expert_ids,
+            int descriptor_table_id,
+            int num_active,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            int d_model,
+            int intermediate)
+        {
+            (void)input;
+            (void)expert_ids;
+            (void)descriptor_table_id;
+            (void)num_active;
+            (void)gate_outputs;
+            (void)up_outputs;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
+         * @brief Grouped single-token gate/up projections from device routing indices.
+         *
+         * This variant consumes FP32 routing index tensors directly on device and
+         * avoids the decode-time D2H top-k synchronization. Implementations may
+         * return false to let stages fall back to the host-routed table path.
+         */
+        virtual bool groupedExpertGateUpDecodeFromRouting(
+            const TensorBase *input,
+            ITensor *routing_indices,
+            int descriptor_table_id,
+            int top_k,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            int d_model,
+            int intermediate)
+        {
+            (void)input;
+            (void)routing_indices;
+            (void)descriptor_table_id;
+            (void)top_k;
+            (void)gate_outputs;
+            (void)up_outputs;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
+         * @brief Grouped decode path using a persistent descriptor table.
+         *
+         * The active expert ids are uploaded as tiny per-call routing metadata;
+         * the down projection descriptor is selected on device from the table.
+         */
+        virtual bool groupedExpertDownDecodeFromTable(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            const int *expert_ids,
+            const float *expert_weights,
+            int descriptor_table_id,
+            int num_active,
+            ITensor *output,
+            int d_model,
+            int intermediate)
+        {
+            (void)gate_tensors;
+            (void)up_tensors;
+            (void)expert_ids;
+            (void)expert_weights;
+            (void)descriptor_table_id;
+            (void)num_active;
+            (void)output;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
+         * @brief Grouped decode down path from device routing tensors.
+         *
+         * Reads FP32 routing_indices and routing_weights directly on device,
+         * selecting expert descriptors by expert id without host-side dynamic
+         * expert dispatch.
+         */
+        virtual bool groupedExpertDownDecodeFromRouting(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            ITensor *routing_indices,
+            ITensor *routing_weights,
+            int descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate)
+        {
+            (void)gate_tensors;
+            (void)up_tensors;
+            (void)routing_indices;
+            (void)routing_weights;
+            (void)descriptor_table_id;
+            (void)top_k;
+            (void)output;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
         // =================================================================
         // Device-resident histogram + expert mask (Phase 2)
         //

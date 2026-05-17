@@ -11,6 +11,8 @@
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../tensors/ITensor.h"
+#include "../../../tensors/TensorClasses.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/ROCmKernelProfiler.h"
 
@@ -30,6 +32,41 @@ namespace
             return false;
         }
         return true;
+    }
+
+    bool groupedDecodeSupportsCodebook(uint8_t codebook_id)
+    {
+        return codebook_id == 0 || codebook_id == 4 || codebook_id == 5 ||
+               codebook_id == 6 || codebook_id == 7 || codebook_id == 8;
+    }
+
+    bool groupedDecodeRequiresMins(uint8_t codebook_id)
+    {
+        return codebook_id == 5 || codebook_id == 7 || codebook_id == 8;
+    }
+
+    bool validateGroupedDownDesc(
+        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        int d_model,
+        int intermediate,
+        uint8_t codebook_id)
+    {
+        return desc.valid() && desc.n == d_model && desc.k == intermediate &&
+               desc.blocks_per_row == static_cast<uint32_t>(intermediate / 32) &&
+               desc.codebook_id == codebook_id &&
+               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins);
+    }
+
+    bool validateGroupedGateUpDesc(
+        const llaminar2::DeviceNativeVNNIMatrixDesc &desc,
+        int d_model,
+        int intermediate,
+        uint8_t codebook_id)
+    {
+        return desc.valid() && desc.n == intermediate && desc.k == d_model &&
+               desc.blocks_per_row == static_cast<uint32_t>(d_model / 32) &&
+               desc.codebook_id == codebook_id &&
+               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins);
     }
 }
 
@@ -118,6 +155,53 @@ extern "C"
     bool hipMoE_float_to_int(
         const float *d_input, int *d_output, int count,
         int device_idx, void *stream);
+
+    bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_descs,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_output,
+        int num_active,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream);
+
+    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_output,
+        int num_active,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream);
+
+    bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
+        const float *d_hidden,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        int num_active,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream);
 }
 
 namespace llaminar2
@@ -168,6 +252,66 @@ namespace llaminar2
             hipFree(d_staging_weights_);
             d_staging_weights_ = nullptr;
         }
+        if (d_grouped_gate_ptrs_)
+        {
+            hipFree(d_grouped_gate_ptrs_);
+            d_grouped_gate_ptrs_ = nullptr;
+        }
+        if (d_grouped_up_ptrs_)
+        {
+            hipFree(d_grouped_up_ptrs_);
+            d_grouped_up_ptrs_ = nullptr;
+        }
+        if (d_grouped_expert_ids_)
+        {
+            hipFree(d_grouped_expert_ids_);
+            d_grouped_expert_ids_ = nullptr;
+        }
+        if (d_grouped_decode_weights_)
+        {
+            hipFree(d_grouped_decode_weights_);
+            d_grouped_decode_weights_ = nullptr;
+        }
+        if (d_grouped_down_descs_)
+        {
+            hipFree(d_grouped_down_descs_);
+            d_grouped_down_descs_ = nullptr;
+        }
+        if (d_grouped_swiglu_int8_)
+        {
+            hipFree(d_grouped_swiglu_int8_);
+            d_grouped_swiglu_int8_ = nullptr;
+        }
+        if (d_grouped_swiglu_scales_)
+        {
+            hipFree(d_grouped_swiglu_scales_);
+            d_grouped_swiglu_scales_ = nullptr;
+        }
+        if (d_grouped_gate_output_ptrs_)
+        {
+            hipFree(d_grouped_gate_output_ptrs_);
+            d_grouped_gate_output_ptrs_ = nullptr;
+        }
+        if (d_grouped_up_output_ptrs_)
+        {
+            hipFree(d_grouped_up_output_ptrs_);
+            d_grouped_up_output_ptrs_ = nullptr;
+        }
+        if (d_grouped_gateup_expert_ids_)
+        {
+            hipFree(d_grouped_gateup_expert_ids_);
+            d_grouped_gateup_expert_ids_ = nullptr;
+        }
+        if (d_grouped_hidden_int8_)
+        {
+            hipFree(d_grouped_hidden_int8_);
+            d_grouped_hidden_int8_ = nullptr;
+        }
+        if (d_grouped_hidden_scales_)
+        {
+            hipFree(d_grouped_hidden_scales_);
+            d_grouped_hidden_scales_ = nullptr;
+        }
         if (d_shared_gate_scratch_)
         {
             hipFree(d_shared_gate_scratch_);
@@ -187,6 +331,27 @@ namespace llaminar2
         {
             hipFree(d_route_weights_);
             d_route_weights_ = nullptr;
+        }
+        for (auto &table : grouped_down_desc_tables_)
+        {
+            if (table.device_descs)
+            {
+                hipFree(table.device_descs);
+                table.device_descs = nullptr;
+            }
+        }
+        for (auto &table : grouped_gateup_desc_tables_)
+        {
+            if (table.device_gate_descs)
+            {
+                hipFree(table.device_gate_descs);
+                table.device_gate_descs = nullptr;
+            }
+            if (table.device_up_descs)
+            {
+                hipFree(table.device_up_descs);
+                table.device_up_descs = nullptr;
+            }
         }
     }
 
@@ -330,7 +495,7 @@ namespace llaminar2
         bufs.d_weights = d_route_weights_;
 
         const bool decode_single_token = (seq_len == 1);
-        if (decode_single_token)
+        if (decode_single_token && !debugEnv().rocm.moe_router_decode_blas)
         {
             if (!hipMoE_gate_logits_single_token(hidden, gate_weights, bufs.d_logits,
                                                  d_model, num_experts,
@@ -854,6 +1019,145 @@ namespace llaminar2
         staging_capacity_ = count;
     }
 
+    bool ROCmMoEKernel::ensureGroupedDecodeCapacity(int num_active, int intermediate)
+    {
+        if (num_active <= 0 || intermediate <= 0 || (intermediate % 32) != 0)
+            return false;
+
+        if (!setMoEDevice(device_ordinal_, "ensureGroupedDecodeCapacity"))
+            return false;
+
+        const int blocks_per_row = intermediate / 32;
+        const bool pointer_capacity_ok = grouped_decode_active_cap_ >= num_active;
+        const bool activation_capacity_ok = grouped_decode_intermediate_cap_ >= intermediate;
+        if (pointer_capacity_ok && activation_capacity_ok &&
+            d_grouped_gate_ptrs_ && d_grouped_up_ptrs_ && d_grouped_decode_weights_ &&
+            d_grouped_expert_ids_ && d_grouped_down_descs_ &&
+            d_grouped_swiglu_int8_ && d_grouped_swiglu_scales_)
+        {
+            return true;
+        }
+
+        auto free_grouped = [&]()
+        {
+            if (d_grouped_gate_ptrs_)
+                (void)hipFree(d_grouped_gate_ptrs_);
+            if (d_grouped_up_ptrs_)
+                (void)hipFree(d_grouped_up_ptrs_);
+            if (d_grouped_expert_ids_)
+                (void)hipFree(d_grouped_expert_ids_);
+            if (d_grouped_decode_weights_)
+                (void)hipFree(d_grouped_decode_weights_);
+            if (d_grouped_down_descs_)
+                (void)hipFree(d_grouped_down_descs_);
+            if (d_grouped_swiglu_int8_)
+                (void)hipFree(d_grouped_swiglu_int8_);
+            if (d_grouped_swiglu_scales_)
+                (void)hipFree(d_grouped_swiglu_scales_);
+            d_grouped_gate_ptrs_ = nullptr;
+            d_grouped_up_ptrs_ = nullptr;
+            d_grouped_expert_ids_ = nullptr;
+            d_grouped_decode_weights_ = nullptr;
+            d_grouped_down_descs_ = nullptr;
+            d_grouped_swiglu_int8_ = nullptr;
+            d_grouped_swiglu_scales_ = nullptr;
+            grouped_decode_active_cap_ = 0;
+            grouped_decode_intermediate_cap_ = 0;
+        };
+
+        free_grouped();
+
+        hipError_t err = hipMalloc(&d_grouped_gate_ptrs_, static_cast<size_t>(num_active) * sizeof(float *));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_up_ptrs_, static_cast<size_t>(num_active) * sizeof(float *));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_expert_ids_, static_cast<size_t>(num_active) * sizeof(int));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_decode_weights_, static_cast<size_t>(num_active) * sizeof(float));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_down_descs_, static_cast<size_t>(num_active) * sizeof(DeviceNativeVNNIMatrixDesc));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_swiglu_int8_, static_cast<size_t>(num_active) * intermediate * sizeof(int8_t));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_swiglu_scales_, static_cast<size_t>(num_active) * blocks_per_row * sizeof(float));
+
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::ensureGroupedDecodeCapacity] hipMalloc failed: "
+                      << hipGetErrorString(err));
+            free_grouped();
+            return false;
+        }
+
+        grouped_decode_active_cap_ = num_active;
+        grouped_decode_intermediate_cap_ = intermediate;
+        return true;
+    }
+
+    bool ROCmMoEKernel::ensureGroupedGateUpCapacity(int num_active, int d_model)
+    {
+        if (num_active <= 0 || d_model <= 0 || (d_model % 32) != 0)
+            return false;
+
+        if (!setMoEDevice(device_ordinal_, "ensureGroupedGateUpCapacity"))
+            return false;
+
+        const int blocks_per_row = d_model / 32;
+        if (grouped_gateup_active_cap_ >= num_active &&
+            grouped_gateup_d_model_cap_ >= d_model &&
+            d_grouped_gate_output_ptrs_ && d_grouped_up_output_ptrs_ &&
+            d_grouped_gateup_expert_ids_ &&
+            d_grouped_hidden_int8_ && d_grouped_hidden_scales_)
+        {
+            return true;
+        }
+
+        auto free_gateup = [&]()
+        {
+            if (d_grouped_gate_output_ptrs_)
+                (void)hipFree(d_grouped_gate_output_ptrs_);
+            if (d_grouped_up_output_ptrs_)
+                (void)hipFree(d_grouped_up_output_ptrs_);
+            if (d_grouped_gateup_expert_ids_)
+                (void)hipFree(d_grouped_gateup_expert_ids_);
+            if (d_grouped_hidden_int8_)
+                (void)hipFree(d_grouped_hidden_int8_);
+            if (d_grouped_hidden_scales_)
+                (void)hipFree(d_grouped_hidden_scales_);
+            d_grouped_gate_output_ptrs_ = nullptr;
+            d_grouped_up_output_ptrs_ = nullptr;
+            d_grouped_gateup_expert_ids_ = nullptr;
+            d_grouped_hidden_int8_ = nullptr;
+            d_grouped_hidden_scales_ = nullptr;
+            grouped_gateup_active_cap_ = 0;
+            grouped_gateup_d_model_cap_ = 0;
+        };
+
+        free_gateup();
+
+        hipError_t err = hipMalloc(&d_grouped_gate_output_ptrs_, static_cast<size_t>(num_active) * sizeof(float *));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_up_output_ptrs_, static_cast<size_t>(num_active) * sizeof(float *));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_gateup_expert_ids_, static_cast<size_t>(num_active) * sizeof(int));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_hidden_int8_, static_cast<size_t>(d_model) * sizeof(int8_t));
+        if (err == hipSuccess)
+            err = hipMalloc(&d_grouped_hidden_scales_, static_cast<size_t>(blocks_per_row) * sizeof(float));
+
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::ensureGroupedGateUpCapacity] hipMalloc failed: "
+                      << hipGetErrorString(err));
+            free_gateup();
+            return false;
+        }
+
+        grouped_gateup_active_cap_ = num_active;
+        grouped_gateup_d_model_cap_ = d_model;
+        return true;
+    }
+
     bool ROCmMoEKernel::routeWithTensors(
         ITensor *hidden, ITensor *gate_weights,
         int seq_len, int d_model, int num_experts, int top_k,
@@ -893,7 +1197,10 @@ namespace llaminar2
 
         float *h_idx = nullptr;
         float *h_wt = nullptr;
-        const bool needs_decode_host_topk = (seq_len == 1);
+        const bool needs_decode_host_topk =
+            (seq_len == 1) &&
+            !(debugEnv().rocm.moe_grouped_decode &&
+              debugEnv().rocm.moe_device_routed_decode);
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
         const bool needs_snapshot_host_topk = true;
 #else
@@ -1099,6 +1406,7 @@ namespace llaminar2
 
         scatterAddWeighted(o, e, d_staging_indices_, d_staging_weights_,
                            num_tokens, d_model);
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
 
     void ROCmMoEKernel::sharedExpertGateFromTensors(
@@ -1147,6 +1455,789 @@ namespace llaminar2
         }
 
         weightedAdd(o, in, weight, count);
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    }
+
+    int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable(
+        const DeviceNativeVNNIMatrixDesc *down_descs,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!down_descs || num_experts <= 0 || d_model <= 0 ||
+            intermediate <= 0 || (intermediate % 32) != 0)
+        {
+            return -1;
+        }
+
+        if (!setMoEDevice(device_ordinal_, "uploadGroupedExpertDownDescriptorTable"))
+            return -1;
+
+        bool have_valid_desc = false;
+        uint8_t codebook_id = 0;
+        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+        {
+            const auto &desc = down_descs[expert_id];
+            if (!desc.valid())
+                continue;
+
+            if (!have_valid_desc)
+            {
+                codebook_id = desc.codebook_id;
+                if (!groupedDecodeSupportsCodebook(codebook_id))
+                {
+                    LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] Unsupported native-VNNI codebook "
+                              << static_cast<int>(codebook_id));
+                    return -1;
+                }
+                have_valid_desc = true;
+            }
+
+            if (!validateGroupedDownDesc(desc, d_model, intermediate, codebook_id))
+            {
+                LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] Invalid descriptor for expert "
+                          << expert_id);
+                return -1;
+            }
+        }
+
+        if (!have_valid_desc)
+            return -1;
+
+        GroupedDownDescriptorTable table;
+        table.host_descs.assign(down_descs, down_descs + num_experts);
+        table.num_experts = num_experts;
+        table.d_model = d_model;
+        table.intermediate = intermediate;
+        table.codebook_id = codebook_id;
+
+        DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
+        hipError_t err = hipMalloc(&device_descs,
+                                   static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] hipMalloc failed: "
+                      << hipGetErrorString(err));
+            return -1;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        err = hipMemcpyAsync(device_descs, table.host_descs.data(),
+                             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
+                             hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] H2D descriptor table upload failed: "
+                      << hipGetErrorString(err));
+            (void)hipFree(device_descs);
+            return -1;
+        }
+
+        table.device_descs = device_descs;
+
+        grouped_down_desc_tables_.push_back(std::move(table));
+        return static_cast<int>(grouped_down_desc_tables_.size() - 1);
+    }
+
+    int ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables(
+        const DeviceNativeVNNIMatrixDesc *gate_descs,
+        const DeviceNativeVNNIMatrixDesc *up_descs,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!gate_descs || !up_descs || num_experts <= 0 || d_model <= 0 ||
+            intermediate <= 0 || (d_model % 32) != 0)
+        {
+            return -1;
+        }
+
+        if (!setMoEDevice(device_ordinal_, "uploadGroupedExpertGateUpDescriptorTables"))
+            return -1;
+
+        bool have_valid_desc = false;
+        uint8_t codebook_id = 0;
+        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+        {
+            const auto &gate_desc = gate_descs[expert_id];
+            const auto &up_desc = up_descs[expert_id];
+            if (!gate_desc.valid() && !up_desc.valid())
+                continue;
+
+            if (!gate_desc.valid() || !up_desc.valid())
+            {
+                LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Incomplete descriptor pair for expert "
+                          << expert_id);
+                return -1;
+            }
+
+            if (!have_valid_desc)
+            {
+                if (gate_desc.codebook_id != up_desc.codebook_id)
+                {
+                    LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Gate/up codebook mismatch for expert "
+                              << expert_id << ": gate=" << static_cast<int>(gate_desc.codebook_id)
+                              << " up=" << static_cast<int>(up_desc.codebook_id));
+                    return -1;
+                }
+                codebook_id = gate_desc.codebook_id;
+                if (!groupedDecodeSupportsCodebook(codebook_id))
+                {
+                    LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Unsupported native-VNNI codebook "
+                              << static_cast<int>(codebook_id));
+                    return -1;
+                }
+                have_valid_desc = true;
+            }
+
+            if (!validateGroupedGateUpDesc(gate_desc, d_model, intermediate, codebook_id) ||
+                !validateGroupedGateUpDesc(up_desc, d_model, intermediate, codebook_id))
+            {
+                LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Invalid descriptor pair for expert "
+                          << expert_id);
+                return -1;
+            }
+        }
+
+        if (!have_valid_desc)
+            return -1;
+
+        GroupedGateUpDescriptorTable table;
+        table.host_gate_descs.assign(gate_descs, gate_descs + num_experts);
+        table.host_up_descs.assign(up_descs, up_descs + num_experts);
+        table.num_experts = num_experts;
+        table.d_model = d_model;
+        table.intermediate = intermediate;
+        table.codebook_id = codebook_id;
+
+        DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
+        DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
+        hipError_t err = hipMalloc(&device_gate_descs,
+                                   static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
+        if (err == hipSuccess)
+            err = hipMalloc(&device_up_descs,
+                            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] hipMalloc failed: "
+                      << hipGetErrorString(err));
+            if (device_gate_descs)
+                (void)hipFree(device_gate_descs);
+            if (device_up_descs)
+                (void)hipFree(device_up_descs);
+            return -1;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        err = hipMemcpyAsync(device_gate_descs, table.host_gate_descs.data(),
+                             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
+                             hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(device_up_descs, table.host_up_descs.data(),
+                                 static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                 hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] H2D descriptor upload failed: "
+                      << hipGetErrorString(err));
+            (void)hipFree(device_gate_descs);
+            (void)hipFree(device_up_descs);
+            return -1;
+        }
+
+        table.device_gate_descs = device_gate_descs;
+        table.device_up_descs = device_up_descs;
+
+        grouped_gateup_desc_tables_.push_back(std::move(table));
+        return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
+    }
+
+    bool ROCmMoEKernel::groupedExpertGateUpDecodeFromTable(
+        const TensorBase *input,
+        const int *expert_ids,
+        int descriptor_table_id,
+        int num_active,
+        ITensor *const *gate_outputs,
+        ITensor *const *up_outputs,
+        int d_model,
+        int intermediate)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
+
+        if (!input || !expert_ids || descriptor_table_id < 0 || num_active <= 0 ||
+            !gate_outputs || !up_outputs || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (num_active > 16 || (d_model % 32) != 0)
+            return false;
+        if (descriptor_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
+            return false;
+
+        const auto &table = grouped_gateup_desc_tables_[descriptor_table_id];
+        if (!table.device_gate_descs || !table.device_up_descs || table.num_experts <= 0 ||
+            table.d_model != d_model || table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < num_active; ++i)
+        {
+            const int expert_id = expert_ids[i];
+            if (expert_id < 0 || expert_id >= table.num_experts ||
+                !validateGroupedGateUpDesc(table.host_gate_descs[expert_id], d_model, intermediate, table.codebook_id) ||
+                !validateGroupedGateUpDesc(table.host_up_descs[expert_id], d_model, intermediate, table.codebook_id))
+            {
+                return false;
+            }
+        }
+
+        if (!ensureGroupedGateUpCapacity(num_active, d_model))
+            return false;
+
+        if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromTable"))
+            return false;
+
+        const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        if (!d_hidden)
+        {
+            if (!const_cast<TensorBase *>(input)->ensureOnDevice(DeviceId::rocm(device_ordinal_), getStream()))
+                return false;
+            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        }
+        if (!d_hidden)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromTable] Input tensor has no device pointer");
+            return false;
+        }
+
+        host_grouped_gate_output_ptrs_.assign(static_cast<size_t>(num_active), nullptr);
+        host_grouped_up_output_ptrs_.assign(static_cast<size_t>(num_active), nullptr);
+        host_grouped_gateup_expert_ids_.assign(expert_ids, expert_ids + num_active);
+        for (int i = 0; i < num_active; ++i)
+        {
+            host_grouped_gate_output_ptrs_[i] = static_cast<float *>(gate_outputs[i]->gpu_data_ptr());
+            host_grouped_up_output_ptrs_[i] = static_cast<float *>(up_outputs[i]->gpu_data_ptr());
+            if (!host_grouped_gate_output_ptrs_[i] || !host_grouped_up_output_ptrs_[i])
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromTable] Null gate/up output pointer for active slot "
+                          << i << " expert=" << expert_ids[i]);
+                return false;
+            }
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t err = hipMemcpyAsync(d_grouped_gate_output_ptrs_, host_grouped_gate_output_ptrs_.data(),
+                                        static_cast<size_t>(num_active) * sizeof(float *),
+                                        hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_up_output_ptrs_, host_grouped_up_output_ptrs_.data(),
+                                 static_cast<size_t>(num_active) * sizeof(float *),
+                                 hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_gateup_expert_ids_, host_grouped_gateup_expert_ids_.data(),
+                                 static_cast<size_t>(num_active) * sizeof(int),
+                                 hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromTable] H2D staging failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            d_hidden,
+            table.device_gate_descs,
+            table.device_up_descs,
+            d_grouped_gateup_expert_ids_,
+            d_grouped_gate_output_ptrs_,
+            d_grouped_up_output_ptrs_,
+            d_grouped_hidden_int8_,
+            d_grouped_hidden_scales_,
+            num_active,
+            intermediate,
+            d_model,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
+
+        if (ok)
+        {
+            for (int i = 0; i < num_active; ++i)
+            {
+                gate_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                up_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            }
+        }
+        return ok;
+    }
+
+    bool ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting(
+        const TensorBase *input,
+        ITensor *routing_indices,
+        int descriptor_table_id,
+        int top_k,
+        ITensor *const *gate_outputs,
+        ITensor *const *up_outputs,
+        int d_model,
+        int intermediate)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
+
+        if (!input || !routing_indices || descriptor_table_id < 0 || top_k <= 0 ||
+            !gate_outputs || !up_outputs || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (top_k > 16 || (d_model % 32) != 0)
+            return false;
+        if (descriptor_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
+            return false;
+
+        const auto &table = grouped_gateup_desc_tables_[descriptor_table_id];
+        if (!table.device_gate_descs || !table.device_up_descs || table.num_experts <= 0 ||
+            table.d_model != d_model || table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        for (int expert_id = 0; expert_id < table.num_experts; ++expert_id)
+        {
+            if (!validateGroupedGateUpDesc(table.host_gate_descs[expert_id], d_model, intermediate, table.codebook_id) ||
+                !validateGroupedGateUpDesc(table.host_up_descs[expert_id], d_model, intermediate, table.codebook_id))
+            {
+                return false;
+            }
+        }
+
+        if (!ensureGroupedGateUpCapacity(top_k, d_model))
+            return false;
+
+        if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromRouting"))
+            return false;
+
+        const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        if (!d_hidden)
+        {
+            if (!const_cast<TensorBase *>(input)->ensureOnDevice(DeviceId::rocm(device_ordinal_), getStream()))
+                return false;
+            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        }
+        const float *d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        if (!d_routing_indices)
+        {
+            if (!routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_)))
+                return false;
+            d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        }
+        if (!d_hidden || !d_routing_indices)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] Missing input/routing device pointer");
+            return false;
+        }
+
+        host_grouped_gate_output_ptrs_.assign(static_cast<size_t>(top_k), nullptr);
+        host_grouped_up_output_ptrs_.assign(static_cast<size_t>(top_k), nullptr);
+        for (int i = 0; i < top_k; ++i)
+        {
+            host_grouped_gate_output_ptrs_[i] = static_cast<float *>(gate_outputs[i]->gpu_data_ptr());
+            host_grouped_up_output_ptrs_[i] = static_cast<float *>(up_outputs[i]->gpu_data_ptr());
+            if (!host_grouped_gate_output_ptrs_[i] || !host_grouped_up_output_ptrs_[i])
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] Null gate/up output pointer for slot "
+                          << i);
+                return false;
+            }
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t err = hipMemcpyAsync(d_grouped_gate_output_ptrs_, host_grouped_gate_output_ptrs_.data(),
+                                        static_cast<size_t>(top_k) * sizeof(float *),
+                                        hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_up_output_ptrs_, host_grouped_up_output_ptrs_.data(),
+                                 static_cast<size_t>(top_k) * sizeof(float *),
+                                 hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting] H2D pointer staging failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        if (!hipMoE_float_to_int(
+                d_routing_indices, d_grouped_gateup_expert_ids_, top_k,
+                device_ordinal_, getStream()))
+        {
+            return false;
+        }
+
+        const bool ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            d_hidden,
+            table.device_gate_descs,
+            table.device_up_descs,
+            d_grouped_gateup_expert_ids_,
+            d_grouped_gate_output_ptrs_,
+            d_grouped_up_output_ptrs_,
+            d_grouped_hidden_int8_,
+            d_grouped_hidden_scales_,
+            top_k,
+            intermediate,
+            d_model,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
+
+        if (ok)
+        {
+            for (int i = 0; i < top_k; ++i)
+            {
+                gate_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                up_outputs[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            }
+        }
+        return ok;
+    }
+
+    bool ROCmMoEKernel::groupedExpertDownDecodeFromTable(
+        ITensor *const *gate_tensors,
+        ITensor *const *up_tensors,
+        const int *expert_ids,
+        const float *expert_weights,
+        int descriptor_table_id,
+        int num_active,
+        ITensor *output,
+        int d_model,
+        int intermediate)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SWIGLU, static_cast<hipStream_t>(getStream()));
+
+        if (!gate_tensors || !up_tensors || !expert_ids || !expert_weights ||
+            !output || descriptor_table_id < 0 || num_active <= 0 ||
+            d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (num_active > 16 || (intermediate % 32) != 0)
+            return false;
+        if (descriptor_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+            return false;
+
+        const auto &table = grouped_down_desc_tables_[descriptor_table_id];
+        if (!table.device_descs || table.num_experts <= 0 ||
+            table.d_model != d_model || table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < num_active; ++i)
+        {
+            const int expert_id = expert_ids[i];
+            if (expert_id < 0 || expert_id >= table.num_experts ||
+                !validateGroupedDownDesc(table.host_descs[expert_id], d_model, intermediate, table.codebook_id))
+            {
+                return false;
+            }
+        }
+
+        if (!ensureGroupedDecodeCapacity(num_active, intermediate))
+            return false;
+
+        const float *host_gate_ptrs[16] = {};
+        const float *host_up_ptrs[16] = {};
+        for (int i = 0; i < num_active; ++i)
+        {
+            host_gate_ptrs[i] = static_cast<const float *>(gate_tensors[i]->gpu_data_ptr());
+            host_up_ptrs[i] = static_cast<const float *>(up_tensors[i]->gpu_data_ptr());
+            if (!host_gate_ptrs[i] || !host_up_ptrs[i])
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromTable] Null gate/up device pointer for active slot "
+                          << i << " expert=" << expert_ids[i]);
+                return false;
+            }
+        }
+
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!d_output)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromTable] Output tensor has no device pointer");
+            return false;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t err = hipMemcpyAsync(d_grouped_gate_ptrs_, host_gate_ptrs,
+                                        static_cast<size_t>(num_active) * sizeof(float *),
+                                        hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_up_ptrs_, host_up_ptrs,
+                                 static_cast<size_t>(num_active) * sizeof(float *),
+                                 hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_expert_ids_, expert_ids,
+                                 static_cast<size_t>(num_active) * sizeof(int),
+                                 hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_decode_weights_, expert_weights,
+                                 static_cast<size_t>(num_active) * sizeof(float),
+                                 hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromTable] H2D staging failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            d_grouped_gate_ptrs_,
+            d_grouped_up_ptrs_,
+            table.device_descs,
+            d_grouped_expert_ids_,
+            d_grouped_decode_weights_,
+            d_grouped_swiglu_int8_,
+            d_grouped_swiglu_scales_,
+            d_output,
+            num_active,
+            d_model,
+            intermediate,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
+
+        if (ok)
+            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        return ok;
+    }
+
+    bool ROCmMoEKernel::groupedExpertDownDecodeFromRouting(
+        ITensor *const *gate_tensors,
+        ITensor *const *up_tensors,
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int descriptor_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SWIGLU, static_cast<hipStream_t>(getStream()));
+
+        if (!gate_tensors || !up_tensors || !routing_indices || !routing_weights ||
+            !output || descriptor_table_id < 0 || top_k <= 0 ||
+            d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (top_k > 16 || (intermediate % 32) != 0)
+            return false;
+        if (descriptor_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+            return false;
+
+        const auto &table = grouped_down_desc_tables_[descriptor_table_id];
+        if (!table.device_descs || table.num_experts <= 0 ||
+            table.d_model != d_model || table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        for (int expert_id = 0; expert_id < table.num_experts; ++expert_id)
+        {
+            if (!validateGroupedDownDesc(table.host_descs[expert_id], d_model, intermediate, table.codebook_id))
+                return false;
+        }
+
+        if (!ensureGroupedDecodeCapacity(top_k, intermediate))
+            return false;
+
+        const float *host_gate_ptrs[16] = {};
+        const float *host_up_ptrs[16] = {};
+        for (int i = 0; i < top_k; ++i)
+        {
+            host_gate_ptrs[i] = static_cast<const float *>(gate_tensors[i]->gpu_data_ptr());
+            host_up_ptrs[i] = static_cast<const float *>(up_tensors[i]->gpu_data_ptr());
+            if (!host_gate_ptrs[i] || !host_up_ptrs[i])
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRouting] Null gate/up device pointer for slot "
+                          << i);
+                return false;
+            }
+        }
+
+        const float *d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        if (!d_routing_indices)
+        {
+            if (!routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_)))
+                return false;
+            d_routing_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        }
+        const float *d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!d_weights)
+        {
+            if (!routing_weights->ensureOnDevice(DeviceId::rocm(device_ordinal_)))
+                return false;
+            d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
+        }
+
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!d_routing_indices || !d_weights || !d_output)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRouting] Missing routing/output device pointer");
+            return false;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t err = hipMemcpyAsync(d_grouped_gate_ptrs_, host_gate_ptrs,
+                                        static_cast<size_t>(top_k) * sizeof(float *),
+                                        hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_up_ptrs_, host_up_ptrs,
+                                 static_cast<size_t>(top_k) * sizeof(float *),
+                                 hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRouting] H2D pointer staging failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        if (!hipMoE_float_to_int(
+                d_routing_indices, d_grouped_expert_ids_, top_k,
+                device_ordinal_, getStream()))
+        {
+            return false;
+        }
+
+        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+            d_grouped_gate_ptrs_,
+            d_grouped_up_ptrs_,
+            table.device_descs,
+            d_grouped_expert_ids_,
+            d_weights,
+            d_grouped_swiglu_int8_,
+            d_grouped_swiglu_scales_,
+            d_output,
+            top_k,
+            d_model,
+            intermediate,
+            table.codebook_id,
+            device_ordinal_,
+            getStream());
+
+        if (ok)
+            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        return ok;
+    }
+
+    bool ROCmMoEKernel::groupedExpertDownDecode(
+        ITensor *const *gate_tensors,
+        ITensor *const *up_tensors,
+        const int *expert_ids,
+        const float *expert_weights,
+        const DeviceNativeVNNIMatrixDesc *down_descs,
+        int num_active,
+        ITensor *output,
+        int d_model,
+        int intermediate)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SWIGLU, static_cast<hipStream_t>(getStream()));
+
+        if (!gate_tensors || !up_tensors || !expert_ids || !expert_weights ||
+            !down_descs || !output || num_active <= 0 || d_model <= 0 || intermediate <= 0)
+        {
+            return false;
+        }
+        if (num_active > 16 || (intermediate % 32) != 0)
+        {
+            return false;
+        }
+
+        const uint8_t codebook_id = down_descs[0].codebook_id;
+        for (int i = 0; i < num_active; ++i)
+        {
+            if (expert_ids[i] < 0 || !down_descs[i].valid() ||
+                down_descs[i].n != d_model || down_descs[i].k != intermediate ||
+                down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
+                down_descs[i].codebook_id != codebook_id ||
+                ((down_descs[i].codebook_id == 5 || down_descs[i].codebook_id == 7 ||
+                  down_descs[i].codebook_id == 8) &&
+                 !down_descs[i].mins))
+            {
+                return false;
+            }
+        }
+
+        if (codebook_id != 0 && codebook_id != 4 && codebook_id != 5 &&
+            codebook_id != 6 && codebook_id != 7 && codebook_id != 8)
+        {
+            LOG_DEBUG("[ROCmMoEKernel::groupedExpertDownDecode] Unsupported native-VNNI codebook "
+                      << static_cast<int>(codebook_id) << "; using fallback");
+            return false;
+        }
+
+        if (!ensureGroupedDecodeCapacity(num_active, intermediate))
+            return false;
+
+        const float *host_gate_ptrs[16] = {};
+        const float *host_up_ptrs[16] = {};
+        for (int i = 0; i < num_active; ++i)
+        {
+            host_gate_ptrs[i] = static_cast<const float *>(gate_tensors[i]->gpu_data_ptr());
+            host_up_ptrs[i] = static_cast<const float *>(up_tensors[i]->gpu_data_ptr());
+            if (!host_gate_ptrs[i] || !host_up_ptrs[i])
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecode] Null gate/up device pointer for active slot "
+                          << i << " expert=" << expert_ids[i]);
+                return false;
+            }
+        }
+
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!d_output)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecode] Output tensor has no device pointer");
+            return false;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t err = hipMemcpyAsync(d_grouped_gate_ptrs_, host_gate_ptrs,
+                                        static_cast<size_t>(num_active) * sizeof(float *),
+                                        hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_up_ptrs_, host_up_ptrs,
+                                 static_cast<size_t>(num_active) * sizeof(float *),
+                                 hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_decode_weights_, expert_weights,
+                                 static_cast<size_t>(num_active) * sizeof(float),
+                                 hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(d_grouped_down_descs_, down_descs,
+                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                 hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecode] H2D staging failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        const bool ok = rocmMoE_grouped_swiglu_down_native_vnni_decode(
+            d_grouped_gate_ptrs_,
+            d_grouped_up_ptrs_,
+            d_grouped_down_descs_,
+            d_grouped_decode_weights_,
+            d_grouped_swiglu_int8_,
+            d_grouped_swiglu_scales_,
+            d_output,
+            num_active,
+            d_model,
+            intermediate,
+            codebook_id,
+            device_ordinal_,
+            getStream());
+
+        if (ok)
+            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        return ok;
     }
 
     // =========================================================================
@@ -1252,6 +2343,7 @@ namespace llaminar2
         int offset = host_expert_offsets_[expert_id];
 
         gatherTokenBatch(h, b, d_group_token_indices_ + offset, count, d_model);
+        batch_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
 
     void ROCmMoEKernel::scatterExpertResults(
@@ -1268,6 +2360,7 @@ namespace llaminar2
 
         scatterAddWeighted(o, r, d_group_token_indices_ + offset,
                            d_group_weights_ + offset, count, d_model);
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     }
 
 } // namespace llaminar2

@@ -25,9 +25,11 @@
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/cpu/moe/CPUMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "backends/GPUDeviceContextPool.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #endif
 
 #include "../../../utils/TestTensorFactory.h"
@@ -37,6 +39,7 @@
 #include <random>
 #include <iostream>
 #include <iomanip>
+#include <memory>
 #include <numeric>
 #include <algorithm>
 
@@ -83,7 +86,8 @@ namespace
             norm_a += static_cast<double>(a[i]) * a[i];
             norm_b += static_cast<double>(b[i]) * b[i];
         }
-        if (norm_a < 1e-30 || norm_b < 1e-30) return 0.0;
+        if (norm_a < 1e-30 || norm_b < 1e-30)
+            return 0.0;
         return dot / (std::sqrt(norm_a) * std::sqrt(norm_b));
     }
 
@@ -96,7 +100,8 @@ namespace
             err_sq += diff * diff;
             ref_sq += static_cast<double>(reference[i]) * reference[i];
         }
-        if (ref_sq < 1e-30) return 0.0;
+        if (ref_sq < 1e-30)
+            return 0.0;
         return std::sqrt(err_sq / ref_sq);
     }
 
@@ -115,7 +120,8 @@ namespace
     {
         std::mt19937 gen(seed);
         std::uniform_real_distribution<float> dist(lo, hi);
-        for (auto &x : v) x = dist(gen);
+        for (auto &x : v)
+            x = dist(gen);
     }
 
 } // namespace
@@ -145,8 +151,8 @@ TEST(Test__ROCmMoEKernel, Route_DecodeSmall)
     CPUMoEKernel cpu_kernel;
     MoERoutingResult cpu_result;
     ASSERT_TRUE(cpu_kernel.route(hidden.data(), gate_weights.data(),
-                                  seq_len, d_model, num_experts, top_k,
-                                  true, cpu_result));
+                                 seq_len, d_model, num_experts, top_k,
+                                 true, cpu_result));
 
     // GPU execution
     ROCmMoEKernel gpu_kernel(0);
@@ -160,8 +166,8 @@ TEST(Test__ROCmMoEKernel, Route_DecodeSmall)
 
     MoERoutingResult gpu_result;
     ASSERT_TRUE(gpu_kernel.route(d_hidden, d_gate_weights,
-                                  seq_len, d_model, num_experts, top_k,
-                                  true, gpu_result));
+                                 seq_len, d_model, num_experts, top_k,
+                                 true, gpu_result));
 
     hipFree(d_hidden);
     hipFree(d_gate_weights);
@@ -221,8 +227,8 @@ TEST(Test__ROCmMoEKernel, Route_PrefillLarge)
     CPUMoEKernel cpu_kernel;
     MoERoutingResult cpu_result;
     ASSERT_TRUE(cpu_kernel.route(hidden.data(), gate_weights.data(),
-                                  seq_len, d_model, num_experts, top_k,
-                                  true, cpu_result));
+                                 seq_len, d_model, num_experts, top_k,
+                                 true, cpu_result));
 
     // GPU
     ROCmMoEKernel gpu_kernel(0);
@@ -234,8 +240,8 @@ TEST(Test__ROCmMoEKernel, Route_PrefillLarge)
 
     MoERoutingResult gpu_result;
     ASSERT_TRUE(gpu_kernel.route(d_hidden, d_gate,
-                                  seq_len, d_model, num_experts, top_k,
-                                  true, gpu_result));
+                                 seq_len, d_model, num_experts, top_k,
+                                 true, gpu_result));
 
     hipFree(d_hidden);
     hipFree(d_gate);
@@ -317,7 +323,8 @@ TEST(Test__ROCmMoEKernel, GatherTokenBatch)
     int mismatches = 0;
     for (size_t i = 0; i < gpu_batch.size(); ++i)
     {
-        if (gpu_batch[i] != cpu_batch[i]) ++mismatches;
+        if (gpu_batch[i] != cpu_batch[i])
+            ++mismatches;
     }
     EXPECT_EQ(mismatches, 0) << "Gather had " << mismatches << " mismatches (should be exact copy)";
 
@@ -549,6 +556,518 @@ TEST(Test__ROCmMoEKernel, SwiGLU)
 }
 
 // ============================================================================
+// Test: grouped decode expert down path matches existing sequential ROCm path
+// ============================================================================
+
+TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q4_0MatchesSequential)
+{
+    SKIP_IF_NO_ROCM();
+
+    const int d_model = 128;
+    const int intermediate = 128;
+    const int num_active = 4;
+    const int expert_ids[num_active] = {2, 7, 3, 5};
+    const float route_weights[num_active] = {0.39f, 0.27f, 0.21f, 0.13f};
+    const DeviceId device = DeviceId::rocm(0);
+
+    ROCmMoEKernel moe_kernel(0);
+
+    std::vector<std::unique_ptr<TensorBase>> weight_tensors;
+    std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> packed_weights;
+    std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> down_kernels;
+    weight_tensors.reserve(num_active);
+    packed_weights.reserve(num_active);
+    down_kernels.reserve(num_active);
+
+    for (int i = 0; i < num_active; ++i)
+    {
+        auto weights = TestTensorFactory::createQ4_0Random(
+            {static_cast<size_t>(d_model), static_cast<size_t>(intermediate)});
+        auto packed = std::make_unique<rocm::ROCmPackedWeights>();
+        ASSERT_TRUE(rocm::packWeightsToROCm(weights.get(), *packed))
+            << "packWeightsToROCm failed for expert " << expert_ids[i];
+        ASSERT_FALSE(packed->native_vnni_payload.empty());
+
+        auto kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(packed.get(), 0);
+        weight_tensors.push_back(std::move(weights));
+        packed_weights.push_back(std::move(packed));
+        down_kernels.push_back(std::move(kernel));
+    }
+
+    auto reqs = down_kernels[0]->getWorkspaceRequirements(1, d_model, intermediate);
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace->allocate(reqs));
+    for (auto &kernel : down_kernels)
+    {
+        kernel->bindWorkspace(workspace.get());
+        kernel->prepareWeights();
+    }
+
+    std::vector<std::shared_ptr<FP32Tensor>> gate_tensors;
+    std::vector<std::shared_ptr<FP32Tensor>> up_tensors;
+    gate_tensors.reserve(num_active);
+    up_tensors.reserve(num_active);
+    for (int i = 0; i < num_active; ++i)
+    {
+        auto gate = TestTensorFactory::createFP32Random(
+            {1, static_cast<size_t>(intermediate)}, -2.0f, 2.0f, 100 + i);
+        auto up = TestTensorFactory::createFP32Random(
+            {1, static_cast<size_t>(intermediate)}, -2.0f, 2.0f, 200 + i);
+        ASSERT_TRUE(gate->ensureOnDevice(device));
+        ASSERT_TRUE(up->ensureOnDevice(device));
+        gate_tensors.push_back(std::move(gate));
+        up_tensors.push_back(std::move(up));
+    }
+
+    auto sequential_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    auto grouped_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    auto device_routed_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    ASSERT_TRUE(sequential_output->ensureOnDevice(device));
+    ASSERT_TRUE(grouped_output->ensureOnDevice(device));
+    ASSERT_TRUE(device_routed_output->ensureOnDevice(device));
+    moe_kernel.zeroBuffer(sequential_output.get(), static_cast<size_t>(d_model) * sizeof(float));
+    moe_kernel.zeroBuffer(grouped_output.get(), static_cast<size_t>(d_model) * sizeof(float));
+    moe_kernel.zeroBuffer(device_routed_output.get(), static_cast<size_t>(d_model) * sizeof(float));
+
+    for (int i = 0; i < num_active; ++i)
+    {
+        auto expert_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+        ASSERT_TRUE(expert_output->ensureOnDevice(device));
+        ASSERT_TRUE(down_kernels[i]->multiply_tensor_with_fused_swiglu(
+            gate_tensors[i].get(), up_tensors[i].get(), expert_output.get(),
+            1, d_model, intermediate));
+        expert_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        moe_kernel.weightedAddFromTensors(
+            sequential_output.get(), expert_output.get(), route_weights[i], d_model);
+    }
+    sequential_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+    ITensor *gate_ptrs[num_active] = {};
+    ITensor *up_ptrs[num_active] = {};
+    DeviceNativeVNNIMatrixDesc descs[num_active] = {};
+    for (int i = 0; i < num_active; ++i)
+    {
+        gate_ptrs[i] = gate_tensors[i].get();
+        up_ptrs[i] = up_tensors[i].get();
+        ASSERT_TRUE(down_kernels[i]->exportNativeVNNIMatrixDesc(descs[i]));
+        ASSERT_EQ(descs[i].n, d_model);
+        ASSERT_EQ(descs[i].k, intermediate);
+    }
+
+    ASSERT_TRUE(moe_kernel.groupedExpertDownDecode(
+        gate_ptrs, up_ptrs, expert_ids, route_weights, descs,
+        num_active, grouped_output.get(), d_model, intermediate));
+    hipDeviceSynchronize();
+
+    sequential_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+    const float *seq = sequential_output->data();
+    const float *grouped = grouped_output->data();
+    ASSERT_FALSE(hasNaNOrInf(grouped, d_model));
+    const double cosine = cosineSimilarity(grouped, seq, d_model);
+    const double l2_err = relativeL2Error(grouped, seq, d_model);
+
+    EXPECT_GE(cosine, 0.999)
+        << "Grouped expert down cosine mismatch: " << cosine;
+    EXPECT_LE(l2_err, 0.02)
+        << "Grouped expert down relative L2 too high: " << l2_err;
+
+    std::cout << "[GroupedExpertDownDecode_Q4_0MatchesSequential] cosine="
+              << std::fixed << std::setprecision(6) << cosine
+              << " l2_err=" << l2_err << std::endl;
+}
+
+template <typename WeightFactory>
+void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory create_weights)
+{
+    const int d_model = 128;
+    const int intermediate = 256;
+    const int num_experts = 8;
+    const int num_active = 4;
+    const int expert_ids[num_active] = {2, 7, 3, 5};
+    const float route_weights[num_active] = {0.39f, 0.27f, 0.21f, 0.13f};
+    const DeviceId device = DeviceId::rocm(0);
+
+    ROCmMoEKernel moe_kernel(0);
+
+    std::vector<std::unique_ptr<TensorBase>> weight_tensors;
+    std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> packed_weights;
+    std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> down_kernels;
+    weight_tensors.reserve(num_experts);
+    packed_weights.reserve(num_experts);
+    down_kernels.reserve(num_experts);
+
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+    {
+        auto weights = create_weights(static_cast<size_t>(d_model), static_cast<size_t>(intermediate));
+        auto packed = std::make_unique<rocm::ROCmPackedWeights>();
+        ASSERT_TRUE(rocm::packWeightsToROCm(weights.get(), *packed))
+            << "packWeightsToROCm failed for " << label << " expert " << expert_id;
+        ASSERT_FALSE(packed->native_vnni_payload.empty());
+
+        auto kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(packed.get(), 0);
+        weight_tensors.push_back(std::move(weights));
+        packed_weights.push_back(std::move(packed));
+        down_kernels.push_back(std::move(kernel));
+    }
+
+    auto reqs = down_kernels[0]->getWorkspaceRequirements(1, d_model, intermediate);
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace->allocate(reqs));
+    for (auto &kernel : down_kernels)
+    {
+        kernel->bindWorkspace(workspace.get());
+        kernel->prepareWeights();
+    }
+
+    std::vector<std::shared_ptr<FP32Tensor>> gate_tensors;
+    std::vector<std::shared_ptr<FP32Tensor>> up_tensors;
+    gate_tensors.reserve(num_active);
+    up_tensors.reserve(num_active);
+    for (int i = 0; i < num_active; ++i)
+    {
+        auto gate = TestTensorFactory::createFP32Random(
+            {1, static_cast<size_t>(intermediate)}, -2.0f, 2.0f, 300 + i);
+        auto up = TestTensorFactory::createFP32Random(
+            {1, static_cast<size_t>(intermediate)}, -2.0f, 2.0f, 400 + i);
+        ASSERT_TRUE(gate->ensureOnDevice(device));
+        ASSERT_TRUE(up->ensureOnDevice(device));
+        gate_tensors.push_back(std::move(gate));
+        up_tensors.push_back(std::move(up));
+    }
+
+    auto sequential_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    auto grouped_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    auto device_routed_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    ASSERT_TRUE(sequential_output->ensureOnDevice(device));
+    ASSERT_TRUE(grouped_output->ensureOnDevice(device));
+    ASSERT_TRUE(device_routed_output->ensureOnDevice(device));
+    moe_kernel.zeroBuffer(sequential_output.get(), static_cast<size_t>(d_model) * sizeof(float));
+    moe_kernel.zeroBuffer(grouped_output.get(), static_cast<size_t>(d_model) * sizeof(float));
+    moe_kernel.zeroBuffer(device_routed_output.get(), static_cast<size_t>(d_model) * sizeof(float));
+
+    for (int i = 0; i < num_active; ++i)
+    {
+        auto expert_output = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+        ASSERT_TRUE(expert_output->ensureOnDevice(device));
+        ASSERT_TRUE(down_kernels[expert_ids[i]]->multiply_tensor_with_fused_swiglu(
+            gate_tensors[i].get(), up_tensors[i].get(), expert_output.get(),
+            1, d_model, intermediate));
+        expert_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        moe_kernel.weightedAddFromTensors(
+            sequential_output.get(), expert_output.get(), route_weights[i], d_model);
+    }
+    sequential_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+    ITensor *gate_ptrs[num_active] = {};
+    ITensor *up_ptrs[num_active] = {};
+    std::vector<DeviceNativeVNNIMatrixDesc> descs(num_experts);
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+    {
+        ASSERT_TRUE(down_kernels[expert_id]->exportNativeVNNIMatrixDesc(descs[expert_id]));
+        ASSERT_EQ(descs[expert_id].n, d_model);
+        ASSERT_EQ(descs[expert_id].k, intermediate);
+    }
+    for (int i = 0; i < num_active; ++i)
+    {
+        gate_ptrs[i] = gate_tensors[i].get();
+        up_ptrs[i] = up_tensors[i].get();
+    }
+
+    const int table_id = moe_kernel.uploadGroupedExpertDownDescriptorTable(
+        descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(table_id, 0);
+
+    ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromTable(
+        gate_ptrs, up_ptrs, expert_ids, route_weights, table_id,
+        num_active, grouped_output.get(), d_model, intermediate));
+
+    auto routing_indices = TestTensorFactory::createFP32({static_cast<size_t>(num_active)});
+    auto routing_weights = TestTensorFactory::createFP32({static_cast<size_t>(num_active)});
+    for (int i = 0; i < num_active; ++i)
+    {
+        routing_indices->mutable_data()[i] = static_cast<float>(expert_ids[i]);
+        routing_weights->mutable_data()[i] = route_weights[i];
+    }
+    ASSERT_TRUE(routing_indices->ensureOnDevice(device));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(device));
+
+    ASSERT_TRUE(moe_kernel.groupedExpertDownDecodeFromRouting(
+        gate_ptrs, up_ptrs, routing_indices.get(), routing_weights.get(), table_id,
+        num_active, device_routed_output.get(), d_model, intermediate));
+    hipDeviceSynchronize();
+
+    sequential_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    device_routed_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+    const float *seq = sequential_output->data();
+    const float *grouped = grouped_output->data();
+    const float *device_routed = device_routed_output->data();
+    ASSERT_FALSE(hasNaNOrInf(grouped, d_model));
+    ASSERT_FALSE(hasNaNOrInf(device_routed, d_model));
+    const double cosine = cosineSimilarity(grouped, seq, d_model);
+    const double l2_err = relativeL2Error(grouped, seq, d_model);
+    const double device_cosine = cosineSimilarity(device_routed, seq, d_model);
+    const double device_l2_err = relativeL2Error(device_routed, seq, d_model);
+
+    EXPECT_GE(cosine, 0.999)
+        << label << " grouped expert down cosine mismatch: " << cosine;
+    EXPECT_LE(l2_err, 0.02)
+        << label << " grouped expert down relative L2 too high: " << l2_err;
+    EXPECT_GE(device_cosine, 0.999)
+        << label << " device-routed grouped expert down cosine mismatch: " << device_cosine;
+    EXPECT_LE(device_l2_err, 0.02)
+        << label << " device-routed grouped expert down relative L2 too high: " << device_l2_err;
+
+    std::cout << "[GroupedExpertDownDecode_" << label << "MatchesSequential] cosine="
+              << std::fixed << std::setprecision(6) << cosine
+              << " l2_err=" << l2_err
+              << " device_cosine=" << device_cosine
+              << " device_l2_err=" << device_l2_err << std::endl;
+}
+
+TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q5_KMatchesSequential)
+{
+    SKIP_IF_NO_ROCM();
+    runGroupedExpertDownDecodeFormatMatch("Q5_K", [](size_t rows, size_t cols)
+                                          { return TestTensorFactory::createQ5_KRandom({rows, cols}); });
+}
+
+TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q6_KMatchesSequential)
+{
+    SKIP_IF_NO_ROCM();
+    runGroupedExpertDownDecodeFormatMatch("Q6_K", [](size_t rows, size_t cols)
+                                          { return TestTensorFactory::createQ6_KRandom({rows, cols}); });
+}
+
+template <typename WeightFactory>
+void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory create_weights)
+{
+    const int d_model = 256;
+    const int intermediate = 128;
+    const int num_experts = 8;
+    const int num_active = 4;
+    const int expert_ids[num_active] = {2, 7, 3, 5};
+    const DeviceId device = DeviceId::rocm(0);
+
+    ROCmMoEKernel moe_kernel(0);
+
+    std::vector<std::unique_ptr<TensorBase>> gate_weight_tensors;
+    std::vector<std::unique_ptr<TensorBase>> up_weight_tensors;
+    std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> gate_packed_weights;
+    std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> up_packed_weights;
+    std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> gate_kernels;
+    std::vector<std::unique_ptr<rocm::ROCmQuantisedGemmKernel>> up_kernels;
+    gate_weight_tensors.reserve(num_experts);
+    up_weight_tensors.reserve(num_experts);
+    gate_packed_weights.reserve(num_experts);
+    up_packed_weights.reserve(num_experts);
+    gate_kernels.reserve(num_experts);
+    up_kernels.reserve(num_experts);
+
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+    {
+        auto gate_weights = create_weights(static_cast<size_t>(intermediate), static_cast<size_t>(d_model));
+        auto up_weights = create_weights(static_cast<size_t>(intermediate), static_cast<size_t>(d_model));
+        auto gate_packed = std::make_unique<rocm::ROCmPackedWeights>();
+        auto up_packed = std::make_unique<rocm::ROCmPackedWeights>();
+        ASSERT_TRUE(rocm::packWeightsToROCm(gate_weights.get(), *gate_packed))
+            << "packWeightsToROCm failed for " << label << " gate expert " << expert_id;
+        ASSERT_TRUE(rocm::packWeightsToROCm(up_weights.get(), *up_packed))
+            << "packWeightsToROCm failed for " << label << " up expert " << expert_id;
+        ASSERT_FALSE(gate_packed->native_vnni_payload.empty());
+        ASSERT_FALSE(up_packed->native_vnni_payload.empty());
+
+        auto gate_kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(gate_packed.get(), 0);
+        auto up_kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(up_packed.get(), 0);
+        gate_weight_tensors.push_back(std::move(gate_weights));
+        up_weight_tensors.push_back(std::move(up_weights));
+        gate_packed_weights.push_back(std::move(gate_packed));
+        up_packed_weights.push_back(std::move(up_packed));
+        gate_kernels.push_back(std::move(gate_kernel));
+        up_kernels.push_back(std::move(up_kernel));
+    }
+
+    auto reqs = gate_kernels[0]->getWorkspaceRequirements(1, intermediate, d_model);
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace->allocate(reqs));
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+    {
+        gate_kernels[expert_id]->bindWorkspace(workspace.get());
+        up_kernels[expert_id]->bindWorkspace(workspace.get());
+        gate_kernels[expert_id]->prepareWeights();
+        up_kernels[expert_id]->prepareWeights();
+    }
+
+    auto input = TestTensorFactory::createFP32Random(
+        {1, static_cast<size_t>(d_model)}, -2.0f, 2.0f, 900);
+    ASSERT_TRUE(input->ensureOnDevice(device));
+
+    std::vector<std::shared_ptr<FP32Tensor>> seq_gate_tensors;
+    std::vector<std::shared_ptr<FP32Tensor>> seq_up_tensors;
+    std::vector<std::shared_ptr<FP32Tensor>> grouped_gate_tensors;
+    std::vector<std::shared_ptr<FP32Tensor>> grouped_up_tensors;
+    std::vector<std::shared_ptr<FP32Tensor>> device_gate_tensors;
+    std::vector<std::shared_ptr<FP32Tensor>> device_up_tensors;
+    seq_gate_tensors.reserve(num_active);
+    seq_up_tensors.reserve(num_active);
+    grouped_gate_tensors.reserve(num_active);
+    grouped_up_tensors.reserve(num_active);
+    device_gate_tensors.reserve(num_active);
+    device_up_tensors.reserve(num_active);
+
+    std::vector<ITensorGemm::TensorProjectionDesc> projections;
+    projections.reserve(num_active * 2);
+    for (int i = 0; i < num_active; ++i)
+    {
+        auto seq_gate = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
+        auto seq_up = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
+        auto grouped_gate = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
+        auto grouped_up = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
+        auto device_gate = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
+        auto device_up = TestTensorFactory::createFP32({1, static_cast<size_t>(intermediate)});
+        ASSERT_TRUE(seq_gate->ensureOnDevice(device));
+        ASSERT_TRUE(seq_up->ensureOnDevice(device));
+        ASSERT_TRUE(grouped_gate->ensureOnDevice(device));
+        ASSERT_TRUE(grouped_up->ensureOnDevice(device));
+        ASSERT_TRUE(device_gate->ensureOnDevice(device));
+        ASSERT_TRUE(device_up->ensureOnDevice(device));
+
+        const int expert_id = expert_ids[i];
+        projections.emplace_back(gate_kernels[expert_id].get(), seq_gate.get(), intermediate, nullptr, "gate");
+        projections.emplace_back(up_kernels[expert_id].get(), seq_up.get(), intermediate, nullptr, "up");
+
+        seq_gate_tensors.push_back(std::move(seq_gate));
+        seq_up_tensors.push_back(std::move(seq_up));
+        grouped_gate_tensors.push_back(std::move(grouped_gate));
+        grouped_up_tensors.push_back(std::move(grouped_up));
+        device_gate_tensors.push_back(std::move(device_gate));
+        device_up_tensors.push_back(std::move(device_up));
+    }
+
+    ASSERT_TRUE(gate_kernels[expert_ids[0]]->multiply_fused_tensor(
+        input.get(), projections, 1, d_model));
+    hipDeviceSynchronize();
+
+    std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
+    for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+    {
+        ASSERT_TRUE(gate_kernels[expert_id]->exportNativeVNNIMatrixDesc(gate_descs[expert_id]));
+        ASSERT_TRUE(up_kernels[expert_id]->exportNativeVNNIMatrixDesc(up_descs[expert_id]));
+        ASSERT_EQ(gate_descs[expert_id].n, intermediate);
+        ASSERT_EQ(gate_descs[expert_id].k, d_model);
+        ASSERT_EQ(up_descs[expert_id].n, intermediate);
+        ASSERT_EQ(up_descs[expert_id].k, d_model);
+    }
+
+    ITensor *grouped_gate_ptrs[num_active] = {};
+    ITensor *grouped_up_ptrs[num_active] = {};
+    ITensor *device_gate_ptrs[num_active] = {};
+    ITensor *device_up_ptrs[num_active] = {};
+    for (int i = 0; i < num_active; ++i)
+    {
+        grouped_gate_ptrs[i] = grouped_gate_tensors[i].get();
+        grouped_up_ptrs[i] = grouped_up_tensors[i].get();
+        device_gate_ptrs[i] = device_gate_tensors[i].get();
+        device_up_ptrs[i] = device_up_tensors[i].get();
+    }
+
+    const int table_id = moe_kernel.uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(table_id, 0);
+
+    ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromTable(
+        input.get(), expert_ids, table_id, num_active,
+        grouped_gate_ptrs, grouped_up_ptrs, d_model, intermediate));
+
+    auto routing_indices = TestTensorFactory::createFP32({static_cast<size_t>(num_active)});
+    for (int i = 0; i < num_active; ++i)
+        routing_indices->mutable_data()[i] = static_cast<float>(expert_ids[i]);
+    ASSERT_TRUE(routing_indices->ensureOnDevice(device));
+
+    ASSERT_TRUE(moe_kernel.groupedExpertGateUpDecodeFromRouting(
+        input.get(), routing_indices.get(), table_id, num_active,
+        device_gate_ptrs, device_up_ptrs, d_model, intermediate));
+    hipDeviceSynchronize();
+
+    for (int i = 0; i < num_active; ++i)
+    {
+        seq_gate_tensors[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        seq_up_tensors[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        grouped_gate_tensors[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        grouped_up_tensors[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        device_gate_tensors[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        device_up_tensors[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        const float *seq_gate = seq_gate_tensors[i]->data();
+        const float *seq_up = seq_up_tensors[i]->data();
+        const float *grouped_gate = grouped_gate_tensors[i]->data();
+        const float *grouped_up = grouped_up_tensors[i]->data();
+        const float *device_gate = device_gate_tensors[i]->data();
+        const float *device_up = device_up_tensors[i]->data();
+
+        ASSERT_FALSE(hasNaNOrInf(grouped_gate, intermediate));
+        ASSERT_FALSE(hasNaNOrInf(grouped_up, intermediate));
+        ASSERT_FALSE(hasNaNOrInf(device_gate, intermediate));
+        ASSERT_FALSE(hasNaNOrInf(device_up, intermediate));
+
+        const double gate_cosine = cosineSimilarity(grouped_gate, seq_gate, intermediate);
+        const double up_cosine = cosineSimilarity(grouped_up, seq_up, intermediate);
+        const double gate_l2 = relativeL2Error(grouped_gate, seq_gate, intermediate);
+        const double up_l2 = relativeL2Error(grouped_up, seq_up, intermediate);
+        const double device_gate_cosine = cosineSimilarity(device_gate, seq_gate, intermediate);
+        const double device_up_cosine = cosineSimilarity(device_up, seq_up, intermediate);
+        const double device_gate_l2 = relativeL2Error(device_gate, seq_gate, intermediate);
+        const double device_up_l2 = relativeL2Error(device_up, seq_up, intermediate);
+
+        EXPECT_GE(gate_cosine, 0.999)
+            << label << " grouped gate cosine mismatch for active slot " << i;
+        EXPECT_GE(up_cosine, 0.999)
+            << label << " grouped up cosine mismatch for active slot " << i;
+        EXPECT_LE(gate_l2, 0.02)
+            << label << " grouped gate relative L2 too high for active slot " << i;
+        EXPECT_LE(up_l2, 0.02)
+            << label << " grouped up relative L2 too high for active slot " << i;
+        EXPECT_GE(device_gate_cosine, 0.999)
+            << label << " device-routed grouped gate cosine mismatch for active slot " << i;
+        EXPECT_GE(device_up_cosine, 0.999)
+            << label << " device-routed grouped up cosine mismatch for active slot " << i;
+        EXPECT_LE(device_gate_l2, 0.02)
+            << label << " device-routed grouped gate relative L2 too high for active slot " << i;
+        EXPECT_LE(device_up_l2, 0.02)
+            << label << " device-routed grouped up relative L2 too high for active slot " << i;
+
+        std::cout << "[GroupedExpertGateUpDecode_" << label
+                  << "] slot=" << i
+                  << " gate_cosine=" << std::fixed << std::setprecision(6) << gate_cosine
+                  << " up_cosine=" << up_cosine
+                  << " gate_l2=" << gate_l2
+                  << " up_l2=" << up_l2
+                  << " device_gate_cosine=" << device_gate_cosine
+                  << " device_up_cosine=" << device_up_cosine
+                  << " device_gate_l2=" << device_gate_l2
+                  << " device_up_l2=" << device_up_l2 << std::endl;
+    }
+}
+
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q5_KMatchesFusedProjection)
+{
+    SKIP_IF_NO_ROCM();
+    runGroupedExpertGateUpDecodeFormatMatch("Q5_K", [](size_t rows, size_t cols)
+                                            { return TestTensorFactory::createQ5_KRandom({rows, cols}); });
+}
+
+TEST(Test__ROCmMoEKernel, GroupedExpertGateUpDecode_Q6_KMatchesFusedProjection)
+{
+    SKIP_IF_NO_ROCM();
+    runGroupedExpertGateUpDecodeFormatMatch("Q6_K", [](size_t rows, size_t cols)
+                                            { return TestTensorFactory::createQ6_KRandom({rows, cols}); });
+}
+
+// ============================================================================
 // Test: KernelFactory dispatch creates ROCmMoEKernel for ROCm devices
 // ============================================================================
 
@@ -665,7 +1184,8 @@ TEST(Test__ROCmMoEKernel, Histogram_Reset)
     std::vector<uint64_t> counts_before(num_experts, 0);
     gpu_kernel.syncHistogramToHost(counts_before.data(), layer_idx, num_experts);
     uint64_t sum_before = 0;
-    for (auto c : counts_before) sum_before += c;
+    for (auto c : counts_before)
+        sum_before += c;
     ASSERT_GT(sum_before, 0u) << "Histogram should have non-zero counts before reset";
 
     // Reset
@@ -755,14 +1275,16 @@ TEST(Test__ROCmMoEKernel, ExpertMask_ApplyZerosWeights)
             EXPECT_FLOAT_EQ(result_weights[i], original_weights[i])
                 << "Active expert " << expert << " weight at slot " << i
                 << " should be unchanged";
-            if (result_weights[i] == original_weights[i]) ++unchanged_count;
+            if (result_weights[i] == original_weights[i])
+                ++unchanged_count;
         }
         else
         {
             EXPECT_FLOAT_EQ(result_weights[i], 0.0f)
                 << "Inactive expert " << expert << " weight at slot " << i
                 << " should be zeroed";
-            if (result_weights[i] == 0.0f) ++zeroed_count;
+            if (result_weights[i] == 0.0f)
+                ++zeroed_count;
         }
     }
 
@@ -865,14 +1387,14 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_Basic)
     // Token 6: experts {0, 1}
     // Token 7: experts {2, 3}
     std::vector<int> routing_indices = {
-        1, 3,  // token 0
-        0, 2,  // token 1
-        0, 1,  // token 2
-        2, 3,  // token 3
-        0, 3,  // token 4
-        1, 2,  // token 5
-        0, 1,  // token 6
-        2, 3   // token 7
+        1, 3, // token 0
+        0, 2, // token 1
+        0, 1, // token 2
+        2, 3, // token 3
+        0, 3, // token 4
+        1, 2, // token 5
+        0, 1, // token 6
+        2, 3  // token 7
     };
 
     // Random routing weights
@@ -888,7 +1410,12 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_Basic)
 
     // Build expected token→expert→weight mapping for verification
     // For each slot, record {expert_id, token_idx, weight}
-    struct SlotInfo { int expert; int token; float weight; };
+    struct SlotInfo
+    {
+        int expert;
+        int token;
+        float weight;
+    };
     std::vector<std::vector<SlotInfo>> expected_per_expert(num_experts);
     for (int s = 0; s < total_slots; ++s)
     {
@@ -1149,7 +1676,8 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_PrefillScale)
                 break;
             }
         }
-        if (!weights_match) break;
+        if (!weights_match)
+            break;
     }
     EXPECT_TRUE(weights_match) << "Grouped weights don't match original routing weights";
 

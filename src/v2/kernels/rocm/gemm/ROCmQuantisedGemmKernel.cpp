@@ -1086,6 +1086,28 @@ namespace llaminar2
         ROCmQuantisedGemmKernel::ROCmQuantisedGemmKernel(ROCmQuantisedGemmKernel &&) noexcept = default;
         ROCmQuantisedGemmKernel &ROCmQuantisedGemmKernel::operator=(ROCmQuantisedGemmKernel &&) noexcept = default;
 
+        bool ROCmQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
+        {
+            out = {};
+            ensureWeightsConverted();
+
+            if (!impl_ || !impl_->has_native_vnni ||
+                !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
+            {
+                return false;
+            }
+
+            out.payload = impl_->d_weights_native_vnni;
+            out.scales = impl_->d_weights_native_scales;
+            out.mins = impl_->d_weights_native_mins;
+            out.emins = impl_->d_weights_native_emins;
+            out.n = static_cast<int>(N_);
+            out.k = static_cast<int>(K_);
+            out.blocks_per_row = impl_->native_vnni_blocks_per_row;
+            out.codebook_id = impl_->native_vnni_codebook_id;
+            return out.valid();
+        }
+
         /**
          * @brief Classify the best prefill route for the current shape and weight format.
          *

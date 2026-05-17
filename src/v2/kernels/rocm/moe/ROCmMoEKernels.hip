@@ -42,9 +42,25 @@ __global__ void rocm_moe_gate_logits_single_token_kernel(
 
     const float *w = gate_weights + expert * d_model;
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+
+    if ((d_model & 3) == 0)
     {
-        sum += hidden[i] * w[i];
+        const int vec_count = d_model >> 2;
+        const float4 *hidden4 = reinterpret_cast<const float4 *>(hidden);
+        const float4 *w4 = reinterpret_cast<const float4 *>(w);
+        for (int i = threadIdx.x; i < vec_count; i += blockDim.x)
+        {
+            const float4 h = hidden4[i];
+            const float4 ww = w4[i];
+            sum += h.x * ww.x + h.y * ww.y + h.z * ww.z + h.w * ww.w;
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        {
+            sum += hidden[i] * w[i];
+        }
     }
 
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
@@ -390,7 +406,7 @@ bool hipMoE_gate_logits_single_token(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
-    const int threads = 256;
+    const int threads = 128;
     hipLaunchKernelGGL(rocm_moe_gate_logits_single_token_kernel,
         dim3(num_experts), dim3(threads), 0, static_cast<hipStream_t>(stream),
         hidden, gate_weights, logits, d_model, num_experts);
