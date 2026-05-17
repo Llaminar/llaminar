@@ -197,6 +197,15 @@ namespace llaminar2
                 float alpha,
                 int rocm_device_id, void *stream);
 
+            bool rocmQuantGemm_applyFp32CombineEpilogue(
+                const float *d_computed,
+                float *d_output,
+                const float *d_existing,
+                const float *d_bias,
+                int M, int N,
+                float alpha, float beta,
+                int rocm_device_id, void *stream);
+
             // In-place bias addition: output[m,n] += bias[n] (common .hip)
             bool rocmQuantGemm_biasAdd(
                 float *d_output,     // [M × N] FP32 output (modified in-place)
@@ -1268,13 +1277,6 @@ namespace llaminar2
                 LOG_TRACE("[" << callsite << "] Trying native-VNNI prefill (M=" << m
                               << " N=" << n << " K=" << k << ")");
 
-                if (beta != 0.0f)
-                {
-                    LOG_WARN("[" << callsite << "] Native-VNNI prefill does not support beta != 0");
-                    logFallback("native_beta");
-                    return false;
-                }
-
                 if (!impl_->d_weights_native_vnni || !impl_->d_weights_native_scales)
                 {
                     LOG_WARN("[" << callsite << "] Native-VNNI prefill missing weight buffers:"
@@ -1285,13 +1287,21 @@ namespace llaminar2
                     return false;
                 }
 
+                if (beta != 0.0f && d_output == impl_->d_C_fp32)
+                {
+                    LOG_WARN("[" << callsite << "] Native-VNNI prefill beta path needs a distinct existing-output buffer");
+                    logFallback("native_beta_alias");
+                    return false;
+                }
+
+                float *d_native_output = (beta != 0.0f) ? impl_->d_C_fp32 : d_output;
                 native_ok = rocmGemm_native_vnni_fp32(
                     d_A_int8,
                     impl_->d_weights_native_vnni,
                     impl_->d_weights_native_scales,
                     impl_->d_weights_native_mins,
                     impl_->d_weights_native_emins,
-                    d_output,
+                    d_native_output,
                     d_scales_A,
                     d_scales_A_blockwise,
                     m, n, k,
@@ -1314,7 +1324,37 @@ namespace llaminar2
                         std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count());
                 }
 
-                if (alpha != 1.0f || d_bias)
+                if (beta != 0.0f)
+                {
+                    std::chrono::high_resolution_clock::time_point epilogue_start{};
+                    if (profiling_enabled)
+                        epilogue_start = std::chrono::high_resolution_clock::now();
+
+                    if (!rocmQuantGemm_applyFp32CombineEpilogue(
+                            d_native_output,
+                            d_output,
+                            d_output,
+                            d_bias,
+                            m,
+                            n,
+                            alpha,
+                            beta,
+                            rocm_device_id_,
+                            effective_stream))
+                    {
+                        logFallback("launch_error");
+                        return false;
+                    }
+
+                    if (profiling_enabled)
+                    {
+                        const auto epilogue_end = std::chrono::high_resolution_clock::now();
+                        record_epilogue_ms(
+                            path,
+                            std::chrono::duration<double, std::milli>(epilogue_end - epilogue_start).count());
+                    }
+                }
+                else if (alpha != 1.0f || d_bias)
                 {
                     std::chrono::high_resolution_clock::time_point epilogue_start{};
                     if (profiling_enabled)
@@ -1560,7 +1600,29 @@ namespace llaminar2
                                 std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count());
                         }
 
-                        const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
+                        const float *d_existing = nullptr;
+                        if (beta != 0.0f)
+                        {
+                            if (d_output == impl_->d_C_fp32)
+                            {
+                                logFallback("beta_alias");
+                                return false;
+                            }
+                            hipError_t copy_err = hipMemcpyAsync(
+                                impl_->d_C_fp32,
+                                d_output,
+                                static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
+                                hipMemcpyDeviceToDevice,
+                                static_cast<hipStream_t>(effective_stream));
+                            if (copy_err != hipSuccess)
+                            {
+                                LOG_ERROR("[" << callsite << "] Failed to snapshot beta existing output: "
+                                              << hipGetErrorString(copy_err));
+                                logFallback("launch_error");
+                                return false;
+                            }
+                            d_existing = impl_->d_C_fp32;
+                        }
 
                         std::chrono::high_resolution_clock::time_point epilogue_start{};
                         if (profiling_enabled)
@@ -1833,7 +1895,29 @@ namespace llaminar2
             }
 
             // Epilogue: apply activation/weight scales, alpha/beta, and optional bias.
-            const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
+            const float *d_existing = nullptr;
+            if (beta != 0.0f)
+            {
+                if (d_output == impl_->d_C_fp32)
+                {
+                    logFallback("beta_alias");
+                    return false;
+                }
+                hipError_t copy_err = hipMemcpyAsync(
+                    impl_->d_C_fp32,
+                    d_output,
+                    static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float),
+                    hipMemcpyDeviceToDevice,
+                    static_cast<hipStream_t>(effective_stream));
+                if (copy_err != hipSuccess)
+                {
+                    LOG_ERROR("[" << callsite << "] Failed to snapshot beta existing output: "
+                                  << hipGetErrorString(copy_err));
+                    logFallback("launch_error");
+                    return false;
+                }
+                d_existing = impl_->d_C_fp32;
+            }
 
             std::chrono::high_resolution_clock::time_point epilogue_start{};
             if (profiling_enabled)
@@ -2079,11 +2163,10 @@ namespace llaminar2
                     // Fix: redirect kernel output to HBM workspace, then bulk DMA.
                     // =================================================================
                     const bool gemv_output_is_mapped = C_fp32->isMapped();
-                    const bool gemv_output_needs_copyout = gemv_output_is_mapped;
-                    float *d_gemv_output = d_output;
-                    if (gemv_output_needs_copyout)
+                    const bool gemv_output_needs_copyout = gemv_output_is_mapped || beta != 0.0f;
+                    float *d_gemv_output = gemv_output_needs_copyout ? impl_->d_C_fp32 : d_output;
+                    if (gemv_output_is_mapped)
                     {
-                        d_gemv_output = impl_->d_C_fp32;
                         static std::once_flag gemv_mapped_once;
                         std::call_once(gemv_mapped_once, [&]()
                                        { LOG_WARN("[multiply_tensor] GEMV MAPPED OUTPUT REDIRECT: M=1 N=" << n
@@ -2116,10 +2199,10 @@ namespace llaminar2
                     }
 
                     // =====================================================================
-                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline
-                    // Native GEMV produces FP32, then applies alpha/bias with the shared epilogue when needed.
+                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, scale_A inline.
+                    // Native GEMV produces FP32, then applies alpha/beta/bias with the shared epilogue when needed.
                     // =====================================================================
-                    if (impl_->has_native_vnni && beta == 0.0f)
+                    if (impl_->has_native_vnni)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwise(
                                 d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
@@ -2146,7 +2229,25 @@ namespace llaminar2
                             return false;
                         }
 
-                        if (alpha != 1.0f || d_bias)
+                        if (beta != 0.0f)
+                        {
+                            if (!rocmQuantGemm_applyFp32CombineEpilogue(
+                                    d_gemv_output,
+                                    d_gemv_output,
+                                    d_output,
+                                    d_bias,
+                                    m,
+                                    n,
+                                    alpha,
+                                    beta,
+                                    rocm_device_id_,
+                                    gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI beta epilogue failed");
+                                return false;
+                            }
+                        }
+                        else if (alpha != 1.0f || d_bias)
                         {
                             if (!rocmQuantGemm_applyFp32Epilogue(
                                     d_gemv_output,
@@ -2172,8 +2273,8 @@ namespace llaminar2
                         return true;
                     }
 
-                    // Use INT8 scatter+reduce GEMV when alpha=1, beta=0 AND VNNI weights available
-                    if (alpha == 1.0f && beta == 0.0f && d_weights_vnni)
+                    // Use INT8 scatter+reduce GEMV when VNNI weights are available.
+                    if (d_weights_vnni)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwise(
                                 d_input, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
@@ -2182,12 +2283,13 @@ namespace llaminar2
                             return false;
                         }
 
+                        const float *d_existing = (beta != 0.0f) ? d_output : nullptr;
                         bool int8_decode_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                             impl_->d_A_int8, d_weights_vnni, d_gemv_output,
                             impl_->d_scales_A_blockwise, d_scales_B,
                             n, k,
                             alpha, beta,
-                            nullptr, d_bias,
+                            d_existing, d_bias,
                             rocm_device_id_, gpu_stream_);
 
                         if (!int8_decode_ok)
@@ -2195,7 +2297,7 @@ namespace llaminar2
                             int8_decode_ok = rocmGemv_int8_scatter_vnni_blockwise(
                                 impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A_blockwise, d_scales_B, d_bias,
                                 impl_->d_scatter_partial,
-                                n, k, alpha, beta, nullptr,
+                                n, k, alpha, beta, d_existing,
                                 rocm_device_id_, gpu_stream_);
                         }
 
@@ -4502,8 +4604,8 @@ namespace llaminar2
 
                     validateWorkspace();
 
-                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, then optional alpha/bias epilogue.
-                    if (impl_->has_native_vnni && beta == 0.0f)
+                    // Native-VNNI path: lossless Q4/IQ4 decode, FP16 block scales, then optional alpha/beta/bias epilogue.
+                    if (impl_->has_native_vnni)
                     {
                         if (!rocmQuantGemm_quantizeActivationsBlockwise(
                                 d_A, impl_->d_A_int8, impl_->d_scales_A_blockwise, m, k, rocm_device_id_, gpu_stream_))
@@ -4512,13 +4614,14 @@ namespace llaminar2
                             return false;
                         }
 
+                        float *d_native_output = (beta != 0.0f) ? impl_->d_C_fp32 : d_C;
                         if (!rocmGemv_native_vnni_fp32(
                                 impl_->d_A_int8,
                                 impl_->d_weights_native_vnni,
                                 impl_->d_weights_native_scales,
                                 impl_->d_weights_native_mins,
                                 impl_->d_weights_native_emins,
-                                d_C,
+                                d_native_output,
                                 impl_->d_scales_A,
                                 impl_->d_scatter_partial,
                                 n, k,
@@ -4530,7 +4633,25 @@ namespace llaminar2
                             return false;
                         }
 
-                        if (alpha != 1.0f || d_bias)
+                        if (beta != 0.0f)
+                        {
+                            if (!rocmQuantGemm_applyFp32CombineEpilogue(
+                                    d_native_output,
+                                    d_C,
+                                    d_C,
+                                    d_bias,
+                                    m,
+                                    n,
+                                    alpha,
+                                    beta,
+                                    rocm_device_id_,
+                                    gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Native-VNNI beta epilogue failed");
+                                return false;
+                            }
+                        }
+                        else if (alpha != 1.0f || d_bias)
                         {
                             if (!rocmQuantGemm_applyFp32Epilogue(
                                     d_C,
@@ -4588,9 +4709,10 @@ namespace llaminar2
 
                     if (d_vnni)
                     {
+                        float *d_int8_output = (beta != 0.0f) ? impl_->d_C_fp32 : d_C;
                         const float *d_existing = (beta != 0.0f) ? d_C : nullptr;
                         bool ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
-                            impl_->d_A_int8, d_vnni, d_C,
+                            impl_->d_A_int8, d_vnni, d_int8_output,
                             impl_->d_scales_A_blockwise, d_s,
                             n, k,
                             alpha, beta,
@@ -4600,7 +4722,7 @@ namespace llaminar2
                         if (!ok)
                         {
                             ok = rocmGemv_int8_scatter_vnni_blockwise(
-                                impl_->d_A_int8, d_vnni, d_C, impl_->d_scales_A_blockwise, d_s, d_bias,
+                                impl_->d_A_int8, d_vnni, d_int8_output, impl_->d_scales_A_blockwise, d_s, d_bias,
                                 impl_->d_scatter_partial,
                                 n, k, alpha, beta, d_existing,
                                 rocm_device_id_, gpu_stream_);
@@ -4610,6 +4732,21 @@ namespace llaminar2
                         {
                             LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 GEMV (VNNI blockwise) failed");
                             return false;
+                        }
+                        if (beta != 0.0f)
+                        {
+                            hipError_t copy_err = hipMemcpyAsync(
+                                d_C,
+                                d_int8_output,
+                                static_cast<size_t>(n) * sizeof(float),
+                                hipMemcpyDeviceToDevice,
+                                static_cast<hipStream_t>(gpu_stream_));
+                            if (copy_err != hipSuccess)
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] INT8 beta output copy failed: "
+                                          << hipGetErrorString(copy_err));
+                                return false;
+                            }
                         }
                         return true;
                     }

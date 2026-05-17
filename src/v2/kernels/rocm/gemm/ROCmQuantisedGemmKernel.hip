@@ -131,6 +131,31 @@ __global__ void applyFp32Epilogue_kernel(
     }
     d_output[idx] = result;
 }
+
+__global__ void applyFp32CombineEpilogue_kernel(
+    const float* d_computed,
+    float* d_output,
+    const float* d_existing,
+    const float* __restrict__ d_bias,
+    int M, int N,
+    float alpha, float beta)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+
+    const int col = idx % N;
+    float result = alpha * d_computed[idx];
+    if (beta != 0.0f && d_existing != nullptr)
+    {
+        result += beta * d_existing[idx];
+    }
+    if (d_bias != nullptr)
+    {
+        result += d_bias[col];
+    }
+    d_output[idx] = result;
+}
 // ============================================================================
 // Vectorized Scaling Kernel with 1D Flat Grid (M > 1 fast path)
 // ============================================================================
@@ -1490,6 +1515,57 @@ extern "C"
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmQuantGemm_applyFp32Epilogue] Kernel launch failed: %s (M=%d, N=%d)\n",
+                    hipGetErrorString(err), M, N);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool rocmQuantGemm_applyFp32CombineEpilogue(
+        const float *d_computed,
+        float *d_output,
+        const float *d_existing,
+        const float *d_bias,
+        int M, int N,
+        float alpha, float beta,
+        int rocm_device_id, void *stream)
+    {
+        if (!d_computed || !d_output)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32CombineEpilogue] Null pointer: d_computed=%p d_output=%p\n",
+                    (const void *)d_computed, (void *)d_output);
+            return false;
+        }
+
+        if (beta != 0.0f && d_existing == nullptr)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32CombineEpilogue] d_existing required when beta != 0 (M=%d N=%d)\n",
+                    M, N);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        if (d_computed == d_output && beta == 0.0f)
+        {
+            return rocmQuantGemm_applyFp32Epilogue(
+                d_output, d_bias, M, N, alpha, rocm_device_id, stream);
+        }
+
+        const int block_size = 256;
+        const int total = M * N;
+        const int grid_size = (total + block_size - 1) / block_size;
+        hipLaunchKernelGGL(
+            applyFp32CombineEpilogue_kernel,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
+            d_computed, d_output, d_existing, d_bias, M, N, alpha, beta);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32CombineEpilogue] Kernel launch failed: %s (M=%d, N=%d)\n",
                     hipGetErrorString(err), M, N);
             return false;
         }

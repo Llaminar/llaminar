@@ -23,6 +23,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -408,6 +409,144 @@ namespace
         float cos = cosineSimilarity(gpu_ptr, ref.data(), static_cast<size_t>(N));
         LOG_INFO("[NativeVNNI_GEMV] Q4_0 model-dim 896×896 cosine=" << cos);
         EXPECT_GT(cos, 0.99f);
+
+        cleanupWorkspace(kernel);
+    }
+
+    TEST_F(NativeVNNIGEMVTest, Q4_0_Decode_AlphaBetaAccumulatesExistingOutput)
+    {
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        const int M = 1, N = 896, K = 896;
+        const float alpha = 0.375f;
+        const float beta = 1.0f;
+
+        auto weights = TestTensorFactory::createQ4_0Random(
+            {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        ASSERT_FALSE(packed.native_vnni_payload.empty());
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)});
+        auto output_base = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+        auto output_accum = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        std::vector<float> initial(static_cast<size_t>(N));
+        for (int col = 0; col < N; ++col)
+        {
+            initial[col] = 0.03125f * static_cast<float>((col % 23) - 11);
+            output_accum->mutable_data()[col] = initial[col];
+        }
+
+        const auto device = DeviceId::rocm(0);
+        ASSERT_TRUE(input->ensureOnDevice(device));
+        ASSERT_TRUE(output_base->allocateOnDevice(device));
+        ASSERT_TRUE(output_accum->ensureOnDevice(device));
+
+        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_base.get(), M, N, K));
+        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output_accum.get(), M, N, K,
+                                           true, alpha, beta));
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        output_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        output_accum->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        const float *base = output_base->data();
+        const float *accum = output_accum->data();
+        std::vector<float> expected(static_cast<size_t>(N));
+        float max_abs_diff = 0.0f;
+        for (int col = 0; col < N; ++col)
+        {
+            expected[col] = alpha * base[col] + beta * initial[col];
+            max_abs_diff = std::max(max_abs_diff, std::fabs(accum[col] - expected[col]));
+        }
+
+        const float cos = cosineSimilarity(accum, expected.data(), static_cast<size_t>(N));
+        LOG_INFO("[NativeVNNI_GEMV] Q4_0 decode alpha/beta accumulation cosine=" << cos
+                                                                                 << " max_abs_diff=" << max_abs_diff);
+        EXPECT_GT(cos, 0.99999f);
+        EXPECT_LT(max_abs_diff, 2e-3f);
+
+        cleanupWorkspace(kernel);
+    }
+
+    TEST_F(NativeVNNIGEMVTest, Q4_0_FusedSwiGLUDown_Decode_AlphaBetaAccumulatesExistingOutput)
+    {
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        const int M = 1, N = 256, K = 896;
+        const float alpha = 0.625f;
+        const float beta = 1.0f;
+
+        auto weights = TestTensorFactory::createQ4_0Random(
+            {static_cast<size_t>(N), static_cast<size_t>(K)});
+
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        ASSERT_FALSE(packed.native_vnni_payload.empty());
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+        auto gate = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 301);
+        auto up = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 302);
+        auto output_base = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+        auto output_accum = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        std::vector<float> initial(static_cast<size_t>(N));
+        for (int col = 0; col < N; ++col)
+        {
+            initial[col] = 0.0625f * static_cast<float>((col % 17) - 8);
+            output_accum->mutable_data()[col] = initial[col];
+        }
+
+        const auto device = DeviceId::rocm(0);
+        ASSERT_TRUE(gate->ensureOnDevice(device));
+        ASSERT_TRUE(up->ensureOnDevice(device));
+        ASSERT_TRUE(output_base->allocateOnDevice(device));
+        ASSERT_TRUE(output_accum->ensureOnDevice(device));
+
+        ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+            gate.get(), up.get(), output_base.get(), M, N, K));
+        ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+            gate.get(), up.get(), output_accum.get(), M, N, K, alpha, beta));
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        output_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        output_accum->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        const float *base = output_base->data();
+        const float *accum = output_accum->data();
+        std::vector<float> expected(static_cast<size_t>(N));
+        float max_abs_diff = 0.0f;
+        for (int col = 0; col < N; ++col)
+        {
+            expected[col] = alpha * base[col] + beta * initial[col];
+            max_abs_diff = std::max(max_abs_diff, std::fabs(accum[col] - expected[col]));
+        }
+
+        const float cos = cosineSimilarity(accum, expected.data(), static_cast<size_t>(N));
+        LOG_INFO("[NativeVNNI_GEMV] Q4_0 fused SwiGLU/down decode alpha/beta accumulation cosine=" << cos
+                                                                                                   << " max_abs_diff=" << max_abs_diff);
+        EXPECT_GT(cos, 0.99999f);
+        EXPECT_LT(max_abs_diff, 2e-3f);
 
         cleanupWorkspace(kernel);
     }
