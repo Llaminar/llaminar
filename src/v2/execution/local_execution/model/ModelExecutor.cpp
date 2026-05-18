@@ -26,7 +26,7 @@ namespace llaminar2
           config_(config),
           layer_executor_(config.layer_config)
     {
-        LOG_INFO("[ModelExecutor] Initialized with n_layers=" << config_.n_layers
+        LOG_DEBUG("[ModelExecutor] Initialized with n_layers=" << config_.n_layers
                                                               << ", max_batch_size=" << config_.max_batch_size
                                                               << ", max_seq_len=" << config_.max_seq_len);
 

@@ -631,7 +631,7 @@ namespace llaminar2
                               : (n_kv_heads * head_dim)),
           is_sharded_(false), device_ctx_(nullptr)
     {
-        LOG_INFO("[CUDARingKVCache] Creating cache: "
+        LOG_DEBUG("[CUDARingKVCache] Creating cache: "
                  << n_layers << " layers, batch=" << batch_size
                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
                  << ", precision=" << static_cast<int>(Precision));
@@ -657,7 +657,7 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[CUDARingKVCache] Allocated "
+        LOG_DEBUG("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");
 
@@ -688,7 +688,7 @@ namespace llaminar2
         device_ctx_ = ctx;
         device_id_ = ctx->deviceOrdinal();
 
-        LOG_INFO("[CUDARingKVCache] Creating cache with device context: "
+        LOG_DEBUG("[CUDARingKVCache] Creating cache with device context: "
                  << n_layers << " layers, batch=" << batch_size
                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
                  << ", device=" << device_id_
@@ -715,7 +715,7 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[CUDARingKVCache] Allocated "
+        LOG_DEBUG("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");
 
@@ -735,7 +735,7 @@ namespace llaminar2
                               : (local_n_kv_heads * head_dim)),
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
-        LOG_INFO("[CUDARingKVCache] Creating sharded cache: "
+        LOG_DEBUG("[CUDARingKVCache] Creating sharded cache: "
                  << n_layers << " layers, batch=" << batch_size
                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
@@ -763,7 +763,7 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[CUDARingKVCache] Allocated "
+        LOG_DEBUG("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");
 
@@ -795,7 +795,7 @@ namespace llaminar2
         device_ctx_ = ctx;
         device_id_ = ctx->deviceOrdinal();
 
-        LOG_INFO("[CUDARingKVCache] Creating sharded cache with device context: "
+        LOG_DEBUG("[CUDARingKVCache] Creating sharded cache with device context: "
                  << n_layers << " layers, batch=" << batch_size
                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
@@ -824,7 +824,7 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[CUDARingKVCache] Allocated "
+        LOG_DEBUG("[CUDARingKVCache] Allocated "
                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
                  << " MB total (including scratch)");
 

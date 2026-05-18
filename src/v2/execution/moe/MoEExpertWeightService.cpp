@@ -703,7 +703,7 @@ namespace llaminar2
 
         if (freed > 0)
         {
-            LOG_INFO("[MoEWeightService] Layer " << ctx.layer_idx
+            LOG_DEBUG("[MoEWeightService] Layer " << ctx.layer_idx
                                                  << ": released " << (freed >> 20) << " MB raw expert weights"
                                                  << " (VNNI engines retain packed data)");
         }
@@ -1413,7 +1413,7 @@ namespace llaminar2
         }
 
         const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
-        LOG_INFO("[MoEWeightService::GPU-rebalance] " << (count * 3) << " expert GEMM engines "
+        LOG_DEBUG("[MoEWeightService::GPU-rebalance] " << (count * 3) << " expert GEMM engines "
                                                       << "prepared via GPU pipeline in "
                                                       << std::fixed << std::setprecision(1) << elapsed_ms << " ms"
                                                       << " (layer " << ctx.layer_idx << ", "
@@ -1581,7 +1581,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[MoEWeightService::GPU] Planned " << total_planned << " expert weights for "
+        LOG_DEBUG("[MoEWeightService::GPU] Planned " << total_planned << " expert weights for "
                                                     << ctx.device_id.to_string() << " (layer " << ctx.layer_idx << ")");
 
         // Phase 2: Allocate VRAM pool + pinned ring buffer
@@ -1715,7 +1715,7 @@ namespace llaminar2
         }
 
         const auto elapsed_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
-        LOG_INFO("[MoEWeightService::GPU] " << (local_count * 3) << "/" << (num_experts * 3)
+        LOG_DEBUG("[MoEWeightService::GPU] " << (local_count * 3) << "/" << (num_experts * 3)
                                             << " expert GEMM engines prepared via GPU pipeline in "
                                             << std::fixed << std::setprecision(1) << elapsed_ms << " ms"
                                             << " (layer " << ctx.layer_idx << ", "
@@ -1903,7 +1903,7 @@ namespace llaminar2
                               dst_ctx.prepared_down_gemm, "down"))
             return false;
 
-        LOG_INFO("[MoEWeightService] GPU-direct transferred " << expert_ids.size()
+        LOG_DEBUG("[MoEWeightService] GPU-direct transferred " << expert_ids.size()
                                                               << " experts (3 weight types) ROCm:" << src_rocm
                                                               << " → ROCm:" << dst_rocm << " layer " << layer_idx);
         return true;

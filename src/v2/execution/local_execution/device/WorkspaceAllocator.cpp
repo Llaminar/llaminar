@@ -65,7 +65,7 @@ namespace llaminar2
         budget = std::max(budget, config.min_budget);
         budget = std::min(budget, config.max_budget);
 
-        LOG_INFO("[WorkspaceAllocator] " << device.toString()
+        LOG_DEBUG("[WorkspaceAllocator] " << device.toString()
                                          << " available=" << (available / (1024 * 1024)) << "MB"
                                          << ", budget=" << (budget / (1024 * 1024)) << "MB"
                                          << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
@@ -284,7 +284,7 @@ namespace llaminar2
                     }
                 }
 
-                LOG_INFO("[WorkspaceAllocator] Reallocating workspace on "
+                LOG_DEBUG("[WorkspaceAllocator] Reallocating workspace on "
                          << device.toString() << " with "
                          << combined.buffers.size() << " buffers ("
                          << (needed / (1024 * 1024)) << "MB needed, budget="
@@ -305,7 +305,7 @@ namespace llaminar2
                     consumer_binding.consumer->bindWorkspace(manager.get());
                 }
 
-                LOG_INFO("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
+                LOG_DEBUG("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
                                                              << "MB workspace on " << device.toString()
                                                              << " (" << manager->bufferCount() << " buffers)");
 
@@ -347,7 +347,7 @@ namespace llaminar2
                                                   : 0;
                 if (needed <= max_expandable)
                 {
-                    LOG_INFO("[WorkspaceAllocator] Expanding budget on "
+                    LOG_DEBUG("[WorkspaceAllocator] Expanding budget on "
                              << device.toString() << " from "
                              << (budget / (1024 * 1024)) << "MB to "
                              << (needed / (1024 * 1024)) << "MB (available="
@@ -371,7 +371,7 @@ namespace llaminar2
                 consumer_binding.consumer->bindWorkspace(manager.get());
             }
 
-            LOG_INFO("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
+            LOG_DEBUG("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
                                                        << "MB workspace on " << device.toString()
                                                        << " (" << manager->bufferCount() << " buffers, model-aware budget)");
 
@@ -461,7 +461,7 @@ namespace llaminar2
                 consumer->bindWorkspace(manager.get());
             }
 
-            LOG_INFO("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
+            LOG_DEBUG("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
                                                        << "MB workspace on " << device.toString()
                                                        << " (" << manager->bufferCount() << " buffers)");
 

@@ -669,7 +669,7 @@ namespace llaminar2
             const float *send_data = hidden->data();
             if (mpi_log.log_collectives)
             {
-                LOG_INFO("[MPI] rank " << rank << " SEND " << count
+                LOG_DEBUG("[MPI] rank " << rank << " SEND " << count
                          << " floats (" << (count * sizeof(float) / 1024) << " KB)"
                          << " to rank " << action.peer_rank << " tag=" << action.mpi_tag);
             }
@@ -689,7 +689,7 @@ namespace llaminar2
                     auto elapsed = std::chrono::steady_clock::now() - start_time;
                     double ms = std::chrono::duration<double, std::milli>(elapsed).count();
                     double bw_mbps = (count * sizeof(float)) / (ms * 1000.0);
-                    LOG_INFO("[MPI] rank " << rank << " SEND complete: "
+                    LOG_DEBUG("[MPI] rank " << rank << " SEND complete: "
                              << ms << "ms, " << bw_mbps << " MB/s");
                 }
             }
@@ -717,7 +717,7 @@ namespace llaminar2
 
         if (mpi_log.log_collectives)
         {
-            LOG_INFO("[MPI] rank " << rank << " RECV " << count
+            LOG_DEBUG("[MPI] rank " << rank << " RECV " << count
                      << " floats (" << (count * sizeof(float) / 1024) << " KB)"
                      << " from rank " << action.peer_rank << " tag=" << action.mpi_tag);
         }
@@ -767,7 +767,7 @@ namespace llaminar2
                 auto elapsed = std::chrono::steady_clock::now() - start_time;
                 double ms = std::chrono::duration<double, std::milli>(elapsed).count();
                 double bw_mbps = (count * sizeof(float)) / (ms * 1000.0);
-                LOG_INFO("[MPI] rank " << rank << " RECV complete: "
+                LOG_DEBUG("[MPI] rank " << rank << " RECV complete: "
                          << ms << "ms, " << bw_mbps << " MB/s");
             }
         }
@@ -840,7 +840,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("GlobalOrchestrator: rank " << config_.rank << "/" << config_.world_size
+        LOG_DEBUG("GlobalOrchestrator: rank " << config_.rank << "/" << config_.world_size
                  << ", " << config_.topology.numStages() << " PP stages, "
                  << rank_plan_.steps.size() << " execution steps");
         LOG_DEBUG("GlobalOrchestrator plan:\n" << rank_plan_.toString());
@@ -869,7 +869,7 @@ namespace llaminar2
                       << config_.d_model << "] for PP transfers");
         }
 
-        LOG_INFO("GlobalOrchestrator: pipeline_head=" << is_pipeline_head_
+        LOG_DEBUG("GlobalOrchestrator: pipeline_head=" << is_pipeline_head_
                  << " pipeline_tail=" << is_pipeline_tail_
                  << " tail_rank=" << tail_rank_);
     }
@@ -1011,7 +1011,7 @@ namespace llaminar2
             {
                 auto dt = std::chrono::steady_clock::now() - t0;
                 double ms = std::chrono::duration<double, std::milli>(dt).count();
-                LOG_INFO("[MPI] rank " << config_.rank << " broadcast_int32 token="
+                LOG_DEBUG("[MPI] rank " << config_.rank << " broadcast_int32 token="
                          << token << " root=" << tail_rank_
                          << (mpi_log.log_timing ? (" " + std::to_string(ms) + "ms") : ""));
             }

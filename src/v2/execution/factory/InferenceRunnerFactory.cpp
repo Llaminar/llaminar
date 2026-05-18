@@ -249,7 +249,7 @@ namespace llaminar2
                     injected_tp_context->degree() == static_cast<int>(domain->participants.size()))
                 {
                     graph_config.domain_tp_contexts[domain_name] = injected_tp_context;
-                    LOG_INFO(log_prefix << " using injected "
+                    LOG_DEBUG(log_prefix << " using injected "
                                         << tpScopeToString(injected_tp_context->scope())
                                         << " TP context for MoE continuation dense domain '"
                                         << domain_name << "'");
@@ -296,7 +296,7 @@ namespace llaminar2
             {
                 graph_config.moe.expert_overlay_runtime_plan.reset();
                 graph_config.moe.expert_overlay_execution_plan.reset();
-                LOG_INFO(log_prefix << " using graph-native MoE overlay lowering for tiered expert overlay");
+                LOG_DEBUG(log_prefix << " using graph-native MoE overlay lowering for tiered expert overlay");
 
                 if (!populateMoEContinuationDomainTPContextsForGraph(
                         graph_config,
@@ -844,7 +844,7 @@ namespace llaminar2
         graph_config.moe.local_expert_start = start;
         graph_config.moe.local_expert_count = count;
 
-        LOG_INFO("[InferenceRunner] MoE expert mode="
+        LOG_DEBUG("[InferenceRunner] MoE expert mode="
                  << moeExpertModeToString(graph_config.moe.expert_mode)
                  << " participant=" << participant_index << "/" << participants
                  << " expert_range=[" << start << ", " << (start + count) << ")"
@@ -910,7 +910,7 @@ namespace llaminar2
         graph_config.tp_ctx = global_tp_ctx;
         graph_config.tp_device_idx = device_idx;
 
-        LOG_INFO("[InferenceRunner] Injected GlobalTPContext: degree=" << degree
+        LOG_DEBUG("[InferenceRunner] Injected GlobalTPContext: degree=" << degree
                                                                        << " device_idx=" << device_idx
                                                                        << " domainId=" << global_tp_ctx->domainId());
         LOG_DEBUG("[InferenceRunner] Global TP QKV: head_start=" << assignment.head_start
@@ -985,7 +985,7 @@ namespace llaminar2
         const auto &devices = local_tp_ctx->devices();
         const auto &weights = local_tp_ctx->weights();
         const float my_weight = weights.empty() ? (1.0f / tp_degree) : weights[device_idx];
-        LOG_INFO("[InferenceRunner] LOCAL TP enabled: degree=" << tp_degree
+        LOG_DEBUG("[InferenceRunner] LOCAL TP enabled: degree=" << tp_degree
                                                                << " device_idx=" << device_idx
                                                                << " device=" << devices[device_idx].toString()
                                                                << " weight=" << (my_weight * 100.0f) << "%"
@@ -1038,7 +1038,7 @@ namespace llaminar2
         graph_config.vocab_local = assignment.vocab_count;
         graph_config.lm_head_column_parallel = true;
 
-        LOG_INFO("[InferenceRunner] Using TensorParallelConfig (proportional split): "
+        LOG_DEBUG("[InferenceRunner] Using TensorParallelConfig (proportional split): "
                  << "rank=" << current_rank << "/" << tp_config->worldSize()
                  << " device=" << assignment.device.to_string()
                  << " work_fraction=" << (assignment.work_fraction * 100.0f) << "%");
@@ -1314,7 +1314,7 @@ namespace llaminar2
         {
             graph_config.n_layers = config.pp_stage_config->layerCount();
             graph_config.pp_layer_offset = config.pp_stage_config->first_layer;
-            LOG_INFO("[InferenceRunner] PP stage graph config: layers=["
+            LOG_DEBUG("[InferenceRunner] PP stage graph config: layers=["
                      << config.pp_stage_config->first_layer << ", "
                      << config.pp_stage_config->last_layer << ")"
                      << " has_embedding=" << (config.pp_stage_config->has_embedding ? "yes" : "no")
@@ -1333,7 +1333,7 @@ namespace llaminar2
         {
             turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
             graph_config.turboquant_ctx = turboquant_ctx.get();
-            LOG_INFO("[InferenceRunner] TurboQuant context created for "
+            LOG_DEBUG("[InferenceRunner] TurboQuant context created for "
                      << kvCachePrecisionToString(config.kv_cache_precision)
                      << " KV cache (head_dim=" << graph_config.head_dim << ")");
         }
@@ -1353,7 +1353,7 @@ namespace llaminar2
             kv_rotation = std::make_shared<ActivationRotation>(
                 graph_config.head_dim, graph_config.head_dim, /*seed=*/42);
             graph_config.kv_rotation = kv_rotation.get();
-            LOG_INFO("[InferenceRunner] KV rotation created for Q16_1 cache"
+            LOG_DEBUG("[InferenceRunner] KV rotation created for Q16_1 cache"
                      << " (block_dim=" << graph_config.head_dim
                      << ", kv_cache_scale_k=" << graph_config.kv_cache_scale_k
                      << ", kv_cache_scale_v=" << graph_config.kv_cache_scale_v << ")");
@@ -1429,7 +1429,7 @@ namespace llaminar2
             // Use the provided domain-scoped context; the caller owns its lifetime.
             graph_config.tp_ctx = injected_global_tp_ctx;
             graph_config.tp_device_idx = config.tp_device_index;
-            LOG_INFO("[InferenceRunner] Using injected GlobalTPContext: degree="
+            LOG_DEBUG("[InferenceRunner] Using injected GlobalTPContext: degree="
                      << injected_global_tp_ctx->degree()
                      << " myIndex=" << config.tp_device_index
                      << " domainId=" << injected_global_tp_ctx->domainId());
@@ -1447,7 +1447,7 @@ namespace llaminar2
                 graph_config.tp_ctx = ctx.get();
                 graph_config.tp_device_idx = ctx->myIndex();
                 global_tp_ctx = std::move(ctx);
-                LOG_INFO("[InferenceRunner] GlobalTPContext created: degree="
+                LOG_DEBUG("[InferenceRunner] GlobalTPContext created: degree="
                          << global_tp_ctx->degree()
                          << " myIndex=" << global_tp_ctx->myIndex()
                          << " backend=" << static_cast<int>(global_tp_ctx->backend()));
@@ -1522,7 +1522,7 @@ namespace llaminar2
                     graph_config.moe.decode_histogram = moe_controller->histogram();
                     graph_config.moe.rebalance_mode = moe_controller->mode();
 
-                    LOG_INFO("[InferenceRunner] MoE rebalance controller: mode="
+                    LOG_DEBUG("[InferenceRunner] MoE rebalance controller: mode="
                              << moeRebalanceRuntimeModeToString(rebalance_config.mode)
                              << " max_replicas=" << effective_replicas
                              << " hot_cache=" << graph_config.moe.hot_expert_cache.toString()
@@ -1659,7 +1659,7 @@ namespace llaminar2
                     if (collective_ctx)
                     {
                         orchestrator->setCollectiveContext(std::move(collective_ctx));
-                        LOG_INFO("[InferenceRunner] GPU-native collectives enabled (NCCL/RCCL)");
+                        LOG_DEBUG("[InferenceRunner] GPU-native collectives enabled (NCCL/RCCL)");
                     }
                     else
                     {
@@ -1697,7 +1697,7 @@ namespace llaminar2
                     if (collective_ctx)
                     {
                         orchestrator->setCollectiveContext(std::move(collective_ctx));
-                        LOG_INFO("[InferenceRunner] GLOBAL TP mode: forcing MPI-backed CollectiveContext via LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT=1");
+                        LOG_DEBUG("[InferenceRunner] GLOBAL TP mode: forcing MPI-backed CollectiveContext via LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT=1");
                     }
                     else
                     {
@@ -2116,7 +2116,7 @@ namespace llaminar2
                 auto embedding_fallback = weight_mgr->getWeightForDevice("token_embd.weight", device);
                 if (embedding_fallback)
                 {
-                    LOG_INFO("[PPStageRunner] output.weight not found, using tied embeddings");
+                    LOG_DEBUG("[PPStageRunner] output.weight not found, using tied embeddings");
                 }
             }
             if (!final_norm)
@@ -2239,7 +2239,7 @@ namespace llaminar2
         // Tied embeddings: if output.weight is missing, reuse token_embd.weight
         if (!lm_head && embedding)
         {
-            LOG_INFO("[UnifiedPipeline] output.weight not found, using tied embeddings (token_embd.weight)");
+            LOG_DEBUG("[UnifiedPipeline] output.weight not found, using tied embeddings (token_embd.weight)");
             lm_head = embedding;
         }
 
@@ -2398,7 +2398,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        LOG_INFO("[UnifiedPipeline] Created runner with "
+        LOG_DEBUG("[UnifiedPipeline] Created runner with "
                  << pipeline_config->numStages() << " PP stages, "
                  << pipeline_config->total_layers << " layers");
 
@@ -2583,7 +2583,7 @@ namespace llaminar2
         // PP handles inter-stage communication externally (not via MPI collectives)
         // =====================================================================
 
-        LOG_INFO("[PPStageRunner] PP stage runner created successfully: "
+        LOG_DEBUG("[PPStageRunner] PP stage runner created successfully: "
                  << "layers=[" << pp_config.first_layer << ", " << pp_config.last_layer << ") "
                  << "has_embedding=" << pp_config.has_embedding
                  << " has_lm_head=" << pp_config.has_lm_head
@@ -2983,7 +2983,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");
+        LOG_DEBUG("[InferenceRunner] Testable DeviceGraphOrchestrator created successfully");
 
         return orchestrator;
     }
@@ -3015,7 +3015,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        LOG_INFO("[InferenceRunner] Creating RankOrchestrator with "
+        LOG_DEBUG("[InferenceRunner] Creating RankOrchestrator with "
                  << config.devices.size() << " devices, backend="
                  << static_cast<int>(config.backend));
 

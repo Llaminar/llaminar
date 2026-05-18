@@ -4,6 +4,7 @@
  */
 
 #include "execution/moe/MoERuntimeTable.h"
+#include "execution/moe/DecodeExpertHistogram.h"
 
 #include <gtest/gtest.h>
 
@@ -36,8 +37,8 @@ namespace llaminar2::test
                                              int owner,
                                              int local_slot,
                                              DeviceMoEExpertFlags flags = DeviceMoEExpertFlags::Valid |
-                                                                         DeviceMoEExpertFlags::Resident |
-                                                                         DeviceMoEExpertFlags::LocalCompute)
+                                                                          DeviceMoEExpertFlags::Resident |
+                                                                          DeviceMoEExpertFlags::LocalCompute)
         {
             const uintptr_t base = 0x10000000u + static_cast<uintptr_t>(expert_id) * 0x10000u;
             DeviceMoEExpertDescriptor desc;
@@ -65,8 +66,8 @@ namespace llaminar2::test
                 update.experts.push_back(expertDesc(expert, expert % 2, expert));
                 update.local_compute_mask.push_back(1);
                 update.replica_role.push_back(static_cast<uint8_t>((expert % 2 == 0)
-                                                                        ? DeviceMoEReplicaRole::Primary
-                                                                        : DeviceMoEReplicaRole::Replica));
+                                                                       ? DeviceMoEReplicaRole::Primary
+                                                                       : DeviceMoEReplicaRole::Replica));
             }
             return update;
         }
@@ -187,6 +188,41 @@ namespace llaminar2::test
         ASSERT_TRUE(table.prepareInactiveBank(0, updateForEpoch(3, 4)));
         EXPECT_THROW(table.flipActiveBank(0, 2, nullptr), std::invalid_argument);
         ASSERT_TRUE(table.flipActiveBank(0, 3, nullptr));
+    }
+
+    TEST(Test__MoERuntimeTable, SyncDecodeHistogramToHostMergesAndResetsCounts)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 2, 4, 2);
+        table.hostLayerState(0).decode_histogram[0] = 3;
+        table.hostLayerState(0).decode_histogram[2] = 1;
+        table.hostLayerState(1).decode_histogram[1] = 2;
+        table.hostLayerState(1).decode_histogram[3] = 2;
+
+        DecodeExpertHistogramConfig cfg;
+        cfg.num_layers = 2;
+        cfg.num_experts = 4;
+        cfg.top_k = 2;
+        cfg.window_size = 8;
+        cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
+        cfg.expert_to_socket = {0, 1, 0, 1};
+        DecodeExpertHistogram hist(cfg);
+
+        hist.recordTokenBoundary(1);
+        ASSERT_TRUE(table.syncDecodeHistogramToHost(hist));
+
+        EXPECT_EQ(hist.activationCount(0, 0), 3u);
+        EXPECT_EQ(hist.activationCount(0, 2), 1u);
+        EXPECT_EQ(hist.activationCount(1, 1), 2u);
+        EXPECT_EQ(hist.activationCount(1, 3), 2u);
+        EXPECT_EQ(hist.windowTokenCount(), 1u);
+
+        for (int layer = 0; layer < 2; ++layer)
+            for (int expert = 0; expert < 4; ++expert)
+                EXPECT_EQ(table.hostLayerState(layer).decode_histogram[expert], 0u);
+
+        ASSERT_TRUE(table.syncDecodeHistogramToHost(hist));
+        EXPECT_EQ(hist.activationCount(0, 0), 3u);
+        EXPECT_EQ(hist.activationCount(1, 1), 2u);
     }
 
     TEST(Test__MoERuntimeTable, ConstructorRejectsInvalidBoundsAndUnsupportedMirroring)

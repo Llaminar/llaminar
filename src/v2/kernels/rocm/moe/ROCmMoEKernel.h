@@ -309,6 +309,7 @@ namespace llaminar2
         void ensureStagingCapacity(int count);
         bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
         bool ensureGroupedGateUpCapacity(int num_active, int d_model);
+        bool ensureGroupedGateUpKPartScratchCapacity(int num_active, int k_partitions, int intermediate);
         bool ensureRuntimeGateUpPointerArrays(
             int descriptor_table_id,
             int top_k,
@@ -325,6 +326,19 @@ namespace llaminar2
             const float ***d_up_ptrs);
         bool ensureSharedGateScratchCapacity(int seq_len);
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
+        bool ensureRouteLogitsPartialsCapacity(size_t partial_count);
+        bool ensureRouterQ8HiddenScratchCapacity(int d_model);
+        struct RouterQ8GateCacheEntry;
+        const RouterQ8GateCacheEntry *getOrCreateQ8RouterGateCache(
+            ITensor *gate_weights,
+            const float *gate_device_ptr,
+            int d_model,
+            int num_experts);
+        const void *getOrCreateFP16RouterGateCache(
+            ITensor *gate_weights,
+            const float *gate_device_ptr,
+            int d_model,
+            int num_experts);
 
         /// Core GPU routing: gate logits GEMM + softmax + top-k.
         /// Returns device buffers (caller must D2H and hipFree).
@@ -348,6 +362,7 @@ namespace llaminar2
             int d_model = 0;
             int intermediate = 0;
             uint8_t codebook_id = 0;
+            bool valid = false;
         };
 
         struct GroupedGateUpDescriptorTable
@@ -360,6 +375,7 @@ namespace llaminar2
             int d_model = 0;
             int intermediate = 0;
             uint8_t codebook_id = 0;
+            bool valid = false;
         };
 
         struct RuntimeGateUpPointerCacheEntry
@@ -380,6 +396,29 @@ namespace llaminar2
             std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
             const float **d_gate_ptrs = nullptr;
             const float **d_up_ptrs = nullptr;
+        };
+
+        struct RouterFP16GateCacheEntry
+        {
+            std::uintptr_t source_tensor = 0;
+            std::uintptr_t source_device_ptr = 0;
+            int d_model = 0;
+            int num_experts = 0;
+            size_t element_count = 0;
+            void *d_gate_weights_fp16 = nullptr;
+        };
+
+        struct RouterQ8GateCacheEntry
+        {
+            std::uintptr_t source_tensor = 0;
+            std::uintptr_t source_device_ptr = 0;
+            int d_model = 0;
+            int num_experts = 0;
+            int blocks_per_row = 0;
+            size_t element_count = 0;
+            size_t scale_count = 0;
+            int8_t *d_gate_weights_q8 = nullptr;
+            float *d_gate_scales = nullptr;
         };
 
         int device_ordinal_;
@@ -419,8 +458,13 @@ namespace llaminar2
         int *d_grouped_gateup_expert_ids_ = nullptr;
         int8_t *d_grouped_hidden_int8_ = nullptr;
         float *d_grouped_hidden_scales_ = nullptr;
+        float *d_grouped_gateup_gate_partials_ = nullptr;
+        float *d_grouped_gateup_up_partials_ = nullptr;
         int grouped_gateup_active_cap_ = 0;
         int grouped_gateup_d_model_cap_ = 0;
+        int grouped_gateup_kpart_active_cap_ = 0;
+        int grouped_gateup_kpart_partitions_cap_ = 0;
+        int grouped_gateup_kpart_intermediate_cap_ = 0;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
         std::vector<RuntimeGateUpPointerCacheEntry> runtime_gateup_pointer_cache_;
         std::vector<float *> host_grouped_gate_output_ptrs_;
@@ -432,11 +476,19 @@ namespace llaminar2
         int shared_gate_scratch_capacity_ = 0;
 
         // Reusable routing buffers for routeCore().
-        float *d_route_logits_ = nullptr;  ///< [route_logits_capacity_] floats on device
-        int *d_route_indices_ = nullptr;   ///< [route_topk_capacity_] ints on device
-        float *d_route_weights_ = nullptr; ///< [route_topk_capacity_] floats on device
+        float *d_route_logits_ = nullptr;            ///< [route_logits_capacity_] floats on device
+        int *d_route_indices_ = nullptr;             ///< [route_topk_capacity_] ints on device
+        float *d_route_weights_ = nullptr;           ///< [route_topk_capacity_] floats on device
+        float *d_route_logits_partials_ = nullptr;   ///< [route_logits_partials_capacity_] floats on device
+        int8_t *d_router_q8_hidden_ = nullptr;       ///< [router_q8_hidden_d_model_cap_] int8 values on device
+        float *d_router_q8_hidden_scales_ = nullptr; ///< [router_q8_hidden_blocks_cap_] floats on device
         size_t route_logits_capacity_ = 0;
         size_t route_topk_capacity_ = 0;
+        size_t route_logits_partials_capacity_ = 0;
+        int router_q8_hidden_d_model_cap_ = 0;
+        int router_q8_hidden_blocks_cap_ = 0;
+        std::vector<RouterFP16GateCacheEntry> router_fp16_gate_cache_;
+        std::vector<RouterQ8GateCacheEntry> router_q8_gate_cache_;
 
         // Phase 4: GPU-side expert grouping state (for prepareExpertGroups)
         int *d_group_int_indices_ = nullptr;   ///< float→int converted routing indices

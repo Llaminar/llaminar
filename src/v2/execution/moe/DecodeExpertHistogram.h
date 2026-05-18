@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -47,9 +48,35 @@ namespace llaminar2
         /// expert_weights: [top_k] corresponding routing weights
         /// Thread-safe via atomics (counts) and per-layer mutex (weighted sums).
         void record(int layer_idx,
-                    const int* expert_indices,
-                    const float* expert_weights,
+                    const int *expert_indices,
+                    const float *expert_weights,
                     int top_k);
+
+        /// Record only the decode-token boundary for a routed layer.
+        /// This is used by graph-captured device routing paths where expert
+        /// counts stay on device and are merged in batches. The token window is
+        /// still advanced once per decode token by the final MoE layer.
+        void recordTokenBoundary(int layer_idx, uint64_t token_count = 1);
+
+        /// Merge per-expert activation counts that were accumulated outside the
+        /// host hot path, for example in a runtime-table device histogram.
+        /// Weighted activation sums are intentionally not reconstructed here.
+        /// If count_window_tokens is true and layer_idx is the final MoE layer,
+        /// windowTokenCount advances by total_count / configured top_k.
+        void mergeLayerCounts(int layer_idx,
+                              const uint64_t *expert_counts,
+                              int num_experts,
+                              bool count_window_tokens = false);
+
+        using RuntimeHistogramSyncCallback = std::function<bool()>;
+
+        /// Register a lazy sync source for device/runtime histograms.
+        /// Callbacks should merge pending counts into this histogram and reset
+        /// their source counters so repeated syncs are idempotent.
+        void registerRuntimeHistogramSync(RuntimeHistogramSyncCallback callback);
+
+        /// Merge all registered runtime histogram sources into this host view.
+        bool syncRuntimeHistograms();
 
         // ── Queries (read-only, lock-free for counts) ─────
 
@@ -93,7 +120,7 @@ namespace llaminar2
         // ── Placement update ──────────────────────────────
 
         /// Update expert-to-socket mapping (called after rebalancing)
-        void updatePlacement(const std::vector<int>& expert_to_socket);
+        void updatePlacement(const std::vector<int> &expert_to_socket);
 
         // ── Diagnostics ───────────────────────────────────
 
@@ -103,7 +130,7 @@ namespace llaminar2
         /// Human-readable summary of a layer's histogram
         std::string layerSummary(int layer_idx) const;
 
-        const DecodeExpertHistogramConfig& config() const { return config_; }
+        const DecodeExpertHistogramConfig &config() const { return config_; }
 
     private:
         DecodeExpertHistogramConfig config_;
@@ -115,14 +142,14 @@ namespace llaminar2
 
             /// Protected by mutex (less frequent access)
             mutable std::mutex weight_mutex;
-            std::vector<float> weighted_sums;                      // [num_experts]
+            std::vector<float> weighted_sums;                         // [num_experts]
             std::vector<std::array<uint64_t, MAX_TOP_K>> slot_counts; // [num_experts][MAX_TOP_K]
 
             explicit LayerData(int num_experts);
-            LayerData(LayerData&& other) noexcept;
-            LayerData& operator=(LayerData&&) = delete;
-            LayerData(const LayerData&) = delete;
-            LayerData& operator=(const LayerData&) = delete;
+            LayerData(LayerData &&other) noexcept;
+            LayerData &operator=(LayerData &&) = delete;
+            LayerData(const LayerData &) = delete;
+            LayerData &operator=(const LayerData &) = delete;
             void reset();
         };
 
@@ -133,6 +160,9 @@ namespace llaminar2
         // Placement mapping protected by mutex (updated infrequently)
         mutable std::mutex placement_mutex_;
         std::vector<int> expert_to_socket_; // [num_experts]
+
+        mutable std::mutex runtime_sync_mutex_;
+        std::vector<RuntimeHistogramSyncCallback> runtime_sync_callbacks_;
     };
 
 } // namespace llaminar2

@@ -542,7 +542,7 @@ namespace llaminar2
             has_embedding_ = has_embedding;
             has_lm_head_ = has_lm_head;
             has_layer_range_ = true;
-            LOG_INFO("[WeightManager] Layer range set: layers [" << first_layer << ", " << last_layer
+            LOG_DEBUG("[WeightManager] Layer range set: layers [" << first_layer << ", " << last_layer
                                                                  << "), embedding=" << (has_embedding ? "yes" : "no")
                                                                  << ", lm_head=" << (has_lm_head ? "yes" : "no"));
         }

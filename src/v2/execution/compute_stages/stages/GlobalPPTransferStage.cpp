@@ -102,7 +102,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[GlobalPPTransferStage] " << name_ << ": sending " << count
+            LOG_DEBUG("[GlobalPPTransferStage] " << name_ << ": sending " << count
                                                 << " floats (" << bytes << " bytes) to rank " << params_.peer_rank
                                                 << " tag=" << params_.tag);
         }
@@ -118,12 +118,12 @@ namespace llaminar2
         {
             double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
             double bandwidth_gbps = (ms > 0) ? (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0) : 0.0;
-            LOG_INFO("[GlobalPPTransferStage] " << name_ << ": send completed in "
+            LOG_DEBUG("[GlobalPPTransferStage] " << name_ << ": send completed in "
                                                 << ms << " ms (" << bandwidth_gbps << " GB/s)");
         }
         else if (mpi_env.log_collectives)
         {
-            LOG_INFO("[GlobalPPTransferStage] " << name_ << ": send completed");
+            LOG_DEBUG("[GlobalPPTransferStage] " << name_ << ": send completed");
         }
 
         return true;
@@ -140,7 +140,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[GlobalPPTransferStage] " << name_ << ": receiving " << count
+            LOG_DEBUG("[GlobalPPTransferStage] " << name_ << ": receiving " << count
                                                 << " floats (" << bytes << " bytes) from rank " << params_.peer_rank
                                                 << " tag=" << params_.tag);
         }
@@ -159,12 +159,12 @@ namespace llaminar2
         {
             double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
             double bandwidth_gbps = (ms > 0) ? (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0) : 0.0;
-            LOG_INFO("[GlobalPPTransferStage] " << name_ << ": recv completed in "
+            LOG_DEBUG("[GlobalPPTransferStage] " << name_ << ": recv completed in "
                                                 << ms << " ms (" << bandwidth_gbps << " GB/s)");
         }
         else if (mpi_env.log_collectives)
         {
-            LOG_INFO("[GlobalPPTransferStage] " << name_ << ": recv completed");
+            LOG_DEBUG("[GlobalPPTransferStage] " << name_ << ": recv completed");
         }
 
         return true;

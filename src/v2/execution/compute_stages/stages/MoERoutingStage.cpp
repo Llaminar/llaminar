@@ -74,6 +74,12 @@ namespace llaminar2
         invalidateDumpInfoCache();
     }
 
+    void MoERoutingStage::recordRuntimeHistogramTokenBoundary() const
+    {
+        if (params_.decode_histogram && params_.layer_idx >= 0 && params_.seq_len == 1)
+            params_.decode_histogram->recordTokenBoundary(params_.layer_idx);
+    }
+
     bool MoERoutingStage::execute(IDeviceContext *ctx)
     {
         if (!ctx)
@@ -135,6 +141,7 @@ namespace llaminar2
 
             LOG_TRACE("[MoERoutingStage] Runtime-routed single token to top-"
                       << top_k << " of " << num_experts << " experts");
+            recordRuntimeHistogramTokenBoundary();
             return true;
         }
 
@@ -197,14 +204,25 @@ namespace llaminar2
         return isDeviceRoutedDecodeGraphCapturable();
     }
 
+    void MoERoutingStage::onGraphReplayed()
+    {
+        recordRuntimeHistogramTokenBoundary();
+    }
+
+    bool MoERoutingStage::needsOnGraphReplayed() const
+    {
+        return params_.decode_histogram != nullptr && isDeviceRoutedDecodeGraphCapturable();
+    }
+
     bool MoERoutingStage::isDeviceRoutedDecodeGraphCapturable() const
     {
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
         return false;
 #else
-        // routeWithTensors() is capture-safe only when ROCm decode keeps top-k
-        // routing tensors device-resident. Snapshots and decode histograms both
-        // require host top-k/logit materialization, so they stay manual.
+        // Runtime-table decode routing is capture-safe when ROCm keeps top-k
+        // routing tensors device-resident. Snapshot builds still require host
+        // top-k/logit materialization, but decode histograms are merged lazily
+        // from DeviceMoELayerRuntime::decode_histogram.
         const auto &rocm = debugEnv().rocm;
         return params_.device_id.is_rocm() &&
                params_.seq_len == 1 &&
@@ -220,8 +238,7 @@ namespace llaminar2
                rocm.moe_grouped_decode &&
                rocm.moe_device_routed_decode &&
                params_.moe_runtime_table &&
-               hasInitializedRuntimeTableIfProvided() &&
-               !params_.decode_histogram;
+               hasInitializedRuntimeTableIfProvided();
 #endif
     }
 

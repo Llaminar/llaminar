@@ -433,7 +433,7 @@ namespace llaminar2
         {
             if (mmap_region_)
             {
-                LOG_INFO("[ModelLoader] Releasing mmap region ("
+                LOG_DEBUG("[ModelLoader] Releasing mmap region ("
                          << (mmap_region_->size() / (1024 * 1024)) << " MB)");
                 mmap_region_.reset();
             }
@@ -441,7 +441,7 @@ namespace llaminar2
             {
                 if (region)
                 {
-                    LOG_INFO("[ModelLoader] Releasing split mmap region ("
+                    LOG_DEBUG("[ModelLoader] Releasing split mmap region ("
                              << (region->size() / (1024 * 1024)) << " MB)");
                     region.reset();
                 }
@@ -463,7 +463,7 @@ namespace llaminar2
             }
             if (total > 0)
             {
-                LOG_INFO("[ModelLoader] Advised DONTNEED on mmap regions ("
+                LOG_DEBUG("[ModelLoader] Advised DONTNEED on mmap regions ("
                          << (total / (1024 * 1024)) << " MB) — pages reclaimable by OS");
             }
             return total;

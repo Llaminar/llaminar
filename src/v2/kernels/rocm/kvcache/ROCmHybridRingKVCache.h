@@ -453,7 +453,7 @@ namespace llaminar2
                 state.initialize(qkv_dim);
             }
 
-            LOG_INFO("[ROCmHybridRingKVCache] Created: " << total_layers_ << " total layers, "
+            LOG_DEBUG("[ROCmHybridRingKVCache] Created: " << total_layers_ << " total layers, "
                                                          << layer_map_.kvLayerCount() << " KV (FA), "
                                                          << n_gdn << " GDN. "
                                                          << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");

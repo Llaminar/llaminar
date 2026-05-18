@@ -129,7 +129,7 @@ namespace
 
         for (const auto &tier : output.tiers)
         {
-            LOG_INFO("[MoEExpertDispatchStage] layer=" << layer
+            LOG_DEBUG("[MoEExpertDispatchStage] layer=" << layer
                      << " tier=" << tier.tier_index
                      << " name=" << tier.tier_name
                      << " domain=" << tier.domain
@@ -161,7 +161,7 @@ namespace
             const int resident_experts = tier.max_experts_per_layer > 0
                                              ? tier.max_experts_per_layer
                                              : assigned_experts;
-            LOG_INFO("[MoEExpertDispatchStage] placement layer=" << placement.layer
+            LOG_DEBUG("[MoEExpertDispatchStage] placement layer=" << placement.layer
                      << " tier=" << tier_index
                      << " name=" << tier.name
                      << " domain=" << tier.domain

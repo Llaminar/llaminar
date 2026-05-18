@@ -89,6 +89,88 @@ namespace
         uint32_t prefill_route_capacity;
         uint32_t reserved_u32[2];
     };
+
+    __device__ __forceinline__ bool moe_topk_pair_better(
+        float candidate_value,
+        int candidate_id,
+        float best_value,
+        int best_id)
+    {
+        return candidate_value > best_value ||
+               (candidate_value == best_value && candidate_id < best_id);
+    }
+
+    __device__ void moe_select_topk_probabilities_block(
+        float *__restrict__ expert_probs,
+        int num_experts,
+        int top_k,
+        int *__restrict__ selected_ids,
+        float *__restrict__ selected_weights)
+    {
+        __shared__ float warp_best_values[8];
+        __shared__ int warp_best_ids[8];
+
+        const int lane = threadIdx.x % warpSize;
+        const int warp_id = threadIdx.x / warpSize;
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            float best_value = -1.0f;
+            int best_id = kDeviceMoEMaxExperts;
+
+            if (threadIdx.x < num_experts)
+            {
+                best_value = expert_probs[threadIdx.x];
+                best_id = threadIdx.x;
+            }
+
+            for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            {
+                const float other_value = __shfl_down(best_value, offset);
+                const int other_id = __shfl_down(best_id, offset);
+                if (moe_topk_pair_better(other_value, other_id, best_value, best_id))
+                {
+                    best_value = other_value;
+                    best_id = other_id;
+                }
+            }
+
+            if (lane == 0)
+            {
+                warp_best_values[warp_id] = best_value;
+                warp_best_ids[warp_id] = best_id;
+            }
+            __syncthreads();
+
+            if (warp_id == 0)
+            {
+                best_value = (lane < num_warps) ? warp_best_values[lane] : -1.0f;
+                best_id = (lane < num_warps) ? warp_best_ids[lane] : kDeviceMoEMaxExperts;
+                for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+                {
+                    const float other_value = __shfl_down(best_value, offset);
+                    const int other_id = __shfl_down(best_id, offset);
+                    if (moe_topk_pair_better(other_value, other_id, best_value, best_id))
+                    {
+                        best_value = other_value;
+                        best_id = other_id;
+                    }
+                }
+
+                if (lane == 0)
+                {
+                    selected_ids[slot] = best_id;
+                    selected_weights[slot] = best_value;
+                    if (best_id >= 0 && best_id < num_experts)
+                    {
+                        expert_probs[best_id] = -1.0f;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
 }
 
 // =========================================================================
@@ -129,6 +211,277 @@ __global__ void rocm_moe_gate_logits_single_token_kernel(
         for (int i = threadIdx.x; i < d_model; i += blockDim.x)
         {
             sum += hidden[i] * w[i];
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int nw = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < nw) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            sum += __shfl_down(sum, offset);
+        if (lane == 0) logits[expert] = sum;
+    }
+}
+
+__global__ void rocm_moe_gate_logits_single_token_kpart_kernel(
+    const float *__restrict__ hidden,       // [d_model]
+    const float *__restrict__ gate_weights, // [num_experts, d_model]
+    float *__restrict__ partials,           // [num_experts, k_partitions]
+    int d_model, int num_experts, int k_partitions,
+    bool use_vec4)
+{
+    const int expert = blockIdx.x;
+    const int partition = blockIdx.y;
+    if (expert >= num_experts || partition >= k_partitions) return;
+
+    const int block_count = (d_model + 31) / 32;
+    const int blocks_per_partition = (block_count + k_partitions - 1) / k_partitions;
+    const int block_begin = partition * blocks_per_partition;
+    const int block_end_unclamped = block_begin + blocks_per_partition;
+    const int block_end = (block_end_unclamped < block_count) ? block_end_unclamped : block_count;
+    const int element_begin = block_begin * 32;
+    const int element_end_unclamped = block_end * 32;
+    const int element_end = (element_end_unclamped < d_model) ? element_end_unclamped : d_model;
+
+    const float *w = gate_weights + expert * d_model;
+    float sum = 0.0f;
+
+    if (use_vec4)
+    {
+        const int vec_begin = element_begin >> 2;
+        const int vec_end = element_end >> 2;
+        const float4 *hidden4 = reinterpret_cast<const float4 *>(hidden);
+        const float4 *w4 = reinterpret_cast<const float4 *>(w);
+        for (int i = vec_begin + threadIdx.x; i < vec_end; i += blockDim.x)
+        {
+            const float4 h = hidden4[i];
+            const float4 ww = w4[i];
+            sum += h.x * ww.x + h.y * ww.y + h.z * ww.z + h.w * ww.w;
+        }
+    }
+    else
+    {
+        for (int i = element_begin + threadIdx.x; i < element_end; i += blockDim.x)
+        {
+            sum += hidden[i] * w[i];
+        }
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int nw = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < nw) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            sum += __shfl_down(sum, offset);
+        if (lane == 0) partials[expert * k_partitions + partition] = sum;
+    }
+}
+
+__global__ void rocm_moe_gate_logits_kpart_reduce_kernel(
+    const float *__restrict__ partials, // [num_experts, k_partitions]
+    float *__restrict__ logits,         // [num_experts]
+    int num_experts, int k_partitions)
+{
+    const int expert = blockIdx.x;
+    if (expert >= num_experts) return;
+
+    const float *expert_partials = partials + expert * k_partitions;
+    float sum = 0.0f;
+    for (int partition = threadIdx.x; partition < k_partitions; partition += blockDim.x)
+    {
+        sum += expert_partials[partition];
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int nw = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < nw) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            sum += __shfl_down(sum, offset);
+        if (lane == 0) logits[expert] = sum;
+    }
+}
+
+__global__ void rocm_moe_fp32_to_fp16_kernel(
+    const float *__restrict__ input,
+    __half *__restrict__ output,
+    int count)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    output[idx] = __float2half(input[idx]);
+}
+
+__global__ void rocm_moe_router_gate_quantize_q8_kernel(
+    const float *__restrict__ gate_weights, // [num_experts, d_model]
+    int8_t *__restrict__ gate_weights_q8,   // [num_experts, blocks_per_row, 32]
+    float *__restrict__ gate_scales,        // [num_experts, blocks_per_row]
+    int d_model, int num_experts)
+{
+    constexpr int BLOCK_SIZE = 32;
+    const int expert = blockIdx.x;
+    const int block_idx = blockIdx.y;
+    const int lane = threadIdx.x;
+    if (expert >= num_experts || lane >= BLOCK_SIZE) return;
+
+    const int blocks_per_row = d_model / BLOCK_SIZE;
+    const int k = block_idx * BLOCK_SIZE + lane;
+    const size_t scale_idx = static_cast<size_t>(expert) * blocks_per_row + block_idx;
+    const float value = (k < d_model) ? gate_weights[static_cast<size_t>(expert) * d_model + k] : 0.0f;
+
+    float max_abs = fabsf(value);
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+    {
+        max_abs = fmaxf(max_abs, __shfl_xor(max_abs, mask));
+    }
+
+    const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+    if (lane == 0)
+    {
+        gate_scales[scale_idx] = scale;
+    }
+
+    const float q_value = value / scale;
+    gate_weights_q8[scale_idx * BLOCK_SIZE + lane] = static_cast<int8_t>(
+        rintf(fminf(127.0f, fmaxf(-127.0f, q_value))));
+}
+
+__global__ void rocm_moe_router_hidden_quantize_q8_kernel(
+    const float *__restrict__ hidden,       // [d_model]
+    int8_t *__restrict__ hidden_q8,         // [d_model]
+    float *__restrict__ hidden_scales,      // [blocks_per_row]
+    int d_model)
+{
+    constexpr int BLOCK_SIZE = 32;
+    const int block_idx = blockIdx.x;
+    const int lane = threadIdx.x;
+    const int k = block_idx * BLOCK_SIZE + lane;
+    if (lane >= BLOCK_SIZE || k >= d_model) return;
+
+    const float value = hidden[k];
+    float max_abs = fabsf(value);
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+    {
+        max_abs = fmaxf(max_abs, __shfl_xor(max_abs, mask));
+    }
+
+    const float scale = (max_abs > 0.0f) ? (max_abs / 127.0f) : 1.0f;
+    if (lane == 0)
+    {
+        hidden_scales[block_idx] = scale;
+    }
+
+    const float q_value = value / scale;
+    hidden_q8[k] = static_cast<int8_t>(
+        rintf(fminf(127.0f, fmaxf(-127.0f, q_value))));
+}
+
+__global__ void rocm_moe_gate_logits_single_token_q8_weights_kernel(
+    const int8_t *__restrict__ hidden_q8,       // [d_model]
+    const float *__restrict__ hidden_scales,    // [blocks_per_row]
+    const int8_t *__restrict__ gate_weights_q8, // [num_experts, blocks_per_row, 32]
+    const float *__restrict__ gate_scales,      // [num_experts, blocks_per_row]
+    float *__restrict__ logits,                 // [num_experts]
+    int d_model, int num_experts)
+{
+    constexpr int BLOCK_SIZE = 32;
+    const int expert = blockIdx.x;
+    if (expert >= num_experts) return;
+
+    const int blocks_per_row = d_model / BLOCK_SIZE;
+    float sum = 0.0f;
+    for (int block_idx = threadIdx.x; block_idx < blocks_per_row; block_idx += blockDim.x)
+    {
+        const int32_t *h4 = reinterpret_cast<const int32_t *>(hidden_q8 + block_idx * BLOCK_SIZE);
+        const size_t scale_idx = static_cast<size_t>(expert) * blocks_per_row + block_idx;
+        const int32_t *w4 = reinterpret_cast<const int32_t *>(gate_weights_q8 + scale_idx * BLOCK_SIZE);
+
+        int32_t block_acc = 0;
+        #pragma unroll
+        for (int group = 0; group < 8; ++group)
+        {
+            block_acc = __builtin_amdgcn_sdot4(h4[group], w4[group], block_acc, false);
+        }
+        sum += static_cast<float>(block_acc) * hidden_scales[block_idx] * gate_scales[scale_idx];
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int nw = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < nw) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            sum += __shfl_down(sum, offset);
+        if (lane == 0) logits[expert] = sum;
+    }
+}
+
+__global__ void rocm_moe_gate_logits_single_token_fp16_weights_kernel(
+    const float *__restrict__ hidden,          // [d_model]
+    const __half *__restrict__ gate_weights,   // [num_experts, d_model]
+    float *__restrict__ logits,                // [num_experts]
+    int d_model, int num_experts)
+{
+    const int expert = blockIdx.x;
+    if (expert >= num_experts) return;
+
+    const __half *w = gate_weights + expert * d_model;
+    float sum = 0.0f;
+
+    if ((d_model & 1) == 0)
+    {
+        const int pair_count = d_model >> 1;
+        const __half2 *w2 = reinterpret_cast<const __half2 *>(w);
+        for (int i = threadIdx.x; i < pair_count; i += blockDim.x)
+        {
+            const float2 ww = __half22float2(w2[i]);
+            const int h = i << 1;
+            sum += hidden[h] * ww.x + hidden[h + 1] * ww.y;
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        {
+            sum += hidden[i] * __half2float(w[i]);
         }
     }
 
@@ -541,6 +894,282 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
     }
 }
 
+__global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
+    const float *__restrict__ logits,                 // [num_experts] input logits, left unmodified
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    float *__restrict__ legacy_indices,               // optional [top_k]
+    float *__restrict__ legacy_weights,               // optional [top_k]
+    int num_experts, int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram)
+{
+    if (!logits || !runtime || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    {
+        return;
+    }
+
+    __shared__ float expert_probs[kDeviceMoEMaxExperts];
+    __shared__ float shared_max[8];
+    __shared__ float shared_sum[8];
+
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+
+    float max_val = -FLT_MAX;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        max_val = fmaxf(max_val, logits[expert]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        max_val = fmaxf(max_val, __shfl_down(max_val, offset));
+    }
+    if (lane == 0) shared_max[warp_id] = max_val;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        max_val = (lane < num_warps) ? shared_max[lane] : -FLT_MAX;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+            max_val = fmaxf(max_val, __shfl_down(max_val, offset));
+        }
+        if (lane == 0) shared_max[0] = max_val;
+    }
+    __syncthreads();
+    max_val = shared_max[0];
+
+    float sum = 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        const float value = expf(logits[expert] - max_val);
+        expert_probs[expert] = value;
+        sum += value;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        sum += __shfl_down(sum, offset);
+    }
+    if (lane == 0) shared_sum[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < num_warps) ? shared_sum[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+            sum += __shfl_down(sum, offset);
+        }
+        if (lane == 0) shared_sum[0] = sum;
+    }
+    __syncthreads();
+
+    const float inv_sum = (shared_sum[0] > 0.0f) ? 1.0f / shared_sum[0] : 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        expert_probs[expert] *= inv_sum;
+    }
+    __syncthreads();
+
+    __shared__ int selected_ids[kDeviceMoEMaxTopK];
+    __shared__ float selected_weights[kDeviceMoEMaxTopK];
+    moe_select_topk_probabilities_block(expert_probs, num_experts, top_k, selected_ids, selected_weights);
+
+    if (threadIdx.x == 0)
+    {
+        if (normalize_weights)
+        {
+            float topk_sum = 0.0f;
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                topk_sum += selected_weights[slot];
+            }
+            if (topk_sum > 0.0f)
+            {
+                const float inv_topk_sum = 1.0f / topk_sum;
+                for (int slot = 0; slot < top_k; ++slot)
+                {
+                    selected_weights[slot] *= inv_topk_sum;
+                }
+            }
+        }
+
+        const bool runtime_shape_ok =
+            runtime->active_bank <= 1u &&
+            runtime->active_epoch != 0u &&
+            runtime->expert_count == static_cast<uint32_t>(num_experts) &&
+            runtime->top_k == static_cast<uint32_t>(top_k);
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int expert_id = selected_ids[slot];
+            const float weight = selected_weights[slot];
+
+            if (runtime_shape_ok)
+            {
+                runtime->topk_expert_ids[slot] = expert_id;
+                runtime->topk_weights[slot] = weight;
+                if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
+                {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+                }
+            }
+
+            if (write_legacy_outputs && legacy_indices && legacy_weights)
+            {
+                legacy_indices[slot] = static_cast<float>(expert_id);
+                legacy_weights[slot] = weight;
+            }
+        }
+    }
+}
+
+__global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
+    const float *__restrict__ partials,                // [num_experts, k_partitions]
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    float *__restrict__ legacy_indices,                // optional [top_k]
+    float *__restrict__ legacy_weights,                // optional [top_k]
+    int num_experts, int k_partitions, int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram)
+{
+    if (!partials || !runtime || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        k_partitions <= 0 || top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    {
+        return;
+    }
+
+    __shared__ float expert_probs[kDeviceMoEMaxExperts];
+
+    float local_max = -FLT_MAX;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        const float *expert_partials = partials + expert * k_partitions;
+        float sum = 0.0f;
+        for (int partition = 0; partition < k_partitions; ++partition)
+        {
+            sum += expert_partials[partition];
+        }
+        expert_probs[expert] = sum;
+        local_max = fmaxf(local_max, sum);
+    }
+
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+
+    __shared__ float shared_max[8];
+    if (lane == 0) shared_max[warp_id] = local_max;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        local_max = (lane < num_warps) ? shared_max[lane] : -FLT_MAX;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+            local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+        }
+        if (lane == 0) shared_max[0] = local_max;
+    }
+    __syncthreads();
+    const float max_val = shared_max[0];
+
+    float local_sum = 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        const float value = expf(expert_probs[expert] - max_val);
+        expert_probs[expert] = value;
+        local_sum += value;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+    {
+        local_sum += __shfl_down(local_sum, offset);
+    }
+
+    __shared__ float shared_sum[8];
+    if (lane == 0) shared_sum[warp_id] = local_sum;
+    __syncthreads();
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        local_sum = (lane < num_warps) ? shared_sum[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        {
+            local_sum += __shfl_down(local_sum, offset);
+        }
+        if (lane == 0) shared_sum[0] = local_sum;
+    }
+    __syncthreads();
+
+    const float inv_sum = (shared_sum[0] > 0.0f) ? 1.0f / shared_sum[0] : 0.0f;
+    for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+    {
+        expert_probs[expert] *= inv_sum;
+    }
+    __syncthreads();
+
+    __shared__ int selected_ids[kDeviceMoEMaxTopK];
+    __shared__ float selected_weights[kDeviceMoEMaxTopK];
+    moe_select_topk_probabilities_block(expert_probs, num_experts, top_k, selected_ids, selected_weights);
+
+    if (threadIdx.x == 0)
+    {
+        if (normalize_weights)
+        {
+            float topk_sum = 0.0f;
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                topk_sum += selected_weights[slot];
+            }
+            if (topk_sum > 0.0f)
+            {
+                const float inv_topk_sum = 1.0f / topk_sum;
+                for (int slot = 0; slot < top_k; ++slot)
+                {
+                    selected_weights[slot] *= inv_topk_sum;
+                }
+            }
+        }
+
+        const bool runtime_shape_ok =
+            runtime->active_bank <= 1u &&
+            runtime->active_epoch != 0u &&
+            runtime->expert_count == static_cast<uint32_t>(num_experts) &&
+            runtime->top_k == static_cast<uint32_t>(top_k);
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int expert_id = selected_ids[slot];
+            const float weight = selected_weights[slot];
+
+            if (runtime_shape_ok)
+            {
+                runtime->topk_expert_ids[slot] = expert_id;
+                runtime->topk_weights[slot] = weight;
+                if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
+                {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+                }
+            }
+
+            if (write_legacy_outputs && legacy_indices && legacy_weights)
+            {
+                legacy_indices[slot] = static_cast<float>(expert_id);
+                legacy_weights[slot] = weight;
+            }
+        }
+    }
+}
+
 // =========================================================================
 // Kernel 2c: Decode Route Select Runtime Copy
 //
@@ -719,6 +1348,45 @@ __global__ void rocm_moe_shared_expert_gate_scale_kernel(
     shared_output[idx] *= gate_values[token];
 }
 
+__global__ void rocm_moe_shared_expert_gate_decode_fused_kernel(
+    const float *__restrict__ input,        // [d_model], token 0
+    const float *__restrict__ gate_inp,     // [d_model]
+    float *__restrict__ shared_output,      // [d_model], token 0
+    int d_model)
+{
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+    {
+        sum += input[i] * gate_inp[i];
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    __shared__ float warp_sums[16];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
+        float block_sum = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            block_sum += __shfl_down(block_sum, offset);
+        if (lane == 0)
+            warp_sums[0] = 1.0f / (1.0f + expf(-block_sum));
+    }
+    __syncthreads();
+
+    const float gate = warp_sums[0];
+    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+    {
+        shared_output[i] *= gate;
+    }
+}
+
 // =========================================================================
 // Kernel 6: SwiGLU — silu(gate) * up
 //
@@ -781,6 +1449,214 @@ bool hipMoE_gate_logits_single_token(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE gate_logits_single_token kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_gate_logits_single_token_kpart(
+    const float *hidden, const float *gate_weights, float *logits,
+    float *partials,
+    int d_model, int num_experts, int k_partitions,
+    int device_idx, void *stream)
+{
+    if (!hidden || !gate_weights || !logits || !partials ||
+        d_model <= 0 || num_experts <= 0 || k_partitions <= 0)
+    {
+        fprintf(stderr, "HIP MoE K-part gate logits invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const bool use_vec4 = ((d_model & 3) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(hidden) & 0xfu) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(gate_weights) & 0xfu) == 0);
+    const int partial_threads = 128;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_single_token_kpart_kernel,
+        dim3(num_experts, k_partitions), dim3(partial_threads), 0, static_cast<hipStream_t>(stream),
+        hidden, gate_weights, partials, d_model, num_experts, k_partitions, use_vec4);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE gate_logits_single_token_kpart kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+
+    const int reduce_threads = 64;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_kpart_reduce_kernel,
+        dim3(num_experts), dim3(reduce_threads), 0, static_cast<hipStream_t>(stream),
+        partials, logits, num_experts, k_partitions);
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE gate_logits_kpart_reduce kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_gate_logits_single_token_kpart_partials(
+    const float *hidden, const float *gate_weights, float *partials,
+    int d_model, int num_experts, int k_partitions,
+    int device_idx, void *stream)
+{
+    if (!hidden || !gate_weights || !partials ||
+        d_model <= 0 || num_experts <= 0 || k_partitions <= 0)
+    {
+        fprintf(stderr, "HIP MoE K-part gate logits partials invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const bool use_vec4 = ((d_model & 3) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(hidden) & 0xfu) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(gate_weights) & 0xfu) == 0);
+    const int partial_threads = 128;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_single_token_kpart_kernel,
+        dim3(num_experts, k_partitions), dim3(partial_threads), 0, static_cast<hipStream_t>(stream),
+        hidden, gate_weights, partials, d_model, num_experts, k_partitions, use_vec4);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE gate_logits_single_token_kpart_partials kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_fp32_to_fp16(
+    const float *input, void *output_fp16, int count,
+    int device_idx, void *stream)
+{
+    if (!input || !output_fp16 || count < 0)
+    {
+        fprintf(stderr, "HIP MoE fp32_to_fp16 invalid args\n");
+        return false;
+    }
+    if (count == 0)
+        return true;
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int threads = 256;
+    const int blocks = (count + threads - 1) / threads;
+    hipLaunchKernelGGL(rocm_moe_fp32_to_fp16_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        input, static_cast<__half *>(output_fp16), count);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE fp32_to_fp16 kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_gate_logits_single_token_fp16_weights(
+    const float *hidden, const void *gate_weights_fp16, float *logits,
+    int d_model, int num_experts,
+    int device_idx, void *stream)
+{
+    if (!hidden || !gate_weights_fp16 || !logits || d_model <= 0 || num_experts <= 0)
+    {
+        fprintf(stderr, "HIP MoE fp16 gate logits invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int threads = 128;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_single_token_fp16_weights_kernel,
+        dim3(num_experts), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        hidden, static_cast<const __half *>(gate_weights_fp16), logits, d_model, num_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE gate_logits_single_token_fp16_weights kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_quantize_router_gate_q8(
+    const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
+    int d_model, int num_experts,
+    int device_idx, void *stream)
+{
+    if (!gate_weights || !gate_weights_q8 || !gate_scales ||
+        d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+    {
+        fprintf(stderr, "HIP MoE Q8 router gate quantize invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int blocks_per_row = d_model / 32;
+    hipLaunchKernelGGL(rocm_moe_router_gate_quantize_q8_kernel,
+        dim3(num_experts, blocks_per_row), dim3(32), 0, static_cast<hipStream_t>(stream),
+        gate_weights, gate_weights_q8, gate_scales, d_model, num_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE Q8 router gate quantize kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_gate_logits_single_token_q8_weights(
+    const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+    const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+    int d_model, int num_experts,
+    int device_idx, void *stream)
+{
+    if (!hidden || !hidden_q8 || !hidden_scales || !gate_weights_q8 || !gate_scales || !logits ||
+        d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+    {
+        fprintf(stderr, "HIP MoE Q8 gate logits invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    (void)hipGetLastError();
+
+    const int blocks_per_row = d_model / 32;
+    hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_kernel,
+        dim3(blocks_per_row), dim3(32), 0, hip_stream,
+        hidden, hidden_q8, hidden_scales, d_model);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE Q8 hidden quantize kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+
+    const int threads = 128;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_single_token_q8_weights_kernel,
+        dim3(num_experts), dim3(threads), 0, hip_stream,
+        hidden_q8, hidden_scales, gate_weights_q8, gate_scales, logits,
+        d_model, num_experts);
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE Q8 gate logits kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;
@@ -890,6 +1766,94 @@ bool hipMoE_softmax_topk_decode_runtime(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE softmax_topk_decode_runtime kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_softmax_topk_decode_runtime_wave64(
+    const float *logits,
+    void *runtime,
+    float *legacy_indices,
+    float *legacy_weights,
+    int num_experts, int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!logits || !runtime || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    {
+        return false;
+    }
+    if (write_legacy_outputs && (!legacy_indices || !legacy_weights))
+    {
+        return false;
+    }
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_runtime_wave64_kernel,
+        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        logits,
+        static_cast<DeviceMoELayerRuntimeView *>(runtime),
+        legacy_indices, legacy_weights,
+        num_experts, top_k,
+        normalize_weights,
+        write_legacy_outputs,
+        update_runtime_histogram);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE softmax_topk_decode_runtime_wave64 kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
+    const float *partials,
+    void *runtime,
+    float *legacy_indices,
+    float *legacy_weights,
+    int num_experts, int k_partitions, int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+    bool update_runtime_histogram,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!partials || !runtime || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        k_partitions <= 0 || top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    {
+        return false;
+    }
+    if (write_legacy_outputs && (!legacy_indices || !legacy_weights))
+    {
+        return false;
+    }
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel,
+        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        partials,
+        static_cast<DeviceMoELayerRuntimeView *>(runtime),
+        legacy_indices, legacy_weights,
+        num_experts, k_partitions, top_k,
+        normalize_weights,
+        write_legacy_outputs,
+        update_runtime_histogram);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE router_kpart_reduce_softmax_topk_decode_runtime kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;
@@ -1020,6 +1984,36 @@ bool hipMoE_shared_expert_gate(
                     hipGetErrorString(err));
             return false;
         }
+    }
+
+    return true;
+}
+
+bool hipMoE_shared_expert_gate_decode_fused(
+    const float *input, const float *gate_inp,
+    float *shared_output, int d_model,
+    int device_idx, void *stream)
+{
+    if (!input || !gate_inp || !shared_output || d_model <= 0)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_decode_fused invalid args\n");
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int threads = 256;
+    hipLaunchKernelGGL(rocm_moe_shared_expert_gate_decode_fused_kernel,
+        dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        input, gate_inp, shared_output, d_model);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE shared_expert_gate_decode_fused kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
     }
 
     return true;

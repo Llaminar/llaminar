@@ -148,7 +148,7 @@ namespace llaminar2
         auto t1 = std::chrono::steady_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-        LOG_INFO("[repackEmbeddingToQ8] Repacked "
+        LOG_DEBUG("[repackEmbeddingToQ8] Repacked "
                  << tensorTypeName(embed_table->native_type()) << " embedding "
                  << vocab_size << "×" << d_model << " → EmbedQ8 "
                  << (byte_size / (1024 * 1024)) << " MB (" << total_blocks << " blocks) in "
@@ -264,7 +264,7 @@ namespace llaminar2
         auto t1 = std::chrono::steady_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-        LOG_INFO("[repackEmbeddingToQ8] Repacked "
+        LOG_DEBUG("[repackEmbeddingToQ8] Repacked "
                  << tensorTypeName(embed_table->native_type()) << " embedding "
                  << "rows [" << vocab_start << ", " << (vocab_start + vocab_count) << ") of "
                  << total_vocab << "×" << d_model << " → EmbedQ8 "

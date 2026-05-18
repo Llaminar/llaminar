@@ -80,7 +80,7 @@ namespace llaminar2
         // Check if NUMA is available on this system
         if (numa_available() < 0)
         {
-            LOG_INFO("NUMAAllocator: libnuma present but NUMA not available on this system");
+            LOG_DEBUG("NUMAAllocator: libnuma present but NUMA not available on this system");
             numa_available_ = false;
             num_numa_nodes_ = 1;
             allocated_per_node_.resize(1, 0);
@@ -97,7 +97,7 @@ namespace llaminar2
 
         allocated_per_node_.resize(num_numa_nodes_, 0);
 
-        LOG_INFO("NUMAAllocator: NUMA available with " << num_numa_nodes_ << " node(s)");
+        LOG_DEBUG("NUMAAllocator: NUMA available with " << num_numa_nodes_ << " node(s)");
 
         // Log memory per node
         for (int i = 0; i < num_numa_nodes_; ++i)
@@ -109,7 +109,7 @@ namespace llaminar2
             }
         }
 #else
-        LOG_INFO("NUMAAllocator: libnuma not available, using standard allocation");
+        LOG_DEBUG("NUMAAllocator: libnuma not available, using standard allocation");
         numa_available_ = false;
         num_numa_nodes_ = 1;
         allocated_per_node_.resize(1, 0);

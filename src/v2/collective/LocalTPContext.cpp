@@ -428,13 +428,13 @@ namespace llaminar2
                                                     << ", backend=" << collectiveBackendTypeToString(backend_));
         if (debugEnv().tp_collective_contract_trace)
         {
-            LOG_INFO("[TP_COLLECTIVE_CONTEXT] event=localtp_create"
-                     << " context_id=" << context_id_
-                     << " context=" << static_cast<const void *>(this)
-                     << " degree=" << degree()
-                     << " backend=" << collectiveBackendTypeToString(backend_)
-                     << " devices=" << [&]()
-                     {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=localtp_create"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " degree=" << degree()
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " devices=" << [&]()
+                      {
                             std::string out;
                             for (size_t i = 0; i < devices_.size(); ++i)
                             {
@@ -489,11 +489,11 @@ namespace llaminar2
             return;
         }
 
-        LOG_INFO("[LocalTPContext][Telemetry] "
-                 << "backend=" << collectiveBackendTypeToString(backend_)
-                 << " nccl_allreduce_attempts=" << attempts
-                 << " nccl_allreduce_success=" << success
-                 << " nccl_allreduce_failures=" << failures);
+        LOG_DEBUG("[LocalTPContext][Telemetry] "
+                  << "backend=" << collectiveBackendTypeToString(backend_)
+                  << " nccl_allreduce_attempts=" << attempts
+                  << " nccl_allreduce_success=" << success
+                  << " nccl_allreduce_failures=" << failures);
     }
 
     // =========================================================================
@@ -870,9 +870,9 @@ namespace llaminar2
                 else
                 {
                     fp16_scratch_counts_[device_index] = effective_count;
-                    LOG_INFO("LocalTPContext: Allocated FP16 scratch buffer: "
-                             << (alloc_bytes / 1024) << " KB (live="
-                             << (live_bytes / 1024) << " KB) on device " << ordinal);
+                    LOG_DEBUG("LocalTPContext: Allocated FP16 scratch buffer: "
+                              << (alloc_bytes / 1024) << " KB (live="
+                              << (live_bytes / 1024) << " KB) on device " << ordinal);
                 }
             }
 
@@ -1311,14 +1311,14 @@ namespace llaminar2
             for (int i = 0; i < num_participants; ++i)
             {
                 TensorBase *tb = barrier_tensors_[i];
-                LOG_INFO("[LocalTPContext][HostAllreduceTrace] slot=" << i
-                                                                      << " tensor=" << static_cast<void *>(tb)
-                                                                      << " current_device=" << (tb && tb->current_device() ? tb->current_device()->toString() : "none")
-                                                                      << " host=" << (tb ? tb->raw_data() : nullptr)
-                                                                      << " gpu=" << (tb ? tb->gpu_data_ptr() : nullptr)
-                                                                      << " numel=" << (tb ? tb->numel() : 0)
-                                                                      << " count=" << effective_count
-                                                                      << " stage=" << barrier_stage_name_);
+                LOG_DEBUG("[LocalTPContext][HostAllreduceTrace] slot=" << i
+                                                                       << " tensor=" << static_cast<void *>(tb)
+                                                                       << " current_device=" << (tb && tb->current_device() ? tb->current_device()->toString() : "none")
+                                                                       << " host=" << (tb ? tb->raw_data() : nullptr)
+                                                                       << " gpu=" << (tb ? tb->gpu_data_ptr() : nullptr)
+                                                                       << " numel=" << (tb ? tb->numel() : 0)
+                                                                       << " count=" << effective_count
+                                                                       << " stage=" << barrier_stage_name_);
             }
         }
 
@@ -2013,7 +2013,7 @@ namespace llaminar2
 
                 if (!logged_graph_policy_allow_marker_.exchange(true))
                 {
-                    LOG_INFO("LOCALTP_NCCL_GRAPH_POLICY=SUPPORTED reason=" << graph_policy_reason);
+                    LOG_DEBUG("LOCALTP_NCCL_GRAPH_POLICY=SUPPORTED reason=" << graph_policy_reason);
                 }
             }
 
@@ -2212,8 +2212,8 @@ namespace llaminar2
                 nccl_allreduce_success_.fetch_add(1);
                 if (!logged_real_path_marker_.exchange(true))
                 {
-                    LOG_INFO("LOCALTP_NCCL_PATH=REAL backend=NCCL collective=allreduce_multi count="
-                             << effective_count << " participants=" << num_participants);
+                    LOG_DEBUG("LOCALTP_NCCL_PATH=REAL backend=NCCL collective=allreduce_multi count="
+                              << effective_count << " participants=" << num_participants);
                 }
             }
 
@@ -2660,18 +2660,18 @@ namespace llaminar2
     {
         if (debugEnv().tp_collective_contract_trace)
         {
-            LOG_INFO("[TP_COLLECTIVE_CONTEXT] event=localtp_set_compute_streams"
-                     << " context_id=" << context_id_
-                     << " context=" << static_cast<const void *>(this)
-                     << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
-                     << " stream_count=" << compute_streams.size());
+            LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=localtp_set_compute_streams"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
+                      << " stream_count=" << compute_streams.size());
             for (size_t i = 0; i < compute_streams.size(); ++i)
             {
-                LOG_INFO("[TP_COLLECTIVE_CONTEXT] event=localtp_compute_stream"
-                         << " context_id=" << context_id_
-                         << " slot=" << i
-                         << " stream=" << compute_streams[i]
-                         << " device=" << (i < devices_.size() ? devices_[i].toString() : std::string("(unknown)")));
+                LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=localtp_compute_stream"
+                          << " context_id=" << context_id_
+                          << " slot=" << i
+                          << " stream=" << compute_streams[i]
+                          << " device=" << (i < devices_.size() ? devices_[i].toString() : std::string("(unknown)")));
             }
         }
 
@@ -2756,22 +2756,22 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_arrival"
-                 << " context_id=" << context_id_
-                 << " context=" << static_cast<const void *>(this)
-                 << " backend=" << collectiveBackendTypeToString(backend_)
-                 << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
-                 << " sequence=" << sequence
-                 << " slot=" << device_index
-                 << " degree=" << degree()
-                 << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                 << " count=" << effective_count
-                 << " dtype=" << static_cast<int>(dtype)
-                 << " precision=" << (precision.empty() ? "(default)" : precision)
-                 << " stream=" << stream
-                 << " tensor=" << static_cast<void *>(tensor)
-                 << " tensor_name=" << (tensor && !tensor->debugName().empty() ? tensor->debugName() : "(unnamed)")
-                 << " gpu_ptr=" << (tensor ? tensor->gpu_data_ptr() : nullptr));
+        LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_arrival"
+                  << " context_id=" << context_id_
+                  << " context=" << static_cast<const void *>(this)
+                  << " backend=" << collectiveBackendTypeToString(backend_)
+                  << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
+                  << " sequence=" << sequence
+                  << " slot=" << device_index
+                  << " degree=" << degree()
+                  << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                  << " count=" << effective_count
+                  << " dtype=" << static_cast<int>(dtype)
+                  << " precision=" << (precision.empty() ? "(default)" : precision)
+                  << " stream=" << stream
+                  << " tensor=" << static_cast<void *>(tensor)
+                  << " tensor_name=" << (tensor && !tensor->debugName().empty() ? tensor->debugName() : "(unnamed)")
+                  << " gpu_ptr=" << (tensor ? tensor->gpu_data_ptr() : nullptr));
 
         if (mismatch)
         {
@@ -3111,16 +3111,16 @@ namespace llaminar2
         }
 
         backend_initialized_ = true;
-        LOG_INFO("LocalTPContext: Backend " << backend_impl_->name()
-                                            << " initialized for " << degree() << " devices");
+        LOG_DEBUG("LocalTPContext: Backend " << backend_impl_->name()
+                                             << " initialized for " << degree() << " devices");
 
         if (backend_ == CollectiveBackendType::NCCL)
         {
-            LOG_INFO("[LocalTPContext][NCCLReady] "
-                     << "status=ready"
-                     << " backend_impl=" << backend_impl_->name()
-                     << " degree=" << degree()
-                     << " multi_gpu_single_process=" << (backend_impl_->isMultiGpuSingleProcess() ? 1 : 0));
+            LOG_DEBUG("[LocalTPContext][NCCLReady] "
+                      << "status=ready"
+                      << " backend_impl=" << backend_impl_->name()
+                      << " degree=" << degree()
+                      << " multi_gpu_single_process=" << (backend_impl_->isMultiGpuSingleProcess() ? 1 : 0));
         }
         return true;
     }

@@ -379,7 +379,7 @@ namespace llaminar2
                         tool_call_format_ = factory->getToolCallFormat();
                         if (recommended_sampling_params_.has_penalties() || recommended_sampling_params_.temperature != 1.0f)
                         {
-                            LOG_INFO("[OrchestrationRunner] Model-recommended sampling: "
+                            LOG_DEBUG("[OrchestrationRunner] Model-recommended sampling: "
                                      << "temp=" << recommended_sampling_params_.temperature
                                      << " top_p=" << recommended_sampling_params_.top_p
                                      << " top_k=" << recommended_sampling_params_.top_k
@@ -388,14 +388,14 @@ namespace llaminar2
                         }
                         if (!stop_thinking_prompt_.empty())
                         {
-                            LOG_INFO("[OrchestrationRunner] Stop-thinking prompt configured ("
+                            LOG_DEBUG("[OrchestrationRunner] Stop-thinking prompt configured ("
                                      << stop_thinking_prompt_.size() << " chars)");
                         }
                     }
                 }
             }
 
-            LOG_INFO("OrchestrationRunner initialized successfully");
+            LOG_DEBUG("OrchestrationRunner initialized successfully");
             return true;
         }
         catch (const std::exception &e)
@@ -794,7 +794,7 @@ namespace llaminar2
             return setError("Failed to get MPI context");
         }
 
-        LOG_INFO("MPI initialized: rank " << mpi_ctx_->rank()
+        LOG_DEBUG("MPI initialized: rank " << mpi_ctx_->rank()
                                           << " of " << mpi_ctx_->world_size());
 
         return true;
@@ -903,13 +903,13 @@ namespace llaminar2
 
             if (overlay_execution_plan->buildsRootGraph())
             {
-                LOG_INFO("[OrchestrationRunner] MoE overlay root plan bound to base domain '"
+                LOG_DEBUG("[OrchestrationRunner] MoE overlay root plan bound to base domain '"
                          << config_.moe_expert_parallel_plan->effectiveBaseModelDomain()
                          << "' devices=" << plan_.local_tp_devices.size());
             }
             else
             {
-                LOG_INFO("[OrchestrationRunner] MoE overlay non-root plan narrowed to participant endpoint role "
+                LOG_DEBUG("[OrchestrationRunner] MoE overlay non-root plan narrowed to participant endpoint role "
                          << toString(overlay_execution_plan->currentRankPlan().role));
             }
         }
@@ -962,7 +962,7 @@ namespace llaminar2
             return setError("Failed to create LOCAL TP context");
         }
 
-        LOG_INFO("LOCAL TP context created with " << plan_.local_tp_devices.size() << " devices");
+        LOG_DEBUG("LOCAL TP context created with " << plan_.local_tp_devices.size() << " devices");
         return true;
     }
 
@@ -993,7 +993,7 @@ namespace llaminar2
             return setError("Failed to create LOCAL PP context");
         }
 
-        LOG_INFO("LOCAL PP context created with " << pp_config.numStages()
+        LOG_DEBUG("LOCAL PP context created with " << pp_config.numStages()
                                                   << " stages on " << plan_.local_pp_devices.size() << " devices");
         return true;
     }
@@ -1042,7 +1042,7 @@ namespace llaminar2
                 // Per-node prepopulation: each node leader warms its own page cache
                 if (topo->is_node_leader())
                 {
-                    LOG_INFO("Node leader (rank " << mpi_ctx_->rank()
+                    LOG_DEBUG("Node leader (rank " << mpi_ctx_->rank()
                                                   << ", node " << topo->placement().node_id
                                                   << ") pre-populating page cache for multi-rank mmap...");
                     MmapRegion::prepopulatePageCache(model_path);
@@ -1060,7 +1060,7 @@ namespace llaminar2
                 // Fallback: no topology available (mock or non-standard context)
                 if (mpi_ctx_->rank() == 0)
                 {
-                    LOG_INFO("Pre-populating page cache for multi-rank mmap (rank 0 fallback)...");
+                    LOG_DEBUG("Pre-populating page cache for multi-rank mmap (rank 0 fallback)...");
                     MmapRegion::prepopulatePageCache(model_path);
                 }
                 MPI_Barrier(mpi_ctx_->communicator());
@@ -1131,7 +1131,7 @@ namespace llaminar2
             config_.moe_expert_parallel_plan = std::move(frozen_plan);
             if (config_.moe_expert_parallel_plan->isTieredOverlay())
             {
-                LOG_INFO("[OrchestrationRunner] MoE expert overlay plan frozen: placements="
+                LOG_DEBUG("[OrchestrationRunner] MoE expert overlay plan frozen: placements="
                          << config_.moe_expert_parallel_plan->placements.size()
                          << " routed_tiers=" << config_.moe_expert_parallel_plan->routed_tiers.size()
                          << " domains=" << config_.moe_expert_parallel_plan->domains.size()
@@ -1176,7 +1176,7 @@ namespace llaminar2
             return setError(oss.str());
         }
 
-        LOG_INFO("TP/PP configuration validated against model architecture");
+        LOG_DEBUG("TP/PP configuration validated against model architecture");
         return true;
     }
 
@@ -1434,7 +1434,7 @@ namespace llaminar2
         // Store as IInferenceRunner (RankOrchestrator extends it)
         runner_ = std::move(multi_orchestrator);
 
-        LOG_INFO("Multi-device compute graph built successfully");
+        LOG_DEBUG("Multi-device compute graph built successfully");
         return true;
     }
 
@@ -1495,7 +1495,7 @@ namespace llaminar2
         orch = std::make_unique<RankOrchestrator>(model_ctx_, mdo_config);
         runner_ = std::move(orch);
 
-        LOG_INFO("Local PP compute graph built successfully");
+        LOG_DEBUG("Local PP compute graph built successfully");
         return true;
     }
 
@@ -1580,7 +1580,7 @@ namespace llaminar2
             return setError("Failed to create inference runner");
         }
 
-        LOG_INFO("[OrchestrationRunner] Compute graph built successfully");
+        LOG_DEBUG("[OrchestrationRunner] Compute graph built successfully");
         return true;
     }
 
@@ -1750,7 +1750,11 @@ namespace llaminar2
             gpu_cache_masks = controller->computeGpuCacheExpertMasks(gpu_cache_experts);
 
         const auto old_placement = controller->currentPlacement();
+        const ExpertReplicaSet previous_replicas = controller->currentReplicas();
+        const bool had_replicas = previous_replicas.num_replicated > 0;
         std::vector<int> new_placement;
+        ExpertReplicaSet replica_arrivals;
+        bool replica_state_changed = false;
 
         const int max_replicas = controller->maxReplicasPerSocket();
         if (max_replicas > 0)
@@ -1758,16 +1762,38 @@ namespace llaminar2
             controller->proposeReplicas(max_replicas);
             if (controller->hasReplicas())
             {
+                const auto &current_replicas = controller->currentReplicas();
+                replica_state_changed = !current_replicas.sameReplicaPlacement(previous_replicas);
+                replica_arrivals = current_replicas.arrivalsSince(previous_replicas);
+
                 if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
                 {
-                    LOG_INFO("[MoE] Expert replication: "
-                             << controller->currentReplicas().num_replicated
+                    LOG_DEBUG("[MoE] Expert replication: "
+                             << current_replicas.num_replicated
                              << " experts replicated (cap=" << max_replicas
                              << " per rank/device, hot_cache="
                              << config_.moe_hot_expert_cache.toString() << ")");
-                    LOG_INFO("[MoE] Keeping base expert ownership stable while applying hot-expert replicas");
+                    LOG_DEBUG("[MoE] Keeping base expert ownership stable while applying hot-expert replicas");
+                    if (!replica_state_changed)
+                    {
+                        LOG_DEBUG("[MoE] Hot expert replica set unchanged; skipping replica transfer and mask reapply");
+                    }
+                    else if (replica_arrivals.num_replicated < current_replicas.num_replicated)
+                    {
+                        LOG_DEBUG("[MoE] Transferring " << replica_arrivals.num_replicated
+                                                       << " newly-arrived hot replicas; "
+                                                       << (current_replicas.num_replicated - replica_arrivals.num_replicated)
+                                                       << " already resident");
+                    }
                 }
                 controller->resetRebalanceWindow();
+            }
+            else if (had_replicas)
+            {
+                replica_state_changed = true;
+                controller->resetRebalanceWindow();
+                if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
+                    LOG_DEBUG("[MoE] Hot expert replica set is now empty; releasing previous replicas");
             }
         }
 
@@ -1777,13 +1803,17 @@ namespace llaminar2
             controller->syncReplicaPlacement();
         }
 
-        if (new_placement.empty() && !controller->hasReplicas() && gpu_cache_masks.empty())
+        if (controller->hasReplicas() && !replica_state_changed && gpu_cache_masks.empty())
+            return true;
+
+        if (new_placement.empty() && !controller->hasReplicas() && !replica_state_changed && gpu_cache_masks.empty())
             return true;
 
         ReceivedWeightsMap received;
         if (controller->hasReplicas())
         {
-            received = transferReplicaWeights(controller->currentReplicas(), controller->numLayers());
+            if (replica_arrivals.num_replicated > 0)
+                received = transferReplicaWeights(replica_arrivals, controller->numLayers());
         }
         else if (!new_placement.empty())
         {
@@ -1809,12 +1839,14 @@ namespace llaminar2
 
         if (controller->hasReplicas())
             setExpertReplicaSet(controller->currentReplicas(), socket_id);
+        else if (had_replicas && replica_state_changed)
+            setExpertReplicaSet(controller->currentReplicas(), socket_id);
 
         if (config_.moe_rebalance.release_raw_expert_weights || debugEnv().moe_rebalance.release_raw_weights)
         {
             const size_t freed = releaseRawExpertWeights();
             if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
-                LOG_INFO("[MoE] Released " << (freed >> 20) << " MB raw expert weights");
+                LOG_DEBUG("[MoE] Released " << (freed >> 20) << " MB raw expert weights");
         }
 
         return true;
@@ -1977,7 +2009,7 @@ namespace llaminar2
         if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)
             return;
 
-        LOG_INFO("[MPI] Rank 0 sending SHUTDOWN to worker ranks");
+        LOG_DEBUG("[MPI] Rank 0 sending SHUTDOWN to worker ranks");
         broadcastCommand(MPICommand::SHUTDOWN);
     }
 
@@ -1989,7 +2021,7 @@ namespace llaminar2
             return;
         }
 
-        LOG_INFO("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
+        LOG_DEBUG("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
                                          << " entering worker loop");
 
         while (true)
@@ -2057,7 +2089,7 @@ namespace llaminar2
 
             case MPICommand::SHUTDOWN:
             {
-                LOG_INFO("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
+                LOG_DEBUG("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
                                                  << " received SHUTDOWN");
                 return;
             }

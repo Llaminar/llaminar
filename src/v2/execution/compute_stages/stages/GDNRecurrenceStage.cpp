@@ -237,7 +237,7 @@ namespace llaminar2
             bool ok;
             if (params_.seq_len == 1)
             {
-                LOG_INFO("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
+                LOG_DEBUG("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
                          << " Q=" << static_cast<const void *>(d_q)
                          << " K=" << static_cast<const void *>(d_k)
                          << " V=" << static_cast<const void *>(d_v)
@@ -261,7 +261,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_INFO("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
+                LOG_DEBUG("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
                          << " Q=" << static_cast<const void *>(d_q)
                          << " K=" << static_cast<const void *>(d_k)
                          << " V=" << static_cast<const void *>(d_v)

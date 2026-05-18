@@ -353,7 +353,7 @@ namespace llaminar2
                 forward_cache.segment_cache.consecutive_failures);
             if (capture_policy.collective_segmented_enabled)
             {
-                LOG_INFO("[ForwardExecutionEngine] Experimental collective segmented GPU-graph replay enabled");
+                LOG_DEBUG("[ForwardExecutionEngine] Experimental collective segmented GPU-graph replay enabled");
             }
 
             if (capture_policy.allow_segmented_capture && !forward_cache.gpu_stream)
@@ -427,12 +427,12 @@ namespace llaminar2
             double setup_us = std::chrono::duration<double, std::micro>(exec_t0 - start).count();
             double exec_us = std::chrono::duration<double, std::micro>(exec_t1 - exec_t0).count();
             double sync_us = std::chrono::duration<double, std::micro>(end - exec_t1).count();
-            LOG_INFO("[DEVICE_DECODE] dev=" << input.device
-                                            << " setup=" << std::fixed << std::setprecision(1) << setup_us << "us"
-                                            << " exec=" << exec_us << "us"
-                                            << " sync=" << sync_us << "us"
-                                            << " total=" << (ms * 1000.0) << "us"
-                                            << " phase3=" << forward_cache.phase3_active);
+            LOG_DEBUG("[DEVICE_DECODE] dev=" << input.device
+                                             << " setup=" << std::fixed << std::setprecision(1) << setup_us << "us"
+                                             << " exec=" << exec_us << "us"
+                                             << " sync=" << sync_us << "us"
+                                             << " total=" << (ms * 1000.0) << "us"
+                                             << " phase3=" << forward_cache.phase3_active);
         }
 
         LOG_DEBUG("[ForwardExecutionEngine] Forward (cached) completed in "
@@ -607,12 +607,12 @@ namespace llaminar2
                           << pp_copy.copy_bytes << " bytes on " << pp_copy.device.toString());
             }
 
-            LOG_INFO("[ForwardExecutionEngine] Cached forward graph for signature "
-                     << "[seq_len=" << signature.seq_len
-                     << ", batch_size=" << signature.batch_size
-                     << ", device=" << signature.device.to_string()
-                     << ", decode=" << signature.decode
-                     << "] (" << build_cache->graph->size() << " stages)");
+            LOG_DEBUG("[ForwardExecutionEngine] Cached forward graph for signature "
+                      << "[seq_len=" << signature.seq_len
+                      << ", batch_size=" << signature.batch_size
+                      << ", device=" << signature.device.to_string()
+                      << ", decode=" << signature.decode
+                      << "] (" << build_cache->graph->size() << " stages)");
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -681,15 +681,15 @@ namespace llaminar2
 
     void ForwardExecutionEngine::forEachCachedStage(
         ComputeStageType type,
-        const std::function<void(IComputeStage*)>& visitor) const
+        const std::function<void(IComputeStage *)> &visitor) const
     {
-        for (const auto& [sig, cache] : cache_)
+        for (const auto &[sig, cache] : cache_)
         {
             if (!cache.valid || !cache.graph)
                 continue;
-            for (const auto& node_name : cache.graph->getExecutionOrder())
+            for (const auto &node_name : cache.graph->getExecutionOrder())
             {
-                auto* node = cache.graph->getNode(node_name);
+                auto *node = cache.graph->getNode(node_name);
                 if (node && node->stage && node->stage->type() == type)
                     visitor(node->stage.get());
             }

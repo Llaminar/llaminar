@@ -80,7 +80,7 @@ namespace llaminar2
                 }
             }
 
-            LOG_INFO("[Qwen35GraphConfigBuilder] Hybrid architecture:"
+            LOG_DEBUG("[Qwen35GraphConfigBuilder] Hybrid architecture:"
                      << " " << gdn_count << " GDN layers + "
                      << fa_count << " FA layers"
                      << " (interval=" << config.gdn.full_attention_interval << ")");
@@ -151,7 +151,7 @@ namespace llaminar2
         // Tied embeddings: if output.weight is missing, reuse token_embd.weight
         if (!lm_head && embedding)
         {
-            LOG_INFO("[Qwen35GraphConfigBuilder] output.weight not found, using tied embeddings");
+            LOG_DEBUG("[Qwen35GraphConfigBuilder] output.weight not found, using tied embeddings");
             lm_head = embedding;
         }
 

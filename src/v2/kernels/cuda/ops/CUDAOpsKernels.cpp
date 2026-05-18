@@ -1438,7 +1438,7 @@ namespace llaminar2
                         std::lock_guard<std::mutex> lock(s_embed_cache_mutex_);
                         s_workspace_embed_cache_[workspace_] = embed_table;
                     }
-                    LOG_INFO("[CUDAEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
+                    LOG_DEBUG("[CUDAEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
                              << tensorTypeName(embed_table->native_type()) << " "
                              << repacked.vocab_size << "x" << d_model
                              << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"

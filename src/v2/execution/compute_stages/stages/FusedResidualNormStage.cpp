@@ -186,7 +186,7 @@ namespace llaminar2
                 if (do_trace)
                 {
                     const int last = (seq_len - 1) * hidden_dim;
-                    LOG_INFO("[LayerTrace] " << name() << " post-residual [" << seq_len << "x" << hidden_dim
+                    LOG_DEBUG("[LayerTrace] " << name() << " post-residual [" << seq_len << "x" << hidden_dim
                                              << "] last_row[:6]=" << res_data[last] << "," << res_data[last + 1] << "," << res_data[last + 2]
                                              << "," << res_data[last + 3] << "," << res_data[last + 4] << "," << res_data[last + 5]);
                 }
@@ -224,7 +224,7 @@ namespace llaminar2
             {
                 const float *r = residual_base->data();
                 const int last = (seq_len - 1) * hidden_dim;
-                LOG_INFO("[LayerTrace] " << name() << " post-residual [" << seq_len << "x" << hidden_dim
+                LOG_DEBUG("[LayerTrace] " << name() << " post-residual [" << seq_len << "x" << hidden_dim
                                          << "] last_row[:6]=" << r[last] << "," << r[last + 1] << "," << r[last + 2]
                                          << "," << r[last + 3] << "," << r[last + 4] << "," << r[last + 5]);
             }

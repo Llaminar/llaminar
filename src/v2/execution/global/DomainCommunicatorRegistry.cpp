@@ -73,7 +73,7 @@ namespace llaminar2
                 if (ctx && ctx->isValid())
                 {
                     contexts_[stage->stage_id] = std::move(ctx);
-                    LOG_INFO("[DomainCommunicatorRegistry] Rank " << world_rank
+                    LOG_DEBUG("[DomainCommunicatorRegistry] Rank " << world_rank
                                                                   << " joined domain for stage " << stage->stage_id
                                                                   << " (domain_size=" << contexts_[stage->stage_id]->degree() << ")");
                 }

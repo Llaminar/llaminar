@@ -397,7 +397,7 @@ namespace llaminar2::cuda
             }
         }
 
-        LOG_INFO("[packMoEExpertsCUDA] Packed " << num_experts << " experts ("
+        LOG_DEBUG("[packMoEExpertsCUDA] Packed " << num_experts << " experts ("
                  << rows_per_expert << "x" << K << " each), total slab "
                  << (batch->all_vnni.size() / (1024 * 1024)) << " MB vnni + "
                  << (batch->all_scales.size() * 2 / (1024 * 1024)) << " MB scales");

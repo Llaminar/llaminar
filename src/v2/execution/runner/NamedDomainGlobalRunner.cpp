@@ -115,7 +115,7 @@ namespace llaminar2
             const int my_rank = mpi_ctx->rank();
             const int world_size = mpi_ctx->world_size();
 
-            LOG_INFO("NamedDomainGlobalRunner: initializing on rank " << my_rank
+            LOG_DEBUG("NamedDomainGlobalRunner: initializing on rank " << my_rank
                                                                       << " of " << world_size);
 
             // ----------------------------------------------------------
@@ -200,7 +200,7 @@ namespace llaminar2
             // ----------------------------------------------------------
             if (config_.show_topology && my_rank == 0)
             {
-                LOG_INFO("Multi-domain topology:\n"
+                LOG_DEBUG("Multi-domain topology:\n"
                          << renderMultiDomainTopologyInfo(topology, world_size));
             }
 
@@ -374,7 +374,7 @@ namespace llaminar2
             }
 
             initialized_ = true;
-            LOG_INFO("NamedDomainGlobalRunner: initialized on rank " << my_rank);
+            LOG_DEBUG("NamedDomainGlobalRunner: initialized on rank " << my_rank);
             return true;
         }
         catch (const std::exception &e)

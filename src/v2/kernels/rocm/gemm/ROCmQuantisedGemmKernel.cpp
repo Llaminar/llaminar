@@ -98,6 +98,7 @@
 #include <algorithm>
 #include <atomic>
 #include <string>
+#include <array>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -827,8 +828,8 @@ namespace llaminar2
                 }
                 hipEventCreateWithFlags(&quant_ready, hipEventDisableTiming);
                 initialized = true;
-                LOG_INFO("[ConcurrentPrefillPool] Initialized " << count
-                                                                << " streams on device " << dev_id);
+                LOG_DEBUG("[ConcurrentPrefillPool] Initialized " << count
+                                                                 << " streams on device " << dev_id);
             }
 
             // Ensure scratch buffer i has at least `elements` int32s
@@ -1544,12 +1545,12 @@ namespace llaminar2
                 {
                     static std::once_flag vnni_prefill_policy_once;
                     std::call_once(vnni_prefill_policy_once, [&]()
-                                   { LOG_INFO("[" << callsite << "] INT8 prefill policy enabled (ratio+work map): "
-                                                  << policy_cfg.profile
-                                                  << ", M=" << m << ", N=" << n << ", K=" << k
-                                                  << ", N/K=" << std::fixed << std::setprecision(2)
-                                                  << (static_cast<double>(n) / static_cast<double>(std::max(k, 1)))
-                                                  << ")"); });
+                                   { LOG_DEBUG("[" << callsite << "] INT8 prefill policy enabled (ratio+work map): "
+                                                   << policy_cfg.profile
+                                                   << ", M=" << m << ", N=" << n << ", K=" << k
+                                                   << ", N/K=" << std::fixed << std::setprecision(2)
+                                                   << (static_cast<double>(n) / static_cast<double>(std::max(k, 1)))
+                                                   << ")"); });
                 }
 
                 // Wide-tile path: covers all M-rows in one block (extreme-wide shapes)
@@ -2827,6 +2828,21 @@ namespace llaminar2
             int batch_N[8] = {};
             int batch_count = 0;
 
+            auto isGDNDecodeProjectionSet = [&]() -> bool
+            {
+                if (m != 1 || projections.size() != 4)
+                    return false;
+
+                constexpr std::array<const char *, 4> expected_names = {"qkv", "z", "alpha", "beta"};
+                for (size_t i = 0; i < expected_names.size(); ++i)
+                {
+                    const char *name = projections[i].name;
+                    if (!name || std::strcmp(name, expected_names[i]) != 0)
+                        return false;
+                }
+                return true;
+            };
+
             // =========================================================================
             // CONCURRENT PREFILL PATH: Multi-stream dispatch for M>1 projections
             //
@@ -3023,7 +3039,8 @@ namespace llaminar2
             // =========================================================================
             // CONCURRENT DECODE PATH: Multi-stream dispatch for M=1 GEMV projections
             //
-            // When enabled (LLAMINAR_ROCM_CONCURRENT_DECODE=1), overlaps fused GEMV
+            // When enabled globally (LLAMINAR_ROCM_CONCURRENT_DECODE=1) or for a
+            // scoped projection set (GDN), overlaps fused GEMV
             // projections on separate HIP streams.  At small TP-sharded N dimensions,
             // individual GEMVs may not saturate all CUs, so overlapping them can
             // improve utilization.
@@ -3040,9 +3057,13 @@ namespace llaminar2
             //      main stream waits on all completion events
             // =========================================================================
 #ifdef HAVE_ROCM
+            const bool use_concurrent_decode =
+                debugEnv().rocm.concurrent_decode ||
+                (debugEnv().rocm.gdn_concurrent_decode && isGDNDecodeProjectionSet());
+
             if (m == 1 && projections.size() >= 2 &&
                 fused_uses_blockwise_shared_quant &&
-                debugEnv().rocm.concurrent_decode)
+                use_concurrent_decode)
             {
                 bool decode_concurrent_eligible = true;
                 for (size_t i = 0; i < projections.size(); ++i)

@@ -52,10 +52,10 @@ namespace llaminar2
         int my_rank = config_.mpi_ctx ? config_.mpi_ctx->rank() : 0;
         if (my_rank == 0)
         {
-            LOG_INFO("GlobalOrchestratorRunner: PP topology:\n" << config_.topology.toTable());
+            LOG_DEBUG("GlobalOrchestratorRunner: PP topology:\n" << config_.topology.toTable());
         }
 
-        LOG_INFO("GlobalOrchestratorRunner initialized: " << architecture_name_
+        LOG_DEBUG("GlobalOrchestratorRunner initialized: " << architecture_name_
                  << " on rank " << my_rank);
         return true;
     }

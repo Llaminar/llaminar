@@ -442,7 +442,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_INFO("[TransferEngine::uploadFull] ZERO-COPY: Tensor is mapped, no memcpy needed");
+                LOG_DEBUG("[TransferEngine::uploadFull] ZERO-COPY: Tensor is mapped, no memcpy needed");
             }
             return TransferResult::ok(TransferMethod::MAPPED_NOOP);
         }
@@ -587,7 +587,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_INFO("[TransferEngine::uploadFull] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
+                LOG_DEBUG("[TransferEngine::uploadFull] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
             }
 
             LOG_DEBUG("[GPU_ALLOC] tensor=" << static_cast<void *>(tensor)
@@ -612,7 +612,7 @@ namespace llaminar2
 
             if (trace && pin_us > 100)
             {
-                LOG_INFO("[TransferEngine::uploadFull] ensureHostPinned() took " << pin_us << " us");
+                LOG_DEBUG("[TransferEngine::uploadFull] ensureHostPinned() took " << pin_us << " us");
             }
         }
 
@@ -676,7 +676,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_INFO("[TransferEngine::uploadFull] hostToDevice(" << bytes << " bytes) took "
+                LOG_DEBUG("[TransferEngine::uploadFull] hostToDevice(" << bytes << " bytes) took "
                                                                       << h2d_us << " us (" << bandwidth_gbps << " GB/s)");
             }
 
@@ -706,7 +706,7 @@ namespace llaminar2
         auto overall_us = std::chrono::duration_cast<std::chrono::microseconds>(overall_end - overall_start).count();
         if (trace && overall_us > 1000)
         {
-            LOG_INFO("[TransferEngine::uploadFull] TOTAL took " << overall_us << " us for " << bytes << " bytes");
+            LOG_DEBUG("[TransferEngine::uploadFull] TOTAL took " << overall_us << " us for " << bytes << " bytes");
         }
 
         return TransferResult::ok(TransferMethod::HOST_TO_DEVICE);

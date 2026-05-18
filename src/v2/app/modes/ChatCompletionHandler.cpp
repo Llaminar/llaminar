@@ -453,12 +453,12 @@ namespace llaminar2
         if (!set_.dry_sequence_breakers)
             effective.dry_sequence_breakers = model_defaults.dry_sequence_breakers;
 
-        LOG_INFO("[ChatCompletion] Sampling params (user-set fields marked *): "
-                 << "temp=" << effective.temperature << (set_.temperature ? "* " : " ")
-                 << "top_p=" << effective.top_p << (set_.top_p ? "* " : " ")
-                 << "top_k=" << effective.top_k << (set_.top_k ? "* " : " ")
-                 << "presence_penalty=" << effective.presence_penalty << (set_.presence_penalty ? "* " : " ")
-                 << "frequency_penalty=" << effective.frequency_penalty << (set_.frequency_penalty ? "*" : ""));
+        LOG_DEBUG("[ChatCompletion] Sampling params (user-set fields marked *): "
+                  << "temp=" << effective.temperature << (set_.temperature ? "* " : " ")
+                  << "top_p=" << effective.top_p << (set_.top_p ? "* " : " ")
+                  << "top_k=" << effective.top_k << (set_.top_k ? "* " : " ")
+                  << "presence_penalty=" << effective.presence_penalty << (set_.presence_penalty ? "* " : " ")
+                  << "frequency_penalty=" << effective.frequency_penalty << (set_.frequency_penalty ? "*" : ""));
 
         runner_.setSamplingParams(effective);
 
@@ -620,8 +620,8 @@ namespace llaminar2
                             !stop_thinking_tokens.empty())
                         {
                             // Budget exhausted — start injecting stop-thinking sequence
-                            LOG_INFO("[ChatCompletion] Thinking budget exhausted ("
-                                     << thinking_tokens << " tokens), injecting stop-thinking prompt");
+                            LOG_DEBUG("[ChatCompletion] Thinking budget exhausted ("
+                                      << thinking_tokens << " tokens), injecting stop-thinking prompt");
                             next_token = stop_thinking_tokens[0];
                             stop_thinking_idx = 1;
                             in_thinking = false;
@@ -898,8 +898,8 @@ namespace llaminar2
                 if (thinking_tokens >= request.thinking_budget_tokens &&
                     !stop_thinking_tokens.empty())
                 {
-                    LOG_INFO("[ChatCompletion/stream] Thinking budget exhausted ("
-                             << thinking_tokens << " tokens), injecting stop-thinking prompt");
+                    LOG_DEBUG("[ChatCompletion/stream] Thinking budget exhausted ("
+                              << thinking_tokens << " tokens), injecting stop-thinking prompt");
                     next_token = stop_thinking_tokens[0];
                     stop_thinking_idx = 1;
                     token_text = tokenizer_.decode_token(next_token);

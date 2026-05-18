@@ -18,9 +18,11 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
@@ -33,6 +35,7 @@
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar2;
 using ::testing::_;
@@ -102,7 +105,77 @@ namespace
     CPUShortConvolution g_cpu_conv;
     CPUGatedDeltaNet g_cpu_gdn;
 
+    class ScopedEnvVar
+    {
+    public:
+        explicit ScopedEnvVar(const char *name)
+            : name_(name)
+        {
+            const char *value = std::getenv(name_);
+            if (value)
+            {
+                had_value_ = true;
+                old_value_ = value;
+            }
+            unsetenv(name_);
+        }
+
+        ~ScopedEnvVar()
+        {
+            if (had_value_)
+                setenv(name_, old_value_.c_str(), 1);
+            else
+                unsetenv(name_);
+            mutableDebugEnv().rocm.reload();
+        }
+
+        void set(const char *value)
+        {
+            setenv(name_, value, 1);
+            mutableDebugEnv().rocm.reload();
+        }
+
+        void clear()
+        {
+            unsetenv(name_);
+            mutableDebugEnv().rocm.reload();
+        }
+
+    private:
+        const char *name_;
+        bool had_value_ = false;
+        std::string old_value_;
+    };
+
 } // namespace
+
+TEST(GDNROCmConfig, ConcurrentDecodeFlagDefaultsOffAndParsesEnv)
+{
+    ScopedEnvVar flag("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
+
+    flag.clear();
+    EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);
+
+    flag.set("1");
+    EXPECT_TRUE(debugEnv().rocm.gdn_concurrent_decode);
+
+    flag.set("0");
+    EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);
+}
+
+TEST(GDNROCmConfig, SharedExpertGroupedDecodeFlagDefaultsOffAndParsesEnv)
+{
+    ScopedEnvVar flag("LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE");
+
+    flag.clear();
+    EXPECT_FALSE(debugEnv().rocm.shared_expert_grouped_decode);
+
+    flag.set("1");
+    EXPECT_TRUE(debugEnv().rocm.shared_expert_grouped_decode);
+
+    flag.set("0");
+    EXPECT_FALSE(debugEnv().rocm.shared_expert_grouped_decode);
+}
 
 // ============================================================================
 // Mock Kernels for verifying stage delegation

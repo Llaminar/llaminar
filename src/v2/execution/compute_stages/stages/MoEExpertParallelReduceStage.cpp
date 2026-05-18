@@ -251,7 +251,7 @@ namespace llaminar2
             if (!env.moe_expert_overlay.transfer_trace && !env.moe_expert_overlay.trace && !env.profile.enabled)
                 return;
 
-            LOG_INFO("[MoEExpertParallelReduceStage] mode=" << toString(diagnostics.mode)
+            LOG_DEBUG("[MoEExpertParallelReduceStage] mode=" << toString(diagnostics.mode)
                                                             << " host_staged=" << (diagnostics.host_staged ? "true" : "false")
                                                             << " continuation_domain=" << diagnostics.continuation_domain
                                                             << " continuation_device=" << deviceString(diagnostics.continuation_device)
@@ -269,7 +269,7 @@ namespace llaminar2
             {
                 for (const auto &partial : diagnostics.partials)
                 {
-                    LOG_INFO("[MoEExpertParallelReduceStage] partial name=" << partial.name
+                    LOG_DEBUG("[MoEExpertParallelReduceStage] partial name=" << partial.name
                                                                             << " source_domain=" << partial.source_domain
                                                                             << " source_device=" << deviceString(partial.source_device)
                                                                             << " bytes=" << partial.bytes

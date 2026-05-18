@@ -53,7 +53,7 @@ namespace llaminar2
         const bool mpi_coordinated = mpi_ctx->world_size() > 1;
         if (mpi_coordinated && mpi_ctx->rank() != 0)
         {
-            LOG_INFO("Rank " << mpi_ctx->rank()
+            LOG_DEBUG("Rank " << mpi_ctx->rank()
                              << " entering MPI worker loop for single-shot chat inference");
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();

@@ -387,7 +387,7 @@ namespace llaminar2
         auto runtime_plan = std::make_shared<MoEExpertOverlayRuntimePlan>(
             std::move(plan), options.current_world_rank, std::move(domains), std::move(routed_tiers));
 
-        LOG_INFO("[MoEExpertOverlayRuntimePlan] Resolved overlay topology: continuation_domain="
+        LOG_DEBUG("[MoEExpertOverlayRuntimePlan] Resolved overlay topology: continuation_domain="
                  << runtime_plan->sourcePlan().continuation_domain
                  << " continuation_device=" << runtime_plan->continuationDevice().to_string()
                  << " domains=" << runtime_plan->domains().size()

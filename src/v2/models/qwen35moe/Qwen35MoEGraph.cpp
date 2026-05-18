@@ -7,12 +7,16 @@
 #include "Qwen35MoESchema.h"
 #include "../../utils/Logger.h"
 #include "../../execution/compute_stages/ComputeStageFactory.h"
+#include "../../execution/compute_stages/stages/MoEExpertDispatchStage.h"
 #include "../../execution/compute_stages/stages/MoERoutingStage.h"
 #include "../../execution/compute_stages/stages/MoEExpertComputeStage.h"
-#include "../../execution/moe/MoEExpertOwnerMap.h"
+#include "../../execution/compute_stages/stages/MoELocalExpertStage.h"
+#include "../../execution/compute_stages/stages/MoESparseDispatchStage.h"
+#include "../../execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "../../execution/moe/MoEExpertParallelPlan.h"
-#include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
+#include "../../execution/moe/MoEExpertOwnerMap.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "../../execution/moe/MoEOverlaySparseCollective.h"
 #include "../../memory/BufferId.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
 #include "../../tensors/Tensors.h"
@@ -20,7 +24,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <functional>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -97,30 +100,6 @@ namespace llaminar2
             return suffix;
         }
 
-        int stableMoEOverlayDomainId(const std::string &domain_name)
-        {
-            const size_t hashed = std::hash<std::string>{}(domain_name);
-            return static_cast<int>(hashed & 0x3fffffffU);
-        }
-
-        MoEOverlayCollectiveKey makeSparseCollectiveKey(
-            int layer_idx,
-            int tier_index,
-            const std::string &domain_name,
-            MoEOverlayCollectiveDirection direction,
-            uint64_t sequence)
-        {
-            MoEOverlayCollectiveKey key;
-            key.generation_id = 1;
-            key.step_id = 0;
-            key.layer_idx = layer_idx;
-            key.tier_idx = tier_index;
-            key.domain_id = stableMoEOverlayDomainId(domain_name);
-            key.direction = direction;
-            key.sequence = sequence;
-            return key;
-        }
-
         std::shared_ptr<MoEExpertOverlayRuntimePlan> runtimePlanForGraph(
             const GraphConfig &config)
         {
@@ -131,20 +110,65 @@ namespace llaminar2
             return resolveMoEExpertOverlayRuntimePlan(config.moe.expert_parallel_plan);
         }
 
-        std::shared_ptr<const MoEExpertOverlayExecutionPlan> executionPlanForGraph(
-            const GraphConfig &config,
-            const std::shared_ptr<MoEExpertOverlayRuntimePlan> &runtime_plan)
+        int continuationRootParticipant(const MoEExpertParallelPlan &plan)
         {
-            if (config.moe.expert_overlay_execution_plan)
-                return config.moe.expert_overlay_execution_plan;
-            if (!config.moe.expert_parallel_plan || !config.moe.expert_parallel_plan->isTieredOverlay())
-                return nullptr;
-
-            const int current_rank = runtime_plan ? runtime_plan->currentWorldRank() : 0;
-            return std::make_shared<MoEExpertOverlayExecutionPlan>(
-                resolveMoEExpertOverlayExecutionPlan(config.moe.expert_parallel_plan, current_rank));
+            return std::max(0, plan.continuation_domain_spec.logical_root_participant);
         }
 
+        int participantCountForGraphNativeOverlay(
+            const MoEExpertOwnerMap &owner_map,
+            int continuation_root_participant)
+        {
+            int max_participant = std::max(0, continuation_root_participant);
+            for (const auto &participant : owner_map.participants())
+                max_participant = std::max(max_participant, participant.participant_id);
+            return max_participant + 1;
+        }
+
+        std::vector<int> participantsWithLast(int participant_count, int last_participant)
+        {
+            std::vector<int> participants;
+            participants.reserve(static_cast<size_t>(std::max(0, participant_count)));
+            for (int participant = 0; participant < participant_count; ++participant)
+            {
+                if (participant != last_participant)
+                    participants.push_back(participant);
+            }
+            if (last_participant >= 0 && last_participant < participant_count)
+                participants.push_back(last_participant);
+            return participants;
+        }
+
+        MoEOverlayCollectiveKey graphNativeMoEKey(
+            int layer_idx,
+            int tier_idx,
+            int target_participant,
+            MoEOverlayCollectiveDirection direction)
+        {
+            MoEOverlayCollectiveKey key;
+            key.generation_id = 1;
+            key.step_id = 0;
+            key.layer_idx = layer_idx;
+            key.tier_idx = tier_idx;
+            key.domain_id = std::max(0, target_participant);
+            key.direction = direction;
+            const uint64_t direction_offset = direction == MoEOverlayCollectiveDirection::Dispatch ? 0ull : 2048ull;
+            key.sequence = static_cast<uint64_t>(std::max(layer_idx, 0)) * 8192ull +
+                           direction_offset +
+                           static_cast<uint64_t>(std::max(tier_idx, 0)) * 128ull +
+                           static_cast<uint64_t>(std::max(target_participant, 0));
+            return key;
+        }
+
+        DeviceId participantDeviceForGraphNativeOverlay(
+            const MoEExpertOwnerMap &owner_map,
+            int participant_id)
+        {
+            const auto *participant = owner_map.participantForId(participant_id);
+            if (!participant || !participant->device.is_valid())
+                return DeviceId::cpu();
+            return participant->device;
+        }
     } // namespace
 
     // =========================================================================
@@ -166,44 +190,51 @@ namespace llaminar2
     {
     }
 
-    IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(DeviceId device,
-                                                               int prefill_token_capacity,
-                                                               const std::string &key_suffix)
-    {
-#if !defined(HAVE_ROCM)
-        (void)device;
-        (void)prefill_token_capacity;
-        (void)key_suffix;
-        return nullptr;
-#else
-        if (!device.is_rocm() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || config_.n_layers <= 0)
-            return nullptr;
-
-        const std::string key = key_suffix.empty()
-                                    ? device.to_string()
-                                    : device.to_string() + "#" + key_suffix;
-        auto it = moe_runtime_tables_.find(key);
-        if (it != moe_runtime_tables_.end())
+        IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(DeviceId device,
+                                                                   int prefill_token_capacity,
+                                                                   const std::string &key_suffix)
         {
-            if (prefill_token_capacity > 0)
-                it->second->ensurePrefillRouteScratchCapacity(prefill_token_capacity);
-            return it->second.get();
+    #if !defined(HAVE_ROCM)
+            (void)device;
+            (void)prefill_token_capacity;
+            (void)key_suffix;
+            return nullptr;
+    #else
+            if (!device.is_rocm() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || config_.n_layers <= 0)
+                return nullptr;
+
+            const std::string key = key_suffix.empty()
+                                        ? device.to_string()
+                                        : device.to_string() + "#" + key_suffix;
+            auto it = moe_runtime_tables_.find(key);
+            if (it != moe_runtime_tables_.end())
+            {
+                if (prefill_token_capacity > 0)
+                    it->second->ensurePrefillRouteScratchCapacity(prefill_token_capacity);
+                return it->second.get();
+            }
+
+            DeviceMoERuntimeTable::Config table_config;
+            table_config.device_id = device;
+            table_config.num_layers = config_.n_layers;
+            table_config.num_experts = config_.moe.num_experts;
+            table_config.top_k = config_.moe.top_k;
+            table_config.mirror_to_device = true;
+            table_config.prefill_token_capacity = std::max(0, prefill_token_capacity);
+
+            auto table = std::make_unique<MoERuntimeTable>(table_config);
+            IMoERuntimeTable *ptr = table.get();
+            if (config_.moe.decode_histogram)
+            {
+                auto *histogram = config_.moe.decode_histogram;
+                histogram->registerRuntimeHistogramSync([ptr, histogram]() {
+                    return ptr->syncDecodeHistogramToHost(*histogram);
+                });
+            }
+            moe_runtime_tables_.emplace(key, std::move(table));
+            return ptr;
+    #endif
         }
-
-        DeviceMoERuntimeTable::Config table_config;
-        table_config.device_id = device;
-        table_config.num_layers = config_.n_layers;
-        table_config.num_experts = config_.moe.num_experts;
-        table_config.top_k = config_.moe.top_k;
-        table_config.mirror_to_device = true;
-        table_config.prefill_token_capacity = std::max(0, prefill_token_capacity);
-
-        auto table = std::make_unique<MoERuntimeTable>(table_config);
-        IMoERuntimeTable *ptr = table.get();
-        moe_runtime_tables_.emplace(key, std::move(table));
-        return ptr;
-#endif
-    }
 
     // =========================================================================
     // Schema
@@ -302,7 +333,7 @@ namespace llaminar2
             if (continuation_device.is_valid() && continuation_device != device &&
                 !domainContainsDevice(continuation_domain, device))
             {
-                LOG_INFO("[Qwen35MoEGraph] Layer " << layer_idx
+                LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
                                                    << " using MoE overlay continuation_domain root device "
                                                    << continuation_device.to_string()
                                                    << " instead of caller device " << device.to_string());
@@ -379,16 +410,6 @@ namespace llaminar2
         // Stage 3: MoE Expert Compute (routed expert SwiGLU FFN)
         // =====================================================================
         TensorBase *moe_output = buffers.get(BufferId::MOE_COMBINED_OUTPUT);
-        bool overlay_reduce_pending = false;
-        std::vector<const ITensor *> overlay_reduce_partials;
-        std::vector<std::shared_ptr<TensorBase>> overlay_reduce_partial_lifetimes;
-        std::vector<MoEExpertParallelReducePartialInfo> overlay_reduce_partial_infos;
-        std::vector<TensorBase *> overlay_reduce_sparse_scratch;
-        std::vector<std::shared_ptr<TensorBase>> overlay_reduce_sparse_scratch_lifetimes;
-        std::vector<std::string> overlay_reduce_dependencies;
-        std::shared_ptr<MoEExpertParallelReduceDiagnostics> overlay_reduce_diagnostics;
-        std::string overlay_continuation_domain;
-        DeviceId overlay_continuation_device = device;
 
         {
             // Infer expert intermediate size from weight shape
@@ -417,7 +438,6 @@ namespace llaminar2
                 expert_params.down_exps = layer.moe_down_exps;
                 expert_params.expert_intermediate = expert_intermediate;
                 expert_params.layer_idx = layer_idx;
-                expert_params.moe_runtime_table = moe_runtime_table;
                 expert_params.routing_indices = routing_indices;
                 expert_params.routing_weights = routing_weights;
                 expert_params.routing_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
@@ -427,6 +447,7 @@ namespace llaminar2
                 expert_params.input_buffer_id = BufferId::NORMALIZED;
                 expert_params.prepared_store = prepared_weight_store_;
                 expert_params.expert_mask = std::move(expert_mask);
+                expert_params.moe_runtime_table = moe_runtime_table;
 
                 if (config_.moe.expert_mode == MoEExpertMode::ExpertParallel &&
                     expert_params.expert_mask.empty())
@@ -576,38 +597,23 @@ namespace llaminar2
 
             const bool overlay_requested = overlay_plan && overlay_plan->isTieredOverlay();
             const ExpertLayerPlacement *overlay_placement = overlay_requested
-                                                                 ? findExpertOverlayPlacement(*overlay_plan, layer_idx)
-                                                                 : nullptr;
-            const bool use_graph_native_overlay = overlay_requested && overlay_placement &&
-                                                  isUsableExpertOverlayPlacement(
-                                                      *overlay_placement,
-                                                      *overlay_plan,
-                                                      config_.moe.num_experts,
-                                                      layer_idx);
+                                                                ? findExpertOverlayPlacement(*overlay_plan, layer_idx)
+                                                                : nullptr;
+            const bool use_expert_overlay = overlay_requested && overlay_placement &&
+                                            isUsableExpertOverlayPlacement(*overlay_placement,
+                                                                           *overlay_plan,
+                                                                           config_.moe.num_experts,
+                                                                           layer_idx);
 
-            if (overlay_requested && !use_graph_native_overlay)
+            if (overlay_requested && !use_expert_overlay)
             {
                 LOG_WARN("[Qwen35MoEGraph] Expert overlay requested for layer " << layer_idx
-                                                                                << " but no usable explicit placement was found; using single-stage routed expert path");
+                                                                                << " but no usable placement was found; using legacy routed expert path");
             }
 
-            if (use_graph_native_overlay)
+            if (use_expert_overlay)
             {
-                const auto owner_map = MoEExpertOwnerMap::build(*overlay_plan);
                 auto dispatch_output_lifetime = std::make_shared<MoEExpertDispatchOutput>();
-                auto collective_lifetime = std::make_shared<MoEOverlayLocalSparseCollectiveContext>(
-                    MoEOverlayLocalSparseCollectiveContext::Config{
-                        .participant_count = 1,
-                        .slot_count = std::max<size_t>(4u, overlay_plan->routed_tiers.size() * 2u + 1u),
-                    });
-                auto workspace_lifetime = std::make_shared<MoEOverlayCollectiveWorkspace>();
-                workspace_lifetime->ensureCapacity(
-                    static_cast<size_t>(std::max(total_tokens, 1)),
-                    static_cast<size_t>(std::max(total_tokens * config_.moe.top_k, 1)),
-                    config_.d_model,
-                    config_.moe.top_k,
-                    DeviceId::cpu());
-                workspace_lifetime->resetForStep(1, 0);
 
                 MoEExpertDispatchStage::Params dispatch_params;
                 dispatch_params.device_id = DeviceId::cpu();
@@ -625,7 +631,6 @@ namespace llaminar2
                                                     : MoEExpertTransferMode::Auto;
                 dispatch_params.placement = *overlay_placement;
                 dispatch_params.routed_tiers = overlay_plan->routed_tiers;
-                dispatch_params.output = dispatch_output_lifetime.get();
                 dispatch_params.output_lifetime = dispatch_output_lifetime;
 
                 const std::string dispatch_name = prefix + "moe_expert_dispatch";
@@ -634,11 +639,35 @@ namespace llaminar2
                               DeviceId::cpu());
                 graph.addDependency(dispatch_name, prefix + "moe_routing");
 
-                overlay_continuation_domain = dispatch_params.continuation_domain;
-                overlay_continuation_device = device;
+                auto owner_map_lifetime = std::make_shared<MoEExpertOwnerMap>(
+                    MoEExpertOwnerMap::build(*overlay_plan));
+                const int continuation_root_participant = continuationRootParticipant(*overlay_plan);
+                const int participant_count = participantCountForGraphNativeOverlay(
+                    *owner_map_lifetime,
+                    continuation_root_participant);
 
-                std::string previous_return_node;
-                bool cleared_sparse_output = false;
+                std::vector<std::shared_ptr<MoEOverlayCollectiveWorkspace>> participant_workspaces(
+                    static_cast<size_t>(participant_count));
+                for (auto &workspace : participant_workspaces)
+                {
+                    workspace = std::make_shared<MoEOverlayCollectiveWorkspace>();
+                    workspace->ensureCapacity(static_cast<size_t>(std::max(total_tokens, 1)),
+                                              static_cast<size_t>(std::max(total_tokens * config_.moe.top_k, 1)),
+                                              config_.d_model,
+                                              config_.moe.top_k,
+                                              DeviceId::cpu());
+                }
+
+                MoEOverlayLocalSparseCollectiveContext::Config collective_config;
+                collective_config.participant_count = participant_count;
+                collective_config.slot_count = std::max<size_t>(
+                    8,
+                    overlay_plan->routed_tiers.size() * static_cast<size_t>(participant_count) * 4u + 8u);
+                auto collective_context_lifetime = std::make_shared<MoEOverlayLocalSparseCollectiveContext>(
+                    collective_config);
+
+                std::string last_return_reduce;
+                bool first_return_scatter = true;
 
                 for (size_t tier_index = 0; tier_index < overlay_plan->routed_tiers.size(); ++tier_index)
                 {
@@ -653,124 +682,196 @@ namespace llaminar2
                         continue;
                     }
 
-
-                    const auto participant_ids = owner_map.participantIdsForTier(static_cast<int>(tier_index));
-                    const int target_participant = participant_ids.empty() ? 0 : participant_ids.front();
-                    const auto *participant = owner_map.participantForId(target_participant);
-                    DeviceId tier_device = participant && participant->device.is_valid()
-                                               ? participant->device
-                                               : device;
-                    if (!tier_device.is_valid())
-                        tier_device = DeviceId::cpu();
-
-                    const std::string tier_suffix = nodeSuffixForTier(tier, static_cast<int>(tier_index));
-                    const std::string sparse_dispatch_name = prefix + "moe_sparse_dispatch_" + tier_suffix;
-                    const std::string local_expert_name = prefix + "moe_local_expert_" + tier_suffix;
-                    const std::string sparse_return_name = prefix + "moe_sparse_return_reduce_" + tier_suffix;
-
-                    auto inbound_rows_lifetime = std::make_shared<MoEOverlaySparseRows>(
-                        workspace_lifetime->dispatchReceive(layer_idx, static_cast<int>(tier_index)));
-                    MoESparseDispatchStage::Params sparse_dispatch_params;
-                    sparse_dispatch_params.device_id = DeviceId::cpu();
-                    sparse_dispatch_params.collective_context_lifetime = collective_lifetime;
-                    sparse_dispatch_params.workspace_lifetime = workspace_lifetime;
-                    sparse_dispatch_params.key = makeSparseCollectiveKey(
-                        layer_idx,
-                        static_cast<int>(tier_index),
-                        tier.domain,
-                        MoEOverlayCollectiveDirection::Dispatch,
-                        100u + static_cast<uint64_t>(tier_index));
-                    sparse_dispatch_params.source_participant = 0;
-                    sparse_dispatch_params.target_participant = target_participant;
-                    sparse_dispatch_params.hidden = buffers.normalized;
-                    sparse_dispatch_params.routing_indices = routing_indices;
-                    sparse_dispatch_params.routing_weights = routing_weights;
-                    sparse_dispatch_params.seq_len = total_tokens;
-                    sparse_dispatch_params.top_k = config_.moe.top_k;
-                    sparse_dispatch_params.d_model = config_.d_model;
-                    sparse_dispatch_params.dispatch_output_lifetime = dispatch_output_lifetime;
-                    sparse_dispatch_params.tier_index = static_cast<int>(tier_index);
-                    sparse_dispatch_params.inbound_rows_lifetime = inbound_rows_lifetime;
-
-                    graph.addNode(sparse_dispatch_name,
-                                  ComputeStageFactory::createMoESparseDispatch(sparse_dispatch_params),
-                                  DeviceId::cpu());
-                    graph.addDependency(sparse_dispatch_name, dispatch_name);
-
-                    auto outbound_rows_lifetime = std::make_shared<MoEOverlayReturnRows>(
-                        workspace_lifetime->localExpertOutput(layer_idx, static_cast<int>(tier_index)));
-                    MoELocalExpertStage::Params local_params;
-                    local_params.device_id = tier_device;
-                    local_params.input_rows_lifetime = inbound_rows_lifetime;
-                    local_params.output_rows_lifetime = outbound_rows_lifetime;
-                    local_params.workspace_lifetime = workspace_lifetime;
-                    local_params.gate_exps = layer.moe_gate_exps;
-                    local_params.up_exps = layer.moe_up_exps;
-                    local_params.down_exps = layer.moe_down_exps;
-                    local_params.num_experts = config_.moe.num_experts;
-                    local_params.top_k = config_.moe.top_k;
-                    local_params.d_model = config_.d_model;
-                    local_params.expert_intermediate = expert_intermediate;
-                    local_params.layer_idx = layer_idx;
-                    local_params.expert_mask = owner_map.expertMaskForParticipant(
-                        layer_idx,
-                        target_participant,
-                        config_.moe.num_experts);
-                    local_params.prepared_store = prepared_weight_store_;
-                    if (model_ctx_)
+                    const auto target_participants = owner_map_lifetime->participantIdsForTier(
+                        static_cast<int>(tier_index));
+                    for (const int target_participant : target_participants)
                     {
-                        auto weight_mgr = model_ctx_->concreteWeightManager();
-                        if (weight_mgr)
-                            local_params.expert_registry = &weight_mgr->expertGemmRegistry();
+                        auto participant_mask = owner_map_lifetime->expertMaskForParticipant(
+                            layer_idx,
+                            target_participant,
+                            config_.moe.num_experts);
+                        if (!hasActiveExpertMask(participant_mask))
+                            continue;
+
+                        const DeviceId target_device = participantDeviceForGraphNativeOverlay(
+                            *owner_map_lifetime,
+                            target_participant);
+                        const std::string participant_suffix =
+                            nodeSuffixForTier(tier, static_cast<int>(tier_index)) +
+                            "_p" + std::to_string(target_participant);
+
+                        auto target_dispatch_inbound = std::make_shared<MoEOverlaySparseRows>(
+                            participant_workspaces[static_cast<size_t>(target_participant)]->dispatchReceive(
+                                layer_idx,
+                                static_cast<int>(tier_index)));
+                        const MoEOverlayCollectiveKey dispatch_key = graphNativeMoEKey(
+                            layer_idx,
+                            static_cast<int>(tier_index),
+                            target_participant,
+                            MoEOverlayCollectiveDirection::Dispatch);
+
+                        std::string previous_dispatch_node;
+                        std::string target_dispatch_node;
+                        for (const int source_participant : participantsWithLast(participant_count, target_participant))
+                        {
+                            auto inbound_lifetime = source_participant == target_participant
+                                                        ? target_dispatch_inbound
+                                                        : std::make_shared<MoEOverlaySparseRows>(
+                                                              participant_workspaces[static_cast<size_t>(source_participant)]->dispatchReceive(
+                                                                  layer_idx,
+                                                                  static_cast<int>(tier_index)));
+
+                            MoESparseDispatchStage::Params sparse_dispatch_params;
+                            sparse_dispatch_params.device_id = DeviceId::cpu();
+                            sparse_dispatch_params.collective_context_lifetime = collective_context_lifetime;
+                            sparse_dispatch_params.workspace_lifetime = participant_workspaces[static_cast<size_t>(source_participant)];
+                            sparse_dispatch_params.key = dispatch_key;
+                            sparse_dispatch_params.source_participant = source_participant;
+                            sparse_dispatch_params.target_participant = target_participant;
+                            sparse_dispatch_params.seq_len = total_tokens;
+                            sparse_dispatch_params.top_k = config_.moe.top_k;
+                            sparse_dispatch_params.d_model = config_.d_model;
+                            sparse_dispatch_params.tier_index = static_cast<int>(tier_index);
+                            sparse_dispatch_params.replicated_hidden_export = true;
+                            sparse_dispatch_params.logical_continuation_root_participant = continuation_root_participant;
+                            sparse_dispatch_params.inbound_rows_lifetime = inbound_lifetime;
+                            if (source_participant == continuation_root_participant)
+                            {
+                                sparse_dispatch_params.hidden = buffers.normalized;
+                                sparse_dispatch_params.routing_indices = routing_indices;
+                                sparse_dispatch_params.routing_weights = routing_weights;
+                                sparse_dispatch_params.dispatch_output_lifetime = dispatch_output_lifetime;
+                            }
+
+                            const std::string sparse_dispatch_name = prefix + "moe_sparse_dispatch_" +
+                                                                     participant_suffix +
+                                                                     "_from_p" + std::to_string(source_participant);
+                            graph.addNode(sparse_dispatch_name,
+                                          ComputeStageFactory::createMoESparseDispatch(sparse_dispatch_params),
+                                          DeviceId::cpu());
+                            graph.addDependency(sparse_dispatch_name,
+                                                previous_dispatch_node.empty() ? dispatch_name : previous_dispatch_node);
+                            previous_dispatch_node = sparse_dispatch_name;
+                            if (source_participant == target_participant)
+                                target_dispatch_node = sparse_dispatch_name;
+                        }
+
+                        auto local_output_lifetime = std::make_shared<MoEOverlayReturnRows>(
+                            participant_workspaces[static_cast<size_t>(target_participant)]->localExpertOutput(
+                                layer_idx,
+                                static_cast<int>(tier_index)));
+
+                        MoELocalExpertStage::Params local_params;
+                        local_params.device_id = target_device;
+                        local_params.input_rows_lifetime = target_dispatch_inbound;
+                        local_params.output_rows_lifetime = local_output_lifetime;
+                        local_params.workspace_lifetime = participant_workspaces[static_cast<size_t>(target_participant)];
+                        local_params.gate_exps = layer.moe_gate_exps;
+                        local_params.up_exps = layer.moe_up_exps;
+                        local_params.down_exps = layer.moe_down_exps;
+                        local_params.num_experts = config_.moe.num_experts;
+                        local_params.top_k = config_.moe.top_k;
+                        local_params.d_model = config_.d_model;
+                        local_params.expert_intermediate = expert_intermediate;
+                        local_params.layer_idx = layer_idx;
+                        local_params.expert_mask = std::move(participant_mask);
+                        local_params.prepared_store = prepared_weight_store_;
+                        local_params.runtime_participant_index = target_participant;
+                        if (model_ctx_)
+                        {
+                            auto weight_mgr = model_ctx_->concreteWeightManager();
+                            if (weight_mgr)
+                            {
+                                auto &registry = weight_mgr->expertGemmRegistry();
+                                local_params.expert_registry = &registry;
+                                (void)registry.populateExpertEnginesForDomain(
+                                    tier.domain,
+                                    target_device,
+                                    layer_idx,
+                                    config_.moe.num_experts,
+                                    local_params.prepared_gate_gemm,
+                                    local_params.prepared_up_gemm,
+                                    local_params.prepared_down_gemm);
+                            }
+                        }
+
+                        const std::string local_name = prefix + "moe_local_expert_" + participant_suffix;
+                        graph.addNode(local_name,
+                                      ComputeStageFactory::createMoELocalExpert(local_params),
+                                      target_device);
+                        graph.addDependency(local_name,
+                                            target_dispatch_node.empty() ? previous_dispatch_node : target_dispatch_node);
+
+                        const MoEOverlayCollectiveKey return_key = graphNativeMoEKey(
+                            layer_idx,
+                            static_cast<int>(tier_index),
+                            target_participant,
+                            MoEOverlayCollectiveDirection::ReturnReduce);
+                        std::string previous_return_node = last_return_reduce;
+                        std::string root_return_node;
+                        for (const int source_participant : participantsWithLast(participant_count, continuation_root_participant))
+                        {
+                            std::shared_ptr<const MoEOverlayReturnRows> outbound_lifetime;
+                            if (source_participant == target_participant)
+                            {
+                                outbound_lifetime = local_output_lifetime;
+                            }
+                            else
+                            {
+                                outbound_lifetime = std::make_shared<MoEOverlayReturnRows>(
+                                    participant_workspaces[static_cast<size_t>(source_participant)]->localExpertOutput(
+                                        layer_idx,
+                                        static_cast<int>(tier_index)));
+                            }
+
+                            auto inbound_lifetime = std::make_shared<MoEOverlayReturnRows>(
+                                participant_workspaces[static_cast<size_t>(source_participant)]->returnReceive(
+                                    layer_idx,
+                                    static_cast<int>(tier_index)));
+
+                            MoESparseReturnReduceStage::Params return_params;
+                            return_params.device_id = DeviceId::cpu();
+                            return_params.collective_context_lifetime = collective_context_lifetime;
+                            return_params.workspace_lifetime = participant_workspaces[static_cast<size_t>(source_participant)];
+                            return_params.key = return_key;
+                            return_params.source_participant = source_participant;
+                            return_params.target_participant = continuation_root_participant;
+                            return_params.outbound_rows_lifetime = outbound_lifetime;
+                            return_params.inbound_rows_lifetime = inbound_lifetime;
+                            return_params.dense_output = moe_output;
+                            return_params.seq_len = total_tokens;
+                            return_params.d_model = config_.d_model;
+                            return_params.clear_output_before_scatter =
+                                source_participant == continuation_root_participant && first_return_scatter;
+
+                            const std::string return_name = prefix + "moe_sparse_return_reduce_" +
+                                                            participant_suffix +
+                                                            "_from_p" + std::to_string(source_participant);
+                            graph.addNode(return_name,
+                                          ComputeStageFactory::createMoESparseReturnReduce(return_params),
+                                          DeviceId::cpu());
+                            graph.addDependency(return_name, local_name);
+                            if (!previous_return_node.empty())
+                                graph.addDependency(return_name, previous_return_node);
+                            previous_return_node = return_name;
+                            if (source_participant == continuation_root_participant)
+                                root_return_node = return_name;
+                        }
+
+                        if (!root_return_node.empty())
+                        {
+                            last_return_reduce = root_return_node;
+                            first_return_scatter = false;
+                        }
                     }
-                    local_params.runtime_participant_index = target_participant;
-                    if (tier_device.is_rocm() &&
-                        (rocm_env.moe_grouped_decode || rocm_env.moe_grouped_prefill))
-                    {
-                        local_params.moe_runtime_table = moeRuntimeTableForDevice(
-                            tier_device,
-                            0,
-                            "overlay_p" + std::to_string(target_participant));
-                    }
-
-                    graph.addNode(local_expert_name,
-                                  ComputeStageFactory::createMoELocalExpert(local_params),
-                                  tier_device);
-                    graph.addDependency(local_expert_name, sparse_dispatch_name);
-
-                    auto return_rows_lifetime = std::make_shared<MoEOverlayReturnRows>(
-                        workspace_lifetime->returnReceive(layer_idx, static_cast<int>(tier_index)));
-                    MoESparseReturnReduceStage::Params return_params;
-                    return_params.device_id = DeviceId::cpu();
-                    return_params.collective_context_lifetime = collective_lifetime;
-                    return_params.workspace_lifetime = workspace_lifetime;
-                    return_params.key = makeSparseCollectiveKey(
-                        layer_idx,
-                        static_cast<int>(tier_index),
-                        tier.domain,
-                        MoEOverlayCollectiveDirection::ReturnReduce,
-                        200u + static_cast<uint64_t>(tier_index));
-                    return_params.source_participant = 0;
-                    return_params.target_participant = 0;
-                    return_params.outbound_rows_lifetime = outbound_rows_lifetime;
-                    return_params.inbound_rows_lifetime = return_rows_lifetime;
-                    return_params.dense_output = moe_output;
-                    return_params.seq_len = total_tokens;
-                    return_params.d_model = config_.d_model;
-                    return_params.clear_output_before_scatter = !cleared_sparse_output;
-                    cleared_sparse_output = true;
-
-                    graph.addNode(sparse_return_name,
-                                  ComputeStageFactory::createMoESparseReturnReduce(return_params),
-                                  DeviceId::cpu());
-                    graph.addDependency(sparse_return_name, local_expert_name);
-                    if (!previous_return_node.empty())
-                        graph.addDependency(sparse_return_name, previous_return_node);
-                    previous_return_node = sparse_return_name;
                 }
 
-                if (!previous_return_node.empty())
-                    ffn_terminal = previous_return_node;
+                if (last_return_reduce.empty())
+                {
+                    throw std::runtime_error("Qwen35 MoE graph-native overlay produced no local expert participants for layer " +
+                                             std::to_string(layer_idx));
+                }
+                ffn_terminal = last_return_reduce;
             }
             else
             {
@@ -813,7 +914,6 @@ namespace llaminar2
         // =====================================================================
         TensorBase *shared_output = buffers.get(BufferId::MOE_SHARED_EXPERT_OUTPUT);
         std::string shared_ffn_last; // Track last shared expert stage (empty if no shared expert)
-        bool shared_expert_reduced_into_moe_output = false;
 
         if (layer.shared_expert_gate && layer.shared_expert_up && layer.shared_expert_down && shared_output)
         {
@@ -901,54 +1001,6 @@ namespace llaminar2
                 shared_ffn_last = prefix + "shared_expert_gate";
             }
 
-            if (overlay_reduce_pending && overlay_runtime_plan &&
-                overlay_runtime_plan->sharedExpertDomain().name != overlay_continuation_domain)
-            {
-                const auto &shared_domain = overlay_runtime_plan->sharedExpertDomain();
-                overlay_reduce_partials.push_back(shared_output);
-                overlay_reduce_partial_infos.push_back(MoEExpertParallelReducePartialInfo{
-                    .name = "shared_expert",
-                    .source_domain = shared_domain.name,
-                    .source_device = shared_device,
-                });
-                overlay_reduce_dependencies.push_back(shared_ffn_last);
-                shared_expert_reduced_into_moe_output = true;
-
-                LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
-                                                    << " shared expert domain '" << shared_domain.name
-                                                    << "' contributes through cross-domain reduce to continuation domain '"
-                                                    << overlay_continuation_domain << "'");
-            }
-        }
-
-        if (overlay_reduce_pending)
-        {
-            MoEExpertParallelReduceStage::Params reduce_params;
-            reduce_params.device_id = overlay_continuation_device;
-            reduce_params.partials = std::move(overlay_reduce_partials);
-            reduce_params.partial_lifetimes = std::move(overlay_reduce_partial_lifetimes);
-            reduce_params.partial_infos = std::move(overlay_reduce_partial_infos);
-            reduce_params.sparse_expansion_scratch = std::move(overlay_reduce_sparse_scratch);
-            reduce_params.sparse_expansion_scratch_lifetimes = std::move(overlay_reduce_sparse_scratch_lifetimes);
-            reduce_params.output = moe_output;
-            reduce_params.output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
-            reduce_params.rows = static_cast<size_t>(total_tokens);
-            reduce_params.cols = static_cast<size_t>(config_.d_model);
-            reduce_params.layer_idx = layer_idx;
-            reduce_params.mode = overlay_continuation_device.is_gpu()
-                                     ? MoEExpertParallelReduceMode::ContinuationDeviceOptimized
-                                     : MoEExpertParallelReduceMode::HostStagedCorrectness;
-            reduce_params.continuation_domain = overlay_continuation_domain;
-            reduce_params.continuation_device = overlay_continuation_device;
-            reduce_params.diagnostics_lifetime = overlay_reduce_diagnostics;
-
-            const std::string reduce_name = prefix + "moe_expert_parallel_reduce";
-            graph.addNode(reduce_name,
-                          ComputeStageFactory::createMoEExpertParallelReduce(reduce_params),
-                          overlay_continuation_device);
-            for (const auto &dependency : overlay_reduce_dependencies)
-                graph.addDependency(reduce_name, dependency);
-            ffn_terminal = reduce_name;
         }
 
         // =====================================================================
@@ -957,7 +1009,7 @@ namespace llaminar2
         // The combined MoE output goes to attn_proj so that the next layer's
         // FusedResidualNormStage handles the residual add automatically.
         {
-            if (!shared_expert_reduced_into_moe_output && !shared_ffn_last.empty() && shared_output)
+            if (!shared_ffn_last.empty() && shared_output)
             {
                 // Add expert_output + shared_expert_output → attn_proj
                 ResidualAddStage::Params add_params;

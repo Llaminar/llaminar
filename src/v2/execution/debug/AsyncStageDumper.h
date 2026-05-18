@@ -165,7 +165,7 @@ namespace llaminar2
             }
 
             instance.initialized_ = true;
-            LOG_INFO("[AsyncStageDumper] Initialized with " << num_threads << " I/O threads");
+            LOG_DEBUG("[AsyncStageDumper] Initialized with " << num_threads << " I/O threads");
         }
 
         /**
@@ -179,7 +179,7 @@ namespace llaminar2
             if (!instance.initialized_)
                 return;
 
-            LOG_INFO("[AsyncStageDumper] Shutting down, "
+            LOG_DEBUG("[AsyncStageDumper] Shutting down, "
                      << instance.queue_.pendingCount() << " tasks pending...");
 
             instance.queue_.shutdown();
@@ -193,7 +193,7 @@ namespace llaminar2
             instance.workers_.clear();
             instance.initialized_ = false;
 
-            LOG_INFO("[AsyncStageDumper] Shutdown complete. Total writes: "
+            LOG_DEBUG("[AsyncStageDumper] Shutdown complete. Total writes: "
                      << instance.total_writes_.load()
                      << ", bytes: " << instance.total_bytes_.load());
         }

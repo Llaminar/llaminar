@@ -129,7 +129,7 @@ namespace llaminar2
                 std::to_string(action.stage_id));
         }
 
-        LOG_INFO("[StageRunnerFactory] Built single-device runner for stage "
+        LOG_DEBUG("[StageRunnerFactory] Built single-device runner for stage "
                  << action.stage_id << " on device " << device.to_string()
                  << " layers [" << action.first_layer << ", " << action.last_layer << "]");
 
@@ -215,7 +215,7 @@ namespace llaminar2
                 std::to_string(action.stage_id));
         }
 
-        LOG_INFO("[StageRunnerFactory] Built local TP runner for stage "
+        LOG_DEBUG("[StageRunnerFactory] Built local TP runner for stage "
                  << action.stage_id << " with " << action.devices.size() << " device(s)"
                  << " layers [" << action.first_layer << ", " << action.last_layer << "]");
 
@@ -297,7 +297,7 @@ namespace llaminar2
                 std::to_string(action.stage_id));
         }
 
-        LOG_INFO("[StageRunnerFactory] Built global TP runner for stage "
+        LOG_DEBUG("[StageRunnerFactory] Built global TP runner for stage "
                  << action.stage_id << " tp_rank=" << tp_device_index
                  << "/" << tp_domain_size
                  << " device=" << device.to_string()

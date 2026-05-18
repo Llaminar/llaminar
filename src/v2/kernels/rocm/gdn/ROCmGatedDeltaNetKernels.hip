@@ -57,16 +57,18 @@ namespace { // anonymous namespace to avoid symbol conflicts with CUDA kernels
 // =========================================================================
 // Decode Recurrence Kernel (seq_len=1, multi-block per head)
 //
-// Optimizations vs V1:
-//   1. Fused decay into per-column loops — eliminates separate decay pass
-//      and one full traversal of the d_k×d_v state matrix
-//   2. Two-pass column processing: Pass 1 reads state (decay+kv), Pass 2
-//      reads+writes (decay+update+output). Saves 50% memory traffic vs
-//      original 3-pass + decay.
-//   3. 2D grid: (n_heads, col_blocks) for better CU utilization on gfx906
-//      (was: 16 blocks / 60 CUs = 27%, now: 32+ blocks = 53%+)
-//   4. Single-wavefront blocks (64 threads) — L2 norm reduction is
-//      intra-wavefront shuffle only, no cross-warp shared memory needed
+// V3 Optimizations:
+//   1. ROW_SPLIT=4: 256 threads/block (4 wavefronts) — each column
+//      processed by 4 threads splitting d_k rows. Increases occupancy
+//      from 0.53 to 2.1 waves/CU on gfx906 (32→128 total wavefronts).
+//   2. Fused decay into per-column loops — eliminates separate decay pass
+//   3. Two-pass column processing: Pass 1 reads state (decay+kv), Pass 2
+//      reads+writes (decay+update+output). 50% traffic savings.
+//   4. 2D grid: (n_heads, col_blocks) with col_blocks = d_v / 64
+//   5. Shared-memory reduction for cross-wavefront kv/output sums
+//
+// Memory: d_k × d_v × 4 bytes per head = 64KB state
+// Occupancy: 128 wavefronts / 60 CUs = 2.1 waves/CU (was 0.53)
 // =========================================================================
 
 __global__ void rocm_gdn_recurrent_step_kernel(
@@ -88,8 +90,12 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
 
-    // Column this thread handles (2D grid: blockIdx.y selects column tile)
-    const int vi = blockIdx.y * block_size + tid;
+    // ROW_SPLIT=4: 4 threads collaborate on each column, splitting d_k rows
+    constexpr int ROW_SPLIT = 4;
+    const int cols_per_block = block_size / ROW_SPLIT; // 64
+    const int split_id = tid / cols_per_block;         // 0..3
+    const int col_in_block = tid % cols_per_block;     // 0..63
+    const int vi = blockIdx.y * cols_per_block + col_in_block;
 
     const float *q_head = q + h * d_k;
     const float *k_head = k + h * d_k;
@@ -98,12 +104,18 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     float *o_head = output + h * d_v;
 
     extern __shared__ float smem[];
-    float *q_local = smem;
-    float *k_local = smem + d_k;
+    float *q_local = smem;                              // [d_k]
+    float *k_local = smem + d_k;                        // [d_k]
+    float *warp_sums = smem + 2 * d_k;                  // [4] for norm reduction
+    float *reduce_kv = smem + 2 * d_k + 4;             // [block_size]
+    float *reduce_out = smem + 2 * d_k + 4 + block_size; // [block_size]
 
     const float scale = rsqrtf((float)d_k);
+    const int warp_id = tid / 64;
+    const int lane_id = tid % 64;
+    const int num_warps = block_size / 64; // 4
 
-    // Load Q and K into shared memory (all threads cooperate)
+    // Load Q and K into shared memory (all 256 threads cooperate)
     for (int i = tid; i < d_k; i += block_size) {
         q_local[i] = q_head[i];
         k_local[i] = k_head[i];
@@ -111,26 +123,40 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     __syncthreads();
 
     if (use_qk_l2norm) {
-        // Single-wavefront reduction — no cross-warp shared memory needed
-        // Q norm
+        // Multi-wavefront Q norm reduction
         float q_sum = 0.0f;
         for (int i = tid; i < d_k; i += block_size)
             q_sum += q_local[i] * q_local[i];
         for (int offset = 32; offset > 0; offset >>= 1)
             q_sum += __shfl_xor(q_sum, offset);
-        // All lanes in wavefront now have the full sum
-        float q_inv = scale / fmaxf(sqrtf(q_sum), 1e-6f);
+        if (lane_id == 0) warp_sums[warp_id] = q_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < num_warps; w++) total += warp_sums[w];
+            warp_sums[0] = total;
+        }
+        __syncthreads();
+        float q_inv = scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
         for (int i = tid; i < d_k; i += block_size)
             q_local[i] *= q_inv;
         __syncthreads();
 
-        // K norm
+        // Multi-wavefront K norm reduction
         float k_sum = 0.0f;
         for (int i = tid; i < d_k; i += block_size)
             k_sum += k_local[i] * k_local[i];
         for (int offset = 32; offset > 0; offset >>= 1)
             k_sum += __shfl_xor(k_sum, offset);
-        float k_inv = 1.0f / fmaxf(sqrtf(k_sum), 1e-6f);
+        if (lane_id == 0) warp_sums[warp_id] = k_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < num_warps; w++) total += warp_sums[w];
+            warp_sums[0] = total;
+        }
+        __syncthreads();
+        float k_inv = 1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
         for (int i = tid; i < d_k; i += block_size)
             k_local[i] *= k_inv;
         __syncthreads();
@@ -140,40 +166,64 @@ __global__ void rocm_gdn_recurrent_step_kernel(
         __syncthreads();
     }
 
-    // Gate and beta — compute on lane 0, broadcast via shuffle
+    // Gate and beta — compute on thread 0, broadcast via shared memory
     float decay, beta_h;
     if (tid == 0) {
         float x = alpha[h] + dt_bias[h];
         float sp = (x > 20.0f) ? x : log1pf(expf(x));
-        decay = expf(A_log[h] * sp);
-        beta_h = 1.0f / (1.0f + expf(-beta_raw[h]));
+        warp_sums[0] = expf(A_log[h] * sp);
+        warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[h]));
     }
-    decay = __shfl(decay, 0);
-    beta_h = __shfl(beta_h, 0);
+    __syncthreads();
+    decay = warp_sums[0];
+    beta_h = warp_sums[1];
 
-    // Fused per-column processing — NO separate decay pass
-    // Each thread owns one column vi and processes it end-to-end.
-    // Columns are independent so no sync needed between them.
-    if (vi < d_v) {
-        // Pass 1: Fused decay + kv dot product (read-only, no write-back)
-        // Saves writing the decayed state back to global memory
-        float kv = 0.0f;
-        for (int j = 0; j < d_k; j++) {
-            float s_decayed = S[j * d_v + vi] * decay;
-            kv += s_decayed * k_local[j];
+    // Row-split column processing: ROW_SPLIT=4 threads collaborate on each
+    // column, splitting d_k rows. Shared-memory reduction for kv and output.
+    {
+        const int rows_per_split = d_k / ROW_SPLIT;
+        const int j_start = split_id * rows_per_split;
+        const int j_end = (split_id == ROW_SPLIT - 1) ? d_k : j_start + rows_per_split;
+
+        // Pass 1: Fused decay + partial kv dot product (read-only)
+        float partial_kv = 0.0f;
+        if (vi < d_v) {
+            for (int j = j_start; j < j_end; j++) {
+                float s_decayed = S[j * d_v + vi] * decay;
+                partial_kv += s_decayed * k_local[j];
+            }
+        }
+        reduce_kv[tid] = partial_kv;
+        __syncthreads();
+
+        // Reduce kv across splits and compute delta
+        float delta = 0.0f;
+        if (vi < d_v) {
+            float kv = 0.0f;
+            for (int s = 0; s < ROW_SPLIT; s++)
+                kv += reduce_kv[col_in_block + s * cols_per_block];
+            delta = (v_head[vi] - kv) * beta_h;
         }
 
-        float delta = (v_head[vi] - kv) * beta_h;
-
-        // Pass 2: Fused decay + delta update + output (read-modify-write)
-        // Re-applies decay to avoid intermediate write-back
-        float out_vi = 0.0f;
-        for (int j = 0; j < d_k; j++) {
-            float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
-            S[j * d_v + vi] = s_new;
-            out_vi += s_new * q_local[j];
+        // Pass 2: Fused decay + update + partial output (read-modify-write)
+        float partial_out = 0.0f;
+        if (vi < d_v) {
+            for (int j = j_start; j < j_end; j++) {
+                float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
+                S[j * d_v + vi] = s_new;
+                partial_out += s_new * q_local[j];
+            }
         }
-        o_head[vi] = out_vi;
+        reduce_out[tid] = partial_out;
+        __syncthreads();
+
+        // Reduce output across splits — only split_id=0 writes final output
+        if (vi < d_v && split_id == 0) {
+            float out_vi = 0.0f;
+            for (int s = 0; s < ROW_SPLIT; s++)
+                out_vi += reduce_out[col_in_block + s * cols_per_block];
+            o_head[vi] = out_vi;
+        }
     }
 }
 
@@ -758,10 +808,13 @@ bool rocmGDN_recurrent_step(
         print_pointer_attrs("state", state);
     }
 
-    // 2D grid: x=heads, y=column tiles (64 threads = 1 wavefront per block)
-    int col_threads = 64;
-    int num_col_blocks = (d_v + col_threads - 1) / col_threads;
-    int smem_size = 2 * d_k * sizeof(float);
+    // ROW_SPLIT=4: 256 threads/block (4 wavefronts), 64 columns per block.
+    // Increases occupancy from 0.53 to 2.1 waves/CU on gfx906 (32→128 wavefronts).
+    // Shared memory: q[d_k] + k[d_k] + warp_sums[4] + reduce_kv[256] + reduce_out[256]
+    int col_threads = 256;
+    int cols_per_block = col_threads / 4; // 64 columns with ROW_SPLIT=4
+    int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+    int smem_size = (2 * d_k + 4 + 2 * col_threads) * sizeof(float);
 
     hipLaunchKernelGGL(rocm_gdn_recurrent_step_kernel,
         dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,

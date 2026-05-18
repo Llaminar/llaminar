@@ -15,6 +15,8 @@
 namespace llaminar2
 {
 
+    class DecodeExpertHistogram;
+
     inline constexpr uint32_t kDeviceMoEMaxExperts = 256;
     inline constexpr uint32_t kDeviceMoEMaxTopK = 16;
 
@@ -135,6 +137,9 @@ namespace llaminar2
         virtual bool prepareInactiveBank(int layer_idx, const MoEPlacementUpdate &update) = 0;
         virtual bool flipActiveBank(int layer_idx, uint32_t epoch, void *stream) = 0;
         virtual bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const = 0;
+        virtual bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
+                                               void *stream = nullptr,
+                                               bool reset_runtime_counts = true) = 0;
     };
 
     class DeviceMoERuntimeTable final : public IMoERuntimeTable
@@ -170,6 +175,9 @@ namespace llaminar2
         DeviceMoELayerRuntime &hostLayerState(int layer_idx);
         const DeviceMoELayerRuntime &hostLayerState(int layer_idx) const override;
         bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const override;
+        bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
+                                       void *stream = nullptr,
+                                       bool reset_runtime_counts = true) override;
         void ensurePrefillRouteScratchCapacity(int token_capacity, void *stream = nullptr);
 
         const DeviceId &deviceId() const noexcept { return device_id_; }

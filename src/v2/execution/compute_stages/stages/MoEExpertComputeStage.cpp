@@ -2044,6 +2044,117 @@ namespace llaminar2
         bind_if_needed(cached_down_gemm_);
     }
 
+    bool SharedExpertFFNStage::ensureSharedGroupedGateUpDescriptorTable(
+        IMoEKernel *kernel, int d_model, int intermediate) const
+    {
+        if (!kernel || !cached_gate_gemm_ || !cached_up_gemm_ || d_model <= 0 || intermediate <= 0)
+            return false;
+
+        if (shared_grouped_gateup_desc_table_id_ >= 0 &&
+            shared_grouped_gateup_desc_table_d_model_ == d_model &&
+            shared_grouped_gateup_desc_table_intermediate_ == intermediate)
+        {
+            return true;
+        }
+
+        DeviceNativeVNNIMatrixDesc gate_desc;
+        DeviceNativeVNNIMatrixDesc up_desc;
+        if (!cached_gate_gemm_->exportNativeVNNIMatrixDesc(gate_desc) ||
+            !cached_up_gemm_->exportNativeVNNIMatrixDesc(up_desc) ||
+            gate_desc.n != intermediate || gate_desc.k != d_model ||
+            up_desc.n != intermediate || up_desc.k != d_model)
+        {
+            return false;
+        }
+
+        const int table_id = kernel->uploadGroupedExpertGateUpDescriptorTables(
+            &gate_desc, &up_desc, 1, d_model, intermediate);
+        if (table_id < 0)
+            return false;
+
+        shared_grouped_gateup_desc_table_id_ = table_id;
+        shared_grouped_gateup_desc_table_d_model_ = d_model;
+        shared_grouped_gateup_desc_table_intermediate_ = intermediate;
+        return true;
+    }
+
+    bool SharedExpertFFNStage::ensureSharedGroupedDownDescriptorTable(
+        IMoEKernel *kernel, int d_model, int intermediate) const
+    {
+        if (!kernel || !cached_down_gemm_ || d_model <= 0 || intermediate <= 0)
+            return false;
+
+        if (shared_grouped_down_desc_table_id_ >= 0 &&
+            shared_grouped_down_desc_table_d_model_ == d_model &&
+            shared_grouped_down_desc_table_intermediate_ == intermediate)
+        {
+            return true;
+        }
+
+        DeviceNativeVNNIMatrixDesc down_desc;
+        if (!cached_down_gemm_->exportNativeVNNIMatrixDesc(down_desc) ||
+            down_desc.n != d_model || down_desc.k != intermediate)
+        {
+            return false;
+        }
+
+        const int table_id = kernel->uploadGroupedExpertDownDescriptorTable(
+            &down_desc, 1, d_model, intermediate);
+        if (table_id < 0)
+            return false;
+
+        shared_grouped_down_desc_table_id_ = table_id;
+        shared_grouped_down_desc_table_d_model_ = d_model;
+        shared_grouped_down_desc_table_intermediate_ = intermediate;
+        return true;
+    }
+
+    bool SharedExpertFFNStage::tryGroupedDecode(
+        IMoEKernel *kernel, int d_model, int intermediate) const
+    {
+        if (!params_.device_id.is_rocm() || params_.seq_len != 1 ||
+            !debugEnv().rocm.shared_expert_grouped_decode)
+        {
+            return false;
+        }
+
+        if (!ensureSharedGroupedGateUpDescriptorTable(kernel, d_model, intermediate) ||
+            !ensureSharedGroupedDownDescriptorTable(kernel, d_model, intermediate))
+        {
+            return false;
+        }
+
+        constexpr int expert_id = 0;
+        constexpr float expert_weight = 1.0f;
+        ITensor *gate_outputs[1] = {scratch_gate_.get()};
+        ITensor *up_outputs[1] = {scratch_up_.get()};
+        if (!kernel->groupedExpertGateUpDecodeFromTable(
+                params_.input,
+                &expert_id,
+                shared_grouped_gateup_desc_table_id_,
+                1,
+                gate_outputs,
+                up_outputs,
+                d_model,
+                intermediate))
+        {
+            return false;
+        }
+
+        ITensor *gate_tensors[1] = {scratch_gate_.get()};
+        ITensor *up_tensors[1] = {scratch_up_.get()};
+        return kernel->groupedExpertDownDecodeFromTable(
+            gate_tensors,
+            up_tensors,
+            &expert_id,
+            &expert_weight,
+            shared_grouped_down_desc_table_id_,
+            1,
+            params_.output,
+            d_model,
+            intermediate);
+    }
+
     bool SharedExpertFFNStage::execute(IDeviceContext *ctx)
     {
         if (!ctx)
@@ -2081,6 +2192,10 @@ namespace llaminar2
             scratch_seq_len_ = seq_len;
         }
 
+        IMoEKernel *kernel = ensureMoEKernel();
+        if (tryGroupedDecode(kernel, d_model, intermediate))
+            return true;
+
         // Gate+Up projections via fused multi-projection (quantizes input once)
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {cached_gate_gemm_, scratch_gate_.get(), intermediate, nullptr, "shared_gate"},
@@ -2096,7 +2211,6 @@ namespace llaminar2
             markGpuTensorWritten(projection.output, params_.device_id, gpuStream());
 
         // SwiGLU+Down via fused kernel with MoE kernel fallback
-        IMoEKernel *kernel = ensureMoEKernel();
         if (!fusedSwigluDown(
                 scratch_gate_.get(), scratch_up_.get(), params_.output,
                 cached_down_gemm_, kernel, seq_len, d_model, intermediate,

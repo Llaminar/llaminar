@@ -219,7 +219,7 @@ namespace llaminar2
             count = tensor->numel();
             if (count == 0)
             {
-                LOG_INFO("[TRACE] " << name() << " INPUT '" << tensor_name
+                LOG_DEBUG("[TRACE] " << name() << " INPUT '" << tensor_name
                                     << "' [empty tensor]");
                 return;
             }
@@ -260,7 +260,7 @@ namespace llaminar2
                     << tensor->dtype_name() << "] ";
             }
             oss << "[data unavailable - raw weights released after GEMM packing]";
-            LOG_INFO(oss.str());
+            LOG_DEBUG(oss.str());
             return;
         }
 
@@ -280,7 +280,7 @@ namespace llaminar2
             oss << " checksum=" << computeChecksum(data, count);
         }
 
-        LOG_INFO(oss.str());
+        LOG_DEBUG(oss.str());
     }
 
     void IComputeStage::traceOutput(const std::string &tensor_name, const ITensor *tensor) const
@@ -297,7 +297,7 @@ namespace llaminar2
             count = tensor->numel();
             if (count == 0)
             {
-                LOG_INFO("[TRACE] " << name() << " OUTPUT '" << tensor_name
+                LOG_DEBUG("[TRACE] " << name() << " OUTPUT '" << tensor_name
                                     << "' [empty tensor]");
                 return;
             }
@@ -329,7 +329,7 @@ namespace llaminar2
 
         if (!data)
         {
-            LOG_INFO("[TRACE] " << name() << " OUTPUT '" << tensor_name
+            LOG_DEBUG("[TRACE] " << name() << " OUTPUT '" << tensor_name
                                 << "' [no fp32 data available]");
             return;
         }
@@ -350,7 +350,7 @@ namespace llaminar2
             oss << " checksum=" << computeChecksum(data, count);
         }
 
-        LOG_INFO(oss.str());
+        LOG_DEBUG(oss.str());
     }
 
     void IComputeStage::traceIntermediate(const std::string &array_name, const float *data, size_t count) const

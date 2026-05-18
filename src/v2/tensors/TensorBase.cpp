@@ -970,7 +970,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_INFO("[TensorBase::allocateOnDevice] ZERO-COPY: Tensor is mapped, no allocation needed");
+                LOG_DEBUG("[TensorBase::allocateOnDevice] ZERO-COPY: Tensor is mapped, no allocation needed");
             }
             return true;
         }
@@ -985,7 +985,7 @@ namespace llaminar2
             // a subsequent prepareForRead sees the reset state before markWritten runs.
             if (trace)
             {
-                LOG_INFO("[TensorBase::allocateOnDevice] Reusing existing allocation on " << target_device.toString());
+                LOG_DEBUG("[TensorBase::allocateOnDevice] Reusing existing allocation on " << target_device.toString());
             }
             return true;
         }
@@ -1029,7 +1029,7 @@ namespace llaminar2
 
                 if (trace)
                 {
-                    LOG_INFO("[TensorBase::allocateOnDevice] Promoted secondary buffer to primary for "
+                    LOG_DEBUG("[TensorBase::allocateOnDevice] Promoted secondary buffer to primary for "
                              << target_device.toString() << " ptr=" << promoted_ptr);
                 }
                 return true;
@@ -1061,7 +1061,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_INFO("[TensorBase::allocateOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
+                LOG_DEBUG("[TensorBase::allocateOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
             }
 
             if (!gpu_data_ptr_)

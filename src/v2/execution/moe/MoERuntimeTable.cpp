@@ -5,6 +5,7 @@
 
 #include "MoERuntimeTable.h"
 
+#include "DecodeExpertHistogram.h"
 #include "../../utils/Logger.h"
 
 #ifdef HAVE_ROCM
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace llaminar2
 {
@@ -166,6 +168,97 @@ namespace llaminar2
                state.expert_offsets &&
                state.grouped_token_ids &&
                state.grouped_route_weights;
+    }
+
+    bool DeviceMoERuntimeTable::syncDecodeHistogramToHost(
+        DecodeExpertHistogram &histogram,
+        void *stream,
+        bool reset_runtime_counts)
+    {
+        const auto &hist_config = histogram.config();
+        if (hist_config.num_layers != num_layers_ ||
+            hist_config.num_experts != num_experts_ ||
+            hist_config.top_k != top_k_)
+        {
+            LOG_ERROR("[MoERuntimeTable] decode histogram config mismatch: table layers="
+                      << num_layers_ << " experts=" << num_experts_ << " top_k=" << top_k_
+                      << " histogram layers=" << hist_config.num_layers
+                      << " experts=" << hist_config.num_experts
+                      << " top_k=" << hist_config.top_k);
+            return false;
+        }
+
+        std::vector<uint64_t> counts(static_cast<size_t>(num_layers_) * static_cast<size_t>(num_experts_), 0);
+
+        if (!mirror_to_device_)
+        {
+            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
+                const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                auto *dst = counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                std::copy(state.decode_histogram,
+                          state.decode_histogram + num_experts_,
+                          dst);
+            }
+        }
+        else
+        {
+#ifdef HAVE_ROCM
+            const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
+            throwOnHipError(set_err, "[MoERuntimeTable] hipSetDevice failed for decode histogram sync");
+            auto hip_stream = static_cast<hipStream_t>(stream);
+            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
+                const auto *src = device_layers_[layer_idx].decode_histogram;
+                auto *dst = counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                throwOnHipError(hipMemcpyAsync(dst,
+                                               src,
+                                               static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                                               hipMemcpyDeviceToHost,
+                                               hip_stream),
+                                layerPrefix(layer_idx) + "hipMemcpyAsync failed for decode histogram D2H");
+            }
+            throwOnHipError(hipStreamSynchronize(hip_stream),
+                            "[MoERuntimeTable] hipStreamSynchronize failed for decode histogram D2H");
+#else
+            (void)stream;
+            (void)reset_runtime_counts;
+            LOG_ERROR("[MoERuntimeTable] ROCm decode histogram sync requested but HAVE_ROCM is not enabled");
+            return false;
+#endif
+        }
+
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            const auto *layer_counts = counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+            histogram.mergeLayerCounts(layer_idx, layer_counts, num_experts_, /*count_window_tokens=*/false);
+        }
+
+        if (!reset_runtime_counts)
+            return true;
+
+        for (auto &state : host_layers_)
+            std::fill(state.decode_histogram, state.decode_histogram + num_experts_, 0ULL);
+
+        if (mirror_to_device_)
+        {
+#ifdef HAVE_ROCM
+            auto hip_stream = static_cast<hipStream_t>(stream);
+            for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            {
+                auto *dst = device_layers_[layer_idx].decode_histogram;
+                throwOnHipError(hipMemsetAsync(dst,
+                                               0,
+                                               static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                                               hip_stream),
+                                layerPrefix(layer_idx) + "hipMemsetAsync failed for decode histogram reset");
+            }
+            throwOnHipError(hipStreamSynchronize(hip_stream),
+                            "[MoERuntimeTable] hipStreamSynchronize failed for decode histogram reset");
+#endif
+        }
+
+        return true;
     }
 
     void DeviceMoERuntimeTable::ensurePrefillRouteScratchCapacity(int token_capacity, void *stream)

@@ -164,13 +164,13 @@ namespace llaminar2
             rebalancer_ = std::make_unique<SocketAwareRebalancer>(config_.rebalance_config);
         }
 
-        LOG_INFO("[MoERebalanceController] Initialized: mode="
-                 << (config_.mode == MoERebalanceMode::OBSERVE ? "OBSERVE" : "DYNAMIC")
-                 << " layers=" << config_.num_layers
-                 << " experts=" << config_.num_experts
-                 << " top_k=" << config_.top_k
-                 << " window=" << config_.window_size
-                 << " sockets=" << config_.sockets.size());
+        LOG_DEBUG("[MoERebalanceController] Initialized: mode="
+                  << (config_.mode == MoERebalanceMode::OBSERVE ? "OBSERVE" : "DYNAMIC")
+                  << " layers=" << config_.num_layers
+                  << " experts=" << config_.num_experts
+                  << " top_k=" << config_.top_k
+                  << " window=" << config_.window_size
+                  << " sockets=" << config_.sockets.size());
     }
 
     bool MoERebalanceController::shouldRebalance() const
@@ -205,8 +205,8 @@ namespace llaminar2
         total_rebalances_++;
         total_swaps_ += proposal.numSwaps();
 
-        LOG_INFO("[MoERebalanceController] Rebalance #" << total_rebalances_
-                                                        << ": " << proposal.summary());
+        LOG_DEBUG("[MoERebalanceController] Rebalance #" << total_rebalances_
+                                                         << ": " << proposal.summary());
 
         return new_placement;
     }
@@ -227,10 +227,10 @@ namespace llaminar2
             return;
         }
 
-        LOG_INFO("[MoERebalanceController] Histogram summary (window tokens="
-                 << histogram_->windowTokenCount()
-                 << " gen=" << histogram_->windowGeneration()
-                 << " avg_imbalance=" << histogram_->averageSocketImbalance() << "):");
+        LOG_DEBUG("[MoERebalanceController] Histogram summary (window tokens="
+                  << histogram_->windowTokenCount()
+                  << " gen=" << histogram_->windowGeneration()
+                  << " avg_imbalance=" << histogram_->averageSocketImbalance() << "):");
 
         for (int l = 0; l < config_.num_layers; ++l)
         {
@@ -388,11 +388,11 @@ namespace llaminar2
             total_gpu_assignments += static_cast<int>(hot_experts.size());
         }
 
-        LOG_INFO("[MoERebalanceController] GPU expert cache masks: "
-                 << cache_count << "/" << num_experts << " routed experts per layer on GPU domain"
-                 << " (gpu_sockets=" << gpu_sockets.size()
-                 << ", cpu_sockets=" << cpu_sockets.size()
-                 << ", assignments=" << total_gpu_assignments << ")");
+        LOG_DEBUG("[MoERebalanceController] GPU expert cache masks: "
+                  << cache_count << "/" << num_experts << " routed experts per layer on GPU domain"
+                  << " (gpu_sockets=" << gpu_sockets.size()
+                  << ", cpu_sockets=" << cpu_sockets.size()
+                  << ", assignments=" << total_gpu_assignments << ")");
 
         return masks_by_socket;
     }
@@ -509,12 +509,12 @@ namespace llaminar2
         auto t_end = std::chrono::high_resolution_clock::now();
         last_rebalance_duration_ms_ = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
-        LOG_INFO("[MoERebalanceController] LPT global rebalance: "
-                 << experts_moved << "/" << num_experts << " experts moved, "
-                 << "per-layer avg imbalance " << std::fixed << std::setprecision(3)
-                 << per_layer_before << "x -> " << per_layer_after << "x"
-                 << " (worst: " << worst_before << "x layer " << worst_layer_before << ")"
-                 << " in " << std::setprecision(2) << last_rebalance_duration_ms_ << " ms");
+        LOG_DEBUG("[MoERebalanceController] LPT global rebalance: "
+                  << experts_moved << "/" << num_experts << " experts moved, "
+                  << "per-layer avg imbalance " << std::fixed << std::setprecision(3)
+                  << per_layer_before << "x -> " << per_layer_after << "x"
+                  << " (worst: " << worst_before << "x layer " << worst_layer_before << ")"
+                  << " in " << std::setprecision(2) << last_rebalance_duration_ms_ << " ms");
 
         histogram_->resetWindow();
         growWindowIfAdaptive();
@@ -591,8 +591,8 @@ namespace llaminar2
         // Store as current replicas
         current_replicas_ = result;
 
-        LOG_INFO("[MoERebalanceController] Proposed " << result.num_replicated
-                                                      << " expert replicas (max " << max_replicas_per_socket << " per socket)");
+        LOG_DEBUG("[MoERebalanceController] Proposed " << result.num_replicated
+                                                       << " expert replicas (max " << max_replicas_per_socket << " per socket)");
 
         // Log the top replicas per socket
         for (int s = 0; s < num_sockets; ++s)
@@ -611,7 +611,7 @@ namespace llaminar2
                     count++;
                 }
             }
-            LOG_INFO("[MoERebalanceController] " << oss.str());
+            LOG_DEBUG("[MoERebalanceController] " << oss.str());
         }
 
         return result;

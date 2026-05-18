@@ -53,7 +53,7 @@ namespace llaminar2
         k_pos_bytes_ = static_cast<size_t>(n_kv_heads) * k_block_size_;
         v_pos_bytes_ = static_cast<size_t>(n_kv_heads) * v_block_size_;
 
-        LOG_INFO("CUDARingKVCacheTQ: K block=" << k_block_size_ << "B, V block=" << v_block_size_
+        LOG_DEBUG("CUDARingKVCacheTQ: K block=" << k_block_size_ << "B, V block=" << v_block_size_
                                                << "B, per-position: K=" << k_pos_bytes_ << "B V=" << v_pos_bytes_ << "B"
                                                << " (vs FP16: " << (n_kv_heads * head_dim * 2 * 2) << "B)");
 
@@ -78,7 +78,7 @@ namespace llaminar2
                 cudaMemcpyAsync(&gpu_rot_val, rotations_.d_rotations,
                                 sizeof(float), cudaMemcpyDeviceToHost, init_stream);
                 cudaStreamSynchronize(init_stream);
-                LOG_INFO("[CUDARingKVCacheTQ] Rotation check: CPU[0,0]=" << cpu_rot.matrix[0]
+                LOG_DEBUG("[CUDARingKVCacheTQ] Rotation check: CPU[0,0]=" << cpu_rot.matrix[0]
                                                                          << " GPU[0,0]=" << gpu_rot_val
                                                                          << " match=" << (std::abs(cpu_rot.matrix[0] - gpu_rot_val) < 1e-6f)
                                                                          << " seed=" << tq_ctx->rotation().seed);
@@ -115,7 +115,7 @@ namespace llaminar2
             const size_t total_tq_bytes = static_cast<size_t>(n_layers) * batch_size *
                                           max_seq_len * (k_pos_bytes_ + v_pos_bytes_);
             const size_t total_scratch_bytes = static_cast<size_t>(n_layers) * 2 * scratch_bytes;
-            LOG_INFO("CUDARingKVCacheTQ VRAM: TQ caches="
+            LOG_DEBUG("CUDARingKVCacheTQ VRAM: TQ caches="
                      << (total_tq_bytes / 1024) << "KB, per-layer FP16 scratch="
                      << (total_scratch_bytes / (1024 * 1024)) << "MB (" << n_layers << " layers)");
         }
@@ -140,7 +140,7 @@ namespace llaminar2
             memset(h_dequant_params_, 0, n_layers * sizeof(TQDequantDynamicParams));
         }
 
-        LOG_INFO("CUDARingKVCacheTQ created: " << n_layers << " layers, "
+        LOG_DEBUG("CUDARingKVCacheTQ created: " << n_layers << " layers, "
                                                << max_seq_len << " max_seq_len, " << n_kv_heads << " KV heads, "
                                                << head_dim << " head_dim on cuda:" << device_id);
     }

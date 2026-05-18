@@ -450,7 +450,7 @@ namespace llaminar2
             mmap_region_ = MmapRegion::create(file_path, mmap_numa_node, skip_mmap_cache_eviction_);
             if (mmap_region_)
             {
-                LOG_INFO("[ModelLoader] mmap enabled: " << file_path
+                LOG_DEBUG("[ModelLoader] mmap enabled: " << file_path
                                                         << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)"
                                                         << (skip_mmap_cache_eviction_ ? " [cache-warm]" : ""));
 
@@ -479,7 +479,7 @@ namespace llaminar2
         }
         else
         {
-            LOG_INFO("[ModelLoader] mmap disabled (--no-mmap), using ifstream loading");
+            LOG_DEBUG("[ModelLoader] mmap disabled (--no-mmap), using ifstream loading");
         }
 
         loaded_ = true;
@@ -2680,7 +2680,7 @@ namespace llaminar2
             std::string split_path = generateSplitPath(file_path_, idx, model_.split_count);
             model_.split_paths[idx] = split_path;
 
-            LOG_INFO("[ModelLoader] Loading split " << idx << ": " << split_path);
+            LOG_DEBUG("[ModelLoader] Loading split " << idx << ": " << split_path);
 
             // Open split file
             split_streams_[idx - 1].open(split_path, std::ios::binary);
@@ -2874,10 +2874,10 @@ namespace llaminar2
             uint64_t aligned = (cur + align - 1) / align * align;
             model_.split_data_offsets[idx] = aligned;
 
-            LOG_INFO("[ModelLoader] Split " << idx << " has " << tensor_count << " tensors");
+            LOG_DEBUG("[ModelLoader] Split " << idx << " has " << tensor_count << " tensors");
         }
 
-        LOG_INFO("[ModelLoader] Total tensors across all splits: " << model_.tensors.size());
+        LOG_DEBUG("[ModelLoader] Total tensors across all splits: " << model_.tensors.size());
         return true;
     }
 

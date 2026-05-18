@@ -115,7 +115,7 @@ namespace llaminar2
 
         if (!logged_once)
         {
-            LOG_INFO("[DeviceSampler::sampleGreedy] GPU-side argmax active ("
+            LOG_DEBUG("[DeviceSampler::sampleGreedy] GPU-side argmax active ("
                      << runners.size() << " devices, vocab_local="
                      << infos[0].vocab_local << " each)");
             logged_once = true;
@@ -300,7 +300,7 @@ namespace llaminar2
 
         if (!logged_once)
         {
-            LOG_INFO("[DeviceSampler::sample] GPU-side top-k/top-p active ("
+            LOG_DEBUG("[DeviceSampler::sample] GPU-side top-k/top-p active ("
                      << runners.size() << " devices, k=" << effective_k
                      << ", vocab_local=" << infos[0].vocab_local << " each)");
             logged_once = true;

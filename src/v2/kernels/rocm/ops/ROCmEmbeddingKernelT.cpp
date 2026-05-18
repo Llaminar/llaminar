@@ -302,7 +302,7 @@ namespace llaminar2
                 }
             }
 
-            LOG_INFO("[ROCmEmbeddingKernelT] Host token stats: num_tokens=" << num_tokens
+            LOG_DEBUG("[ROCmEmbeddingKernelT] Host token stats: num_tokens=" << num_tokens
                                                                             << " vocab_size=" << vocab_size
                                                                             << " min_id=" << min_id
                                                                             << " max_id=" << max_id
@@ -706,7 +706,7 @@ namespace llaminar2
                         cached_embed_table_ = embed_table;
                         cached_embed_table_by_device_[dev] = embed_table;
                     }
-                    LOG_INFO("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
+                    LOG_DEBUG("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
                              << tensorTypeName(embed_table->native_type()) << " "
                              << repacked.vocab_size << "x" << d_model
                              << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"

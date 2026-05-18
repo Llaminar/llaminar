@@ -153,7 +153,7 @@ namespace llaminar2
             // ================================================================
             if (config.topology_tree)
             {
-                LOG_INFO("Using ParallelismTree topology for runner creation");
+                LOG_DEBUG("Using ParallelismTree topology for runner creation");
                 
                 // Get MPI context for world size and rank
                 auto mpi_ctx = MPIContextFactory::global();
@@ -171,8 +171,8 @@ namespace llaminar2
                 // For now, log tree structure and fall back to standard path
                 // Full tree-to-runner compilation requires model loading first
                 LOG_DEBUG("Topology tree structure:\n" << config.topology_tree->toString());
-                LOG_INFO("Note: Full tree compilation requires loaded model context");
-                LOG_INFO("Falling back to standard OrchestrationRunner path");
+                LOG_DEBUG("Note: Full tree compilation requires loaded model context");
+                LOG_DEBUG("Falling back to standard OrchestrationRunner path");
                 
                 // The actual tree compilation would be:
                 // auto runner = TreeToRunnerCompiler::compile(*config.topology_tree, compile_ctx);
@@ -188,7 +188,7 @@ namespace llaminar2
             // list spans multiple hostnames.
             if (NamedDomainGlobalRunner::shouldUse(config))
             {
-                LOG_INFO("Named-domain global PP configuration detected — using NamedDomainGlobalRunner");
+                LOG_DEBUG("Named-domain global PP configuration detected — using NamedDomainGlobalRunner");
                 auto runner_plan_builder = createExecutionPlanBuilder();
                 return std::make_unique<NamedDomainGlobalRunner>(
                     std::move(config),
@@ -205,11 +205,11 @@ namespace llaminar2
 
                 if (needs_global)
                 {
-                    LOG_INFO("Global orchestration conditions detected ("
+                    LOG_DEBUG("Global orchestration conditions detected ("
                              << "world_size=" << world_size
                              << ", pp_degree=" << config.pp_degree
                              << ", tp_scope=" << tpScopeToString(config.tp_scope) << ")");
-                    LOG_INFO("Note: Non-named-domain global orchestration is not yet supported. "
+                    LOG_DEBUG("Note: Non-named-domain global orchestration is not yet supported. "
                              "Use --define-domain + --pp-stage with scope=node_local or scope=global.");
                 }
             }

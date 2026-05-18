@@ -92,7 +92,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_INFO("HeterogeneousBackend: Initializing with " << group.size() << " devices");
+        LOG_DEBUG("HeterogeneousBackend: Initializing with " << group.size() << " devices");
 
         // Validate the group
         if (!validateGroup(group))
@@ -112,9 +112,9 @@ namespace llaminar2
         // Select bridge devices
         selectBridgeDevices();
 
-        LOG_INFO("HeterogeneousBackend: CUDA devices: " << cuda_devices_.size()
+        LOG_DEBUG("HeterogeneousBackend: CUDA devices: " << cuda_devices_.size()
                                                         << ", ROCm devices: " << rocm_devices_.size());
-        LOG_INFO("HeterogeneousBackend: Bridge devices - CUDA: " << cuda_bridge_.toString()
+        LOG_DEBUG("HeterogeneousBackend: Bridge devices - CUDA: " << cuda_bridge_.toString()
                                                                  << ", ROCm: " << rocm_bridge_.toString());
 
         // Create sub-backends
@@ -134,7 +134,7 @@ namespace llaminar2
         }
 
         initialized_ = true;
-        LOG_INFO("HeterogeneousBackend: Initialization complete");
+        LOG_DEBUG("HeterogeneousBackend: Initialization complete");
         return true;
     }
 
@@ -3182,7 +3182,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_INFO("HeterogeneousBackend: Creating NCCL backend for "
+        LOG_DEBUG("HeterogeneousBackend: Creating NCCL backend for "
                  << cuda_devices_.size() << " CUDA devices");
 
         // Create NCCL backend
@@ -3206,7 +3206,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_INFO("HeterogeneousBackend: NCCL backend initialized");
+        LOG_DEBUG("HeterogeneousBackend: NCCL backend initialized");
         return true;
     }
 
@@ -3220,7 +3220,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_INFO("HeterogeneousBackend: Creating RCCL backend for "
+        LOG_DEBUG("HeterogeneousBackend: Creating RCCL backend for "
                  << rocm_devices_.size() << " ROCm devices");
 
         // Create RCCL backend
@@ -3244,13 +3244,13 @@ namespace llaminar2
             return false;
         }
 
-        LOG_INFO("HeterogeneousBackend: RCCL backend initialized");
+        LOG_DEBUG("HeterogeneousBackend: RCCL backend initialized");
         return true;
     }
 
     bool HeterogeneousBackend::createBridgeBackend()
     {
-        LOG_INFO("HeterogeneousBackend: Creating HOST bridge backend for "
+        LOG_DEBUG("HeterogeneousBackend: Creating HOST bridge backend for "
                  << cuda_bridge_.toString() << " <-> " << rocm_bridge_.toString());
 
         // Create HostBackend for cross-vendor bridge (host-staged transfers)
@@ -3274,7 +3274,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_INFO("HeterogeneousBackend: HOST bridge backend initialized");
+        LOG_DEBUG("HeterogeneousBackend: HOST bridge backend initialized");
         return true;
     }
 

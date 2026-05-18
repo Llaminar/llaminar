@@ -101,7 +101,7 @@ namespace llaminar2
         // requested later, so skipping here is purely an optimisation.
         if (cuda_ordinals.size() < 2)
         {
-            LOG_INFO("[BackendRouter] Only " << cuda_ordinals.size()
+            LOG_DEBUG("[BackendRouter] Only " << cuda_ordinals.size()
                      << " CUDA device in cluster inventory; skipping NCCL pre-initialization "
                      << "(collectives require >=2 devices, lazy init will run on demand if needed)");
             return;
@@ -127,7 +127,7 @@ namespace llaminar2
             return;
         }
 
-        LOG_INFO("[BackendRouter] Pre-initialized NCCL backend with copy communicators");
+        LOG_DEBUG("[BackendRouter] Pre-initialized NCCL backend with copy communicators");
 #else
         LOG_DEBUG("[BackendRouter] NCCL not available (HAVE_NCCL not defined)");
 #endif
@@ -188,7 +188,7 @@ namespace llaminar2
         // requested later, so skipping here is purely an optimisation.
         if (rocm_ordinals.size() < 2)
         {
-            LOG_INFO("[BackendRouter] Only " << rocm_ordinals.size()
+            LOG_DEBUG("[BackendRouter] Only " << rocm_ordinals.size()
                      << " ROCm device in cluster inventory; skipping RCCL pre-initialization "
                      << "(collectives require >=2 devices, lazy init will run on demand if needed)");
             return;
@@ -214,7 +214,7 @@ namespace llaminar2
             return;
         }
 
-        LOG_INFO("[BackendRouter] Pre-initialized RCCL backend with copy communicators");
+        LOG_DEBUG("[BackendRouter] Pre-initialized RCCL backend with copy communicators");
 #else
         LOG_DEBUG("[BackendRouter] RCCL not available (HAVE_RCCL not defined)");
 #endif
@@ -239,7 +239,7 @@ namespace llaminar2
         CollectiveBackendType type = selectBackendType(group);
 
         // Log backend selection with group composition
-        LOG_INFO("BackendRouter: Selected " << toString(type) << " for group '" << group.name
+        LOG_DEBUG("BackendRouter: Selected " << toString(type) << " for group '" << group.name
                                             << "' (cuda_count=" << group.cuda_count << ", rocm_count=" << group.rocm_count
                                             << ", heterogeneous=" << (group.isHeterogeneous() ? "true" : "false") << ")");
 
@@ -645,7 +645,7 @@ namespace llaminar2
     {
         if (backend)
         {
-            LOG_INFO("BackendRouter: Registering UPI backend (domain rank=" << backend->domainRank()
+            LOG_DEBUG("BackendRouter: Registering UPI backend (domain rank=" << backend->domainRank()
                                                                             << ", domain size=" << backend->domainSize() << ")");
         }
         upi_backend_ = std::move(backend);
@@ -803,7 +803,7 @@ namespace llaminar2
 #ifdef HAVE_NCCL
             return std::make_unique<NCCLBackend>(mpi_ctx);
 #else
-            LOG_INFO("DefaultBackendFactory::createBackend - NCCL not available (HAVE_NCCL not defined)");
+            LOG_DEBUG("DefaultBackendFactory::createBackend - NCCL not available (HAVE_NCCL not defined)");
             return nullptr;
 #endif
 
@@ -811,7 +811,7 @@ namespace llaminar2
 #ifdef HAVE_RCCL
             return std::make_unique<RCCLBackend>(mpi_ctx);
 #else
-            LOG_INFO("DefaultBackendFactory::createBackend - RCCL not available (HAVE_RCCL not defined)");
+            LOG_DEBUG("DefaultBackendFactory::createBackend - RCCL not available (HAVE_RCCL not defined)");
             return nullptr;
 #endif
 
@@ -915,7 +915,7 @@ namespace llaminar2
         // No MPI context needed for tests
         instance_ = std::make_unique<BackendRouter>(nullptr, test_inventory);
 
-        LOG_INFO("[GlobalBackendRouter] Initialized for testing (no MPI)");
+        LOG_DEBUG("[GlobalBackendRouter] Initialized for testing (no MPI)");
         return instance_ != nullptr;
     }
 

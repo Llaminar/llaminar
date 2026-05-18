@@ -50,8 +50,10 @@ TEST(Test__DecodeExpertHistogram, Construction)
     EXPECT_EQ(hist.config().window_size, 256);
 
     // All counts start at zero
-    for (int l = 0; l < 4; ++l) {
-        for (int e = 0; e < 64; ++e) {
+    for (int l = 0; l < 4; ++l)
+    {
+        for (int e = 0; e < 64; ++e)
+        {
             EXPECT_EQ(hist.activationCount(l, e), 0u);
             EXPECT_FLOAT_EQ(hist.weightedActivation(l, e), 0.0f);
         }
@@ -207,7 +209,8 @@ TEST(Test__DecodeExpertHistogram, WindowFull_ExactSize)
     int idx[] = {0};
     float w[] = {1.0f};
 
-    for (int i = 0; i < 9; ++i) {
+    for (int i = 0; i < 9; ++i)
+    {
         hist.record(0, idx, w, 1);
         EXPECT_FALSE(hist.windowFull());
     }
@@ -224,7 +227,8 @@ TEST(Test__DecodeExpertHistogram, WindowReset_ClearsCounters)
     int idx[] = {0, 1};
     float w[] = {0.6f, 0.4f};
     // Simulate 50 complete decode tokens (both layers per token)
-    for (int i = 0; i < 50; ++i) {
+    for (int i = 0; i < 50; ++i)
+    {
         hist.record(0, idx, w, 2);
         hist.record(1, idx, w, 2);
     }
@@ -271,7 +275,8 @@ TEST(Test__DecodeExpertHistogram, TopExperts_SortedByCount)
 
     // Record different counts per expert
     float w[] = {1.0f};
-    for (int e = 0; e < 8; ++e) {
+    for (int e = 0; e < 8; ++e)
+    {
         int idx[] = {e};
         for (int i = 0; i < (e + 1) * 10; ++i)
             hist.record(0, idx, w, 1);
@@ -337,8 +342,10 @@ TEST(Test__DecodeExpertHistogram, ThreadSafety_ConcurrentRecords)
     const int records_per_thread = 1000;
     std::vector<std::thread> threads;
 
-    for (int t = 0; t < num_threads; ++t) {
-        threads.emplace_back([&hist, t, records_per_thread]() {
+    for (int t = 0; t < num_threads; ++t)
+    {
+        threads.emplace_back([&hist, t, records_per_thread]()
+                             {
             int indices[4];
             float weights[4] = {0.4f, 0.3f, 0.2f, 0.1f};
             for (int i = 0; i < records_per_thread; ++i) {
@@ -346,11 +353,10 @@ TEST(Test__DecodeExpertHistogram, ThreadSafety_ConcurrentRecords)
                 for (int k = 0; k < 4; ++k)
                     indices[k] = (t * 4 + k) % 16;
                 hist.record(0, indices, weights, 4);
-            }
-        });
+            } });
     }
 
-    for (auto& t : threads)
+    for (auto &t : threads)
         t.join();
 
     // Total window tokens = num_threads * records_per_thread
@@ -393,7 +399,8 @@ TEST(Test__DecodeExpertHistogram, LargeScale_256Experts_36Layers)
     int indices[8];
     float weights[8] = {0.18f, 0.16f, 0.14f, 0.12f, 0.1f, 0.1f, 0.1f, 0.1f};
 
-    for (int token = 0; token < 512; ++token) {
+    for (int token = 0; token < 512; ++token)
+    {
         // Rotate expert selection
         for (int k = 0; k < 8; ++k)
             indices[k] = (token * 8 + k) % 256;
@@ -407,7 +414,8 @@ TEST(Test__DecodeExpertHistogram, LargeScale_256Experts_36Layers)
     EXPECT_EQ(hist.windowTokenCount(), 512u);
 
     // Verify per-layer consistency
-    for (int l = 0; l < 36; ++l) {
+    for (int l = 0; l < 36; ++l)
+    {
         auto layer_hist = hist.layerHistogram(l);
         uint64_t layer_total = std::accumulate(layer_hist.begin(), layer_hist.end(), uint64_t{0});
         // Each token activates 8 experts, 512 tokens per layer
@@ -415,7 +423,8 @@ TEST(Test__DecodeExpertHistogram, LargeScale_256Experts_36Layers)
     }
 
     // Socket loads should be roughly balanced (round-robin placement + uniform routing)
-    for (int l = 0; l < 36; ++l) {
+    for (int l = 0; l < 36; ++l)
+    {
         auto loads = hist.socketLoads(l);
         ASSERT_EQ(loads.size(), 2u);
         // With uniform routing across 256 experts with round-robin,
@@ -438,7 +447,8 @@ TEST(Test__DecodeExpertHistogram, AverageSocketImbalance)
     // Perfectly balanced routing across all layers
     int idx[] = {0, 1};
     float w[] = {0.5f, 0.5f};
-    for (int l = 0; l < 3; ++l) {
+    for (int l = 0; l < 3; ++l)
+    {
         for (int i = 0; i < 100; ++i)
             hist.record(l, idx, w, 2);
     }
@@ -472,7 +482,8 @@ TEST(Test__DecodeExpertHistogram, MultipleWindowResets)
     float w[] = {1.0f};
 
     // Fill and reset multiple windows
-    for (int gen = 0; gen < 3; ++gen) {
+    for (int gen = 0; gen < 3; ++gen)
+    {
         EXPECT_EQ(hist.windowGeneration(), static_cast<uint64_t>(gen));
         for (int i = 0; i < 5; ++i)
             hist.record(0, idx, w, 1);
@@ -494,4 +505,73 @@ TEST(Test__DecodeExpertHistogram, LayerHistogram_ReturnsCorrectSize)
     EXPECT_EQ(layer_hist.size(), 32u);
     for (auto count : layer_hist)
         EXPECT_EQ(count, 0u);
+}
+
+TEST(Test__DecodeExpertHistogram, MergeLayerCountsMatchesHostRecordCounts)
+{
+    auto cfg = makeConfig(3, 8, 2, 256);
+    DecodeExpertHistogram recorded(cfg);
+    DecodeExpertHistogram merged(cfg);
+
+    int idx_a[] = {1, 3};
+    float w_a[] = {0.7f, 0.3f};
+    int idx_b[] = {3, 5};
+    float w_b[] = {0.6f, 0.4f};
+
+    for (int token = 0; token < 4; ++token)
+    {
+        for (int layer = 0; layer < 3; ++layer)
+        {
+            const int *idx = (token % 2 == 0) ? idx_a : idx_b;
+            const float *weights = (token % 2 == 0) ? w_a : w_b;
+            recorded.record(layer, idx, weights, 2);
+        }
+    }
+
+    for (int layer = 0; layer < 3; ++layer)
+    {
+        uint64_t counts[8] = {};
+        counts[1] = 2;
+        counts[3] = 4;
+        counts[5] = 2;
+        merged.mergeLayerCounts(layer, counts, 8, /*count_window_tokens=*/layer == 2);
+    }
+
+    for (int layer = 0; layer < 3; ++layer)
+        EXPECT_EQ(merged.layerHistogram(layer), recorded.layerHistogram(layer));
+    EXPECT_EQ(merged.windowTokenCount(), recorded.windowTokenCount());
+}
+
+TEST(Test__DecodeExpertHistogram, RuntimeSyncCallbackMergesOnceAndCanAdvanceWindowSeparately)
+{
+    auto cfg = makeConfig(2, 4, 2, 3);
+    DecodeExpertHistogram hist(cfg);
+
+    uint64_t layer0_counts[4] = {2, 0, 1, 1};
+    uint64_t layer1_counts[4] = {0, 2, 0, 2};
+    bool pending = true;
+    hist.registerRuntimeHistogramSync([&]()
+                                      {
+        if (!pending)
+            return true;
+        hist.mergeLayerCounts(0, layer0_counts, 4);
+        hist.mergeLayerCounts(1, layer1_counts, 4);
+        pending = false;
+        return true; });
+
+    hist.recordTokenBoundary(0);
+    EXPECT_EQ(hist.windowTokenCount(), 0u);
+    hist.recordTokenBoundary(1);
+    EXPECT_EQ(hist.windowTokenCount(), 1u);
+
+    EXPECT_TRUE(hist.syncRuntimeHistograms());
+    EXPECT_EQ(hist.activationCount(0, 0), 2u);
+    EXPECT_EQ(hist.activationCount(0, 2), 1u);
+    EXPECT_EQ(hist.activationCount(1, 1), 2u);
+    EXPECT_EQ(hist.activationCount(1, 3), 2u);
+    EXPECT_EQ(hist.windowTokenCount(), 1u);
+
+    EXPECT_TRUE(hist.syncRuntimeHistograms());
+    EXPECT_EQ(hist.activationCount(0, 0), 2u);
+    EXPECT_EQ(hist.activationCount(1, 1), 2u);
 }

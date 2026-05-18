@@ -443,7 +443,7 @@ namespace llaminar2
         // Tied embeddings: if output.weight is missing, reuse token_embd.weight
         if (!lm_head && embedding)
         {
-            LOG_INFO("[QwenStandardGraphConfigBuilder] output.weight not found, using tied embeddings");
+            LOG_DEBUG("[QwenStandardGraphConfigBuilder] output.weight not found, using tied embeddings");
             lm_head = embedding;
         }
 

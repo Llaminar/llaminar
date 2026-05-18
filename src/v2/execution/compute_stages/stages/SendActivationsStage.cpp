@@ -69,7 +69,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[SendActivationsStage] " << name_ << ": sending " << count
+            LOG_DEBUG("[SendActivationsStage] " << name_ << ": sending " << count
                                                << " floats (" << bytes << " bytes) to rank " << params_.dest_rank
                                                << " tag=" << params_.tag << " async=" << params_.async);
         }
@@ -84,7 +84,7 @@ namespace llaminar2
 
             if (mpi_env.log_collectives)
             {
-                LOG_INFO("[SendActivationsStage] " << name_ << ": isend initiated");
+                LOG_DEBUG("[SendActivationsStage] " << name_ << ": isend initiated");
             }
         }
         else
@@ -98,12 +98,12 @@ namespace llaminar2
             {
                 double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
                 double bandwidth_gbps = (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
-                LOG_INFO("[SendActivationsStage] " << name_ << ": send completed in "
+                LOG_DEBUG("[SendActivationsStage] " << name_ << ": send completed in "
                                                    << ms << " ms (" << bandwidth_gbps << " GB/s)");
             }
             else if (mpi_env.log_collectives)
             {
-                LOG_INFO("[SendActivationsStage] " << name_ << ": send completed");
+                LOG_DEBUG("[SendActivationsStage] " << name_ << ": send completed");
             }
         }
 
@@ -131,7 +131,7 @@ namespace llaminar2
             const auto &mpi_env = debugEnv().mpi_logging;
             if (mpi_env.log_collectives)
             {
-                LOG_INFO("[SendActivationsStage] " << name_ << ": async send completed via wait()");
+                LOG_DEBUG("[SendActivationsStage] " << name_ << ": async send completed via wait()");
             }
         }
     }

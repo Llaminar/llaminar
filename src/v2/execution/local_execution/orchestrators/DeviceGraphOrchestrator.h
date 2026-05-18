@@ -1748,7 +1748,7 @@ namespace llaminar2
             snapshot_capture_.clear();
             snapshot_enabled_ = true;
 
-            LOG_INFO("[DeviceGraphOrchestrator::enableSnapshotCapture] Setting callback on executor_");
+            LOG_DEBUG("[DeviceGraphOrchestrator::enableSnapshotCapture] Setting callback on executor_");
             executor_.setSnapshotCallback(
                 [this](const std::string &name, const StageDumpInfo &dump)
                 {

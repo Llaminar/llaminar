@@ -2210,6 +2210,19 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_REPACK_SLOTS=<n>` - Ring-buffer slot count for startup GPU repack pipeline
      * - `LLAMINAR_ROCM_REPACK_BUDGET_MB=<mb>` - VRAM budget cap for startup GPU repack staging buffers
      * - `LLAMINAR_ROCM_REPACK_STREAMS=<n>` - Stream count hint for startup GPU repack pipeline
+     * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
+     * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
+     * - `LLAMINAR_ROCM_NVNNI_Q8_DIRECT=1` - Force Q8_0 native-VNNI GEMV direct path (KB=1, no reduce kernel)
+     * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=1` - Enable experimental multi-stream GDN decode projection GEMVs (default: off)
+     * - `LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE=1` - Enable experimental shared-expert decode through MoE grouped FFN kernels (default: off)
+     * - `LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE=0` - Disable parallel-expert grouped MoE decode down projection
+     * - `LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE=0` - Disable K-partitioned grouped MoE gate/up decode projection
+     * - `LLAMINAR_ROCM_MOE_GATEUP_KPARTS=<2|4|8>` - K partitions for grouped MoE gate/up decode projection (default: 8)
+     * - `LLAMINAR_ROCM_MOE_ROUTER_Q8=1` - Enable cached Q8 router gate weights for ROCm MoE decode routing (default: off)
+     * - `LLAMINAR_ROCM_MOE_ROUTER_FP16=1` - Enable cached FP16 router gate weights for ROCm MoE decode routing (default: off)
+     * - `LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE=1` - Enable K-partitioned FP32 router logits for ROCm MoE decode routing (default: off)
+     * - `LLAMINAR_ROCM_MOE_ROUTER_KPARTS=<2|4|8|16>` - K partitions for FP32 router logits decode routing (default: 8)
+     * - `LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK=0` - Disable shared-memory ROCm MoE decode softmax/top-k runtime kernel for <=256 experts (default: on)
      *
      * @code
      *   LLAMINAR_ROCM_TRACE_COHERENCE=1 \
@@ -2238,33 +2251,47 @@ namespace llaminar2
         int vnni_prefill_ffn_override_kernel_body = 2;
         int vnni_prefill_grid_swizzle = -1;
         int vnni_prefill_ffn_override_grid_swizzle = 1;
-        bool wide_tile_v3 = false;              ///< Use V3 wide-tile kernel (LDS double-buffered, N64) (LLAMINAR_ROCM_WIDE_TILE_V3)
-        bool wide_tile_v7 = false;              ///< Use V7 wide-tile kernel (safe-tile split, N128) (LLAMINAR_ROCM_WIDE_TILE_V7)
-        int wide_tile_kt = 16;                  ///< KT parameter for wide-tile kernels (4, 8, or 16) (LLAMINAR_ROCM_WIDE_TILE_KT)
-        int blockwise_v3_mt = -1;               ///< V3 blockwise M_TILE override (-1=auto, 16/32) (LLAMINAR_ROCM_BLOCKWISE_V3_MT)
-        int blockwise_v7_mt = -1;               ///< V7 blockwise M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_BLOCKWISE_V7_MT)
-        int blockwise_v3_unroll = -1;           ///< V3 blockwise UNROLL_KK override (-1=auto, 0=disable, 1=full, 2/4=partial) (LLAMINAR_ROCM_BLOCKWISE_V3_UNROLL)
-        int blockwise_v7_unroll = -1;           ///< V7 blockwise UNROLL_KK override (-1=auto, 0=disable, 1=full, 2/4=partial) (LLAMINAR_ROCM_BLOCKWISE_V7_UNROLL)
-        bool blockwise_force_v3 = false;        ///< Force V3 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V3)
-        bool blockwise_force_v7 = false;        ///< Force V7 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V7)
-        int blockwise_quant_variant = 0;        ///< Blockwise quant kernel variant (0=auto, 1-5=manual) (LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT)
-        int nvnni_mt = -1;                      ///< Native-VNNI M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_NVNNI_MT)
-        int nvnni_unroll = -1;                  ///< Native-VNNI UNROLL_G override (-1=auto, 0=none, 1=full, 2/4=partial) (LLAMINAR_ROCM_NVNNI_UNROLL)
-        int nvnni_min_blocks = -1;              ///< Native-VNNI MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NVNNI_MIN_BLOCKS)
-        bool nvnni_force_n64 = false;           ///< Force N64 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N64)
-        bool nvnni_force_n128 = false;          ///< Force N128 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N128)
-        int ratio_prefill_variant = -1;         ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
-        int ratio_prefill_kb = 0;               ///< Ratio prefill split-K blocks override (0=auto)
-        int ratio_prefill_linear_variant = -1;  ///< Linear codebook ratio prefill tile override (-1=use global/auto)
-        int ratio_prefill_linear_kb = 0;        ///< Linear codebook ratio prefill split-K override (0=use global/auto)
-        int ratio_prefill_iq4_variant = -1;     ///< IQ4 codebook ratio prefill tile override (-1=use global/auto)
-        int ratio_prefill_iq4_kb = 0;           ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
-        bool concurrent_prefill = true;         ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
-        bool concurrent_decode = false;         ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
-        bool moe_grouped_decode = true;         ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
-        bool moe_grouped_decode_router = false; ///< Enable experimental grouped MoE decode router logits path (LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER)
-        bool moe_device_routed_decode = true;   ///< Enable runtime-table device routed MoE decode (LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE)
-        bool moe_grouped_prefill = true;        ///< Enable grouped MoE prefill path when supported (LLAMINAR_ROCM_MOE_GROUPED_PREFILL)
+        bool wide_tile_v3 = false;                 ///< Use V3 wide-tile kernel (LDS double-buffered, N64) (LLAMINAR_ROCM_WIDE_TILE_V3)
+        bool wide_tile_v7 = false;                 ///< Use V7 wide-tile kernel (safe-tile split, N128) (LLAMINAR_ROCM_WIDE_TILE_V7)
+        int wide_tile_kt = 16;                     ///< KT parameter for wide-tile kernels (4, 8, or 16) (LLAMINAR_ROCM_WIDE_TILE_KT)
+        int blockwise_v3_mt = -1;                  ///< V3 blockwise M_TILE override (-1=auto, 16/32) (LLAMINAR_ROCM_BLOCKWISE_V3_MT)
+        int blockwise_v7_mt = -1;                  ///< V7 blockwise M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_BLOCKWISE_V7_MT)
+        int blockwise_v3_unroll = -1;              ///< V3 blockwise UNROLL_KK override (-1=auto, 0=disable, 1=full, 2/4=partial) (LLAMINAR_ROCM_BLOCKWISE_V3_UNROLL)
+        int blockwise_v7_unroll = -1;              ///< V7 blockwise UNROLL_KK override (-1=auto, 0=disable, 1=full, 2/4=partial) (LLAMINAR_ROCM_BLOCKWISE_V7_UNROLL)
+        bool blockwise_force_v3 = false;           ///< Force V3 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V3)
+        bool blockwise_force_v7 = false;           ///< Force V7 blockwise for all shapes (LLAMINAR_ROCM_BLOCKWISE_FORCE_V7)
+        int blockwise_quant_variant = 0;           ///< Blockwise quant kernel variant (0=auto, 1-5=manual) (LLAMINAR_ROCM_BLOCKWISE_QUANT_VARIANT)
+        int nvnni_mt = -1;                         ///< Native-VNNI M_TILE override (-1=auto, 16/32/64) (LLAMINAR_ROCM_NVNNI_MT)
+        int nvnni_unroll = -1;                     ///< Native-VNNI UNROLL_G override (-1=auto, 0=none, 1=full, 2/4=partial) (LLAMINAR_ROCM_NVNNI_UNROLL)
+        int nvnni_min_blocks = -1;                 ///< Native-VNNI MIN_BLOCKS override (-1=auto, 1=bare, 2=2-wave, 3=3-wave) (LLAMINAR_ROCM_NVNNI_MIN_BLOCKS)
+        bool nvnni_force_n64 = false;              ///< Force N64 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N64)
+        bool nvnni_force_n128 = false;             ///< Force N128 for all native-VNNI shapes (LLAMINAR_ROCM_NVNNI_FORCE_N128)
+        int nvnni_gemv_kb = -1;                    ///< Native-VNNI GEMV K-partition override (-1=auto, 1..64) (LLAMINAR_ROCM_NVNNI_GEMV_KB)
+        int nvnni_gemv_target_waves = -1;          ///< Native-VNNI GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES)
+        bool nvnni_q8_direct = false;              ///< Force Q8_0 native-VNNI GEMV KB=1 direct path (LLAMINAR_ROCM_NVNNI_Q8_DIRECT)
+        bool nvnni_atomic_reduce = false;          ///< Fuse GEMV reduce via atomicAdd (eliminates reduce kernel) (LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE)
+        int ratio_prefill_variant = -1;            ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
+        int ratio_prefill_kb = 0;                  ///< Ratio prefill split-K blocks override (0=auto)
+        int ratio_prefill_linear_variant = -1;     ///< Linear codebook ratio prefill tile override (-1=use global/auto)
+        int ratio_prefill_linear_kb = 0;           ///< Linear codebook ratio prefill split-K override (0=use global/auto)
+        int ratio_prefill_iq4_variant = -1;        ///< IQ4 codebook ratio prefill tile override (-1=use global/auto)
+        int ratio_prefill_iq4_kb = 0;              ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
+        bool concurrent_prefill = true;            ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
+        bool concurrent_decode = false;            ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
+        bool gdn_concurrent_decode = false;        ///< Enable multi-stream GDN decode projection GEMVs only (LLAMINAR_ROCM_GDN_CONCURRENT_DECODE)
+        bool shared_expert_grouped_decode = false; ///< Enable shared-expert decode through grouped MoE FFN kernels (LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE)
+        bool moe_grouped_decode = true;            ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
+        bool moe_grouped_decode_router = false;    ///< Enable experimental grouped MoE decode router logits path (LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER)
+        bool moe_router_q8 = false;                ///< Enable cached Q8 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
+        bool moe_router_fp16 = false;              ///< Enable cached FP16 router gate weights for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_FP16, disabled by LLAMINAR_DETERMINISTIC)
+        bool moe_router_kpart_decode = false;      ///< Enable K-partitioned FP32 router logits for ROCm MoE decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
+        int moe_router_kparts = 8;                 ///< K partitions for FP32 router logits decode routing (LLAMINAR_ROCM_MOE_ROUTER_KPARTS)
+        bool moe_router_wave_topk = true;          ///< Enable shared-memory decode softmax/top-k runtime kernel for <=256 experts (LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK)
+        bool moe_parallel_down_decode = true;      ///< Enable parallel-expert grouped MoE decode down projection (LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE, disabled by LLAMINAR_DETERMINISTIC)
+        bool moe_gateup_kpart_decode = true;       ///< Enable K-partitioned grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
+        int moe_gateup_kparts = 8;                 ///< K partitions for grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPARTS)
+        bool moe_device_routed_decode = true;      ///< Enable runtime-table device routed MoE decode (LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE)
+        bool moe_grouped_prefill = true;           ///< Enable grouped MoE prefill path when supported (LLAMINAR_ROCM_MOE_GROUPED_PREFILL)
 
         // --- Startup GPU weight loading pipeline (LoadOrchestrator) ---
         int repack_slots = 3;     ///< Ring-buffer slot count for startup GPU repack pipeline (LLAMINAR_ROCM_REPACK_SLOTS)
@@ -2313,6 +2340,10 @@ namespace llaminar2
             nvnni_min_blocks = -1;
             nvnni_force_n64 = false;
             nvnni_force_n128 = false;
+            nvnni_gemv_kb = -1;
+            nvnni_gemv_target_waves = -1;
+            nvnni_q8_direct = false;
+            nvnni_atomic_reduce = false;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -2321,8 +2352,18 @@ namespace llaminar2
             ratio_prefill_iq4_kb = 0;
             concurrent_prefill = true;
             concurrent_decode = false;
+            gdn_concurrent_decode = false;
+            shared_expert_grouped_decode = false;
             moe_grouped_decode = true;
             moe_grouped_decode_router = false;
+            moe_router_q8 = false;
+            moe_router_fp16 = false;
+            moe_router_kpart_decode = false;
+            moe_router_kparts = 8;
+            moe_router_wave_topk = true;
+            moe_parallel_down_decode = true;
+            moe_gateup_kpart_decode = true;
+            moe_gateup_kparts = 8;
             moe_device_routed_decode = true;
             moe_grouped_prefill = true;
             repack_slots = 3;
@@ -2557,6 +2598,30 @@ namespace llaminar2
                 nvnni_force_n128 = (std::atoi(nvnni_force_n128_env) != 0);
             }
 
+            const char *nvnni_gemv_kb_env = std::getenv("LLAMINAR_ROCM_NVNNI_GEMV_KB");
+            if (nvnni_gemv_kb_env)
+            {
+                nvnni_gemv_kb = std::clamp(std::atoi(nvnni_gemv_kb_env), -1, 64);
+            }
+
+            const char *nvnni_gemv_target_waves_env = std::getenv("LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES");
+            if (nvnni_gemv_target_waves_env)
+            {
+                nvnni_gemv_target_waves = std::clamp(std::atoi(nvnni_gemv_target_waves_env), -1, 64);
+            }
+
+            const char *nvnni_q8_direct_env = std::getenv("LLAMINAR_ROCM_NVNNI_Q8_DIRECT");
+            if (nvnni_q8_direct_env)
+            {
+                nvnni_q8_direct = (std::atoi(nvnni_q8_direct_env) != 0);
+            }
+
+            const char *nvnni_atomic_reduce_env = std::getenv("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE");
+            if (nvnni_atomic_reduce_env)
+            {
+                nvnni_atomic_reduce = (std::atoi(nvnni_atomic_reduce_env) != 0);
+            }
+
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");
             if (ratio_prefill_variant_env)
             {
@@ -2605,6 +2670,18 @@ namespace llaminar2
                 concurrent_decode = (std::atoi(concurrent_decode_env) != 0);
             }
 
+            const char *gdn_concurrent_decode_env = std::getenv("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
+            if (gdn_concurrent_decode_env)
+            {
+                gdn_concurrent_decode = (std::atoi(gdn_concurrent_decode_env) != 0);
+            }
+
+            const char *shared_expert_grouped_decode_env = std::getenv("LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE");
+            if (shared_expert_grouped_decode_env)
+            {
+                shared_expert_grouped_decode = (std::atoi(shared_expert_grouped_decode_env) != 0);
+            }
+
             const char *moe_grouped_decode_env = std::getenv("LLAMINAR_ROCM_MOE_GROUPED_DECODE");
             if (moe_grouped_decode_env)
             {
@@ -2615,6 +2692,70 @@ namespace llaminar2
             if (moe_grouped_decode_router_env)
             {
                 moe_grouped_decode_router = (std::atoi(moe_grouped_decode_router_env) != 0);
+            }
+
+            const char *moe_router_q8_env = std::getenv("LLAMINAR_ROCM_MOE_ROUTER_Q8");
+            if (moe_router_q8_env)
+            {
+                moe_router_q8 = (std::atoi(moe_router_q8_env) != 0);
+            }
+
+            const char *moe_router_fp16_env = std::getenv("LLAMINAR_ROCM_MOE_ROUTER_FP16");
+            if (moe_router_fp16_env)
+            {
+                moe_router_fp16 = (std::atoi(moe_router_fp16_env) != 0);
+            }
+
+            const char *moe_router_kpart_decode_env = std::getenv("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE");
+            if (moe_router_kpart_decode_env)
+            {
+                moe_router_kpart_decode = (std::atoi(moe_router_kpart_decode_env) != 0);
+            }
+            const char *moe_router_kparts_env = std::getenv("LLAMINAR_ROCM_MOE_ROUTER_KPARTS");
+            if (moe_router_kparts_env)
+            {
+                const int requested = std::atoi(moe_router_kparts_env);
+                if (requested == 2 || requested == 4 || requested == 8 || requested == 16)
+                {
+                    moe_router_kparts = requested;
+                }
+            }
+
+            const char *moe_router_wave_topk_env = std::getenv("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK");
+            if (moe_router_wave_topk_env)
+            {
+                moe_router_wave_topk = (std::atoi(moe_router_wave_topk_env) != 0);
+            }
+
+            const char *moe_parallel_down_decode_env = std::getenv("LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE");
+            if (moe_parallel_down_decode_env)
+            {
+                moe_parallel_down_decode = (std::atoi(moe_parallel_down_decode_env) != 0);
+            }
+
+            const char *moe_gateup_kpart_decode_env = std::getenv("LLAMINAR_ROCM_MOE_GATEUP_KPART_DECODE");
+            if (moe_gateup_kpart_decode_env)
+            {
+                moe_gateup_kpart_decode = (std::atoi(moe_gateup_kpart_decode_env) != 0);
+            }
+            const char *moe_gateup_kparts_env = std::getenv("LLAMINAR_ROCM_MOE_GATEUP_KPARTS");
+            if (moe_gateup_kparts_env)
+            {
+                const int requested = std::atoi(moe_gateup_kparts_env);
+                if (requested == 2 || requested == 4 || requested == 8)
+                {
+                    moe_gateup_kparts = requested;
+                }
+            }
+            const char *deterministic_env = std::getenv("LLAMINAR_DETERMINISTIC");
+            if (deterministic_env && std::atoi(deterministic_env) != 0)
+            {
+                moe_router_q8 = false;
+                moe_router_fp16 = false;
+                moe_router_kpart_decode = false;
+                moe_router_wave_topk = false;
+                moe_parallel_down_decode = false;
+                moe_gateup_kpart_decode = false;
             }
 
             const char *moe_device_routed_decode_env = std::getenv("LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE");

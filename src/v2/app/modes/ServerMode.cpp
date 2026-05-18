@@ -91,8 +91,8 @@ namespace llaminar2
             // Non-root ranks: enter MPI worker loop to participate in
             // inference collectives (allreduce for Global TP) when rank 0
             // initiates them. Returns when rank 0 sends SHUTDOWN.
-            LOG_INFO("Rank " << mpi_ctx->rank()
-                             << " entering MPI worker loop for inference participation");
+            LOG_DEBUG("Rank " << mpi_ctx->rank()
+                              << " entering MPI worker loop for inference participation");
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
             runner->shutdown();
@@ -123,7 +123,8 @@ namespace llaminar2
         // Inference is serialized on a single model instance. Keep HTTP handling
         // on one stable worker so OpenMP does not initialize per-request teams
         // on a large rotating httplib thread pool.
-        svr.new_task_queue = [] { return createSerializedInferenceTaskQueue().release(); };
+        svr.new_task_queue = []
+        { return createSerializedInferenceTaskQueue().release(); };
 
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);

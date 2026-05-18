@@ -104,7 +104,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[AllGatherVStage] Using CollectiveContext, seq_len=" << seq_len
+            LOG_DEBUG("[AllGatherVStage] Using CollectiveContext, seq_len=" << seq_len
                                                                            << " local_dim=" << local_dim
                                                                            << " total_recv_elements=" << total_recv);
         }
@@ -124,7 +124,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[AllGatherVStage] CollectiveContext result=" << (success ? "SUCCESS" : "FAILED"));
+            LOG_DEBUG("[AllGatherVStage] CollectiveContext result=" << (success ? "SUCCESS" : "FAILED"));
         }
 
         return success;
@@ -187,7 +187,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[AllGatherVStage] MPI_Allgatherv rank=" << rank
+            LOG_DEBUG("[AllGatherVStage] MPI_Allgatherv rank=" << rank
                                                               << " send_count=" << send_count
                                                               << " seq_len=" << seq_len
                                                               << " local_dim=" << local_dim);
@@ -218,7 +218,7 @@ namespace llaminar2
         {
             auto end = std::chrono::high_resolution_clock::now();
             auto duration_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-            LOG_INFO("[AllGatherVStage] MPI_Allgatherv duration=" << duration_us << " us");
+            LOG_DEBUG("[AllGatherVStage] MPI_Allgatherv duration=" << duration_us << " us");
         }
 
         if (result != MPI_SUCCESS)
@@ -229,7 +229,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[AllGatherVStage] MPI_Allgatherv completed successfully");
+            LOG_DEBUG("[AllGatherVStage] MPI_Allgatherv completed successfully");
         }
 
         return true;

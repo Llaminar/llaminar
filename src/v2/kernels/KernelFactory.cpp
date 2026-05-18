@@ -2221,7 +2221,7 @@ namespace llaminar
                 auto *raw_ptr = kernel.get();
                 rmsnorm_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                LOG_INFO("[KernelFactory][RMSNORM] create dev=" << static_cast<int>(target_device.type)
+                LOG_DEBUG("[KernelFactory][RMSNORM] create dev=" << static_cast<int>(target_device.type)
                                                                 << ":" << target_device.ordinal
                                                                 << " tensor_type=" << static_cast<int>(tensor->native_type())
                                                                 << " kernel=" << static_cast<const void *>(raw_ptr));
@@ -3538,7 +3538,7 @@ namespace llaminar
                     return nullptr;
                 }
 
-                LOG_INFO("[PreparedEmbeddingWeights] Prepared embedding for "
+                LOG_DEBUG("[PreparedEmbeddingWeights] Prepared embedding for "
                          << target_device.to_string() << ": "
                          << llaminar2::tensorTypeName(tensor->native_type()) << " "
                          << repacked.vocab_size << "x" << d_model
@@ -4169,7 +4169,7 @@ namespace llaminar
                         throw std::runtime_error("KernelFactory::createHybridKVCache: mpi_ctx is required for CPU");
                     }
 
-                    LOG_INFO("[KernelFactory] Creating CPU Hybrid KVCache: "
+                    LOG_DEBUG("[KernelFactory] Creating CPU Hybrid KVCache: "
                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
                              << ", total_layers=" << config.num_layers
                              << ", kv_layers=" << hc.countKVLayers()
@@ -4258,7 +4258,7 @@ namespace llaminar
                 {
                     const int cuda_device = config.device.cuda_ordinal();
 
-                    LOG_INFO("[KernelFactory] Creating CUDA Hybrid KVCache: "
+                    LOG_DEBUG("[KernelFactory] Creating CUDA Hybrid KVCache: "
                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
                              << ", device=CUDA:" << cuda_device
                              << ", total_layers=" << config.num_layers
@@ -4333,7 +4333,7 @@ namespace llaminar
                 {
                     const int rocm_device = config.device.rocm_ordinal();
 
-                    LOG_INFO("[KernelFactory] Creating ROCm Hybrid KVCache: "
+                    LOG_DEBUG("[KernelFactory] Creating ROCm Hybrid KVCache: "
                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
                              << ", device=ROCm:" << rocm_device
                              << ", total_layers=" << config.num_layers
@@ -4392,7 +4392,7 @@ namespace llaminar
                             static_cast<int>(gdn_state->recurrence_state.size()));
                     }
 
-                    LOG_INFO("[KernelFactory] Initialized GDN kernels for "
+                    LOG_DEBUG("[KernelFactory] Initialized GDN kernels for "
                              << hybrid->gdnLayerCount() << " GDN layers on "
                              << config.device.to_string());
                 }

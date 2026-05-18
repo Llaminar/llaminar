@@ -544,7 +544,7 @@ namespace llaminar2
 
             if (ctx->isGPU() && std::getenv("LLAMINAR_SYNC_AFTER_STAGE"))
             {
-                LOG_INFO("[DeviceGraphExecutor] sync after stage: " << node->name);
+                LOG_DEBUG("[DeviceGraphExecutor] sync after stage: " << node->name);
                 ctx->synchronize();
             }
 
@@ -563,7 +563,7 @@ namespace llaminar2
             size_t pending = AsyncStageDumper::pendingTasks();
             if (pending > 0)
             {
-                LOG_INFO("[DeviceGraphExecutor] Waiting for " << pending << " pending async dumps...");
+                LOG_DEBUG("[DeviceGraphExecutor] Waiting for " << pending << " pending async dumps...");
                 AsyncStageDumper::waitForCompletion();
             }
         }
@@ -1336,8 +1336,8 @@ namespace llaminar2
                     last_row << "...";
             }
 
-            // Use stream directly with LOG_INFO
-            LOG_INFO(header.str() << first_row.str() << last_row.str());
+            // Use stream directly with LOG_DEBUG
+            LOG_DEBUG(header.str() << first_row.str() << last_row.str());
         }
     }
 

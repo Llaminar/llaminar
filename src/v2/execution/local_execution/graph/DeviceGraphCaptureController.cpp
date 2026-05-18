@@ -201,7 +201,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[DeviceGraphExecutor] Segmented graph: " << capturable_segments << " capturable segments ("
+        LOG_DEBUG("[DeviceGraphExecutor] Segmented graph: " << capturable_segments << " capturable segments ("
                                                            << capturable_stages << " stages) + " << manual_segments << " manual segments ("
                                                            << manual_stages << " stages)");
 
@@ -372,7 +372,7 @@ namespace llaminar2
 
                 if (trace_replay)
                 {
-                    LOG_INFO("[ReplayTrace] " << device_id.toString()
+                    LOG_DEBUG("[ReplayTrace] " << device_id.toString()
                                               << " COLLECTIVE enter: " << stage_name
                                               << " insertStreamDependency(compute←capture)");
                 }
@@ -388,7 +388,7 @@ namespace llaminar2
 
                 if (trace_replay)
                 {
-                    LOG_INFO("[ReplayTrace] " << device_id.toString()
+                    LOG_DEBUG("[ReplayTrace] " << device_id.toString()
                                               << " COLLECTIVE execute: " << stage_name);
                 }
 
@@ -410,7 +410,7 @@ namespace llaminar2
 
                 if (trace_replay)
                 {
-                    LOG_INFO("[ReplayTrace] " << device_id.toString()
+                    LOG_DEBUG("[ReplayTrace] " << device_id.toString()
                                               << " COLLECTIVE done: " << stage_name);
                 }
             }
@@ -1365,7 +1365,7 @@ namespace llaminar2
             {
                 const char *seg_type = seg.capturable ? "GRAPH" : "MANUAL";
                 const auto &first_name = seg.stage_names.empty() ? std::string("<empty>") : seg.stage_names.front();
-                LOG_INFO("[ReplayTrace] " << device_id.toString()
+                LOG_DEBUG("[ReplayTrace] " << device_id.toString()
                                           << " step=" << current_step
                                           << " seg=" << seg_idx << "/" << total_segments
                                           << " [" << seg_type << "]"
@@ -1399,7 +1399,7 @@ namespace llaminar2
 
             if (trace_replay)
             {
-                LOG_INFO("[ReplayTrace] " << device_id.toString()
+                LOG_DEBUG("[ReplayTrace] " << device_id.toString()
                                           << " step=" << current_step
                                           << " seg=" << seg_idx << "/" << total_segments << " DONE");
             }
@@ -1409,7 +1409,7 @@ namespace llaminar2
 
         if (trace_replay)
         {
-            LOG_INFO("[ReplayTrace] " << device_id.toString()
+            LOG_DEBUG("[ReplayTrace] " << device_id.toString()
                                       << " step=" << current_step
                                       << " ALL " << total_segments << " segments done, entering final synchronize()");
         }
@@ -1421,7 +1421,7 @@ namespace llaminar2
         gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
         if (trace_replay)
         {
-            LOG_INFO("[ReplayTrace] " << device_id.toString()
+            LOG_DEBUG("[ReplayTrace] " << device_id.toString()
                                       << " step=" << current_step << " final synchronize() complete");
         }
         result.success = true;

@@ -608,30 +608,6 @@ add_v2_test(V2_Unit_MoEExpertParallelPlan
     MPI_PROCS 1
 )
 
-add_executable(v2_unit_moe_continuation_domain_spec unit/execution/moe/Test__MoEContinuationDomainSpec.cpp)
-target_link_libraries(v2_unit_moe_continuation_domain_spec
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEContinuationDomainSpec
-    COMMAND $<TARGET_FILE:v2_unit_moe_continuation_domain_spec>
-    LABELS "V2;Unit;Execution;MoE;Continuation;Configuration;TensorParallel"
-    MPI_PROCS 1
-)
-
-add_executable(v2_unit_moe_continuation_tp_context_plumbing unit/execution/moe/Test__MoEContinuationTPContextPlumbing.cpp)
-target_link_libraries(v2_unit_moe_continuation_tp_context_plumbing
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEContinuationTPContextPlumbing
-    COMMAND $<TARGET_FILE:v2_unit_moe_continuation_tp_context_plumbing>
-    LABELS "V2;Unit;Execution;MoE;Continuation;ITPContext;TensorParallel"
-    MPI_PROCS 1
-)
-
 # Test: MoE Expert Parallel Planner - static same-layer expert residency planning
 add_executable(v2_unit_moe_expert_parallel_planner unit/execution/moe/Test__MoEExpertParallelPlanner.cpp)
 target_link_libraries(v2_unit_moe_expert_parallel_planner
@@ -645,175 +621,35 @@ add_v2_test(V2_Unit_MoEExpertParallelPlanner
     MPI_PROCS 1
 )
 
-add_executable(v2_unit_moe_routed_tier_planner unit/execution/moe/Test__MoERoutedTierPlanner.cpp)
-target_link_libraries(v2_unit_moe_routed_tier_planner
+# Test: Graph-native MoE overlay sparse dispatch collective contract
+add_executable(v2_unit_moe_overlay_dispatch_collective unit/execution/moe/Test__MoEOverlayDispatchCollective.cpp)
+target_link_libraries(v2_unit_moe_overlay_dispatch_collective
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Unit_MoERoutedTierPlanner_FlexibleNamesAndBudgets
-    COMMAND $<TARGET_FILE:v2_unit_moe_routed_tier_planner>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Planner;RoutedTiers"
+add_v2_test(V2_Unit_MoEOverlayDispatchCollective
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_dispatch_collective>
+    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;Dispatch;Collective"
     MPI_PROCS 1
 )
 
-# Test: MoERoutedTierRebalancer — Phase 13 deterministic hot-cache placement
-add_executable(v2_unit_moe_routed_tier_rebalancer unit/execution/moe/Test__MoERoutedTierRebalancer.cpp)
-target_link_libraries(v2_unit_moe_routed_tier_rebalancer
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
+# Test: MoE overlay domain runtime graph dispatch descriptors
+add_executable(v2_unit_moe_overlay_domain_runtime
+    unit/execution/moe/Test__MoEOverlayDomainRuntime.cpp
+    integration/mpi_gtest_main.cpp
 )
-add_v2_test(V2_Unit_MoERoutedTierRebalancer_AllGPU
-    COMMAND $<TARGET_FILE:v2_unit_moe_routed_tier_rebalancer>
-        --gtest_filter="Test__MoERoutedTierRebalancer.AllGPU_*"
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Planner;Rebalancer;AllGPU"
-    MPI_PROCS 1
-)
-add_v2_test(V2_Unit_MoERoutedTierRebalancer_MixedGpuCpu
-    COMMAND $<TARGET_FILE:v2_unit_moe_routed_tier_rebalancer>
-        --gtest_filter="Test__MoERoutedTierRebalancer.MixedGpuCpu_*"
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Planner;Rebalancer;MixedGpuCpu"
-    MPI_PROCS 1
-)
-
-# Test: MoEGraphNativeProfilingMetrics — Phase 14 graph-native overlay profiling unit test
-add_executable(v2_unit_moe_graph_native_profiling_metrics
-    unit/execution/moe/Test__MoEGraphNativeProfilingMetrics.cpp
-)
-target_link_libraries(v2_unit_moe_graph_native_profiling_metrics
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEGraphNativeProfilingMetrics
-    COMMAND $<TARGET_FILE:v2_unit_moe_graph_native_profiling_metrics>
-    LABELS "V2;Unit;Execution;MoE;GraphNative;Profiling;Phase14"
-    MPI_PROCS 1
-)
-
-# Test: MoEGraphNativeProductionHardening - Phase 21 placement explanation and validation diagnostics
-add_executable(v2_unit_moe_graph_native_production_hardening
-    unit/execution/moe/Test__MoEGraphNativeProductionHardening.cpp
-)
-target_link_libraries(v2_unit_moe_graph_native_production_hardening
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEGraphNativeProductionHardening
-    COMMAND $<TARGET_FILE:v2_unit_moe_graph_native_production_hardening>
-    LABELS "V2;Unit;Execution;MoE;GraphNative;Production;Hardening;Phase21"
-    MPI_PROCS 1
-)
-
-# Test: MoERuntimeTable - graph-facing runtime table and rebalance epoch foundation
-add_executable(v2_unit_moe_runtime_table
-    unit/execution/moe/Test__MoERuntimeTable.cpp
-)
-target_link_libraries(v2_unit_moe_runtime_table
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoERuntimeTable
-    COMMAND $<TARGET_FILE:v2_unit_moe_runtime_table>
-    LABELS "V2;Unit;Execution;MoE;GraphNative;RuntimeTable;Rebalance"
-    MPI_PROCS 1
-)
-
-# Test: MoE Expert Owner Map - graph-native whole-expert ownership for routed tiers
-add_executable(v2_unit_moe_expert_owner_map unit/execution/moe/Test__MoEExpertOwnerMap.cpp)
-target_link_libraries(v2_unit_moe_expert_owner_map
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEExpertOwnerMap_DisjointAcceleratorParticipants
-    COMMAND $<TARGET_FILE:v2_unit_moe_expert_owner_map>
-    LABELS "V2;Unit;Execution;MoE;GraphNative;ExpertParallel;OwnerMap"
-    MPI_PROCS 1
-)
-
-add_executable(v2_unit_moe_overlay_collective_workspace unit/execution/moe/Test__MoEOverlayCollectiveWorkspace.cpp)
-target_include_directories(v2_unit_moe_overlay_collective_workspace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_unit_moe_overlay_collective_workspace
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEOverlayCollectiveWorkspace
-    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_collective_workspace>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;Sparse;Workspace"
-    MPI_PROCS 1
-)
-
-# Test: MoEGraphRoleRunner scalar-only API contract and participant identity keying
-add_executable(v2_unit_moe_graph_role_runner_no_tensor_payload_api
-    unit/execution/moe/Test__MoEGraphRoleRunner_NoTensorPayloadAPI.cpp
-)
-target_include_directories(v2_unit_moe_graph_role_runner_no_tensor_payload_api PRIVATE
+target_include_directories(v2_unit_moe_overlay_domain_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(v2_unit_moe_graph_role_runner_no_tensor_payload_api
+target_link_libraries(v2_unit_moe_overlay_domain_runtime
     llaminar2_core
     GTest::gtest
-    GTest::gtest_main
+    MPI::MPI_CXX
 )
-add_v2_test(V2_Unit_MoEGraphRoleRunner_NoTensorPayloadAPI
-    COMMAND $<TARGET_FILE:v2_unit_moe_graph_role_runner_no_tensor_payload_api>
-    LABELS "V2;Unit;Execution;MoE;GraphNative;Overlay;ScalarControl"
-    MPI_PROCS 1
-)
-
-add_executable(v2_unit_moe_graph_native_forbidden_dependency_scan
-    unit/execution/moe/Test__MoEGraphNative_ForbiddenDependencyScan.cpp
-)
-target_include_directories(v2_unit_moe_graph_native_forbidden_dependency_scan PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_unit_moe_graph_native_forbidden_dependency_scan
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEGraphNative_ForbiddenDependencyScan
-    COMMAND $<TARGET_FILE:v2_unit_moe_graph_native_forbidden_dependency_scan>
-    LABELS "V2;Unit;Execution;MoE;GraphNative;Overlay;Guard"
-    MPI_PROCS 1
-)
-
-add_executable(v2_unit_moe_overlay_legacy_runtime_quarantined
-    unit/execution/moe/Test__MoEOverlayLegacyRuntimeQuarantined.cpp
-)
-target_include_directories(v2_unit_moe_overlay_legacy_runtime_quarantined PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_unit_moe_overlay_legacy_runtime_quarantined
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEOverlayLegacyRuntimeQuarantined
-    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_legacy_runtime_quarantined>
-    LABELS "V2;Unit;Execution;MoE;GraphNative;Overlay;Guard;Legacy"
-    MPI_PROCS 1
-)
-
-add_executable(v2_unit_moe_overlay_no_cpu_fallback_sidecar
-    unit/execution/moe/Test__MoEOverlayNoCPUFallbackSidecar.cpp
-)
-target_include_directories(v2_unit_moe_overlay_no_cpu_fallback_sidecar PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_unit_moe_overlay_no_cpu_fallback_sidecar
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEOverlayNoCPUFallbackSidecar
-    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_no_cpu_fallback_sidecar>
-    LABELS "V2;Unit;Execution;MoE;GraphNative;Overlay;CPUFallback;Guard"
+add_v2_test(V2_Unit_MoEOverlayDomainRuntime
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_domain_runtime>
+    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;Runtime;Dispatch"
     MPI_PROCS 1
 )
 
@@ -4288,29 +4124,6 @@ add_v2_test(V2_Perf_HostBackendCrossVendorCopy
     MPI_PROCS 1
 )
 
-# MoE Graph-Native Overlay Benchmark Harness Validator
-# =============================================================================
-add_executable(v2_perf_moe_graph_native_overlay performance/moe/Perf__MoEGraphNativeOverlayHarness.cpp)
-target_include_directories(v2_perf_moe_graph_native_overlay PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_perf_moe_graph_native_overlay llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Perf_MoEGraphNativeOverlay
-    COMMAND $<TARGET_FILE:v2_perf_moe_graph_native_overlay>
-    LABELS "V2;Performance;MoE;GraphNative;Overlay;Benchmark;Release"
-    MPI_PROCS 1
-)
-
-# MoE Graph-Native Overlay Benchmark Analysis Validator
-# =============================================================================
-add_executable(v2_perf_moe_graph_native_overlay_analysis performance/moe/Perf__MoEGraphNativeOverlayAnalysis.cpp)
-target_link_libraries(v2_perf_moe_graph_native_overlay_analysis GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Perf_MoEGraphNativeOverlayAnalysis
-    COMMAND $<TARGET_FILE:v2_perf_moe_graph_native_overlay_analysis>
-    LABELS "V2;Performance;MoE;GraphNative;Overlay;Benchmark;Analysis;Release"
-    MPI_PROCS 1
-)
-
 # CUDA Event Synchronization Tests
 # =============================================================================
 # Tests for CUDA event-based synchronization in the backend.
@@ -5120,109 +4933,6 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3.5 MoE NodeLocalTP parity tests enabled (requires mpirun -np 2+)")
 
-    # ---- Graph-Native MoE Parity: rocm_hot / cpu_cold two-tier overlay ----
-    #
-    # Phase 15: Production-path PyTorch parity gate for the graph-native MoE overlay
-    # with:
-    #   rocm_hot  — single ROCm device (rocm:0), world rank 0, ReplicatedExperts
-    #               (continuation domain + shared expert domain)
-    #   cpu_cold  — single CPU, world rank 1, ReplicatedExperts, fallback=true
-    #
-    # Key differences from legacy ExpertOverlay tests:
-    #   - Both domains use ReplicatedExperts (not TensorParallelExperts)
-    #   - LLAMINAR_MOE_LEGACY_OVERLAY_DOMAIN_RUNTIME must NOT be set
-    #   - Parity bodies are not unconditionally skipped; they gate on hardware/model
-    #   - Phase 14 profiler: verifies cpu_fallback_rows > 0 when LLAMINAR_PROFILING=1
-    #
-    # REQUIRES: mpirun -np 2 (rank 0 = rocm_hot owner, rank 1 = cpu_cold participant)
-    # Hardware/model: SKIP when ROCm unavailable or model absent; non-skipping on
-    #                 production hardware lane.
-    add_executable(v2_integration_parity_qwen35moe_graph_native_rocmhot_cpucold
-        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_RocmHotCpuCold_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen35moe_graph_native_rocmhot_cpucold
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen35moe_graph_native_rocmhot_cpucold PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graph_native_rocmhot_cpucold
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_GraphNative_RocmHotCpuCold
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CPU;ReplicatedExperts;PyTorch;FullModel"
-        MPI_PROCS 2
-        TIMEOUT 600
-    )
-    message(STATUS "V2: Qwen3.5 MoE GraphNative RocmHot/CpuCold parity tests enabled (requires mpirun -np 2, ROCm device, 35B model)")
-
-    # ---- Graph-Native MoE Parity: cuda_hot / rocm_warm all-GPU overlay ----
-    #
-    # Phase 16: Production-path PyTorch parity gate for the graph-native MoE overlay
-    # with:
-    #   cuda_hot   — single CUDA device (cuda:0), world rank 0, ReplicatedExperts
-    #                (continuation domain + shared expert domain)
-    #   rocm_warm  — single ROCm device (rocm:0), world rank 1, ReplicatedExperts
-    #
-    # No routed tier has fallback=true and no CPU expert participant is expected.
-    #
-    # REQUIRES: mpirun -np 2 (rank 0 = cuda_hot owner, rank 1 = rocm_warm participant)
-    # Hardware/model: SKIP when CUDA/ROCm unavailable or model absent; non-skipping on
-    #                 production hardware lane.
-    add_executable(v2_integration_parity_qwen35moe_graph_native_cudahot_rocmwarm
-        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarm_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen35moe_graph_native_cudahot_rocmwarm
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen35moe_graph_native_cudahot_rocmwarm PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graph_native_cudahot_rocmwarm
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_GraphNative_CudaHotRocmWarm
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;MixtureOfExperts;MPI;CUDA;ROCm;ReplicatedExperts;PyTorch;FullModel"
-        MPI_PROCS 2
-        TIMEOUT 600
-    )
-    message(STATUS "V2: Qwen3.5 MoE GraphNative CudaHot/RocmWarm parity tests enabled (requires mpirun -np 2, CUDA+ROCm devices, 35B model)")
-
-    # ---- Graph-Native MoE Parity: cuda_hot / rocm_warm / cpu_cold mixed overlay ----
-    #
-    # Phase 17: Production-path PyTorch parity gate for the graph-native MoE overlay
-    # with CUDA hot experts, ROCm warm experts, and CPU cold fallback experts.
-    #
-    # REQUIRES: mpirun -np 3 (rank 0 = cuda_hot owner, rank 1 = rocm_warm
-    # participant, rank 2 = cpu_cold fallback participant).
-    add_executable(v2_integration_parity_qwen35moe_graph_native_cudahot_rocmwarm_cpucold
-        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
-    )
-    target_link_libraries(v2_integration_parity_qwen35moe_graph_native_cudahot_rocmwarm_cpucold
-        llaminar2_core
-        v2_test_utils
-        GTest::gtest
-        ZLIB::ZLIB
-    )
-    target_include_directories(v2_integration_parity_qwen35moe_graph_native_cudahot_rocmwarm_cpucold PRIVATE
-        ${WORKSPACE_ROOT_PARITY}/external/cnpy
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graph_native_cudahot_rocmwarm_cpucold
-        TEST_PREFIX V2_Integration_Parity_Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;MixtureOfExperts;MPI;CUDA;ROCm;CPU;ReplicatedExperts;PyTorch;FullModel"
-        MPI_PROCS 3
-        TIMEOUT 600
-    )
-    message(STATUS "V2: Qwen3.5 MoE GraphNative CudaHot/RocmWarm/CpuCold parity tests enabled (requires mpirun -np 3, CUDA+ROCm devices, 35B model)")
-
     # =========================================================================
     # Test: Qwen2 NodeLocalTP Parity (Multi-Socket CPU TP)
     #
@@ -5297,44 +5007,6 @@ target_link_libraries(v2_test_moe_expert_dispatch_stage llaminar2_core GTest::gt
 add_v2_test(V2_Unit_MoEExpertDispatchStage
     COMMAND $<TARGET_FILE:v2_test_moe_expert_dispatch_stage>
     LABELS "V2;Unit;Execution;ComputeStage;MoE;ExpertParallel;Dispatch"
-    MPI_PROCS 1
-)
-
-add_executable(v2_unit_moe_local_expert_stage_params unit/execution/compute_stages/Test__MoELocalExpertStage_Params.cpp)
-target_include_directories(v2_unit_moe_local_expert_stage_params PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_unit_moe_local_expert_stage_params llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MoELocalExpertStage_Params
-    COMMAND $<TARGET_FILE:v2_unit_moe_local_expert_stage_params>
-    LABELS "V2;Unit;Execution;ComputeStage;MoE;GraphNative;Overlay;Params"
-    MPI_PROCS 1
-)
-
-# Test: MoELocalExpertStage validatePreparedWeights (Phase 12)
-add_executable(v2_unit_moe_local_expert_stage_prepared_weights
-    unit/execution/compute_stages/Test__MoELocalExpertStage_PreparedWeights.cpp
-)
-target_include_directories(v2_unit_moe_local_expert_stage_prepared_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_unit_moe_local_expert_stage_prepared_weights llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MoELocalExpertStage_PreparedWeights
-    COMMAND $<TARGET_FILE:v2_unit_moe_local_expert_stage_prepared_weights>
-    LABELS "V2;Unit;Execution;ComputeStage;MoE;GraphNative;PreparedWeights"
-    MPI_PROCS 1
-)
-
-# Test: MoEGraphNative PreparedExpertWeights MVP (Phase 12 integration)
-add_executable(v2_integration_moe_graph_native_prepared_expert_weights_mvp
-    integration/moe/Test__MoEGraphNative_PreparedExpertWeights_MVP.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_prepared_expert_weights_mvp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(v2_integration_moe_graph_native_prepared_expert_weights_mvp
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEGraphNative_PreparedExpertWeights_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_prepared_expert_weights_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;PreparedWeights;CPU"
     MPI_PROCS 1
 )
 
@@ -5634,6 +5306,15 @@ target_link_libraries(v2_test_orchestration_config_parser llaminar2_core GTest::
 add_v2_test(V2_Unit_OrchestrationConfigParser
     COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
     LABELS "V2;Unit;Config;CLI;YAML;Orchestration;Heterogeneous"
+    MPI_PROCS 1
+)
+
+# Test: MoE expert overlay parser config (Phase 2 same-layer expert overlay surface)
+add_executable(v2_test_moe_expert_overlay_config unit/config/Test__MoEExpertOverlayConfig.cpp)
+target_link_libraries(v2_test_moe_expert_overlay_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MoEExpertOverlayConfig
+    COMMAND $<TARGET_FILE:v2_test_moe_expert_overlay_config>
+    LABELS "V2;Unit;Config;CLI;YAML;MoE;ExpertOverlay"
     MPI_PROCS 1
 )
 
@@ -8892,272 +8573,71 @@ if(HAVE_ROCM)
     message(STATUS "V2 Tests: Added ROCm MoE kernel integration tests")
 endif()
 
-add_executable(v2_integration_moe_graph_role_runner_noop_mpi
-    integration/moe/Test__MoEGraphRoleRunner_NoOpMPI.cpp
+# =============================================================================
+# MoE Expert Overlay CPU Fallback MPI Integration Tests
+# =============================================================================
+add_executable(v2_integration_moe_expert_overlay_cpu_fallback_mpi
+    integration/moe/Test__MoEExpertOverlay_CPUFallback_MPI.cpp
     integration/mpi_gtest_main.cpp
 )
-target_include_directories(v2_integration_moe_graph_role_runner_noop_mpi PRIVATE
+target_include_directories(v2_integration_moe_expert_overlay_cpu_fallback_mpi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(v2_integration_moe_graph_role_runner_noop_mpi
+target_link_libraries(v2_integration_moe_expert_overlay_cpu_fallback_mpi
     llaminar2_core
     GTest::gtest
     MPI::MPI_CXX
 )
-add_v2_test(V2_Integration_MoEGraphRoleRunner_NoOpMPI
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_role_runner_noop_mpi>
-    LABELS "V2;Integration;MoE;GraphNative;Overlay;NoOp;MPI"
-    MPI_PROCS 2
+add_v2_test(V2_Integration_MoEExpertOverlay_CPUFallback_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_cpu_fallback_mpi>
+    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;CPUFallback;NodeLocalTP;MPI"
+    MPI_PROCS 3
 )
-
-add_executable(v2_integration_moe_overlay_sparse_transport_mpi
-    integration/moe/Test__MoEOverlaySparseTransport_MPI.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_integration_moe_overlay_sparse_transport_mpi PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_overlay_sparse_transport_mpi
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEOverlaySparseTransport_MPI
-    COMMAND $<TARGET_FILE:v2_integration_moe_overlay_sparse_transport_mpi>
-    LABELS "V2;Integration;MoE;GraphNative;Overlay;SparseTransport;MPI"
-    MPI_PROCS 2
-)
-
-add_executable(v2_integration_moe_graph_native_abort_propagation
-    integration/moe/Test__MoEGraphNative_AbortPropagation.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_abort_propagation PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_abort_propagation
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEGraphNativeAbortPropagation
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_abort_propagation>
-    LABELS "V2;Integration;MoE;GraphNative;Overlay;SparseTransport;Abort;MPI;Phase21"
-    MPI_PROCS 2
-)
-
-add_executable(v2_integration_moe_graph_native_transfer_counters
-    integration/moe/Test__MoEGraphNative_TransferCounters.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_transfer_counters PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_transfer_counters
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_MoEGraphNative_TransferCounters
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_transfer_counters>
-    LABELS "V2;Integration;MoE;GraphNative;Overlay;SparseDispatch;TransferCounters"
-    MPI_PROCS 1
-)
-
-add_executable(v2_integration_moe_graph_native_cpuonly_mvp
-    integration/moe/Test__MoEGraphNative_CPUOnly_MVP.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_cpuonly_mvp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_cpuonly_mvp
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEGraphNative_CPUOnly_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_cpuonly_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;Overlay;SparseDispatch;CPUOnly;MPI"
-    MPI_PROCS 2
-)
-
-add_executable(v2_integration_moe_graph_native_cpu_cold_mpi
-    integration/moe/Test__MoEGraphNative_CPUCold_MPI.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_cpu_cold_mpi PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_cpu_cold_mpi
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEGraphNative_CPUCold_MPI
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_cpu_cold_mpi>
-    LABELS "V2;Integration;MoE;GraphNative;Overlay;SparseDispatch;CPUCold;MPI"
+add_v2_test(V2_Integration_MoEExpertOverlay_SparseTransfer_CPUFallback_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_cpu_fallback_mpi> --gtest_filter="Test__MoEExpertOverlay_CPUFallback_MPI.SparseTransferSendsOnlyFallbackRowsAndMatchesMaskedReference"
+    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;CPUFallback;NodeLocalTP;MPI;SparseTransfer"
     MPI_PROCS 3
 )
 
-add_executable(v2_integration_moe_graph_native_rocm_hot_cpu_cold_mvp
-    integration/moe/Test__MoEGraphNative_RocmHotCpuCold_MVP.cpp
+# Phase 7: correctness-first CPU TensorParallelExperts fallback for routed expert overlay.
+add_executable(v2_integration_moe_expert_overlay_cpu_tensor_parallel_experts_mpi
+    integration/moe/Test__MoEExpertOverlay_CPUTensorParallelExperts_MPI.cpp
     integration/mpi_gtest_main.cpp
 )
-target_include_directories(v2_integration_moe_graph_native_rocm_hot_cpu_cold_mvp PRIVATE
+target_include_directories(v2_integration_moe_expert_overlay_cpu_tensor_parallel_experts_mpi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(v2_integration_moe_graph_native_rocm_hot_cpu_cold_mvp
+target_link_libraries(v2_integration_moe_expert_overlay_cpu_tensor_parallel_experts_mpi
     llaminar2_core
     GTest::gtest
     MPI::MPI_CXX
 )
-add_v2_test(V2_Integration_MoEGraphNative_RocmHotCpuCold_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_rocm_hot_cpu_cold_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;ExpertParallel;ROCm;CPU;MPI;MVP"
-    MPI_PROCS 2
+add_v2_test(V2_Integration_MoEExpertOverlay_CPUTensorParallelExperts_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_cpu_tensor_parallel_experts_mpi>
+    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;CPUFallback;NodeLocalTP;TensorParallelExperts;MPI"
+    MPI_PROCS 3
 )
 
-add_executable(v2_integration_moe_graph_native_gpuonly_tiers_mvp
-    integration/moe/Test__MoEGraphNative_GPUOnlyTiers_MVP.cpp
+# Phase 8: model-light CUDA + ROCm + CPU tier overlay and dense cross-domain reduce.
+add_executable(v2_integration_moe_expert_overlay_multi_accelerator_tiers
+    integration/moe/Test__MoEExpertOverlay_MultiAcceleratorTiers.cpp
 )
-target_include_directories(v2_integration_moe_graph_native_gpuonly_tiers_mvp PRIVATE
+target_include_directories(v2_integration_moe_expert_overlay_multi_accelerator_tiers PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-target_link_libraries(v2_integration_moe_graph_native_gpuonly_tiers_mvp
+target_link_libraries(v2_integration_moe_expert_overlay_multi_accelerator_tiers
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-add_v2_test(V2_Integration_MoEGraphNative_GPUOnlyTiers_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_gpuonly_tiers_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;RoutedTiers;GPUOnly;MVP"
+add_v2_test(V2_Integration_MoEExpertOverlay_MultiAcceleratorTiers
+    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_multi_accelerator_tiers>
+    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;MultiAccelerator;DenseReduce;CUDA;ROCm;CPU"
     MPI_PROCS 1
 )
-
-add_executable(v2_integration_moe_graph_native_mixed_cuda_rocm_cpu_tiers_mvp
-    integration/moe/Test__MoEGraphNative_MixedCudaRocmCpuTiers_MVP.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_mixed_cuda_rocm_cpu_tiers_mvp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_mixed_cuda_rocm_cpu_tiers_mvp
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_MoEGraphNative_MixedCudaRocmCpuTiers_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_mixed_cuda_rocm_cpu_tiers_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;RoutedTiers;CUDA;ROCm;CPU;MVP"
-    MPI_PROCS 1
-)
-
-add_executable(v2_integration_moe_graph_native_localtp_continuation_rocm_hot_cpu_cold_mvp
-    integration/moe/Test__MoEGraphNative_LocalTPContinuation_RocmHotCpuCold_MVP.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_localtp_continuation_rocm_hot_cpu_cold_mvp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_localtp_continuation_rocm_hot_cpu_cold_mvp
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_MoEGraphNative_LocalTPContinuation_RocmHotCpuCold_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_localtp_continuation_rocm_hot_cpu_cold_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;Continuation;LocalTP;ROCm;CPU;MVP"
-    MPI_PROCS 1
-)
-
-add_executable(v2_integration_moe_graph_native_globaltp_continuation_cpu_cold_mvp
-    integration/moe/Test__MoEGraphNative_GlobalTPContinuation_CPUCold_MVP.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_globaltp_continuation_cpu_cold_mvp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_globaltp_continuation_cpu_cold_mvp
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEGraphNative_GlobalTPContinuation_CPUCold_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_globaltp_continuation_cpu_cold_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;Continuation;GlobalTP;CPUCold;MPI;MVP"
-    MPI_PROCS 2
-)
-
-add_executable(v2_integration_moe_graph_native_production_config_smoke
-    integration/moe/Test__MoEGraphNative_ProductionConfigSmoke.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_production_config_smoke PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_production_config_smoke
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_MoEGraphNative_ProductionConfigSmoke
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_production_config_smoke>
-    LABELS "V2;Integration;MoE;GraphNative;Production;Configuration;Smoke"
-    MPI_PROCS 1
-)
-
-# Test: MoEGraphNative RebalancedOwnerMap MVP — Phase 13 integration
-add_executable(v2_integration_moe_graph_native_rebalanced_owner_map_mvp
-    integration/moe/Test__MoEGraphNative_RebalancedOwnerMap_MVP.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_rebalanced_owner_map_mvp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_rebalanced_owner_map_mvp
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEGraphNative_RebalancedOwnerMap_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_rebalanced_owner_map_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;Rebalancer;OwnerMap;Phase13;MVP"
-    MPI_PROCS 1
-)
-
-# Test: MoEGraphNative ProfilingMetrics MVP — Phase 14 integration
-add_executable(v2_integration_moe_graph_native_profiling_metrics_mvp
-    integration/moe/Test__MoEGraphNative_ProfilingMetrics_MVP.cpp
-)
-target_include_directories(v2_integration_moe_graph_native_profiling_metrics_mvp PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_graph_native_profiling_metrics_mvp
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_MoEGraphNative_ProfilingMetrics_MVP
-    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_profiling_metrics_mvp>
-    LABELS "V2;Integration;MoE;GraphNative;Profiling;Phase14;MVP"
-    MPI_PROCS 1
-)
-
-add_executable(v2_integration_moe_continuation_config
-    integration/moe/Test__MoEContinuationConfig.cpp
-)
-target_include_directories(v2_integration_moe_continuation_config PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_continuation_config
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_MoEContinuationLocalTPConfig
-    COMMAND $<TARGET_FILE:v2_integration_moe_continuation_config> --gtest_filter="Test__MoEContinuationConfig.LocalTPContinuationStillRejectsRoutedTensorParallelExpertsByDefault"
-    LABELS "V2;Integration;MoE;Continuation;LocalTP;Configuration"
-    MPI_PROCS 1
-)
-add_v2_test(V2_Integration_MoEContinuationGlobalTPConfig
-    COMMAND $<TARGET_FILE:v2_integration_moe_continuation_config> --gtest_filter="Test__MoEContinuationConfig.GlobalTPContinuationStillRejectsRoutedTensorParallelExpertsByDefault"
-    LABELS "V2;Integration;MoE;Continuation;GlobalTP;Configuration"
+add_v2_test(V2_Integration_MoEExpertOverlay_SparseTransfer
+    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_multi_accelerator_tiers> --gtest_filter="Test__MoEExpertOverlay_MultiAcceleratorTiers.SparsePrefillTransferVolumeScalesWithRoutedRowsAndScatterAddsReturn:Test__MoEExpertOverlay_MultiAcceleratorTiers.DenseTransferCompatibilityModeKeepsFullSequenceVolume:Test__MoEExpertOverlay_MultiAcceleratorTiers.DecodeFallbackTransferUsesOneHiddenRowAndTopKMetadata"
+    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;MultiAccelerator;DenseReduce;SparseTransfer;CUDA;ROCm;CPU"
     MPI_PROCS 1
 )
 
@@ -10495,18 +9975,19 @@ add_v2_test(V2_Unit_Qwen35MoEGraph
     MPI_PROCS 1
 )
 
-add_executable(v2_unit_qwen35moe_graph_native_production_lowering unit/models/qwen35moe/Test__Qwen35MoEGraphNativeProductionLowering.cpp)
-target_link_libraries(v2_unit_qwen35moe_graph_native_production_lowering
+# Test: Qwen35MoEExpertOverlayGraph — model-light expert overlay graph path
+add_executable(v2_test_qwen35moe_expert_overlay_graph unit/models/qwen35moe/Test__Qwen35MoEExpertOverlayGraph.cpp)
+target_link_libraries(v2_test_qwen35moe_expert_overlay_graph
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
 )
-target_include_directories(v2_unit_qwen35moe_graph_native_production_lowering PRIVATE
+target_include_directories(v2_test_qwen35moe_expert_overlay_graph PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
-add_v2_test(V2_Unit_Qwen35MoEGraphNativeProductionLowering
-    COMMAND $<TARGET_FILE:v2_unit_qwen35moe_graph_native_production_lowering>
-    LABELS "V2;Unit;Qwen35MoE;GraphNative;Production;MixtureOfExperts;Overlay"
+add_v2_test(V2_Unit_Qwen35MoEExpertOverlayGraph
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_expert_overlay_graph>
+    LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;ExpertParallel;Overlay"
     MPI_PROCS 1
 )
 

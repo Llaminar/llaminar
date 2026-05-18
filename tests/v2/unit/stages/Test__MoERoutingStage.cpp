@@ -270,7 +270,7 @@ TEST_F(MoERoutingStageTest, GraphCapturableRejectsCPUAndPrefill)
     EXPECT_FALSE(prefill_stage.isGraphCapturable());
 }
 
-TEST_F(MoERoutingStageTest, GraphCapturableRejectsHistogramDependency)
+TEST_F(MoERoutingStageTest, GraphCapturableRejectsHistogramWithoutRuntimeTable)
 {
     ScopedRocmMoEFlags flags(true, true);
 
@@ -299,6 +299,49 @@ TEST_F(MoERoutingStageTest, GraphCapturableRejectsHistogramDependency)
 
     MoERoutingStage stage(params);
     EXPECT_FALSE(stage.isGraphCapturable());
+}
+
+TEST_F(MoERoutingStageTest, GraphCapturableAllowsHistogramWithInitializedRuntimeTable)
+{
+    ScopedRocmMoEFlags flags(true, true);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto gate_weights = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
+    auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    DecodeExpertHistogramConfig histogram_config;
+    histogram_config.num_layers = 1;
+    histogram_config.num_experts = NUM_EXPERTS;
+    histogram_config.top_k = TOP_K;
+    DecodeExpertHistogram histogram(histogram_config);
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.input = input.get();
+    params.gate_weights = gate_weights.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.layer_idx = 0;
+    params.decode_histogram = &histogram;
+    params.moe_runtime_table = &runtime_table;
+
+    MoERoutingStage stage(params);
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.isGraphCapturable());
+    EXPECT_TRUE(stage.needsOnGraphReplayed());
+#else
+    EXPECT_FALSE(stage.isGraphCapturable());
+    EXPECT_FALSE(stage.needsOnGraphReplayed());
+#endif
 }
 
 TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsReleaseOnlyGuardAndFlags)
@@ -337,11 +380,11 @@ TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsReleaseOnlyGuardAndFl
         params.moe_runtime_table = &runtime_table;
 
         MoERoutingStage runtime_stage(params);
-    #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
         EXPECT_TRUE(runtime_stage.isGraphCapturable());
-    #else
+#else
         EXPECT_FALSE(runtime_stage.isGraphCapturable());
-    #endif
+#endif
     }
 }
 

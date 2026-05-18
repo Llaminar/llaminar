@@ -94,7 +94,7 @@ namespace llaminar2
 
                 if (needs_init)
                 {
-                    LOG_INFO("[packNativeVNNI] Initializing IQ grid LUT tables on device "
+                    LOG_DEBUG("[packNativeVNNI] Initializing IQ grid LUT tables on device "
                              << current_device);
                     if (!rocmInitIQGridTables(
                             current_device,
@@ -533,7 +533,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[packMoEExpertsROCm] Packed " << num_experts << " experts ("
+        LOG_DEBUG("[packMoEExpertsROCm] Packed " << num_experts << " experts ("
                  << rows_per_expert << "x" << K << " each), total slab "
                  << (batch->all_native_vnni.size() / (1024 * 1024)) << " MB vnni + "
                  << (batch->all_native_scales.size() * 2 / (1024 * 1024)) << " MB scales");

@@ -248,7 +248,7 @@ namespace llaminar2
             return false;
         }
 
-        LOG_INFO("[NCCLReady] status=probing"
+        LOG_DEBUG("[NCCLReady] status=probing"
                  << " requested_group_size=" << group.size()
                  << " local_rank=" << group.local_rank
                  << " visible_cuda_devices=" << cuda_device_count);
@@ -321,7 +321,7 @@ namespace llaminar2
             num_ranks_ = mpi_ctx_->world_size();
             local_rank_ = mpi_ctx_->rank();
 
-            LOG_INFO("NCCLBackend: Initialized multi-process communicator with "
+            LOG_DEBUG("NCCLBackend: Initialized multi-process communicator with "
                      << num_ranks_ << " ranks, local_rank=" << local_rank_
                      << ", device=" << local_device.ordinal);
         }
@@ -340,7 +340,7 @@ namespace llaminar2
                 return false;
             }
             comm_ = comm_ptr;
-            LOG_INFO("NCCLBackend: Initialized single-GPU communicator");
+            LOG_DEBUG("NCCLBackend: Initialized single-GPU communicator");
         }
         else
         {
@@ -371,7 +371,7 @@ namespace llaminar2
                 return false;
             }
 
-            LOG_INFO("NCCLBackend: Initialized multi-GPU single-process (via NCCLCoordinator) with "
+            LOG_DEBUG("NCCLBackend: Initialized multi-GPU single-process (via NCCLCoordinator) with "
                      << num_ranks_ << " GPU(s), local_rank=" << local_rank_);
         }
 
@@ -384,7 +384,7 @@ namespace llaminar2
         }
 
         initialized_ = true;
-        LOG_INFO("[NCCLReady] status=ready"
+        LOG_DEBUG("[NCCLReady] status=ready"
                  << " mode=" << (is_multi_gpu_single_process_ ? "multi_gpu_single_process" : (is_multi_process ? "multi_process" : "single_gpu"))
                  << " num_ranks=" << num_ranks_
                  << " local_rank=" << local_rank_);
@@ -1939,7 +1939,7 @@ namespace llaminar2
         }
 
         copy_comms_initialized_ = true;
-        LOG_INFO("[NCCLBackend] All-GPU copy communicator initialized with " << device_count << " devices");
+        LOG_DEBUG("[NCCLBackend] All-GPU copy communicator initialized with " << device_count << " devices");
         return true;
     }
 

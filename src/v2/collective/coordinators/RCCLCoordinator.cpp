@@ -260,7 +260,7 @@ namespace llaminar2
         }
 
         initialized_.store(true);
-        LOG_INFO("[RCCLCoordinator] Initialized with " << num_devices_ << " ROCm GPU(s)");
+        LOG_DEBUG("[RCCLCoordinator] Initialized with " << num_devices_ << " ROCm GPU(s)");
         return true;
 #else
         last_error_ = "RCCL not available (HAVE_RCCL not defined)";
@@ -292,7 +292,7 @@ namespace llaminar2
         }
 
         initialized_.store(false);
-        LOG_INFO("[RCCLCoordinator] Shutdown complete");
+        LOG_DEBUG("[RCCLCoordinator] Shutdown complete");
     }
 
     void RCCLCoordinator::abortCommunicators()
@@ -424,13 +424,13 @@ namespace llaminar2
             compute_events_[i] = static_cast<void *>(ev);
         }
 
-        LOG_INFO("[RCCLCoordinator] Compute streams registered for " << num_devices_
+        LOG_DEBUG("[RCCLCoordinator] Compute streams registered for " << num_devices_
                                                                      << " devices — using stream-level pre-sync");
         if (debugEnv().tp_collective_contract_trace)
         {
             for (int i = 0; i < num_devices_; ++i)
             {
-                LOG_INFO("[TP_COLLECTIVE_CONTEXT] event=rccl_compute_stream"
+                LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=rccl_compute_stream"
                          << " coordinator=" << static_cast<const void *>(this)
                          << " slot=" << i
                          << " ordinal=" << device_ordinals_[i]
@@ -1096,7 +1096,7 @@ namespace llaminar2
         //    ordering (prior compute → allreduce → subsequent compute).
         if (debugEnv().tp_collective_contract_trace)
         {
-            LOG_INFO("[TP_COLLECTIVE_CONTRACT] event=rccl_onstream_launch"
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_onstream_launch"
                      << " coordinator=" << static_cast<const void *>(this)
                      << " slot=" << device_idx
                      << " ordinal=" << ordinal
@@ -1119,7 +1119,7 @@ namespace llaminar2
 
         if (debugEnv().tp_collective_contract_trace)
         {
-            LOG_INFO("[TP_COLLECTIVE_CONTRACT] event=rccl_onstream_enqueued"
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_onstream_enqueued"
                      << " coordinator=" << static_cast<const void *>(this)
                      << " slot=" << device_idx
                      << " ordinal=" << ordinal

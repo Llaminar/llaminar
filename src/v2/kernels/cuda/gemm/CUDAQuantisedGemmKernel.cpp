@@ -207,7 +207,7 @@ namespace llaminar2
                 }
                 cudaQuantGemm_createEvent(&quant_ready, dev_id);
                 initialized = true;
-                LOG_INFO("[CUDAConcurrentPrefillPool] Initialized " << count
+                LOG_DEBUG("[CUDAConcurrentPrefillPool] Initialized " << count
                                                                     << " streams on device " << dev_id);
             }
 
@@ -504,7 +504,7 @@ namespace llaminar2
                 {
                     static std::once_flag native_vnni_decode_once;
                     std::call_once(native_vnni_decode_once, [&]()
-                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI tuned GEMV decode enabled for supported CUDA codebooks"); });
+                                   { LOG_DEBUG("[CUDAQuantisedGemmKernel] NativeVNNI tuned GEMV decode enabled for supported CUDA codebooks"); });
 
                     // Lazy-create per-device GEMV context (SM count, kpar partials)
                     if (!impl->gemv_ctx)
@@ -536,7 +536,7 @@ namespace llaminar2
                 {
                     static std::once_flag native_vnni_prefill_once;
                     std::call_once(native_vnni_prefill_once, [&]()
-                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel active (codebook " << static_cast<int>(impl->native_codebook_id) << ")"); });
+                                   { LOG_DEBUG("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel active (codebook " << static_cast<int>(impl->native_codebook_id) << ")"); });
 
                     // Lazy-create per-device prefill context (stream-K fixup buffer + SM count)
                     if (!impl->prefill_ctx)
@@ -801,7 +801,7 @@ namespace llaminar2
                     // No Int8Expanded or TC-blocked weights are uploaded.
                     static std::once_flag vnni_only_once;
                     std::call_once(vnni_only_once, [&]()
-                                   { LOG_INFO("[CUDAQuantisedGemmKernel] NativeVNNI-only mode (codebook "
+                                   { LOG_DEBUG("[CUDAQuantisedGemmKernel] NativeVNNI-only mode (codebook "
                                               << static_cast<int>(packed_->native_codebook_id) << ")"); });
 
                     if (!uploadNativePackedWeights(*packed_, upload, cuda_device_id_))
@@ -879,7 +879,7 @@ namespace llaminar2
             // DEBUG: Print first few weight values to verify slicing
             if (N_ == 64 && K_ == 896) // This is the K weight shape for LOCAL TP
             {
-                LOG_INFO("[CUDAQuantisedGemmKernel DEBUG] K weight N=" << N_ << " K=" << K_
+                LOG_DEBUG("[CUDAQuantisedGemmKernel DEBUG] K weight N=" << N_ << " K=" << K_
                                                                        << " device=" << cuda_device_id_
                                                                        << " first 5 weights[0]: " << h_weights_fp32[0] << ", "
                                                                        << h_weights_fp32[1] << ", " << h_weights_fp32[2] << ", "
@@ -1843,7 +1843,7 @@ namespace llaminar2
             {
                 static std::once_flag cublas_gemm_once;
                 std::call_once(cublas_gemm_once, []()
-                               { LOG_INFO("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM path active (Q4_0 native dequant)"); });
+                               { LOG_DEBUG("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM path active (Q4_0 native dequant)"); });
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
                 CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);

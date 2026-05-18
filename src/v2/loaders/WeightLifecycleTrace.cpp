@@ -137,7 +137,7 @@ namespace llaminar2
             out << device << ":" << count;
         }
 
-        LOG_INFO(out.str());
+        LOG_DEBUG(out.str());
     }
 
     std::string toString(WeightLifecycleEventType type)

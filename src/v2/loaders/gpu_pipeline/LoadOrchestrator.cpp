@@ -160,7 +160,7 @@ void LoadOrchestrator::allocate(size_t pinned_slot_size, int num_h2d_streams)
         }
     }
 
-    LOG_INFO("LoadOrchestrator: allocated " << devices_.size() << " device(s)");
+    LOG_DEBUG("LoadOrchestrator: allocated " << devices_.size() << " device(s)");
 }
 
 WeightVRAMPool* LoadOrchestrator::getPool(int device_id)
@@ -264,7 +264,7 @@ void LoadOrchestrator::load()
                                      std::to_string(ctx.device_id));
         }
 
-        LOG_INFO("LoadOrchestrator::load: processing " << ctx.pending_jobs.size()
+        LOG_DEBUG("LoadOrchestrator::load: processing " << ctx.pending_jobs.size()
                  << " weights on device " << ctx.device_id);
 
         if (!pipeline.processJobs(ctx.pending_jobs))

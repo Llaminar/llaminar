@@ -872,7 +872,7 @@ namespace llaminar2
                 auto embd_dims = loader_.getTensorShape("token_embd.weight");
                 if (embd_dims && embd_dims->size() == 2)
                 {
-                    LOG_INFO("[WeightManager] Rank " << rank
+                    LOG_DEBUG("[WeightManager] Rank " << rank
                                                      << " output.weight not in GGUF — using tied embedding "
                                                      << "token_embd.weight as column-parallel LM head");
                     dims_opt = embd_dims;
@@ -1423,7 +1423,7 @@ namespace llaminar2
                                          " failed to load expert slice for: " + name);
             }
 
-            LOG_INFO("[WeightManager] Rank " << rank << " expert-parallel " << name
+            LOG_DEBUG("[WeightManager] Rank " << rank << " expert-parallel " << name
                                              << " [" << ne0 << ", " << ne1 << ", " << ne2
                                              << "] -> loaded ONLY experts [" << expert_start << ", " << expert_end
                                              << ") = " << expert_count << "/" << ne2 << " experts");
@@ -2532,7 +2532,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_INFO("[WeightManager] Pre-loading weights for " << devices.size() << " devices");
+        LOG_DEBUG("[WeightManager] Pre-loading weights for " << devices.size() << " devices");
 
         std::vector<std::string> weight_names;
         bool seeded_from_loader = false;
@@ -2567,7 +2567,7 @@ namespace llaminar2
                 return true;
             }
 
-            LOG_INFO("[WeightManager] Cache empty; seeding preload from model tensor list ("
+            LOG_DEBUG("[WeightManager] Cache empty; seeding preload from model tensor list ("
                      << weight_names.size() << " tensors)");
         }
 
@@ -2668,7 +2668,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[WeightManager] Preload complete: loaded=" << loaded_tensors
+        LOG_DEBUG("[WeightManager] Preload complete: loaded=" << loaded_tensors
                                                              << ", uploads=" << total_uploads
                                                              << ", failures=" << load_failures
                                                              << (seeded_from_loader ? " (seeded from loader names)" : ""));
@@ -2689,7 +2689,7 @@ namespace llaminar2
         DeviceId device,
         bool include_expert_jobs)
     {
-        LOG_INFO("[WeightManager] prepareWeightsForDevice(" << device.to_string()
+        LOG_DEBUG("[WeightManager] prepareWeightsForDevice(" << device.to_string()
                                                             << ", frozen_bindings=" << frozen_weights.bindings().size() << ")");
         if (!lifecycle_gates_.materialization_complete)
             markMaterializationComplete();
@@ -2719,7 +2719,7 @@ namespace llaminar2
 
             if (!lifecycle_gates_.device_preparation_complete)
                 markDevicePreparationComplete();
-            LOG_INFO("[WeightManager] Binding-driven CPU preparation registered "
+            LOG_DEBUG("[WeightManager] Binding-driven CPU preparation registered "
                      << registered << " GEMM bindings for " << device.to_string());
             return true;
         }
@@ -2741,7 +2741,7 @@ namespace llaminar2
             return isWeightInLayerRange(name, first_layer, last_layer, has_embedding, has_lm_head);
         };
 
-        LOG_INFO("[WeightManager] prepareWeightsForDevice(" << device.to_string()
+        LOG_DEBUG("[WeightManager] prepareWeightsForDevice(" << device.to_string()
                                                             << " layers=[" << first_layer << ", " << last_layer << ")"
                                                             << " embed=" << has_embedding << " lm_head=" << has_lm_head << ")");
 
@@ -2764,7 +2764,7 @@ namespace llaminar2
         std::future<bool> gemm_future;
         if (is_gpu)
         {
-            LOG_INFO("[WeightManager] Using GPU weight loading pipeline for " << device_name);
+            LOG_DEBUG("[WeightManager] Using GPU weight loading pipeline for " << device_name);
             gemm_future = std::async(std::launch::async, [this, device, &layer_filter, frozen_weights, include_expert_jobs]()
                                      { return packGemmWeightsViaPipeline(device, layer_filter, frozen_weights, include_expert_jobs); });
         }
@@ -2828,7 +2828,7 @@ namespace llaminar2
         if (is_gpu && ok)
         {
             size_t released = releaseAllHostWeightData();
-            LOG_INFO("[WeightManager] finalizeForDevice(" << device_name
+            LOG_DEBUG("[WeightManager] finalizeForDevice(" << device_name
                                                           << "): released " << released << " host tensors");
         }
 
@@ -2845,7 +2845,7 @@ namespace llaminar2
         }
 
         // Step 1: Clone and upload all weights to all devices
-        LOG_INFO("[WeightManager] finalizeForDevices: pre-loading weights for "
+        LOG_DEBUG("[WeightManager] finalizeForDevices: pre-loading weights for "
                  << devices.size() << " devices");
         if (!preloadForDevices(devices))
         {
@@ -2874,7 +2874,7 @@ namespace llaminar2
 
                 if (dev.is_gpu())
                 {
-                    LOG_INFO("[WeightManager] finalizeForDevices: launching GPU pipeline for "
+                    LOG_DEBUG("[WeightManager] finalizeForDevices: launching GPU pipeline for "
                              << dev.toString());
                     gemm_futures.push_back(std::async(std::launch::async,
                                                       [this, dev]()
@@ -2900,7 +2900,7 @@ namespace llaminar2
                     all_ok = false;
                 }
                 const char *mode = devices[i].is_gpu() ? "GPU pipeline" : "CPU repack";
-                LOG_INFO("[WeightManager] packGemmWeights for " << devices[i].toString()
+                LOG_DEBUG("[WeightManager] packGemmWeights for " << devices[i].toString()
                                                                 << " completed in " << pack_ms << " ms (" << mode << ")");
             }
         }
@@ -2908,7 +2908,7 @@ namespace llaminar2
         const auto gemm_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       std::chrono::high_resolution_clock::now() - gemm_wall_start)
                                       .count();
-        LOG_INFO("[WeightManager] All " << devices.size() << " devices GEMM packed in "
+        LOG_DEBUG("[WeightManager] All " << devices.size() << " devices GEMM packed in "
                                         << gemm_wall_ms << " ms wall-clock"
                                         << (devices.size() > 1 ? " (parallel)" : ""));
 
@@ -2918,12 +2918,12 @@ namespace llaminar2
         if (release_host_data)
         {
             size_t released = releaseAllHostWeightData();
-            LOG_INFO("[WeightManager] finalizeForDevices: released " << released
+            LOG_DEBUG("[WeightManager] finalizeForDevices: released " << released
                                                                      << " host tensors across " << devices.size() << " devices");
         }
         else
         {
-            LOG_INFO("[WeightManager] finalizeForDevices: retaining host weight data "
+            LOG_DEBUG("[WeightManager] finalizeForDevices: retaining host weight data "
                      "(nested TP-in-PP; outer caller will release)");
         }
 
@@ -2944,7 +2944,7 @@ namespace llaminar2
                     if (line.compare(0, 6, "VmRSS:") == 0 ||
                         line.compare(0, 8, "RssAnon:") == 0)
                     {
-                        LOG_INFO("[WeightManager] " << label << " " << line);
+                        LOG_DEBUG("[WeightManager] " << label << " " << line);
                     }
                 }
             };
@@ -3088,7 +3088,7 @@ namespace llaminar2
 
             if (preprocessed_count > 0)
             {
-                LOG_INFO("[WeightManager] Preprocessed " << preprocessed_count << "/" << gemm_weights.size()
+                LOG_DEBUG("[WeightManager] Preprocessed " << preprocessed_count << "/" << gemm_weights.size()
                                                          << " weights in " << preproc_ms << " ms");
             }
         }
@@ -3597,7 +3597,7 @@ namespace llaminar2
             preparation_plan = preparation_plan.filteredForRank(execution_plan->currentRankPlan());
         moe_overlay_preparation_diagnostics_ = preparation_plan.diagnostics();
 
-        LOG_INFO("[WeightManager] " << moe_overlay_preparation_diagnostics_.render());
+        LOG_DEBUG("[WeightManager] " << moe_overlay_preparation_diagnostics_.render());
 
         {
             std::unordered_set<std::string> cpu_owned_parent_names;
@@ -3632,7 +3632,7 @@ namespace llaminar2
                 return preparation_plan.hasAnyRequestForDeviceLayerRole(device, layer_idx, role);
             };
 
-            LOG_INFO("[WeightManager] Preparing MoE overlay experts for " << device.to_string());
+            LOG_DEBUG("[WeightManager] Preparing MoE overlay experts for " << device.to_string());
             const bool device_ok = packGemmWeightsViaPipeline(
                 device,
                 layer_role_filter,
@@ -3787,7 +3787,7 @@ namespace llaminar2
                             // models on the same binding-first path as untied models.
                             gemm_weights.push_back(DenseGemmJob{"output.weight", embed_tensor.get(), embed_tensor, std::nullopt});
                             collected_names.insert("output.weight");
-                            LOG_INFO("[WeightManager] GPU pipeline: including tied token_embd.weight as canonical output.weight LM head GEMM");
+                            LOG_DEBUG("[WeightManager] GPU pipeline: including tied token_embd.weight as canonical output.weight LM head GEMM");
                         }
                     }
                 }
@@ -3964,7 +3964,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_INFO("[WeightManager] GPU pipeline: loading " << gemm_weights.size()
+        LOG_DEBUG("[WeightManager] GPU pipeline: loading " << gemm_weights.size()
                                                           << " GEMM weights + " << moe_jobs.size()
                                                           << " MoE expert slots for " << target_device.to_string());
 
@@ -4172,7 +4172,7 @@ namespace llaminar2
                 }
             }
 
-            LOG_INFO("[WeightManager] GPU pipeline: planned " << planned_count
+            LOG_DEBUG("[WeightManager] GPU pipeline: planned " << planned_count
                                                               << " weights for " << target_device.to_string()
                                                               << " with no host-backed raw bytes; adopted_dense=" << adopted_dense
                                                               << " missing_dense=" << missing_dense
@@ -4715,12 +4715,12 @@ namespace llaminar2
 
         if (moe_registered > 0)
         {
-            LOG_INFO("[WeightManager] GPU pipeline: registered " << moe_registered
+            LOG_DEBUG("[WeightManager] GPU pipeline: registered " << moe_registered
                                                                  << " MoE expert GEMM kernels in ExpertGemmRegistry");
         }
 
         const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-        LOG_INFO("[WeightManager] GPU pipeline: loaded " << registered << "/" << gemm_weights.size()
+        LOG_DEBUG("[WeightManager] GPU pipeline: loaded " << registered << "/" << gemm_weights.size()
                                                          << " dense + " << moe_registered << "/" << moe_jobs.size()
                                                          << " MoE expert weights in " << std::fixed << std::setprecision(1) << elapsed << " ms");
 
@@ -4854,7 +4854,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[WeightManager] Uploaded " << uploaded_count << " non-GEMM weights to "
+        LOG_DEBUG("[WeightManager] Uploaded " << uploaded_count << " non-GEMM weights to "
                                              << target_device.to_string());
         return true;
     }
@@ -4867,7 +4867,7 @@ namespace llaminar2
         // after all graphs have resolved their prepared weight bindings.
         if (!lifecycle_gates_.canReleaseHostData())
         {
-            LOG_INFO("[WeightManager] releaseAllHostWeightData() blocked by lifecycle gate "
+            LOG_DEBUG("[WeightManager] releaseAllHostWeightData() blocked by lifecycle gate "
                      "(state="
                      << toString(lifecycle_gates_.currentState())
                      << "). Host data retained until all gates complete.");
@@ -5006,7 +5006,7 @@ namespace llaminar2
             try_release(tensor.get(), key);
         }
 
-        LOG_INFO("[WeightManager] Released host weight data: " << released_count
+        LOG_DEBUG("[WeightManager] Released host weight data: " << released_count
                                                                << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) released, "
                                                                << retained_count << " tensors (" << (retained_bytes / (1024 * 1024)) << " MB) retained, "
                                                                << skipped_count << " already released, " << error_count << " errors"
@@ -5043,7 +5043,7 @@ namespace llaminar2
             ptr->release_host_weight_data();
             released_bytes += tensor_bytes;
             released_count++;
-            LOG_INFO("[WeightManager] Released host-resident weight: " << key
+            LOG_DEBUG("[WeightManager] Released host-resident weight: " << key
                                                                        << " (" << (tensor_bytes / (1024 * 1024)) << " MB)");
         };
 
@@ -5059,7 +5059,7 @@ namespace llaminar2
 
         if (released_count > 0)
         {
-            LOG_INFO("[WeightManager] Post-upload host-resident release: "
+            LOG_DEBUG("[WeightManager] Post-upload host-resident release: "
                      << released_count << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) freed");
 
 #if defined(__GLIBC__)
@@ -5128,7 +5128,7 @@ namespace llaminar2
         for (const auto &[name, tensor] : per_device_cache_)
             try_release(name, tensor);
 
-        LOG_INFO("[WeightManager] Released cached MoE expert raw data: "
+        LOG_DEBUG("[WeightManager] Released cached MoE expert raw data: "
                  << released_count << " tensors (" << (released_bytes >> 20) << " MB) released, "
                  << already_released << " already released, "
                  << skipped_views << " borrowed views skipped, "
@@ -5197,7 +5197,7 @@ namespace llaminar2
         auto total_released = cache_bucket.released + per_device_bucket.released + decode_bucket.released;
         auto total_views = cache_bucket.borrowed_views + per_device_bucket.borrowed_views + decode_bucket.borrowed_views;
 
-        LOG_INFO("[WeightManager] Host memory summary"
+        LOG_DEBUG("[WeightManager] Host memory summary"
                  << (context ? std::string(" (") + context + ")" : std::string{})
                  << ": heap=" << (total_heap >> 20) << " MB"
                  << " mmap=" << (total_mmap >> 20) << " MB"
@@ -5931,7 +5931,7 @@ namespace llaminar2
                 auto embd_dims = loader_.getTensorShape("token_embd.weight");
                 if (embd_dims && embd_dims->size() == 2)
                 {
-                    LOG_INFO("[WeightManager] Device " << device.to_string()
+                    LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                                        << " output.weight not in GGUF — using tied embedding "
                                                        << "token_embd.weight as column-parallel LM head");
 
@@ -6077,7 +6077,7 @@ namespace llaminar2
             expert_slice.inner_is_presliced = true;
             registerDerivedMetadata(name, result, WeightDerivationKind::ExpertSlice, expert_slice, device);
 
-            LOG_INFO("[WeightManager] Device " << device.to_string()
+            LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                                << " expert-parallel " << name
                                                << " [" << dims[0] << ", " << dims[1] << ", " << ne2
                                                << "] -> experts [" << expert_start << ", "

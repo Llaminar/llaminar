@@ -54,7 +54,7 @@ namespace llaminar2
         const bool mpi_coordinated = mpi_ctx->world_size() > 1;
         if (mpi_coordinated && mpi_ctx->rank() != 0)
         {
-            LOG_INFO("Rank " << mpi_ctx->rank()
+            LOG_DEBUG("Rank " << mpi_ctx->rank()
                              << " entering MPI worker loop for completion inference");
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
@@ -97,7 +97,7 @@ namespace llaminar2
 
             if (mpi_ctx->rank() == 0)
             {
-                LOG_INFO("Tokenized prompt: " << tokens.size() << " tokens");
+                LOG_DEBUG("Tokenized prompt: " << tokens.size() << " tokens");
                 std::ostringstream token_ids_str;
                 token_ids_str << "Token IDs: [";
                 for (size_t i = 0; i < tokens.size(); ++i)
@@ -107,7 +107,7 @@ namespace llaminar2
                         token_ids_str << ", ";
                 }
                 token_ids_str << "]";
-                LOG_INFO(token_ids_str.str());
+                LOG_DEBUG(token_ids_str.str());
             }
         }
         catch (const std::exception &e)

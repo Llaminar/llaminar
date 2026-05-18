@@ -109,7 +109,7 @@ namespace llaminar2
     void DeviceKernelCache::clear()
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        LOG_INFO("DeviceKernelCache: clearing " << cache_.size() << " cached kernels");
+        LOG_DEBUG("DeviceKernelCache: clearing " << cache_.size() << " cached kernels");
         cache_.clear();
     }
 

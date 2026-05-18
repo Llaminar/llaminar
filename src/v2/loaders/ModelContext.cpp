@@ -294,7 +294,7 @@ namespace llaminar2
         // This ensures nested MDO (TP within PP) builds graphs with correct layer count
         ctx->pp_block_count_override_ = last_layer - first_layer;
 
-        LOG_INFO("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
+        LOG_DEBUG("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
                                                                         << "), embedding=" << (has_embedding ? "yes" : "no")
                                                                         << ", lm_head=" << (has_lm_head ? "yes" : "no"));
 

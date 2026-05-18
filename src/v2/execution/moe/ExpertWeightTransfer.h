@@ -363,7 +363,7 @@ namespace llaminar2
 
                 auto t1 = std::chrono::steady_clock::now();
                 double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                LOG_INFO("[ExpertWeightTransfer] Transferred " << manifest.size()
+                LOG_DEBUG("[ExpertWeightTransfer] Transferred " << manifest.size()
                                                                << " experts × " << num_layers << " layers, "
                                                                << (total_bytes / (1024.0 * 1024.0)) << " MB received in "
                                                                << ms << " ms");

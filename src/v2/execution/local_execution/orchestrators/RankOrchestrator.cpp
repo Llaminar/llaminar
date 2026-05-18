@@ -362,19 +362,19 @@ namespace llaminar2
                                                            << ", multi-device orchestration may not be beneficial");
             }
 
-            LOG_INFO("RankOrchestrator: Creating with pre-existing TP context, "
+            LOG_DEBUG("RankOrchestrator: Creating with pre-existing TP context, "
                      << tp_ctx_->degree() << " devices");
 
             initializeDeviceRunners();
 
-            LOG_INFO("RankOrchestrator: Initialized with " << device_runners_.size() << " device runners");
+            LOG_DEBUG("RankOrchestrator: Initialized with " << device_runners_.size() << " device runners");
         }
         else
         {
             // Auto-detect mode from config
             mode_ = config_.effectiveMode();
 
-            LOG_INFO("RankOrchestrator: Creating with mode="
+            LOG_DEBUG("RankOrchestrator: Creating with mode="
                      << (mode_ == ParallelismMode::TP ? "TP" : mode_ == ParallelismMode::PP ? "PP"
                                                                                             : "TP_PP")
                      << ", backend=" << static_cast<int>(config_.backend));
@@ -400,7 +400,7 @@ namespace llaminar2
 
                 initializeDeviceRunners();
 
-                LOG_INFO("RankOrchestrator: Initialized TP mode with " << device_runners_.size() << " device runners");
+                LOG_DEBUG("RankOrchestrator: Initialized TP mode with " << device_runners_.size() << " device runners");
             }
             else
             {
@@ -408,7 +408,7 @@ namespace llaminar2
                 initializePPDeviceRunners();
                 initializePPContext();
 
-                LOG_INFO("RankOrchestrator: Initialized PP mode with " << config_.pp_stages.size() << " stages");
+                LOG_DEBUG("RankOrchestrator: Initialized PP mode with " << config_.pp_stages.size() << " stages");
             }
         }
     }
@@ -525,7 +525,7 @@ namespace llaminar2
                         wm_config.dimensions.gdn_n_k_heads = gdn_group_count;
                         wm_config.dimensions.gdn_n_v_heads = gdn_time_step_rank;
                         wm_config.dimensions.gdn_d_state = gdn_state_size;
-                        LOG_INFO("RankOrchestrator: GDN dimensions for FusedQKV slicing"
+                        LOG_DEBUG("RankOrchestrator: GDN dimensions for FusedQKV slicing"
                                  << " (group_count=" << gdn_group_count
                                  << " time_step_rank=" << gdn_time_step_rank
                                  << " state_size=" << gdn_state_size << ")");
@@ -535,7 +535,7 @@ namespace llaminar2
                 // Apply all configuration in a single call
                 weight_mgr->configure(wm_config);
 
-                LOG_INFO("RankOrchestrator: Configured WeightManager for LOCAL TP ("
+                LOG_DEBUG("RankOrchestrator: Configured WeightManager for LOCAL TP ("
                          << tp_ctx_->degree() << " devices, "
                          << "heads=" << n_heads << ", kv_heads=" << n_kv_heads
                          << ", d_ff=" << d_ff << ", vocab=" << vocab_size << ")");
@@ -548,7 +548,7 @@ namespace llaminar2
                     try
                     {
                         const auto &assignment = tp_config->forDevice(dev_id);
-                        LOG_INFO("RankOrchestrator: Device " << dev_idx << " (" << dev_id.to_string() << ") assignment:"
+                        LOG_DEBUG("RankOrchestrator: Device " << dev_idx << " (" << dev_id.to_string() << ") assignment:"
                                                              << " head_start=" << assignment.head_start
                                                              << " head_count=" << assignment.head_count
                                                              << " kv_head_start=" << assignment.kv_head_start
@@ -570,7 +570,7 @@ namespace llaminar2
                     stage_sharding_map_["K_PROJECTION"] = SnapshotShardingMode::REPLICATED;
                     stage_sharding_map_["V_PROJECTION"] = SnapshotShardingMode::REPLICATED;
                     stage_sharding_map_["K_ROPE"] = SnapshotShardingMode::REPLICATED;
-                    LOG_INFO("RankOrchestrator: GQA override: K/V stages set to REPLICATED "
+                    LOG_DEBUG("RankOrchestrator: GQA override: K/V stages set to REPLICATED "
                              "(n_kv_heads="
                              << n_kv_heads << " < tp_degree=" << tp_ctx_->degree() << ")");
                 }
@@ -596,7 +596,7 @@ namespace llaminar2
 
             if (tp_ctx_->reserveTempBufferBytes(buffer_with_margin))
             {
-                LOG_INFO("RankOrchestrator: Reserved collective temp buffer: "
+                LOG_DEBUG("RankOrchestrator: Reserved collective temp buffer: "
                          << buffer_with_margin << " bytes ("
                          << "max_seq_len=" << config_.max_seq_len
                          << ", hidden_size=" << hidden_size
@@ -648,7 +648,7 @@ namespace llaminar2
                 }
                 if (config_.nested_pp_stage_config.has_value())
                 {
-                    LOG_INFO("RankOrchestrator: Preloading weights for "
+                    LOG_DEBUG("RankOrchestrator: Preloading weights for "
                              << device_ids.size() << " nested TP-in-PP devices"
                              << " (binding-driven preparation deferred to runner materialization)");
                     if (!weight_mgr->preloadForDevices(device_ids))
@@ -658,7 +658,7 @@ namespace llaminar2
                 }
                 else
                 {
-                    LOG_INFO("RankOrchestrator: Finalizing weights for "
+                    LOG_DEBUG("RankOrchestrator: Finalizing weights for "
                              << device_ids.size() << " devices"
                              << " (release_host_data=false, deferred until after graph build)");
                     if (!weight_mgr->finalizeForDevices(device_ids, /*release_host_data=*/false))
@@ -820,7 +820,7 @@ namespace llaminar2
                     size_t released = weight_mgr->releaseAllHostWeightData();
                     if (released > 0)
                     {
-                        LOG_INFO("RankOrchestrator: Host weight release after graph materialization: "
+                        LOG_DEBUG("RankOrchestrator: Host weight release after graph materialization: "
                                  << released << " tensors released");
 #ifdef __linux__
                         ::malloc_trim(0);
@@ -830,7 +830,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_INFO("RankOrchestrator: Retaining host weight data "
+                LOG_DEBUG("RankOrchestrator: Retaining host weight data "
                          "(nested TP-in-PP; outer caller will release)");
             }
         }
@@ -892,7 +892,7 @@ namespace llaminar2
             if (!compute_streams.empty())
             {
                 tp_ctx_->setComputeStreams(compute_streams);
-                LOG_INFO("RankOrchestrator: Registered " << compute_streams.size()
+                LOG_DEBUG("RankOrchestrator: Registered " << compute_streams.size()
                                                          << " compute streams for event-based collective sync");
             }
         }
@@ -949,7 +949,7 @@ namespace llaminar2
         {
             if (isCrossVendorTransfer(config_.pp_stages[i], config_.pp_stages[i + 1]))
             {
-                LOG_INFO("RankOrchestrator: PP stage " << i
+                LOG_DEBUG("RankOrchestrator: PP stage " << i
                                                        << " outputs to cross-vendor stage " << (i + 1)
                                                        << " - will use host-staged transfer");
             }
@@ -1010,7 +1010,7 @@ namespace llaminar2
                 // =====================================================================
                 // TP Domain Stage: Create nested RankOrchestrator in TP mode
                 // =====================================================================
-                LOG_INFO("RankOrchestrator: PP stage " << stage_idx
+                LOG_DEBUG("RankOrchestrator: PP stage " << stage_idx
                                                        << " is a TP domain with " << stage_config.stage_devices.size() << " devices");
 
                 // Build TP configuration for the nested orchestrator
@@ -1050,7 +1050,7 @@ namespace llaminar2
 
                 pp_stage_runners_.push_back(std::move(nested_mdo));
 
-                LOG_INFO("RankOrchestrator: Created TP domain PP stage " << stage_idx
+                LOG_DEBUG("RankOrchestrator: Created TP domain PP stage " << stage_idx
                                                                          << " with " << stage_config.stage_devices.size() << " devices"
                                                                          << " (layers " << stage_config.first_layer << "-" << stage_config.last_layer << ")");
             }
@@ -1073,13 +1073,13 @@ namespace llaminar2
 
                 pp_stage_runners_.push_back(std::move(runner));
 
-                LOG_INFO("RankOrchestrator: Created PP stage " << stage_idx
+                LOG_DEBUG("RankOrchestrator: Created PP stage " << stage_idx
                                                                << " runner on device " << primary_device.to_string()
                                                                << " (layers " << stage_config.first_layer << "-" << stage_config.last_layer << ")");
             }
         }
 
-        LOG_INFO("RankOrchestrator: Successfully initialized " << pp_stage_runners_.size() << " PP stage runners");
+        LOG_DEBUG("RankOrchestrator: Successfully initialized " << pp_stage_runners_.size() << " PP stage runners");
 
         // =====================================================================
         // Release host weight copies now that all PP stages are prepared.
@@ -1102,12 +1102,12 @@ namespace llaminar2
 
         if (has_cpu_stage)
         {
-            LOG_INFO("RankOrchestrator: Retaining host weight data (CPU PP stages present)");
+            LOG_DEBUG("RankOrchestrator: Retaining host weight data (CPU PP stages present)");
         }
         else if (auto *concrete_wm = dynamic_cast<WeightManager *>(model_ctx_->weightManager().get()))
         {
             size_t released = concrete_wm->releaseAllHostWeightData();
-            LOG_INFO("RankOrchestrator: Released " << released << " host weight copies after PP preparation");
+            LOG_DEBUG("RankOrchestrator: Released " << released << " host weight copies after PP preparation");
         }
 
         // Build PPActivationContract describing inter-stage data transfers
@@ -1143,7 +1143,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_INFO("RankOrchestrator: PPActivationContract built with "
+                LOG_DEBUG("RankOrchestrator: PPActivationContract built with "
                          << pp_activation_contract_->numTransfers() << " transfers"
                          << " (embedding=" << embedding_dim << ", max_seq=" << max_seq_len << ")");
             }
@@ -1201,7 +1201,7 @@ namespace llaminar2
             throw std::runtime_error("Failed to create LocalPPContext");
         }
 
-        LOG_INFO("RankOrchestrator: Initialized LocalPPContext with " << pp_config.numStages() << " stages");
+        LOG_DEBUG("RankOrchestrator: Initialized LocalPPContext with " << pp_config.numStages() << " stages");
     }
 
     void RankOrchestrator::aggregateStats() const
@@ -1439,7 +1439,7 @@ namespace llaminar2
                         tp_ctx_->requestAbort(); });
                 }
 
-                LOG_INFO("[TPWorkerPool] Created " << device_runners_.size()
+                LOG_DEBUG("[TPWorkerPool] Created " << device_runners_.size()
                                                    << " persistent worker threads");
             }
 
@@ -1475,7 +1475,7 @@ namespace llaminar2
                     IInferenceRunner *runner_iface = device_runners_[i].get();
                     if (debugEnv().tp_collective_contract_trace)
                     {
-                        LOG_INFO("[TP_WORKER_CONTRACT] event=forward_enter"
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_enter"
                                  << " worker=" << i
                                  << " device=" << device_id.toString()
                                  << " runner=" << static_cast<void *>(runner_iface)
@@ -1486,7 +1486,7 @@ namespace llaminar2
                         const bool ok = runner_iface->forward(tokens, seq_len);
                         if (debugEnv().tp_collective_contract_trace)
                         {
-                            LOG_INFO("[TP_WORKER_CONTRACT] event=forward_leave"
+                            LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_leave"
                                      << " worker=" << i
                                      << " device=" << device_id.toString()
                                      << " success=" << (ok ? 1 : 0));
@@ -1615,7 +1615,7 @@ namespace llaminar2
                                       .count();
                 if (tp_timing)
                 {
-                    LOG_INFO("[DECODE_BREAKDOWN] launch=" << std::fixed << std::setprecision(1)
+                    LOG_DEBUG("[DECODE_BREAKDOWN] launch=" << std::fixed << std::setprecision(1)
                                                           << launch_us << "us"
                                                           << " wait=" << wait_us << "us"
                                                           << " total=" << total_us << "us");
@@ -1644,7 +1644,7 @@ namespace llaminar2
                 static bool logged_prefill_skip = false;
                 if (!logged_prefill_skip)
                 {
-                    LOG_INFO("[forwardTP] Skipping prefill logits gather (seq_len="
+                    LOG_DEBUG("[forwardTP] Skipping prefill logits gather (seq_len="
                              << seq_len << ") — prefill logits are not consumed");
                     logged_prefill_skip = true;
                 }
@@ -1689,7 +1689,7 @@ namespace llaminar2
 
             if (tp_timing)
             {
-                LOG_INFO("[TP_TIMING] seq_len=" << seq_len
+                LOG_DEBUG("[TP_TIMING] seq_len=" << seq_len
                                                 << " forward=" << std::fixed << std::setprecision(3) << forward_ms << "ms"
                                                 << " gather=" << std::fixed << std::setprecision(3) << gather_ms << "ms"
                                                 << " total=" << std::fixed << std::setprecision(3) << total_ms << "ms");
@@ -2574,7 +2574,7 @@ namespace llaminar2
             }
 
             // Debug: log data pointer and first 4 values to verify each device has different data
-            LOG_INFO("RankOrchestrator::getTPSnapshot: device " << i
+            LOG_DEBUG("RankOrchestrator::getTPSnapshot: device " << i
                                                                 << " key=" << key << " ptr=" << static_cast<const void *>(snap.data)
                                                                 << " size=" << snap.size
                                                                 << " shape=[" << snap.rows << "x" << snap.cols << "]"
@@ -2888,7 +2888,7 @@ namespace llaminar2
                 }
             }
         }
-        LOG_INFO("[RankOrchestrator] Applied LocalTP MoE expert masks to "
+        LOG_DEBUG("[RankOrchestrator] Applied LocalTP MoE expert masks to "
                  << applied << "/" << device_runners_.size() << " device runners");
     }
 

@@ -74,6 +74,8 @@ namespace llaminar2
 
         bool allowsZeroOutput() const override { return false; }
         bool isGraphCapturable() const override;
+        void onGraphReplayed() override;
+        bool needsOnGraphReplayed() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
@@ -97,6 +99,7 @@ namespace llaminar2
         IMoEKernel *ensureMoEKernel() const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool hasInitializedRuntimeTableIfProvided() const;
+        void recordRuntimeHistogramTokenBoundary() const;
         void stashRoutingResults(
             const std::vector<int> &expert_indices,
             const std::vector<float> &expert_weights,

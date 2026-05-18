@@ -427,6 +427,17 @@ namespace llaminar2
         mutable int scratch_seq_len_ = 0;
 
         void ensureGemmEnginesCached() const;
+        bool ensureSharedGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
+        bool ensureSharedGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
+        bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
+
+        mutable int shared_grouped_gateup_desc_table_id_ = -1;
+        mutable int shared_grouped_gateup_desc_table_d_model_ = 0;
+        mutable int shared_grouped_gateup_desc_table_intermediate_ = 0;
+
+        mutable int shared_grouped_down_desc_table_id_ = -1;
+        mutable int shared_grouped_down_desc_table_d_model_ = 0;
+        mutable int shared_grouped_down_desc_table_intermediate_ = 0;
 
         /// Cached MoE kernel for SwiGLU fallback
         mutable IMoEKernel *moe_kernel_ = nullptr;

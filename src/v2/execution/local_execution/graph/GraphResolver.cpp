@@ -227,7 +227,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[GraphResolver] Resolved " << result.stats.stages_emitted << " stages"
+        LOG_DEBUG("[GraphResolver] Resolved " << result.stats.stages_emitted << " stages"
                                              << " (skipped=" << result.stats.stages_skipped
                                              << ", allreduce=" << result.stats.allreduce_inserted
                                              << ", allgather=" << result.stats.allgather_inserted << ")");

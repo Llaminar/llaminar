@@ -456,7 +456,7 @@ namespace llaminar2
                     << "\n";
         }
 
-        LOG_INFO("[BufferArena] " << summary.str());
+        LOG_DEBUG("[BufferArena] " << summary.str());
     }
 
     // =========================================================================

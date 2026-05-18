@@ -560,7 +560,7 @@ namespace llaminar2
                     }
                 }
 
-                LOG_INFO("[AttentionComputeStage] Dumped effective K/V to " << dump_dir);
+                LOG_DEBUG("[AttentionComputeStage] Dumped effective K/V to " << dump_dir);
                 if (params_.layer_idx == 0)
                     dump_iteration++;
             }
