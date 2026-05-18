@@ -1811,7 +1811,23 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::isGraphCapturable() const
     {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
         return false;
+#else
+        // Device-routed grouped decode path: after warmup, all descriptor tables
+        // are built and execution is pure kernel launches reading routing info
+        // from the device-resident MoE runtime table.
+        const auto &rocm = debugEnv().rocm;
+        return params_.device_id.is_rocm() &&
+               params_.seq_len == 1 &&
+               rocm.moe_grouped_decode &&
+               rocm.moe_device_routed_decode &&
+               params_.moe_runtime_table != nullptr &&
+               params_.top_k > 0 && params_.top_k <= 16 &&
+               params_.replica_set.num_replicated == 0 &&
+               hasFullLocalExpertOwnership() &&
+               expertMaskAllEnabled();
+#endif
     }
 
     StageBufferRequirements MoEExpertComputeStage::getBufferRequirements() const
@@ -2254,6 +2270,17 @@ namespace llaminar2
         }
     }
 
+    bool SharedExpertFFNStage::isGraphCapturable() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+        return false;
+#else
+        // After warmup: GEMM engines cached, scratch buffers allocated,
+        // all operations are pure kernel launches (fused gate+up, swiglu, down).
+        return params_.device_id.is_rocm() && params_.seq_len == 1;
+#endif
+    }
+
     StageBufferRequirements SharedExpertFFNStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
@@ -2434,6 +2461,16 @@ namespace llaminar2
         default:
             return false;
         }
+    }
+
+    bool SharedExpertGateStage::isGraphCapturable() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+        return false;
+#else
+        // Single kernel call (sigmoid gating) — pure kernel launch after warmup.
+        return params_.device_id.is_rocm() && params_.seq_len == 1;
+#endif
     }
 
     StageBufferRequirements SharedExpertGateStage::getBufferRequirements() const

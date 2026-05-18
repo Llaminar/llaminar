@@ -125,13 +125,6 @@ namespace llaminar2
                 stage_capturable = collectives_graph_capturable;
             }
 
-            if (node->stage->type() == ComputeStageType::MOE_SHARED_EXPERT_FFN ||
-                node->stage->type() == ComputeStageType::MOE_SHARED_EXPERT_GATE ||
-                name.find("shared_expert") != std::string::npos)
-            {
-                stage_capturable = false;
-            }
-
             if (has_collective_nodes && !segmented_collective_capture_allow.empty())
             {
                 // Explicit allowlist mode: only allowlisted stages are capturable
@@ -202,8 +195,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DeviceGraphExecutor] Segmented graph: " << capturable_segments << " capturable segments ("
-                                                           << capturable_stages << " stages) + " << manual_segments << " manual segments ("
-                                                           << manual_stages << " stages)");
+                                                            << capturable_stages << " stages) + " << manual_segments << " manual segments ("
+                                                            << manual_stages << " stages)");
 
         for (auto &seg : segment_cache.segments)
         {
@@ -373,8 +366,8 @@ namespace llaminar2
                 if (trace_replay)
                 {
                     LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                              << " COLLECTIVE enter: " << stage_name
-                                              << " insertStreamDependency(compute←capture)");
+                                               << " COLLECTIVE enter: " << stage_name
+                                               << " insertStreamDependency(compute←capture)");
                 }
 
                 if (capture_stream)
@@ -389,7 +382,7 @@ namespace llaminar2
                 if (trace_replay)
                 {
                     LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                              << " COLLECTIVE execute: " << stage_name);
+                                               << " COLLECTIVE execute: " << stage_name);
                 }
 
                 node->stage->setGPUStream(compute_stream);
@@ -411,7 +404,7 @@ namespace llaminar2
                 if (trace_replay)
                 {
                     LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                              << " COLLECTIVE done: " << stage_name);
+                                               << " COLLECTIVE done: " << stage_name);
                 }
             }
             else if (has_collective_nodes)
@@ -1366,11 +1359,11 @@ namespace llaminar2
                 const char *seg_type = seg.capturable ? "GRAPH" : "MANUAL";
                 const auto &first_name = seg.stage_names.empty() ? std::string("<empty>") : seg.stage_names.front();
                 LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                          << " step=" << current_step
-                                          << " seg=" << seg_idx << "/" << total_segments
-                                          << " [" << seg_type << "]"
-                                          << " stages=" << seg.stage_names.size()
-                                          << " first=" << first_name);
+                                           << " step=" << current_step
+                                           << " seg=" << seg_idx << "/" << total_segments
+                                           << " [" << seg_type << "]"
+                                           << " stages=" << seg.stage_names.size()
+                                           << " first=" << first_name);
             }
 
             // Segment execution picks capturable or manual behavior based on
@@ -1400,8 +1393,8 @@ namespace llaminar2
             if (trace_replay)
             {
                 LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                          << " step=" << current_step
-                                          << " seg=" << seg_idx << "/" << total_segments << " DONE");
+                                           << " step=" << current_step
+                                           << " seg=" << seg_idx << "/" << total_segments << " DONE");
             }
 
             seg_idx++;
@@ -1410,8 +1403,8 @@ namespace llaminar2
         if (trace_replay)
         {
             LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                      << " step=" << current_step
-                                      << " ALL " << total_segments << " segments done, entering final synchronize()");
+                                       << " step=" << current_step
+                                       << " ALL " << total_segments << " segments done, entering final synchronize()");
         }
         // Sync both known streams instead of device-wide hipDeviceSynchronize.
         // Graph segments replayed on capture_stream; manual segments (embedding)
@@ -1422,7 +1415,7 @@ namespace llaminar2
         if (trace_replay)
         {
             LOG_DEBUG("[ReplayTrace] " << device_id.toString()
-                                      << " step=" << current_step << " final synchronize() complete");
+                                       << " step=" << current_step << " final synchronize() complete");
         }
         result.success = true;
         return result;

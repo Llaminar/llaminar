@@ -388,7 +388,7 @@ namespace llaminar2
         std::string name() const override { return "shared_expert_ffn"; }
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
-        bool isGraphCapturable() const override { return false; }
+        bool isGraphCapturable() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -476,7 +476,7 @@ namespace llaminar2
         std::string name() const override { return "shared_expert_gate"; }
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
-        bool isGraphCapturable() const override { return false; }
+        bool isGraphCapturable() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
