@@ -387,6 +387,46 @@ namespace llaminar2
         const bool has_replicas = params_.replica_set.num_replicated > 0;
 
         // =====================================================================
+        // Phase 5: Fully-grouped MoE prefill pipeline (graph-capturable)
+        // All 5 kernels launched with zero host sync, counts stay on device.
+        // Falls through to per-expert path if conditions not met.
+        // =====================================================================
+        if (is_gpu && canUseFixedTopologyGroupedPrefill())
+        {
+            // Ensure descriptor tables are built (lazy, only first call)
+            bool tables_ready = true;
+            if (grouped_gateup_desc_table_id_ < 0 || grouped_down_desc_table_id_ < 0)
+            {
+                if (static_cast<int>(all_expert_ids_.size()) != num_experts)
+                {
+                    all_expert_ids_.resize(static_cast<size_t>(num_experts));
+                    std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
+                }
+                tables_ready = ensureGemmEnginesForExperts(all_expert_ids_) &&
+                               ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate) &&
+                               ensureGroupedDownDescriptorTable(kernel, d_model, intermediate);
+            }
+
+            if (!tables_ready)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Grouped prefill: descriptor table build failed, layer "
+                          << params_.layer_idx);
+                return false;
+            }
+
+            if (!executeFixedTopologyGroupedPrefill(kernel, seq_len))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Grouped prefill pipeline failed, layer "
+                          << params_.layer_idx);
+                return false;
+            }
+
+            if (params_.device_id.is_gpu())
+                markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
+            return true;
+        }
+
+        // =====================================================================
         // GPU prefill path: grouping + gather/scatter stay on device
         // Avoids D2H of routing tensors and CPU grouping O(seq_len * top_k)
         // =====================================================================
@@ -1604,14 +1644,50 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::canUseFixedTopologyGroupedPrefill() const
     {
-        return false;
+        return params_.device_id.is_rocm() &&
+               debugEnv().rocm.moe_grouped_prefill &&
+               params_.seq_len > 1 &&
+               hasFullLocalExpertOwnership() &&
+               expertMaskAllEnabled() &&
+               params_.replica_set.num_replicated == 0;
     }
 
     bool MoEExpertComputeStage::executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const
     {
-        (void)kernel;
         (void)max_tokens;
-        return false;
+        if (!kernel)
+            return false;
+
+        const int seq_len = params_.seq_len;
+        const int num_experts = params_.num_experts;
+        const int top_k = params_.top_k;
+        const int d_model = params_.d_model;
+        const int intermediate = params_.expert_intermediate;
+
+        // Async grouping (no D2H, no sync)
+        if (!kernel->prepareExpertGroupsAsync(
+                params_.routing_indices, params_.routing_weights,
+                seq_len, num_experts, top_k))
+        {
+            LOG_DEBUG("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                      "prepareExpertGroupsAsync failed, falling back");
+            return false;
+        }
+
+        // Execute the full grouped pipeline (5 kernel launches, zero sync)
+        if (!kernel->executeGroupedPrefillPipeline(
+                params_.input, params_.output,
+                grouped_gateup_desc_table_id_,
+                grouped_down_desc_table_id_,
+                seq_len, d_model, intermediate,
+                num_experts, top_k))
+        {
+            LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                      "grouped prefill pipeline failed");
+            return false;
+        }
+
+        return true;
     }
 
     bool MoEExpertComputeStage::isDeviceRoutedDecodeGraphCapturable() const

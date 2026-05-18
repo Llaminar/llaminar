@@ -159,6 +159,11 @@ if(HAVE_CUDA)
     # executable device links), but we keep a small pool as a safety net.
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
+        # Limit concurrent host linking — each ld.lld uses 1-2 GB RSS.
+        # Without this, 500+ test executables link simultaneously causing
+        # severe I/O wait and memory pressure.
+        set_property(GLOBAL APPEND PROPERTY JOB_POOLS link_pool=24)
+        set(CMAKE_JOB_POOL_LINK link_pool)
     endif()
 endif()
 
@@ -453,6 +458,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMM kernels for M>1 prefill (gfx906)
+        kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
         kernels/rocm/kvcache/ROCmTurboQuantKernels.hip        # TurboQuant quantize/dequant/RoPE GPU kernels
@@ -1275,6 +1281,7 @@ add_library(llaminar2_core STATIC
     app/AppLifecycle.cpp
     app/SubcommandRouter.cpp
     app/Splash.cpp
+    app/StartupBanner.cpp
     app/InferenceRunnerAdapter.cpp
     app/ChatTemplateResolver.cpp
     app/MPIBootstrapPhase.cpp
@@ -1305,6 +1312,7 @@ add_library(llaminar2_core STATIC
     loaders/LayerWeightStreamer.cpp
     loaders/WeightStreamerFactory.cpp
     loaders/PreparedWeightStore.cpp
+    loaders/WeightLoadProgressAggregator.cpp
     loaders/WeightLifecycleTrace.cpp
     loaders/WeightPlan.cpp
     loaders/WeightIdentity.cpp

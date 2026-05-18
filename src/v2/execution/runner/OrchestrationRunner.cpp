@@ -7,6 +7,7 @@
  */
 
 #include "OrchestrationRunner.h"
+#include "../../app/StartupBanner.h"
 #include "../../config/OrchestrationConfigParser.h"
 #include "../../config/TPPPValidator.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
@@ -42,6 +43,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <print>
+#include <sstream>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -352,6 +355,9 @@ namespace llaminar2
                 return false;
             }
 
+            // Print consolidated startup banner (rank 0 only, after all preflight passes)
+            printStartupBanner();
+
             // Step 6: Build compute graph
             if (!buildComputeGraph())
             {
@@ -380,16 +386,16 @@ namespace llaminar2
                         if (recommended_sampling_params_.has_penalties() || recommended_sampling_params_.temperature != 1.0f)
                         {
                             LOG_DEBUG("[OrchestrationRunner] Model-recommended sampling: "
-                                     << "temp=" << recommended_sampling_params_.temperature
-                                     << " top_p=" << recommended_sampling_params_.top_p
-                                     << " top_k=" << recommended_sampling_params_.top_k
-                                     << " presence_penalty=" << recommended_sampling_params_.presence_penalty
-                                     << " frequency_penalty=" << recommended_sampling_params_.frequency_penalty);
+                                      << "temp=" << recommended_sampling_params_.temperature
+                                      << " top_p=" << recommended_sampling_params_.top_p
+                                      << " top_k=" << recommended_sampling_params_.top_k
+                                      << " presence_penalty=" << recommended_sampling_params_.presence_penalty
+                                      << " frequency_penalty=" << recommended_sampling_params_.frequency_penalty);
                         }
                         if (!stop_thinking_prompt_.empty())
                         {
                             LOG_DEBUG("[OrchestrationRunner] Stop-thinking prompt configured ("
-                                     << stop_thinking_prompt_.size() << " chars)");
+                                      << stop_thinking_prompt_.size() << " chars)");
                         }
                     }
                 }
@@ -795,7 +801,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("MPI initialized: rank " << mpi_ctx_->rank()
-                                          << " of " << mpi_ctx_->world_size());
+                                           << " of " << mpi_ctx_->world_size());
 
         return true;
     }
@@ -904,13 +910,13 @@ namespace llaminar2
             if (overlay_execution_plan->buildsRootGraph())
             {
                 LOG_DEBUG("[OrchestrationRunner] MoE overlay root plan bound to base domain '"
-                         << config_.moe_expert_parallel_plan->effectiveBaseModelDomain()
-                         << "' devices=" << plan_.local_tp_devices.size());
+                          << config_.moe_expert_parallel_plan->effectiveBaseModelDomain()
+                          << "' devices=" << plan_.local_tp_devices.size());
             }
             else
             {
                 LOG_DEBUG("[OrchestrationRunner] MoE overlay non-root plan narrowed to participant endpoint role "
-                         << toString(overlay_execution_plan->currentRankPlan().role));
+                          << toString(overlay_execution_plan->currentRankPlan().role));
             }
         }
 
@@ -994,7 +1000,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("LOCAL PP context created with " << pp_config.numStages()
-                                                  << " stages on " << plan_.local_pp_devices.size() << " devices");
+                                                   << " stages on " << plan_.local_pp_devices.size() << " devices");
         return true;
     }
 
@@ -1021,6 +1027,12 @@ namespace llaminar2
         weight_config.weight_precision = WeightPrecision::NATIVE;
         weight_config.use_mmap = config_.use_mmap;
 
+        // For GPU targets, skip NUMA mmap binding — weights are uploaded to VRAM,
+        // so the host staging mmap doesn't need NUMA placement. This avoids the
+        // catastrophic POSIX_FADV_DONTNEED + cold OMP first-touch path that can
+        // turn a 4-second model load into a 100+ second ordeal.
+        weight_config.target_is_gpu = (plan_.primary_device.device_type != DeviceType::CPU);
+
         // Multi-rank page cache pre-population:
         // In multi-rank mode, each rank independently mmaps and first-touches the
         // same file. Without coordination, this creates N concurrent page fault
@@ -1043,8 +1055,8 @@ namespace llaminar2
                 if (topo->is_node_leader())
                 {
                     LOG_DEBUG("Node leader (rank " << mpi_ctx_->rank()
-                                                  << ", node " << topo->placement().node_id
-                                                  << ") pre-populating page cache for multi-rank mmap...");
+                                                   << ", node " << topo->placement().node_id
+                                                   << ") pre-populating page cache for multi-rank mmap...");
                     MmapRegion::prepopulatePageCache(model_path);
                 }
                 // Intra-node barrier: same-node ranks wait for their node leader only.
@@ -1103,10 +1115,10 @@ namespace llaminar2
             LOG_WARN("Failed to create tokenizer from model context");
         }
 
-        LOG_INFO("Model context created from: " << model_path
-                                                << " (layers " << weight_config.first_layer << "-" << weight_config.last_layer
-                                                << ", embedding=" << weight_config.has_embedding
-                                                << ", lm_head=" << weight_config.has_lm_head << ")");
+        LOG_DEBUG("Model context created from: " << model_path
+                                                 << " (layers " << weight_config.first_layer << "-" << weight_config.last_layer
+                                                 << ", embedding=" << weight_config.has_embedding
+                                                 << ", lm_head=" << weight_config.has_lm_head << ")");
 
         return true;
     }
@@ -1132,10 +1144,10 @@ namespace llaminar2
             if (config_.moe_expert_parallel_plan->isTieredOverlay())
             {
                 LOG_DEBUG("[OrchestrationRunner] MoE expert overlay plan frozen: placements="
-                         << config_.moe_expert_parallel_plan->placements.size()
-                         << " routed_tiers=" << config_.moe_expert_parallel_plan->routed_tiers.size()
-                         << " domains=" << config_.moe_expert_parallel_plan->domains.size()
-                         << (requested_without_placements ? " (planned from model metadata)" : ""));
+                          << config_.moe_expert_parallel_plan->placements.size()
+                          << " routed_tiers=" << config_.moe_expert_parallel_plan->routed_tiers.size()
+                          << " domains=" << config_.moe_expert_parallel_plan->domains.size()
+                          << (requested_without_placements ? " (planned from model metadata)" : ""));
             }
         }
         catch (const std::exception &e)
@@ -1201,8 +1213,8 @@ namespace llaminar2
                             " exceeds model maximum of " + std::to_string(model_max));
         }
 
-        LOG_INFO("Context length: " << config_.max_seq_len
-                                    << " / " << model_max << " (model max)");
+        LOG_DEBUG("Context length: " << config_.max_seq_len
+                                     << " / " << model_max << " (model max)");
         return true;
     }
 
@@ -1320,9 +1332,215 @@ namespace llaminar2
             return setError(msg);
         }
 
-        LOG_INFO("[MemoryPlanner] Memory validation passed:\n"
-                 << plan.renderTable());
+        LOG_DEBUG("[MemoryPlanner] Memory validation passed:\n"
+                  << plan.renderTable());
         return true;
+    }
+
+    void OrchestrationRunner::printStartupBanner()
+    {
+        // Only rank 0 prints the banner
+        if (mpi_ctx_ && mpi_ctx_->rank() != 0)
+            return;
+
+        StartupBannerData data;
+
+        // Phase 1: Cluster topology
+        data.cluster = &cluster_inventory_;
+        if (config_.n_threads > 0)
+            data.threads_per_rank = config_.n_threads;
+        else
+        {
+            // cpu_cores is per-socket (this rank's local cores) — use directly as threads/rank
+            if (!cluster_inventory_.ranks.empty())
+            {
+                data.threads_per_rank = cluster_inventory_.ranks[0].cpu_cores;
+            }
+        }
+        data.bind_policy = "socket";
+
+        // Phase 2: Inference configuration
+        {
+            DeviceId device = DeviceAddressAdapter::toDeviceId(plan_.primary_device);
+            std::ostringstream dev_oss;
+            dev_oss << device.to_string();
+            if (device.is_cpu() && cluster_inventory_.world_size > 1)
+            {
+                int sockets = cluster_inventory_.ranks[0].cpu_sockets;
+                int cores_per_socket = cluster_inventory_.ranks[0].cpu_cores;
+                dev_oss << " (" << sockets << "S x " << cores_per_socket << "C, TP=" << cluster_inventory_.world_size << ")";
+            }
+            data.device_description = dev_oss.str();
+
+            // Parallelism
+            std::ostringstream par_oss;
+            int effective_tp = plan_.totalTPDegree();
+            par_oss << "TP=" << effective_tp;
+            if (effective_tp > 1)
+            {
+                if (config_.tp_scope == TPScope::GLOBAL || config_.cpu_global_tp_all_local)
+                    par_oss << " (global)";
+                else if (plan_.usesLocalTP())
+                    par_oss << " (local)";
+            }
+            par_oss << " | PP=" << config_.pp_degree;
+            data.parallelism = par_oss.str();
+
+            // Precision
+            std::ostringstream prec_oss;
+            prec_oss << "Activations: FP32";
+            if (device.is_cpu())
+                prec_oss << " | KV Cache: Q16_1";
+            else
+                prec_oss << " | KV Cache: FP16";
+            data.precision = prec_oss.str();
+
+            // Context length
+            std::ostringstream ctx_oss;
+            int model_max = model_ctx_ ? static_cast<int>(model_ctx_->contextLength()) : 0;
+            ctx_oss << config_.max_seq_len;
+            if (model_max > 0)
+                ctx_oss << " / " << model_max << " (model max)";
+            data.context_length = ctx_oss.str();
+
+            // Backend
+            if (device.is_cpu())
+                data.backend = "CPU (OneDNN/AVX-512)";
+            else if (device.is_cuda())
+                data.backend = "CUDA (GPU " + std::to_string(device.ordinal) + ")";
+            else if (device.is_rocm())
+                data.backend = "ROCm (GPU " + std::to_string(device.ordinal) + ")";
+        }
+
+        // Phase 3: Model
+        if (model_ctx_)
+        {
+            // Filename (basename)
+            const std::string &path = config_.model_path;
+            size_t slash = path.find_last_of('/');
+            data.model_filename = (slash != std::string::npos) ? path.substr(slash + 1) : path;
+
+            // File size
+            const auto &model = model_ctx_->model();
+            size_t file_bytes = 0;
+            for (const auto &t : model.tensors)
+                file_bytes += t.size_bytes;
+            double file_gb = static_cast<double>(file_bytes) / (1024.0 * 1024.0 * 1024.0);
+            char size_buf[32];
+            snprintf(size_buf, sizeof(size_buf), "%.1f GB", file_gb);
+            data.model_size = size_buf;
+
+            // Architecture
+            std::ostringstream arch_oss;
+            arch_oss << model.architecture << " (" << model.block_count << " layers";
+            // Check for MoE
+            uint64_t n_experts = 0;
+            auto it_experts = model.metadata.find("expert_count");
+            if (it_experts != model.metadata.end())
+                n_experts = it_experts->second.asUInt64();
+            if (n_experts == 0)
+            {
+                auto it2 = model.metadata.find(model.architecture + ".expert_count");
+                if (it2 != model.metadata.end())
+                    n_experts = it2->second.asUInt64();
+            }
+            if (n_experts > 0)
+            {
+                arch_oss << ", " << n_experts << " experts";
+                // top-k
+                uint64_t top_k = 0;
+                auto it_topk = model.metadata.find("expert_used_count");
+                if (it_topk != model.metadata.end())
+                    top_k = it_topk->second.asUInt64();
+                if (top_k == 0)
+                {
+                    auto it2 = model.metadata.find(model.architecture + ".expert_used_count");
+                    if (it2 != model.metadata.end())
+                        top_k = it2->second.asUInt64();
+                }
+                if (top_k > 0)
+                    arch_oss << ", top-" << top_k;
+            }
+            arch_oss << ")";
+            data.architecture = arch_oss.str();
+
+            // Vocab
+            std::ostringstream vocab_oss;
+            if (model.vocab_size > 0)
+            {
+                // Format with comma separators
+                std::string vs = std::to_string(model.vocab_size);
+                std::string formatted;
+                int count = 0;
+                for (int i = static_cast<int>(vs.size()) - 1; i >= 0; --i)
+                {
+                    if (count > 0 && count % 3 == 0)
+                        formatted = "," + formatted;
+                    formatted = vs[static_cast<size_t>(i)] + formatted;
+                    count++;
+                }
+                vocab_oss << formatted << " tokens";
+            }
+            data.vocab = vocab_oss.str();
+
+            // Thinking model detection
+            auto it_think = model.metadata.find("tokenizer.chat_template");
+            if (it_think != model.metadata.end())
+            {
+                const std::string &tmpl = it_think->second.asString();
+                if (tmpl.find("<think>") != std::string::npos)
+                    data.thinking = "Enabled (<think>...</think>)";
+            }
+        }
+
+        // Phase 4: Preflight checks (all passed if we got here)
+        {
+            // Host RAM — we know it passed since we're past validateMemoryPlan
+            PreflightCheckResult ram_check;
+            ram_check.name = "Host RAM (weight staging)";
+            ram_check.passed = true;
+            if (model_ctx_)
+            {
+                const auto &model = model_ctx_->model();
+                size_t weight_bytes = 0;
+                for (const auto &t : model.tensors)
+                    weight_bytes += t.size_bytes;
+                double weight_gb = static_cast<double>(weight_bytes) / (1024.0 * 1024.0 * 1024.0);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%.1f GB required", weight_gb);
+                ram_check.detail = buf;
+            }
+            data.preflight_checks.push_back(ram_check);
+
+            PreflightCheckResult mem_check;
+            mem_check.name = "Device memory (weights + KV + activ.)";
+            mem_check.passed = true;
+            mem_check.detail = "fits";
+            data.preflight_checks.push_back(mem_check);
+
+            PreflightCheckResult schema_check;
+            schema_check.name = "Weight schema validation";
+            schema_check.passed = true;
+            if (model_ctx_)
+            {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%lu tensors in model",
+                         static_cast<unsigned long>(model_ctx_->model().tensor_count));
+                schema_check.detail = buf;
+            }
+            data.preflight_checks.push_back(schema_check);
+        }
+
+        // Render and print
+        bool use_color = StartupBanner::shouldUseColor();
+        std::string banner = StartupBanner::render(data, use_color);
+
+        // Print directly to stderr (bypassing LOG_INFO) to preserve ANSI colors.
+        // LOG_INFO strips escape codes via its formatting pipeline.
+        if (!banner.empty())
+        {
+            std::print(stderr, "{}\n", banner);
+        }
     }
 
     bool OrchestrationRunner::buildComputeGraph()
@@ -1389,8 +1607,8 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[OrchestrationRunner] Execution strategy: MULTI-DEVICE (LOCAL TP)");
-        LOG_INFO("[OrchestrationRunner]   TP degree: " << plan_.local_tp_devices.size());
+        LOG_DEBUG("[OrchestrationRunner] Execution strategy: MULTI-DEVICE (LOCAL TP)");
+        LOG_DEBUG("[OrchestrationRunner]   TP degree: " << plan_.local_tp_devices.size());
 
         // Log each device
         for (size_t i = 0; i < plan_.local_tp_devices.size(); ++i)
@@ -1401,7 +1619,7 @@ namespace llaminar2
             {
                 weight_str = " (weight=" + std::to_string(plan_.local_tp_weights[i]) + ")";
             }
-            LOG_INFO("[OrchestrationRunner]   Device " << i << ": " << dev.toString() << weight_str);
+            LOG_DEBUG("[OrchestrationRunner]   Device " << i << ": " << dev.toString() << weight_str);
         }
 
         // Build config from execution plan via canonical factory
@@ -1409,9 +1627,9 @@ namespace llaminar2
         mdo_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
         mdo_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
 
-        LOG_INFO("[OrchestrationRunner] Multi-device precision config: activation="
-                 << activationPrecisionToString(mdo_config.activation_precision)
-                 << ", kv_cache=" << kvCachePrecisionToString(mdo_config.kv_cache_precision));
+        LOG_DEBUG("[OrchestrationRunner] Multi-device precision config: activation="
+                  << activationPrecisionToString(mdo_config.activation_precision)
+                  << ", kv_cache=" << kvCachePrecisionToString(mdo_config.kv_cache_precision));
 
         // Validate config
         if (!mdo_config.validate())
@@ -1448,8 +1666,8 @@ namespace llaminar2
             return setError("Invalid LOCAL PP plan: need >=2 devices and matching layer boundaries");
         }
 
-        LOG_INFO("[OrchestrationRunner] Execution strategy: LOCAL PIPELINE PARALLEL");
-        LOG_INFO("[OrchestrationRunner]   PP stages: " << pp_devices.size());
+        LOG_DEBUG("[OrchestrationRunner] Execution strategy: LOCAL PIPELINE PARALLEL");
+        LOG_DEBUG("[OrchestrationRunner]   PP stages: " << pp_devices.size());
 
         // Validate all devices exist
         const auto &dm = DeviceManager::instance();
@@ -1474,12 +1692,12 @@ namespace llaminar2
         for (size_t i = 0; i < mdo_config.pp_stages.size(); ++i)
         {
             const auto &stage = mdo_config.pp_stages[i];
-            LOG_INFO("[OrchestrationRunner]   Stage " << i << ": "
-                                                      << pp_devices[i].toString()
-                                                      << " layers [" << stage.first_layer << ", "
-                                                      << stage.last_layer << ") "
-                                                      << (stage.has_embedding ? "[+embed] " : "")
-                                                      << (stage.has_lm_head ? "[+lm_head] " : ""));
+            LOG_DEBUG("[OrchestrationRunner]   Stage " << i << ": "
+                                                       << pp_devices[i].toString()
+                                                       << " layers [" << stage.first_layer << ", "
+                                                       << stage.last_layer << ") "
+                                                       << (stage.has_embedding ? "[+embed] " : "")
+                                                       << (stage.has_lm_head ? "[+lm_head] " : ""));
         }
 
         if (!mdo_config.validate())
@@ -1539,20 +1757,20 @@ namespace llaminar2
         }
 
         // Log execution strategy decision
-        LOG_INFO("[OrchestrationRunner] Execution strategy: SINGLE-DEVICE");
-        LOG_INFO("[OrchestrationRunner]   Target device: " << device.toString());
-        LOG_INFO("[OrchestrationRunner]   Device source: " << device_source);
+        LOG_DEBUG("[OrchestrationRunner] Execution strategy: SINGLE-DEVICE");
+        LOG_DEBUG("[OrchestrationRunner]   Target device: " << device.toString());
+        LOG_DEBUG("[OrchestrationRunner]   Device source: " << device_source);
         if (device.is_cpu())
         {
-            LOG_INFO("[OrchestrationRunner]   Backend: CPU (OneDNN/AVX-512)");
+            LOG_DEBUG("[OrchestrationRunner]   Backend: CPU (OneDNN/AVX-512)");
         }
         else if (device.is_cuda())
         {
-            LOG_INFO("[OrchestrationRunner]   Backend: CUDA (GPU " << device.ordinal << ")");
+            LOG_DEBUG("[OrchestrationRunner]   Backend: CUDA (GPU " << device.ordinal << ")");
         }
         else if (device.is_rocm())
         {
-            LOG_INFO("[OrchestrationRunner]   Backend: ROCm (GPU " << device.ordinal << ")");
+            LOG_DEBUG("[OrchestrationRunner]   Backend: ROCm (GPU " << device.ordinal << ")");
         }
 
         // Build config from execution plan via canonical factory
@@ -1561,9 +1779,9 @@ namespace llaminar2
         runner_config.moe_expert_parallel_plan = config_.moe_expert_parallel_plan;
         runner_config.moe_expert_overlay_mpi_ctx = moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_;
 
-        LOG_INFO("[OrchestrationRunner] Single-device precision config: activation="
-                 << activationPrecisionToString(runner_config.activation_precision)
-                 << ", kv_cache=" << kvCachePrecisionToString(runner_config.kv_cache_precision));
+        LOG_DEBUG("[OrchestrationRunner] Single-device precision config: activation="
+                  << activationPrecisionToString(runner_config.activation_precision)
+                  << ", kv_cache=" << kvCachePrecisionToString(runner_config.kv_cache_precision));
 
         // Create runner via factory (returns IInferenceRunner)
         if (model_ctx_)
@@ -1769,10 +1987,10 @@ namespace llaminar2
                 if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
                 {
                     LOG_DEBUG("[MoE] Expert replication: "
-                             << current_replicas.num_replicated
-                             << " experts replicated (cap=" << max_replicas
-                             << " per rank/device, hot_cache="
-                             << config_.moe_hot_expert_cache.toString() << ")");
+                              << current_replicas.num_replicated
+                              << " experts replicated (cap=" << max_replicas
+                              << " per rank/device, hot_cache="
+                              << config_.moe_hot_expert_cache.toString() << ")");
                     LOG_DEBUG("[MoE] Keeping base expert ownership stable while applying hot-expert replicas");
                     if (!replica_state_changed)
                     {
@@ -1781,9 +1999,9 @@ namespace llaminar2
                     else if (replica_arrivals.num_replicated < current_replicas.num_replicated)
                     {
                         LOG_DEBUG("[MoE] Transferring " << replica_arrivals.num_replicated
-                                                       << " newly-arrived hot replicas; "
-                                                       << (current_replicas.num_replicated - replica_arrivals.num_replicated)
-                                                       << " already resident");
+                                                        << " newly-arrived hot replicas; "
+                                                        << (current_replicas.num_replicated - replica_arrivals.num_replicated)
+                                                        << " already resident");
                     }
                 }
                 controller->resetRebalanceWindow();
@@ -1822,7 +2040,7 @@ namespace llaminar2
                 received = transferExpertWeights(manifest, controller->numLayers());
         }
 
-        const int socket_id = mpi_ctx_ ? mpi_ctx_->rank() : 0;
+        const int socket_id = mpi_ctx_ ? mpi_ctx_->local_rank() : 0;
         if (!gpu_cache_masks.empty())
         {
             if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks))
@@ -2022,7 +2240,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
-                                         << " entering worker loop");
+                                          << " entering worker loop");
 
         while (true)
         {
@@ -2090,7 +2308,7 @@ namespace llaminar2
             case MPICommand::SHUTDOWN:
             {
                 LOG_DEBUG("[MPIWorkerLoop] Rank " << mpi_ctx_->rank()
-                                                 << " received SHUTDOWN");
+                                                  << " received SHUTDOWN");
                 return;
             }
 

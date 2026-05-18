@@ -103,9 +103,9 @@ namespace llaminar2
                 if (shmem->initialize(group))
                 {
                     backend_ = std::move(shmem);
-                    LOG_INFO("GlobalTPContext: Using ShmemSpinBackend for domain " << domain_id_
-                                                                                   << " (same-node UPI fast path, domain_size="
-                                                                                   << domain_size_ << ")");
+                    LOG_DEBUG("GlobalTPContext: Using ShmemSpinBackend for domain " << domain_id_
+                                                                                    << " (same-node UPI fast path, domain_size="
+                                                                                    << domain_size_ << ")");
                 }
                 else
                 {
@@ -123,10 +123,10 @@ namespace llaminar2
                 if (backend_)
                 {
                     LOG_DEBUG("GlobalTPContext: Using UPICollectiveBackend for domain " << domain_id_
-                                                                                         << " (domain_size=" << domain_size_
-                                                                                         << ", all_same_node=" << all_same_node_
-                                                                                         << ", requested_backend="
-                                                                                         << collectiveBackendTypeToString(backend_type_) << ")");
+                                                                                        << " (domain_size=" << domain_size_
+                                                                                        << ", all_same_node=" << all_same_node_
+                                                                                        << ", requested_backend="
+                                                                                        << collectiveBackendTypeToString(backend_type_) << ")");
                 }
             }
             else
@@ -270,7 +270,7 @@ namespace llaminar2
             domain_size,
             std::move(world_ranks),
             true, // owns_communicator = true (we created it)
-                backend_type,
+            backend_type,
             std::move(detection.node_ids)));
     }
 
@@ -310,7 +310,7 @@ namespace llaminar2
             domain_size,
             std::move(world_ranks),
             false, // owns_communicator = false (test owns it)
-                backend_type,
+            backend_type,
             std::move(node_ids)));
     }
 

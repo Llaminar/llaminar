@@ -676,7 +676,7 @@ namespace llaminar2
                 cmd_str << cmd[i];
             }
         }
-        LOG_INFO("[MPIBootstrap] Launching: " << cmd_str.str());
+        LOG_DEBUG("[MPIBootstrap] Launching: " << cmd_str.str());
 
         // Replace current process with mpirun
         execvp("mpirun", c_argv.data());

@@ -280,6 +280,21 @@ namespace llaminar2
             int expert_id, int d_model) override;
 
         // =================================================================
+        // Phase 5: Fully-grouped MoE prefill pipeline (graph-capturable)
+        // =================================================================
+
+        bool prepareExpertGroupsAsync(
+            ITensor *routing_indices, ITensor *routing_weights,
+            int seq_len, int num_experts, int top_k) override;
+
+        bool executeGroupedPrefillPipeline(
+            ITensor *hidden, ITensor *output,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            int seq_len, int d_model, int intermediate,
+            int num_experts, int top_k) override;
+
+        // =================================================================
         // ITensorKernel interface
         // =================================================================
 
@@ -498,6 +513,20 @@ namespace llaminar2
         float *d_group_weights_ = nullptr;     ///< [total_slots] grouped routing weights
         int group_slots_cap_ = 0;              ///< capacity for total_slots buffers
         int group_experts_cap_ = 0;            ///< capacity for num_experts buffers
+
+        // Phase 5: Grouped prefill pipeline scratch buffers
+        int8_t *d_prefill_A_int8_ = nullptr;       ///< [prefill_slots_cap_, max(d_model,intermediate)]
+        float *d_prefill_A_scales_ = nullptr;      ///< [prefill_slots_cap_, max_blocks_per_row]
+        float *d_prefill_gate_ = nullptr;          ///< [prefill_slots_cap_, intermediate]
+        float *d_prefill_up_ = nullptr;            ///< [prefill_slots_cap_, intermediate]
+        int8_t *d_prefill_swiglu_int8_ = nullptr;  ///< [prefill_slots_cap_, intermediate]
+        float *d_prefill_swiglu_scales_ = nullptr; ///< [prefill_slots_cap_, blocks_per_intermediate]
+        float *d_prefill_down_out_ = nullptr;      ///< [prefill_slots_cap_, d_model]
+        int prefill_slots_cap_ = 0;                ///< Current capacity (total_slots)
+        int prefill_d_model_cap_ = 0;              ///< Current d_model capacity
+        int prefill_intermediate_cap_ = 0;         ///< Current intermediate capacity
+
+        bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
     };
 
 } // namespace llaminar2

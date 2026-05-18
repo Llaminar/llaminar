@@ -116,7 +116,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_INFO("[Main] Startup thread affinity verification passed");
+                LOG_DEBUG("[Main] Startup thread affinity verification passed");
             }
         }
 
@@ -153,8 +153,8 @@ namespace llaminar2
 
             if (mpi_ctx->rank() == 0)
             {
-                LOG_INFO("[Main] CPU shorthand runtime mapping enabled: GLOBAL TP degree="
-                         << config.tp_degree << ", world_size=" << mpi_ctx->world_size());
+                LOG_DEBUG("[Main] CPU shorthand runtime mapping enabled: GLOBAL TP degree="
+                          << config.tp_degree << ", world_size=" << mpi_ctx->world_size());
             }
         }
 
@@ -255,7 +255,8 @@ namespace llaminar2
 
             if (debugEnv().moe_expert_overlay.trace && mpi_ctx->rank() == 0)
             {
-                LOG_INFO("[MoEExpertOverlayExecutionPlan]\n" << overlay_execution_plan->diagnostics());
+                LOG_INFO("[MoEExpertOverlayExecutionPlan]\n"
+                         << overlay_execution_plan->diagnostics());
             }
         }
 
@@ -350,9 +351,9 @@ namespace llaminar2
                     {
                         if (mpi_ctx->rank() == 0)
                         {
-                            LOG_INFO("Using model-specific chat template override for '"
-                                     << architecture << "' ("
-                                     << model_template->size() << " bytes)");
+                            LOG_DEBUG("Using model-specific chat template override for '"
+                                      << architecture << "' ("
+                                      << model_template->size() << " bytes)");
                         }
                         tokenizer->setChatTemplate(
                             ChatTemplate::create(*model_template, "", ""));

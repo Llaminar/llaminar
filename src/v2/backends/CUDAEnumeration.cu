@@ -35,7 +35,7 @@ namespace llaminar2
                 return devices;
             }
 
-            LOG_INFO("[CUDA] Found " << device_count << " CUDA device(s)");
+            LOG_DEBUG("[CUDA] Found " << device_count << " CUDA device(s)");
 
             // Save current device to restore after enumeration
             // (enumeration changes current device via cudaSetDevice for memory queries)
@@ -90,9 +90,9 @@ namespace llaminar2
                 dev.supports_bf16 = (prop.major >= 8); // Ampere (SM 8.0+)
                 dev.supports_int8 = (prop.major >= 6); // DP4A on Pascal+
 
-                LOG_INFO("[CUDA] Device " << i << ": " << dev.name
-                                          << " (SM " << prop.major << "." << prop.minor
-                                          << ", " << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
+                LOG_DEBUG("[CUDA] Device " << i << ": " << dev.name
+                                           << " (SM " << prop.major << "." << prop.minor
+                                           << ", " << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
 
                 // Read PCIe link information from sysfs
                 dev.pcie = pcie_enumeration::read_pcie_link_info(

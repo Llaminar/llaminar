@@ -434,8 +434,8 @@ TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonic
                             "--moe-expert-overlay", "tiered",
                             "--moe-expert-overlay-continuation", "rocm_hot",
                             "--moe-expert-overlay-shared-domain", "rocm_hot",
-                            "--moe-expert-overlay-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;compute=tensor_parallel_experts;owner=0",
-                            "--moe-expert-overlay-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=tensor_parallel_experts;ranks=0,1",
+                            "--moe-expert-overlay-domain", "rocm_hot=0:rocm:0,0:rocm:1;weights=0.60,0.40;scope=local;backend=rccl;compute=expert_id_sharded;owner=0",
+                            "--moe-expert-overlay-domain", "cpu_cold=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;compute=expert_id_sharded;ranks=0,1",
                             "--moe-expert-overlay-tier", "hot@rocm_hot;priority=0",
                             "--moe-expert-overlay-tier", "cold@cpu_cold;priority=1;fallback=true"};
 
@@ -457,7 +457,7 @@ TEST(Test__OrchestrationConfigParser, Phase9B_NamedAndOverlayDomainsShareCanonic
     EXPECT_EQ(named_domain.owner_rank, overlay_domain.owner_rank);
     EXPECT_EQ(named_domain.ranks, overlay_domain.ranks);
     EXPECT_EQ(named_domain.compute_kind, ExecutionDomainComputeKind::UNSPECIFIED);
-    EXPECT_EQ(overlay_domain.compute_kind, ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS);
+    EXPECT_EQ(overlay_domain.compute_kind, ExecutionDomainComputeKind::EXPERT_ID_SHARDED);
 
     const auto inventory = overlay_config.executionDomainDefinitions();
     ASSERT_EQ(inventory.size(), 2u);

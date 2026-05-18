@@ -111,8 +111,8 @@ namespace llaminar2
                 throw std::runtime_error("Failed to initialize HIP context on worker thread");
             }
 
-            LOG_INFO("[AMDDeviceContext] Created context for ROCm device " << device_ordinal
-                                                                           << " (" << device_name_ << ")");
+            LOG_DEBUG("[AMDDeviceContext] Created context for ROCm device " << device_ordinal
+                                                                            << " (" << device_name_ << ")");
         }
         catch (const std::exception &e)
         {

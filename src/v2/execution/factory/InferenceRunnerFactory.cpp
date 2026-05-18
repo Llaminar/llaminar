@@ -39,12 +39,17 @@
 #include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../execution/moe/MoEExpertParallelPlanner.h"
+#include "../../loaders/WeightLoadProgress.h"
+#include "../../loaders/WeightLoadProgressAggregator.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <future>
 #include <functional>
+#include <iomanip>
 #include <sstream>
 #include <thread>
 #include <unordered_set>
@@ -250,9 +255,9 @@ namespace llaminar2
                 {
                     graph_config.domain_tp_contexts[domain_name] = injected_tp_context;
                     LOG_DEBUG(log_prefix << " using injected "
-                                        << tpScopeToString(injected_tp_context->scope())
-                                        << " TP context for MoE continuation dense domain '"
-                                        << domain_name << "'");
+                                         << tpScopeToString(injected_tp_context->scope())
+                                         << " TP context for MoE continuation dense domain '"
+                                         << domain_name << "'");
                     continue;
                 }
 
@@ -311,6 +316,115 @@ namespace llaminar2
 
             return true;
         }
+
+        // =====================================================================
+        // Host RAM preflight check
+        // =====================================================================
+        // Reads /proc/meminfo MemAvailable to determine if the system has
+        // enough free RAM to hold the model weights during loading.
+        // For GPU: weights are staged in host RAM temporarily before H2D transfer.
+        // For CPU: weights remain in host RAM for the entire inference session.
+        // Returns 0 on error (check skipped).
+        size_t getAvailableHostRAM()
+        {
+#ifdef __linux__
+            FILE *meminfo = fopen("/proc/meminfo", "r");
+            if (!meminfo)
+                return 0;
+
+            size_t available_bytes = 0;
+            char line[256];
+            while (fgets(line, sizeof(line), meminfo))
+            {
+                if (strncmp(line, "MemAvailable:", 13) == 0)
+                {
+                    unsigned long kb = 0;
+                    if (sscanf(line + 13, "%lu", &kb) == 1)
+                        available_bytes = static_cast<size_t>(kb) * 1024ULL;
+                    break;
+                }
+            }
+            fclose(meminfo);
+            return available_bytes;
+#else
+            return 0; // Cannot check on non-Linux — skip preflight
+#endif
+        }
+
+        /// Compute total host RAM required for eager weight loading.
+        /// Sums GGUF tensor sizes for all weights that will be loaded by this rank.
+        size_t computeEagerLoadHostBytes(
+            const GGUFModel &model,
+            const std::vector<std::pair<std::string, bool>> &weights_to_load)
+        {
+            size_t total = 0;
+            for (const auto &[name, is_optional] : weights_to_load)
+            {
+                if (auto *info = model.findTensor(name))
+                    total += info->size_bytes;
+            }
+            // Global weights loaded separately
+            for (const char *global_name : {"output.weight", "token_embd.weight", "output_norm.weight"})
+            {
+                if (auto *info = model.findTensor(global_name))
+                    total += info->size_bytes;
+            }
+            return total;
+        }
+
+        bool hostRamPreflight(
+            const GGUFModel &model,
+            const std::vector<std::pair<std::string, bool>> &weights_to_load,
+            DeviceId device)
+        {
+            const size_t required_bytes = computeEagerLoadHostBytes(model, weights_to_load);
+            if (required_bytes == 0)
+                return true;
+
+            const size_t available_bytes = getAvailableHostRAM();
+            if (available_bytes == 0)
+            {
+                // Cannot determine — skip check (non-Linux or /proc not available)
+                LOG_DEBUG("[HostRAM] Cannot determine available RAM — skipping preflight");
+                return true;
+            }
+
+            // Safety margin: max(2 GB, 10% of required)
+            const size_t safety_margin = std::max<size_t>(
+                2ULL * 1024 * 1024 * 1024,
+                required_bytes / 10);
+
+            const size_t needed_with_margin = required_bytes + safety_margin;
+
+            const double required_gb = static_cast<double>(required_bytes) / (1024.0 * 1024.0 * 1024.0);
+            const double available_gb = static_cast<double>(available_bytes) / (1024.0 * 1024.0 * 1024.0);
+
+            if (needed_with_margin <= available_bytes)
+            {
+                LOG_DEBUG("[HostRAM] Preflight passed: need "
+                          << std::fixed << std::setprecision(1) << required_gb
+                          << " GB, available " << available_gb << " GB"
+                          << (device.is_gpu() ? " (temporary staging for GPU transfer)" : " (retained for CPU inference)"));
+                return true;
+            }
+
+            // Failure — construct helpful error message
+            const double margin_gb = static_cast<double>(safety_margin) / (1024.0 * 1024.0 * 1024.0);
+            LOG_ERROR("[HostRAM] Insufficient host memory for weight loading.\n"
+                      << "  Required:  " << std::fixed << std::setprecision(1) << required_gb << " GB (model weights)\n"
+                      << "  Margin:    " << margin_gb << " GB (safety headroom)\n"
+                      << "  Available: " << available_gb << " GB (system MemAvailable)\n"
+                      << "  Device:    " << device.to_string()
+                      << (device.is_gpu() ? " (host RAM needed temporarily for GPU transfer)" : " (host RAM retained for CPU inference)")
+                      << "\n"
+                      << "  Mitigations:\n"
+                      << "    - Free system memory (close other applications)\n"
+                      << "    - Use a smaller or more quantized model\n"
+                      << "    - Set LLAMINAR_WEIGHT_STREAMING=1 for GPU (streams weights on demand)\n"
+                      << "    - Use tensor parallelism across machines (-tp with MPI sharding)");
+            return false;
+        }
+
     } // namespace
 
     bool applyMoEExpertOverlayConfigToGraphForTesting(
@@ -845,10 +959,10 @@ namespace llaminar2
         graph_config.moe.local_expert_count = count;
 
         LOG_DEBUG("[InferenceRunner] MoE expert mode="
-                 << moeExpertModeToString(graph_config.moe.expert_mode)
-                 << " participant=" << participant_index << "/" << participants
-                 << " expert_range=[" << start << ", " << (start + count) << ")"
-                 << " count=" << count << "/" << graph_config.moe.num_experts);
+                  << moeExpertModeToString(graph_config.moe.expert_mode)
+                  << " participant=" << participant_index << "/" << participants
+                  << " expert_range=[" << start << ", " << (start + count) << ")"
+                  << " count=" << count << "/" << graph_config.moe.num_experts);
         return true;
     }
 
@@ -911,8 +1025,8 @@ namespace llaminar2
         graph_config.tp_device_idx = device_idx;
 
         LOG_DEBUG("[InferenceRunner] Injected GlobalTPContext: degree=" << degree
-                                                                       << " device_idx=" << device_idx
-                                                                       << " domainId=" << global_tp_ctx->domainId());
+                                                                        << " device_idx=" << device_idx
+                                                                        << " domainId=" << global_tp_ctx->domainId());
         LOG_DEBUG("[InferenceRunner] Global TP QKV: head_start=" << assignment.head_start
                                                                  << " local_n_heads=" << assignment.head_count << "/" << graph_config.n_heads);
         LOG_DEBUG("[InferenceRunner] Global TP FFN: d_ff_local=" << assignment.d_ff_count << "/" << graph_config.d_ff);
@@ -986,10 +1100,10 @@ namespace llaminar2
         const auto &weights = local_tp_ctx->weights();
         const float my_weight = weights.empty() ? (1.0f / tp_degree) : weights[device_idx];
         LOG_DEBUG("[InferenceRunner] LOCAL TP enabled: degree=" << tp_degree
-                                                               << " device_idx=" << device_idx
-                                                               << " device=" << devices[device_idx].toString()
-                                                               << " weight=" << (my_weight * 100.0f) << "%"
-                                                               << " backend=" << static_cast<int>(local_tp_ctx->backend()));
+                                                                << " device_idx=" << device_idx
+                                                                << " device=" << devices[device_idx].toString()
+                                                                << " weight=" << (my_weight * 100.0f) << "%"
+                                                                << " backend=" << static_cast<int>(local_tp_ctx->backend()));
         LOG_DEBUG("[InferenceRunner] LOCAL TP QKV: head_start=" << assignment.head_start
                                                                 << " local_n_heads=" << assignment.head_count << "/" << graph_config.n_heads
                                                                 << " local_n_kv_heads=" << assignment.kv_head_count << "/" << graph_config.n_kv_heads);
@@ -1039,9 +1153,9 @@ namespace llaminar2
         graph_config.lm_head_column_parallel = true;
 
         LOG_DEBUG("[InferenceRunner] Using TensorParallelConfig (proportional split): "
-                 << "rank=" << current_rank << "/" << tp_config->worldSize()
-                 << " device=" << assignment.device.to_string()
-                 << " work_fraction=" << (assignment.work_fraction * 100.0f) << "%");
+                  << "rank=" << current_rank << "/" << tp_config->worldSize()
+                  << " device=" << assignment.device.to_string()
+                  << " work_fraction=" << (assignment.work_fraction * 100.0f) << "%");
         LOG_DEBUG("[InferenceRunner] QKV: head_start=" << graph_config.head_start
                                                        << " local_n_heads=" << graph_config.local_n_heads << "/" << graph_config.n_heads
                                                        << " local_n_kv_heads=" << graph_config.local_n_kv_heads << "/" << graph_config.n_kv_heads);
@@ -1315,10 +1429,10 @@ namespace llaminar2
             graph_config.n_layers = config.pp_stage_config->layerCount();
             graph_config.pp_layer_offset = config.pp_stage_config->first_layer;
             LOG_DEBUG("[InferenceRunner] PP stage graph config: layers=["
-                     << config.pp_stage_config->first_layer << ", "
-                     << config.pp_stage_config->last_layer << ")"
-                     << " has_embedding=" << (config.pp_stage_config->has_embedding ? "yes" : "no")
-                     << " has_lm_head=" << (config.pp_stage_config->has_lm_head ? "yes" : "no"));
+                      << config.pp_stage_config->first_layer << ", "
+                      << config.pp_stage_config->last_layer << ")"
+                      << " has_embedding=" << (config.pp_stage_config->has_embedding ? "yes" : "no")
+                      << " has_lm_head=" << (config.pp_stage_config->has_lm_head ? "yes" : "no"));
         }
 
         // =====================================================================
@@ -1334,8 +1448,8 @@ namespace llaminar2
             turboquant_ctx = std::make_shared<TurboQuantContext>(graph_config.head_dim);
             graph_config.turboquant_ctx = turboquant_ctx.get();
             LOG_DEBUG("[InferenceRunner] TurboQuant context created for "
-                     << kvCachePrecisionToString(config.kv_cache_precision)
-                     << " KV cache (head_dim=" << graph_config.head_dim << ")");
+                      << kvCachePrecisionToString(config.kv_cache_precision)
+                      << " KV cache (head_dim=" << graph_config.head_dim << ")");
         }
 
         // =====================================================================
@@ -1354,9 +1468,9 @@ namespace llaminar2
                 graph_config.head_dim, graph_config.head_dim, /*seed=*/42);
             graph_config.kv_rotation = kv_rotation.get();
             LOG_DEBUG("[InferenceRunner] KV rotation created for Q16_1 cache"
-                     << " (block_dim=" << graph_config.head_dim
-                     << ", kv_cache_scale_k=" << graph_config.kv_cache_scale_k
-                     << ", kv_cache_scale_v=" << graph_config.kv_cache_scale_v << ")");
+                      << " (block_dim=" << graph_config.head_dim
+                      << ", kv_cache_scale_k=" << graph_config.kv_cache_scale_k
+                      << ", kv_cache_scale_v=" << graph_config.kv_cache_scale_v << ")");
         }
 
         // =====================================================================
@@ -1430,9 +1544,9 @@ namespace llaminar2
             graph_config.tp_ctx = injected_global_tp_ctx;
             graph_config.tp_device_idx = config.tp_device_index;
             LOG_DEBUG("[InferenceRunner] Using injected GlobalTPContext: degree="
-                     << injected_global_tp_ctx->degree()
-                     << " myIndex=" << config.tp_device_index
-                     << " domainId=" << injected_global_tp_ctx->domainId());
+                      << injected_global_tp_ctx->degree()
+                      << " myIndex=" << config.tp_device_index
+                      << " domainId=" << injected_global_tp_ctx->domainId());
         }
         else if (mpi_ctx && mpi_ctx->world_size() > 1 && weights_sharded && !local_tp_ctx)
         {
@@ -1448,9 +1562,9 @@ namespace llaminar2
                 graph_config.tp_device_idx = ctx->myIndex();
                 global_tp_ctx = std::move(ctx);
                 LOG_DEBUG("[InferenceRunner] GlobalTPContext created: degree="
-                         << global_tp_ctx->degree()
-                         << " myIndex=" << global_tp_ctx->myIndex()
-                         << " backend=" << static_cast<int>(global_tp_ctx->backend()));
+                          << global_tp_ctx->degree()
+                          << " myIndex=" << global_tp_ctx->myIndex()
+                          << " backend=" << static_cast<int>(global_tp_ctx->backend()));
             }
             else
             {
@@ -1523,11 +1637,11 @@ namespace llaminar2
                     graph_config.moe.rebalance_mode = moe_controller->mode();
 
                     LOG_DEBUG("[InferenceRunner] MoE rebalance controller: mode="
-                             << moeRebalanceRuntimeModeToString(rebalance_config.mode)
-                             << " max_replicas=" << effective_replicas
-                             << " hot_cache=" << graph_config.moe.hot_expert_cache.toString()
-                             << " window=" << rebalance_config.window_size
-                             << " experts=" << graph_config.moe.num_experts);
+                              << moeRebalanceRuntimeModeToString(rebalance_config.mode)
+                              << " max_replicas=" << effective_replicas
+                              << " hot_cache=" << graph_config.moe.hot_expert_cache.toString()
+                              << " window=" << rebalance_config.window_size
+                              << " experts=" << graph_config.moe.num_experts);
                 }
             }
         }
@@ -1603,10 +1717,73 @@ namespace llaminar2
         // Load weights and configure orchestrator
         {
             ScopedWeightLoadDetailTimer timer("graph.build.configure_weights");
+
+            // Set up cross-rank progress aggregation (MPI collective — all ranks must participate).
+            // The aggregator uses MPI_Win_allocate to create a shared window for progress data.
+            // This MUST be unconditional (not gated on log level) since it's a collective.
+            std::shared_ptr<WeightLoadProgressAggregator> aggregator;
+            const int rank = mpi_ctx ? mpi_ctx->rank() : 0;
+            const int world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
+            if (mpi_ctx && world_size > 1)
+            {
+                aggregator = WeightLoadProgressAggregator::create(
+                    mpi_ctx->communicator(), rank, world_size);
+            }
+
+            // Set up progress renderer (rank 0 only, gated on log level)
+            std::shared_ptr<WeightLoadProgress> progress_tracker;
+            if (Logger::getInstance().shouldLog(LogLevel::WARN))
+            {
+                auto weight_mgr = model_ctx->concreteWeightManager();
+                if (weight_mgr && !weight_mgr->weightLoadProgress())
+                {
+                    progress_tracker = std::make_shared<WeightLoadProgress>(rank, world_size);
+                    if (aggregator)
+                    {
+                        progress_tracker->setAggregator(aggregator);
+                        aggregator->startPolling(progress_tracker);
+                    }
+                    weight_mgr->setWeightLoadProgress(progress_tracker);
+                }
+            }
+            else if (aggregator)
+            {
+                // Non-rendering ranks still need a progress tracker to publish to aggregator
+                auto weight_mgr = model_ctx->concreteWeightManager();
+                if (weight_mgr && !weight_mgr->weightLoadProgress())
+                {
+                    progress_tracker = std::make_shared<WeightLoadProgress>(rank, world_size);
+                    progress_tracker->setAggregator(aggregator);
+                    weight_mgr->setWeightLoadProgress(progress_tracker);
+                }
+            }
+
             if (!configureOrchestratorWeightsImpl(orchestrator.get(), model_ctx, device, config, graph_config))
             {
                 LOG_ERROR("[InferenceRunner] Failed to configure orchestrator weights");
                 return nullptr;
+            }
+
+            // Finalize progress display
+            {
+                // Stop aggregator polling and synchronize all ranks
+                if (aggregator)
+                {
+                    aggregator->stopPolling();
+                    aggregator->barrier();    // Ensures all ranks are done before summary
+                    aggregator->freeWindow(); // Collective — must be called while synchronized
+                }
+
+                auto weight_mgr = model_ctx->concreteWeightManager();
+                if (weight_mgr)
+                {
+                    auto progress = weight_mgr->weightLoadProgress();
+                    if (progress)
+                    {
+                        progress->finalize();
+                        weight_mgr->setWeightLoadProgress(nullptr);
+                    }
+                }
             }
         }
 
@@ -1794,6 +1971,49 @@ namespace llaminar2
 
         // Use validated weight list (only weights that exist in the model)
         auto &weights_to_load = validation.weights_to_load;
+        const auto &gguf_model = model_ctx->model();
+
+        // =====================================================================
+        // Host RAM preflight check: ensure enough memory before loading
+        // =====================================================================
+        if (!hostRamPreflight(gguf_model, weights_to_load, device))
+        {
+            WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
+            return false;
+        }
+
+        // =====================================================================
+        // CPU progress tracking: track the eager GGUF read phase (Phase 1).
+        // On CPU, this is the real bottleneck (disk I/O + tensor decode).
+        // On GPU, Phase 2 (H2D pipeline) is tracked separately and is the
+        // real bottleneck, so we skip Phase 1 progress for GPU devices.
+        // =====================================================================
+        int eager_progress_idx = -1;
+        std::atomic<size_t> eager_bytes_loaded{0};
+
+        if (device.is_cpu() && weight_mgr->weightLoadProgress())
+        {
+            // Compute total bytes from GGUF metadata (no disk I/O)
+            size_t total_eager_bytes = 0;
+            for (const auto &[name, is_optional] : weights_to_load)
+            {
+                if (auto *info = gguf_model.findTensor(name))
+                    total_eager_bytes += info->size_bytes;
+            }
+            // Include global weights
+            for (const char *global_name : {"output.weight", "token_embd.weight", "output_norm.weight"})
+            {
+                if (auto *info = gguf_model.findTensor(global_name))
+                    total_eager_bytes += info->size_bytes;
+            }
+
+            if (total_eager_bytes > 0)
+            {
+                eager_progress_idx = weight_mgr->weightLoadProgress()->registerDevice(
+                    weight_mgr->weightLoadProgress()->makeDeviceLabel(device.to_string()),
+                    total_eager_bytes);
+            }
+        }
 
         const unsigned hw_threads = std::max(1u, std::thread::hardware_concurrency());
         const unsigned target_workers = std::min<unsigned>(8u, hw_threads);
@@ -1839,6 +2059,16 @@ namespace llaminar2
                             first_error = weight_name;
                         }
                         return;
+                    }
+                }
+
+                // Update CPU eager-load progress bar
+                if (eager_progress_idx >= 0)
+                {
+                    if (auto *info = gguf_model.findTensor(weight_name))
+                    {
+                        size_t loaded = eager_bytes_loaded.fetch_add(info->size_bytes, std::memory_order_relaxed) + info->size_bytes;
+                        weight_mgr->weightLoadProgress()->update(eager_progress_idx, loaded);
                     }
                 }
             }
@@ -1921,6 +2151,20 @@ namespace llaminar2
                 weight_mgr->getWeightForDevice("output_norm.weight");
 
             LOG_DEBUG("[InferenceRunner] Global weights loaded into cache");
+
+            // Update progress with global weights and finish
+            if (eager_progress_idx >= 0)
+            {
+                for (const char *global_name : {"output.weight", "token_embd.weight", "output_norm.weight"})
+                {
+                    if (auto *info = gguf_model.findTensor(global_name))
+                    {
+                        size_t loaded = eager_bytes_loaded.fetch_add(info->size_bytes, std::memory_order_relaxed) + info->size_bytes;
+                        weight_mgr->weightLoadProgress()->update(eager_progress_idx, loaded);
+                    }
+                }
+                weight_mgr->weightLoadProgress()->finish(eager_progress_idx);
+            }
         }
 
         configureWeightManagerForGraph(
@@ -2399,8 +2643,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[UnifiedPipeline] Created runner with "
-                 << pipeline_config->numStages() << " PP stages, "
-                 << pipeline_config->total_layers << " layers");
+                  << pipeline_config->numStages() << " PP stages, "
+                  << pipeline_config->total_layers << " layers");
 
         return orchestrator;
     }
@@ -2584,10 +2828,10 @@ namespace llaminar2
         // =====================================================================
 
         LOG_DEBUG("[PPStageRunner] PP stage runner created successfully: "
-                 << "layers=[" << pp_config.first_layer << ", " << pp_config.last_layer << ") "
-                 << "has_embedding=" << pp_config.has_embedding
-                 << " has_lm_head=" << pp_config.has_lm_head
-                 << " device=" << device.to_string());
+                  << "layers=[" << pp_config.first_layer << ", " << pp_config.last_layer << ") "
+                  << "has_embedding=" << pp_config.has_embedding
+                  << " has_lm_head=" << pp_config.has_lm_head
+                  << " device=" << device.to_string());
 
         return orchestrator;
     }
@@ -3016,8 +3260,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[InferenceRunner] Creating RankOrchestrator with "
-                 << config.devices.size() << " devices, backend="
-                 << static_cast<int>(config.backend));
+                  << config.devices.size() << " devices, backend="
+                  << static_cast<int>(config.backend));
 
         try
         {

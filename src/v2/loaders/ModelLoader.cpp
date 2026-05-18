@@ -444,15 +444,18 @@ namespace llaminar2
         // Memory-map the file for zero-syscall tensor loading.
         // Pass NUMA node so mmap pages are bound to the correct socket,
         // avoiding cross-NUMA bandwidth penalties during GEMV decode.
-        const int mmap_numa_node = factory_ ? factory_->getNumaNode() : -1;
+        // For GPU targets, skip NUMA binding entirely — weights go to VRAM anyway,
+        // and MAP_POPULATE gives the fastest sequential I/O (no page cache eviction).
+        const int mmap_numa_node = target_is_gpu_ ? -1 : (factory_ ? factory_->getNumaNode() : -1);
         if (use_mmap_)
         {
             mmap_region_ = MmapRegion::create(file_path, mmap_numa_node, skip_mmap_cache_eviction_);
             if (mmap_region_)
             {
                 LOG_DEBUG("[ModelLoader] mmap enabled: " << file_path
-                                                        << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)"
-                                                        << (skip_mmap_cache_eviction_ ? " [cache-warm]" : ""));
+                                                         << " (" << (mmap_region_->size() / (1024 * 1024)) << " MB)"
+                                                         << (skip_mmap_cache_eviction_ ? " [cache-warm]" : "")
+                                                         << (target_is_gpu_ ? " [gpu-target, no NUMA bind]" : ""));
 
                 // If multi-part, also mmap the split files
                 if (model_.split_count > 1)
@@ -1629,26 +1632,66 @@ namespace llaminar2
                 // This handles all quantized types without a massive switch
                 switch (ttype)
                 {
-                case TensorType::Q4_0: tensor = std::make_shared<Q4_0Tensor>(slice_shape, raw); break;
-                case TensorType::Q4_1: tensor = std::make_shared<Q4_1Tensor>(slice_shape, raw); break;
-                case TensorType::Q5_0: tensor = std::make_shared<Q5_0Tensor>(slice_shape, raw); break;
-                case TensorType::Q5_1: tensor = std::make_shared<Q5_1Tensor>(slice_shape, raw); break;
-                case TensorType::Q8_0: tensor = std::make_shared<Q8_0Tensor>(slice_shape, raw); break;
-                case TensorType::Q2_K: tensor = std::make_shared<Q2_KTensor>(slice_shape, raw); break;
-                case TensorType::Q3_K: tensor = std::make_shared<Q3_KTensor>(slice_shape, raw); break;
-                case TensorType::Q4_K: tensor = std::make_shared<Q4_KTensor>(slice_shape, raw); break;
-                case TensorType::Q5_K: tensor = std::make_shared<Q5_KTensor>(slice_shape, raw); break;
-                case TensorType::Q6_K: tensor = std::make_shared<Q6_KTensor>(slice_shape, raw); break;
-                case TensorType::Q8_K: tensor = std::make_shared<Q8_KTensor>(slice_shape, raw); break;
-                case TensorType::IQ4_NL: tensor = std::make_shared<IQ4_NLTensor>(slice_shape, raw); break;
-                case TensorType::IQ4_XS: tensor = std::make_shared<IQ4_XSTensor>(slice_shape, raw); break;
-                case TensorType::IQ3_S: tensor = std::make_shared<IQ3_STensor>(slice_shape, raw); break;
-                case TensorType::IQ3_XXS: tensor = std::make_shared<IQ3_XXSTensor>(slice_shape, raw); break;
-                case TensorType::IQ2_S: tensor = std::make_shared<IQ2_STensor>(slice_shape, raw); break;
-                case TensorType::IQ2_XS: tensor = std::make_shared<IQ2_XSTensor>(slice_shape, raw); break;
-                case TensorType::IQ2_XXS: tensor = std::make_shared<IQ2_XXSTensor>(slice_shape, raw); break;
-                case TensorType::IQ1_S: tensor = std::make_shared<IQ1_STensor>(slice_shape, raw); break;
-                case TensorType::IQ1_M: tensor = std::make_shared<IQ1_MTensor>(slice_shape, raw); break;
+                case TensorType::Q4_0:
+                    tensor = std::make_shared<Q4_0Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q4_1:
+                    tensor = std::make_shared<Q4_1Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q5_0:
+                    tensor = std::make_shared<Q5_0Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q5_1:
+                    tensor = std::make_shared<Q5_1Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q8_0:
+                    tensor = std::make_shared<Q8_0Tensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q2_K:
+                    tensor = std::make_shared<Q2_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q3_K:
+                    tensor = std::make_shared<Q3_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q4_K:
+                    tensor = std::make_shared<Q4_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q5_K:
+                    tensor = std::make_shared<Q5_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q6_K:
+                    tensor = std::make_shared<Q6_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::Q8_K:
+                    tensor = std::make_shared<Q8_KTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ4_NL:
+                    tensor = std::make_shared<IQ4_NLTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ4_XS:
+                    tensor = std::make_shared<IQ4_XSTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ3_S:
+                    tensor = std::make_shared<IQ3_STensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ3_XXS:
+                    tensor = std::make_shared<IQ3_XXSTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ2_S:
+                    tensor = std::make_shared<IQ2_STensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ2_XS:
+                    tensor = std::make_shared<IQ2_XSTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ2_XXS:
+                    tensor = std::make_shared<IQ2_XXSTensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ1_S:
+                    tensor = std::make_shared<IQ1_STensor>(slice_shape, raw);
+                    break;
+                case TensorType::IQ1_M:
+                    tensor = std::make_shared<IQ1_MTensor>(slice_shape, raw);
+                    break;
                 default:
                     LOG_ERROR("[ModelLoader] Unsupported quantized type for expert slicing: " << static_cast<int>(ttype));
                     return nullptr;

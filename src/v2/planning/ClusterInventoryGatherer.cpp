@@ -10,6 +10,7 @@
 
 #include "planning/ClusterInventoryGatherer.h"
 #include "backends/ComputeBackend.h"
+#include "backends/HardwareInventory.h"
 #include "utils/Logger.h"
 #include "utils/MPITopology.h"
 #include "utils/NodeDetection.h"
@@ -62,6 +63,51 @@ namespace llaminar2
             }
         };
 
+        // Detect CPU hardware once for enriching RankInventory
+        auto hw = HardwareInventory::detect();
+
+        // Helper to enrich a RankInventory with detected CPU hardware.
+        // Each rank reports its LOCAL socket's cores/threads (local_rank = socket index).
+        // Machine-wide topology (cpu_sockets count, cpu_socket_info) is preserved for display.
+        auto enrichCPUInfo = [&](RankInventory &ri)
+        {
+            const int num_sockets = static_cast<int>(hw.cpu_sockets.size());
+            ri.cpu_sockets = num_sockets;
+            ri.numa_nodes = num_sockets;
+            ri.cpu_socket_info = hw.cpu_sockets;
+
+            // Determine which socket this rank owns (local_rank maps to socket index)
+            int my_socket = ri.local_rank;
+            if (my_socket >= 0 && my_socket < num_sockets)
+            {
+                const auto &sock = hw.cpu_sockets[my_socket];
+                ri.cpu_cores = sock.num_physical_cores();
+                ri.cpu.compute_units = sock.num_threads();
+                ri.cpu.memory_bytes = sock.memory_bytes;
+                ri.cpu_memory_bytes = sock.memory_bytes;
+                if (!sock.model_name.empty())
+                    ri.cpu.name = sock.model_name;
+            }
+            else
+            {
+                // Fallback: single-rank or unknown mapping — report full machine
+                int total_cores = 0, total_threads = 0;
+                size_t total_mem = 0;
+                for (const auto &sock : hw.cpu_sockets)
+                {
+                    total_cores += sock.num_physical_cores();
+                    total_threads += sock.num_threads();
+                    total_mem += sock.memory_bytes;
+                }
+                ri.cpu_cores = total_cores;
+                ri.cpu.compute_units = total_threads;
+                ri.cpu.memory_bytes = total_mem;
+                ri.cpu_memory_bytes = total_mem > 0 ? total_mem : ri.cpu_memory_bytes;
+                if (!hw.cpu_sockets.empty() && !hw.cpu_sockets[0].model_name.empty())
+                    ri.cpu.name = hw.cpu_sockets[0].model_name;
+            }
+        };
+
         // For single-rank execution, create a simple inventory
         if (!mpi_ctx || mpi_ctx->world_size() == 1)
         {
@@ -75,13 +121,19 @@ namespace llaminar2
             // Add CPU by default
             rank_inv.cpu.type = DeviceType::CPU;
             rank_inv.cpu.local_device_id = 0;
-            rank_inv.cpu_cores = 1;
 
-            // Query system RAM via POSIX sysconf
-            long pages = sysconf(_SC_PHYS_PAGES);
-            long page_size = sysconf(_SC_PAGE_SIZE);
-            if (pages > 0 && page_size > 0)
-                rank_inv.cpu_memory_bytes = static_cast<size_t>(pages) * static_cast<size_t>(page_size);
+            // Enrich with detected CPU hardware (sets cpu_cores, cpu_memory_bytes, etc.)
+            // Single-rank sees the full machine (local_rank=0, fallback path in enrichCPUInfo)
+            enrichCPUInfo(rank_inv);
+
+            // Fallback: if HardwareInventory didn't find NUMA memory, use sysconf
+            if (rank_inv.cpu_memory_bytes == 0)
+            {
+                long pages = sysconf(_SC_PHYS_PAGES);
+                long page_size = sysconf(_SC_PAGE_SIZE);
+                if (pages > 0 && page_size > 0)
+                    rank_inv.cpu_memory_bytes = static_cast<size_t>(pages) * static_cast<size_t>(page_size);
+            }
 
             // Enumerate actual GPUs from DeviceManager
             for (const auto &dev : devices)
@@ -115,11 +167,16 @@ namespace llaminar2
                 {
                     switch (dt)
                     {
-                    case DeviceType::CUDA:   return ComputeBackendType::GPU_CUDA;
-                    case DeviceType::ROCm:   return ComputeBackendType::GPU_ROCM;
-                    case DeviceType::Vulkan: return ComputeBackendType::GPU_VULKAN;
-                    case DeviceType::Metal:  return ComputeBackendType::GPU_METAL;
-                    default:                 return ComputeBackendType::CPU;
+                    case DeviceType::CUDA:
+                        return ComputeBackendType::GPU_CUDA;
+                    case DeviceType::ROCm:
+                        return ComputeBackendType::GPU_ROCM;
+                    case DeviceType::Vulkan:
+                        return ComputeBackendType::GPU_VULKAN;
+                    case DeviceType::Metal:
+                        return ComputeBackendType::GPU_METAL;
+                    default:
+                        return ComputeBackendType::CPU;
                     }
                 };
 
@@ -143,15 +200,15 @@ namespace llaminar2
                         gpu.compute_capability_major = dev.compute_capability / 10;
                         gpu.compute_capability_minor = dev.compute_capability % 10;
                         LOG_DEBUG("[gatherClusterInventory] Explicit TP device " << i << ": "
-                                  << dev.name << " (ordinal=" << addr.device_ordinal
-                                  << ", " << dev.total_memory_bytes / (1024 * 1024) << " MB total, "
-                                  << dev.free_memory_bytes / (1024 * 1024) << " MB free)");
+                                                                                 << dev.name << " (ordinal=" << addr.device_ordinal
+                                                                                 << ", " << dev.total_memory_bytes / (1024 * 1024) << " MB total, "
+                                                                                 << dev.free_memory_bytes / (1024 * 1024) << " MB free)");
                     }
                     else
                     {
                         LOG_WARN("[gatherClusterInventory] Explicit TP device " << i
-                                  << " (ordinal=" << addr.device_ordinal
-                                  << ") not found in DeviceManager — memory info unavailable");
+                                                                                << " (ordinal=" << addr.device_ordinal
+                                                                                << ") not found in DeviceManager — memory info unavailable");
                     }
                     rank_inv.gpus.push_back(gpu);
                 }
@@ -162,7 +219,7 @@ namespace llaminar2
             inventory.node_count = 1;
             inventory.total_gpus = static_cast<int>(rank_inv.gpus.size());
 
-            LOG_INFO("[gatherClusterInventory] Discovered " << inventory.total_gpus << " GPU(s)");
+            LOG_DEBUG("[gatherClusterInventory] Discovered " << inventory.total_gpus << " GPU(s)");
             return inventory;
         }
 
@@ -206,15 +263,9 @@ namespace llaminar2
         // Populate CPU info
         local_rank_inv.cpu.type = DeviceType::CPU;
         local_rank_inv.cpu.local_device_id = 0;
-        local_rank_inv.cpu_cores = 1;
 
-        // Query system RAM via POSIX sysconf
-        {
-            long pages = sysconf(_SC_PHYS_PAGES);
-            long page_size = sysconf(_SC_PAGE_SIZE);
-            if (pages > 0 && page_size > 0)
-                local_rank_inv.cpu_memory_bytes = static_cast<size_t>(pages) * static_cast<size_t>(page_size);
-        }
+        // Enrich with detected CPU hardware (sets cpu_cores, cpu_memory_bytes, etc.)
+        enrichCPUInfo(local_rank_inv);
 
         // Populate GPU info from DeviceManager
         for (const auto &dev : devices)
@@ -340,9 +391,9 @@ namespace llaminar2
         inventory.node_count = node_id_buf[world_size];
         inventory.buildNodeAggregations();
 
-        LOG_INFO("[gatherClusterInventory] Discovered " << inventory.total_gpus
-                                                        << " GPU(s) across " << world_size
-                                                        << " ranks on " << inventory.node_count << " node(s)");
+        LOG_DEBUG("[gatherClusterInventory] Discovered " << inventory.total_gpus
+                                                         << " GPU(s) across " << world_size
+                                                         << " ranks on " << inventory.node_count << " node(s)");
         return inventory;
     }
 

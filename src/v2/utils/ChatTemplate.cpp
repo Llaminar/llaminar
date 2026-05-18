@@ -348,10 +348,10 @@ namespace llaminar2
         std::string without_thinking = renderJinjaWithoutThinkingVar(test_messages, true);
 
         LOG_DEBUG("[ChatTemplate] detectThinkingTags: with_thinking (" << with_thinking.size()
-                                                                        << " chars), no_thinking ("
-                                                                        << no_thinking.size()
-                                                                        << " chars), without_thinking ("
-                                                                        << without_thinking.size() << " chars)");
+                                                                       << " chars), no_thinking ("
+                                                                       << no_thinking.size()
+                                                                       << " chars), without_thinking ("
+                                                                       << without_thinking.size() << " chars)");
 
         if (with_thinking.empty())
         {
@@ -496,9 +496,9 @@ namespace llaminar2
         if (is_thinking_model_)
         {
 
-            LOG_INFO("[ChatTemplate] Thinking model detected via Jinja differential rendering"
-                     << "\n  start_tag: \"" << thinking_start_tag_ << "\""
-                     << "\n  end_tag: \"" << thinking_end_tag_ << "\"");
+            LOG_DEBUG("[ChatTemplate] Thinking model detected via Jinja differential rendering"
+                      << "\n  start_tag: \"" << thinking_start_tag_ << "\""
+                      << "\n  end_tag: \"" << thinking_end_tag_ << "\"");
         }
     }
 

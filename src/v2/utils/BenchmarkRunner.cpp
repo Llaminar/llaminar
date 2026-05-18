@@ -288,7 +288,7 @@ namespace llaminar2
             prompt = generateDefaultPrompt();
             if (mpi_ctx_->rank() == 0)
             {
-                LOG_INFO("Using default benchmark prompt (~512 tokens)");
+                LOG_DEBUG("Using default benchmark prompt (~512 tokens)");
             }
         }
 
@@ -339,12 +339,12 @@ namespace llaminar2
 
         if (mpi_ctx_->rank() == 0)
         {
-            LOG_INFO("Benchmark configuration:");
-            LOG_INFO("  Prefill tokens: " << token_count);
-            LOG_INFO("  Decode tokens:  " << n_decode);
-            LOG_INFO("  Warmup runs:    " << WARMUP_ITERATIONS);
-            LOG_INFO("  Benchmark runs: " << BENCHMARK_ITERATIONS);
-            LOG_INFO("");
+            LOG_DEBUG("Benchmark configuration:");
+            LOG_DEBUG("  Prefill tokens: " << token_count);
+            LOG_DEBUG("  Decode tokens:  " << n_decode);
+            LOG_DEBUG("  Warmup runs:    " << WARMUP_ITERATIONS);
+            LOG_DEBUG("  Benchmark runs: " << BENCHMARK_ITERATIONS);
+            LOG_DEBUG("");
         }
 
         // Enable GPU-side greedy sampling to skip D2H logits gather during decode.
@@ -415,7 +415,7 @@ namespace llaminar2
             // transfers can evict hot data from LLC, causing the first benchmark
             // iteration to measure cold-cache performance).
             if (mpi_ctx_->rank() == 0)
-                LOG_INFO("Re-warming caches after post-warmup setup...");
+                LOG_DEBUG("Re-warming caches after post-warmup setup...");
             runner_->clear_cache();
             auto [rw_ok, rw_time] = runPrefill(tokens);
             if (rw_ok && n_decode > 0)
@@ -427,7 +427,6 @@ namespace llaminar2
 
         if (mpi_ctx_->rank() == 0)
         {
-            LOG_INFO("");
             LOG_INFO("Running " << BENCHMARK_ITERATIONS << " benchmark iterations...");
         }
 
@@ -558,8 +557,7 @@ namespace llaminar2
 
         if (mpi_ctx_->rank() == 0)
         {
-            LOG_INFO("");
-            LOG_INFO("Benchmark iterations complete.");
+            LOG_INFO("Benchmark complete.");
         }
 
         return result;

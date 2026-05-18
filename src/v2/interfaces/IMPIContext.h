@@ -69,6 +69,16 @@ namespace llaminar2
          */
         virtual bool is_root() const = 0;
 
+        /**
+         * @brief Get the node-local rank (0..ranks_per_node-1)
+         *
+         * Maps to the physical socket index under Llaminar's 1-rank-per-socket
+         * binding invariant. Defaults to global rank() for single-node setups.
+         *
+         * @return Local rank within the physical node
+         */
+        virtual int local_rank() const { return rank(); }
+
         // =========================================================================
         // MPI Communicator Access
         // =========================================================================

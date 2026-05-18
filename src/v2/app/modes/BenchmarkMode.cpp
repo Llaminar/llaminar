@@ -68,7 +68,7 @@ namespace llaminar2
 
         if (mpi_ctx->rank() == 0)
         {
-            LOG_INFO("Running benchmark mode...");
+            LOG_DEBUG("Running benchmark mode...");
         }
 
         auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
@@ -91,10 +91,10 @@ namespace llaminar2
                         orch_runner->applyMoERebalanceWithReplicas(/*log_histogram_summary=*/true);
                         if (mpi_ctx->rank() == 0)
                         {
-                            LOG_INFO("[MoE] Post-warmup setup complete"
-                                     << (controller->hasReplicas()
-                                         ? " (with per-token replica dispatch)"
-                                         : " (local rebalance only)"));
+                    LOG_DEBUG("[MoE] Post-warmup setup complete"
+                              << (controller->hasReplicas()
+                                  ? " (with per-token replica dispatch)"
+                                  : " (local rebalance only)"));
                         } });
                     // No per-step rebalancing — the post-warmup placement
                     // is used for all benchmark iterations.

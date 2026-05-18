@@ -51,6 +51,7 @@ namespace llaminar2
     class PreparedWeightStore;
     class MoEExpertOverlayRuntimePlan;
     struct MoEExpertOverlayExecutionPlan;
+    class WeightLoadProgress;
 
     /**
      * @brief Weight manager with distribution strategy and caching
@@ -543,8 +544,8 @@ namespace llaminar2
             has_lm_head_ = has_lm_head;
             has_layer_range_ = true;
             LOG_DEBUG("[WeightManager] Layer range set: layers [" << first_layer << ", " << last_layer
-                                                                 << "), embedding=" << (has_embedding ? "yes" : "no")
-                                                                 << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+                                                                  << "), embedding=" << (has_embedding ? "yes" : "no")
+                                                                  << ", lm_head=" << (has_lm_head ? "yes" : "no"));
         }
 
         /**
@@ -752,6 +753,23 @@ namespace llaminar2
             float fraction);
 
         // =========================================================================
+        // Progress Tracking
+        // =========================================================================
+
+        /// Set a shared progress tracker for weight loading visualization.
+        /// Must be set before calling prepareWeightsForDevice().
+        void setWeightLoadProgress(std::shared_ptr<WeightLoadProgress> progress)
+        {
+            weight_load_progress_ = std::move(progress);
+        }
+
+        /// Get the current progress tracker (may be null).
+        std::shared_ptr<WeightLoadProgress> weightLoadProgress() const
+        {
+            return weight_load_progress_;
+        }
+
+        // =========================================================================
         // Phase 9: Weight Lifecycle Gates
         // =========================================================================
 
@@ -950,6 +968,9 @@ namespace llaminar2
         // =========================================================================
         // Per-device tensor cache for multi-device scenarios (LOCAL TP)
         // =========================================================================
+
+        /// Progress tracker for weight loading (shared across devices)
+        std::shared_ptr<WeightLoadProgress> weight_load_progress_;
 
         /// Key: "device_type:ordinal:weight_name" e.g. "cuda:0:token_embd.weight"
         /// Value: Device-specific tensor clone, uploaded to that device

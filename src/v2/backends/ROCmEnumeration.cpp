@@ -45,7 +45,7 @@ namespace llaminar2
                 return devices;
             }
 
-            LOG_INFO("[ROCm] Found " << device_count << " ROCm device(s)");
+            LOG_DEBUG("[ROCm] Found " << device_count << " ROCm device(s)");
 
             // Save the current device so we can restore it after enumeration
             int saved_device = 0;
@@ -151,8 +151,8 @@ namespace llaminar2
                 dev.supports_bf16 = (arch_num >= 908);
                 dev.supports_int8 = (arch_num >= 906);
 
-                LOG_INFO("[ROCm] Device " << i << ": " << dev.name
-                                          << " (" << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
+                LOG_DEBUG("[ROCm] Device " << i << ": " << dev.name
+                                           << " (" << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
 
                 // Read PCIe link information from sysfs
                 dev.pcie = pcie_enumeration::read_pcie_link_info(

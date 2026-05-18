@@ -243,6 +243,17 @@ namespace llaminar2
         void setSkipMmapCacheEviction(bool skip) { skip_mmap_cache_eviction_ = skip; }
 
         /**
+         * @brief Indicate target device is GPU — skip NUMA mmap binding
+         *
+         * When enabled, mmap uses MAP_POPULATE (fast sequential kernel readahead)
+         * instead of NUMA-bound first-touch. For GPU inference, weights are uploaded
+         * to VRAM anyway, so NUMA placement of the host staging area doesn't matter.
+         *
+         * Must be called BEFORE loadModel().
+         */
+        void setTargetIsGpu(bool is_gpu) { target_is_gpu_ = is_gpu; }
+
+        /**
          * @brief Check if mmap is active (file successfully memory-mapped)
          */
         bool isMmapActive() const { return mmap_region_ != nullptr; }
@@ -412,7 +423,8 @@ namespace llaminar2
         uint64_t headCountKV() const override { return model_.head_count_kv; }
         uint64_t vocabSize() const override { return model_.vocab_size; }
         uint64_t contextLength() const override { return model_.context_length; }
-        uint64_t feedForwardLength() const override {
+        uint64_t feedForwardLength() const override
+        {
             uint64_t d_ff = getUInt64("feed_forward_length", 0);
             if (d_ff == 0)
             {
@@ -434,7 +446,7 @@ namespace llaminar2
             if (mmap_region_)
             {
                 LOG_DEBUG("[ModelLoader] Releasing mmap region ("
-                         << (mmap_region_->size() / (1024 * 1024)) << " MB)");
+                          << (mmap_region_->size() / (1024 * 1024)) << " MB)");
                 mmap_region_.reset();
             }
             for (auto &region : split_mmap_regions_)
@@ -442,7 +454,7 @@ namespace llaminar2
                 if (region)
                 {
                     LOG_DEBUG("[ModelLoader] Releasing split mmap region ("
-                             << (region->size() / (1024 * 1024)) << " MB)");
+                              << (region->size() / (1024 * 1024)) << " MB)");
                     region.reset();
                 }
             }
@@ -464,7 +476,7 @@ namespace llaminar2
             if (total > 0)
             {
                 LOG_DEBUG("[ModelLoader] Advised DONTNEED on mmap regions ("
-                         << (total / (1024 * 1024)) << " MB) — pages reclaimable by OS");
+                          << (total / (1024 * 1024)) << " MB) — pages reclaimable by OS");
             }
             return total;
         }
@@ -473,7 +485,7 @@ namespace llaminar2
         // Tensor factory (created internally if not provided)
         TensorFactory *factory_;
         std::unique_ptr<TensorFactory> owned_factory_; // Owned factory if created internally
-        std::shared_ptr<IMPIContext> owned_mpi_ctx_;    // Owned MPI context for owned factory
+        std::shared_ptr<IMPIContext> owned_mpi_ctx_;   // Owned MPI context for owned factory
 
         // Parsing helpers
         bool parseHeader();
@@ -532,6 +544,7 @@ namespace llaminar2
         // mmap state (when use_mmap_ is true)
         bool use_mmap_ = true;
         bool skip_mmap_cache_eviction_ = false;
+        bool target_is_gpu_ = false;
         std::shared_ptr<MmapRegion> mmap_region_;                     // Main file mmap (shared for zero-copy tensors)
         std::vector<std::shared_ptr<MmapRegion>> split_mmap_regions_; // Split file mmaps
 

@@ -418,6 +418,14 @@ namespace llaminar2
          */
         bool buildSingleDeviceComputeGraph();
 
+        /**
+         * @brief Print consolidated startup banner (rank 0 only).
+         *
+         * Called after all validation passes, before buildComputeGraph().
+         * Consolidates topology, config, model, and preflight info.
+         */
+        void printStartupBanner();
+
         // =====================================================================
         // Error Handling
         // =====================================================================

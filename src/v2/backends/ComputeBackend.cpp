@@ -593,7 +593,7 @@ namespace llaminar2
         }
         else
         {
-            LOG_INFO("[DeviceManager] CPU-only startup fast-path active: skipping GPU enumeration");
+            LOG_DEBUG("[DeviceManager] CPU-only startup fast-path active: skipping GPU enumeration");
         }
 
         // Filter CUDA devices by NUMA affinity

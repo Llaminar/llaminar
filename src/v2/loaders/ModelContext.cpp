@@ -208,6 +208,7 @@ namespace llaminar2
         // Configure mmap before loading (must precede loadModel)
         ctx->loader_.setUseMmap(config.use_mmap);
         ctx->loader_.setSkipMmapCacheEviction(config.skip_mmap_cache_eviction);
+        ctx->loader_.setTargetIsGpu(config.target_is_gpu);
 
         // Load model metadata
         try
@@ -295,8 +296,8 @@ namespace llaminar2
         ctx->pp_block_count_override_ = last_layer - first_layer;
 
         LOG_DEBUG("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
-                                                                        << "), embedding=" << (has_embedding ? "yes" : "no")
-                                                                        << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+                                                                         << "), embedding=" << (has_embedding ? "yes" : "no")
+                                                                         << ", lm_head=" << (has_lm_head ? "yes" : "no"));
 
         return ctx;
     }

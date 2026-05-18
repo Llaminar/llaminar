@@ -45,16 +45,16 @@ namespace llaminar2
         {
             int numa_node = g_cpu_numa_node.load();
             g_cpu_backend = new CPUBackend(numa_node);
-            LOG_INFO("[BackendManager] Initialized CPU backend (NUMA node: "
-                     << numa_node << ", memory: "
-                     << (g_cpu_backend->deviceMemoryTotal(0) / (1024 * 1024)) << " MB)");
+            LOG_DEBUG("[BackendManager] Initialized CPU backend (NUMA node: "
+                      << numa_node << ", memory: "
+                      << (g_cpu_backend->deviceMemoryTotal(0) / (1024 * 1024)) << " MB)");
         }
 
         void initCUDABackend()
         {
 #ifdef HAVE_CUDA
             g_cuda_backend = new CUDABackend();
-            LOG_INFO("[BackendManager] Initialized CUDA backend (" << g_cuda_backend->deviceCount() << " devices)");
+            LOG_DEBUG("[BackendManager] Initialized CUDA backend (" << g_cuda_backend->deviceCount() << " devices)");
 #else
             g_cuda_backend = nullptr;
             LOG_DEBUG("[BackendManager] CUDA backend not available (HAVE_CUDA not defined)");
@@ -65,7 +65,7 @@ namespace llaminar2
         {
 #ifdef HAVE_ROCM
             g_rocm_backend = new ROCmBackend();
-            LOG_INFO("[BackendManager] Initialized ROCm backend (" << g_rocm_backend->deviceCount() << " devices)");
+            LOG_DEBUG("[BackendManager] Initialized ROCm backend (" << g_rocm_backend->deviceCount() << " devices)");
 
             // Register hipBLAS GEMM kernel factory for DeviceKernelCache
             rocm::registerHipBLASGemmKernelFactory();

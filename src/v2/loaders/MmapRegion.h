@@ -240,10 +240,10 @@ namespace llaminar2
             ::munmap(buf, BUF_SIZE);
             ::close(fd);
 
-            LOG_INFO("[MmapRegion] Page cache pre-populated: " << file_path
-                                                               << " (" << (total_read / (1024 * 1024)) << " MB in "
-                                                               << std::fixed << std::setprecision(1) << secs << "s, "
-                                                               << std::fixed << std::setprecision(0) << mbps << " MB/s)");
+            LOG_DEBUG("[MmapRegion] Page cache pre-populated: " << file_path
+                                                                << " (" << (total_read / (1024 * 1024)) << " MB in "
+                                                                << std::fixed << std::setprecision(1) << secs << "s, "
+                                                                << std::fixed << std::setprecision(0) << mbps << " MB/s)");
             return total_read == file_size;
 #else
             (void)file_path;
@@ -268,7 +268,7 @@ namespace llaminar2
          * @return Unique pointer to MmapRegion, or nullptr on failure
          */
         static std::unique_ptr<MmapRegion> create(const std::string &file_path, int numa_node = -1,
-                                                   bool skip_cache_eviction = false)
+                                                  bool skip_cache_eviction = false)
         {
 #ifdef __linux__
             // Open file read-only

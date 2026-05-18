@@ -120,6 +120,7 @@ namespace llaminar2::test
         int rank() const override { return config_.rank; }
         int world_size() const override { return config_.world_size; }
         bool is_root() const override { return config_.rank == 0; }
+        int local_rank() const override { return config_.rank; }
         MPI_Comm communicator() const override { return MPI_COMM_NULL; }
 
         // =========================================================================
@@ -721,8 +722,8 @@ namespace llaminar2::test
 
     private:
         Config config_;
-        std::shared_ptr<IMPITopology> topology_;          ///< Optional attached topology
-        MPI_Comm intra_node_comm_ = MPI_COMM_NULL;        ///< Configurable intra-node communicator
+        std::shared_ptr<IMPITopology> topology_;   ///< Optional attached topology
+        MPI_Comm intra_node_comm_ = MPI_COMM_NULL; ///< Configurable intra-node communicator
 
         // Atomic call counters (thread-safe) - Collectives
         mutable std::atomic<size_t> barrier_calls_{0};

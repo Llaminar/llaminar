@@ -363,6 +363,32 @@ extern "C"
         uint8_t codebook_id,
         int device_idx,
         void *stream);
+
+    bool rocmMoE_grouped_prefill_pipeline(
+        const float *d_hidden,
+        const void *d_gate_desc_table,
+        const void *d_up_desc_table,
+        const void *d_down_desc_table,
+        const int *d_group_counts,
+        const int *d_group_offsets,
+        const int *d_group_token_indices,
+        const float *d_group_weights,
+        int8_t *d_scratch_A_int8,
+        float *d_scratch_scales,
+        float *d_scratch_gate,
+        float *d_scratch_up,
+        int8_t *d_scratch_swiglu_int8,
+        float *d_scratch_swiglu_scales,
+        float *d_scratch_down_out,
+        float *d_output,
+        int num_experts,
+        int d_model,
+        int intermediate,
+        int max_tokens_per_expert,
+        int total_slots,
+        uint8_t codebook_id,
+        int device_id,
+        void *stream);
 }
 
 namespace
@@ -639,6 +665,43 @@ namespace llaminar2
                 hipFree(table.device_up_descs);
                 table.device_up_descs = nullptr;
             }
+        }
+
+        // Phase 5: grouped prefill scratch
+        if (d_prefill_A_int8_)
+        {
+            hipFree(d_prefill_A_int8_);
+            d_prefill_A_int8_ = nullptr;
+        }
+        if (d_prefill_A_scales_)
+        {
+            hipFree(d_prefill_A_scales_);
+            d_prefill_A_scales_ = nullptr;
+        }
+        if (d_prefill_gate_)
+        {
+            hipFree(d_prefill_gate_);
+            d_prefill_gate_ = nullptr;
+        }
+        if (d_prefill_up_)
+        {
+            hipFree(d_prefill_up_);
+            d_prefill_up_ = nullptr;
+        }
+        if (d_prefill_swiglu_int8_)
+        {
+            hipFree(d_prefill_swiglu_int8_);
+            d_prefill_swiglu_int8_ = nullptr;
+        }
+        if (d_prefill_swiglu_scales_)
+        {
+            hipFree(d_prefill_swiglu_scales_);
+            d_prefill_swiglu_scales_ = nullptr;
+        }
+        if (d_prefill_down_out_)
+        {
+            hipFree(d_prefill_down_out_);
+            d_prefill_down_out_ = nullptr;
         }
     }
 
@@ -3795,6 +3858,299 @@ namespace llaminar2
 
         scatterAddWeighted(o, r, d_group_token_indices_ + offset,
                            d_group_weights_ + offset, count, d_model);
+    }
+
+    // =========================================================================
+    // Phase 5: Fully-grouped MoE prefill pipeline (graph-capturable)
+    // =========================================================================
+
+    bool ROCmMoEKernel::prepareExpertGroupsAsync(
+        ITensor *routing_indices, ITensor *routing_weights,
+        int seq_len, int num_experts, int top_k)
+    {
+        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
+            return false;
+
+        const int total_slots = seq_len * top_k;
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+
+        // 1. Ensure routing tensors are on device
+        routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+        routing_weights->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+
+        const float *d_float_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const float *d_float_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!d_float_indices || !d_float_weights)
+        {
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] null device pointers");
+            return false;
+        }
+
+        // 2. Lazy-allocate grouping buffers
+        if (total_slots > group_slots_cap_)
+        {
+            if (d_group_int_indices_)
+                hipFree(d_group_int_indices_);
+            if (d_group_token_indices_)
+                hipFree(d_group_token_indices_);
+            if (d_group_weights_)
+                hipFree(d_group_weights_);
+            hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
+            hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
+            hipMalloc(&d_group_weights_, total_slots * sizeof(float));
+            group_slots_cap_ = total_slots;
+        }
+        if (num_experts > group_experts_cap_)
+        {
+            if (d_group_offsets_)
+                hipFree(d_group_offsets_);
+            if (d_group_counts_)
+                hipFree(d_group_counts_);
+            hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
+            hipMalloc(&d_group_counts_, num_experts * sizeof(int));
+            group_experts_cap_ = num_experts;
+        }
+
+        // 3. Convert float indices → int on device
+        if (!hipMoE_float_to_int(d_float_indices, d_group_int_indices_,
+                                 total_slots, device_ordinal_, getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] float_to_int failed");
+            return false;
+        }
+
+        // 4. Group tokens by expert (counts, offsets, scatter) — all on device
+        if (!groupTokensByExpertDevice(
+                d_group_int_indices_, d_float_weights,
+                seq_len, num_experts, top_k,
+                d_group_offsets_, d_group_counts_,
+                d_group_token_indices_, d_group_weights_))
+        {
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] groupTokensByExpertDevice failed");
+            return false;
+        }
+
+        // NO D2H copy, NO hipStreamSynchronize — data stays on device
+        // for consumption by executeGroupedPrefillPipeline()
+
+        prepared_num_experts_ = num_experts;
+        return true;
+    }
+
+    bool ROCmMoEKernel::ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate)
+    {
+        const bool need_realloc = (total_slots > prefill_slots_cap_ ||
+                                   d_model > prefill_d_model_cap_ ||
+                                   intermediate > prefill_intermediate_cap_);
+        if (!need_realloc)
+            return true;
+
+        // Free existing allocations
+        if (d_prefill_A_int8_)
+        {
+            hipFree(d_prefill_A_int8_);
+            d_prefill_A_int8_ = nullptr;
+        }
+        if (d_prefill_A_scales_)
+        {
+            hipFree(d_prefill_A_scales_);
+            d_prefill_A_scales_ = nullptr;
+        }
+        if (d_prefill_gate_)
+        {
+            hipFree(d_prefill_gate_);
+            d_prefill_gate_ = nullptr;
+        }
+        if (d_prefill_up_)
+        {
+            hipFree(d_prefill_up_);
+            d_prefill_up_ = nullptr;
+        }
+        if (d_prefill_swiglu_int8_)
+        {
+            hipFree(d_prefill_swiglu_int8_);
+            d_prefill_swiglu_int8_ = nullptr;
+        }
+        if (d_prefill_swiglu_scales_)
+        {
+            hipFree(d_prefill_swiglu_scales_);
+            d_prefill_swiglu_scales_ = nullptr;
+        }
+        if (d_prefill_down_out_)
+        {
+            hipFree(d_prefill_down_out_);
+            d_prefill_down_out_ = nullptr;
+        }
+
+        const int max_dim = (d_model > intermediate) ? d_model : intermediate;
+        const int max_blocks = max_dim / 32;
+        const int inter_blocks = intermediate / 32;
+
+        hipError_t err = hipSuccess;
+        // A_int8: used for both gather→quant (K=d_model) and swiglu→quant (K=intermediate)
+        // Allocate for the larger dimension
+        err = hipMalloc(&d_prefill_A_int8_, static_cast<size_t>(total_slots) * max_dim * sizeof(int8_t));
+        if (err != hipSuccess)
+            goto fail;
+        err = hipMalloc(&d_prefill_A_scales_, static_cast<size_t>(total_slots) * max_blocks * sizeof(float));
+        if (err != hipSuccess)
+            goto fail;
+        err = hipMalloc(&d_prefill_gate_, static_cast<size_t>(total_slots) * intermediate * sizeof(float));
+        if (err != hipSuccess)
+            goto fail;
+        err = hipMalloc(&d_prefill_up_, static_cast<size_t>(total_slots) * intermediate * sizeof(float));
+        if (err != hipSuccess)
+            goto fail;
+        err = hipMalloc(&d_prefill_swiglu_int8_, static_cast<size_t>(total_slots) * intermediate * sizeof(int8_t));
+        if (err != hipSuccess)
+            goto fail;
+        err = hipMalloc(&d_prefill_swiglu_scales_, static_cast<size_t>(total_slots) * inter_blocks * sizeof(float));
+        if (err != hipSuccess)
+            goto fail;
+        err = hipMalloc(&d_prefill_down_out_, static_cast<size_t>(total_slots) * d_model * sizeof(float));
+        if (err != hipSuccess)
+            goto fail;
+
+        prefill_slots_cap_ = total_slots;
+        prefill_d_model_cap_ = d_model;
+        prefill_intermediate_cap_ = intermediate;
+        return true;
+
+    fail:
+        LOG_ERROR("[ROCmMoEKernel::ensureGroupedPrefillScratchCapacity] hipMalloc failed: "
+                  << hipGetErrorString(err));
+        // Cleanup partial allocations
+        if (d_prefill_A_int8_)
+        {
+            hipFree(d_prefill_A_int8_);
+            d_prefill_A_int8_ = nullptr;
+        }
+        if (d_prefill_A_scales_)
+        {
+            hipFree(d_prefill_A_scales_);
+            d_prefill_A_scales_ = nullptr;
+        }
+        if (d_prefill_gate_)
+        {
+            hipFree(d_prefill_gate_);
+            d_prefill_gate_ = nullptr;
+        }
+        if (d_prefill_up_)
+        {
+            hipFree(d_prefill_up_);
+            d_prefill_up_ = nullptr;
+        }
+        if (d_prefill_swiglu_int8_)
+        {
+            hipFree(d_prefill_swiglu_int8_);
+            d_prefill_swiglu_int8_ = nullptr;
+        }
+        if (d_prefill_swiglu_scales_)
+        {
+            hipFree(d_prefill_swiglu_scales_);
+            d_prefill_swiglu_scales_ = nullptr;
+        }
+        if (d_prefill_down_out_)
+        {
+            hipFree(d_prefill_down_out_);
+            d_prefill_down_out_ = nullptr;
+        }
+        prefill_slots_cap_ = 0;
+        prefill_d_model_cap_ = 0;
+        prefill_intermediate_cap_ = 0;
+        return false;
+    }
+
+    bool ROCmMoEKernel::executeGroupedPrefillPipeline(
+        ITensor *hidden, ITensor *output,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        int seq_len, int d_model, int intermediate,
+        int num_experts, int top_k)
+    {
+        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
+            num_experts <= 0 || top_k <= 0)
+            return false;
+
+        if (gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] invalid gateup descriptor table id "
+                      << gateup_desc_table_id);
+            return false;
+        }
+        if (down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] invalid down descriptor table id "
+                      << down_desc_table_id);
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+
+        if (!gateup_table.valid || !down_table.valid)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] descriptor tables not valid");
+            return false;
+        }
+
+        // Compute max_tokens_per_expert upper bound (seq_len * top_k / 1 = worst case all tokens to one expert)
+        // Use min(seq_len * top_k, seq_len) since each token only counted once per expert
+        // In practice, seq_len is the upper bound (a token can only be in one expert's group once per top-k slot)
+        const int total_slots = seq_len * top_k;
+        const int max_tokens_per_expert = seq_len; // worst case: all tokens go to same expert
+
+        // Ensure scratch buffers
+        if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
+            return false;
+
+        // Ensure hidden and output are on device
+        hidden->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+        output->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+
+        // Zero the output buffer (pre-zero requirement for scatter-add)
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipMemsetAsync(d_output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float), stream);
+
+        // Call the fully-grouped pipeline (5 kernel launches, zero sync)
+        const bool ok = rocmMoE_grouped_prefill_pipeline(
+            d_hidden,
+            gateup_table.device_gate_descs,
+            gateup_table.device_up_descs,
+            down_table.device_descs,
+            d_group_counts_,
+            d_group_offsets_,
+            d_group_token_indices_,
+            d_group_weights_,
+            d_prefill_A_int8_,
+            d_prefill_A_scales_,
+            d_prefill_gate_,
+            d_prefill_up_,
+            d_prefill_swiglu_int8_,
+            d_prefill_swiglu_scales_,
+            d_prefill_down_out_,
+            d_output,
+            num_experts,
+            d_model,
+            intermediate,
+            max_tokens_per_expert,
+            total_slots,
+            gateup_table.codebook_id,
+            device_ordinal_,
+            getStream());
+
+        if (!ok)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] pipeline failed for layer");
+            return false;
+        }
+
+        return true;
     }
 
 } // namespace llaminar2

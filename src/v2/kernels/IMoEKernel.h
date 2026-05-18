@@ -732,6 +732,78 @@ namespace llaminar2
             ITensor *output, ITensor *expert_results,
             int expert_id, int d_model);
 
+        // =================================================================
+        // Phase 5: Fully-grouped MoE prefill pipeline (graph-capturable)
+        //
+        // Runs ALL experts in a single pipeline with NO host-device sync:
+        //   1. gather + quantize  (all experts, single launch)
+        //   2. gate+up GEMM      (all experts, single launch)
+        //   3. SwiGLU + quantize (all experts, single launch)
+        //   4. down GEMM         (all experts, single launch)
+        //   5. weighted scatter  (all experts, single launch)
+        //
+        // Requires prepareExpertGroupsAsync() (no D2H) to have been called.
+        // =================================================================
+
+        /**
+         * @brief Prepare device-side expert groups WITHOUT D2H synchronization.
+         *
+         * Same as prepareExpertGroups() but omits the hipStreamSynchronize
+         * and D2H copy of counts/offsets. The grouped data stays entirely
+         * on device for consumption by executeGroupedPrefillPipeline().
+         *
+         * @return true if GPU grouping succeeded.
+         */
+        virtual bool prepareExpertGroupsAsync(
+            ITensor *routing_indices, ITensor *routing_weights,
+            int seq_len, int num_experts, int top_k)
+        {
+            (void)routing_indices;
+            (void)routing_weights;
+            (void)seq_len;
+            (void)num_experts;
+            (void)top_k;
+            return false;
+        }
+
+        /**
+         * @brief Execute the full grouped MoE prefill pipeline (graph-capturable).
+         *
+         * Runs all 5 kernels (gather+quant, gate+up GEMM, SwiGLU+quant,
+         * down GEMM, weighted scatter) in a single function with zero
+         * host-device synchronization.
+         *
+         * @param hidden         Input hidden states [seq_len, d_model]
+         * @param output         Output buffer [seq_len, d_model] (pre-zeroed)
+         * @param gate_desc_table_id  Descriptor table ID for gate weights
+         * @param up_desc_table_id    Descriptor table ID for up weights (same table)
+         * @param down_desc_table_id  Descriptor table ID for down weights
+         * @param seq_len        Number of tokens in the sequence
+         * @param d_model        Model dimension
+         * @param intermediate   Expert intermediate dimension
+         * @param num_experts    Total number of experts
+         * @param top_k          Experts per token
+         * @return true on success
+         */
+        virtual bool executeGroupedPrefillPipeline(
+            ITensor *hidden, ITensor *output,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            int seq_len, int d_model, int intermediate,
+            int num_experts, int top_k)
+        {
+            (void)hidden;
+            (void)output;
+            (void)gateup_desc_table_id;
+            (void)down_desc_table_id;
+            (void)seq_len;
+            (void)d_model;
+            (void)intermediate;
+            (void)num_experts;
+            (void)top_k;
+            return false;
+        }
+
     protected:
         // State for CPU-default prepareExpertGroups / getExpertTokenCount /
         // gatherExpertBatch / scatterExpertResults.

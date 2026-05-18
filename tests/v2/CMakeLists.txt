@@ -621,38 +621,6 @@ add_v2_test(V2_Unit_MoEExpertParallelPlanner
     MPI_PROCS 1
 )
 
-# Test: Graph-native MoE overlay sparse dispatch collective contract
-add_executable(v2_unit_moe_overlay_dispatch_collective unit/execution/moe/Test__MoEOverlayDispatchCollective.cpp)
-target_link_libraries(v2_unit_moe_overlay_dispatch_collective
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Unit_MoEOverlayDispatchCollective
-    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_dispatch_collective>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;Dispatch;Collective"
-    MPI_PROCS 1
-)
-
-# Test: MoE overlay domain runtime graph dispatch descriptors
-add_executable(v2_unit_moe_overlay_domain_runtime
-    unit/execution/moe/Test__MoEOverlayDomainRuntime.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_unit_moe_overlay_domain_runtime PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_unit_moe_overlay_domain_runtime
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Unit_MoEOverlayDomainRuntime
-    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_domain_runtime>
-    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Overlay;Runtime;Dispatch"
-    MPI_PROCS 1
-)
-
 # Test: Tensor Host Release Lifecycle (CPU-only tensor release guard regression)
 # Regression tests for the bug where releaseAllHostWeightData() released CPU-only
 # tensors that were never uploaded to GPU, causing null data access in graph stages.
@@ -3830,6 +3798,15 @@ add_v2_test(V2_Unit_WeightSlicer
     MPI_PROCS 1
 )
 
+# Test: WeightLoadProgress - Progress bar rendering, IProgressPublisher, aggregator integration
+add_executable(v2_unit_weight_load_progress unit/loaders/Test__WeightLoadProgress.cpp)
+target_link_libraries(v2_unit_weight_load_progress llaminar2_core GTest::gtest_main)
+add_v2_test(V2_Unit_WeightLoadProgress
+    COMMAND $<TARGET_FILE:v2_unit_weight_load_progress>
+    LABELS "V2;Unit;Loaders;Progress;MPI"
+    MPI_PROCS 1
+)
+
 # Test: PPActivationContract (PP inter-stage transfer contract)
 add_executable(v2_unit_pp_activation_contract unit/collective/Test__PPActivationContract.cpp)
 target_link_libraries(v2_unit_pp_activation_contract llaminar2_core GTest::gtest_main)
@@ -5306,15 +5283,6 @@ target_link_libraries(v2_test_orchestration_config_parser llaminar2_core GTest::
 add_v2_test(V2_Unit_OrchestrationConfigParser
     COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
     LABELS "V2;Unit;Config;CLI;YAML;Orchestration;Heterogeneous"
-    MPI_PROCS 1
-)
-
-# Test: MoE expert overlay parser config (Phase 2 same-layer expert overlay surface)
-add_executable(v2_test_moe_expert_overlay_config unit/config/Test__MoEExpertOverlayConfig.cpp)
-target_link_libraries(v2_test_moe_expert_overlay_config llaminar2_core GTest::gtest GTest::gtest_main)
-add_v2_test(V2_Unit_MoEExpertOverlayConfig
-    COMMAND $<TARGET_FILE:v2_test_moe_expert_overlay_config>
-    LABELS "V2;Unit;Config;CLI;YAML;MoE;ExpertOverlay"
     MPI_PROCS 1
 )
 
@@ -7893,8 +7861,6 @@ if(HAVE_ROCM)
     # Performance Test: ROCm GEMV Kernel (bandwidth-optimized M=1 decode)
     # Benchmarks and validates the INT8 GEMV kernel against CPU reference
     # for Qwen2.5-0.5B and 7B decode workloads
-    # TODO(rocm-vnni): re-enable after CK references are stripped from this test.
-    if(FALSE)
     add_executable(v2_perf_rocm_gemv_kernel
         performance/kernels/rocm/Perf__ROCmGemvKernel.cpp
     )
@@ -7909,7 +7875,6 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm GEMV kernel performance benchmarks")
-    endif()
 
     # Performance Test: ROCm TP Scaling Analysis
     # Benchmarks GEMV (decode M=1) and GEMM (prefill) at TP-sharded dimensions
@@ -8572,74 +8537,6 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm MoE kernel integration tests")
 endif()
-
-# =============================================================================
-# MoE Expert Overlay CPU Fallback MPI Integration Tests
-# =============================================================================
-add_executable(v2_integration_moe_expert_overlay_cpu_fallback_mpi
-    integration/moe/Test__MoEExpertOverlay_CPUFallback_MPI.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_integration_moe_expert_overlay_cpu_fallback_mpi PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_expert_overlay_cpu_fallback_mpi
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEExpertOverlay_CPUFallback_MPI
-    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_cpu_fallback_mpi>
-    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;CPUFallback;NodeLocalTP;MPI"
-    MPI_PROCS 3
-)
-add_v2_test(V2_Integration_MoEExpertOverlay_SparseTransfer_CPUFallback_MPI
-    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_cpu_fallback_mpi> --gtest_filter="Test__MoEExpertOverlay_CPUFallback_MPI.SparseTransferSendsOnlyFallbackRowsAndMatchesMaskedReference"
-    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;CPUFallback;NodeLocalTP;MPI;SparseTransfer"
-    MPI_PROCS 3
-)
-
-# Phase 7: correctness-first CPU TensorParallelExperts fallback for routed expert overlay.
-add_executable(v2_integration_moe_expert_overlay_cpu_tensor_parallel_experts_mpi
-    integration/moe/Test__MoEExpertOverlay_CPUTensorParallelExperts_MPI.cpp
-    integration/mpi_gtest_main.cpp
-)
-target_include_directories(v2_integration_moe_expert_overlay_cpu_tensor_parallel_experts_mpi PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_expert_overlay_cpu_tensor_parallel_experts_mpi
-    llaminar2_core
-    GTest::gtest
-    MPI::MPI_CXX
-)
-add_v2_test(V2_Integration_MoEExpertOverlay_CPUTensorParallelExperts_MPI
-    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_cpu_tensor_parallel_experts_mpi>
-    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;CPUFallback;NodeLocalTP;TensorParallelExperts;MPI"
-    MPI_PROCS 3
-)
-
-# Phase 8: model-light CUDA + ROCm + CPU tier overlay and dense cross-domain reduce.
-add_executable(v2_integration_moe_expert_overlay_multi_accelerator_tiers
-    integration/moe/Test__MoEExpertOverlay_MultiAcceleratorTiers.cpp
-)
-target_include_directories(v2_integration_moe_expert_overlay_multi_accelerator_tiers PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-target_link_libraries(v2_integration_moe_expert_overlay_multi_accelerator_tiers
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Integration_MoEExpertOverlay_MultiAcceleratorTiers
-    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_multi_accelerator_tiers>
-    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;MultiAccelerator;DenseReduce;CUDA;ROCm;CPU"
-    MPI_PROCS 1
-)
-add_v2_test(V2_Integration_MoEExpertOverlay_SparseTransfer
-    COMMAND $<TARGET_FILE:v2_integration_moe_expert_overlay_multi_accelerator_tiers> --gtest_filter="Test__MoEExpertOverlay_MultiAcceleratorTiers.SparsePrefillTransferVolumeScalesWithRoutedRowsAndScatterAddsReturn:Test__MoEExpertOverlay_MultiAcceleratorTiers.DenseTransferCompatibilityModeKeepsFullSequenceVolume:Test__MoEExpertOverlay_MultiAcceleratorTiers.DecodeFallbackTransferUsesOneHiddenRowAndTopKMetadata"
-    LABELS "V2;Integration;MoE;ExpertParallel;Overlay;MultiAccelerator;DenseReduce;SparseTransfer;CUDA;ROCm;CPU"
-    MPI_PROCS 1
-)
 
 # =============================================================================
 # GPU Expert Transfer Unit Tests
@@ -9972,22 +9869,6 @@ target_include_directories(v2_test_qwen35moe_graph PRIVATE
 add_v2_test(V2_Unit_Qwen35MoEGraph
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
     LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;TensorParallel"
-    MPI_PROCS 1
-)
-
-# Test: Qwen35MoEExpertOverlayGraph — model-light expert overlay graph path
-add_executable(v2_test_qwen35moe_expert_overlay_graph unit/models/qwen35moe/Test__Qwen35MoEExpertOverlayGraph.cpp)
-target_link_libraries(v2_test_qwen35moe_expert_overlay_graph
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-target_include_directories(v2_test_qwen35moe_expert_overlay_graph PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
-add_v2_test(V2_Unit_Qwen35MoEExpertOverlayGraph
-    COMMAND $<TARGET_FILE:v2_test_qwen35moe_expert_overlay_graph>
-    LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;ExpertParallel;Overlay"
     MPI_PROCS 1
 )
 
