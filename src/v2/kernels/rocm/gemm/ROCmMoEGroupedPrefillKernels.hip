@@ -79,15 +79,12 @@ __device__ __constant__ int8_t k_iq4_pf_codebook_i8[16] = {
 // ============================================================================
 // Kernel 1: Grouped Gather + Quantize (all experts, single launch)
 //
-// For each expert e:
-//   - Reads d_group_counts[e] tokens from hidden at indices d_group_token_indices[offset..offset+count]
-//   - Quantizes each row to INT8 with per-block (32-element) scales
-//   - Writes to contiguous output: A_int8[expert_base + token * K + ...]
+// FLAT GRID: grid(blocks_per_row, total_slots) — no empty blocks.
+// Each block handles one 32-element quantization block of one token slot.
 //
-// Grid: dim3(blocks_per_row, max_tokens_per_expert, num_experts)
+// Grid: dim3(blocks_per_row, total_slots)
 //   blockIdx.x = quantization block within the row
-//   blockIdx.y = token within this expert's batch
-//   blockIdx.z = expert index
+//   blockIdx.y = global slot index (0..total_slots-1)
 // Block: 32 threads (warp-cooperative quantization)
 // ============================================================================
 
@@ -96,20 +93,12 @@ void moe_grouped_gather_quantize_prefill_kernel(
     const float* __restrict__ hidden,            // [seq_len, d_model]
     int8_t*      __restrict__ A_int8_out,        // [total_slots, K] gathered + quantized
     float*       __restrict__ scales_out,        // [total_slots, blocks_per_row] per-block scales
-    const int*   __restrict__ d_group_counts,    // [num_experts] tokens per expert
-    const int*   __restrict__ d_group_offsets,   // [num_experts] prefix sum offsets
     const int*   __restrict__ d_group_token_indices, // [total_slots] original token indices
     int K)                                       // d_model (columns)
 {
     const int block_in_row = blockIdx.x;   // which 32-element block in the row
-    const int token_in_expert = blockIdx.y; // which token within this expert
-    const int expert_id = blockIdx.z;       // which expert
+    const int global_slot = blockIdx.y;    // which slot (flat across all experts)
 
-    const int count = d_group_counts[expert_id];
-    if (token_in_expert >= count) return;   // early-exit for over-provisioned M-tiles
-
-    const int offset = d_group_offsets[expert_id];
-    const int global_slot = offset + token_in_expert;
     const int original_token = d_group_token_indices[global_slot];
 
     const int lane = threadIdx.x;  // 0..31
@@ -237,7 +226,7 @@ __device__ __forceinline__ void moe_prefill_decode_q4like_groups(
 }
 
 template <NativeVNNIFormatPrefill FMT>
-__global__ __launch_bounds__(64)
+__global__ __launch_bounds__(128)
 void moe_grouped_gate_up_prefill_gemm_kernel(
     const int8_t*  __restrict__ A_int8,              // [total_slots, K] quantized activations
     const float*   __restrict__ scales_A_blockwise,  // [total_slots, blocks_per_row]
@@ -249,16 +238,19 @@ void moe_grouped_gate_up_prefill_gemm_kernel(
     float*         __restrict__ up_output,           // [total_slots, N]
     int N, int K)
 {
-    constexpr int TILE_N = 64;
+    constexpr int TILE_N = 128;
+    constexpr int TILE_M = 8;  // Process 8 tokens per block, amortizing weight decode
     const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int token_in_expert = blockIdx.y;
+    const int token_group = blockIdx.y;  // group of TILE_M tokens
     const int expert_id = blockIdx.z;
 
     const int count = d_group_counts[expert_id];
-    if (token_in_expert >= count || n >= N) return;
+    const int first_token = token_group * TILE_M;
+    if (first_token >= count || n >= N) return;
 
+    // How many tokens in this group (1..TILE_M)
+    const int tokens_in_group = min(TILE_M, count - first_token);
     const int offset = d_group_offsets[expert_id];
-    const int global_slot = offset + token_in_expert;
     const int blocks_per_row = K / 32;
 
     // Get weight descriptors for this expert
@@ -273,20 +265,15 @@ void moe_grouped_gate_up_prefill_gemm_kernel(
     const uint16_t* up_scale_base = static_cast<const uint16_t*>(up_desc.scales);
     const uint16_t* up_min_base = static_cast<const uint16_t*>(up_desc.mins);
 
-    // Input row for this token
-    const int8_t* a_row = A_int8 + static_cast<size_t>(global_slot) * K;
-    const float* a_scales = scales_A_blockwise + static_cast<size_t>(global_slot) * blocks_per_row;
-
-    float gate_acc = 0.0f;
-    float up_acc = 0.0f;
+    // Accumulators for TILE_M tokens
+    float gate_acc[TILE_M] = {};
+    float up_acc[TILE_M] = {};
 
     for (int b = 0; b < blocks_per_row; ++b)
     {
-        const int32_t* a4 = reinterpret_cast<const int32_t*>(a_row + b * 32);
         const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-        const float scale_ab = a_scales[b];
 
-        // Decode gate weights
+        // Decode weights ONCE per K-block (shared across all TILE_M tokens)
         int32_t gate_groups[8];
         {
             constexpr int PB = PrefillNVNNITraits<FMT>::payload_bytes;
@@ -294,7 +281,6 @@ void moe_grouped_gate_up_prefill_gemm_kernel(
             moe_prefill_decode_q4like_groups<FMT>(gate_payload, gate_groups);
         }
 
-        // Decode up weights
         int32_t up_groups[8];
         {
             constexpr int PB = PrefillNVNNITraits<FMT>::payload_bytes;
@@ -302,82 +288,99 @@ void moe_grouped_gate_up_prefill_gemm_kernel(
             moe_prefill_decode_q4like_groups<FMT>(up_payload, up_groups);
         }
 
-        if constexpr (PrefillNVNNITraits<FMT>::is_dual_scale) {
-            // Q6_K: dual-scale accumulation
-            int32_t gate_acc_lo = 0, gate_acc_hi = 0;
-            int32_t up_acc_lo = 0, up_acc_hi = 0;
-            #pragma unroll
-            for (int g = 0; g < 4; ++g) {
-                gate_acc_lo = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_acc_lo, false);
-                up_acc_lo = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_acc_lo, false);
-            }
-            #pragma unroll
-            for (int g = 4; g < 8; ++g) {
-                gate_acc_hi = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_acc_hi, false);
-                up_acc_hi = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_acc_hi, false);
-            }
-            const uint16_t gate_scale_lo_bits = gate_scale_base[linear];
-            const uint16_t gate_scale_hi_bits = gate_min_base[linear];
-            const float gate_s_lo = __half2float(*reinterpret_cast<const __half*>(&gate_scale_lo_bits));
-            const float gate_s_hi = __half2float(*reinterpret_cast<const __half*>(&gate_scale_hi_bits));
-            gate_acc += (static_cast<float>(gate_acc_lo) * gate_s_lo +
-                         static_cast<float>(gate_acc_hi) * gate_s_hi) * scale_ab;
+        // Process each of TILE_M tokens with the same decoded weights
+        #pragma unroll
+        for (int m = 0; m < TILE_M; ++m)
+        {
+            if (m >= tokens_in_group) break;
 
-            const uint16_t up_scale_lo_bits = up_scale_base[linear];
-            const uint16_t up_scale_hi_bits = up_min_base[linear];
-            const float up_s_lo = __half2float(*reinterpret_cast<const __half*>(&up_scale_lo_bits));
-            const float up_s_hi = __half2float(*reinterpret_cast<const __half*>(&up_scale_hi_bits));
-            up_acc += (static_cast<float>(up_acc_lo) * up_s_lo +
-                       static_cast<float>(up_acc_hi) * up_s_hi) * scale_ab;
-        }
-        else {
-            // Symmetric / asymmetric: single-scale accumulation
-            int32_t gate_dot = 0, up_dot = 0;
-            #pragma unroll
-            for (int g = 0; g < 8; ++g) {
-                gate_dot = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_dot, false);
-                up_dot = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_dot, false);
-            }
+            const int global_slot = offset + first_token + m;
+            const int32_t* a4 = reinterpret_cast<const int32_t*>(
+                A_int8 + static_cast<size_t>(global_slot) * K + b * 32);
+            const float scale_ab = scales_A_blockwise[
+                static_cast<size_t>(global_slot) * blocks_per_row + b];
 
-            const uint16_t gate_scale_bits = gate_scale_base[linear];
-            const float gate_d = __half2float(*reinterpret_cast<const __half*>(&gate_scale_bits));
-            gate_acc += static_cast<float>(gate_dot) * gate_d * scale_ab;
-
-            const uint16_t up_scale_bits = up_scale_base[linear];
-            const float up_d = __half2float(*reinterpret_cast<const __half*>(&up_scale_bits));
-            up_acc += static_cast<float>(up_dot) * up_d * scale_ab;
-
-            if constexpr (PrefillNVNNITraits<FMT>::is_asymmetric) {
-                // min correction: sum_a * block_min * scale_ab
-                constexpr int32_t ones = 0x01010101;
-                int32_t sum_a = 0;
+            if constexpr (PrefillNVNNITraits<FMT>::is_dual_scale) {
+                int32_t gate_acc_lo = 0, gate_acc_hi = 0;
+                int32_t up_acc_lo = 0, up_acc_hi = 0;
                 #pragma unroll
-                for (int g = 0; g < 8; ++g)
-                    sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+                for (int g = 0; g < 4; ++g) {
+                    gate_acc_lo = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_acc_lo, false);
+                    up_acc_lo = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_acc_lo, false);
+                }
+                #pragma unroll
+                for (int g = 4; g < 8; ++g) {
+                    gate_acc_hi = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_acc_hi, false);
+                    up_acc_hi = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_acc_hi, false);
+                }
+                const uint16_t gate_scale_lo_bits = gate_scale_base[linear];
+                const uint16_t gate_scale_hi_bits = gate_min_base[linear];
+                const float gate_s_lo = __half2float(*reinterpret_cast<const __half*>(&gate_scale_lo_bits));
+                const float gate_s_hi = __half2float(*reinterpret_cast<const __half*>(&gate_scale_hi_bits));
+                gate_acc[m] += (static_cast<float>(gate_acc_lo) * gate_s_lo +
+                                static_cast<float>(gate_acc_hi) * gate_s_hi) * scale_ab;
 
-                const uint16_t gate_min_bits = gate_min_base[linear];
-                const float gate_m = __half2float(*reinterpret_cast<const __half*>(&gate_min_bits));
-                gate_acc += static_cast<float>(sum_a) * gate_m * scale_ab;
+                const uint16_t up_scale_lo_bits = up_scale_base[linear];
+                const uint16_t up_scale_hi_bits = up_min_base[linear];
+                const float up_s_lo = __half2float(*reinterpret_cast<const __half*>(&up_scale_lo_bits));
+                const float up_s_hi = __half2float(*reinterpret_cast<const __half*>(&up_scale_hi_bits));
+                up_acc[m] += (static_cast<float>(up_acc_lo) * up_s_lo +
+                              static_cast<float>(up_acc_hi) * up_s_hi) * scale_ab;
+            }
+            else {
+                int32_t gate_dot = 0, up_dot = 0;
+                #pragma unroll
+                for (int g = 0; g < 8; ++g) {
+                    gate_dot = __builtin_amdgcn_sdot4(a4[g], gate_groups[g], gate_dot, false);
+                    up_dot = __builtin_amdgcn_sdot4(a4[g], up_groups[g], up_dot, false);
+                }
 
-                const uint16_t up_min_bits = up_min_base[linear];
-                const float up_m = __half2float(*reinterpret_cast<const __half*>(&up_min_bits));
-                up_acc += static_cast<float>(sum_a) * up_m * scale_ab;
+                const uint16_t gate_scale_bits = gate_scale_base[linear];
+                const float gate_d = __half2float(*reinterpret_cast<const __half*>(&gate_scale_bits));
+                gate_acc[m] += static_cast<float>(gate_dot) * gate_d * scale_ab;
+
+                const uint16_t up_scale_bits = up_scale_base[linear];
+                const float up_d = __half2float(*reinterpret_cast<const __half*>(&up_scale_bits));
+                up_acc[m] += static_cast<float>(up_dot) * up_d * scale_ab;
+
+                if constexpr (PrefillNVNNITraits<FMT>::is_asymmetric) {
+                    constexpr int32_t ones = 0x01010101;
+                    int32_t sum_a = 0;
+                    #pragma unroll
+                    for (int g = 0; g < 8; ++g)
+                        sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+
+                    const uint16_t gate_min_bits = gate_min_base[linear];
+                    const float gate_m = __half2float(*reinterpret_cast<const __half*>(&gate_min_bits));
+                    gate_acc[m] += static_cast<float>(sum_a) * gate_m * scale_ab;
+
+                    const uint16_t up_min_bits = up_min_base[linear];
+                    const float up_m = __half2float(*reinterpret_cast<const __half*>(&up_min_bits));
+                    up_acc[m] += static_cast<float>(sum_a) * up_m * scale_ab;
+                }
             }
         }
     }
 
-    gate_output[static_cast<size_t>(global_slot) * N + n] = gate_acc;
-    up_output[static_cast<size_t>(global_slot) * N + n] = up_acc;
+    // Write outputs for all tokens in this group
+    #pragma unroll
+    for (int m = 0; m < TILE_M; ++m)
+    {
+        if (m >= tokens_in_group) break;
+        const int global_slot = offset + first_token + m;
+        gate_output[static_cast<size_t>(global_slot) * N + n] = gate_acc[m];
+        up_output[static_cast<size_t>(global_slot) * N + n] = up_acc[m];
+    }
 }
 
 
 // ============================================================================
 // Kernel 3: Grouped SwiGLU + Quantize (all experts, single launch)
 //
-// Grid: dim3(blocks_per_intermediate_row, max_tokens_per_expert, num_experts)
-//   blockIdx.x = quantization block within the intermediate dim
-//   blockIdx.y = token within expert
-//   blockIdx.z = expert index
+// FLAT GRID: grid(blocks_per_intermediate, total_slots) — no empty blocks.
+// Each block handles one 32-element quantization block of one slot.
+//
+// Grid: dim3(blocks_per_intermediate_row, total_slots)
 // Block: 32 threads
 // ============================================================================
 
@@ -387,19 +390,10 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
     const float* __restrict__ up_data,           // [total_slots, intermediate]
     int8_t*      __restrict__ A_int8_out,        // [total_slots, intermediate] quantized SwiGLU output
     float*       __restrict__ scales_out,        // [total_slots, blocks_per_intermediate]
-    const int*   __restrict__ d_group_counts,    // [num_experts]
-    const int*   __restrict__ d_group_offsets,   // [num_experts]
     int intermediate)                            // expert intermediate dimension
 {
     const int block_in_row = blockIdx.x;
-    const int token_in_expert = blockIdx.y;
-    const int expert_id = blockIdx.z;
-
-    const int count = d_group_counts[expert_id];
-    if (token_in_expert >= count) return;
-
-    const int offset = d_group_offsets[expert_id];
-    const int global_slot = offset + token_in_expert;
+    const int global_slot = blockIdx.y;
 
     const int lane = threadIdx.x;
     const int k = block_in_row * 32 + lane;
@@ -435,13 +429,14 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
 //
 // Same structure as gate+up but for the down projection.
 // Output is FP32 (not quantized) since it goes directly to scatter.
+// M-tiled: each block processes TILE_M tokens, amortizing weight decode.
 //
-// Grid: dim3((d_model + TILE_N - 1) / TILE_N, max_tokens_per_expert, num_experts)
+// Grid: dim3((d_model + TILE_N - 1) / TILE_N, ceil(max_tokens/TILE_M), num_experts)
 // Block: 64 threads
 // ============================================================================
 
 template <NativeVNNIFormatPrefill FMT>
-__global__ __launch_bounds__(64)
+__global__ __launch_bounds__(128)
 void moe_grouped_down_prefill_gemm_kernel(
     const int8_t*  __restrict__ A_int8,              // [total_slots, intermediate] (from SwiGLU output)
     const float*   __restrict__ scales_A_blockwise,  // [total_slots, blocks_per_intermediate]
@@ -452,16 +447,18 @@ void moe_grouped_down_prefill_gemm_kernel(
     int N,   // d_model (output columns)
     int K)   // intermediate (input columns / reduction dim)
 {
-    constexpr int TILE_N = 64;
+    constexpr int TILE_N = 128;
+    constexpr int TILE_M = 8;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int token_in_expert = blockIdx.y;
+    const int token_group = blockIdx.y;
     const int expert_id = blockIdx.z;
 
     const int count = d_group_counts[expert_id];
-    if (token_in_expert >= count || n >= N) return;
+    const int first_token = token_group * TILE_M;
+    if (first_token >= count || n >= N) return;
 
+    const int tokens_in_group = min(TILE_M, count - first_token);
     const int offset = d_group_offsets[expert_id];
-    const int global_slot = offset + token_in_expert;
     const int blocks_per_row = K / 32;
 
     const DeviceNativeVNNIMatrixDesc& desc = down_descs[expert_id];
@@ -469,17 +466,13 @@ void moe_grouped_down_prefill_gemm_kernel(
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
     const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
 
-    const int8_t* a_row = A_int8 + static_cast<size_t>(global_slot) * K;
-    const float* a_scales = scales_A_blockwise + static_cast<size_t>(global_slot) * blocks_per_row;
-
-    float acc = 0.0f;
+    float acc[TILE_M] = {};
 
     for (int b = 0; b < blocks_per_row; ++b)
     {
-        const int32_t* a4 = reinterpret_cast<const int32_t*>(a_row + b * 32);
         const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
-        const float scale_ab = a_scales[b];
 
+        // Decode weights ONCE per K-block (shared across TILE_M tokens)
         int32_t packed_groups[8];
         {
             constexpr int PB = PrefillNVNNITraits<FMT>::payload_bytes;
@@ -487,57 +480,77 @@ void moe_grouped_down_prefill_gemm_kernel(
             moe_prefill_decode_q4like_groups<FMT>(payload, packed_groups);
         }
 
-        if constexpr (PrefillNVNNITraits<FMT>::is_dual_scale) {
-            int32_t acc_lo = 0, acc_hi = 0;
-            #pragma unroll
-            for (int g = 0; g < 4; ++g)
-                acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
-            #pragma unroll
-            for (int g = 4; g < 8; ++g)
-                acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
+        // Process TILE_M tokens with decoded weights
+        #pragma unroll
+        for (int m = 0; m < TILE_M; ++m)
+        {
+            if (m >= tokens_in_group) break;
 
-            const uint16_t scale_lo_bits = scale_base[linear];
-            const uint16_t scale_hi_bits = min_base[linear];
-            const float s_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
-            const float s_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
-            acc += (static_cast<float>(acc_lo) * s_lo +
-                    static_cast<float>(acc_hi) * s_hi) * scale_ab;
-        }
-        else {
-            int32_t dot = 0;
-            #pragma unroll
-            for (int g = 0; g < 8; ++g)
-                dot = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], dot, false);
+            const int global_slot = offset + first_token + m;
+            const int32_t* a4 = reinterpret_cast<const int32_t*>(
+                A_int8 + static_cast<size_t>(global_slot) * K + b * 32);
+            const float scale_ab = scales_A_blockwise[
+                static_cast<size_t>(global_slot) * blocks_per_row + b];
 
-            const uint16_t scale_bits = scale_base[linear];
-            const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
-            acc += static_cast<float>(dot) * block_d * scale_ab;
+            if constexpr (PrefillNVNNITraits<FMT>::is_dual_scale) {
+                int32_t acc_lo = 0, acc_hi = 0;
+                #pragma unroll
+                for (int g = 0; g < 4; ++g)
+                    acc_lo = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_lo, false);
+                #pragma unroll
+                for (int g = 4; g < 8; ++g)
+                    acc_hi = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], acc_hi, false);
 
-            if constexpr (PrefillNVNNITraits<FMT>::is_asymmetric) {
-                constexpr int32_t ones = 0x01010101;
-                int32_t sum_a = 0;
+                const uint16_t scale_lo_bits = scale_base[linear];
+                const uint16_t scale_hi_bits = min_base[linear];
+                const float s_lo = __half2float(*reinterpret_cast<const __half*>(&scale_lo_bits));
+                const float s_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
+                acc[m] += (static_cast<float>(acc_lo) * s_lo +
+                           static_cast<float>(acc_hi) * s_hi) * scale_ab;
+            }
+            else {
+                int32_t dot = 0;
                 #pragma unroll
                 for (int g = 0; g < 8; ++g)
-                    sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+                    dot = __builtin_amdgcn_sdot4(a4[g], packed_groups[g], dot, false);
 
-                const uint16_t min_bits = min_base[linear];
-                const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-                acc += static_cast<float>(sum_a) * block_m * scale_ab;
+                const uint16_t scale_bits = scale_base[linear];
+                const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+                acc[m] += static_cast<float>(dot) * block_d * scale_ab;
+
+                if constexpr (PrefillNVNNITraits<FMT>::is_asymmetric) {
+                    constexpr int32_t ones = 0x01010101;
+                    int32_t sum_a = 0;
+                    #pragma unroll
+                    for (int g = 0; g < 8; ++g)
+                        sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+
+                    const uint16_t min_bits = min_base[linear];
+                    const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
+                    acc[m] += static_cast<float>(sum_a) * block_m * scale_ab;
+                }
             }
         }
     }
 
-    output[static_cast<size_t>(global_slot) * N + n] = acc;
+    // Write outputs
+    #pragma unroll
+    for (int m = 0; m < TILE_M; ++m)
+    {
+        if (m >= tokens_in_group) break;
+        const int global_slot = offset + first_token + m;
+        output[static_cast<size_t>(global_slot) * N + n] = acc[m];
+    }
 }
 
 
 // ============================================================================
 // Kernel 5: Grouped Weighted Scatter-Add (all experts, single launch)
 //
-// For each expert e, for each token assigned to it:
-//   output[original_token, :] += weight * expert_result[slot, :]
+// FLAT GRID: grid(tiles_per_row, total_slots) — no empty blocks.
+// For each slot: output[original_token, :] += weight * expert_result[slot, :]
 //
-// Grid: dim3((d_model + 63) / 64, max_tokens_per_expert, num_experts)
+// Grid: dim3((d_model + 63) / 64, total_slots)
 // Block: 64 threads
 //
 // Uses atomicAdd since multiple experts can contribute to the same output token.
@@ -547,22 +560,16 @@ __global__ __launch_bounds__(64)
 void moe_grouped_weighted_scatter_prefill_kernel(
     float*       __restrict__ output,                // [seq_len, d_model]
     const float* __restrict__ expert_results,        // [total_slots, d_model]
-    const int*   __restrict__ d_group_counts,        // [num_experts]
-    const int*   __restrict__ d_group_offsets,       // [num_experts]
     const int*   __restrict__ d_group_token_indices, // [total_slots] original token index
     const float* __restrict__ d_group_weights,       // [total_slots] routing weights
     int d_model)
 {
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int token_in_expert = blockIdx.y;
-    const int expert_id = blockIdx.z;
+    const int global_slot = blockIdx.y;
 
-    const int count = d_group_counts[expert_id];
-    if (token_in_expert >= count || n >= d_model) return;
+    if (n >= d_model) return;
 
-    const int offset = d_group_offsets[expert_id];
-    const int global_slot = offset + token_in_expert;
     const int original_token = d_group_token_indices[global_slot];
     const float weight = d_group_weights[global_slot];
 
@@ -625,23 +632,26 @@ bool rocmMoE_grouped_prefill_pipeline(
     const int blocks_per_intermediate = intermediate / 32;
 
     // =========================================================================
-    // Kernel 1: Gather + Quantize hidden → A_int8
+    // Kernel 1: Gather + Quantize hidden → A_int8 (FLAT grid over total_slots)
     // =========================================================================
     {
-        dim3 grid(blocks_per_d_model, max_tokens_per_expert, num_experts);
+        dim3 grid(blocks_per_d_model, total_slots);
         dim3 block(32);
         hipLaunchKernelGGL(moe_grouped_gather_quantize_prefill_kernel,
             grid, block, 0, hip_stream,
             d_hidden, d_scratch_A_int8, d_scratch_scales,
-            d_group_counts, d_group_offsets, d_group_token_indices, d_model);
+            d_group_token_indices, d_model);
     }
 
     // =========================================================================
-    // Kernel 2: Gate+Up GEMM
+    // Kernel 2: Gate+Up GEMM (M-tiled: each block handles TILE_M=8 tokens)
     // =========================================================================
     {
-        constexpr int TILE_N = 64;
-        dim3 grid((intermediate + TILE_N - 1) / TILE_N, max_tokens_per_expert, num_experts);
+        constexpr int TILE_N = 128;
+        constexpr int TILE_M = 8;
+        dim3 grid((intermediate + TILE_N - 1) / TILE_N,
+                  (max_tokens_per_expert + TILE_M - 1) / TILE_M,
+                  num_experts);
         dim3 block(TILE_N);
 
         const auto* gate_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_gate_desc_table);
@@ -670,24 +680,27 @@ bool rocmMoE_grouped_prefill_pipeline(
     }
 
     // =========================================================================
-    // Kernel 3: SwiGLU + Quantize
+    // Kernel 3: SwiGLU + Quantize (FLAT grid over total_slots)
     // =========================================================================
     {
-        dim3 grid(blocks_per_intermediate, max_tokens_per_expert, num_experts);
+        dim3 grid(blocks_per_intermediate, total_slots);
         dim3 block(32);
         hipLaunchKernelGGL(moe_grouped_swiglu_quantize_prefill_kernel,
             grid, block, 0, hip_stream,
             d_scratch_gate, d_scratch_up,
             d_scratch_swiglu_int8, d_scratch_swiglu_scales,
-            d_group_counts, d_group_offsets, intermediate);
+            intermediate);
     }
 
     // =========================================================================
-    // Kernel 4: Down GEMM
+    // Kernel 4: Down GEMM (M-tiled: each block handles TILE_M=8 tokens)
     // =========================================================================
     {
-        constexpr int TILE_N = 64;
-        dim3 grid((d_model + TILE_N - 1) / TILE_N, max_tokens_per_expert, num_experts);
+        constexpr int TILE_N = 128;
+        constexpr int TILE_M = 8;
+        dim3 grid((d_model + TILE_N - 1) / TILE_N,
+                  (max_tokens_per_expert + TILE_M - 1) / TILE_M,
+                  num_experts);
         dim3 block(TILE_N);
 
         const auto* down_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
@@ -715,16 +728,16 @@ bool rocmMoE_grouped_prefill_pipeline(
     }
 
     // =========================================================================
-    // Kernel 5: Weighted Scatter-Add
+    // Kernel 5: Weighted Scatter-Add (FLAT grid over total_slots)
     // =========================================================================
     {
         constexpr int TILE_N = 64;
-        dim3 grid((d_model + TILE_N - 1) / TILE_N, max_tokens_per_expert, num_experts);
+        dim3 grid((d_model + TILE_N - 1) / TILE_N, total_slots);
         dim3 block(TILE_N);
         hipLaunchKernelGGL(moe_grouped_weighted_scatter_prefill_kernel,
             grid, block, 0, hip_stream,
             d_output, d_scratch_down_out,
-            d_group_counts, d_group_offsets, d_group_token_indices, d_group_weights,
+            d_group_token_indices, d_group_weights,
             d_model);
     }
 

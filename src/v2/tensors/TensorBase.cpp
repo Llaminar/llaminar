@@ -1030,7 +1030,7 @@ namespace llaminar2
                 if (trace)
                 {
                     LOG_DEBUG("[TensorBase::allocateOnDevice] Promoted secondary buffer to primary for "
-                             << target_device.toString() << " ptr=" << promoted_ptr);
+                              << target_device.toString() << " ptr=" << promoted_ptr);
                 }
                 return true;
             }

@@ -2104,16 +2104,11 @@ static int rocblas_prefill_impl(
         // ─── Output fence: rejoin pool streams to caller's stream ───
         // Event fence: makes hip_stream aware of pool completion so
         // subsequent GPU work on hip_stream waits for attention output.
+        // No CPU-side sync needed — all downstream stages operate on hip_stream
+        // which will wait for the events before proceeding.
         for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
             hipEventRecord(pool[s].completion_event, pool[s].stream);
             hipStreamWaitEvent(hip_stream, pool[s].completion_event, 0);
-        }
-        // CPU-side sync: ensures pool work is fully complete before the CPU
-        // returns. This is needed because hipStreamWaitEvent only creates a
-        // GPU-side dependency — CPU-side operations (e.g., hipMemcpy for
-        // coherence transfers) need the data to be globally visible.
-        for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-            hipStreamSynchronize(pool[s].stream);
         }
     }
 

@@ -4100,7 +4100,25 @@ namespace llaminar2
         // Use min(seq_len * top_k, seq_len) since each token only counted once per expert
         // In practice, seq_len is the upper bound (a token can only be in one expert's group once per top-k slot)
         const int total_slots = seq_len * top_k;
-        const int max_tokens_per_expert = seq_len; // worst case: all tokens go to same expert
+
+        // Compute actual max_tokens_per_expert from device counts (avoids grid over-provisioning
+        // in the GEMM kernels which still use 3D grids).
+        // D2H of 256 ints (~1KB) is negligible vs the GEMM work saved.
+        int max_tokens_per_expert = seq_len; // fallback
+        {
+            std::vector<int> host_counts(num_experts);
+            hipStream_t stream = static_cast<hipStream_t>(getStream());
+            hipStreamSynchronize(stream); // ensure counts are ready
+            hipError_t err = hipMemcpy(host_counts.data(), d_group_counts_,
+                                       num_experts * sizeof(int), hipMemcpyDeviceToHost);
+            if (err == hipSuccess) {
+                int actual_max = 0;
+                for (int i = 0; i < num_experts; ++i)
+                    actual_max = std::max(actual_max, host_counts[i]);
+                if (actual_max > 0)
+                    max_tokens_per_expert = actual_max;
+            }
+        }
 
         // Ensure scratch buffers
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))

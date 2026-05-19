@@ -457,16 +457,39 @@ namespace llaminar2
                 if (backend)
                 {
                     const int backend_device_id = target_device.gpu_ordinal();
-                    if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, target_device))
+                    if (stream)
                     {
-                        LOG_WARN("[TransferEngine::uploadFull] Event wait failed for tensor "
-                                 << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
-                                 << " on " << target_device.toString()
-                                 << ", falling back to backend synchronize");
-                        if (!backend->synchronize(backend_device_id))
+                        // Non-blocking: make the consuming stream wait for the event.
+                        // Same-stream waits are no-ops in hardware (ordering is implicit).
+                        // Cross-stream waits correctly serialize without blocking the CPU.
+                        if (!backend->streamWaitEvent(stream, tensor->device_completion_event_, backend_device_id))
                         {
-                            return TransferResult::fail(TransferMethod::NOOP,
-                                                        "backend synchronize failed for " + target_device.toString());
+                            LOG_WARN("[TransferEngine::uploadFull] streamWaitEvent failed for tensor "
+                                     << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
+                                     << " on " << target_device.toString()
+                                     << ", falling back to host-blocking event sync");
+                            if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, target_device))
+                            {
+                                return TransferResult::fail(TransferMethod::NOOP,
+                                                            "event sync failed for " + target_device.toString());
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // No stream provided (host-side access like tensor->data()).
+                        // Must block CPU until GPU work completes.
+                        if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, target_device))
+                        {
+                            LOG_WARN("[TransferEngine::uploadFull] Event wait failed for tensor "
+                                     << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
+                                     << " on " << target_device.toString()
+                                     << ", falling back to backend synchronize");
+                            if (!backend->synchronize(backend_device_id))
+                            {
+                                return TransferResult::fail(TransferMethod::NOOP,
+                                                            "backend synchronize failed for " + target_device.toString());
+                            }
                         }
                     }
                 }

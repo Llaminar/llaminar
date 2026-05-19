@@ -80,7 +80,9 @@ namespace llaminar2
         /// Full execution — coherence, validation, profiling, everything.
         static StageRunPolicy full()
         {
-            return StageRunPolicy{};
+            StageRunPolicy p{};
+            p.timeline = true; // Enable GPU event timeline for prefill profiling
+            return p;
         }
 
         /// Fast decode — minimal overhead for cached decode graphs.

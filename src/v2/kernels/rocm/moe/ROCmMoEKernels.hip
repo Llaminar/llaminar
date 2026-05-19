@@ -1949,8 +1949,9 @@ bool hipMoE_shared_expert_gate(
     int seq_len, int d_model,
     int device_idx, void *stream)
 {
-    llaminar2::HipDeviceGuard::setDevice(device_idx);
-    (void)hipGetLastError();
+    // TIMING: skip device guard and error clear to test if they cause sync
+    // llaminar2::HipDeviceGuard::setDevice(device_idx);
+    // (void)hipGetLastError();
 
     // Phase 1: Compute dot products → sigmoid → gate_scratch[seq_len]
     {

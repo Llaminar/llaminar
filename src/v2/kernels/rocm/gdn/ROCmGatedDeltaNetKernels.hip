@@ -228,20 +228,24 @@ __global__ void rocm_gdn_recurrent_step_kernel(
 }
 
 // =========================================================================
-// Prefill Recurrence Kernel (seq_len>1, multi-block per head)
+// Prefill Recurrence Kernel (seq_len>1, register-cached state)
 //
-// Optimizations vs V1:
-//   1. 2D grid: dim3(n_heads, col_blocks) — each column block processes
-//      a subset of the d_v columns. Columns are fully independent in the
-//      delta-rule recurrence, so no cross-block sync is needed.
-//   2. Fused 2-pass column processing (same as decode kernel):
-//      Pass 1: decay + kv (read-only); Pass 2: decay + update + output
-//      (read-modify-write). Eliminates the separate decay pass.
-//   3. Each thread owns one column vi — all per-column operations are
-//      independent, so no __syncthreads() in the column processing body.
+// V4 optimizations:
+//   1. State cached in registers: each thread keeps its 32 state values
+//      in VGPRs across all 595 timesteps. State is loaded from global
+//      ONCE at kernel start and written back ONCE at end.
+//   2. Single-pass per timestep: kv dot product → delta → state update →
+//      output accumulation in ONE loop over the 32 cached rows.
+//   3. 2D grid: dim3(n_heads, col_blocks) with ROW_SPLIT=4 for parity.
+//   4. Eliminates ~1190 global memory state R/W passes per thread.
+//
+// Register budget: 32 state floats + ~20 other = 52 VGPRs per thread.
+// gfx906 has 256 VGPRs → max occupancy = 4 waves/SIMD = 16 waves/CU.
+// (Currently only 4 waves/CU from 1 block, so this is occupancy-neutral.)
 // =========================================================================
 
-__global__ void rocm_gdn_chunk_forward_kernel(
+__global__ __launch_bounds__(256, 2)
+void rocm_gdn_chunk_forward_kernel(
     const float *__restrict__ Q,
     const float *__restrict__ K,
     const float *__restrict__ V,
@@ -260,11 +264,6 @@ __global__ void rocm_gdn_chunk_forward_kernel(
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
 
-    // Row-split parallelism: ROW_SPLIT threads collaborate on each
-    // column, splitting the d_k rows between them. With ROW_SPLIT=4 and
-    // 256 threads/block: 4 wavefronts/block — matches CUDA's reduction
-    // structure to minimize per-step rounding error that compounds through
-    // the GDN recurrence (ROW_SPLIT=8 caused 10-40x worse parity vs CUDA).
     constexpr int ROW_SPLIT = 4;
     const int cols_per_block = block_size / ROW_SPLIT;
     const int split_id = tid / cols_per_block;   // 0..ROW_SPLIT-1
@@ -281,7 +280,6 @@ __global__ void rocm_gdn_chunk_forward_kernel(
     float *q_local = smem;
     float *k_local = smem + d_k;
     float *warp_sums = smem + 2 * d_k; // [16] for warp reduction
-    // Double-buffered reduction arrays for row-split partial sums
     float *reduce_kv = smem + 2 * d_k + 16;            // [block_size]
     float *reduce_out = smem + 2 * d_k + 16 + block_size; // [block_size]
 
@@ -298,6 +296,62 @@ __global__ void rocm_gdn_chunk_forward_kernel(
         dt_bias_h = dt_bias[h];
     }
     __syncthreads();
+
+    // =====================================================================
+    // REGISTER-CACHED STATE: Load state into registers ONCE
+    // Each thread owns rows_per_split (=d_k/ROW_SPLIT) state values for
+    // its column vi. With d_k=128, ROW_SPLIT=4: 32 floats per thread.
+    // =====================================================================
+    const int rows_per_split = d_k / ROW_SPLIT;
+    const int j_start = split_id * rows_per_split;
+
+    // Use individual variables in groups of 8 to help the compiler
+    // keep them in VGPRs (AMD compiler more likely to register-allocate
+    // fixed-size unrolled groups than a single large array).
+    float sc0, sc1, sc2, sc3, sc4, sc5, sc6, sc7;
+    float sc8, sc9, sc10, sc11, sc12, sc13, sc14, sc15;
+    float sc16, sc17, sc18, sc19, sc20, sc21, sc22, sc23;
+    float sc24, sc25, sc26, sc27, sc28, sc29, sc30, sc31;
+
+    if (vi < d_v) {
+        sc0  = S[(j_start +  0) * d_v + vi];
+        sc1  = S[(j_start +  1) * d_v + vi];
+        sc2  = S[(j_start +  2) * d_v + vi];
+        sc3  = S[(j_start +  3) * d_v + vi];
+        sc4  = S[(j_start +  4) * d_v + vi];
+        sc5  = S[(j_start +  5) * d_v + vi];
+        sc6  = S[(j_start +  6) * d_v + vi];
+        sc7  = S[(j_start +  7) * d_v + vi];
+        sc8  = S[(j_start +  8) * d_v + vi];
+        sc9  = S[(j_start +  9) * d_v + vi];
+        sc10 = S[(j_start + 10) * d_v + vi];
+        sc11 = S[(j_start + 11) * d_v + vi];
+        sc12 = S[(j_start + 12) * d_v + vi];
+        sc13 = S[(j_start + 13) * d_v + vi];
+        sc14 = S[(j_start + 14) * d_v + vi];
+        sc15 = S[(j_start + 15) * d_v + vi];
+        sc16 = S[(j_start + 16) * d_v + vi];
+        sc17 = S[(j_start + 17) * d_v + vi];
+        sc18 = S[(j_start + 18) * d_v + vi];
+        sc19 = S[(j_start + 19) * d_v + vi];
+        sc20 = S[(j_start + 20) * d_v + vi];
+        sc21 = S[(j_start + 21) * d_v + vi];
+        sc22 = S[(j_start + 22) * d_v + vi];
+        sc23 = S[(j_start + 23) * d_v + vi];
+        sc24 = S[(j_start + 24) * d_v + vi];
+        sc25 = S[(j_start + 25) * d_v + vi];
+        sc26 = S[(j_start + 26) * d_v + vi];
+        sc27 = S[(j_start + 27) * d_v + vi];
+        sc28 = S[(j_start + 28) * d_v + vi];
+        sc29 = S[(j_start + 29) * d_v + vi];
+        sc30 = S[(j_start + 30) * d_v + vi];
+        sc31 = S[(j_start + 31) * d_v + vi];
+    } else {
+        sc0=sc1=sc2=sc3=sc4=sc5=sc6=sc7=0.0f;
+        sc8=sc9=sc10=sc11=sc12=sc13=sc14=sc15=0.0f;
+        sc16=sc17=sc18=sc19=sc20=sc21=sc22=sc23=0.0f;
+        sc24=sc25=sc26=sc27=sc28=sc29=sc30=sc31=0.0f;
+    }
 
     for (int t = 0; t < seq_len; t++) {
         const float *q_src = Q + t * qk_stride + h * d_k;
@@ -368,62 +422,145 @@ __global__ void rocm_gdn_chunk_forward_kernel(
         decay = warp_sums[0];
         beta_h = warp_sums[1];
 
-        // Row-split column processing: each column is processed by
-        // ROW_SPLIT threads. Double-buffered shared memory reduction.
-        // NOTE: Register caching tested but regressed on gfx906 (AMD compiler
-        // places arrays in scratch memory). 2-pass approach is faster here.
-        {
-            const int rows_per_split = d_k / ROW_SPLIT;
-            const int j_start = split_id * rows_per_split;
-            const int j_end = (split_id == ROW_SPLIT - 1) ? d_k : j_start + rows_per_split;
+        // =================================================================
+        // SINGLE-PASS register-cached state processing
+        // Pass 1: decay state + accumulate kv dot product (from registers)
+        // =================================================================
+        float partial_kv = 0.0f;
+        if (vi < d_v) {
+            // Apply decay to cached state and compute kv dot product
+            sc0 *= decay; partial_kv += sc0 * k_local[j_start + 0];
+            sc1 *= decay; partial_kv += sc1 * k_local[j_start + 1];
+            sc2 *= decay; partial_kv += sc2 * k_local[j_start + 2];
+            sc3 *= decay; partial_kv += sc3 * k_local[j_start + 3];
+            sc4 *= decay; partial_kv += sc4 * k_local[j_start + 4];
+            sc5 *= decay; partial_kv += sc5 * k_local[j_start + 5];
+            sc6 *= decay; partial_kv += sc6 * k_local[j_start + 6];
+            sc7 *= decay; partial_kv += sc7 * k_local[j_start + 7];
+            sc8 *= decay; partial_kv += sc8 * k_local[j_start + 8];
+            sc9 *= decay; partial_kv += sc9 * k_local[j_start + 9];
+            sc10 *= decay; partial_kv += sc10 * k_local[j_start + 10];
+            sc11 *= decay; partial_kv += sc11 * k_local[j_start + 11];
+            sc12 *= decay; partial_kv += sc12 * k_local[j_start + 12];
+            sc13 *= decay; partial_kv += sc13 * k_local[j_start + 13];
+            sc14 *= decay; partial_kv += sc14 * k_local[j_start + 14];
+            sc15 *= decay; partial_kv += sc15 * k_local[j_start + 15];
+            sc16 *= decay; partial_kv += sc16 * k_local[j_start + 16];
+            sc17 *= decay; partial_kv += sc17 * k_local[j_start + 17];
+            sc18 *= decay; partial_kv += sc18 * k_local[j_start + 18];
+            sc19 *= decay; partial_kv += sc19 * k_local[j_start + 19];
+            sc20 *= decay; partial_kv += sc20 * k_local[j_start + 20];
+            sc21 *= decay; partial_kv += sc21 * k_local[j_start + 21];
+            sc22 *= decay; partial_kv += sc22 * k_local[j_start + 22];
+            sc23 *= decay; partial_kv += sc23 * k_local[j_start + 23];
+            sc24 *= decay; partial_kv += sc24 * k_local[j_start + 24];
+            sc25 *= decay; partial_kv += sc25 * k_local[j_start + 25];
+            sc26 *= decay; partial_kv += sc26 * k_local[j_start + 26];
+            sc27 *= decay; partial_kv += sc27 * k_local[j_start + 27];
+            sc28 *= decay; partial_kv += sc28 * k_local[j_start + 28];
+            sc29 *= decay; partial_kv += sc29 * k_local[j_start + 29];
+            sc30 *= decay; partial_kv += sc30 * k_local[j_start + 30];
+            sc31 *= decay; partial_kv += sc31 * k_local[j_start + 31];
+        }
+        reduce_kv[tid] = partial_kv;
+        __syncthreads();
 
-            // Pass 1: Fused decay + partial kv dot product
-            float partial_kv = 0.0f;
-            if (vi < d_v)
-            {
-                for (int j = j_start; j < j_end; j++)
-                {
-                    float s_decayed = S[j * d_v + vi] * decay;
-                    partial_kv += s_decayed * k_local[j];
-                }
-            }
-            reduce_kv[tid] = partial_kv;
-            __syncthreads();
+        // Reduce kv across splits and compute delta
+        float delta = 0.0f;
+        if (vi < d_v) {
+            float kv = 0.0f;
+            for (int s = 0; s < ROW_SPLIT; s++)
+                kv += reduce_kv[col_in_block + s * cols_per_block];
+            delta = (v_src[vi] - kv) * beta_h;
+        }
 
-            // Reduce kv across all splits and compute delta
-            float delta = 0.0f;
-            if (vi < d_v)
-            {
-                float kv = 0.0f;
-                for (int s = 0; s < ROW_SPLIT; s++)
-                    kv += reduce_kv[col_in_block + s * cols_per_block];
-                delta = (v_src[vi] - kv) * beta_h;
-            }
+        // =================================================================
+        // Pass 2: Update state + accumulate output (all in registers)
+        // =================================================================
+        float partial_out = 0.0f;
+        if (vi < d_v) {
+            sc0 += k_local[j_start + 0] * delta; partial_out += sc0 * q_local[j_start + 0];
+            sc1 += k_local[j_start + 1] * delta; partial_out += sc1 * q_local[j_start + 1];
+            sc2 += k_local[j_start + 2] * delta; partial_out += sc2 * q_local[j_start + 2];
+            sc3 += k_local[j_start + 3] * delta; partial_out += sc3 * q_local[j_start + 3];
+            sc4 += k_local[j_start + 4] * delta; partial_out += sc4 * q_local[j_start + 4];
+            sc5 += k_local[j_start + 5] * delta; partial_out += sc5 * q_local[j_start + 5];
+            sc6 += k_local[j_start + 6] * delta; partial_out += sc6 * q_local[j_start + 6];
+            sc7 += k_local[j_start + 7] * delta; partial_out += sc7 * q_local[j_start + 7];
+            sc8 += k_local[j_start + 8] * delta; partial_out += sc8 * q_local[j_start + 8];
+            sc9 += k_local[j_start + 9] * delta; partial_out += sc9 * q_local[j_start + 9];
+            sc10 += k_local[j_start + 10] * delta; partial_out += sc10 * q_local[j_start + 10];
+            sc11 += k_local[j_start + 11] * delta; partial_out += sc11 * q_local[j_start + 11];
+            sc12 += k_local[j_start + 12] * delta; partial_out += sc12 * q_local[j_start + 12];
+            sc13 += k_local[j_start + 13] * delta; partial_out += sc13 * q_local[j_start + 13];
+            sc14 += k_local[j_start + 14] * delta; partial_out += sc14 * q_local[j_start + 14];
+            sc15 += k_local[j_start + 15] * delta; partial_out += sc15 * q_local[j_start + 15];
+            sc16 += k_local[j_start + 16] * delta; partial_out += sc16 * q_local[j_start + 16];
+            sc17 += k_local[j_start + 17] * delta; partial_out += sc17 * q_local[j_start + 17];
+            sc18 += k_local[j_start + 18] * delta; partial_out += sc18 * q_local[j_start + 18];
+            sc19 += k_local[j_start + 19] * delta; partial_out += sc19 * q_local[j_start + 19];
+            sc20 += k_local[j_start + 20] * delta; partial_out += sc20 * q_local[j_start + 20];
+            sc21 += k_local[j_start + 21] * delta; partial_out += sc21 * q_local[j_start + 21];
+            sc22 += k_local[j_start + 22] * delta; partial_out += sc22 * q_local[j_start + 22];
+            sc23 += k_local[j_start + 23] * delta; partial_out += sc23 * q_local[j_start + 23];
+            sc24 += k_local[j_start + 24] * delta; partial_out += sc24 * q_local[j_start + 24];
+            sc25 += k_local[j_start + 25] * delta; partial_out += sc25 * q_local[j_start + 25];
+            sc26 += k_local[j_start + 26] * delta; partial_out += sc26 * q_local[j_start + 26];
+            sc27 += k_local[j_start + 27] * delta; partial_out += sc27 * q_local[j_start + 27];
+            sc28 += k_local[j_start + 28] * delta; partial_out += sc28 * q_local[j_start + 28];
+            sc29 += k_local[j_start + 29] * delta; partial_out += sc29 * q_local[j_start + 29];
+            sc30 += k_local[j_start + 30] * delta; partial_out += sc30 * q_local[j_start + 30];
+            sc31 += k_local[j_start + 31] * delta; partial_out += sc31 * q_local[j_start + 31];
+        }
+        reduce_out[tid] = partial_out;
+        __syncthreads();
 
-            // Pass 2: Fused decay + update + partial output
-            float partial_out = 0.0f;
-            if (vi < d_v)
-            {
-                for (int j = j_start; j < j_end; j++)
-                {
-                    float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
-                    S[j * d_v + vi] = s_new;
-                    partial_out += s_new * q_local[j];
-                }
-            }
-            reduce_out[tid] = partial_out;
-            __syncthreads();
-
-            // Reduce output and write (only split_id=0 writes)
-            if (vi < d_v && split_id == 0)
-            {
-                float out_vi = 0.0f;
-                for (int s = 0; s < ROW_SPLIT; s++)
-                    out_vi += reduce_out[col_in_block + s * cols_per_block];
-                o_dst[vi] = out_vi;
-            }
+        // Reduce output and write (only split_id=0 writes)
+        if (vi < d_v && split_id == 0) {
+            float out_vi = 0.0f;
+            for (int s = 0; s < ROW_SPLIT; s++)
+                out_vi += reduce_out[col_in_block + s * cols_per_block];
+            o_dst[vi] = out_vi;
         }
         __syncthreads();
+    }
+
+    // =====================================================================
+    // Write state back to global memory ONCE at the end
+    // =====================================================================
+    if (vi < d_v) {
+        S[(j_start +  0) * d_v + vi] = sc0;
+        S[(j_start +  1) * d_v + vi] = sc1;
+        S[(j_start +  2) * d_v + vi] = sc2;
+        S[(j_start +  3) * d_v + vi] = sc3;
+        S[(j_start +  4) * d_v + vi] = sc4;
+        S[(j_start +  5) * d_v + vi] = sc5;
+        S[(j_start +  6) * d_v + vi] = sc6;
+        S[(j_start +  7) * d_v + vi] = sc7;
+        S[(j_start +  8) * d_v + vi] = sc8;
+        S[(j_start +  9) * d_v + vi] = sc9;
+        S[(j_start + 10) * d_v + vi] = sc10;
+        S[(j_start + 11) * d_v + vi] = sc11;
+        S[(j_start + 12) * d_v + vi] = sc12;
+        S[(j_start + 13) * d_v + vi] = sc13;
+        S[(j_start + 14) * d_v + vi] = sc14;
+        S[(j_start + 15) * d_v + vi] = sc15;
+        S[(j_start + 16) * d_v + vi] = sc16;
+        S[(j_start + 17) * d_v + vi] = sc17;
+        S[(j_start + 18) * d_v + vi] = sc18;
+        S[(j_start + 19) * d_v + vi] = sc19;
+        S[(j_start + 20) * d_v + vi] = sc20;
+        S[(j_start + 21) * d_v + vi] = sc21;
+        S[(j_start + 22) * d_v + vi] = sc22;
+        S[(j_start + 23) * d_v + vi] = sc23;
+        S[(j_start + 24) * d_v + vi] = sc24;
+        S[(j_start + 25) * d_v + vi] = sc25;
+        S[(j_start + 26) * d_v + vi] = sc26;
+        S[(j_start + 27) * d_v + vi] = sc27;
+        S[(j_start + 28) * d_v + vi] = sc28;
+        S[(j_start + 29) * d_v + vi] = sc29;
+        S[(j_start + 30) * d_v + vi] = sc30;
+        S[(j_start + 31) * d_v + vi] = sc31;
     }
 }
 

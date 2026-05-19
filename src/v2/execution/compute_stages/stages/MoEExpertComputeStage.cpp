@@ -434,6 +434,7 @@ namespace llaminar2
                           params_.routing_indices, params_.routing_weights,
                           seq_len, num_experts, top_k))
         {
+
             // Scratch sizing based on max local expert token count
             int max_batch = 0;
             std::vector<int> active_local_experts;
