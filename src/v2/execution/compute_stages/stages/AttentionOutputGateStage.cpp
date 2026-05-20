@@ -282,10 +282,10 @@ namespace llaminar2
         auto *gate_base = dynamic_cast<TensorBase *>(params_.gate);
         auto *output_base = dynamic_cast<TensorBase *>(params_.output);
         const size_t rows = (params_.seq_len > 0) ? static_cast<size_t>(params_.seq_len)
-                              : (output_base ? output_base->rows() : 0);
+                                                  : (output_base ? output_base->rows() : 0);
         const size_t cols = output_base ? output_base->cols()
-                        : (input_base ? input_base->cols()
-                                  : (gate_base ? gate_base->cols() : 0));
+                                        : (input_base ? input_base->cols()
+                                                      : (gate_base ? gate_base->cols() : 0));
 
         if (input_base)
             info.addInput("input", input_base, rows, cols);

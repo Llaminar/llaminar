@@ -210,10 +210,10 @@ namespace llaminar2::test::parity
         TensorDistributionStats pytorch_stats;
 
         // --- MoE routing-specific metrics (NaN for non-routing stages) ---
-        bool is_routing_stage = false;     ///< True for MOE_ROUTING_INDICES / MOE_ROUTING_WEIGHTS
-        float routing_overlap = std::numeric_limits<float>::quiet_NaN();     ///< Set overlap (Jaccard) for indices, sparse-vector cosine for weights
-        float routing_top1_match = std::numeric_limits<float>::quiet_NaN();  ///< Fraction of tokens where top-1 expert matches (indices only)
-        float routing_weight_l1 = std::numeric_limits<float>::quiet_NaN();   ///< Mean L1 distance of sparse weight vectors (weights only)
+        bool is_routing_stage = false;                                      ///< True for MOE_ROUTING_INDICES / MOE_ROUTING_WEIGHTS
+        float routing_overlap = std::numeric_limits<float>::quiet_NaN();    ///< Set overlap (Jaccard) for indices, sparse-vector cosine for weights
+        float routing_top1_match = std::numeric_limits<float>::quiet_NaN(); ///< Fraction of tokens where top-1 expert matches (indices only)
+        float routing_weight_l1 = std::numeric_limits<float>::quiet_NaN();  ///< Mean L1 distance of sparse weight vectors (weights only)
     };
 
     /**
@@ -570,17 +570,17 @@ namespace llaminar2::test::parity
      */
     struct BackendThresholds
     {
-        float cosine_threshold = 0.999f;               ///< Min avg cosine for layer pass
-        float decode_cosine_threshold = 0.99f;         ///< Threshold for decode parity
-        int early_layers_count = 4;                    ///< Number of early layers to check
-        int min_early_layers_passed = 4;               ///< Min early layers that must pass
-        float kl_threshold = 0.05f;                    ///< Max KL divergence for logits
-        std::vector<std::string> excluded_stages = {}; ///< Stages to exclude from parity comparison
+        float cosine_threshold = 0.999f;                ///< Min avg cosine for layer pass
+        float decode_cosine_threshold = 0.99f;          ///< Threshold for decode parity
+        int early_layers_count = 4;                     ///< Number of early layers to check
+        int min_early_layers_passed = 4;                ///< Min early layers that must pass
+        float kl_threshold = 0.05f;                     ///< Max KL divergence for logits
+        std::vector<std::string> excluded_stages = {};  ///< Stages to exclude from parity comparison
         std::vector<std::string> allreduce_stages = {}; ///< Stages to allreduce across MPI ranks before comparison
-        float min_top1_accuracy = 80.0f;               ///< Min Top-1 accuracy %
-        float min_top5_accuracy = 80.0f;               ///< Min Top-5 accuracy %
-        float min_decode_pass_rate = 0.8f;             ///< Min fraction of decode steps passing
-        int pytorch_top1_in_topk = 3;                  ///< PyTorch's top-1 must be in llaminar's top-K (0=disabled)
+        float min_top1_accuracy = 80.0f;                ///< Min Top-1 accuracy %
+        float min_top5_accuracy = 80.0f;                ///< Min Top-5 accuracy %
+        float min_decode_pass_rate = 0.8f;              ///< Min fraction of decode steps passing
+        int pytorch_top1_in_topk = 3;                   ///< PyTorch's top-1 must be in llaminar's top-K (0=disabled)
     };
 
     // =============================================================================
@@ -2477,7 +2477,7 @@ namespace llaminar2::test::parity
             result.is_routing_stage = true;
             result.routing_overlap = static_cast<float>(total_overlap / seq_len);
             result.routing_top1_match = static_cast<float>(position_0_match) / static_cast<float>(seq_len);
-            result.cosine_similarity = result.routing_overlap; // Keep for backward compat (layer log)
+            result.cosine_similarity = result.routing_overlap;   // Keep for backward compat (layer log)
             result.max_abs_diff = 1.0f - result.routing_overlap; // "distance" from perfect
             result.passed = (result.routing_overlap >= config_.cosine_threshold);
             return result;
@@ -3676,7 +3676,7 @@ namespace llaminar2::test::parity
                         bool curr_routing = isRoutingStage(stats.stage_results[s].stage_name);
                         bool prev_routing = isRoutingStage(stats.stage_results[s - 1].stage_name);
                         if (curr_routing || prev_routing)
-                            continue;  // Skip drops involving routing stages
+                            continue; // Skip drops involving routing stages
 
                         float drop = stats.stage_results[s - 1].cosine_similarity -
                                      stats.stage_results[s].cosine_similarity;

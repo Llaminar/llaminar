@@ -2222,9 +2222,9 @@ namespace llaminar
                 rmsnorm_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
                 LOG_DEBUG("[KernelFactory][RMSNORM] create dev=" << static_cast<int>(target_device.type)
-                                                                << ":" << target_device.ordinal
-                                                                << " tensor_type=" << static_cast<int>(tensor->native_type())
-                                                                << " kernel=" << static_cast<const void *>(raw_ptr));
+                                                                 << ":" << target_device.ordinal
+                                                                 << " tensor_type=" << static_cast<int>(tensor->native_type())
+                                                                 << " kernel=" << static_cast<const void *>(raw_ptr));
                 LOG_DEBUG("[KernelFactory][Registry] create kind=RMSNORM dev=" << static_cast<int>(target_device.type)
                                                                                << ":" << target_device.ordinal
                                                                                << " variant=" << static_cast<int>(tensor->native_type())
@@ -3539,14 +3539,14 @@ namespace llaminar
                 }
 
                 LOG_DEBUG("[PreparedEmbeddingWeights] Prepared embedding for "
-                         << target_device.to_string() << ": "
-                         << llaminar2::tensorTypeName(tensor->native_type()) << " "
-                         << repacked.vocab_size << "x" << d_model
-                         << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
-                                           " of " + std::to_string(effective_total) + ")")
-                                        : "")
-                         << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                         << " (" << repacked.blocks_per_row << " blocks/row)");
+                          << target_device.to_string() << ": "
+                          << llaminar2::tensorTypeName(tensor->native_type()) << " "
+                          << repacked.vocab_size << "x" << d_model
+                          << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
+                                            " of " + std::to_string(effective_total) + ")")
+                                         : "")
+                          << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                          << " (" << repacked.blocks_per_row << " blocks/row)");
 
                 auto handle = std::make_shared<llaminar2::PreparedEmbeddingHandle>();
                 handle->tensor = tensor;
@@ -4170,11 +4170,11 @@ namespace llaminar
                     }
 
                     LOG_DEBUG("[KernelFactory] Creating CPU Hybrid KVCache: "
-                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
-                             << ", total_layers=" << config.num_layers
-                             << ", kv_layers=" << hc.countKVLayers()
-                             << ", n_kv_heads=" << config.n_kv_heads
-                             << ", head_dim=" << config.head_dim);
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", total_layers=" << config.num_layers
+                              << ", kv_layers=" << hc.countKVLayers()
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", head_dim=" << config.head_dim);
 
                     if (config.is_sharded())
                     {
@@ -4259,12 +4259,12 @@ namespace llaminar
                     const int cuda_device = config.device.cuda_ordinal();
 
                     LOG_DEBUG("[KernelFactory] Creating CUDA Hybrid KVCache: "
-                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
-                             << ", device=CUDA:" << cuda_device
-                             << ", total_layers=" << config.num_layers
-                             << ", kv_layers=" << hc.countKVLayers()
-                             << ", n_kv_heads=" << config.n_kv_heads
-                             << ", head_dim=" << config.head_dim);
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", device=CUDA:" << cuda_device
+                              << ", total_layers=" << config.num_layers
+                              << ", kv_layers=" << hc.countKVLayers()
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", head_dim=" << config.head_dim);
 
                     if (config.is_sharded())
                     {
@@ -4334,12 +4334,12 @@ namespace llaminar
                     const int rocm_device = config.device.rocm_ordinal();
 
                     LOG_DEBUG("[KernelFactory] Creating ROCm Hybrid KVCache: "
-                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
-                             << ", device=ROCm:" << rocm_device
-                             << ", total_layers=" << config.num_layers
-                             << ", kv_layers=" << hc.countKVLayers()
-                             << ", n_kv_heads=" << config.n_kv_heads
-                             << ", head_dim=" << config.head_dim);
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", device=ROCm:" << rocm_device
+                              << ", total_layers=" << config.num_layers
+                              << ", kv_layers=" << hc.countKVLayers()
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", head_dim=" << config.head_dim);
 
                     if (config.is_sharded())
                     {
@@ -4403,8 +4403,8 @@ namespace llaminar
                     }
 
                     LOG_DEBUG("[KernelFactory] Initialized GDN kernels for "
-                             << hybrid->gdnLayerCount() << " GDN layers on "
-                             << config.device.to_string());
+                              << hybrid->gdnLayerCount() << " GDN layers on "
+                              << config.device.to_string());
                 }
 
                 return cache;
