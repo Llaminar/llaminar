@@ -201,7 +201,8 @@ namespace llaminar2
 
     bool MoERoutingStage::isGraphCapturable() const
     {
-        return isDeviceRoutedDecodeGraphCapturable();
+        return isDeviceRoutedDecodeGraphCapturable() ||
+               isDeviceRoutedPrefillGraphCapturable();
     }
 
     void MoERoutingStage::onGraphReplayed()
@@ -211,7 +212,8 @@ namespace llaminar2
 
     bool MoERoutingStage::needsOnGraphReplayed() const
     {
-        return params_.decode_histogram != nullptr && isDeviceRoutedDecodeGraphCapturable();
+        return params_.decode_histogram != nullptr &&
+               (isDeviceRoutedDecodeGraphCapturable() || isDeviceRoutedPrefillGraphCapturable());
     }
 
     bool MoERoutingStage::isDeviceRoutedDecodeGraphCapturable() const
@@ -239,6 +241,30 @@ namespace llaminar2
                rocm.moe_device_routed_decode &&
                params_.moe_runtime_table &&
                hasInitializedRuntimeTableIfProvided();
+#endif
+    }
+
+    bool MoERoutingStage::isDeviceRoutedPrefillGraphCapturable() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+        return false;
+#else
+        // Prefill routing is graph-capturable on ROCm when the full path is
+        // device-only: routeWithTensors() in non-snapshot Release builds does
+        // NO D2H and NO hipStreamSynchronize. Data stays device-resident.
+        const auto &rocm = debugEnv().rocm;
+        return params_.device_id.is_rocm() &&
+               params_.seq_len > 1 &&
+               params_.d_model > 0 &&
+               params_.num_experts > 0 &&
+               params_.top_k > 0 &&
+               params_.top_k <= params_.num_experts &&
+               params_.input &&
+               params_.gate_weights &&
+               params_.output_indices &&
+               params_.output_weights &&
+               rocm.moe_grouped_prefill &&
+               moe_kernel_ != nullptr;
 #endif
     }
 

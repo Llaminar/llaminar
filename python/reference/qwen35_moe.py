@@ -257,6 +257,29 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             return
 
         model = self.hf_model.model
+        self._last_fa_gate_by_layer = {}
+        self._active_fa_rope_layer = None
+
+        from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen35_moe_mod
+
+        original_apply_rotary = qwen35_moe_mod.apply_rotary_pos_emb
+
+        def _flatten_head_tensor(t):
+            if t.dim() == 4:
+                return t.transpose(1, 2).contiguous().reshape(t.shape[0], t.shape[2], -1)
+            return t
+
+        def _capture_apply_rotary_pos_emb(q, k, cos, sin, *args, **kwargs):
+            q_rope, k_rope = original_apply_rotary(q, k, cos, sin, *args, **kwargs)
+            layer_idx = self._active_fa_rope_layer
+            if layer_idx is not None:
+                if self._should_capture(PipelineStage.Q_ROPE):
+                    self.capture_stage(PipelineStage.Q_ROPE, _flatten_head_tensor(q_rope), layer_idx)
+                if self._should_capture(PipelineStage.K_ROPE):
+                    self.capture_stage(PipelineStage.K_ROPE, _flatten_head_tensor(k_rope), layer_idx)
+            return q_rope, k_rope
+
+        qwen35_moe_mod.apply_rotary_pos_emb = _capture_apply_rotary_pos_emb
 
         # Embedding
         def _emb(module, inp, out):
@@ -291,9 +314,30 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
             if not is_linear and attn_module is not None:
                 fa = attn_module
 
+                def _fa_pre(mod, inp, i=idx):
+                    self._active_fa_rope_layer = i
+                self._hook_handles.append(
+                    fa.register_forward_pre_hook(_fa_pre)
+                )
+
+                def _fa_post(mod, inp, out, i=idx):
+                    if self._active_fa_rope_layer == i:
+                        self._active_fa_rope_layer = None
+                self._hook_handles.append(
+                    fa.register_forward_hook(_fa_post)
+                )
+
                 def _q_proj(mod, inp, out, i=idx):
                     if self._should_capture(PipelineStage.Q_PROJECTION):
                         self.capture_stage(PipelineStage.Q_PROJECTION, out, i)
+                    if self._should_capture(PipelineStage.FA_GATE) or self._should_capture(PipelineStage.ATTENTION_CONTEXT):
+                        head_dim = getattr(fa, 'head_dim', self.hf_config.head_dim)
+                        q_gate = out.view(*out.shape[:-1], -1, head_dim * 2)
+                        _, gate = torch.chunk(q_gate, 2, dim=-1)
+                        gate = gate.reshape(*out.shape[:-1], -1)
+                        self._last_fa_gate_by_layer[i] = gate.detach()
+                        if self._should_capture(PipelineStage.FA_GATE):
+                            self.capture_stage(PipelineStage.FA_GATE, gate, i)
                 self._hook_handles.append(
                     fa.q_proj.register_forward_hook(_q_proj)
                 )
@@ -310,6 +354,35 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                         self.capture_stage(PipelineStage.V_PROJECTION, out, i)
                 self._hook_handles.append(
                     fa.v_proj.register_forward_hook(_v_proj)
+                )
+
+                def _q_norm(mod, inp, out, i=idx):
+                    if self._should_capture(PipelineStage.Q_NORM):
+                        self.capture_stage(PipelineStage.Q_NORM, _flatten_head_tensor(out), i)
+                self._hook_handles.append(
+                    fa.q_norm.register_forward_hook(_q_norm)
+                )
+
+                def _k_norm(mod, inp, out, i=idx):
+                    if self._should_capture(PipelineStage.K_NORM):
+                        self.capture_stage(PipelineStage.K_NORM, _flatten_head_tensor(out), i)
+                self._hook_handles.append(
+                    fa.k_norm.register_forward_hook(_k_norm)
+                )
+
+                def _attn_context(mod, inp, i=idx):
+                    h = inp[0] if isinstance(inp, tuple) else inp
+                    if self._should_capture(PipelineStage.ATTENTION_CONTEXT):
+                        gate_by_layer = getattr(self, '_last_fa_gate_by_layer', {})
+                        gate = gate_by_layer.get(i)
+                        if gate is not None:
+                            gate = gate.to(device=h.device, dtype=h.dtype)
+                            raw_context = h / torch.sigmoid(gate).clamp_min(1e-12)
+                            self.capture_stage(PipelineStage.ATTENTION_CONTEXT, raw_context, i)
+                    if self._should_capture(PipelineStage.ATTENTION_CONTEXT_GATED):
+                        self.capture_stage(PipelineStage.ATTENTION_CONTEXT_GATED, h, i)
+                self._hook_handles.append(
+                    fa.o_proj.register_forward_pre_hook(_attn_context)
                 )
 
             # GDN-specific hooks for linear attention layers
@@ -329,6 +402,23 @@ class Qwen35MoEReferenceModel(HuggingFaceReferenceModel):
                 self._hook_handles.append(
                     gdn.conv1d.register_forward_hook(_conv1d_out)
                 )
+
+                # Cached decode uses causal_conv1d_update directly instead of
+                # invoking the Conv1d module, so the forward hook above only
+                # covers prefill/fallback paths. Wrap the update function to
+                # expose the same post-conv boundary for one-token decode.
+                if not getattr(gdn, "_llaminar_conv_update_wrapped", False):
+                    original_update = gdn.causal_conv1d_update
+
+                    def _capture_conv1d_update(x, conv_state, weight, bias, activation,
+                                               *args, _orig=original_update, i=idx, **kwargs):
+                        out = _orig(x, conv_state, weight, bias, activation, *args, **kwargs)
+                        if self._should_capture(PipelineStage.GDN_CONV1D_OUTPUT):
+                            self.capture_stage(PipelineStage.GDN_CONV1D_OUTPUT, out, i)
+                        return out
+
+                    gdn.causal_conv1d_update = _capture_conv1d_update
+                    gdn._llaminar_conv_update_wrapped = True
 
                 def _z_proj(mod, inp, out, i=idx):
                     if self._should_capture(PipelineStage.GDN_Z_PROJECTION):

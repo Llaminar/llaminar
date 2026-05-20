@@ -399,6 +399,95 @@ TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Large)
     EXPECT_LE(l2_error_k, 0.01);
 }
 
+TEST_F(Test__ROCmRoPEParity, RoPE_FP32_PartialRotaryKeepsFullHeadStride)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int seq_len = 5;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 128;
+    constexpr int rotary_dim = 32;
+    constexpr float rope_theta = 1000000.0f;
+    const size_t total_q = seq_len * n_heads * head_dim;
+    const size_t total_k = seq_len * n_kv_heads * head_dim;
+
+    auto q_data = randomFP32(total_q);
+    auto k_data = randomFP32(total_k);
+    std::vector<float> original_q = q_data;
+    std::vector<float> original_k = k_data;
+    std::vector<float> cpu_q = q_data;
+    std::vector<float> cpu_k = k_data;
+    std::vector<float> rocm_q = q_data;
+    std::vector<float> rocm_k = k_data;
+    std::vector<int> position_ids = {1024, 1025, 1026, 1027, 1028};
+
+    CPURoPEKernelT<ActivationPrecision::FP32> cpu_kernel;
+    ASSERT_TRUE(cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
+                                       seq_len, n_heads, n_kv_heads, head_dim,
+                                       rope_theta, -1, rotary_dim));
+
+    rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
+
+    float *d_q, *d_k;
+    hipMalloc(&d_q, total_q * sizeof(float));
+    hipMalloc(&d_k, total_k * sizeof(float));
+
+    hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice);
+
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len,
+                                        n_heads, n_kv_heads, head_dim,
+                                        rope_theta, 0, rotary_dim));
+    hipDeviceSynchronize();
+
+    hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost);
+    hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost);
+
+    hipFree(d_q);
+    hipFree(d_k);
+
+    ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total_q));
+    ASSERT_FALSE(hasNaNOrInf(rocm_k.data(), total_k));
+
+    double cosine_q = cosineSimilarity(rocm_q.data(), cpu_q.data(), total_q);
+    double cosine_k = cosineSimilarity(rocm_k.data(), cpu_k.data(), total_k);
+    double l2_error_q = relativeL2Error(rocm_q.data(), cpu_q.data(), total_q);
+    double l2_error_k = relativeL2Error(rocm_k.data(), cpu_k.data(), total_k);
+
+    std::cout << "  RoPE FP32 Partial Q: cosine=" << cosine_q << ", L2_error=" << l2_error_q << std::endl;
+    std::cout << "  RoPE FP32 Partial K: cosine=" << cosine_k << ", L2_error=" << l2_error_k << std::endl;
+
+    EXPECT_GE(cosine_q, 0.9999);
+    EXPECT_GE(cosine_k, 0.9999);
+    EXPECT_LE(l2_error_q, 0.01);
+    EXPECT_LE(l2_error_k, 0.01);
+
+    for (int tok = 0; tok < seq_len; ++tok)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            for (int d = rotary_dim; d < head_dim; ++d)
+            {
+                size_t idx = (static_cast<size_t>(tok) * n_heads + h) * head_dim + d;
+                EXPECT_FLOAT_EQ(rocm_q[idx], original_q[idx]);
+            }
+        }
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int d = rotary_dim; d < head_dim; ++d)
+            {
+                size_t idx = (static_cast<size_t>(tok) * n_kv_heads + h) * head_dim + d;
+                EXPECT_FLOAT_EQ(rocm_k[idx], original_k[idx]);
+            }
+        }
+    }
+}
+
 // ============================================================================
 // BF16 Parity Tests
 // ============================================================================

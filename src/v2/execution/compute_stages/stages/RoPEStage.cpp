@@ -105,15 +105,12 @@ namespace llaminar2
                                                   << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false")
                                                   << " k_is_q16_1=" << (k_is_q16_1 ? "true" : "false"));
 
-        // Compute effective rotary dimension (partial RoPE support)
+        // Compute the rotary prefix length, but keep head_dim as the physical
+        // per-head stride when invoking kernels. Partial RoPE rotates only the
+        // first rotary_dim elements; the rest of each full-width head is passed
+        // through unchanged.
         const int rotary_dim = static_cast<int>(
             static_cast<float>(params_.head_dim) * params_.partial_rotary_factor);
-        // rotary_dim is used as effective head_dim for RoPE computation.
-        // When partial_rotary_factor < 1.0, only the first `rotary_dim` elements
-        // of each head get rotary encoding, the rest are pass-through.
-        const int effective_head_dim = (params_.partial_rotary_factor < 1.0f)
-                                           ? rotary_dim
-                                           : params_.head_dim;
 
         // Get or create device-scoped cached kernel via KernelFactory
         auto *kernel = getOrRefreshKernelByTensorType(
@@ -356,7 +353,7 @@ namespace llaminar2
             seq_len,
             params_.n_heads,
             n_kv_heads,
-            effective_head_dim,
+            params_.head_dim,
             params_.theta_base,
             params_.mpi_ctx,
             params_.device_id.toKernelDeviceIndex(),

@@ -10141,6 +10141,51 @@ add_v2_test(V2_Unit_MoERoutingStage
     MPI_PROCS 1
 )
 
+add_executable(v2_test_prefill_graph_capturability unit/stages/Test__PrefillGraphCapturability.cpp)
+target_include_directories(v2_test_prefill_graph_capturability PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_prefill_graph_capturability llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefillGraphCapturability
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_capturability>
+    LABELS "V2;Unit;MoE;GDN;Stages;GraphCapture"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_prefill_graph_capture_guards unit/stages/Test__PrefillGraphCaptureGuards.cpp)
+target_include_directories(v2_test_prefill_graph_capture_guards PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_prefill_graph_capture_guards llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefillGraphCaptureGuards
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_capture_guards>
+    LABELS "V2;Unit;MoE;GDN;Stages;GraphCapture"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_prefill_graph_capture_dynamic_params unit/stages/Test__PrefillGraphCaptureDynamicParams.cpp)
+target_include_directories(v2_test_prefill_graph_capture_dynamic_params PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_prefill_graph_capture_dynamic_params llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefillGraphCaptureDynamicParams
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_capture_dynamic_params>
+    LABELS "V2;Unit;Embedding;KVCache;Stages;GraphCapture"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_prefill_graph_cache unit/stages/Test__PrefillGraphCache.cpp)
+target_include_directories(v2_test_prefill_graph_cache PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_prefill_graph_cache llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefillGraphCache
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache>
+    LABELS "V2;Unit;GraphCapture;Stages"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_prefill_graph_cache_integration unit/stages/Test__PrefillGraphCacheIntegration.cpp)
+target_include_directories(v2_test_prefill_graph_cache_integration PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_prefill_graph_cache_integration llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefillGraphCacheIntegration
+    COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_integration>
+    LABELS "V2;Unit;GraphCapture;Stages"
+    MPI_PROCS 1
+)
+
 # =============================================================================
 # Collective Backend Tests
 # =============================================================================

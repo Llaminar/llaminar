@@ -41,15 +41,57 @@ namespace
         return true;
     }
 
+    /// @brief Returns whether grouped MoE kernels instantiate this native-VNNI codebook.
     bool groupedDecodeSupportsCodebook(uint8_t codebook_id)
     {
-        return codebook_id == 0 || codebook_id == 4 || codebook_id == 5 ||
-               codebook_id == 6 || codebook_id == 7 || codebook_id == 8;
+        switch (codebook_id)
+        {
+        case 0:  // Q4_0
+        case 4:  // IQ4_NL / IQ4_XS
+        case 5:  // Q4_1 / Q4_K
+        case 6:  // Q5_0
+        case 7:  // Q5_1 / Q5_K
+        case 8:  // Q6_K
+        case 9:  // Q3_K
+        case 10: // Q2_K
+        case 11: // IQ3_S
+        case 12: // IQ3_XXS
+        case 13: // IQ2_S
+        case 14: // IQ2_XS
+        case 15: // IQ2_XXS
+        case 16: // IQ1_S
+        case 17: // IQ1_M
+        case 19: // Q8_0
+            return true;
+        default:
+            return false;
+        }
     }
 
+    /// @brief Returns whether the descriptor's mins pointer is required for this format.
     bool groupedDecodeRequiresMins(uint8_t codebook_id)
     {
-        return codebook_id == 5 || codebook_id == 7 || codebook_id == 8;
+        switch (codebook_id)
+        {
+        case 5:  // Q4_1 / Q4_K min correction
+        case 7:  // Q5_1 / Q5_K min correction
+        case 8:  // Q6_K high half scale
+        case 9:  // Q3_K high half scale
+        case 10: // Q2_K high half scale
+        case 13: // IQ2_S high half scale
+        case 14: // IQ2_XS high half scale
+        case 16: // IQ1_S min correction
+        case 17: // IQ1_M high half scale
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    /// @brief Returns whether the descriptor's emins pointer is required for this format.
+    bool groupedDecodeRequiresEmins(uint8_t codebook_id)
+    {
+        return codebook_id == 10; // Q2_K stores embedded min correction separately.
     }
 
     bool validateGroupedDownDesc(
@@ -61,7 +103,8 @@ namespace
         return desc.valid() && desc.n == d_model && desc.k == intermediate &&
                desc.blocks_per_row == static_cast<uint32_t>(intermediate / 32) &&
                desc.codebook_id == codebook_id &&
-               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins);
+               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins) &&
+               (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
     }
 
     bool validateGroupedGateUpDesc(
@@ -73,7 +116,8 @@ namespace
         return desc.valid() && desc.n == intermediate && desc.k == d_model &&
                desc.blocks_per_row == static_cast<uint32_t>(d_model / 32) &&
                desc.codebook_id == codebook_id &&
-               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins);
+               (!groupedDecodeRequiresMins(desc.codebook_id) || desc.mins) &&
+               (!groupedDecodeRequiresEmins(desc.codebook_id) || desc.emins);
     }
 
     const int *runtimeTopKExpertIdsDevice(const llaminar2::DeviceMoELayerRuntime *runtime_layer)
@@ -246,6 +290,11 @@ extern "C"
         int num_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_max_expert_count(
+        const int *expert_counts, int *d_max_out,
+        int num_experts,
+        int device_idx, void *stream);
+
     bool hipMoE_scatter_tokens(
         const int *routing_indices, const float *routing_weights,
         const int *expert_offsets, int *write_heads,
@@ -386,7 +435,8 @@ extern "C"
         int intermediate,
         int max_tokens_per_expert,
         int total_slots,
-        uint8_t codebook_id,
+        uint8_t gateup_codebook_id,
+        uint8_t down_codebook_id,
         int device_id,
         void *stream);
 }
@@ -1665,6 +1715,12 @@ namespace llaminar2
         // Step 4: Lazy-allocate write_heads scratch buffer
         if (!d_write_heads_ || max_write_heads_experts_ < num_experts)
         {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] write_heads realloc during graph capture "
+                          "(need " << num_experts << ", have " << max_write_heads_experts_ << ")");
+                return false;
+            }
             if (d_write_heads_)
                 hipFree(d_write_heads_);
 
@@ -3532,7 +3588,8 @@ namespace llaminar2
                 down_descs[i].n != d_model || down_descs[i].k != intermediate ||
                 down_descs[i].blocks_per_row != static_cast<uint32_t>(intermediate / 32) ||
                 down_descs[i].codebook_id != codebook_id ||
-                (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins))
+                (groupedDecodeRequiresMins(down_descs[i].codebook_id) && !down_descs[i].mins) ||
+                (groupedDecodeRequiresEmins(down_descs[i].codebook_id) && !down_descs[i].emins))
             {
                 return false;
             }
@@ -3785,8 +3842,11 @@ namespace llaminar2
                 hipFree(d_group_offsets_);
             if (d_group_counts_)
                 hipFree(d_group_counts_);
+            if (d_group_max_tokens_)
+                hipFree(d_group_max_tokens_);
             hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
             hipMalloc(&d_group_counts_, num_experts * sizeof(int));
+            hipMalloc(&d_group_max_tokens_, sizeof(int));
             group_experts_cap_ = num_experts;
         }
 
@@ -3889,6 +3949,12 @@ namespace llaminar2
         // 2. Lazy-allocate grouping buffers
         if (total_slots > group_slots_cap_)
         {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] grouping buffer realloc during graph capture "
+                          "(need " << total_slots << " slots, have " << group_slots_cap_ << ")");
+                return false;
+            }
             if (d_group_int_indices_)
                 hipFree(d_group_int_indices_);
             if (d_group_token_indices_)
@@ -3902,12 +3968,21 @@ namespace llaminar2
         }
         if (num_experts > group_experts_cap_)
         {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] expert buffer realloc during graph capture "
+                          "(need " << num_experts << " experts, have " << group_experts_cap_ << ")");
+                return false;
+            }
             if (d_group_offsets_)
                 hipFree(d_group_offsets_);
             if (d_group_counts_)
                 hipFree(d_group_counts_);
+            if (d_group_max_tokens_)
+                hipFree(d_group_max_tokens_);
             hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
             hipMalloc(&d_group_counts_, num_experts * sizeof(int));
+            hipMalloc(&d_group_max_tokens_, sizeof(int));
             group_experts_cap_ = num_experts;
         }
 
@@ -3930,6 +4005,15 @@ namespace llaminar2
             return false;
         }
 
+        // Launch device-side max-reduction over expert counts (async, no sync).
+        // Result in d_group_max_tokens_ — consumed by GEMM grid early-exit.
+        if (!hipMoE_max_expert_count(d_group_counts_, d_group_max_tokens_,
+                                     num_experts, device_ordinal_, getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] max_expert_count failed");
+            return false;
+        }
+
         // NO D2H copy, NO hipStreamSynchronize — data stays on device
         // for consumption by executeGroupedPrefillPipeline()
 
@@ -3944,6 +4028,15 @@ namespace llaminar2
                                    intermediate > prefill_intermediate_cap_);
         if (!need_realloc)
             return true;
+
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[ROCmMoEKernel::ensureGroupedPrefillScratchCapacity] prefill scratch realloc during graph capture "
+                      "(need slots=" << total_slots << " d_model=" << d_model << " inter=" << intermediate
+                      << ", have slots=" << prefill_slots_cap_ << " d_model=" << prefill_d_model_cap_
+                      << " inter=" << prefill_intermediate_cap_ << ")");
+            return false;
+        }
 
         // Free existing allocations
         if (d_prefill_A_int8_)
@@ -4096,29 +4189,17 @@ namespace llaminar2
             return false;
         }
 
-        // Compute max_tokens_per_expert upper bound (seq_len * top_k / 1 = worst case all tokens to one expert)
-        // Use min(seq_len * top_k, seq_len) since each token only counted once per expert
-        // In practice, seq_len is the upper bound (a token can only be in one expert's group once per top-k slot)
+        // Grid sizing for K2/K4 GEMM kernels.
+        // Use seq_len as conservative upper bound — no host sync needed.
+        // Each layer has independent routing (different gate weights), so
+        // max_tokens_per_expert varies per layer and per input. A cache would
+        // need (layer_id, input_hash) as key — not worth the complexity.
+        // The K2/K4 kernels early-exit via per-expert d_group_counts check,
+        // so overprovision only costs empty-block dispatch (~4ms / 437ms < 1%).
+        // The device-side max (d_group_max_tokens_) is still computed async for
+        // potential future use (e.g., separate-stream approach or graph capture).
         const int total_slots = seq_len * top_k;
-
-        // Compute actual max_tokens_per_expert from device counts (avoids grid over-provisioning
-        // in the GEMM kernels which still use 3D grids).
-        // D2H of 256 ints (~1KB) is negligible vs the GEMM work saved.
-        int max_tokens_per_expert = seq_len; // fallback
-        {
-            std::vector<int> host_counts(num_experts);
-            hipStream_t stream = static_cast<hipStream_t>(getStream());
-            hipStreamSynchronize(stream); // ensure counts are ready
-            hipError_t err = hipMemcpy(host_counts.data(), d_group_counts_,
-                                       num_experts * sizeof(int), hipMemcpyDeviceToHost);
-            if (err == hipSuccess) {
-                int actual_max = 0;
-                for (int i = 0; i < num_experts; ++i)
-                    actual_max = std::max(actual_max, host_counts[i]);
-                if (actual_max > 0)
-                    max_tokens_per_expert = actual_max;
-            }
-        }
+        const int max_tokens_per_expert = seq_len;
 
         // Ensure scratch buffers
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
@@ -4130,6 +4211,12 @@ namespace llaminar2
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
+
+        if (isGraphCaptureActive() && (!d_hidden || !d_output))
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] null device pointers during graph capture");
+            return false;
+        }
 
         // Zero the output buffer (pre-zero requirement for scatter-add)
         hipStream_t stream = static_cast<hipStream_t>(getStream());
@@ -4159,6 +4246,7 @@ namespace llaminar2
             max_tokens_per_expert,
             total_slots,
             gateup_table.codebook_id,
+            down_table.codebook_id,
             device_ordinal_,
             getStream());
 

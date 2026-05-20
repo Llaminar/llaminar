@@ -2284,6 +2284,34 @@ __global__ void rocm_moe_exclusive_scan_kernel(
 }
 
 // =========================================================================
+// Kernel 11b: Max Expert Count (device-side reduction)
+//
+// Computes max(expert_counts[0..num_experts-1]) entirely on device.
+// Single wavefront (64 threads), warp-shuffle reduction.
+// Grid: 1 block, Block: 64 threads
+// =========================================================================
+
+__global__ void rocm_moe_max_expert_count_kernel(
+    const int *__restrict__ expert_counts,  // [num_experts]
+    int *__restrict__ d_max_out,            // [1] output scalar
+    int num_experts)
+{
+    const int tid = threadIdx.x;
+    int local_max = 0;
+
+    // Each thread processes multiple experts (stride 64)
+    for (int e = tid; e < num_experts; e += 64)
+        local_max = max(local_max, expert_counts[e]);
+
+    // Warp-shuffle reduction within a single wavefront (64 threads)
+    for (int offset = 32; offset > 0; offset >>= 1)
+        local_max = max(local_max, __shfl_down(local_max, offset));
+
+    if (tid == 0)
+        *d_max_out = local_max;
+}
+
+// =========================================================================
 // Kernel 12: Scatter Tokens
 //
 // Scatters token indices and weights into expert-grouped arrays.
@@ -2512,6 +2540,27 @@ bool hipMoE_exclusive_scan(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE exclusive_scan kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_max_expert_count(
+    const int *expert_counts, int *d_max_out,
+    int num_experts,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    hipLaunchKernelGGL(rocm_moe_max_expert_count_kernel,
+        dim3(1), dim3(64), 0, static_cast<hipStream_t>(stream),
+        expert_counts, d_max_out, num_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE max_expert_count kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;

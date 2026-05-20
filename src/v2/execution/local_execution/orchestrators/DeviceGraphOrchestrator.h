@@ -1588,6 +1588,9 @@ namespace llaminar2
          */
         IDeviceContext *getDeviceContext(DeviceId device) override;
 
+        /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
+        bool isMoeRebalancingActive() const override;
+
         // =========================================================================
         // IInferenceRunner Interface Implementation
         // =========================================================================

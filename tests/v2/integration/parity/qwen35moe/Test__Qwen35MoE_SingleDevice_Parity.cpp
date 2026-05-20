@@ -51,7 +51,19 @@ using namespace llaminar2::test::parity::qwen35moe;
 // - GDN layers use recurrent delta-rule (accumulates numerical differences)
 // - 35B model with 256 experts — large model increases error accumulation
 // - FP16 KV cache truncation causes 0.04-0.12 attention cosine drops in decode
-// Thresholds are calibrated from observed single-run baselines with ~4-5% margin.
+// CPU and ROCm intentionally share thresholds so GPU decode drift cannot be
+// hidden behind backend-specific liberal gates while this parity bug is active.
+
+static const auto kQwen35MoE35BStrictSingleDeviceThresholds = BackendThresholds{
+    .cosine_threshold = 0.96f,        // Worst CPU observed: 0.9725 layer avg
+    .decode_cosine_threshold = 0.98f, // Worst CPU observed: 0.9952 LM_HEAD avg
+    .early_layers_count = 6,
+    .min_early_layers_passed = 5, // 6/6 observed; require 5
+    .kl_threshold = 0.03f,        // LM_HEAD observed: 0.005-0.014 (run-to-run variance with dynamic rebalance)
+    .min_top1_accuracy = 0.80f,   // Observed: 100%
+    .min_top5_accuracy = 0.60f,   // Observed: 80% (0.8 on 2 steps)
+    .pytorch_top1_in_topk = 3,    // Observed: 5/5 RefInTop3
+};
 
 static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
     // =========================================================================
@@ -69,16 +81,7 @@ static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
         .devices = {ParityDeviceType::CPU},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.96f,        // Worst observed: 0.9725 layer avg
-            .decode_cosine_threshold = 0.98f, // Worst observed: 0.9952 LM_HEAD avg
-            .early_layers_count = 6,
-            .min_early_layers_passed = 5, // 6/6 observed; require 5
-            .kl_threshold = 0.03f,        // LM_HEAD observed: 0.005-0.014 (run-to-run variance with dynamic rebalance)
-            .min_top1_accuracy = 0.80f,   // Observed: 100%
-            .min_top5_accuracy = 0.60f,   // Observed: 80% (0.8 on 2 steps)
-            .pytorch_top1_in_topk = 3,    // Observed: 5/5 RefInTop3
-        },
+        .thresholds = kQwen35MoE35BStrictSingleDeviceThresholds,
         .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
         .snapshot_dir = "pytorch_qwen35_moe_snapshots",
         .activation_precision = ActivationPrecision::FP32,
@@ -89,16 +92,7 @@ static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
         .devices = {ParityDeviceType::ROCm},
         .parallelism = Parallelism::None,
         .collective = Collective::None,
-        .thresholds = {
-            .cosine_threshold = 0.94f,
-            .decode_cosine_threshold = 0.96f,
-            .early_layers_count = 6,
-            .min_early_layers_passed = 5,
-            .kl_threshold = 0.09f, // Observed ROCm/Q4_K_XL prefill range: ~0.050-0.086 KL
-            .min_top1_accuracy = 0.80f,
-            .min_top5_accuracy = 0.60f,
-            .pytorch_top1_in_topk = 4,
-        },
+        .thresholds = kQwen35MoE35BStrictSingleDeviceThresholds,
         .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
         .snapshot_dir = "pytorch_qwen35_moe_snapshots",
         .activation_precision = ActivationPrecision::FP32,

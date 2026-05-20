@@ -14,6 +14,7 @@
 #include "../graph/DeviceGraphExecutor.h"
 #include "../../compute_stages/IComputeStage.h"
 #include "../graph/IGraphBuilder.h"             // For ForwardOutput
+#include "PrefillGraphCache.h"
 
 #include <memory>
 #include <string>
@@ -160,6 +161,12 @@ namespace llaminar2
         std::vector<IComputeStage *> dynamic_param_stages;
         bool dynamic_param_stages_cached = false;
 
+        // Pre-cached pointers to stages that override onGraphReplayed().
+        // For prefill monolithic graph replay, these must be called after launch
+        // to advance KV cache heads and other host-side bookkeeping.
+        std::vector<IComputeStage *> replay_callback_stages;
+        bool replay_callback_stages_cached = false;
+
         // Tracks whether setGPUStream has been applied to all stages.
         // The capture_stream never changes once set, so we skip the
         // 339-stage loop on subsequent decode steps.
@@ -189,6 +196,9 @@ namespace llaminar2
         /// GPU context for creating new graph captures (not owned)
         IWorkerGPUContext *gpu_ctx = nullptr;
 
+        /// Prefill graph capture/replay cache (keyed by seq_len)
+        std::unique_ptr<PrefillGraphCache> prefill_graph_cache;
+
         /// Number of consecutive graph update failures (fallback heuristic)
         int gpu_graph_update_failures = 0;
 
@@ -206,6 +216,8 @@ namespace llaminar2
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
             gpu_graph_update_failures = 0;
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll();
             graph.reset();
             valid = false;
             token_ids.clear();
@@ -213,6 +225,8 @@ namespace llaminar2
             collective_nodes.clear();
             dynamic_param_stages.clear();
             dynamic_param_stages_cached = false;
+            replay_callback_stages.clear();
+            replay_callback_stages_cached = false;
             gpu_stream_applied = false;
             applied_stream = nullptr;
             phase3_active = false;

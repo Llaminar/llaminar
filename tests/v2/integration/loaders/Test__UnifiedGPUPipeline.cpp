@@ -13,9 +13,14 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <fstream>
 #include <cmath>
+#include <iomanip>
+#include <iostream>
 #include <numeric>
+#include <string>
+#include <vector>
 
 #include "../../utils/TestModelHelper.h"
 #include "../../src/v2/loaders/WeightManager.h"
@@ -80,6 +85,83 @@ static DeviceId getFirstGPU()
     return DeviceId::cpu();
 }
 
+/// @brief Returns cosine similarity for dense FP32 result comparisons.
+static double cosineSimilarity(const float *actual, const float *reference, size_t count)
+{
+    double dot = 0.0;
+    double actual_norm = 0.0;
+    double reference_norm = 0.0;
+    for (size_t elem_idx = 0; elem_idx < count; ++elem_idx)
+    {
+        dot += static_cast<double>(actual[elem_idx]) * reference[elem_idx];
+        actual_norm += static_cast<double>(actual[elem_idx]) * actual[elem_idx];
+        reference_norm += static_cast<double>(reference[elem_idx]) * reference[elem_idx];
+    }
+    if (actual_norm < 1.0e-30 || reference_norm < 1.0e-30)
+        return 0.0;
+    return dot / (std::sqrt(actual_norm) * std::sqrt(reference_norm));
+}
+
+/// @brief Returns relative L2 error for dense FP32 result comparisons.
+static double relativeL2Error(const float *actual, const float *reference, size_t count)
+{
+    double error_sq = 0.0;
+    double reference_sq = 0.0;
+    for (size_t elem_idx = 0; elem_idx < count; ++elem_idx)
+    {
+        const double diff = static_cast<double>(actual[elem_idx]) - reference[elem_idx];
+        error_sq += diff * diff;
+        reference_sq += static_cast<double>(reference[elem_idx]) * reference[elem_idx];
+    }
+    if (reference_sq < 1.0e-30)
+        return 0.0;
+    return std::sqrt(error_sq / reference_sq);
+}
+
+/// @brief Returns maximum absolute difference for diagnostic logging.
+static double maxAbsDiff(const float *actual, const float *reference, size_t count)
+{
+    double max_diff = 0.0;
+    for (size_t elem_idx = 0; elem_idx < count; ++elem_idx)
+        max_diff = std::max(max_diff, std::fabs(static_cast<double>(actual[elem_idx]) - reference[elem_idx]));
+    return max_diff;
+}
+
+/// @brief Checks whether a dense FP32 tensor buffer contains non-finite values.
+static bool hasNaNOrInf(const float *data, size_t count)
+{
+    for (size_t elem_idx = 0; elem_idx < count; ++elem_idx)
+    {
+        if (std::isnan(data[elem_idx]) || std::isinf(data[elem_idx]))
+            return true;
+    }
+    return false;
+}
+
+/// @brief Computes input[M,K] x weight[N,K]^T using the tensor's dequantized FP32 weights.
+static std::vector<float> computeDenseMatmulReference(
+    const float *input,
+    const float *weights,
+    int rows,
+    int output_cols,
+    int input_cols)
+{
+    std::vector<float> reference(static_cast<size_t>(rows) * output_cols, 0.0f);
+    for (int row_idx = 0; row_idx < rows; ++row_idx)
+    {
+        const float *input_row = input + static_cast<size_t>(row_idx) * input_cols;
+        for (int output_idx = 0; output_idx < output_cols; ++output_idx)
+        {
+            const float *weight_row = weights + static_cast<size_t>(output_idx) * input_cols;
+            double accum = 0.0;
+            for (int input_idx = 0; input_idx < input_cols; ++input_idx)
+                accum += static_cast<double>(input_row[input_idx]) * weight_row[input_idx];
+            reference[static_cast<size_t>(row_idx) * output_cols + output_idx] = static_cast<float>(accum);
+        }
+    }
+    return reference;
+}
+
 static int getROCmDeviceCountForTest()
 {
 #ifdef HAVE_ROCM
@@ -102,6 +184,16 @@ static std::vector<DeviceId> firstROCmDevices(int count)
 
 static void verifyLayer0ExpertsReadyOnDevices(WeightManager &weight_mgr,
                                               const std::vector<DeviceId> &devices);
+
+static void verifyExpertGemmAgainstCpuReference(ITensorGemm *engine,
+                                                TensorBase *parent_weight,
+                                                DeviceId device,
+                                                int expert_id,
+                                                int rows,
+                                                int output_cols,
+                                                int input_cols,
+                                                uint32_t input_seed,
+                                                const std::string &label);
 
 // =============================================================================
 // Test Fixture
@@ -155,17 +247,27 @@ protected:
     {
         const std::vector<std::string> weight_suffixes = {
             // FA (Full Attention) weights — only present on FA layers
-            "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
-            "attn_q_norm.weight", "attn_k_norm.weight",
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "attn_q_norm.weight",
+            "attn_k_norm.weight",
             // GDN weights — only present on GDN layers
-            "attn_qkv.weight", "attn_gate.weight",
+            "attn_qkv.weight",
+            "attn_gate.weight",
             // Common norms
-            "attn_norm.weight", "post_attention_norm.weight",
+            "attn_norm.weight",
+            "post_attention_norm.weight",
             // MoE expert weights (present on all layers)
-            "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
             "ffn_gate_inp.weight",
             // Shared expert weights (present on all layers)
-            "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+            "ffn_gate_shexp.weight",
+            "ffn_up_shexp.weight",
+            "ffn_down_shexp.weight",
             "ffn_gate_inp_shexp.weight",
         };
 
@@ -245,6 +347,71 @@ static void verifyLayer0ExpertsReadyOnDevices(WeightManager &weight_mgr,
         EXPECT_NE(registry.getEngine(device, 0, 0, ExpertGemmRegistry::WeightRole::DOWN), nullptr)
             << "Missing down expert 0 on " << device.to_string();
     }
+}
+
+static void verifyExpertGemmAgainstCpuReference(ITensorGemm *engine,
+                                                TensorBase *parent_weight,
+                                                DeviceId device,
+                                                int expert_id,
+                                                int rows,
+                                                int output_cols,
+                                                int input_cols,
+                                                uint32_t input_seed,
+                                                const std::string &label)
+{
+    SCOPED_TRACE(label + " expert=" + std::to_string(expert_id));
+    ASSERT_NE(engine, nullptr);
+    ASSERT_NE(parent_weight, nullptr);
+
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(engine);
+    ASSERT_NE(workspace_consumer, nullptr) << "GEMM kernel should implement IWorkspaceConsumer";
+
+    auto requirements = workspace_consumer->getWorkspaceRequirements(rows, output_cols, input_cols);
+    const size_t budget = requirements.total_bytes_with_alignment() + (8 * 1024 * 1024);
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(device, budget);
+    ASSERT_TRUE(workspace->allocate(requirements)) << "Workspace allocation failed for " << label;
+    workspace_consumer->bindWorkspace(workspace.get());
+
+    auto input = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(rows), static_cast<size_t>(input_cols)}, -0.25f, 0.25f, input_seed);
+    auto output = TestTensorFactory::createFP32({static_cast<size_t>(rows), static_cast<size_t>(output_cols)});
+    ASSERT_NE(input, nullptr);
+    ASSERT_NE(output, nullptr);
+
+    const size_t expert_offset = static_cast<size_t>(expert_id) * output_cols * input_cols;
+    auto expert_view = parent_weight->create_view(
+        {static_cast<size_t>(output_cols), static_cast<size_t>(input_cols)}, expert_offset);
+    ASSERT_NE(expert_view, nullptr);
+
+    const std::vector<float> reference = computeDenseMatmulReference(
+        input->data(), expert_view->data(), rows, output_cols, input_cols);
+
+    ASSERT_TRUE(with_gpu_coherence(
+        device,
+        {input.get()},
+        {output.get()},
+        [&]
+        {
+            return engine->multiply_tensor(input.get(), output.get(), rows, output_cols, input_cols);
+        }))
+        << "Expert GEMM execution failed for " << label;
+    workspace_consumer->unbindWorkspace();
+
+    const float *actual = output->data();
+    ASSERT_FALSE(hasNaNOrInf(actual, reference.size()));
+
+    const double cosine = cosineSimilarity(actual, reference.data(), reference.size());
+    const double rel_l2 = relativeL2Error(actual, reference.data(), reference.size());
+    const double max_abs = maxAbsDiff(actual, reference.data(), reference.size());
+
+    EXPECT_GE(cosine, 0.995) << "relative L2=" << rel_l2 << " max_abs=" << max_abs;
+    EXPECT_LE(rel_l2, 0.08) << "cosine=" << cosine << " max_abs=" << max_abs;
+
+    std::cout << "[UnifiedGPUPipelineTest.RealExpertGemm] " << label
+              << " expert=" << expert_id
+              << " cosine=" << std::fixed << std::setprecision(6) << cosine
+              << " rel_l2=" << rel_l2
+              << " max_abs=" << max_abs << std::endl;
 }
 
 // =============================================================================
@@ -442,21 +609,31 @@ TEST_F(UnifiedGPUPipelineTest, FALayerAttentionWeightsPacked)
 TEST_F(UnifiedGPUPipelineTest, ExpertGemmProducesCorrectOutput)
 {
     // Load layer 0 and get expert weight dimensions BEFORE pipeline
-    loadLayerWeights(0, 1);
+    const bool full_pack_replay = std::getenv("LLAMINAR_QWEN35_MOE_REPLAY_FULL_PACK") &&
+                                  std::string(std::getenv("LLAMINAR_QWEN35_MOE_REPLAY_FULL_PACK")) == "1";
+    if (full_pack_replay)
+        loadLayerWeights(0, static_cast<int>(loader_->blockCount()));
+    else
+        loadLayerWeights(0, 1);
 
     // Get expert gate tensor shape: GGUF 3D shape[0]=cols(K), shape[1]=rows_per_expert(N), shape[2]=num_experts
     auto gate_tensor = weight_mgr_->getWeightForDevice("blk.0.ffn_gate_exps.weight");
     ASSERT_NE(gate_tensor, nullptr);
     ASSERT_EQ(gate_tensor->shape().size(), 3u) << "Expert gate tensor should be 3D";
 
-    const int K = static_cast<int>(gate_tensor->shape()[0]);   // d_model (2048)
-    const int N = static_cast<int>(gate_tensor->shape()[1]);   // expert_intermediate (512)
+    const int K = static_cast<int>(gate_tensor->shape()[0]); // d_model (2048)
+    const int N = static_cast<int>(gate_tensor->shape()[1]); // expert_intermediate (512)
     ASSERT_GT(K, 0);
     ASSERT_GT(N, 0);
 
     // Run pipeline
-    auto filter = makeLayerFilter(0, 1);
-    ASSERT_TRUE(weight_mgr_->packGemmWeightsViaPipeline(device_, filter));
+    if (full_pack_replay)
+        ASSERT_TRUE(weight_mgr_->packGemmWeightsViaPipeline(device_, nullptr));
+    else
+    {
+        auto filter = makeLayerFilter(0, 1);
+        ASSERT_TRUE(weight_mgr_->packGemmWeightsViaPipeline(device_, filter));
+    }
 
     const auto &registry = weight_mgr_->expertGemmRegistry();
 
@@ -499,7 +676,8 @@ TEST_F(UnifiedGPUPipelineTest, ExpertGemmProducesCorrectOutput)
         {
             return gate_engine->multiply_tensor(
                 input.get(), output.get(), M, N, K);
-        })) << "Expert GEMM with_gpu_coherence failed";
+        }))
+        << "Expert GEMM with_gpu_coherence failed";
 
     // Unbind workspace
     ws_consumer->unbindWorkspace();
@@ -525,4 +703,56 @@ TEST_F(UnifiedGPUPipelineTest, ExpertGemmProducesCorrectOutput)
         }
     }
     EXPECT_FALSE(has_nan_inf) << "Expert GEMM output should not contain NaN or Inf";
+}
+
+TEST_F(UnifiedGPUPipelineTest, Layer0RouteTableExpertGEMMsMatchCpuDequantReference)
+{
+    if (!hasROCmBackend())
+    {
+        GTEST_SKIP() << "This diagnostic targets the ROCm packed expert path";
+    }
+    device_ = DeviceId(DeviceType::ROCm, 0);
+
+    loadLayerWeights(0, 1);
+
+    auto gate_tensor = weight_mgr_->getWeightForDevice("blk.0.ffn_gate_exps.weight");
+    auto up_tensor = weight_mgr_->getWeightForDevice("blk.0.ffn_up_exps.weight");
+    auto down_tensor = weight_mgr_->getWeightForDevice("blk.0.ffn_down_exps.weight");
+    ASSERT_NE(gate_tensor, nullptr);
+    ASSERT_NE(up_tensor, nullptr);
+    ASSERT_NE(down_tensor, nullptr);
+    ASSERT_EQ(gate_tensor->shape().size(), 3u);
+    ASSERT_EQ(up_tensor->shape().size(), 3u);
+    ASSERT_EQ(down_tensor->shape().size(), 3u);
+
+    const int d_model = static_cast<int>(gate_tensor->shape()[0]);
+    const int intermediate = static_cast<int>(gate_tensor->shape()[1]);
+    ASSERT_EQ(static_cast<int>(gate_tensor->shape()[2]), EXPECTED_NUM_EXPERTS);
+    ASSERT_EQ(static_cast<int>(up_tensor->shape()[0]), d_model);
+    ASSERT_EQ(static_cast<int>(up_tensor->shape()[1]), intermediate);
+    ASSERT_EQ(static_cast<int>(down_tensor->shape()[0]), intermediate);
+    ASSERT_EQ(static_cast<int>(down_tensor->shape()[1]), d_model);
+
+    auto filter = makeLayerFilter(0, 1);
+    ASSERT_TRUE(weight_mgr_->packGemmWeightsViaPipeline(device_, filter));
+
+    const auto &registry = weight_mgr_->expertGemmRegistry();
+    const std::vector<int> selected_experts = {112, 181, 251, 250};
+    constexpr int rows = 3;
+
+    for (int expert_id : selected_experts)
+    {
+        verifyExpertGemmAgainstCpuReference(
+            registry.getEngine(device_, 0, expert_id, ExpertGemmRegistry::WeightRole::GATE),
+            gate_tensor.get(), device_, expert_id, rows, intermediate, d_model,
+            static_cast<uint32_t>(41000 + expert_id), "layer0_gate");
+        verifyExpertGemmAgainstCpuReference(
+            registry.getEngine(device_, 0, expert_id, ExpertGemmRegistry::WeightRole::UP),
+            up_tensor.get(), device_, expert_id, rows, intermediate, d_model,
+            static_cast<uint32_t>(42000 + expert_id), "layer0_up");
+        verifyExpertGemmAgainstCpuReference(
+            registry.getEngine(device_, 0, expert_id, ExpertGemmRegistry::WeightRole::DOWN),
+            down_tensor.get(), device_, expert_id, rows, d_model, intermediate,
+            static_cast<uint32_t>(43000 + expert_id), "layer0_down");
+    }
 }

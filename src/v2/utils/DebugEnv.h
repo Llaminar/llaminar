@@ -645,6 +645,13 @@ namespace llaminar2
         bool force_mpi_collective_context = false;                             ///< Force MPI-backed CollectiveContext in GLOBAL TP (env: LLAMINAR_FORCE_MPI_COLLECTIVE_CONTEXT)
 
         // =================================================================
+        // Prefill Graph Capture Configuration
+        // =================================================================
+        int prefill_graph_min_seq = 256;                                       ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
+        bool prefill_graph_trace = false;                                      ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
+        bool prefill_graph_buckets = false;                                    ///< Enable bucketed capture for server (env: LLAMINAR_PREFILL_GRAPH_BUCKETS)
+
+        // =================================================================
         // Device Placement / Heterogeneous Execution
         // =================================================================
 
@@ -848,6 +855,25 @@ namespace llaminar2
             if (force_mpi_collective_ctx_env)
             {
                 force_mpi_collective_context = (std::atoi(force_mpi_collective_ctx_env) != 0);
+            }
+
+            // Prefill graph capture configuration
+            const char *prefill_graph_min_seq_env = std::getenv("LLAMINAR_PREFILL_GRAPH_MIN_SEQ");
+            if (prefill_graph_min_seq_env)
+            {
+                prefill_graph_min_seq = std::atoi(prefill_graph_min_seq_env);
+            }
+
+            const char *prefill_graph_trace_env = std::getenv("LLAMINAR_PREFILL_GRAPH_TRACE");
+            if (prefill_graph_trace_env)
+            {
+                prefill_graph_trace = (std::atoi(prefill_graph_trace_env) != 0);
+            }
+
+            const char *prefill_graph_buckets_env = std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKETS");
+            if (prefill_graph_buckets_env)
+            {
+                prefill_graph_buckets = (std::atoi(prefill_graph_buckets_env) != 0);
             }
 
             // Model-level operation flags (embedding, lm_head)

@@ -159,6 +159,17 @@ struct NVNNITraits {
     static constexpr int grid_lds_bytes = grid_entries * grid_entry_bytes;
 };
 
+template <NativeVNNIFormat FMT>
+struct NVNNIGroupedMoESupported {
+    static constexpr bool value =
+        FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_Q4_1 ||
+        FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K ||
+        FMT == NVNNI_Q3_K || FMT == NVNNI_Q2_K || FMT == NVNNI_IQ3_S ||
+        FMT == NVNNI_IQ3_XXS || FMT == NVNNI_IQ2_S || FMT == NVNNI_IQ2_XS ||
+        FMT == NVNNI_IQ2_XXS || FMT == NVNNI_IQ1_S || FMT == NVNNI_IQ1_M ||
+        FMT == NVNNI_Q8_0;
+};
+
 // ============================================================================
 // IQ grid decode helpers
 // ============================================================================
@@ -1326,11 +1337,15 @@ __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
 }
 
 template <NativeVNNIFormat FMT>
-__device__ __forceinline__ void moe_decode_q4like_groups(
+__device__ __forceinline__ void moe_decode_native_vnni_groups(
     const uint8_t* __restrict__ payload,
     int32_t* packed_groups)
 {
-    if constexpr (FMT == NVNNI_IQ4_NL)
+    using Traits = NVNNITraits<FMT>;
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE decode requires a supported native-VNNI format");
+
+    if constexpr (Traits::uses_lut)
     {
         constexpr uint32_t CB_LO_A = 0xBFAD9881u;
         constexpr uint32_t CB_LO_B = 0xF6EADDCFu;
@@ -1358,21 +1373,7 @@ __device__ __forceinline__ void moe_decode_q4like_groups(
             packed_groups[g + 4] = static_cast<int32_t>(__builtin_amdgcn_perm(hi_r1, hi_r0, hi_mux));
         }
     }
-    else if constexpr (FMT == NVNNI_Q4_0)
-    {
-        constexpr uint32_t SWAR_ADD = 0x78787878u;
-        constexpr uint32_t SWAR_XOR = 0x80808080u;
-        constexpr uint32_t NIBBLE_MASK = 0x0F0F0F0Fu;
-
-        #pragma unroll
-        for (int g = 0; g < 4; ++g)
-        {
-            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-            packed_groups[g] = static_cast<int32_t>(((raw & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
-            packed_groups[g + 4] = static_cast<int32_t>((((raw >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
-        }
-    }
-    else if constexpr (NVNNITraits<FMT>::is_5bit)
+    else if constexpr (Traits::is_5bit)
     {
         const uint32_t qh_bits = *reinterpret_cast<const uint32_t*>(payload + 16);
 
@@ -1393,7 +1394,7 @@ __device__ __forceinline__ void moe_decode_q4like_groups(
                                  | ((hb4_hi & 4u) << 18) | ((hb4_hi & 8u) << 25);
             uint32_t val_hi = hi_nibs | hb_hi;
 
-            if constexpr (NVNNITraits<FMT>::center_5bit == 16)
+            if constexpr (Traits::center_5bit == 16)
             {
                 val_lo ^= 0x80808080u;
                 val_lo -= 0x10101010u;
@@ -1407,7 +1408,42 @@ __device__ __forceinline__ void moe_decode_q4like_groups(
             packed_groups[g + 4] = static_cast<int32_t>(val_hi);
         }
     }
-    else if constexpr (NVNNITraits<FMT>::is_6bit)
+    else if constexpr (Traits::is_3bit)
+    {
+        constexpr uint32_t BIT_SPREAD = 0x00204081u;
+        const uint32_t hbit_word = *reinterpret_cast<const uint32_t*>(payload + 8);
+
+        #pragma unroll
+        for (int half = 0; half < 2; ++half)
+        {
+            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + half * 4);
+            #pragma unroll
+            for (int g = 0; g < 4; ++g)
+            {
+                const uint32_t low2_4 = (raw >> (g * 2)) & 0x03030303u;
+                const uint32_t hb4 = (hbit_word >> ((half * 4 + g) * 4)) & 0xFu;
+                const uint32_t hb = ((hb4 * BIT_SPREAD) & 0x01010101u) << 2;
+                uint32_t val = (low2_4 | hb) ^ 0x80808080u;
+                val -= 0x04040404u;
+                val ^= 0x80808080u;
+                packed_groups[half * 4 + g] = static_cast<int32_t>(val);
+            }
+        }
+    }
+    else if constexpr (Traits::is_2bit)
+    {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half)
+        {
+            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + half * 4);
+            const int bg = half * 4;
+            packed_groups[bg] = static_cast<int32_t>(raw & 0x03030303u);
+            packed_groups[bg + 1] = static_cast<int32_t>((raw >> 2) & 0x03030303u);
+            packed_groups[bg + 2] = static_cast<int32_t>((raw >> 4) & 0x03030303u);
+            packed_groups[bg + 3] = static_cast<int32_t>((raw >> 6) & 0x03030303u);
+        }
+    }
+    else if constexpr (Traits::is_6bit)
     {
         const uint8_t* qh_p = payload + 16;
 
@@ -1435,16 +1471,220 @@ __device__ __forceinline__ void moe_decode_q4like_groups(
             packed_groups[g + 4] = static_cast<int32_t>(val_hi);
         }
     }
+    else if constexpr (Traits::is_iq_grid)
+    {
+        if constexpr (Traits::is_iq3_grid && !Traits::has_qh)
+        {
+            const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
+            const uint32_t qs0 = words[0];
+            const uint32_t qs1 = words[1];
+            const uint32_t signs = words[2];
+
+            #pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                const uint32_t word = (g < 4) ? qs0 : qs1;
+                const int idx = (word >> ((g & 3) * 8)) & 0xFF;
+                const uint32_t grid4 = iq3_grid_lookup<FMT>(idx);
+                const uint8_t sign_byte = static_cast<uint8_t>(signs >> ((g / 2) * 8));
+                const uint8_t sign_nibble = (g & 1) ? (sign_byte >> 4) : (sign_byte & 0xF);
+                packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sign_nibble));
+            }
+        }
+        else if constexpr (Traits::is_iq3_grid)
+        {
+            const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
+            const uint32_t qs0 = words[0];
+            const uint32_t qs1 = words[1];
+            const uint32_t qh_signs = words[2];
+            const uint8_t signs3 = payload[12];
+
+            #pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                const uint32_t word = (g < 4) ? qs0 : qs1;
+                int idx = (word >> ((g & 3) * 8)) & 0xFF;
+                idx |= (static_cast<int>((qh_signs >> g) & 1) << 8);
+                const uint32_t grid4 = iq3_grid_lookup<FMT>(idx);
+                const uint8_t sign_byte = (g < 6)
+                    ? static_cast<uint8_t>(qh_signs >> ((g / 2 + 1) * 8))
+                    : signs3;
+                const uint8_t sign_nibble = (g & 1) ? (sign_byte >> 4) : (sign_byte & 0xF);
+                packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sign_nibble));
+            }
+        }
+        else if constexpr (Traits::is_iq2_grid && !Traits::has_qh)
+        {
+            const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
+            const uint32_t qs = words[0];
+            const uint32_t signs = words[1];
+
+            #pragma unroll
+            for (int g = 0; g < 4; ++g)
+            {
+                const int idx = (qs >> (g * 8)) & 0xFF;
+                const uint64_t grid8 = iq2_grid_lookup<FMT>(idx);
+                const uint32_t grid_lo = static_cast<uint32_t>(grid8);
+                const uint32_t grid_hi = static_cast<uint32_t>(grid8 >> 32);
+                const uint8_t sign_byte = static_cast<uint8_t>(signs >> (g * 8));
+                packed_groups[g * 2] = static_cast<int32_t>(iq_apply_signs_4(grid_lo, sign_byte & 0xF));
+                packed_groups[g * 2 + 1] = static_cast<int32_t>(iq_apply_signs_4(grid_hi, sign_byte >> 4));
+            }
+        }
+        else
+        {
+            const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
+            const uint32_t qs = words[0];
+            const uint32_t qh_signs = words[1];
+            const uint8_t signs3 = payload[8];
+
+            #pragma unroll
+            for (int g = 0; g < 4; ++g)
+            {
+                int idx = (qs >> (g * 8)) & 0xFF;
+                if constexpr (Traits::qh_bits_per_lookup == 1)
+                    idx |= (static_cast<int>((qh_signs >> g) & 1) << 8);
+                else if constexpr (Traits::qh_bits_per_lookup == 2)
+                    idx |= (static_cast<int>((qh_signs >> (2 * g)) & 3) << 8);
+                const uint64_t grid8 = iq2_grid_lookup<FMT>(idx);
+                const uint32_t grid_lo = static_cast<uint32_t>(grid8);
+                const uint32_t grid_hi = static_cast<uint32_t>(grid8 >> 32);
+                const uint8_t sign_byte = (g < 3)
+                    ? static_cast<uint8_t>(qh_signs >> ((g + 1) * 8))
+                    : signs3;
+                packed_groups[g * 2] = static_cast<int32_t>(iq_apply_signs_4(grid_lo, sign_byte & 0xF));
+                packed_groups[g * 2 + 1] = static_cast<int32_t>(iq_apply_signs_4(grid_hi, sign_byte >> 4));
+            }
+        }
+    }
+    else if constexpr (Traits::is_iq1_grid)
+    {
+        if constexpr (FMT == NVNNI_IQ1_S)
+        {
+            const uint16_t qh_word = static_cast<uint16_t>(payload[4]) |
+                                     (static_cast<uint16_t>(payload[5]) << 8);
+            #pragma unroll
+            for (int g = 0; g < 4; ++g)
+            {
+                const int idx = payload[g] | (((qh_word >> (3 * g)) & 7) << 8);
+                const uint64_t grid8 = iq1_grid_lookup(idx);
+                packed_groups[g * 2] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+                packed_groups[g * 2 + 1] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+            }
+        }
+        else
+        {
+            const uint8_t qh0 = payload[4];
+            const uint8_t qh1 = payload[5];
+            const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
+            const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
+            const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
+            const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
+
+            uint64_t grid8 = iq1_grid_lookup(idx0);
+            packed_groups[0] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+            packed_groups[1] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+            grid8 = iq1_grid_lookup(idx1);
+            packed_groups[2] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+            packed_groups[3] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+            grid8 = iq1_grid_lookup(idx2);
+            packed_groups[4] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+            packed_groups[5] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+            grid8 = iq1_grid_lookup(idx3);
+            packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
+            packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
+        }
+    }
+    else if constexpr (Traits::is_8bit)
+    {
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+            packed_groups[g] = *reinterpret_cast<const int32_t*>(payload + g * 4);
+    }
     else
     {
+        constexpr uint32_t NIBBLE_MASK = 0x0F0F0F0Fu;
+
         #pragma unroll
         for (int g = 0; g < 4; ++g)
         {
             const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-            packed_groups[g] = static_cast<int32_t>(raw & 0x0F0F0F0Fu);
-            packed_groups[g + 4] = static_cast<int32_t>((raw >> 4) & 0x0F0F0F0Fu);
+            if constexpr (Traits::center_4bit == 8)
+            {
+                constexpr uint32_t SWAR_ADD = 0x78787878u;
+                constexpr uint32_t SWAR_XOR = 0x80808080u;
+                packed_groups[g] = static_cast<int32_t>(((raw & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
+                packed_groups[g + 4] = static_cast<int32_t>((((raw >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
+            }
+            else
+            {
+                packed_groups[g] = static_cast<int32_t>(raw & NIBBLE_MASK);
+                packed_groups[g + 4] = static_cast<int32_t>((raw >> 4) & NIBBLE_MASK);
+            }
         }
     }
+}
+
+template <NativeVNNIFormat FMT>
+__device__ __forceinline__ float moe_native_vnni_dual_scale_correction(
+    const int32_t* __restrict__ a4,
+    const uint8_t* __restrict__ payload,
+    const uint32_t* __restrict__ emin_base,
+    size_t linear,
+    float scale_lo,
+    float scale_hi,
+    float scale_ab)
+{
+    using Traits = NVNNITraits<FMT>;
+    float correction = 0.0f;
+
+    if constexpr (Traits::is_dual_scale_asym)
+    {
+        constexpr int32_t ones = 0x01010101;
+        int32_t sum_a_lo = 0;
+        int32_t sum_a_hi = 0;
+        #pragma unroll
+        for (int g = 0; g < 4; ++g)
+            sum_a_lo = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_lo, false);
+        #pragma unroll
+        for (int g = 4; g < 8; ++g)
+            sum_a_hi = __builtin_amdgcn_sdot4(a4[g], ones, sum_a_hi, false);
+
+        const uint32_t emin_packed = emin_base[linear];
+        const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
+        const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
+        const float min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
+        const float min_hi = __half2float(*reinterpret_cast<const __half*>(&emin_hi_bits));
+        correction += (static_cast<float>(sum_a_lo) * min_lo +
+                       static_cast<float>(sum_a_hi) * min_hi) * scale_ab;
+    }
+
+    if constexpr (FMT == NVNNI_IQ1_M)
+    {
+        constexpr float IQ1S_DELTA = 0.125f;
+        constexpr int32_t ones = 0x01010101;
+        const uint8_t qh0 = payload[4];
+        const uint8_t qh1 = payload[5];
+
+        const int32_t sum_a_g0 = __builtin_amdgcn_sdot4(a4[1], ones,
+                                __builtin_amdgcn_sdot4(a4[0], ones, 0, false), false);
+        const int32_t sum_a_g1 = __builtin_amdgcn_sdot4(a4[3], ones,
+                                __builtin_amdgcn_sdot4(a4[2], ones, 0, false), false);
+        const int32_t sum_a_g2 = __builtin_amdgcn_sdot4(a4[5], ones,
+                                __builtin_amdgcn_sdot4(a4[4], ones, 0, false), false);
+        const int32_t sum_a_g3 = __builtin_amdgcn_sdot4(a4[7], ones,
+                                __builtin_amdgcn_sdot4(a4[6], ones, 0, false), false);
+
+        const float delta0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+        const float delta1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+        const float delta2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
+        const float delta3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+
+        correction += ((delta0 * static_cast<float>(sum_a_g0) + delta1 * static_cast<float>(sum_a_g1)) * scale_lo +
+                       (delta2 * static_cast<float>(sum_a_g2) + delta3 * static_cast<float>(sum_a_g3)) * scale_hi) * scale_ab;
+    }
+
+    return correction;
 }
 
 template <NativeVNNIFormat FMT, bool INDEX_BY_EXPERT_ID>
@@ -1459,9 +1699,8 @@ __global__ void moe_grouped_native_vnni_down_kernel_t(
     int N,
     int K)
 {
-    static_assert(FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_Q4_1 ||
-                      FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K,
-                  "Grouped MoE down currently supports Q4/IQ4, Q5, and Q6 native-VNNI descriptors");
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE down requires a supported native-VNNI descriptor");
 
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
@@ -1480,6 +1719,7 @@ __global__ void moe_grouped_native_vnni_down_kernel_t(
         const uint8_t* payload_base = desc.payload;
         const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
         const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
+        const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
         const int8_t* a_slot = A_int8 + static_cast<size_t>(slot) * K;
         const float* scale_slot = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
 
@@ -1490,7 +1730,7 @@ __global__ void moe_grouped_native_vnni_down_kernel_t(
             int32_t packed_groups[8];
             const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
             const uint8_t* payload = payload_base + linear * NVNNITraits<FMT>::payload_bytes;
-            moe_decode_q4like_groups<FMT>(payload, packed_groups);
+            moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
 
             const float scale_ab = scale_slot[b];
             if constexpr (NVNNITraits<FMT>::is_dual_scale)
@@ -1510,6 +1750,8 @@ __global__ void moe_grouped_native_vnni_down_kernel_t(
                 const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
                 expert_acc += (static_cast<float>(acc_lo) * scale_lo +
                                static_cast<float>(acc_hi) * scale_hi) * scale_ab;
+                expert_acc += moe_native_vnni_dual_scale_correction<FMT>(
+                    a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
             }
             else
             {
@@ -1555,9 +1797,8 @@ __global__ void moe_grouped_native_vnni_down_parallel_experts_kernel_t(
     int N,
     int K)
 {
-    static_assert(FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_Q4_1 ||
-                      FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K,
-                  "Grouped MoE parallel down currently supports Q4/IQ4, Q5, and Q6 native-VNNI descriptors");
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE parallel down requires a supported native-VNNI descriptor");
 
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
@@ -1572,6 +1813,7 @@ __global__ void moe_grouped_native_vnni_down_parallel_experts_kernel_t(
     const uint8_t* payload_base = desc.payload;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
     const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
+    const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
     const int8_t* a_slot = A_int8 + static_cast<size_t>(slot) * K;
     const float* scale_slot = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
 
@@ -1582,7 +1824,7 @@ __global__ void moe_grouped_native_vnni_down_parallel_experts_kernel_t(
         int32_t packed_groups[8];
         const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
         const uint8_t* payload = payload_base + linear * NVNNITraits<FMT>::payload_bytes;
-        moe_decode_q4like_groups<FMT>(payload, packed_groups);
+        moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
 
         const float scale_ab = scale_slot[b];
         if constexpr (NVNNITraits<FMT>::is_dual_scale)
@@ -1602,6 +1844,8 @@ __global__ void moe_grouped_native_vnni_down_parallel_experts_kernel_t(
             const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
             expert_acc += (static_cast<float>(acc_lo) * scale_lo +
                            static_cast<float>(acc_hi) * scale_hi) * scale_ab;
+            expert_acc += moe_native_vnni_dual_scale_correction<FMT>(
+                a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
         }
         else
         {
@@ -1675,6 +1919,7 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range(
     const uint8_t* payload_base = desc.payload;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
     const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
+    const uint32_t* emin_base = static_cast<const uint32_t*>(desc.emins);
     float acc = 0.0f;
 
     if (b_start < 0) b_start = 0;
@@ -1686,7 +1931,7 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range(
         int32_t packed_groups[8];
         const size_t linear = static_cast<size_t>(b) * N + static_cast<size_t>(n);
         const uint8_t* payload = payload_base + linear * NVNNITraits<FMT>::payload_bytes;
-        moe_decode_q4like_groups<FMT>(payload, packed_groups);
+        moe_decode_native_vnni_groups<FMT>(payload, packed_groups);
 
         const float scale_ab = scales_A_blockwise[b];
         if constexpr (NVNNITraits<FMT>::is_dual_scale)
@@ -1706,6 +1951,8 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range(
             const float scale_hi = __half2float(*reinterpret_cast<const __half*>(&scale_hi_bits));
             acc += (static_cast<float>(acc_lo) * scale_lo +
                     static_cast<float>(acc_hi) * scale_hi) * scale_ab;
+            acc += moe_native_vnni_dual_scale_correction<FMT>(
+                a4, payload, emin_base, linear, scale_lo, scale_hi, scale_ab);
         }
         else
         {
@@ -1762,9 +2009,8 @@ __global__ void moe_grouped_native_vnni_gate_up_kernel_t(
     int N,
     int K)
 {
-    static_assert(FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_Q4_1 ||
-                      FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K,
-                  "Grouped MoE gate/up currently supports Q4/IQ4, Q5, and Q6 native-VNNI descriptors");
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE gate/up requires a supported native-VNNI descriptor");
 
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
@@ -1795,9 +2041,8 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
     int K,
     int k_partitions)
 {
-    static_assert(FMT == NVNNI_Q4_0 || FMT == NVNNI_IQ4_NL || FMT == NVNNI_Q4_1 ||
-                      FMT == NVNNI_Q5_0 || FMT == NVNNI_Q5_1 || FMT == NVNNI_Q6_K,
-                  "Grouped MoE K-partition gate/up supports Q4/IQ4, Q5, and Q6 native-VNNI descriptors");
+    static_assert(NVNNIGroupedMoESupported<FMT>::value,
+                  "Grouped MoE K-partition gate/up requires a supported native-VNNI descriptor");
 
     constexpr int TILE_N = 64;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
@@ -2055,55 +2300,38 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
     dim3 grid((N + TN - 1) / TN, num_active);
     dim3 block(TN);
 
+    #define LAUNCH_GROUPED_GATE_UP(FMT_TAG)                                                    \
+        hipLaunchKernelGGL(                                                                    \
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<FMT_TAG>),                \
+            grid, block, 0, static_cast<hipStream_t>(stream),                                  \
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,                \
+            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K)
+
     switch (static_cast<NativeVNNIFormat>(codebook_id))
     {
-    case NVNNI_Q4_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q4_0>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
-        break;
-    case NVNNI_IQ4_NL:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_IQ4_NL>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
-        break;
-    case NVNNI_Q4_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q4_1>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
-        break;
-    case NVNNI_Q5_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q5_0>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
-        break;
-    case NVNNI_Q5_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q5_1>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
-        break;
-    case NVNNI_Q6_K:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kernel_t<NVNNI_Q6_K>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_outputs, d_up_outputs, num_active, N, K);
-        break;
+    case NVNNI_Q4_0:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q4_0);     break;
+    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_GATE_UP(NVNNI_IQ4_NL);   break;
+    case NVNNI_Q4_1:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q4_1);     break;
+    case NVNNI_Q5_0:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q5_0);     break;
+    case NVNNI_Q5_1:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q5_1);     break;
+    case NVNNI_Q6_K:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q6_K);     break;
+    case NVNNI_Q3_K:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q3_K);     break;
+    case NVNNI_Q2_K:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q2_K);     break;
+    case NVNNI_IQ3_S:    LAUNCH_GROUPED_GATE_UP(NVNNI_IQ3_S);    break;
+    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_GATE_UP(NVNNI_IQ3_XXS);  break;
+    case NVNNI_IQ2_S:    LAUNCH_GROUPED_GATE_UP(NVNNI_IQ2_S);    break;
+    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_GATE_UP(NVNNI_IQ2_XS);   break;
+    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_GATE_UP(NVNNI_IQ2_XXS);  break;
+    case NVNNI_IQ1_S:    LAUNCH_GROUPED_GATE_UP(NVNNI_IQ1_S);    break;
+    case NVNNI_IQ1_M:    LAUNCH_GROUPED_GATE_UP(NVNNI_IQ1_M);    break;
+    case NVNNI_Q8_0:     LAUNCH_GROUPED_GATE_UP(NVNNI_Q8_0);     break;
     default:
         fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] unsupported codebook_id=%u\n",
                 static_cast<unsigned>(codebook_id));
         return false;
     }
+
+    #undef LAUNCH_GROUPED_GATE_UP
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -2165,55 +2393,38 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
     dim3 partial_grid((N + TN - 1) / TN, k_partitions, num_active);
     dim3 block(TN);
 
+    #define LAUNCH_GROUPED_GATE_UP_KPART(FMT_TAG)                                             \
+        hipLaunchKernelGGL(                                                                    \
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<FMT_TAG>),          \
+            partial_grid, block, 0, hip_stream,                                                \
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,                \
+            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions)
+
     switch (static_cast<NativeVNNIFormat>(codebook_id))
     {
-    case NVNNI_Q4_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<NVNNI_Q4_0>),
-            partial_grid, block, 0, hip_stream,
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions);
-        break;
-    case NVNNI_IQ4_NL:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<NVNNI_IQ4_NL>),
-            partial_grid, block, 0, hip_stream,
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions);
-        break;
-    case NVNNI_Q4_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<NVNNI_Q4_1>),
-            partial_grid, block, 0, hip_stream,
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions);
-        break;
-    case NVNNI_Q5_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<NVNNI_Q5_0>),
-            partial_grid, block, 0, hip_stream,
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions);
-        break;
-    case NVNNI_Q5_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<NVNNI_Q5_1>),
-            partial_grid, block, 0, hip_stream,
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions);
-        break;
-    case NVNNI_Q6_K:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<NVNNI_Q6_K>),
-            partial_grid, block, 0, hip_stream,
-            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,
-            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions);
-        break;
+    case NVNNI_Q4_0:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q4_0);     break;
+    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ4_NL);   break;
+    case NVNNI_Q4_1:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q4_1);     break;
+    case NVNNI_Q5_0:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q5_0);     break;
+    case NVNNI_Q5_1:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q5_1);     break;
+    case NVNNI_Q6_K:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q6_K);     break;
+    case NVNNI_Q3_K:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q3_K);     break;
+    case NVNNI_Q2_K:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q2_K);     break;
+    case NVNNI_IQ3_S:    LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ3_S);    break;
+    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ3_XXS);  break;
+    case NVNNI_IQ2_S:    LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ2_S);    break;
+    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ2_XS);   break;
+    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ2_XXS);  break;
+    case NVNNI_IQ1_S:    LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ1_S);    break;
+    case NVNNI_IQ1_M:    LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_IQ1_M);    break;
+    case NVNNI_Q8_0:     LAUNCH_GROUPED_GATE_UP_KPART(NVNNI_Q8_0);     break;
     default:
         fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
                 static_cast<unsigned>(codebook_id));
         return false;
     }
+
+    #undef LAUNCH_GROUPED_GATE_UP_KPART
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -2283,55 +2494,38 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
     dim3 grid((N + TN - 1) / TN);
     dim3 block(TN);
 
+    #define LAUNCH_GROUPED_DOWN_DIRECT(FMT_TAG)                                               \
+        hipLaunchKernelGGL(                                                                    \
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<FMT_TAG, false>),           \
+            grid, block, 0, static_cast<hipStream_t>(stream),                                  \
+            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,                      \
+            d_output, num_active, N, K)
+
     switch (static_cast<NativeVNNIFormat>(codebook_id))
     {
-    case NVNNI_Q4_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q4_0, false>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_IQ4_NL:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_IQ4_NL, false>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q4_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q4_1, false>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q5_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q5_0, false>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q5_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q5_1, false>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q6_K:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q6_K, false>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_descs, nullptr, d_weights,
-            d_output, num_active, N, K);
-        break;
+    case NVNNI_Q4_0:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q4_0);     break;
+    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ4_NL);   break;
+    case NVNNI_Q4_1:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q4_1);     break;
+    case NVNNI_Q5_0:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q5_0);     break;
+    case NVNNI_Q5_1:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q5_1);     break;
+    case NVNNI_Q6_K:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q6_K);     break;
+    case NVNNI_Q3_K:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q3_K);     break;
+    case NVNNI_Q2_K:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q2_K);     break;
+    case NVNNI_IQ3_S:    LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ3_S);    break;
+    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ3_XXS);  break;
+    case NVNNI_IQ2_S:    LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ2_S);    break;
+    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ2_XS);   break;
+    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ2_XXS);  break;
+    case NVNNI_IQ1_S:    LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ1_S);    break;
+    case NVNNI_IQ1_M:    LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_IQ1_M);    break;
+    case NVNNI_Q8_0:     LAUNCH_GROUPED_DOWN_DIRECT(NVNNI_Q8_0);     break;
     default:
         fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode] unsupported codebook_id=%u\n",
                 static_cast<unsigned>(codebook_id));
         return false;
     }
+
+    #undef LAUNCH_GROUPED_DOWN_DIRECT
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -2388,55 +2582,38 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
     dim3 grid((N + TN - 1) / TN);
     dim3 block(TN);
 
+    #define LAUNCH_GROUPED_DOWN_TABLE(FMT_TAG)                                                \
+        hipLaunchKernelGGL(                                                                    \
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<FMT_TAG, true>),            \
+            grid, block, 0, static_cast<hipStream_t>(stream),                                  \
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,            \
+            d_output, num_active, N, K)
+
     switch (static_cast<NativeVNNIFormat>(codebook_id))
     {
-    case NVNNI_Q4_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q4_0, true>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_IQ4_NL:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_IQ4_NL, true>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q4_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q4_1, true>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q5_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q5_0, true>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q5_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q5_1, true>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q6_K:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_kernel_t<NVNNI_Q6_K, true>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
+    case NVNNI_Q4_0:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q4_0);     break;
+    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ4_NL);   break;
+    case NVNNI_Q4_1:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q4_1);     break;
+    case NVNNI_Q5_0:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q5_0);     break;
+    case NVNNI_Q5_1:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q5_1);     break;
+    case NVNNI_Q6_K:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q6_K);     break;
+    case NVNNI_Q3_K:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q3_K);     break;
+    case NVNNI_Q2_K:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q2_K);     break;
+    case NVNNI_IQ3_S:    LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ3_S);    break;
+    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ3_XXS);  break;
+    case NVNNI_IQ2_S:    LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ2_S);    break;
+    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ2_XS);   break;
+    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ2_XXS);  break;
+    case NVNNI_IQ1_S:    LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ1_S);    break;
+    case NVNNI_IQ1_M:    LAUNCH_GROUPED_DOWN_TABLE(NVNNI_IQ1_M);    break;
+    case NVNNI_Q8_0:     LAUNCH_GROUPED_DOWN_TABLE(NVNNI_Q8_0);     break;
     default:
         fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table] unsupported codebook_id=%u\n",
                 static_cast<unsigned>(codebook_id));
         return false;
     }
+
+    #undef LAUNCH_GROUPED_DOWN_TABLE
 
     err = hipGetLastError();
     if (err != hipSuccess)
@@ -2502,55 +2679,38 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
     dim3 grid((N + TN - 1) / TN, num_active);
     dim3 block(TN);
 
+    #define LAUNCH_GROUPED_DOWN_PARALLEL(FMT_TAG)                                             \
+        hipLaunchKernelGGL(                                                                    \
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_parallel_experts_kernel_t<FMT_TAG>),  \
+            grid, block, 0, hip_stream,                                                        \
+            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,            \
+            d_output, num_active, N, K)
+
     switch (static_cast<NativeVNNIFormat>(codebook_id))
     {
-    case NVNNI_Q4_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_parallel_experts_kernel_t<NVNNI_Q4_0>),
-            grid, block, 0, hip_stream,
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_IQ4_NL:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_parallel_experts_kernel_t<NVNNI_IQ4_NL>),
-            grid, block, 0, hip_stream,
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q4_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_parallel_experts_kernel_t<NVNNI_Q4_1>),
-            grid, block, 0, hip_stream,
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q5_0:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_parallel_experts_kernel_t<NVNNI_Q5_0>),
-            grid, block, 0, hip_stream,
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q5_1:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_parallel_experts_kernel_t<NVNNI_Q5_1>),
-            grid, block, 0, hip_stream,
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
-    case NVNNI_Q6_K:
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(moe_grouped_native_vnni_down_parallel_experts_kernel_t<NVNNI_Q6_K>),
-            grid, block, 0, hip_stream,
-            d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,
-            d_output, num_active, N, K);
-        break;
+    case NVNNI_Q4_0:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q4_0);     break;
+    case NVNNI_IQ4_NL:   LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ4_NL);   break;
+    case NVNNI_Q4_1:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q4_1);     break;
+    case NVNNI_Q5_0:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q5_0);     break;
+    case NVNNI_Q5_1:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q5_1);     break;
+    case NVNNI_Q6_K:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q6_K);     break;
+    case NVNNI_Q3_K:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q3_K);     break;
+    case NVNNI_Q2_K:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q2_K);     break;
+    case NVNNI_IQ3_S:    LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ3_S);    break;
+    case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ3_XXS);  break;
+    case NVNNI_IQ2_S:    LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ2_S);    break;
+    case NVNNI_IQ2_XS:   LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ2_XS);   break;
+    case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ2_XXS);  break;
+    case NVNNI_IQ1_S:    LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ1_S);    break;
+    case NVNNI_IQ1_M:    LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_IQ1_M);    break;
+    case NVNNI_Q8_0:     LAUNCH_GROUPED_DOWN_PARALLEL(NVNNI_Q8_0);     break;
     default:
         fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel] unsupported codebook_id=%u\n",
                 static_cast<unsigned>(codebook_id));
         return false;
     }
+
+    #undef LAUNCH_GROUPED_DOWN_PARALLEL
 
     err = hipGetLastError();
     if (err != hipSuccess)

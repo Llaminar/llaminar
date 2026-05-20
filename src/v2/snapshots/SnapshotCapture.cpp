@@ -79,6 +79,31 @@ namespace llaminar2
             return;
         }
 
+        // Handle Qwen3.5 full-attention Q/gate split. The raw q_proj snapshot
+        // remains Q_PROJECTION because it matches HuggingFace q_proj output;
+        // this extra key exposes the sigmoid gate consumed before Wo.
+        if (name.find("_q_gate_split") != std::string::npos)
+        {
+            size_t pos = name.find("_q_gate_split");
+            std::string prefix = name.substr(0, pos);
+
+            if (dump.outputs.size() >= 2 && dump.outputs[1].data)
+                storeOutput(prefix + "_FA_GATE", dump.outputs[1]);
+            return;
+        }
+
+        // Handle Qwen3.5 full-attention output gate. This is the gated context
+        // immediately before Wo, matching HuggingFace o_proj's pre-hook input.
+        if (name.find("_attn_output_gate") != std::string::npos)
+        {
+            size_t pos = name.find("_attn_output_gate");
+            std::string prefix = name.substr(0, pos);
+
+            if (!dump.outputs.empty() && dump.outputs[0].data)
+                storeOutput(prefix + "_ATTENTION_CONTEXT_GATED", dump.outputs[0]);
+            return;
+        }
+
         // Handle lm_head_allgather — overwrites partial LM_HEAD with full vocab
         if (name == "lm_head_allgather")
         {
@@ -275,6 +300,7 @@ namespace llaminar2
             {"_gdn_wo_allreduce", "_ATTENTION_OUTPUT"},
             {"_gdn_out_proj", "_ATTENTION_OUTPUT"},
             {"_gdn_proj", "_QKV_PROJECTION"},
+            {"_short_conv", "_GDN_CONV1D_OUTPUT"},
             {"_gdn_recurrence", "_GDN_DELTA_RULE_OUTPUT"},
             {"_gated_norm", "_GDN_NORM_GATE_OUTPUT"},
             // Standard attention stages
@@ -284,11 +310,13 @@ namespace llaminar2
             {"_wo_proj", "_ATTENTION_OUTPUT"},
             {"_q_norm", "_Q_NORM"},
             {"_k_norm", "_K_NORM"},
+            {"_q_gate_split", "_FA_GATE"},
             {"_q_proj", "_Q_PROJECTION"},
             {"_k_proj", "_K_PROJECTION"},
             {"_v_proj", "_V_PROJECTION"},
             {"_q_rope", "_Q_ROPE"},
             {"_k_rope", "_K_ROPE"},
+            {"_attn_output_gate", "_ATTENTION_CONTEXT_GATED"},
             {"_attention", "_ATTENTION_CONTEXT"},
             // FFN stages
             {"_down_allreduce", "_FFN_DOWN"},

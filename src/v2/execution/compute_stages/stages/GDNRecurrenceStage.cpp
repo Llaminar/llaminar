@@ -454,6 +454,25 @@ namespace llaminar2
         }
     }
 
+    bool GDNRecurrenceStage::isGraphCapturable() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+        return params_.seq_len == 1;
+#else
+        // Decode: always capturable (single kernel launch, stable pointers)
+        if (params_.seq_len == 1)
+            return true;
+
+        // Prefill: capturable only on ROCm when GPU state is pre-allocated.
+        // chunk_forward() will skip its lazy allocateState() if state is ready.
+        if (!params_.device_id.is_rocm() || !params_.kernel)
+            return false;
+
+        const int required_state_size = params_.n_heads * params_.d_k * params_.d_v;
+        return params_.kernel->isGPUStateReady(required_state_size);
+#endif
+    }
+
     StageDumpInfo GDNRecurrenceStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;

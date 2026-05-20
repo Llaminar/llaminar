@@ -28,12 +28,18 @@ class PipelineStage(Enum):
     ATTENTION_NORM = auto()         # RMSNorm/LayerNorm before attention
     QKV_PROJECTION = auto()         # Combined Q, K, V linear projections
     Q_PROJECTION = auto()           # Query projection only (if separate)
+    FA_GATE = auto()                # Qwen3.5 full-attention sigmoid gate split from Q projection
     K_PROJECTION = auto()           # Key projection only (if separate)
     V_PROJECTION = auto()           # Value projection only (if separate)
+    Q_NORM = auto()                 # Per-head query RMSNorm (Qwen3/Qwen3.5)
+    K_NORM = auto()                 # Per-head key RMSNorm (Qwen3/Qwen3.5)
+    Q_ROPE = auto()                 # Query after rotary position embedding
+    K_ROPE = auto()                 # Key after rotary position embedding
     ROPE_APPLICATION = auto()       # Rotary position embeddings applied to Q and K
     ATTENTION_SCORES = auto()       # Q @ K^T attention scores (before softmax)
     ATTENTION_SOFTMAX = auto()      # Softmax over attention scores
     ATTENTION_CONTEXT = auto()      # Attention weights @ V (context vectors)
+    ATTENTION_CONTEXT_GATED = auto()  # Qwen3.5 context after sigmoid gate, before output projection
     ATTENTION_OUTPUT = auto()       # Output projection W_o (after context)
     ATTENTION_RESIDUAL = auto()     # After attention residual connection
     
@@ -74,12 +80,18 @@ _STAGE_TO_STRING: Dict[PipelineStage, str] = {
     PipelineStage.ATTENTION_NORM: "ATTENTION_NORM",
     PipelineStage.QKV_PROJECTION: "QKV_PROJECTION",
     PipelineStage.Q_PROJECTION: "Q_PROJECTION",
+    PipelineStage.FA_GATE: "FA_GATE",
     PipelineStage.K_PROJECTION: "K_PROJECTION",
     PipelineStage.V_PROJECTION: "V_PROJECTION",
+    PipelineStage.Q_NORM: "Q_NORM",
+    PipelineStage.K_NORM: "K_NORM",
+    PipelineStage.Q_ROPE: "Q_ROPE",
+    PipelineStage.K_ROPE: "K_ROPE",
     PipelineStage.ROPE_APPLICATION: "ROPE_APPLICATION",
     PipelineStage.ATTENTION_SCORES: "ATTENTION_SCORES",
     PipelineStage.ATTENTION_SOFTMAX: "ATTENTION_SOFTMAX",
     PipelineStage.ATTENTION_CONTEXT: "ATTENTION_CONTEXT",
+    PipelineStage.ATTENTION_CONTEXT_GATED: "ATTENTION_CONTEXT_GATED",
     PipelineStage.ATTENTION_OUTPUT: "ATTENTION_OUTPUT",
     PipelineStage.ATTENTION_RESIDUAL: "ATTENTION_RESIDUAL",
     PipelineStage.FFN_NORM: "FFN_NORM",

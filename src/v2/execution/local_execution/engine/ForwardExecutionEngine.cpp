@@ -90,12 +90,24 @@ namespace llaminar2
         const bool has_stable_forward_inputs =
             ((input.token_ids != nullptr) && (input.position_ids != nullptr)) ||
             (is_pp_non_embedding_stage && (input.position_ids != nullptr));
-        const bool forward_cache_eligible =
+
+        // Prefill graph caching: eligible for GPU devices with gpu_graphs enabled
+        const bool prefill_cache_eligible =
             config_.cache_config.enabled &&
-            is_decode &&
+            !is_decode &&
             !has_unified_pp &&
             has_stable_forward_inputs &&
-            (is_standard_path || is_partial_pp_path);
+            (is_standard_path || is_partial_pp_path) &&
+            input.device.is_gpu() &&
+            debugEnv().execution.gpu_graphs;
+
+        const bool forward_cache_eligible =
+            (config_.cache_config.enabled &&
+             is_decode &&
+             !has_unified_pp &&
+             has_stable_forward_inputs &&
+             (is_standard_path || is_partial_pp_path)) ||
+            prefill_cache_eligible;
 
         ForwardGraphSignature forward_signature;
         ForwardGraphCache *active_forward_cache = nullptr;
@@ -295,6 +307,21 @@ namespace llaminar2
             }
             forward_cache.dynamic_param_stages_cached = true;
         }
+
+        // Cache replay callback stages (KVCacheAppend, MoERouting, etc.)
+        // Called after monolithic graph replay to advance host-side metadata.
+        if (!forward_cache.replay_callback_stages_cached)
+        {
+            forward_cache.replay_callback_stages.clear();
+            const auto &order = forward_cache.graph->getExecutionOrder();
+            for (const auto &node_name : order)
+            {
+                ComputeNode *node = forward_cache.graph->getNode(node_name);
+                if (node && node->stage && node->stage->needsOnGraphReplayed())
+                    forward_cache.replay_callback_stages.push_back(node->stage.get());
+            }
+            forward_cache.replay_callback_stages_cached = true;
+        }
         for (auto *stage : forward_cache.dynamic_param_stages)
         {
             stage->updateDynamicParams(input.position_offset, input.seq_len);
@@ -340,9 +367,8 @@ namespace llaminar2
             }
             else
             {
-                // Prefill: fast path without graph capture overhead
-                success = executor_.executeFastDecode(
-                    *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+                // Prefill with graph capture/replay state machine
+                success = executePrefillWithGraphCache(input, forward_cache, ctx, host);
             }
         }
         else
@@ -439,6 +465,139 @@ namespace llaminar2
                   << ms << "ms, success=" << success);
 
         return success;
+    }
+
+    // =========================================================================
+    // executePrefillWithGraphCache() — Prefill Graph Capture/Replay State Machine
+    // =========================================================================
+
+    bool ForwardExecutionEngine::executePrefillWithGraphCache(
+        const ForwardInput &input,
+        ForwardGraphCache &forward_cache,
+        IDeviceContext *ctx,
+        IForwardExecutionHost &host)
+    {
+        // Initialize prefill graph cache on first use
+        if (!forward_cache.prefill_graph_cache)
+        {
+            const auto &env = debugEnv();
+            PrefillGraphConfig config;
+            config.enabled = env.execution.gpu_graphs;
+            config.min_seq_len = env.execution.prefill_graph_min_seq;
+            config.trace = env.execution.prefill_graph_trace;
+            config.buckets_enabled = env.execution.prefill_graph_buckets;
+            forward_cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
+        }
+
+        auto &cache = *forward_cache.prefill_graph_cache;
+
+        PrefillGraphCacheKey key;
+        key.seq_len = input.seq_len;
+        key.device_id = input.device;
+        // Tier 1 defaults: domain_id="single", placement_epoch=0, topology_signature=0
+
+        auto phase = cache.phase(key);
+
+        if (phase == PrefillGraphPhase::Ready)
+        {
+            // === REPLAY PATH ===
+            // Dynamic params already updated by executeCacheHit caller.
+            if (!cache.launch(key))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph replay FAILED for seq_len=" << input.seq_len);
+                return false;
+            }
+
+            // Post-replay callbacks (KV cache head advance, histogram boundaries)
+            for (auto *stage : forward_cache.replay_callback_stages)
+                stage->onGraphReplayed();
+
+            if (cache.config().trace)
+                LOG_INFO("[ForwardExecutionEngine] Prefill graph REPLAY seq_len=" << input.seq_len
+                         << " replay_count=" << cache.replayCount(key));
+            return true;
+        }
+
+        if (phase == PrefillGraphPhase::Warmup)
+        {
+            // === CAPTURE PATH ===
+            // Get GPU context for capture
+            DeviceId dev_id = ctx->deviceId();
+            auto &pool = GPUDeviceContextPool::instance();
+            IWorkerGPUContext &gpu_ctx = pool.getContext(dev_id);
+            void *stream = gpu_ctx.defaultStream();
+
+            // Apply GPU stream to all stages for capture
+            const auto &order = forward_cache.graph->getExecutionOrder();
+            for (const auto &node_name : order)
+            {
+                ComputeNode *node = forward_cache.graph->getNode(node_name);
+                if (node && node->stage)
+                    node->stage->setGPUStream(stream);
+            }
+
+            if (!cache.beginCapture(key, &gpu_ctx, stream))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture BEGIN failed for seq_len=" << input.seq_len);
+                return false;
+            }
+
+            // Execute stages into the capture stream — this IS valid execution
+            bool exec_success = executor_.executeFastDecode(
+                *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+
+            if (!exec_success)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture EXECUTION failed for seq_len=" << input.seq_len);
+                return false;
+            }
+
+            if (!cache.endCaptureAndInstantiate(key))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture END/INSTANTIATE failed for seq_len=" << input.seq_len);
+                return false;
+            }
+
+            LOG_INFO("[ForwardExecutionEngine] Prefill graph CAPTURED seq_len=" << input.seq_len
+                     << " nodes=" << cache.nodeCount(key));
+            return true;
+        }
+
+        // === WARMUP/COLD PATH ===
+        // Execute normally to warm up lazy allocations
+        bool exec_success = executor_.executeFastDecode(
+            *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+
+        if (!exec_success)
+            return false;
+
+        // After successful warmup, check if graph capture is eligible
+        if (phase == PrefillGraphPhase::Cold)
+        {
+            bool snapshots_active = (executor_.config().snapshot_callback != nullptr);
+            bool moe_rebalancing_active = host.isMoeRebalancingActive();
+
+            auto reason = cache.preflight(
+                *forward_cache.graph, key,
+                &forward_cache.collective_nodes,
+                snapshots_active,
+                moe_rebalancing_active);
+
+            if (reason == PrefillGraphRejectReason::None)
+            {
+                cache.markWarmedUp(key);
+                if (cache.config().trace)
+                    LOG_INFO("[ForwardExecutionEngine] Prefill graph ARMED for capture: seq_len=" << input.seq_len);
+            }
+            else if (cache.config().trace)
+            {
+                LOG_INFO("[ForwardExecutionEngine] Prefill graph capture rejected: "
+                         << toString(reason) << " seq_len=" << input.seq_len);
+            }
+            // Rejection is NOT fatal — we just won't use graph capture for this seq_len.
+        }
+
+        return true;
     }
 
     // =========================================================================

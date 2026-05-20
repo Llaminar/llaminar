@@ -119,6 +119,9 @@ namespace llaminar2
 
         /** Resolve PP copy info for the given input (after a cache-miss build). */
         virtual PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const = 0;
+
+        /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
+        virtual bool isMoeRebalancingActive() const { return false; }
     };
 
     /**
@@ -207,6 +210,13 @@ namespace llaminar2
             bool is_decode,
             bool has_unified_pp,
             std::chrono::high_resolution_clock::time_point start);
+
+        // ----- Prefill graph capture/replay (Tier 1 Phase 5) -----
+        bool executePrefillWithGraphCache(
+            const ForwardInput &input,
+            ForwardGraphCache &forward_cache,
+            IDeviceContext *ctx,
+            IForwardExecutionHost &host);
 
         // ----- GPU Stage Timeline collection -----
         void collectTimeline(

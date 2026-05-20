@@ -253,9 +253,9 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, gpu_stream_))
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
                 {
                     LOG_ERROR("[ROCmRoPEKernelT<FP32>] Failed to populate inv_freq");
                     return false;
@@ -541,9 +541,9 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, gpu_stream_))
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
                 {
                     LOG_ERROR("[ROCmRoPEKernelT<BF16>] Failed to populate inv_freq");
                     return false;
@@ -822,9 +822,9 @@ namespace llaminar2
             }
 
             // Initialize inv_freq if needed
-            if (!inv_freq_initialized_ || inv_freq_head_dim_ != head_dim || inv_freq_theta_ != rope_theta)
+            if (!inv_freq_initialized_ || inv_freq_head_dim_ != eff_rotary || inv_freq_theta_ != rope_theta)
             {
-                if (!hipOps_rope_populate_inv_freq(d_inv_freq, head_dim, rope_theta, dev, gpu_stream_))
+                if (!hipOps_rope_populate_inv_freq(d_inv_freq, eff_rotary, rope_theta, dev, gpu_stream_))
                 {
                     LOG_ERROR("[ROCmRoPEKernelT<FP16>] Failed to populate inv_freq");
                     return false;

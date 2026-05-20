@@ -94,6 +94,25 @@ namespace llaminar2
                 cached_kernel_->setDynamicTokenIds(params_.token_ids, params_.num_tokens);
             }
         }
+
+        /// Check if this stage is ready for prefill graph capture.
+        /// Requires: GPU device, workspace bound, kernel created.
+        bool isPrefillGraphCaptureReady() const
+        {
+            if (!params_.device_id.is_gpu())
+                return false;
+            if (!cached_kernel_)
+                return false;
+            auto *ws = dynamic_cast<const IWorkspaceConsumer *>(cached_kernel_);
+            return ws && ws->hasWorkspace();
+        }
+
+        /// Update the token_ids pointer to point at stable graph cache storage.
+        /// Called when the graph cache takes ownership of the token buffer.
+        void setStableTokenPointer(const int *stable_token_ids)
+        {
+            params_.token_ids = stable_token_ids;
+        }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;

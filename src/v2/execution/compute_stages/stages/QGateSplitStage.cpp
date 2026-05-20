@@ -184,11 +184,16 @@ namespace llaminar2
         StageDumpInfo info;
         auto *q_base = dynamic_cast<const TensorBase *>(params_.output_q);
         auto *gate_base = dynamic_cast<const TensorBase *>(params_.output_gate);
+        const size_t rows = (params_.seq_len > 0) ? static_cast<size_t>(params_.seq_len)
+                                                  : (q_base ? q_base->rows() : 0);
+        const size_t cols = (params_.n_heads > 0 && params_.head_dim > 0)
+                                ? static_cast<size_t>(params_.n_heads * params_.head_dim)
+                                : (q_base ? q_base->cols() : 0);
 
         if (q_base)
-            info.addOutput("output_q", params_.output_q, q_base->rows(), q_base->cols());
+            info.addOutput("output_q", params_.output_q, rows, cols);
         if (gate_base)
-            info.addOutput("output_gate", params_.output_gate, gate_base->rows(), gate_base->cols());
+            info.addOutput("output_gate", params_.output_gate, rows, cols);
 
         return info;
     }

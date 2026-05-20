@@ -32,6 +32,7 @@ extern "C"
     void cudaGDN_gpu_free(float *ptr);
     void cudaGDN_gpu_memset_zero(float *ptr, size_t count);
     void cudaGDN_gpu_memset_zero_async(float *ptr, size_t count, void *stream);
+    void cudaGDN_gpu_memcpy_async(float *dst, const float *src, size_t count, void *stream);
     void cudaGDN_gpu_set_device(int ordinal);
     void cudaGDN_stream_synchronize(void *stream);
 }
@@ -49,9 +50,11 @@ namespace llaminar2
         {
             cudaGDN_gpu_set_device(device_ordinal_);
             cudaGDN_gpu_free(gpu_state_);
+            cudaGDN_gpu_free(scratch_);
         }
 
         void allocateGPUState(int state_size) override { allocateState(state_size); }
+        bool allocateGPUScratch(int scratch_size) override { return allocateScratch(scratch_size); }
         void resetGPUState() override { resetState(); }
 
         /// Allocate GPU conv state [channels * (kernel_size - 1)]
@@ -97,13 +100,39 @@ namespace llaminar2
         {
             cudaGDN_gpu_set_device(device_ordinal_);
             float *effective_state = gpu_state_ ? gpu_state_ : conv_state;
+            float *effective_output = output;
+
+            // Prefill runs one thread per timestep/channel. In-place output can
+            // overwrite an input timestep before another thread reads it, so use
+            // persistent scratch only for the in-place prefill case.
+            const bool needs_scratch = (seq_len > 1 && input == output);
+            if (needs_scratch)
+            {
+                const int required_scratch_size = seq_len * channels;
+                if (!scratch_ || scratch_size_ < required_scratch_size)
+                {
+                    LOG_ERROR("[CUDAShortConvolution] In-place prefill scratch was not preallocated: need "
+                              << required_scratch_size << " floats, have " << scratch_size_);
+                    return false;
+                }
+                effective_output = scratch_;
+            }
 
             // All pointers are device pointers — pass directly to CUDA kernel.
-            // No H2D/D2H copies, no scratch buffer, no stream synchronization.
-            return cudaGDN_short_conv1d(
-                input, weight, bias, output, effective_state,
+            const bool ok = cudaGDN_short_conv1d(
+                input, weight, bias, effective_output, effective_state,
                 seq_len, channels, kernel_size, apply_silu,
                 device_ordinal_, stream_);
+            if (!ok)
+                return false;
+
+            if (needs_scratch)
+            {
+                const size_t count = static_cast<size_t>(seq_len) * static_cast<size_t>(channels);
+                cudaGDN_gpu_memcpy_async(output, scratch_, count, stream_);
+            }
+
+            return true;
         }
 
         void setGPUStream(void *stream) override { stream_ = stream; }
@@ -113,6 +142,31 @@ namespace llaminar2
         void *stream_ = nullptr;
         float *gpu_state_ = nullptr;
         int state_size_ = 0;
+        float *scratch_ = nullptr;
+        int scratch_size_ = 0;
+
+        bool allocateScratch(int scratch_size)
+        {
+            if (scratch_ && scratch_size_ >= scratch_size)
+                return true;
+            if (scratch_)
+            {
+                cudaGDN_gpu_set_device(device_ordinal_);
+                cudaGDN_gpu_free(scratch_);
+                scratch_ = nullptr;
+            }
+
+            scratch_size_ = scratch_size;
+            cudaGDN_gpu_set_device(device_ordinal_);
+            if (!cudaGDN_gpu_malloc(&scratch_, scratch_size_))
+            {
+                LOG_ERROR("[CUDAShortConvolution] GPU malloc failed for in-place prefill scratch");
+                scratch_ = nullptr;
+                scratch_size_ = 0;
+                return false;
+            }
+            return true;
+        }
     };
 
 } // namespace llaminar2

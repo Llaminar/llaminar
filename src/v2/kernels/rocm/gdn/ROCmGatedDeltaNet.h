@@ -14,6 +14,7 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 
 extern "C"
@@ -70,6 +71,10 @@ namespace llaminar2
 
         void allocateGPUState(int state_size) override { allocateState(state_size); }
         void resetGPUState() override { resetState(); }
+        bool isGPUStateReady(int required_state_size) const override
+        {
+            return gpu_state_ != nullptr && state_size_ == required_state_size;
+        }
 
         void allocateState(int state_size)
         {
@@ -117,7 +122,15 @@ namespace llaminar2
             rocmGDN_gpu_set_device(device_ordinal_);
             const int required_state_size = n_heads * d_k * d_v;
             if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmGatedDeltaNet::chunk_forward] GPU state allocation during graph capture "
+                              "(need " << required_state_size << " floats, have " << state_size_ << ")");
+                    return false;
+                }
                 allocateState(required_state_size);
+            }
             if (!gpu_state_)
             {
                 LOG_ERROR("[ROCmGatedDeltaNet] Missing GPU recurrence state");
@@ -144,7 +157,15 @@ namespace llaminar2
             rocmGDN_gpu_set_device(device_ordinal_);
             const int required_state_size = n_heads * d_k * d_v;
             if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmGatedDeltaNet::recurrent_step] GPU state allocation during graph capture "
+                              "(need " << required_state_size << " floats, have " << state_size_ << ")");
+                    return false;
+                }
                 allocateState(required_state_size);
+            }
             if (!gpu_state_)
             {
                 LOG_ERROR("[ROCmGatedDeltaNet] Missing GPU recurrence state");
@@ -178,6 +199,12 @@ namespace llaminar2
             // Grow-only scratch allocation
             if (total > deinterleave_scratch_size_)
             {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmGatedDeltaNet::deinterleave_qkv_device] deinterleave scratch realloc during graph capture "
+                              "(need " << total << " floats, have " << deinterleave_scratch_size_ << ")");
+                    return false;
+                }
                 rocmGDN_gpu_free(deinterleave_scratch_);
                 if (!rocmGDN_gpu_malloc(&deinterleave_scratch_, total))
                 {

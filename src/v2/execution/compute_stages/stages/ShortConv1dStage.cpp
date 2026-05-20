@@ -171,10 +171,13 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
-        // Use addOutput with proper rows/cols so snapshot capture works
+        // The backing arena tensor is sized for the maximum sequence length;
+        // snapshots need the logical rows touched by this stage execution.
         auto *out_base = dynamic_cast<const TensorBase *>(params_.output);
         if (out_base)
-            info.addOutput("output", params_.output, out_base->rows(), out_base->cols());
+            info.addOutput("output", params_.output,
+                           static_cast<size_t>(params_.seq_len),
+                           static_cast<size_t>(params_.channels));
 
         return info;
     }

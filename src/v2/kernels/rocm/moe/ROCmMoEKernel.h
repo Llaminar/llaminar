@@ -294,6 +294,21 @@ namespace llaminar2
             int seq_len, int d_model, int intermediate,
             int num_experts, int top_k) override;
 
+        bool hasGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate) const
+        {
+            return total_slots <= prefill_slots_cap_ &&
+                   d_model <= prefill_d_model_cap_ &&
+                   intermediate <= prefill_intermediate_cap_;
+        }
+
+        bool hasGroupingBufferCapacity(int total_slots, int num_experts) const
+        {
+            return total_slots <= group_slots_cap_ &&
+                   num_experts <= group_experts_cap_ &&
+                   d_write_heads_ != nullptr &&
+                   num_experts <= max_write_heads_experts_;
+        }
+
         // =================================================================
         // ITensorKernel interface
         // =================================================================
@@ -509,6 +524,7 @@ namespace llaminar2
         int *d_group_int_indices_ = nullptr;   ///< float→int converted routing indices
         int *d_group_offsets_ = nullptr;       ///< [num_experts] exclusive prefix sums
         int *d_group_counts_ = nullptr;        ///< [num_experts] per-expert token counts
+        int *d_group_max_tokens_ = nullptr;    ///< [1] device-side max(d_group_counts_) (async reduction)
         int *d_group_token_indices_ = nullptr; ///< [total_slots] grouped token indices
         float *d_group_weights_ = nullptr;     ///< [total_slots] grouped routing weights
         int group_slots_cap_ = 0;              ///< capacity for total_slots buffers

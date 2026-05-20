@@ -243,6 +243,13 @@ namespace llaminar2
         return raw_ptr;
     }
 
+    bool DeviceGraphOrchestrator::isMoeRebalancingActive() const
+    {
+        if (!moe_rebalance_controller_)
+            return false;
+        return moe_rebalance_controller_->mode() == MoERebalanceMode::DYNAMIC;
+    }
+
     // =========================================================================
     // Weight and Buffer Configuration
     // =========================================================================

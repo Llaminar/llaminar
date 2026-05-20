@@ -266,6 +266,9 @@ namespace llaminar2
         bool hasWorkspace() const override;
         DeviceWorkspaceManager *getWorkspace() const override;
 
+        // Test accessor
+        void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+
     private:
         Params params_;
         bool raw_weights_released_ = false;                       ///< Set by releaseRawExpertWeights()
@@ -442,6 +445,11 @@ namespace llaminar2
         /// Cached MoE kernel for SwiGLU fallback
         mutable IMoEKernel *moe_kernel_ = nullptr;
         IMoEKernel *ensureMoEKernel() const;
+
+    public:
+        // Test accessors
+        void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+        void setScratchSeqLenForTesting(int n) { scratch_seq_len_ = n; }
     };
 
     /**
@@ -487,6 +495,10 @@ namespace llaminar2
         /// Cached MoE kernel for sigmoid gating
         mutable IMoEKernel *moe_kernel_ = nullptr;
         IMoEKernel *ensureMoEKernel() const;
+
+    public:
+        // Test accessors
+        void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
     };
 
 } // namespace llaminar2

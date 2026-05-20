@@ -125,13 +125,25 @@ namespace llaminar2
             float *q_token = Q + tok * q_stride;
             float *k_token = K ? (K + tok * k_stride) : nullptr;
 
-            // Apply RoPE to single token
-            primitives::apply_rope_vectorized(
-                q_token, k_token,
-                1, head_dim,
-                n_heads, n_kv_heads,
-                position, rope_theta,
-                &tls_state_);
+            if (eff_rotary < head_dim)
+            {
+                // Non-contiguous batches still need partial RoPE to use the
+                // full head stride while rotating only the prefix dimensions.
+                primitives::apply_rope_partial(
+                    q_token, k_token,
+                    1, head_dim, eff_rotary,
+                    n_heads, n_kv_heads,
+                    position, rope_theta);
+            }
+            else
+            {
+                primitives::apply_rope_vectorized(
+                    q_token, k_token,
+                    1, head_dim,
+                    n_heads, n_kv_heads,
+                    position, rope_theta,
+                    &tls_state_);
+            }
         }
 
         return true;

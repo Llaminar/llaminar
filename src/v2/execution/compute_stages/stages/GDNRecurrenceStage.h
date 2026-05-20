@@ -123,11 +123,7 @@ namespace llaminar2
         }
         bool hasDynamicParams() const override { return true; }
 
-        // Capturable in decode mode (seq_len=1): all device pointers are stable
-        // (arena buffers + kernel-owned gpu_state_), single kernel launch with
-        // constant grid dims, grow-only allocs satisfied during warmup phase.
-        // NOT capturable in prefill (chunk_forward uses different memory patterns).
-        bool isGraphCapturable() const override { return params_.seq_len == 1; }
+        bool isGraphCapturable() const override;
 
         const Params &getParams() const { return params_; }
 

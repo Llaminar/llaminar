@@ -81,6 +81,52 @@ namespace llaminar2
         }
 
         /**
+         * @brief Reference partial RoPE implementation using full head stride.
+         *
+         * Partial RoPE rotates only the first rotary_dim values in each head,
+         * but the physical head still has head_dim values. This mirrors Qwen3.5
+         * style partial rotary embeddings and catches stride/denominator mixups.
+         */
+        void reference_partial_rope(
+            float *data,
+            int seq_len,
+            int n_heads,
+            int head_dim,
+            int rotary_dim,
+            const int *position_ids,
+            float rope_theta)
+        {
+            const int half_rotary = rotary_dim / 2;
+            const int token_stride = n_heads * head_dim;
+
+            for (int tok = 0; tok < seq_len; ++tok)
+            {
+                int position = position_ids ? position_ids[tok] : tok;
+                if (position < 0)
+                    continue;
+
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *head_data = data + tok * token_stride + h * head_dim;
+
+                    for (int i = 0; i < half_rotary; ++i)
+                    {
+                        float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * i) / rotary_dim);
+                        float angle = position * freq;
+                        float cos_val = std::cos(angle);
+                        float sin_val = std::sin(angle);
+
+                        float x = head_data[i];
+                        float y = head_data[i + half_rotary];
+
+                        head_data[i] = x * cos_val - y * sin_val;
+                        head_data[i + half_rotary] = x * sin_val + y * cos_val;
+                    }
+                }
+            }
+        }
+
+        /**
          * @brief Generate random FP32 data
          */
         std::vector<float> generate_random_fp32(size_t count, float min_val = -2.0f, float max_val = 2.0f)
@@ -258,6 +304,94 @@ namespace llaminar2
 
         float max_diff = max_abs_diff(q_data.data(), q_expected.data(), q_size);
         EXPECT_LT(max_diff, FP32_TOLERANCE);
+    }
+
+    TEST_F(CPURoPEKernelTTest, FP32_partial_rotary_keeps_full_head_stride)
+    {
+        constexpr int local_seq_len = 3;
+        constexpr int local_n_heads = 4;
+        constexpr int local_n_kv_heads = 2;
+        constexpr int local_head_dim = 16;
+        constexpr int local_rotary_dim = 4;
+
+        const size_t q_size = local_seq_len * local_n_heads * local_head_dim;
+        const size_t k_size = local_seq_len * local_n_kv_heads * local_head_dim;
+
+        auto q_data = generate_random_fp32(q_size);
+        auto k_data = generate_random_fp32(k_size);
+        std::vector<float> q_original = q_data;
+        std::vector<float> k_original = k_data;
+        std::vector<float> q_expected = q_data;
+        std::vector<float> k_expected = k_data;
+        std::vector<int> position_ids = {7, 8, 9};
+
+        reference_partial_rope(q_expected.data(), local_seq_len, local_n_heads,
+                               local_head_dim, local_rotary_dim,
+                               position_ids.data(), ROPE_THETA);
+        reference_partial_rope(k_expected.data(), local_seq_len, local_n_kv_heads,
+                               local_head_dim, local_rotary_dim,
+                               position_ids.data(), ROPE_THETA);
+
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        ASSERT_TRUE(kernel.apply_typed(q_data.data(), k_data.data(), position_ids.data(),
+                                       local_seq_len, local_n_heads, local_n_kv_heads,
+                                       local_head_dim, ROPE_THETA, -1, local_rotary_dim));
+
+        EXPECT_LT(max_abs_diff(q_data.data(), q_expected.data(), q_size), FP32_TOLERANCE);
+        EXPECT_LT(max_abs_diff(k_data.data(), k_expected.data(), k_size), FP32_TOLERANCE);
+
+        for (int tok = 0; tok < local_seq_len; ++tok)
+        {
+            for (int h = 0; h < local_n_heads; ++h)
+            {
+                for (int d = local_rotary_dim; d < local_head_dim; ++d)
+                {
+                    size_t idx = (static_cast<size_t>(tok) * local_n_heads + h) * local_head_dim + d;
+                    EXPECT_FLOAT_EQ(q_data[idx], q_original[idx]);
+                }
+            }
+            for (int h = 0; h < local_n_kv_heads; ++h)
+            {
+                for (int d = local_rotary_dim; d < local_head_dim; ++d)
+                {
+                    size_t idx = (static_cast<size_t>(tok) * local_n_kv_heads + h) * local_head_dim + d;
+                    EXPECT_FLOAT_EQ(k_data[idx], k_original[idx]);
+                }
+            }
+        }
+    }
+
+    TEST_F(CPURoPEKernelTTest, FP32_partial_rotary_handles_non_contiguous_positions)
+    {
+        constexpr int local_seq_len = 3;
+        constexpr int local_n_heads = 3;
+        constexpr int local_n_kv_heads = 2;
+        constexpr int local_head_dim = 16;
+        constexpr int local_rotary_dim = 8;
+
+        const size_t q_size = local_seq_len * local_n_heads * local_head_dim;
+        const size_t k_size = local_seq_len * local_n_kv_heads * local_head_dim;
+
+        auto q_data = generate_random_fp32(q_size);
+        auto k_data = generate_random_fp32(k_size);
+        std::vector<float> q_expected = q_data;
+        std::vector<float> k_expected = k_data;
+        std::vector<int> position_ids = {11, -1, 4};
+
+        reference_partial_rope(q_expected.data(), local_seq_len, local_n_heads,
+                               local_head_dim, local_rotary_dim,
+                               position_ids.data(), ROPE_THETA);
+        reference_partial_rope(k_expected.data(), local_seq_len, local_n_kv_heads,
+                               local_head_dim, local_rotary_dim,
+                               position_ids.data(), ROPE_THETA);
+
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        ASSERT_TRUE(kernel.apply_typed(q_data.data(), k_data.data(), position_ids.data(),
+                                       local_seq_len, local_n_heads, local_n_kv_heads,
+                                       local_head_dim, ROPE_THETA, -1, local_rotary_dim));
+
+        EXPECT_LT(max_abs_diff(q_data.data(), q_expected.data(), q_size), FP32_TOLERANCE);
+        EXPECT_LT(max_abs_diff(k_data.data(), k_expected.data(), k_size), FP32_TOLERANCE);
     }
 
     // =========================================================================

@@ -2746,6 +2746,13 @@ namespace llaminar2
         /// Allocate GPU state buffer (no-op for CPU implementations)
         virtual void allocateGPUState(int state_size) { (void)state_size; }
 
+        /// Allocate GPU scratch used by graph/stage execution (no-op for CPU implementations)
+        virtual bool allocateGPUScratch(int scratch_size)
+        {
+            (void)scratch_size;
+            return true;
+        }
+
         /// Reset GPU state to zero (no-op for CPU implementations)
         virtual void resetGPUState() {}
 
@@ -2805,6 +2812,14 @@ namespace llaminar2
 
         /// Reset GPU state to zero (no-op for CPU implementations)
         virtual void resetGPUState() {}
+
+        /// Check if GPU state is allocated with the required size.
+        /// Used by graph capture preflight to verify warmup has occurred.
+        virtual bool isGPUStateReady(int required_state_size) const
+        {
+            (void)required_state_size;
+            return false;
+        }
 
         /**
          * @brief Deinterleave merged QKV buffer on device (GPU-only)

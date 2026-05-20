@@ -1477,6 +1477,8 @@ add_library(llaminar2_core STATIC
     snapshots/SnapshotCapture.cpp
     # Forward execution engine (Phase 3: extracted from DeviceGraphOrchestrator)
     execution/local_execution/engine/ForwardExecutionEngine.cpp
+    # Prefill graph cache (Phase 4: persistent prefill graph capture/replay)
+    execution/local_execution/engine/PrefillGraphCache.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)
     # GemmMicroKernelInit.cpp, Q8_1/VNNI instantiation sources - REMOVED
     # Vendored jinja template engine (from llama.cpp, MIT license)

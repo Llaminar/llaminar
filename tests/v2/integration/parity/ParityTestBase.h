@@ -2274,9 +2274,11 @@ namespace llaminar2::test::parity
                 return permuteHeads(llaminar_data, size);
             }
 
-            if (stage == "QKV_PROJECTION")
+            if (stage == "QKV_PROJECTION" || stage == "GDN_CONV1D_OUTPUT")
             {
-                // QKV layout: [seq, Q(n_k*d) | K(n_k*d) | V(n_v*d)]
+                // QKV-like layout: [seq, Q(n_k*d) | K(n_k*d) | V(n_v*d)]
+                // Short-conv preserves this packed layout, so it needs the
+                // same V-head-only permutation as the raw projection snapshot.
                 const size_t q_dim = static_cast<size_t>(n_k * d);
                 const size_t k_dim = static_cast<size_t>(n_k * d);
                 const size_t v_dim = static_cast<size_t>(n_v * d);
@@ -3433,12 +3435,13 @@ namespace llaminar2::test::parity
             std::vector<std::string> per_layer_stages = {
                 "ATTENTION_NORM",
                 // GDN sub-stages (skipped for FA layers where they don't exist)
-                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
+                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_CONV1D_OUTPUT", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
                 // Standard attention sub-stages (skipped for GDN layers)
                 "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+                "FA_GATE",
                 "Q_NORM", "K_NORM", // Qwen3 per-head QK RMSNorm (skipped if not available)
                 "Q_ROPE", "K_ROPE",
-                "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
+                "ATTENTION_CONTEXT", "ATTENTION_CONTEXT_GATED", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
                 "FFN_NORM",
                 // Dense FFN sub-stages (skipped for MoE layers)
                 "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN",
@@ -4501,11 +4504,12 @@ namespace llaminar2::test::parity
             // Stages to compare per layer during decode (same as prefill)
             const std::vector<std::string> decode_per_layer_stages = {
                 "ATTENTION_NORM",
-                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
+                "QKV_PROJECTION", "GDN_Z_PROJECTION", "GDN_CONV1D_OUTPUT", "GDN_DELTA_RULE_OUTPUT", "GDN_NORM_GATE_OUTPUT",
                 "Q_PROJECTION", "K_PROJECTION", "V_PROJECTION",
+                "FA_GATE",
                 "Q_NORM", "K_NORM",
                 "Q_ROPE", "K_ROPE",
-                "ATTENTION_CONTEXT", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
+                "ATTENTION_CONTEXT", "ATTENTION_CONTEXT_GATED", "ATTENTION_OUTPUT", "ATTENTION_RESIDUAL",
                 "FFN_NORM",
                 "FFN_GATE", "FFN_UP", "FFN_SWIGLU", "FFN_DOWN",
                 "MOE_ROUTER_OUTPUT", "MOE_ROUTING_INDICES", "MOE_ROUTING_WEIGHTS",
@@ -5125,6 +5129,35 @@ namespace llaminar2::test::parity
             // Assertions — skip on ranks that lack logit data (PP non-tail ranks)
             if (!has_logit_data)
                 return;
+
+            // Decode also captures per-layer snapshots when the runner exposes
+            // them. Enforce the same early-layer gate used by prefill whenever a
+            // full early-layer window is present on this rank; PP tail ranks may
+            // only own later layers and should still rely on logit assertions.
+            for (const auto &step_stats : summary.step_stats)
+            {
+                int compared_early_layers = 0;
+                int passed_early_layers = 0;
+                for (const auto &layer_stats : step_stats.layer_stats)
+                {
+                    if (layer_stats.layer_idx >= config_.early_layers_count)
+                        continue;
+                    if (layer_stats.stages_compared == 0)
+                        continue;
+
+                    compared_early_layers++;
+                    if (layer_stats.passed)
+                        passed_early_layers++;
+                }
+
+                if (compared_early_layers >= config_.early_layers_count)
+                {
+                    EXPECT_GE(passed_early_layers, config_.min_early_layers_passed)
+                        << "At least " << config_.min_early_layers_passed << " of the first "
+                        << config_.early_layers_count << " layers should pass decode parity at step "
+                        << step_stats.step_idx << " (cosine >= " << config_.decode_cosine_threshold << ")";
+                }
+            }
 
             int min_steps_required = static_cast<int>(summary.steps_total * config_.min_decode_pass_rate);
             EXPECT_GE(summary.steps_passed, min_steps_required)

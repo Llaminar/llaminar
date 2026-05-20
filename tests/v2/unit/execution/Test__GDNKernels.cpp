@@ -17,9 +17,11 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <numeric>
 #include <random>
 #include <string>
@@ -33,9 +35,17 @@
 #include "execution/cache/HybridCacheManager.h"
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
+#ifdef HAVE_ROCM
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "kernels/rocm/ROCmWeightPacker.h"
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
+#include <hip/hip_runtime.h>
+#endif
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "utils/DebugEnv.h"
+#include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
 using ::testing::_;
@@ -146,6 +156,112 @@ namespace
         bool had_value_ = false;
         std::string old_value_;
     };
+
+#ifdef HAVE_ROCM
+    struct GDNProjectionCodebookSpec
+    {
+        std::string name;
+        float min_cosine;
+        std::function<std::unique_ptr<TensorBase>(size_t rows, size_t cols)> create;
+    };
+
+    static const std::vector<GDNProjectionCodebookSpec> ALL_GDN_PROJECTION_CODEBOOKS = {
+        {"Q4_0", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ4_0Random({rows, cols}); }},
+        {"Q8_0", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ8_0Random({rows, cols}); }},
+        {"IQ4_NL", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ4_NLRandom({rows, cols}); }},
+        {"Q4_1", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ4_1Random({rows, cols}); }},
+        {"Q5_0", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ5_0Random({rows, cols}); }},
+        {"Q5_1", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ5_1Random({rows, cols}); }},
+        {"IQ4_XS", 0.985f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ4_XSRandom({rows, cols}); }},
+        {"Q4_K", 0.985f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ4_KRandom({rows, cols}); }},
+        {"Q5_K", 0.985f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ5_KRandom({rows, cols}); }},
+        {"Q6_K", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ6_KRandom({rows, cols}); }},
+        {"Q3_K", 0.980f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ3_KRandom({rows, cols}); }},
+        {"Q2_K", 0.970f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ2_KRandom({rows, cols}); }},
+        {"IQ3_S", 0.975f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ3_SRandom({rows, cols}); }},
+        {"IQ3_XXS", 0.970f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ3_XXSRandom({rows, cols}); }},
+        {"IQ2_S", 0.960f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ2_SRandom({rows, cols}); }},
+        {"IQ2_XS", 0.960f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ2_XSRandom({rows, cols}); }},
+        {"IQ2_XXS", 0.950f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ2_XXSRandom({rows, cols}); }},
+        {"IQ1_S", 0.930f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ1_SRandom({rows, cols}); }},
+        {"IQ1_M", 0.930f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ1_MRandom({rows, cols}); }},
+    };
+
+    float vectorCosine(const std::vector<float> &actual, const std::vector<float> &expected)
+    {
+        double dot = 0.0;
+        double actual_norm = 0.0;
+        double expected_norm = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            dot += static_cast<double>(actual[i]) * expected[i];
+            actual_norm += static_cast<double>(actual[i]) * actual[i];
+            expected_norm += static_cast<double>(expected[i]) * expected[i];
+        }
+        if (actual_norm == 0.0 || expected_norm == 0.0)
+            return 0.0f;
+        return static_cast<float>(dot / (std::sqrt(actual_norm) * std::sqrt(expected_norm)));
+    }
+
+    float vectorRelativeL2(const std::vector<float> &actual, const std::vector<float> &expected)
+    {
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            const double diff = static_cast<double>(actual[i]) - expected[i];
+            sum_sq_diff += diff * diff;
+            sum_sq_ref += static_cast<double>(expected[i]) * expected[i];
+        }
+        return static_cast<float>(std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30)));
+    }
+
+    float vectorMaxAbsDiff(const std::vector<float> &actual, const std::vector<float> &expected)
+    {
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < actual.size(); ++i)
+            max_abs = std::max(max_abs, std::abs(actual[i] - expected[i]));
+        return max_abs;
+    }
+
+    float vectorMaxAbsValue(const std::vector<float> &values)
+    {
+        float max_abs = 0.0f;
+        for (float value : values)
+            max_abs = std::max(max_abs, std::abs(value));
+        return max_abs;
+    }
+
+    void appendCpuGDNProjectionReference(
+        const float *input,
+        const std::vector<float> &weights,
+        int rows,
+        int cols,
+        std::vector<float> &out)
+    {
+        for (int row = 0; row < rows; ++row)
+        {
+            double acc = 0.0;
+            for (int col = 0; col < cols; ++col)
+                acc += static_cast<double>(input[col]) * weights[static_cast<size_t>(row) * cols + col];
+            out.push_back(static_cast<float>(acc));
+        }
+    }
+
+    void appendTensorData(FP32Tensor *tensor, int count, std::vector<float> &out)
+    {
+        const float *data = tensor->data();
+        out.insert(out.end(), data, data + count);
+    }
+
+    struct GDNProjectionBundle
+    {
+        std::unique_ptr<TensorBase> weights;
+        std::vector<float> weights_fp32;
+        rocm::ROCmPackedWeights packed;
+        std::unique_ptr<rocm::ROCmQuantisedGemmKernel> kernel;
+    };
+#endif
 
 } // namespace
 
@@ -938,6 +1054,283 @@ TEST(Test__GDNKernels, Recurrence_Prefill_MatchesSequentialDecode)
             << "State mismatch at index " << i;
     }
 }
+
+#ifdef HAVE_ROCM
+TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int n_heads = 16;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int prefill_len = 37;
+    const int total_len = prefill_len + 1;
+    const size_t qk_elems = static_cast<size_t>(total_len) * n_heads * d_k;
+    const size_t v_elems = static_cast<size_t>(total_len) * n_heads * d_v;
+    const size_t gate_elems = static_cast<size_t>(total_len) * n_heads;
+    const size_t output_elems = static_cast<size_t>(total_len) * n_heads * d_v;
+
+    // Use production head dimensions with deterministic small-magnitude inputs
+    // so the ROCm prefill recurrence can be compared against decode exactly.
+    auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_k)}, 0.0f, 0.03f, 1101);
+    auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_k)}, 0.0f, 0.03f, 1102);
+    auto V = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_v)}, 0.0f, 0.03f, 1103);
+    auto alpha = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, -0.15f, 0.2f, 1104);
+    auto beta = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.2f, 1105);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto prefill_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_v)});
+    auto decode_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_v)});
+
+    ASSERT_EQ(Q->numel(), qk_elems);
+    ASSERT_EQ(K->numel(), qk_elems);
+    ASSERT_EQ(V->numel(), v_elems);
+    ASSERT_EQ(alpha->numel(), gate_elems);
+    ASSERT_EQ(beta->numel(), gate_elems);
+    ASSERT_EQ(prefill_out->numel(), output_elems);
+    ASSERT_EQ(decode_out->numel(), output_elems);
+
+    // Directly exercise the ROCm kernel implementation, bypassing stage
+    // orchestration so this test only covers recurrence state compatibility.
+    ASSERT_TRUE(Q->ensureOnDevice(device));
+    ASSERT_TRUE(K->ensureOnDevice(device));
+    ASSERT_TRUE(V->ensureOnDevice(device));
+    ASSERT_TRUE(alpha->ensureOnDevice(device));
+    ASSERT_TRUE(beta->ensureOnDevice(device));
+    ASSERT_TRUE(A_log->ensureOnDevice(device));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device));
+    ASSERT_TRUE(prefill_out->allocateOnDevice(device));
+    ASSERT_TRUE(decode_out->allocateOnDevice(device));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_prefill = static_cast<float *>(prefill_out->gpu_data_ptr());
+    auto *d_decode = static_cast<float *>(decode_out->gpu_data_ptr());
+
+    ASSERT_NE(d_Q, nullptr);
+    ASSERT_NE(d_K, nullptr);
+    ASSERT_NE(d_V, nullptr);
+    ASSERT_NE(d_alpha, nullptr);
+    ASSERT_NE(d_beta, nullptr);
+    ASSERT_NE(d_A_log, nullptr);
+    ASSERT_NE(d_dt_bias, nullptr);
+    ASSERT_NE(d_prefill, nullptr);
+    ASSERT_NE(d_decode, nullptr);
+
+    // Path 1: prefill the prompt history, then decode one more token using the
+    // same ROCm kernel instance. This locks down the hidden GPU recurrence
+    // state that production decode consumes after prefill.
+    ROCmGatedDeltaNet prefill_kernel(0);
+    ASSERT_TRUE(prefill_kernel.chunk_forward(
+        d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+        d_prefill, nullptr, prefill_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    ASSERT_TRUE(prefill_kernel.recurrent_step(
+        d_Q + static_cast<size_t>(prefill_len) * qk_stride,
+        d_K + static_cast<size_t>(prefill_len) * qk_stride,
+        d_V + static_cast<size_t>(prefill_len) * v_stride,
+        d_alpha + static_cast<size_t>(prefill_len) * n_heads,
+        d_beta + static_cast<size_t>(prefill_len) * n_heads,
+        d_A_log,
+        d_dt_bias,
+        d_prefill + static_cast<size_t>(prefill_len) * v_stride,
+        nullptr,
+        n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true));
+
+    // Path 2: independent decode kernel receives every token one at a time.
+    // Its outputs should match both the prefill history and the first decode
+    // token if prefill state writeback has the same semantics as recurrent_step().
+    ROCmGatedDeltaNet decode_kernel(0);
+    for (int t = 0; t < total_len; ++t)
+    {
+        ASSERT_TRUE(decode_kernel.recurrent_step(
+            d_Q + static_cast<size_t>(t) * qk_stride,
+            d_K + static_cast<size_t>(t) * qk_stride,
+            d_V + static_cast<size_t>(t) * v_stride,
+            d_alpha + static_cast<size_t>(t) * n_heads,
+            d_beta + static_cast<size_t>(t) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_decode + static_cast<size_t>(t) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    prefill_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    decode_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(prefill_out->ensureOnHost());
+    ASSERT_TRUE(decode_out->ensureOnHost());
+
+    // Compare both an absolute bound and a relative norm so a localized state
+    // mismatch and a broad scale drift both fail loudly.
+    const float *prefill = prefill_out->data();
+    const float *decode = decode_out->data();
+    float max_abs_diff = 0.0f;
+    double sum_sq_diff = 0.0;
+    double sum_sq_ref = 0.0;
+    for (size_t i = 0; i < output_elems; ++i)
+    {
+        const float diff = std::abs(prefill[i] - decode[i]);
+        max_abs_diff = std::max(max_abs_diff, diff);
+        sum_sq_diff += static_cast<double>(diff) * diff;
+        sum_sq_ref += static_cast<double>(decode[i]) * decode[i];
+    }
+
+    const double rel_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30));
+    EXPECT_LT(max_abs_diff, 2e-4f) << "ROCm GDN prefill must match recurrent decode at Qwen35 shape";
+    EXPECT_LT(rel_l2, 1e-4) << "ROCm GDN prefill must produce decode-compatible recurrent state";
+}
+
+TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    ScopedEnvVar concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE");
+    ScopedEnvVar gdn_concurrent_decode("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
+    ScopedEnvVar forced_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB");
+    concurrent_decode.set("0");
+    gdn_concurrent_decode.set("0");
+    forced_kb.set("8");
+
+    const int M = 1;
+    const int K = 256;
+    const int n_heads = 16;
+    const int d_k = 32;
+    const int d_v = 32;
+    const int n_qkv = 2 * n_heads * d_k + n_heads * d_v;
+    const int n_z = n_heads * d_v;
+    const int n_a = n_heads;
+    const int n_b = n_heads;
+    const std::array<int, 4> projection_sizes = {n_qkv, n_z, n_a, n_b};
+
+    for (const auto &fmt : ALL_GDN_PROJECTION_CODEBOOKS)
+    {
+        std::array<std::unique_ptr<GDNProjectionBundle>, 4> bundles;
+        WorkspaceRequirements combined_requirements;
+
+        for (size_t projection = 0; projection < bundles.size(); ++projection)
+        {
+            auto bundle = std::make_unique<GDNProjectionBundle>();
+            const int rows = projection_sizes[projection];
+            bundle->weights = fmt.create(static_cast<size_t>(rows), static_cast<size_t>(K));
+            ASSERT_NE(bundle->weights, nullptr)
+                << fmt.name << ": failed to create projection " << projection << " weights";
+
+            bundle->weights_fp32.resize(static_cast<size_t>(rows) * K);
+            bundle->weights->to_fp32(bundle->weights_fp32.data());
+
+            ASSERT_TRUE(rocm::packNativeVNNI(bundle->weights.get(), bundle->packed))
+                << fmt.name << ": native-VNNI pack failed for projection " << projection;
+            ASSERT_FALSE(bundle->packed.native_vnni_payload.empty())
+                << fmt.name << ": native-VNNI payload missing for projection " << projection;
+
+            bundle->kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(&bundle->packed, 0);
+            combined_requirements.merge(bundle->kernel->getWorkspaceRequirements(M, rows, K));
+            bundles[projection] = std::move(bundle);
+        }
+
+        DeviceWorkspaceManager workspace(device, 128 * 1024 * 1024);
+        ASSERT_TRUE(workspace.allocate(combined_requirements))
+            << fmt.name << ": failed to allocate GDN projection workspace";
+        for (auto &bundle : bundles)
+            bundle->kernel->bindWorkspace(&workspace);
+
+        auto input = test::TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 2601);
+        auto out_qkv = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_qkv)});
+        auto out_z = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_z)});
+        auto out_a = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_a)});
+        auto out_b = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_b)});
+
+        ASSERT_TRUE(input->ensureOnDevice(device));
+        ASSERT_TRUE(out_qkv->allocateOnDevice(device));
+        ASSERT_TRUE(out_z->allocateOnDevice(device));
+        ASSERT_TRUE(out_a->allocateOnDevice(device));
+        ASSERT_TRUE(out_b->allocateOnDevice(device));
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {bundles[0]->kernel.get(), out_qkv.get(), n_qkv, nullptr, "qkv"},
+            {bundles[1]->kernel.get(), out_z.get(), n_z, nullptr, "z"},
+            {bundles[2]->kernel.get(), out_a.get(), n_a, nullptr, "alpha"},
+            {bundles[3]->kernel.get(), out_b.get(), n_b, nullptr, "beta"},
+        };
+
+        ASSERT_TRUE(bundles[0]->kernel->multiply_fused_tensor(
+            input.get(), projections, M, K, nullptr, &workspace))
+            << fmt.name << ": fused GDN projection failed";
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        out_qkv->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        out_z->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        out_a->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        out_b->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+
+        const float *input_host = input->data();
+        std::vector<float> expected;
+        expected.reserve(static_cast<size_t>(n_qkv + n_z + n_a + n_b));
+        for (size_t projection = 0; projection < bundles.size(); ++projection)
+        {
+            appendCpuGDNProjectionReference(
+                input_host,
+                bundles[projection]->weights_fp32,
+                projection_sizes[projection],
+                K,
+                expected);
+        }
+
+        std::vector<float> actual;
+        actual.reserve(expected.size());
+        appendTensorData(out_qkv.get(), n_qkv, actual);
+        appendTensorData(out_z.get(), n_z, actual);
+        appendTensorData(out_a.get(), n_a, actual);
+        appendTensorData(out_b.get(), n_b, actual);
+
+        ASSERT_EQ(actual.size(), expected.size());
+        const float cosine = vectorCosine(actual, expected);
+        const float rel_l2 = vectorRelativeL2(actual, expected);
+        const float max_abs = vectorMaxAbsDiff(actual, expected);
+        const float max_ref_abs = vectorMaxAbsValue(expected);
+        const float max_abs_ratio = max_abs / std::max(max_ref_abs, 1e-6f);
+
+        LOG_INFO("[GDNProjectionNativeVNNI] " << fmt.name
+                                               << " cosine=" << cosine
+                                               << " rel_l2=" << rel_l2
+                               << " max_abs=" << max_abs
+                               << " max_abs_ratio=" << max_abs_ratio);
+
+        EXPECT_GT(cosine, fmt.min_cosine)
+            << fmt.name << ": GDN fused projection accuracy below threshold";
+        EXPECT_LT(rel_l2, 0.05f)
+            << fmt.name << ": GDN fused projection relative error too large";
+        EXPECT_LT(max_abs_ratio, 0.02f)
+            << fmt.name << ": GDN fused projection localized error too large";
+
+        for (auto &bundle : bundles)
+            bundle->kernel->unbindWorkspace();
+    }
+}
+#endif
 
 TEST(Test__GDNKernels, Recurrence_L2Norm)
 {

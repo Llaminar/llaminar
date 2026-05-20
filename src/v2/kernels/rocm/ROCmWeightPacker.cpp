@@ -48,6 +48,13 @@ extern "C" bool rocmInitIQGridTables_gemm(
     const void *h_iq2s_grid, const void *h_iq2xs_grid,
     const void *h_iq2xxs_grid, const void *h_iq1s_grid);
 
+// IQ grid table initialization for MoE grouped prefill TU (implemented in ROCmMoEGroupedPrefillKernels.hip)
+extern "C" bool rocmInitIQGridTables_moe_prefill(
+    int device_id,
+    const void *h_iq3s_grid, const void *h_iq3xxs_grid,
+    const void *h_iq2s_grid, const void *h_iq2xs_grid,
+    const void *h_iq2xxs_grid, const void *h_iq1s_grid);
+
 namespace llaminar2
 {
     namespace rocm
@@ -118,6 +125,18 @@ namespace llaminar2
                             llaminar2::iq1s_grid))
                     {
                         LOG_ERROR("[packNativeVNNI] IQ grid GEMM init failed on device " << current_device);
+                        return false;
+                    }
+                    if (!rocmInitIQGridTables_moe_prefill(
+                            current_device,
+                            llaminar2::iq3s_grid,
+                            llaminar2::iq3xxs_grid,
+                            llaminar2::iq2s_grid,
+                            llaminar2::iq2xs_grid,
+                            llaminar2::iq2xxs_grid,
+                            llaminar2::iq1s_grid))
+                    {
+                        LOG_ERROR("[packNativeVNNI] IQ grid MoE prefill init failed on device " << current_device);
                         return false;
                     }
                     std::lock_guard<std::mutex> lock(iq_grid_mutex);

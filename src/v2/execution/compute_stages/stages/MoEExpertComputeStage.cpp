@@ -389,7 +389,7 @@ namespace llaminar2
         // =====================================================================
         // Phase 5: Fully-grouped MoE prefill pipeline (graph-capturable)
         // All 5 kernels launched with zero host sync, counts stay on device.
-        // Falls through to per-expert path if conditions not met.
+        // This is the ONLY ROCm prefill path — no per-expert fallback.
         // =====================================================================
         if (is_gpu && canUseFixedTopologyGroupedPrefill())
         {
@@ -424,6 +424,19 @@ namespace llaminar2
             if (params_.device_id.is_gpu())
                 markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
             return true;
+        }
+
+        // ROCm prefill MUST use grouped path — fail hard if conditions not met
+        if (params_.device_id.is_rocm() && params_.seq_len > 1)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] ROCm prefill (seq_len=" << params_.seq_len
+                      << ") requires grouped prefill but conditions not met: "
+                      << "moe_grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
+                      << ", fullOwnership=" << hasFullLocalExpertOwnership()
+                      << ", allEnabled=" << expertMaskAllEnabled()
+                      << ", replicas=" << params_.replica_set.num_replicated
+                      << ", layer=" << params_.layer_idx);
+            return false;
         }
 
         // =====================================================================
@@ -791,6 +804,12 @@ namespace llaminar2
                                              initializeMoERuntimeTableForGroupedDecode();
         }
 
+        // Snapshot-enabled builds keep legacy routing tensors authoritative for
+        // parity dumps, so MoERoutingStage does not populate the runtime top-k
+        // table. Consuming that table here would use stale/zero routing data.
+#if defined(ENABLE_PIPELINE_SNAPSHOTS)
+        const bool can_try_device_routed_decode = false;
+#else
         const bool can_try_device_routed_decode =
             params_.device_id.is_rocm() &&
             debugEnv().rocm.moe_grouped_decode &&
@@ -803,6 +822,7 @@ namespace llaminar2
             params_.replica_set.num_replicated == 0 &&
             hasFullLocalExpertOwnership() &&
             expertMaskAllEnabled();
+#endif
 
         if (can_try_device_routed_decode)
         {
@@ -1670,8 +1690,8 @@ namespace llaminar2
                 params_.routing_indices, params_.routing_weights,
                 seq_len, num_experts, top_k))
         {
-            LOG_DEBUG("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
-                      "prepareExpertGroupsAsync failed, falling back");
+            LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                      "prepareExpertGroupsAsync failed");
             return false;
         }
 
@@ -1698,7 +1718,35 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::isFixedTopologyPrefillGraphCapturable() const
     {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
         return false;
+#else
+        // Fixed-topology grouped prefill is capturable when all buffers are
+        // pre-allocated from warmup and the stage uses the grouped pipeline.
+        // The MoE kernel must have sufficient grouping + scratch capacity.
+        if (!params_.device_id.is_rocm() || params_.seq_len <= 1)
+            return false;
+
+        const auto &rocm = debugEnv().rocm;
+        if (!rocm.moe_grouped_prefill)
+            return false;
+
+        // Require full local expert ownership, no masks, no replicas
+        if (!hasFullLocalExpertOwnership() || !expertMaskAllEnabled())
+            return false;
+        if (params_.replica_set.num_replicated != 0)
+            return false;
+
+        // Must have all prepared GEMM engines ready
+        if (!hasAllPreparedExpertGemmEngines())
+            return false;
+
+        // MoE kernel must exist and have pre-allocated grouping + scratch
+        if (!moe_kernel_)
+            return false;
+
+        return true;
+#endif
     }
 
     bool MoEExpertComputeStage::hasFullLocalExpertOwnership() const
@@ -1895,15 +1943,19 @@ namespace llaminar2
         // are built and execution is pure kernel launches reading routing info
         // from the device-resident MoE runtime table.
         const auto &rocm = debugEnv().rocm;
-        return params_.device_id.is_rocm() &&
-               params_.seq_len == 1 &&
-               rocm.moe_grouped_decode &&
-               rocm.moe_device_routed_decode &&
-               params_.moe_runtime_table != nullptr &&
-               params_.top_k > 0 && params_.top_k <= 16 &&
-               params_.replica_set.num_replicated == 0 &&
-               hasFullLocalExpertOwnership() &&
-               expertMaskAllEnabled();
+        if (params_.device_id.is_rocm() &&
+            params_.seq_len == 1 &&
+            rocm.moe_grouped_decode &&
+            rocm.moe_device_routed_decode &&
+            params_.moe_runtime_table != nullptr &&
+            params_.top_k > 0 && params_.top_k <= 16 &&
+            params_.replica_set.num_replicated == 0 &&
+            hasFullLocalExpertOwnership() &&
+            expertMaskAllEnabled())
+            return true;
+
+        // Fixed-topology grouped prefill path
+        return isFixedTopologyPrefillGraphCapturable();
 #endif
     }
 
@@ -2354,7 +2406,14 @@ namespace llaminar2
 #else
         // After warmup: GEMM engines cached, scratch buffers allocated,
         // all operations are pure kernel launches (fused gate+up, swiglu, down).
-        return params_.device_id.is_rocm() && params_.seq_len == 1;
+        // Capturable for both decode and prefill once scratch is pre-sized.
+        if (!params_.device_id.is_rocm())
+            return false;
+        // Decode: always ready after warmup (scratch not used for seq_len==1 grouped path)
+        if (params_.seq_len == 1)
+            return true;
+        // Prefill: scratch must be pre-allocated to at least current seq_len
+        return scratch_seq_len_ >= params_.seq_len && moe_kernel_ != nullptr;
 #endif
     }
 
@@ -2546,7 +2605,10 @@ namespace llaminar2
         return false;
 #else
         // Single kernel call (sigmoid gating) — pure kernel launch after warmup.
-        return params_.device_id.is_rocm() && params_.seq_len == 1;
+        // Capturable for both decode (seq_len==1) and prefill (seq_len>1) on ROCm
+        // because the stage is just a kernel launch with stable device pointers.
+        // MoE kernel must already be cached (from warmup execution).
+        return params_.device_id.is_rocm() && moe_kernel_ != nullptr;
 #endif
     }
 

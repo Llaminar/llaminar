@@ -8,6 +8,7 @@
 #include "utils/ROCmKernelProfiler.h"
 #include "utils/DebugEnv.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../common/EmbedQ8Repack.h"
 #include "../../common/PreparedEmbeddingWeights.h"
 #include "../../KernelFactory.h"
@@ -551,6 +552,12 @@ namespace llaminar2
         const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens && preload_stream_ == getStream() && h_token_ids_ && std::memcmp(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int)) == 0;
         if (!token_ids_preloaded)
         {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT::apply_tensor] token_ids not preloaded during graph capture — "
+                          "updateDynamicParams must be called before capture/replay");
+                return false;
+            }
             dynamic_params_active_ = false;
             dynamic_token_count_ = 0;
             err = hipMemcpyAsync(d_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice, stream);

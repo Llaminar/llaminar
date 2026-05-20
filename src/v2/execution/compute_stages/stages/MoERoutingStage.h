@@ -81,6 +81,9 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
+        // Test accessors
+        void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
+
     private:
         Params params_;
 
@@ -98,6 +101,7 @@ namespace llaminar2
 
         IMoEKernel *ensureMoEKernel() const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
+        bool isDeviceRoutedPrefillGraphCapturable() const;
         bool hasInitializedRuntimeTableIfProvided() const;
         void recordRuntimeHistogramTokenBoundary() const;
         void stashRoutingResults(

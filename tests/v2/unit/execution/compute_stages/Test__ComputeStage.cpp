@@ -504,6 +504,84 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
     EXPECT_TRUE(q1_differs) << "pos_offset=5 should produce different result than pos_offset=0";
 }
 
+TEST_F(ComputeStageTest, RoPEPartialRotaryKeepsFullHeadStride)
+{
+    const int seq_len = 1;
+    const int n_heads = 2;
+    const int n_kv_heads = 1;
+    const int head_dim = 8;
+    const int rotary_dim = 4;
+    const float theta_base = 10000.0f;
+    const std::vector<int> position_ids = {7};
+
+    // Use distinct values per head so a reduced head stride rotates the wrong
+    // portion of the row instead of merely producing a small numeric drift.
+    std::vector<float> q_data = {
+        1.0f, 2.0f, 3.0f, 4.0f, 50.0f, 51.0f, 52.0f, 53.0f,
+        -1.0f, -2.0f, -3.0f, -4.0f, 60.0f, 61.0f, 62.0f, 63.0f};
+    std::vector<float> k_data = {
+        5.0f, 6.0f, 7.0f, 8.0f, 70.0f, 71.0f, 72.0f, 73.0f};
+    std::vector<float> q_expected = q_data;
+    std::vector<float> k_expected = k_data;
+
+    auto apply_partial_reference = [&](std::vector<float> &data, int heads)
+    {
+        const int half_rotary = rotary_dim / 2;
+        for (int tok = 0; tok < seq_len; ++tok)
+        {
+            const int position = position_ids[static_cast<size_t>(tok)];
+            for (int head = 0; head < heads; ++head)
+            {
+                float *head_ptr = data.data() + tok * heads * head_dim + head * head_dim;
+                for (int i = 0; i < half_rotary; ++i)
+                {
+                    const float freq = 1.0f / std::pow(theta_base, static_cast<float>(2 * i) / rotary_dim);
+                    const float angle = static_cast<float>(position) * freq;
+                    const float cos_val = std::cos(angle);
+                    const float sin_val = std::sin(angle);
+                    const float x0 = head_ptr[i];
+                    const float x1 = head_ptr[i + half_rotary];
+                    head_ptr[i] = x0 * cos_val - x1 * sin_val;
+                    head_ptr[i + half_rotary] = x0 * sin_val + x1 * cos_val;
+                }
+            }
+        }
+    };
+
+    // Reference uses head_dim for memory stride and rotary_dim for the rotated
+    // prefix, matching HuggingFace partial RoPE layout semantics.
+    apply_partial_reference(q_expected, n_heads);
+    apply_partial_reference(k_expected, n_kv_heads);
+
+    auto Q = makeTensor(seq_len, n_heads * head_dim, q_data);
+    auto K = makeTensor(seq_len, n_kv_heads * head_dim, k_data);
+    RoPEStage::Params params{
+        .Q = Q.get(),
+        .K = K.get(),
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .pos_offset = position_ids[0],
+        .theta_base = theta_base,
+        .seq_len = seq_len,
+        .partial_rotary_factor = static_cast<float>(rotary_dim) / static_cast<float>(head_dim),
+        .position_ids = position_ids.data()};
+
+    RoPEStage stage(params);
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    const float *q_out = Q->data();
+    const float *k_out = K->data();
+    for (size_t i = 0; i < q_expected.size(); ++i)
+    {
+        EXPECT_NEAR(q_out[i], q_expected[i], 1e-5f) << "Q mismatch at index " << i;
+    }
+    for (size_t i = 0; i < k_expected.size(); ++i)
+    {
+        EXPECT_NEAR(k_out[i], k_expected[i], 1e-5f) << "K mismatch at index " << i;
+    }
+}
+
 // =============================================================================
 // ResidualAddStage Tests
 // =============================================================================

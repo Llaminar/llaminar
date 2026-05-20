@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/ROCmWeightPacker.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
@@ -41,6 +42,9 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+
+extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
+extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
 #endif
 
 using namespace llaminar2;
@@ -76,6 +80,19 @@ namespace
             max_err = std::max(max_err, std::fabs(a[i] - b[i]));
         }
         return max_err;
+    }
+
+    float relativeL2Error(const float *a, const float *b, size_t n)
+    {
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref = 0.0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const double diff = static_cast<double>(a[i]) - static_cast<double>(b[i]);
+            sum_sq_diff += diff * diff;
+            sum_sq_ref += static_cast<double>(b[i]) * static_cast<double>(b[i]);
+        }
+        return static_cast<float>(std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30)));
     }
 
     size_t firstBitwiseMismatchIndex(const std::vector<float> &lhs,
@@ -123,6 +140,7 @@ namespace
         float min_cosine;   ///< Minimum expected cosine similarity
 
         std::function<std::unique_ptr<TensorBase>(size_t N, size_t K)> create;
+        bool direct_native_pack = false; ///< Use packNativeVNNI even if the default packer prefers INT8-VNNI.
     };
 
     // Cosine thresholds:
@@ -136,6 +154,9 @@ namespace
         {"Q4_0", false, 0.990f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ4_0Random({N, K}); }},
+        {"Q8_0", false, 0.990f,
+         [](size_t N, size_t K)
+         { return TestTensorFactory::createQ8_0Random({N, K}); }, true},
         {"IQ4_NL", false, 0.990f,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
@@ -225,6 +246,29 @@ namespace
         bool has_rocm_device_ = false;
 
 #ifdef HAVE_ROCM
+        bool packForNativeVNNIGemv(const GEMVFormatSpec &fmt,
+                                   const TensorBase *weights,
+                                   ROCmPackedWeights &packed)
+        {
+            if (fmt.direct_native_pack)
+                return packNativeVNNI(weights, packed);
+            return packWeightsToROCm(weights, packed);
+        }
+
+        class NativeVNNITuningOverrideGuard
+        {
+        public:
+            explicit NativeVNNITuningOverrideGuard(int kb)
+            {
+                rocmGemv_native_vnni_set_tuning_overrides(kb, -1);
+            }
+
+            ~NativeVNNITuningOverrideGuard()
+            {
+                rocmGemv_native_vnni_reset_tuning_overrides();
+            }
+        };
+
         std::unique_ptr<DeviceWorkspaceManager> workspace_;
 
         bool setupWorkspace(ROCmQuantisedGemmKernel &kernel, int M, int N, int K)
@@ -303,7 +347,7 @@ namespace
 
         // 3. Pack for ROCm
         ROCmPackedWeights packed;
-        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed))
+        ASSERT_TRUE(packForNativeVNNIGemv(fmt, weights.get(), packed))
             << "packWeightsToROCm failed for " << fmt.name;
         ASSERT_FALSE(packed.native_vnni_payload.empty())
             << fmt.name << ": native-VNNI payload was not populated";
@@ -794,7 +838,7 @@ namespace
             weights->to_fp32(W_fp32.data());
 
             ROCmPackedWeights packed;
-            if (!packWeightsToROCm(weights.get(), packed) ||
+            if (!packForNativeVNNIGemv(fmt, weights.get(), packed) ||
                 packed.native_vnni_payload.empty())
             {
                 results.push_back({fmt.name, 0.0f, 999.0f, false});
@@ -860,6 +904,72 @@ namespace
         {
             EXPECT_TRUE(r.passed)
                 << r.name << ": cosine=" << r.cosine << " max_abs_err=" << r.max_abs_err;
+        }
+    }
+
+    TEST_F(NativeVNNIGEMVTest, SplitK_KB8MatchesKB1_AllNativeCodebooks)
+    {
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        const int M = 1;
+        const int N = 256;
+        const int K = 1024;
+
+        for (const auto &fmt : ALL_GEMV_FORMATS)
+        {
+            auto weights = fmt.create(static_cast<size_t>(N), static_cast<size_t>(K));
+            ASSERT_NE(weights, nullptr) << fmt.name << ": failed to create weights";
+
+            ROCmPackedWeights packed;
+            ASSERT_TRUE(packForNativeVNNIGemv(fmt, weights.get(), packed))
+                << fmt.name << ": native-VNNI packing failed";
+            ASSERT_FALSE(packed.native_vnni_payload.empty())
+                << fmt.name << ": native-VNNI payload was not populated";
+
+            ROCmQuantisedGemmKernel kernel(&packed, 0);
+            ASSERT_TRUE(setupWorkspace(kernel, M, N, K))
+                << fmt.name << ": workspace allocation failed";
+
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 1701);
+            auto output_kb1 = TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(N)});
+            auto output_kb8 = TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+            {
+                NativeVNNITuningOverrideGuard guard(1);
+                ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_kb1.get(), M, N, K))
+                    << fmt.name << ": KB=1 native-VNNI GEMV failed";
+            }
+            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+            {
+                NativeVNNITuningOverrideGuard guard(8);
+                ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_kb8.get(), M, N, K))
+                    << fmt.name << ": KB=8 native-VNNI GEMV failed";
+            }
+            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+            const float *direct = output_kb1->data();
+            const float *split = output_kb8->data();
+            const float cosine = cosineSimilarity(split, direct, static_cast<size_t>(N));
+            const float rel_l2 = relativeL2Error(split, direct, static_cast<size_t>(N));
+            const float max_abs = maxAbsError(split, direct, static_cast<size_t>(N));
+
+            LOG_INFO("[NativeVNNI_GEMV] " << fmt.name
+                                           << " KB=8 vs KB=1 cosine=" << cosine
+                                           << " rel_l2=" << rel_l2
+                                           << " max_abs=" << max_abs);
+
+            EXPECT_GT(cosine, 0.99999f) << fmt.name << ": split-K changed decode direction";
+            EXPECT_LT(rel_l2, 5e-4f) << fmt.name << ": split-K relative error too large";
+            EXPECT_LT(max_abs, 5e-2f) << fmt.name << ": split-K max absolute error too large";
+
+            cleanupWorkspace(kernel);
         }
     }
 

@@ -26,6 +26,7 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - [MPI Development Best Practices](#mpi-development-best-practices)
 - [Performance Optimization](#performance-optimization)
 - [Code Quality Guidelines](#code-quality-guidelines)
+- [Code Documentation Standards](#code-documentation-standards)
 - [Environment Variables Reference](#environment-variables-reference)
 - [Documentation and Project Resources](#documentation-and-project-resources)
 
@@ -1913,6 +1914,298 @@ std::cout << "║" << std::setw(10) << "Name" << " ║"
 
 ---
 
+## Code Documentation Standards
+
+### Mandatory Documentation Policy
+
+**Every source file** (`.h` and `.cpp`) MUST have documentation sufficient for a junior developer to understand the file's purpose, the role of each public/protected method, and the reasoning behind non-obvious implementation decisions. Undocumented code is considered incomplete — treat missing documentation with the same severity as missing tests.
+
+This section is the single source of truth for all code documentation requirements. It supersedes any informal conventions observed elsewhere in the codebase.
+
+### File-Level Doxygen Headers
+
+Every `.h` and `.cpp` file MUST begin with a Doxygen file header immediately after the include guard (headers) or includes (implementation files):
+
+**Header file (`.h`) pattern:**
+
+```cpp
+#pragma once
+
+/**
+ * @file ExpertWeightCache.h
+ * @brief LRU cache for expert weight tensors with async prefetch support.
+ *
+ * Manages GPU-resident expert weights for MoE layers. Implements a tiered
+ * eviction policy: pinned experts (always resident) are never evicted;
+ * cached experts use LRU ordering based on routing frequency histograms.
+ *
+ * Thread-safety: All public methods are thread-safe. Internal state is
+ * protected by a shared mutex (read-heavy workload optimized).
+ *
+ * Lifecycle: Owned by MoEExpertOverlayExecutionPlan. Created once during
+ * graph construction, persists for the lifetime of the inference session.
+ */
+```
+
+**Implementation file (`.cpp`) pattern:**
+
+```cpp
+#include "ExpertWeightCache.h"
+
+/**
+ * @file ExpertWeightCache.cpp
+ * @brief Implementation of LRU expert weight caching with eviction and prefetch.
+ *
+ * Key algorithms:
+ * - Eviction: Histogram-weighted LRU. Experts with recent high routing
+ *   frequency get a "sticky" bonus that delays eviction by up to 2 positions.
+ * - Prefetch: Double-buffered async H2D transfers, triggered when the router
+ *   predicts an expert will be needed in the next decode step.
+ */
+```
+
+**Required `@file` header fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `@file` | Yes | Exact filename (must match) |
+| `@brief` | Yes | One-line summary of the file's purpose |
+| Description paragraph | Yes | 2-5 sentences explaining what this file does, key design decisions, and how it fits into the larger system |
+| Thread-safety note | If applicable | State whether the class/functions are thread-safe and what synchronization is used |
+| Lifecycle/ownership | If applicable | Who creates and owns instances; when they are destroyed |
+
+### Method/Function Doxygen Headers
+
+**All public and protected methods** in header files MUST have Doxygen comments. Private methods SHOULD have them if the logic is non-trivial.
+
+**Required for public/protected methods:**
+
+```cpp
+/**
+ * @brief Evict the least-recently-used expert from GPU memory.
+ *
+ * Selects the eviction victim using histogram-weighted LRU scoring.
+ * Pinned experts (residency policy = StaticById) are never evicted.
+ * If no evictable expert exists, returns false without modifying state.
+ *
+ * @param layer_idx  Layer index (0-based) to scope the eviction to.
+ * @param force      If true, ignore the sticky bonus and evict purely by LRU order.
+ * @return true if an expert was evicted, false if cache is empty or all experts are pinned.
+ *
+ * @pre  The caller holds no locks on this object (method acquires internal mutex).
+ * @post On success, one cache slot is freed and available for insertExpert().
+ *
+ * @note This is called automatically by insertExpert() when the cache is full.
+ *       Direct calls are only needed for explicit memory pressure relief.
+ */
+bool evictLRU(int layer_idx, bool force = false);
+```
+
+**Minimum required fields for method documentation:**
+
+| Field | When Required | Description |
+|-------|---------------|-------------|
+| `@brief` | Always | One-line summary of what the method does |
+| Description | If behavior is non-obvious | Explain algorithm, edge cases, or side effects |
+| `@param` | If method has parameters | One line per parameter explaining its role and valid values |
+| `@return` | If non-void | What the return value represents and its possible values |
+| `@pre` / `@post` | If there are preconditions or postconditions | State invariants the caller must establish or can rely on |
+| `@note` / `@warning` | If there are gotchas | Performance implications, threading caveats, or non-obvious behavior |
+| `@throws` | If method can throw | What exceptions and under what conditions |
+
+**Acceptable shorthand** for simple getters/setters:
+
+```cpp
+/// @brief Returns the number of currently cached experts for the given layer.
+size_t cachedCount(int layer_idx) const;
+
+/// @brief Sets the maximum cache capacity in bytes. Takes effect on next eviction cycle.
+void setMaxCapacity(size_t bytes);
+```
+
+### Inline Code Comments
+
+**Standard**: A junior developer with general C++ knowledge (but no project-specific context) should be able to follow the logic of any function by reading only the source file and its inline comments.
+
+**Requirements:**
+
+1. **Explain the "why", not the "what"**: Don't restate the code. Explain intent, reasoning, and non-obvious decisions.
+
+2. **Comment every logical block**: A "block" is a group of 3-10 lines that accomplishes a single logical step. Precede each block with a comment explaining its purpose.
+
+3. **Comment non-obvious constants and thresholds**: Magic numbers, empirical constants, and tuning parameters MUST have a comment explaining their origin.
+
+4. **Comment algorithm steps**: For non-trivial algorithms (>15 lines), number the steps or use section markers.
+
+5. **Comment lock acquisition and release**: Any mutex/lock operation must explain what it protects and why the scope was chosen.
+
+**Correct Pattern:**
+
+```cpp
+void MoEExpertOverlayPreparationPlan::buildResidencyMap(const RoutingHistogram& hist)
+{
+    // Phase 1: Identify pinned experts — experts that appear in >80% of recent
+    // decode steps are permanently resident to avoid thrashing.
+    std::vector<int> pinned;
+    for (int eid = 0; eid < num_experts_; ++eid)
+    {
+        float freq = hist.frequency(eid);
+        // Threshold 0.8 determined empirically (see benchmark_results/expert_pin_sweep.csv).
+        // Below this, eviction cost is amortized over enough steps to not matter.
+        if (freq > 0.8f)
+            pinned.push_back(eid);
+    }
+
+    // Phase 2: Rank remaining experts by routing frequency for LRU tiebreaking.
+    // We sort descending so that high-frequency experts get priority in the cache
+    // even when they fall below the pinning threshold.
+    std::vector<std::pair<float, int>> ranked;
+    ranked.reserve(num_experts_ - pinned.size());
+    for (int eid = 0; eid < num_experts_; ++eid)
+    {
+        if (std::find(pinned.begin(), pinned.end(), eid) != pinned.end())
+            continue;
+        ranked.emplace_back(hist.frequency(eid), eid);
+    }
+    std::sort(ranked.begin(), ranked.end(), std::greater<>{});
+
+    // Phase 3: Assign cache tiers based on available GPU memory budget.
+    // Tier 0 = always resident (pinned), Tier 1 = cached (evictable), Tier 2 = host-only.
+    assignTiers(pinned, ranked);
+}
+```
+
+**Anti-Pattern (WRONG):**
+
+```cpp
+// ❌ BAD — No comments, junior developer cannot follow the logic
+void MoEExpertOverlayPreparationPlan::buildResidencyMap(const RoutingHistogram& hist)
+{
+    std::vector<int> pinned;
+    for (int eid = 0; eid < num_experts_; ++eid)
+    {
+        float freq = hist.frequency(eid);
+        if (freq > 0.8f)
+            pinned.push_back(eid);
+    }
+
+    std::vector<std::pair<float, int>> ranked;
+    ranked.reserve(num_experts_ - pinned.size());
+    for (int eid = 0; eid < num_experts_; ++eid)
+    {
+        if (std::find(pinned.begin(), pinned.end(), eid) != pinned.end())
+            continue;
+        ranked.emplace_back(hist.frequency(eid), eid);
+    }
+    std::sort(ranked.begin(), ranked.end(), std::greater<>{});
+    assignTiers(pinned, ranked);
+}
+```
+
+```cpp
+// ❌ BAD — Restates the code instead of explaining intent
+for (int eid = 0; eid < num_experts_; ++eid)  // Loop over experts
+{
+    float freq = hist.frequency(eid);          // Get frequency
+    if (freq > 0.8f)                           // If frequency > 0.8
+        pinned.push_back(eid);                 // Add to pinned
+}
+```
+
+### Anonymous Namespace and Helper Function Documentation
+
+Helper functions in anonymous namespaces and file-static functions MUST have at least a `@brief` comment:
+
+```cpp
+namespace
+{
+    /// @brief Converts residency policy enum to a human-readable string for diagnostics.
+    const char* residencyPolicyName(ExpertResidencyPolicy policy) { ... }
+
+    /// @brief Returns the deterministic participant ranks for a given domain kind,
+    ///        falling back to all-ranks if the domain does not specify explicit participants.
+    std::vector<int> deterministicParticipantRanks(const ExpertDomain& domain) { ... }
+
+    /**
+     * @brief Validates the execution plan and returns a formatted error string.
+     *
+     * Checks: (1) no duplicate expert assignments, (2) all layers covered,
+     * (3) participant ranks exist in the MPI communicator.
+     */
+    std::string formatExecutionPlanErrors(const ExecutionPlan& plan) { ... }
+}
+```
+
+### Template and CRTP Documentation
+
+Template classes and CRTP patterns MUST document template parameters and expected interfaces:
+
+```cpp
+/**
+ * @brief CRTP base providing typed, zero-overhead access to tensor storage.
+ *
+ * @tparam Derived  The concrete tensor class (e.g., Q8_1Tensor, FP32Tensor).
+ *                  Must define a `storage_` member of type compatible with DataType*.
+ * @tparam DataType The native storage element type (e.g., Q8_1Block, float, uint16_t).
+ */
+template <typename Derived, typename DataType>
+class TypedTensorBase { ... };
+```
+
+### Struct and Enum Documentation
+
+All public structs and enums MUST have a `@brief` and per-member documentation:
+
+```cpp
+/**
+ * @brief Describes the execution plan for a single MoE layer's expert dispatch.
+ */
+struct MoELayerPlan
+{
+    int layer_idx;                      ///< Zero-based transformer layer index.
+    std::vector<int> pinned_experts;    ///< Expert IDs permanently resident on this device.
+    std::vector<int> cached_experts;    ///< Expert IDs in the evictable LRU cache.
+    size_t cache_budget_bytes;          ///< Maximum GPU memory for cached (non-pinned) experts.
+};
+
+/**
+ * @brief Expert residency policies controlling placement and eviction behavior.
+ */
+enum class ExpertResidencyPolicy
+{
+    Disabled,                ///< No overlay — all experts loaded statically at init.
+    StaticById,              ///< Fixed set of experts pinned by ID (config-driven).
+    HistogramTieredCache,    ///< Dynamic caching based on routing frequency histograms.
+    ExplicitMasks,           ///< Per-layer bitmasks specifying resident experts.
+    RoutedTierRebalanced,    ///< Periodic rebalancing based on cumulative routing stats.
+};
+```
+
+### When Modifying Existing Files
+
+When modifying an existing file that lacks proper documentation:
+
+1. **Add the `@file` header** if missing — this is mandatory for any PR touching the file.
+2. **Document the methods you modify or call** — if you change a function's behavior or add a call to an undocumented function, document it.
+3. **Add inline comments to the code you write or modify** — all new/changed code must meet the inline comment standard above.
+4. **Do NOT add documentation to code you didn't touch** in the same PR unless specifically tasked with a documentation pass. This prevents merge conflicts and keeps PRs focused.
+
+### Documentation Quality Checklist
+
+Before considering a file complete, verify:
+
+- [ ] `@file` + `@brief` header present at top of file
+- [ ] All public/protected methods have `@brief`, `@param`, `@return` as applicable
+- [ ] Non-trivial private methods have at least a `@brief`
+- [ ] Anonymous namespace helpers have at least `/// @brief` comments
+- [ ] Magic numbers and thresholds have explanatory comments
+- [ ] Each logical block (3-10 lines) within a function is preceded by a purpose comment
+- [ ] Lock/mutex operations explain what they protect
+- [ ] Template parameters document their constraints/expected interfaces
+- [ ] Enums and struct members have `///< ` trailing comments
+
+---
+
 ## Environment Variables Reference
 
 | Variable | Description | Default |
@@ -1995,6 +2288,8 @@ LLAMINAR_TRACE_TRANSFERS_MIN_BYTES=1000000 \
 ---
 
 ## Documentation and Project Resources
+
+> **Code documentation standards** (Doxygen headers, inline comments, method docs) are defined in [Code Documentation Standards](#code-documentation-standards). This section covers project-level documentation files and directory layout only.
 
 ### Key Documentation
 
