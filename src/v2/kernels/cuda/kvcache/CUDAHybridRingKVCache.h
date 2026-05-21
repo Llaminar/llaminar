@@ -257,7 +257,18 @@ namespace llaminar2
 
         void clear() override
         {
-            Base::clear();
+            // CUDARingKVCacheBase::clear() loops through virtual clear_layer().
+            // Hybrid clear_layer() accepts global model layer ids, while the
+            // parent cache stores only compressed FA layer indices. Clear those
+            // compressed entries directly to keep full-attention metadata from
+            // surviving a hybrid request reset.
+            for (int kv_idx = 0; kv_idx < layer_map_.kvLayerCount(); ++kv_idx)
+            {
+                for (int seq = 0; seq < this->batch_size_; ++seq)
+                {
+                    CUDARingKVCacheBase::clear_sequence(kv_idx, seq);
+                }
+            }
             for (auto &state : gdn_states_)
             {
                 state.reset();
@@ -279,13 +290,19 @@ namespace llaminar2
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx >= 0)
             {
-                CUDARingKVCacheBase::clear_layer(kv_idx);
+                for (int seq = 0; seq < this->batch_size_; ++seq)
+                {
+                    CUDARingKVCacheBase::clear_sequence(kv_idx, seq);
+                }
             }
             else
             {
                 int gdn_idx = layer_map_.toGDNIndex(layer);
                 if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
+                {
                     gdn_states_[gdn_idx].reset();
+                    gdn_states_[gdn_idx].resetGPUKernelState();
+                }
             }
         }
 
@@ -454,9 +471,9 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[CUDAHybridRingKVCache] Created: " << total_layers_ << " total layers, "
-                                                         << layer_map_.kvLayerCount() << " KV (FA), "
-                                                         << n_gdn << " GDN. "
-                                                         << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
+                                                          << layer_map_.kvLayerCount() << " KV (FA), "
+                                                          << n_gdn << " GDN. "
+                                                          << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
         }
     };
 

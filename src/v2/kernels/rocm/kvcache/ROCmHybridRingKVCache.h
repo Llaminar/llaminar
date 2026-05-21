@@ -279,13 +279,19 @@ namespace llaminar2
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx >= 0)
             {
-                ROCmRingKVCacheBase::clear_layer(kv_idx);
+                for (int seq = 0; seq < this->batch_size_; ++seq)
+                {
+                    ROCmRingKVCacheBase::clear_sequence(kv_idx, seq);
+                }
             }
             else
             {
                 int gdn_idx = layer_map_.toGDNIndex(layer);
                 if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
+                {
                     gdn_states_[gdn_idx].reset();
+                    gdn_states_[gdn_idx].resetGPUKernelState();
+                }
             }
         }
 
@@ -454,9 +460,9 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[ROCmHybridRingKVCache] Created: " << total_layers_ << " total layers, "
-                                                         << layer_map_.kvLayerCount() << " KV (FA), "
-                                                         << n_gdn << " GDN. "
-                                                         << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
+                                                          << layer_map_.kvLayerCount() << " KV (FA), "
+                                                          << n_gdn << " GDN. "
+                                                          << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
         }
     };
 

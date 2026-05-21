@@ -221,7 +221,10 @@ namespace llaminar2
                 // Reset GDN state for this layer
                 int gdn_idx = layer_map_.toGDNIndex(layer);
                 if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
+                {
                     gdn_states_[gdn_idx].reset();
+                    gdn_states_[gdn_idx].resetGPUKernelState();
+                }
             }
         }
 
@@ -427,9 +430,9 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[CPUHybridRingKVCache] Created: " << total_layers_ << " total layers, "
-                                                        << layer_map_.kvLayerCount() << " KV (FA), "
-                                                        << n_gdn << " GDN. "
-                                                        << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
+                                                         << layer_map_.kvLayerCount() << " KV (FA), "
+                                                         << n_gdn << " GDN. "
+                                                         << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
         }
     };
 

@@ -1412,7 +1412,19 @@ namespace llaminar2
                      << hipGetErrorString(sync_err));
         }
 
-        ROCmRingKVCacheBase::clear();
+        // Do not call ROCmRingKVCacheBase::clear() here: it loops through
+        // clear_layer(), which is virtual. ROCmHybridRingKVCache overrides
+        // clear_layer() to accept global model layer ids, so dispatching there
+        // with compressed FA indices would skip/reset the wrong entries. Clear
+        // compressed entries directly while still using the base sequence helper
+        // for resetEntry()/onClearSequence() bookkeeping.
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                ROCmRingKVCacheBase::clear_sequence(layer, seq);
+            }
+        }
     }
 
     // =========================================================================

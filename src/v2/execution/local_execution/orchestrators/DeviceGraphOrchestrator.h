@@ -45,7 +45,6 @@
 #include "../engine/ForwardExecutionEngine.h"          // Forward execution engine (extracted Phase 3)
 #include "../../../loaders/IWeightStreamer.h"          // For weight streaming (Option B)
 #include "../../../interfaces/IModelContext.h"         // For interface-based construction
-#include "../../../kernels/IHybridKVCache.h"           // For hybrid cache request-boundary reset detection
 #include "../../../memory/BufferArena.h"               // Phase 2: unified buffer management
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
@@ -1634,11 +1633,9 @@ namespace llaminar2
         /**
          * @brief Clear KV cache (IInferenceRunner override)
          *
-         * Resets inference state (KV cache, positions, model recurrence).
-         * Non-hybrid caches keep their forward graph cache and only drop session
-         * replay captures. ROCm hybrid caches own request-shaped GDN state and
-         * cache-side kernel instances, so a request-boundary clear recreates
-         * those caches and evicts cached stages that held their pointers.
+         * Resets inference state (KV cache, positions, model recurrence) while
+         * preserving cached ComputeGraphs. Captured replay state is dropped so
+         * the next request re-warms/re-captures against freshly reset state.
          */
         void clear_cache() override
         {
@@ -1647,57 +1644,22 @@ namespace llaminar2
                 if (ctx && dev.is_gpu())
                     ctx->synchronize();
             }
-            const bool recreate_rocm_hybrid_cache =
-                state_.device_id.is_rocm() && state_.kv_cache &&
-                dynamic_cast<IHybridKVCache *>(state_.kv_cache.get()) != nullptr;
-
             // Invalidate layer graph caches (lightweight, just validity flags)
             for (auto &entry : layer_graph_cache_)
             {
-                if (recreate_rocm_hybrid_cache)
-                    entry.invalidate();
-                else
-                    entry.valid = false;
+                entry.valid = false;
             }
             if (forward_engine_)
             {
-                if (recreate_rocm_hybrid_cache)
-                {
-                    // ROCm hybrid stages keep pointers to cache-owned GDN kernel
-                    // instances. Recreating those kernels below requires cached
-                    // stages to be rebuilt as well.
-                    forward_engine_->clearCache();
-                }
-                else
-                {
-                    // Preserve cached ComputeGraphs, but drop captured graph
-                    // segments. HIP graph captures span many decode steps; a
-                    // new request needs a fresh replay lifecycle after cache
-                    // state is cleared below.
-                    forward_engine_->resetSessionReplayState();
-                }
+                // Preserve cached ComputeGraphs, but drop captured graph
+                // segments. HIP graph captures span many decode steps; a
+                // new request needs a fresh replay lifecycle after cache
+                // state is cleared below.
+                forward_engine_->resetSessionReplayState();
             }
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();
-            if (recreate_rocm_hybrid_cache)
-            {
-                if (!graph_builder_ || !mpi_ctx_ || state_.batch_size <= 0 || state_.max_seq_len <= 0)
-                {
-                    throw std::runtime_error("[DeviceGraphOrchestrator] Cannot recreate ROCm hybrid KV cache: orchestrator state is incomplete");
-                }
-
-                const int n_layers = pp_stage_config_.has_value()
-                                         ? pp_stage_config_.value().layerCount()
-                                         : graph_builder_->config().n_layers;
-                state_.kv_cache.reset();
-                state_.pp_kv_caches.clear();
-                if (!initializeKVCaches(state_.batch_size, state_.max_seq_len,
-                                        n_layers, state_.device_id, mpi_ctx_))
-                {
-                    throw std::runtime_error("[DeviceGraphOrchestrator] Failed to recreate ROCm hybrid KV caches during clear_cache()");
-                }
-            }
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
             // are expensive and model-specific (e.g., GDN buffers for Qwen3.5).
             // The arena is created once in initializeBuffers() and persists for
