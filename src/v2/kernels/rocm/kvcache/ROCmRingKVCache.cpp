@@ -1305,6 +1305,116 @@ namespace llaminar2
     // clear(), clear_sequence(), clear_layer() are now provided by
     // ROCmRingKVCacheBase via entry accessor overrides (resetEntry, onClearSequence).
 
+    template <ActivationPrecision Precision>
+    void ROCmRingKVCache<Precision>::clear()
+    {
+        // Reset every request-shaped sidecar owned by the persistent cache
+        // object. Reconstructing the cache naturally drops these buffers; clear()
+        // must preserve the same invariant without invalidating the main pool
+        // pointers that cached ComputeGraphs depend on.
+        HipDeviceGuard::setDevice(device_id_);
+        hipStream_t clear_stream = static_cast<hipStream_t>(
+            GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
+
+        // Conversion scratch is sized by the previous append/read path and can
+        // carry stale lanes if a later request converts fewer tokens. Drop it so
+        // the next conversion starts from fresh allocation just like a new cache.
+        freeConvScratch();
+
+        // Dynamic head params are used by both captured and non-captured append
+        // paths. Keep the allocations stable, but reset host and device values
+        // to match empty ring entries before the next request's first append.
+        const int num_entries = n_layers_ * batch_size_;
+        if (h_head_params_ && num_entries > 0)
+        {
+            std::memset(h_head_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
+        }
+        if (d_head_params_ && num_entries > 0)
+        {
+            hipError_t head_err = hipMemsetAsync(d_head_params_, 0,
+                                                 static_cast<size_t>(num_entries) * sizeof(int),
+                                                 clear_stream);
+            if (head_err != hipSuccess)
+            {
+                LOG_WARN("[ROCmRingKVCache::clear] head params memset failed: "
+                         << hipGetErrorString(head_err));
+            }
+        }
+
+        // RoPE-on-read shadows and tensor views are cheap metadata wrappers
+        // around request contents. Free/reset them so no view can expose stale
+        // rows after a shorter prompt follows a longer one.
+        for (auto &layer_shadows : rope_shadows_)
+        {
+            for (auto &shadow : layer_shadows)
+            {
+                if (shadow.d_K)
+                {
+                    hipFree(shadow.d_K);
+                    shadow.d_K = nullptr;
+                }
+                if (shadow.d_V)
+                {
+                    hipFree(shadow.d_V);
+                    shadow.d_V = nullptr;
+                }
+                shadow.converted_count = 0;
+                shadow.last_head = -1;
+                shadow.rope_applied = false;
+                shadow.k_view.reset();
+                shadow.v_view.reset();
+            }
+        }
+        rope_shadows_.clear();
+        for (auto &layer_views : tensor_views_)
+        {
+            for (auto &views : layer_views)
+            {
+                views[0].reset();
+                views[1].reset();
+            }
+        }
+
+        if (pool_base_ && pool_size_ > 0)
+        {
+            hipError_t err = hipMemsetAsync(pool_base_, 0, pool_size_, clear_stream);
+            if (err != hipSuccess)
+            {
+                LOG_WARN("[ROCmRingKVCache::clear] pooled KV memset failed: "
+                         << hipGetErrorString(err));
+            }
+        }
+        else
+        {
+            const size_t buffer_size = static_cast<size_t>(max_seq_len_) *
+                                       static_cast<size_t>(kv_storage_dim_) *
+                                       sizeof(DataT);
+            for (auto &layer_entries : entries_)
+            {
+                for (auto &entry : layer_entries)
+                {
+                    if (entry.d_K)
+                        hipMemsetAsync(entry.d_K, 0, buffer_size, clear_stream);
+                    if (entry.d_V)
+                        hipMemsetAsync(entry.d_V, 0, buffer_size, clear_stream);
+                    if (entry.d_K_scratch)
+                        hipMemsetAsync(entry.d_K_scratch, 0, buffer_size, clear_stream);
+                    if (entry.d_V_scratch)
+                        hipMemsetAsync(entry.d_V_scratch, 0, buffer_size, clear_stream);
+                }
+            }
+        }
+
+        hipError_t sync_err = hipStreamSynchronize(clear_stream);
+        if (sync_err != hipSuccess)
+        {
+            LOG_WARN("[ROCmRingKVCache::clear] KV buffer clear sync failed: "
+                     << hipGetErrorString(sync_err));
+        }
+
+        ROCmRingKVCacheBase::clear();
+    }
+
     // =========================================================================
     // get_k() / get_v() implementations
     // =========================================================================

@@ -80,11 +80,17 @@ namespace llaminar2
 
         void resetState()
         {
+            rocmGDN_gpu_set_device(device_ordinal_);
             if (gpu_state_ && state_size_ > 0)
             {
-                rocmGDN_gpu_set_device(device_ordinal_);
                 void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
                 rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
+                rocmGDN_stream_synchronize(stream);
+            }
+            if (scratch_)
+            {
+                void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
+                rocmGDN_gpu_memset_zero_async(scratch_, scratch_size_, stream);
                 rocmGDN_stream_synchronize(stream);
             }
         }

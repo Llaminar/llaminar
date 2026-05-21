@@ -107,6 +107,12 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
     DECODE_TOKENS=$(jq -r ".models[$mi].decode_tokens" "$BASELINE_FILE")
     DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
 
+    # Optional per-model environment variables (e.g. LLAMINAR_MOE_REBALANCE=off)
+    ENV_PREFIX=""
+    if jq -e ".models[$mi].env" "$BASELINE_FILE" > /dev/null 2>&1; then
+        ENV_PREFIX=$(jq -r ".models[$mi].env | to_entries[] | \"\(.key)=\(.value)\"" "$BASELINE_FILE" | tr '\n' ' ')
+    fi
+
     MODEL_PATH="$ROOT_DIR/$MODEL"
     if [[ ! -f "$MODEL_PATH" ]]; then
         echo -e "${RED}✗ FAILED: ${MODEL_NAME}: model not found (${MODEL})${NC}" >&2
@@ -124,7 +130,7 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
         echo -ne "  Benchmarking ${BOLD}${DEVICE}${NC} ... "
 
         set +e
-        BENCH_OUTPUT=$("$RELEASE_BIN" benchmark -d "$DEVICE" -m "$MODEL_PATH" -n "$DECODE_TOKENS" 2>&1)
+        BENCH_OUTPUT=$(env $ENV_PREFIX "$RELEASE_BIN" benchmark -d "$DEVICE" -m "$MODEL_PATH" -n "$DECODE_TOKENS" 2>&1)
         BENCH_EXIT=$?
         set -e
 

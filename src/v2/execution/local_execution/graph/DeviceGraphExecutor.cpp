@@ -8,6 +8,7 @@
 #include "DeviceGraphExecutor.h"
 #include "StageVerifier.h"
 #include "DeviceGraphCaptureController.h"
+#include "GraphCaptureGuard.h"
 #include "../../debug/StageDumper.h"
 #include "../../debug/AsyncStageDumper.h"
 #include "../coherence/StageCoherence.h"
@@ -485,7 +486,7 @@ namespace llaminar2
         // GPU Stage Timing: event-based per-stage profiling
         // Gated by policy AND env var. ~1μs CPU overhead per event record.
         // =====================================================================
-        const bool timeline_active = policy.timeline && debugEnv().gpu_stage_timing && ctx->isGPU();
+        const bool timeline_active = policy.timeline && debugEnv().gpu_stage_timing && ctx->isGPU() && !isGraphCaptureActive();
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
         void *timeline_stream = nullptr;
         if (timeline_active)
@@ -1002,8 +1003,7 @@ namespace llaminar2
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
 
-            const bool need_event = node.is_final_output
-                                    || (policy.snapshot_callback && config_.snapshot_callback)
+            const bool need_event = node.is_final_output || (policy.snapshot_callback && config_.snapshot_callback)
 #if LLAMINAR_ASSERTIONS_ACTIVE
                                     || debugEnv().validation.validate_buffers
 #endif

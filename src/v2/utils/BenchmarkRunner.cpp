@@ -177,10 +177,15 @@ namespace llaminar2
 
                 if (next_token < 0)
                 {
-                    // Fallback: CPU-side greedy sampling
-                    const float *logits = runner_->logits();
-                    size_t vocab_size = tokenizer_->vocab_size();
-                    next_token = sampler.sample_greedy(logits, vocab_size);
+                    // GPU argmax failed. If we skipped logits gather (which we do
+                    // in benchmark mode), the CPU fallback would read stale/null data.
+                    // Treat this as a hard decode error — a failure is not a success.
+                    LOG_ERROR("GPU-side argmax failed at decode step " << i
+                                                                       << ". Cannot fall back to CPU sampling because logits "
+                                                                       << "gather was skipped (setSkipLogitsGatherDecode=true).");
+                    auto end = std::chrono::high_resolution_clock::now();
+                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    return {false, time_ms, tokens_generated, generated_text};
                 }
 
                 if (profile_sampler)

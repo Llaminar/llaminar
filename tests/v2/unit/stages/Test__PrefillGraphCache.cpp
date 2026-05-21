@@ -4,6 +4,8 @@
  */
 
 #include <gtest/gtest.h>
+#include "backends/IGPUGraphCapture.h"
+#include "backends/IWorkerGPUContext.h"
 #include "execution/local_execution/engine/PrefillGraphCache.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "backends/DeviceId.h"
@@ -38,6 +40,102 @@ public:
         : MockComputeStage(ComputeStageType::GEMM, std::move(name), dev) {}
 
     bool isGraphCapturable() const override { return false; }
+};
+
+/**
+ * @brief Minimal graph capture object for PrefillGraphCache state-machine tests.
+ *
+ * The cache tests only need to verify lifecycle dispatch and phase transitions,
+ * so this fake returns success without touching GPU APIs.
+ */
+class FakePrefillGraphCapture final : public IGPUGraphCapture
+{
+public:
+    bool beginCapture() override { return true; }
+    bool endCapture() override { return true; }
+    bool instantiate() override
+    {
+        executable_ = true;
+        return true;
+    }
+    bool launch() override { return executable_; }
+    GraphUpdateResult tryUpdate() override { return GraphUpdateResult::Success; }
+    bool hasExecutable() const override { return executable_; }
+    size_t nodeCount() const override { return 1; }
+    void reset() override { executable_ = false; }
+    const char *backendName() const override { return "Fake"; }
+
+private:
+    bool executable_ = false;
+};
+
+/**
+ * @brief Mock worker GPU context that records graph-capture stream selection.
+ *
+ * This context keeps stream handles as stable in-process addresses and never
+ * calls GPU runtime APIs, which lets the prefill graph cache tests verify the
+ * explicit-stream overload deterministically.
+ */
+class PrefillMockGPUContext final : public IWorkerGPUContext
+{
+public:
+    int deviceOrdinal() const override { return 0; }
+    std::string deviceName() const override { return "PrefillMock"; }
+    bool isInitialized() const override { return true; }
+
+    void submitAndWait(std::function<void()> work) override { work(); }
+    std::future<void> submitAsync(std::function<void()> work) override
+    {
+        work();
+        std::promise<void> done;
+        done.set_value();
+        return done.get_future();
+    }
+
+    void *defaultStream() override { return &default_stream_; }
+    void *createStream() override { return &created_stream_; }
+    void destroyStream(void *stream) override
+    {
+        destroyed_stream_ = stream;
+        destroy_stream_calls_++;
+    }
+
+    void *createEvent() override { return nullptr; }
+    void destroyEvent(void *) override {}
+    void recordEvent(void *, void *) override {}
+    void waitEvent(void *, void *) override {}
+    void synchronizeEvent(void *) override {}
+    float eventElapsedTime(void *, void *) override { return 0.0f; }
+    void *blasHandle() override { return nullptr; }
+    void *blasLtHandle() override { return nullptr; }
+    void setCollectiveComm(void *) override {}
+    void *collectiveComm() const override { return nullptr; }
+    void synchronize() override {}
+    void synchronizeStream(void *) override {}
+    void insertStreamDependency(void *, void *) override {}
+
+    std::unique_ptr<IGPUGraphCapture> createGraphCapture() override
+    {
+        default_capture_calls_++;
+        return std::make_unique<FakePrefillGraphCapture>();
+    }
+
+    std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *stream) override
+    {
+        explicit_capture_calls_++;
+        last_capture_stream_ = stream;
+        return std::make_unique<FakePrefillGraphCapture>();
+    }
+
+    int default_capture_calls_ = 0;
+    int explicit_capture_calls_ = 0;
+    int destroy_stream_calls_ = 0;
+    void *last_capture_stream_ = nullptr;
+    void *destroyed_stream_ = nullptr;
+
+private:
+    int default_stream_ = 0;
+    int created_stream_ = 0;
 };
 
 // =============================================================================
@@ -315,6 +413,38 @@ TEST(Test__PrefillGraphCache, BeginCapture_FailsWithNullContext)
     EXPECT_FALSE(cache.beginCapture(key, nullptr, nullptr));
 }
 
+TEST(Test__PrefillGraphCache, BeginCapture_FailsWithNullExplicitStream)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+    PrefillMockGPUContext gpu_ctx;
+
+    auto key = makeGPUKey(512);
+    cache.markWarmedUp(key);
+
+    EXPECT_FALSE(cache.beginCapture(key, &gpu_ctx, nullptr));
+    EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(gpu_ctx.default_capture_calls_, 0);
+    EXPECT_EQ(gpu_ctx.explicit_capture_calls_, 0);
+}
+
+TEST(Test__PrefillGraphCache, BeginCapture_UsesExplicitStreamOverload)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+    PrefillMockGPUContext gpu_ctx;
+
+    auto key = makeGPUKey(512);
+    cache.markWarmedUp(key);
+    void *explicit_stream = gpu_ctx.createStream();
+
+    EXPECT_TRUE(cache.beginCapture(key, &gpu_ctx, explicit_stream));
+    EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Capturing);
+    EXPECT_EQ(gpu_ctx.default_capture_calls_, 0);
+    EXPECT_EQ(gpu_ctx.explicit_capture_calls_, 1);
+    EXPECT_EQ(gpu_ctx.last_capture_stream_, explicit_stream);
+}
+
 // =============================================================================
 // Test: Cache Key Distinctness
 // =============================================================================
@@ -446,7 +576,8 @@ TEST_F(PrefillGraphCacheGPUTest, FullLifecycle_ColdToReady)
     EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Warmup);
 
     // All GPU operations inside submitAndWait
-    gpu_ctx_->submitAndWait([&] {
+    gpu_ctx_->submitAndWait([&]
+                            {
         void *stream = gpu_ctx_->defaultStream();
 
         // Begin capture (empty capture is valid — validates state machine)
@@ -464,8 +595,7 @@ TEST_F(PrefillGraphCacheGPUTest, FullLifecycle_ColdToReady)
 
         // Launch again
         ASSERT_TRUE(cache.launch(key));
-        EXPECT_EQ(cache.replayCount(key), 2);
-    });
+        EXPECT_EQ(cache.replayCount(key), 2); });
 }
 
 TEST_F(PrefillGraphCacheGPUTest, InvalidateAll_ResetsReadyEntries)
@@ -476,12 +606,12 @@ TEST_F(PrefillGraphCacheGPUTest, InvalidateAll_ResetsReadyEntries)
     auto key = makeGPUKey(512);
     cache.markWarmedUp(key);
 
-    gpu_ctx_->submitAndWait([&] {
+    gpu_ctx_->submitAndWait([&]
+                            {
         void *stream = gpu_ctx_->defaultStream();
         ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
         ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
-        EXPECT_TRUE(cache.hasGraph(key));
-    });
+        EXPECT_TRUE(cache.hasGraph(key)); });
 
     cache.invalidateAll();
     EXPECT_EQ(cache.phase(key), PrefillGraphPhase::Cold);
@@ -497,7 +627,8 @@ TEST_F(PrefillGraphCacheGPUTest, ReplayCount_IncrementedOnLaunch)
     auto key = makeGPUKey(512);
     cache.markWarmedUp(key);
 
-    gpu_ctx_->submitAndWait([&] {
+    gpu_ctx_->submitAndWait([&]
+                            {
         void *stream = gpu_ctx_->defaultStream();
         ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
         ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
@@ -505,8 +636,7 @@ TEST_F(PrefillGraphCacheGPUTest, ReplayCount_IncrementedOnLaunch)
         ASSERT_TRUE(cache.launch(key));
         ASSERT_TRUE(cache.launch(key));
         ASSERT_TRUE(cache.launch(key));
-        EXPECT_EQ(cache.replayCount(key), 3);
-    });
+        EXPECT_EQ(cache.replayCount(key), 3); });
 }
 
 TEST_F(PrefillGraphCacheGPUTest, NodeCount_ZeroForEmptyCapture)
@@ -517,13 +647,13 @@ TEST_F(PrefillGraphCacheGPUTest, NodeCount_ZeroForEmptyCapture)
     auto key = makeGPUKey(512);
     cache.markWarmedUp(key);
 
-    gpu_ctx_->submitAndWait([&] {
+    gpu_ctx_->submitAndWait([&]
+                            {
         void *stream = gpu_ctx_->defaultStream();
         ASSERT_TRUE(cache.beginCapture(key, gpu_ctx_, stream));
         ASSERT_TRUE(cache.endCaptureAndInstantiate(key));
         // Empty capture has 0 nodes
-        EXPECT_EQ(cache.nodeCount(key), 0u);
-    });
+        EXPECT_EQ(cache.nodeCount(key), 0u); });
 }
 
 #endif // HAVE_ROCM || HAVE_CUDA

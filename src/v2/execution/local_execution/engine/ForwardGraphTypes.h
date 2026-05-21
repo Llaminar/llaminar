@@ -13,7 +13,7 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../../compute_stages/IComputeStage.h"
-#include "../graph/IGraphBuilder.h"             // For ForwardOutput
+#include "../graph/IGraphBuilder.h" // For ForwardOutput
 #include "PrefillGraphCache.h"
 
 #include <memory>
@@ -121,6 +121,73 @@ namespace llaminar2
     };
 
     /**
+     * @brief RAII owner for an explicit GPU stream used by cached graph capture.
+     *
+     * The stream is created through the same worker GPU context that owns the
+     * graph-capture backend. It is move-only so ForwardGraphCache entries remain
+     * movable inside unordered_map storage without leaking backend stream handles.
+     */
+    struct CachedGraphStream
+    {
+        void *stream = nullptr;           ///< Backend stream handle (hipStream_t/cudaStream_t as void*)
+        IWorkerGPUContext *ctx = nullptr; ///< Context that created the stream (not owned)
+
+        CachedGraphStream() = default;
+        ~CachedGraphStream() { reset(); }
+
+        CachedGraphStream(const CachedGraphStream &) = delete;
+        CachedGraphStream &operator=(const CachedGraphStream &) = delete;
+
+        CachedGraphStream(CachedGraphStream &&other) noexcept
+            : stream(other.stream), ctx(other.ctx)
+        {
+            other.stream = nullptr;
+            other.ctx = nullptr;
+        }
+
+        CachedGraphStream &operator=(CachedGraphStream &&other) noexcept
+        {
+            if (this != &other)
+            {
+                reset();
+                stream = other.stream;
+                ctx = other.ctx;
+                other.stream = nullptr;
+                other.ctx = nullptr;
+            }
+            return *this;
+        }
+
+        /// @brief Ensure a stream exists for the provided GPU context.
+        bool ensure(IWorkerGPUContext *new_ctx)
+        {
+            if (!new_ctx)
+                return false;
+            if (stream && ctx == new_ctx)
+                return true;
+
+            reset();
+            stream = new_ctx->createStream();
+            if (!stream)
+            {
+                ctx = nullptr;
+                return false;
+            }
+            ctx = new_ctx;
+            return true;
+        }
+
+        /// @brief Destroy the owned stream, if any.
+        void reset()
+        {
+            if (stream && ctx)
+                ctx->destroyStream(stream);
+            stream = nullptr;
+            ctx = nullptr;
+        }
+    };
+
+    /**
      * @brief Cached full forward graph for decode mode
      *
      * During decode (seq_len=1), the graph structure is identical between
@@ -134,7 +201,7 @@ namespace llaminar2
     struct ForwardGraphCache
     {
         std::unique_ptr<ComputeGraph> graph; ///< Cached compute graph
-        ForwardOutput output;           ///< Cached output (logits pointer)
+        ForwardOutput output;                ///< Cached output (logits pointer)
         bool valid = false;                  ///< Whether cache is usable
 
         // Stable buffers — stages point to these, contents updated each step
@@ -199,25 +266,54 @@ namespace llaminar2
         /// Prefill graph capture/replay cache (keyed by seq_len)
         std::unique_ptr<PrefillGraphCache> prefill_graph_cache;
 
+        /// Explicit stream for prefill warmup/capture/replay.
+        CachedGraphStream prefill_capture_stream;
+
         /// Number of consecutive graph update failures (fallback heuristic)
         int gpu_graph_update_failures = 0;
 
         /// Maximum consecutive update failures before disabling graph capture
         static constexpr int kMaxGraphUpdateFailures = 4;
 
-        void invalidate()
+        /**
+         * @brief Reset GPU graph replay/capture state while keeping the cached ComputeGraph.
+         *
+         * Session clears reset KV/GDN/conv recurrence but intentionally preserve graph
+         * objects so host-resident weights do not need to be reloaded. Captured GPU
+         * decode graphs are more stateful: they encode a specific replay lifecycle
+         * over the previous request. Dropping segment captures forces the next
+         * decode to warm up/capture again against the freshly cleared model state.
+         * Prefill graph entries are preserved because their explicit stream and
+         * arena pointers remain owned by this cache, and replay callbacks restore
+         * host-side metadata after each launch.
+         *
+         * The capture stream itself is retained because cached stages store that
+         * stream pointer internally. Destroying it here would leave dynamic-param
+         * updates (for example token-id preloads) with a dangling HIP stream before
+         * the next warmup has a chance to rebind every stage.
+         */
+        void resetReplayState()
         {
             if (gpu_graph)
             {
                 gpu_graph->reset();
                 gpu_graph.reset();
             }
-            segment_cache.reset();
-            gpu_stream = nullptr;
-            gpu_ctx = nullptr;
+            segment_cache.segments.clear();
+            segment_cache.initialized = false;
+            segment_cache.needs_capture = false;
+            segment_cache.consecutive_failures = 0;
+            segment_cache.decode_step = 0;
             gpu_graph_update_failures = 0;
+            phase3_active = false;
+        }
+
+        void invalidate()
+        {
+            resetReplayState();
             if (prefill_graph_cache)
                 prefill_graph_cache->invalidateAll();
+            prefill_capture_stream.reset();
             graph.reset();
             valid = false;
             token_ids.clear();

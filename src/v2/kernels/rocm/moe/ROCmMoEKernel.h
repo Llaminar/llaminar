@@ -52,6 +52,16 @@ namespace llaminar2
         explicit ROCmMoEKernel(int device_ordinal);
         ~ROCmMoEKernel() override;
 
+        /**
+         * @brief Reset request-shaped host metadata while preserving device buffers.
+         *
+         * Session resets clear histogram counts and CPU-side grouping metadata.
+         * Device scratch, runtime pointer arrays, descriptor tables, and router
+         * weight conversion caches stay resident because captured prefill graphs
+         * can reference those stable device addresses across requests.
+         */
+        void resetDynamicState() override;
+
         // =================================================================
         // IMoEKernel interface
         // =================================================================

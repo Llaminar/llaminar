@@ -549,6 +549,37 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ResponseFormat_OpenAICompatibl
     EXPECT_EQ(body["usage"]["total_tokens"], 6);
 }
 
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ReplacesInvalidUtf8InGeneratedContent)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return(std::string(1, static_cast<char>(0xA2))));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "emit invalid byte")};
+    request.max_tokens = 4;
+
+    auto response = handler->handleRequest(request);
+
+    EXPECT_TRUE(response.ok);
+    EXPECT_EQ(response.http_status, 200);
+
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["choices"][0]["message"]["content"].get<std::string>(),
+              std::string("\xEF\xBF\xBD"));
+}
+
 // =============================================================================
 // Error handling tests
 // =============================================================================
@@ -1915,6 +1946,45 @@ TEST_F(Test__ChatCompletionHandler, Streaming_TokenByToken_ContentInDelta)
     // Third chunk: " world"
     auto c2 = json::parse(chunks[2].substr(6, chunks[2].find("\n\n") - 6));
     EXPECT_EQ(c2["choices"][0]["delta"]["content"], " world");
+}
+
+TEST_F(Test__ChatCompletionHandler, Streaming_ReplacesInvalidUtf8InContentDelta)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return(std::string(1, static_cast<char>(0xAA))));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "stream invalid byte")};
+    request.stream = true;
+    request.max_tokens = 4;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    ASSERT_GE(chunks.size(), 4u); // role, content, finish, [DONE]
+
+    auto content_chunk = json::parse(chunks[1].substr(6, chunks[1].find("\n\n") - 6));
+    EXPECT_EQ(content_chunk["choices"][0]["delta"]["content"].get<std::string>(),
+              std::string("\xEF\xBF\xBD"));
 }
 
 TEST_F(Test__ChatCompletionHandler, Streaming_FinalChunk_HasFinishReason)

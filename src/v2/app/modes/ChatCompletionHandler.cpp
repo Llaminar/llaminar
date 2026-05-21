@@ -23,6 +23,19 @@ namespace llaminar2
 {
     namespace
     {
+        std::string dumpJsonForHttp(const json &value)
+        {
+            // Model/tokenizer output can occasionally contain arbitrary byte
+            // fragments (for example an isolated byte-level BPE continuation
+            // byte). nlohmann::json's default dump() mode is strict UTF-8 and
+            // throws in that case, turning an otherwise successful generation
+            // into a 500. HTTP JSON responses must be valid UTF-8, so replace
+            // malformed byte sequences with U+FFFD at the serialization
+            // boundary instead of rejecting the whole response.
+            return value.dump(/*indent=*/-1, /*indent_char=*/' ', /*ensure_ascii=*/false,
+                              json::error_handler_t::replace);
+        }
+
         class RequestCacheCleanup
         {
         public:
@@ -195,7 +208,7 @@ namespace llaminar2
         response.ok = false;
         response.http_status = 500;
         json err = {{"error", {{"message", std::string("Request failed: ") + detail}, {"type", "server_error"}}}};
-        response.json_body = err.dump();
+        response.json_body = dumpJsonForHttp(err);
         return response;
     }
 
@@ -229,7 +242,7 @@ namespace llaminar2
             error_out.ok = false;
             error_out.http_status = 400;
             json err = {{"error", {{"message", std::string("Invalid JSON: ") + e.what()}, {"type", "invalid_request_error"}}}};
-            error_out.json_body = err.dump();
+            error_out.json_body = dumpJsonForHttp(err);
             return std::nullopt;
         }
 
@@ -239,7 +252,7 @@ namespace llaminar2
             error_out.ok = false;
             error_out.http_status = 400;
             json err = {{"error", {{"message", "\"messages\" field is required and must be a non-empty array"}, {"type", "invalid_request_error"}}}};
-            error_out.json_body = err.dump();
+            error_out.json_body = dumpJsonForHttp(err);
             return std::nullopt;
         }
 
@@ -251,7 +264,7 @@ namespace llaminar2
                 error_out.ok = false;
                 error_out.http_status = 400;
                 json err = {{"error", {{"message", "Each message must have a \"role\" field"}, {"type", "invalid_request_error"}}}};
-                error_out.json_body = err.dump();
+                error_out.json_body = dumpJsonForHttp(err);
                 return std::nullopt;
             }
 
@@ -269,7 +282,7 @@ namespace llaminar2
                     error_out.ok = false;
                     error_out.http_status = 400;
                     json err = {{"error", {{"message", "Tool messages must have a \"tool_call_id\" field"}, {"type", "invalid_request_error"}}}};
-                    error_out.json_body = err.dump();
+                    error_out.json_body = dumpJsonForHttp(err);
                     return std::nullopt;
                 }
                 continue;
@@ -281,7 +294,7 @@ namespace llaminar2
                 error_out.ok = false;
                 error_out.http_status = 400;
                 json err = {{"error", {{"message", "Each message must have \"role\" and \"content\" fields"}, {"type", "invalid_request_error"}}}};
-                error_out.json_body = err.dump();
+                error_out.json_body = dumpJsonForHttp(err);
                 return std::nullopt;
             }
         }
@@ -473,7 +486,7 @@ namespace llaminar2
         {
             error_out.http_status = 500;
             json err = {{"error", {{"message", "Failed to encode conversation with chat template"}, {"type", "server_error"}}}};
-            error_out.json_body = err.dump();
+            error_out.json_body = dumpJsonForHttp(err);
             return -1;
         }
 
@@ -487,7 +500,7 @@ namespace llaminar2
                                                                                                                                                                 "Use -c <size> to increase context length."},
                                    {"type", "invalid_request_error"},
                                    {"param", "messages"}}}};
-            error_out.json_body = err.dump();
+            error_out.json_body = dumpJsonForHttp(err);
             return -1;
         }
 
@@ -497,7 +510,7 @@ namespace llaminar2
         {
             error_out.http_status = 500;
             json err = {{"error", {{"message", std::string("Prefill failed: ") + runner_.lastError()}, {"type", "server_error"}}}};
-            error_out.json_body = err.dump();
+            error_out.json_body = dumpJsonForHttp(err);
             return -1;
         }
 
@@ -555,7 +568,7 @@ namespace llaminar2
         {
             response.http_status = 500;
             json err = {{"error", {{"message", "MoE rebalance failed"}, {"type", "server_error"}}}};
-            response.json_body = err.dump();
+            response.json_body = dumpJsonForHttp(err);
             return response;
         };
 
@@ -574,7 +587,7 @@ namespace llaminar2
                 {
                     response.http_status = 500;
                     json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
-                    response.json_body = err.dump();
+                    response.json_body = dumpJsonForHttp(err);
                     return response;
                 }
             }
@@ -586,7 +599,7 @@ namespace llaminar2
                 {
                     response.http_status = 500;
                     json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
-                    response.json_body = err.dump();
+                    response.json_body = dumpJsonForHttp(err);
                     return response;
                 }
 
@@ -707,7 +720,7 @@ namespace llaminar2
 
         response.ok = true;
         response.http_status = 200;
-        response.json_body = json_response.dump();
+        response.json_body = dumpJsonForHttp(json_response);
         return response;
     }
     catch (const std::exception &e)
@@ -765,7 +778,7 @@ namespace llaminar2
                 {"system_fingerprint", "llaminar-v2"},
                 {"choices", json::array({choice})}};
 
-            std::string sse_line = "data: " + chunk.dump() + "\n\n";
+            std::string sse_line = "data: " + dumpJsonForHttp(chunk) + "\n\n";
             return chunk_cb(sse_line);
         };
 
@@ -825,7 +838,7 @@ namespace llaminar2
             response.ok = false;
             response.http_status = 500;
             json err = {{"error", {{"message", "MoE rebalance failed"}, {"type", "server_error"}}}};
-            response.json_body = err.dump();
+            response.json_body = dumpJsonForHttp(err);
             return response;
         };
 
@@ -847,7 +860,7 @@ namespace llaminar2
                     response.ok = false;
                     response.http_status = 500;
                     json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
-                    response.json_body = err.dump();
+                    response.json_body = dumpJsonForHttp(err);
                     return response;
                 }
             }
@@ -863,7 +876,7 @@ namespace llaminar2
                     response.ok = false;
                     response.http_status = 500;
                     json err = {{"error", {{"message", std::string("Decode failed: ") + result.error}, {"type", "server_error"}}}};
-                    response.json_body = err.dump();
+                    response.json_body = dumpJsonForHttp(err);
                     return response;
                 }
 

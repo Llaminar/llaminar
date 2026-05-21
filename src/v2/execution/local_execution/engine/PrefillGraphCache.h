@@ -59,14 +59,14 @@ namespace llaminar2
     {
         None,
         FeatureDisabled,        ///< LLAMINAR_GPU_GRAPHS=0
-        SeqLenBelowMinimum,    ///< seq_len < LLAMINAR_PREFILL_GRAPH_MIN_SEQ
-        NotGPUDevice,          ///< CPU device
-        SnapshotsActive,       ///< ENABLE_PIPELINE_SNAPSHOTS build
-        ActiveMoERebalancing,  ///< Rebalance mode is DYNAMIC or OBSERVE
-        CollectiveNodesPresent,///< Graph has TP/PP collective stages
-        StageNotCapturable,    ///< One or more stages return isGraphCapturable()=false
-        NoGPUContext,          ///< GPU context unavailable
-        InvalidatedByPlacement ///< Expert placement mutation since last capture
+        SeqLenBelowMinimum,     ///< seq_len < LLAMINAR_PREFILL_GRAPH_MIN_SEQ
+        NotGPUDevice,           ///< CPU device
+        SnapshotsActive,        ///< ENABLE_PIPELINE_SNAPSHOTS build
+        ActiveMoERebalancing,   ///< Rebalance mode is DYNAMIC or OBSERVE
+        CollectiveNodesPresent, ///< Graph has TP/PP collective stages
+        StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
+        NoGPUContext,           ///< GPU context unavailable
+        InvalidatedByPlacement  ///< Expert placement mutation since last capture
     };
 
     /// Convert PrefillGraphRejectReason to string for logging.
@@ -115,7 +115,7 @@ namespace llaminar2
         /// Mark warmup complete for a key. Transitions Cold → Warmup (arms capture).
         void markWarmedUp(const PrefillGraphCacheKey &key);
 
-        /// Begin graph capture on the given stream.
+        /// Begin graph capture on the given explicit stream.
         /// Transitions Warmup → Capturing. Returns false if not in Warmup phase or capture fails.
         bool beginCapture(const PrefillGraphCacheKey &key, IWorkerGPUContext *gpu_ctx, void *stream);
 

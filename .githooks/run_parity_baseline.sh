@@ -1,5 +1,5 @@
 #!/bin/bash
-# Focused parity baseline — 30 tests covering all model families.
+# Focused parity baseline — 32 tests covering all model families.
 #
 # Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 MoE (sparse),
 #         NodeLocalTP (multi-device), HybridPPTP (pipeline+tensor parallel),
@@ -48,6 +48,9 @@ TESTS=(
   # Qwen3.5 MoE SingleDevice CPU (2)
   "Qwen35MoESingleDeviceParityTest_PrefillParity_Qwen35MoE_35B_CPU_KV_FP16$"
   "Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_CPU_KV_FP16$"
+  # Qwen3.5 MoE SingleDevice ROCm (2)
+  "Qwen35MoESingleDeviceParityTest_PrefillParity_Qwen35MoE_35B_ROCm_KV_FP16$"
+  "Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_ROCm_KV_FP16$"
   # Qwen2 NodeLocalTP CPU (2)
   "Qwen2NodeLocalTPParityTest_PrefillParity_NodeLocalTP_2xMPI_CPU$"
   "Qwen2NodeLocalTPParityTest_DecodeParity_NodeLocalTP_2xMPI_CPU$"
@@ -70,7 +73,7 @@ FAILED=0
 FAILED_NAMES=()
 
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║         PARITY BASELINE: ${TOTAL} tests (sequential)              ║${NC}"
+echo -e "${BLUE}║         PARITY BASELINE: ${TOTAL} tests (sequential)                ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo "Build dir: $BUILD_DIR"

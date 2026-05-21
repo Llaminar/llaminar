@@ -481,15 +481,13 @@ namespace llaminar2
                         // Must block CPU until GPU work completes.
                         if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, target_device))
                         {
-                            LOG_WARN("[TransferEngine::uploadFull] Event wait failed for tensor "
-                                     << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
-                                     << " on " << target_device.toString()
-                                     << ", falling back to backend synchronize");
-                            if (!backend->synchronize(backend_device_id))
-                            {
-                                return TransferResult::fail(TransferMethod::NOOP,
-                                                            "backend synchronize failed for " + target_device.toString());
-                            }
+                            LOG_ERROR("[TransferEngine::uploadFull] Event wait failed for tensor '"
+                                      << (tensor->debug_name_.empty() ? "(unnamed)" : tensor->debug_name_)
+                                      << "' on device " << target_device.toString()
+                                      << " — this indicates a corrupted or invalid completion event "
+                                      << "(e.g., event recorded during graph capture)");
+                            return TransferResult::fail(TransferMethod::NOOP,
+                                                        "Event wait failed: completion event is invalid");
                         }
                     }
                 }
@@ -700,7 +698,7 @@ namespace llaminar2
             if (trace)
             {
                 LOG_DEBUG("[TransferEngine::uploadFull] hostToDevice(" << bytes << " bytes) took "
-                                                                      << h2d_us << " us (" << bandwidth_gbps << " GB/s)");
+                                                                       << h2d_us << " us (" << bandwidth_gbps << " GB/s)");
             }
 
             if (!h2d_ok)
@@ -825,8 +823,12 @@ namespace llaminar2
                 LOG_TRACE("[TransferEngine::downloadFull] Using event-based sync (waiting for specific kernel)");
                 if (!waitForEventWithProxy(backend, tensor->device_completion_event_, backend_device_id, *tensor->gpu_device_))
                 {
-                    LOG_WARN("[TransferEngine::downloadFull] Event wait failed, falling back to full sync");
-                    backend->synchronize(backend_device_id);
+                    LOG_ERROR("[TransferEngine::downloadFull] Event wait failed for tensor '"
+                              << tensor->debug_name_ << "' on device " << tensor->gpu_device_->toString()
+                              << " — this indicates a corrupted or invalid completion event "
+                              << "(e.g., event recorded during graph capture)");
+                    return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
+                                                "Event wait failed: completion event is invalid");
                 }
             }
             else

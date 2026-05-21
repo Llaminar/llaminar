@@ -101,11 +101,17 @@ namespace llaminar2
 
         void resetState()
         {
+            rocmGDN_gpu_set_device(device_ordinal_);
             if (gpu_state_ && state_size_ > 0)
             {
-                rocmGDN_gpu_set_device(device_ordinal_);
                 void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
                 rocmGDN_gpu_memset_zero_async(gpu_state_, state_size_, stream);
+                rocmGDN_stream_synchronize(stream);
+            }
+            if (deinterleave_scratch_)
+            {
+                void *stream = GPUDeviceContextPool::instance().getAMDContext(device_ordinal_).defaultStream();
+                rocmGDN_gpu_memset_zero_async(deinterleave_scratch_, deinterleave_scratch_size_, stream);
                 rocmGDN_stream_synchronize(stream);
             }
         }
@@ -126,7 +132,8 @@ namespace llaminar2
                 if (isGraphCaptureActive())
                 {
                     LOG_ERROR("[ROCmGatedDeltaNet::chunk_forward] GPU state allocation during graph capture "
-                              "(need " << required_state_size << " floats, have " << state_size_ << ")");
+                              "(need "
+                              << required_state_size << " floats, have " << state_size_ << ")");
                     return false;
                 }
                 allocateState(required_state_size);
@@ -161,7 +168,8 @@ namespace llaminar2
                 if (isGraphCaptureActive())
                 {
                     LOG_ERROR("[ROCmGatedDeltaNet::recurrent_step] GPU state allocation during graph capture "
-                              "(need " << required_state_size << " floats, have " << state_size_ << ")");
+                              "(need "
+                              << required_state_size << " floats, have " << state_size_ << ")");
                     return false;
                 }
                 allocateState(required_state_size);
@@ -202,7 +210,8 @@ namespace llaminar2
                 if (isGraphCaptureActive())
                 {
                     LOG_ERROR("[ROCmGatedDeltaNet::deinterleave_qkv_device] deinterleave scratch realloc during graph capture "
-                              "(need " << total << " floats, have " << deinterleave_scratch_size_ << ")");
+                              "(need "
+                              << total << " floats, have " << deinterleave_scratch_size_ << ")");
                     return false;
                 }
                 rocmGDN_gpu_free(deinterleave_scratch_);

@@ -3071,6 +3071,16 @@ namespace llaminar
                     }
                 }
 
+                // Reset MoE kernels' request-scoped host metadata while keeping
+                // device scratch addresses stable for captured prefill graphs.
+                for (auto &[key, kernel] : moe_cache_)
+                {
+                    if (kernel)
+                    {
+                        kernel->resetDynamicState();
+                    }
+                }
+
 #if LLAMINAR_ASSERTIONS_ACTIVE
                 // Post-reset assertion: no kernel should retain stale dynamic state
                 for (const auto &[key, kernel] : embedding_cache_)
@@ -3086,7 +3096,8 @@ namespace llaminar
                 LOG_DEBUG("[KernelFactory] Reset dynamic state on "
                           << embedding_cache_.size() << " embedding, "
                           << attention_cache_.size() << " attention, "
-                          << rope_cache_.size() << " RoPE kernels");
+                          << rope_cache_.size() << " RoPE, "
+                          << moe_cache_.size() << " MoE kernels");
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()

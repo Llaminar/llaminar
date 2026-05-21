@@ -1128,6 +1128,15 @@ namespace llaminar2
         }
 
         // --- GPU event recording ---
+        // During graph capture, cudaEventRecord/hipEventRecord on the captured stream
+        // creates a graph node rather than a real synchronizable event. If we recorded
+        // here, the event would be invalid for later cudaEventSynchronize calls, causing
+        // "invalid argument" errors when TransferEngine tries to sync before D2H.
+        // Skip event recording entirely during capture — graph replay already ensures
+        // execution order, and the executor syncs the stream after replay.
+        if (isGraphCaptureActive())
+            return;
+
         if (!gpu_device_.has_value())
             return;
 

@@ -174,15 +174,14 @@ namespace llaminar2
 
         auto &entry = it->second;
 
-        // Create graph capture object
-        if (stream)
+        if (!stream)
         {
-            entry.capture = gpu_ctx->createGraphCapture(stream);
+            LOG_ERROR("[PrefillGraphCache] beginCapture() requires an explicit capture stream");
+            return false;
         }
-        else
-        {
-            entry.capture = gpu_ctx->createGraphCapture();
-        }
+
+        // Create graph capture object on the caller-managed prefill stream.
+        entry.capture = gpu_ctx->createGraphCapture(stream);
 
         if (!entry.capture)
         {

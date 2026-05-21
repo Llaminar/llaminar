@@ -755,6 +755,37 @@ namespace llaminar2
         }
     }
 
+    void ROCmMoEKernel::resetDynamicState()
+    {
+        if (!setMoEDevice(device_ordinal_, "resetDynamicState"))
+            return;
+
+        // Histogram counts are session-derived, but the allocation and mask
+        // capacity are weight/model-shaped and may be referenced by captured
+        // prefill graphs, so reset contents without changing device pointers.
+        if (d_histogram_ && max_layers_ > 0 && max_experts_ > 0)
+        {
+            const size_t histogram_bytes = static_cast<size_t>(max_layers_) *
+                                           static_cast<size_t>(max_experts_) *
+                                           sizeof(uint64_t);
+            hipError_t memset_err = hipMemset(d_histogram_, 0, histogram_bytes);
+            if (memset_err != hipSuccess)
+            {
+                LOG_WARN("[ROCmMoEKernel::resetDynamicState] histogram reset failed: "
+                         << hipGetErrorString(memset_err));
+            }
+        }
+
+        // CPU-side grouping metadata mirrors the last request's routing table;
+        // clearing it prevents legacy gather/scatter fallbacks from seeing old
+        // expert counts after a cache clear.
+        host_expert_counts_.clear();
+        host_expert_offsets_.clear();
+        host_grouped_indices_.clear();
+        host_grouped_weights_.clear();
+        prepared_num_experts_ = 0;
+    }
+
     void ROCmMoEKernel::syncBlasStream()
     {
         if (blas_gemm_)
@@ -1718,7 +1749,8 @@ namespace llaminar2
             if (isGraphCaptureActive())
             {
                 LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] write_heads realloc during graph capture "
-                          "(need " << num_experts << ", have " << max_write_heads_experts_ << ")");
+                          "(need "
+                          << num_experts << ", have " << max_write_heads_experts_ << ")");
                 return false;
             }
             if (d_write_heads_)
@@ -3952,7 +3984,8 @@ namespace llaminar2
             if (isGraphCaptureActive())
             {
                 LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] grouping buffer realloc during graph capture "
-                          "(need " << total_slots << " slots, have " << group_slots_cap_ << ")");
+                          "(need "
+                          << total_slots << " slots, have " << group_slots_cap_ << ")");
                 return false;
             }
             if (d_group_int_indices_)
@@ -3971,7 +4004,8 @@ namespace llaminar2
             if (isGraphCaptureActive())
             {
                 LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] expert buffer realloc during graph capture "
-                          "(need " << num_experts << " experts, have " << group_experts_cap_ << ")");
+                          "(need "
+                          << num_experts << " experts, have " << group_experts_cap_ << ")");
                 return false;
             }
             if (d_group_offsets_)
@@ -4032,7 +4066,8 @@ namespace llaminar2
         if (isGraphCaptureActive())
         {
             LOG_ERROR("[ROCmMoEKernel::ensureGroupedPrefillScratchCapacity] prefill scratch realloc during graph capture "
-                      "(need slots=" << total_slots << " d_model=" << d_model << " inter=" << intermediate
+                      "(need slots="
+                      << total_slots << " d_model=" << d_model << " inter=" << intermediate
                       << ", have slots=" << prefill_slots_cap_ << " d_model=" << prefill_d_model_cap_
                       << " inter=" << prefill_intermediate_cap_ << ")");
             return false;

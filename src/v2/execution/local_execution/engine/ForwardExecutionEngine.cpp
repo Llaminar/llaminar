@@ -13,6 +13,7 @@
  */
 
 #include "ForwardExecutionEngine.h"
+#include "../graph/GraphCaptureGuard.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -498,10 +499,47 @@ namespace llaminar2
 
         auto phase = cache.phase(key);
 
+        auto gpuContextForPrefill = [&]() -> IWorkerGPUContext *
+        {
+            if (!ctx || !ctx->deviceId().is_gpu())
+                return nullptr;
+            auto &pool = GPUDeviceContextPool::instance();
+            return &pool.getContext(ctx->deviceId());
+        };
+
+        auto bindPrefillStreamToStages = [&](void *stream)
+        {
+            const auto &order = forward_cache.graph->getExecutionOrder();
+            for (const auto &node_name : order)
+            {
+                ComputeNode *node = forward_cache.graph->getNode(node_name);
+                if (node && node->stage)
+                    node->stage->setGPUStream(stream);
+            }
+        };
+
+        auto ensurePrefillCaptureStream = [&]() -> std::pair<IWorkerGPUContext *, void *>
+        {
+            IWorkerGPUContext *gpu_ctx = gpuContextForPrefill();
+            if (!gpu_ctx)
+                return {nullptr, nullptr};
+            if (!forward_cache.prefill_capture_stream.ensure(gpu_ctx))
+                return {gpu_ctx, nullptr};
+            return {gpu_ctx, forward_cache.prefill_capture_stream.stream};
+        };
+
         if (phase == PrefillGraphPhase::Ready)
         {
             // === REPLAY PATH ===
             // Dynamic params already updated by executeCacheHit caller.
+            auto [gpu_ctx, stream] = ensurePrefillCaptureStream();
+            if (!gpu_ctx || !stream)
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph replay missing explicit capture stream");
+                return false;
+            }
+            bindPrefillStreamToStages(stream);
+
             if (!cache.launch(key))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph replay FAILED for seq_len=" << input.seq_len);
@@ -514,37 +552,42 @@ namespace llaminar2
 
             if (cache.config().trace)
                 LOG_INFO("[ForwardExecutionEngine] Prefill graph REPLAY seq_len=" << input.seq_len
-                         << " replay_count=" << cache.replayCount(key));
+                                                                                  << " replay_count=" << cache.replayCount(key));
             return true;
         }
 
         if (phase == PrefillGraphPhase::Warmup)
         {
             // === CAPTURE PATH ===
-            // Get GPU context for capture
-            DeviceId dev_id = ctx->deviceId();
-            auto &pool = GPUDeviceContextPool::instance();
-            IWorkerGPUContext &gpu_ctx = pool.getContext(dev_id);
-            void *stream = gpu_ctx.defaultStream();
-
-            // Apply GPU stream to all stages for capture
-            const auto &order = forward_cache.graph->getExecutionOrder();
-            for (const auto &node_name : order)
+            auto [gpu_ctx, stream] = ensurePrefillCaptureStream();
+            if (!gpu_ctx || !stream)
             {
-                ComputeNode *node = forward_cache.graph->getNode(node_name);
-                if (node && node->stage)
-                    node->stage->setGPUStream(stream);
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture missing explicit capture stream");
+                return false;
             }
 
-            if (!cache.beginCapture(key, &gpu_ctx, stream))
+            // Apply the dedicated prefill stream to all stages and drain any
+            // previous warmup work before beginning stream capture.
+            bindPrefillStreamToStages(stream);
+            gpu_ctx->synchronizeStream(stream);
+            gpu_ctx->clearLastError();
+
+            if (!cache.beginCapture(key, gpu_ctx, stream))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture BEGIN failed for seq_len=" << input.seq_len);
                 return false;
             }
 
-            // Execute stages into the capture stream — this IS valid execution
-            bool exec_success = executor_.executeFastDecode(
-                *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+            // Execute stages into the capture stream with GraphCaptureGuard active.
+            // This prevents timeline events and coherence events from being
+            // recorded on the capture stream (they become graph nodes, not
+            // real synchronizable events).
+            bool exec_success;
+            {
+                GraphCaptureGuard capture_guard;
+                exec_success = executor_.executeFastDecode(
+                    *forward_cache.graph, ctx, &forward_cache.collective_nodes);
+            }
 
             if (!exec_success)
             {
@@ -558,13 +601,59 @@ namespace llaminar2
                 return false;
             }
 
+            // Kernels recorded during HIP/CUDA stream capture are not executed
+            // until the executable graph is launched. Launch once immediately so
+            // the capture request produces logits and advances device state.
+            if (!cache.launch(key))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph launch-after-capture failed for seq_len=" << input.seq_len);
+                return false;
+            }
+
+            for (auto *stage : forward_cache.replay_callback_stages)
+                stage->onGraphReplayed();
+
             LOG_INFO("[ForwardExecutionEngine] Prefill graph CAPTURED seq_len=" << input.seq_len
-                     << " nodes=" << cache.nodeCount(key));
+                                                                                << " nodes=" << cache.nodeCount(key));
             return true;
         }
 
         // === WARMUP/COLD PATH ===
-        // Execute normally to warm up lazy allocations
+        bool cold_capture_candidate = false;
+        PrefillGraphRejectReason cold_reject_reason = PrefillGraphRejectReason::None;
+        if (phase == PrefillGraphPhase::Cold)
+        {
+            bool snapshots_active = (executor_.config().snapshot_callback != nullptr);
+            bool moe_rebalancing_active = host.isMoeRebalancingActive();
+
+            cold_reject_reason = cache.preflight(
+                *forward_cache.graph, key,
+                &forward_cache.collective_nodes,
+                snapshots_active,
+                moe_rebalancing_active);
+            cold_capture_candidate = (cold_reject_reason == PrefillGraphRejectReason::None);
+        }
+
+        bool cold_stream_ready = false;
+        if (cold_capture_candidate)
+        {
+            auto [gpu_ctx, stream] = ensurePrefillCaptureStream();
+            if (gpu_ctx && stream)
+            {
+                // Warm up lazy allocations on the same explicit stream that the
+                // next request will capture on. This mirrors decode segmented
+                // capture and avoids capture-unsafe first-use work.
+                bindPrefillStreamToStages(stream);
+                cold_stream_ready = true;
+            }
+            else
+            {
+                cold_reject_reason = PrefillGraphRejectReason::NoGPUContext;
+                cold_capture_candidate = false;
+            }
+        }
+
+        // Execute normally to warm up lazy allocations.
         bool exec_success = executor_.executeFastDecode(
             *forward_cache.graph, ctx, &forward_cache.collective_nodes);
 
@@ -574,16 +663,7 @@ namespace llaminar2
         // After successful warmup, check if graph capture is eligible
         if (phase == PrefillGraphPhase::Cold)
         {
-            bool snapshots_active = (executor_.config().snapshot_callback != nullptr);
-            bool moe_rebalancing_active = host.isMoeRebalancingActive();
-
-            auto reason = cache.preflight(
-                *forward_cache.graph, key,
-                &forward_cache.collective_nodes,
-                snapshots_active,
-                moe_rebalancing_active);
-
-            if (reason == PrefillGraphRejectReason::None)
+            if (cold_capture_candidate && cold_stream_ready)
             {
                 cache.markWarmedUp(key);
                 if (cache.config().trace)
@@ -592,7 +672,7 @@ namespace llaminar2
             else if (cache.config().trace)
             {
                 LOG_INFO("[ForwardExecutionEngine] Prefill graph capture rejected: "
-                         << toString(reason) << " seq_len=" << input.seq_len);
+                         << toString(cold_reject_reason) << " seq_len=" << input.seq_len);
             }
             // Rejection is NOT fatal — we just won't use graph capture for this seq_len.
         }
@@ -792,7 +872,7 @@ namespace llaminar2
         const ForwardInput &input,
         std::chrono::high_resolution_clock::time_point start)
     {
-        if (!debugEnv().gpu_stage_timing || suppress_timeline_ ||
+        if (!debugEnv().gpu_stage_timing ||
             !ctx || !ctx->deviceId().is_gpu())
         {
             return;
@@ -801,6 +881,15 @@ namespace llaminar2
         auto &timeline = executor_.stageTimeline();
         if (!timeline.isInitialized())
         {
+            return;
+        }
+
+        // When suppressed (warmup), discard any stale events but don't
+        // collect or accumulate. This prevents stale events from the Cold
+        // phase persisting after graph capture invalidates the stream state.
+        if (suppress_timeline_)
+        {
+            timeline.resetTimings();
             return;
         }
 

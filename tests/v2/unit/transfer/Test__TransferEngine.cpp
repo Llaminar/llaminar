@@ -664,3 +664,244 @@ TEST(Test__TransferEngine_GpuOnly, ReleaseHostWeightData_Idempotent)
     tensor->release_host_weight_data();
     EXPECT_TRUE(tensor->is_raw_data_released());
 }
+
+// ============================================================================
+// Event wait failure tests — lock in hard-error behavior for downloadFull
+// and fallback behavior for uploadFull
+// ============================================================================
+
+namespace
+{
+    /**
+     * @brief MockBackend subclass with configurable event wait failure.
+     *
+     * Allows tests to make waitForEvent() return false on demand,
+     * simulating corrupted or invalid completion events (e.g., events
+     * recorded during CUDA graph capture that are invalid for synchronize).
+     */
+    class FailableEventMockBackend : public MockBackend
+    {
+    public:
+        FailableEventMockBackend() : MockBackend(DeviceType::CUDA) {}
+
+        bool waitForEvent(void *event, int device_id) override
+        {
+            // Still record the operation for test inspection
+            MockBackend::waitForEvent(event, device_id);
+            return !fail_event_wait_;
+        }
+
+        bool synchronize(int device_id) override
+        {
+            // Track that synchronize was called as a fallback
+            sync_fallback_count_++;
+            return !fail_synchronize_;
+        }
+
+        /// Make waitForEvent() return false from now on
+        void setEventWaitFails(bool fail) { fail_event_wait_ = fail; }
+
+        /// Make synchronize() return false from now on
+        void setSynchronizeFails(bool fail) { fail_synchronize_ = fail; }
+
+        /// Number of times synchronize() was called (for verifying fallback behavior)
+        size_t getSyncFallbackCount() const { return sync_fallback_count_; }
+
+    private:
+        bool fail_event_wait_ = false;
+        bool fail_synchronize_ = false;
+        size_t sync_fallback_count_ = 0;
+    };
+} // namespace
+
+class Test__TransferEngine_EventFailure : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        mock_ = std::make_shared<FailableEventMockBackend>();
+
+        // Resolver returns our failable mock
+        s_failable_mock_ = mock_.get();
+        resolver_ = [](DeviceId) -> IBackend *
+        {
+            return s_failable_mock_;
+        };
+    }
+
+    /// Helper: set up a tensor on CUDA device with a completion event.
+    /// Returns the tensor in DEVICE_AUTHORITATIVE state with a valid event.
+    std::unique_ptr<FP32Tensor> createTensorOnDeviceWithEvent()
+    {
+        auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+        tensor->setBackendForTesting(mock_.get());
+
+        // Upload to device (allocates GPU buffer, sets state to SYNCED)
+        bool ok = tensor->ensureOnDevice(DeviceId::cuda(0));
+        EXPECT_TRUE(ok);
+
+        // Transition to DEVICE_AUTHORITATIVE with a completion event
+        // This creates an event and records it on the mock backend
+        tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                      DeviceId::cuda(0));
+
+        return tensor;
+    }
+
+    static FailableEventMockBackend *s_failable_mock_;
+    std::shared_ptr<FailableEventMockBackend> mock_;
+    TransferEngine::BackendResolver resolver_;
+};
+
+FailableEventMockBackend *Test__TransferEngine_EventFailure::s_failable_mock_ = nullptr;
+
+// -----------------------------------------------------------------------------
+// downloadFull: event wait failure → HARD ERROR (TransferResult::fail)
+// -----------------------------------------------------------------------------
+
+TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_ReturnsHardError)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+
+    // Now make event wait fail — simulates corrupted event from graph capture
+    mock_->setEventWaitFails(true);
+
+    auto result = engine.downloadFull(tensor.get());
+
+    // Must be a hard failure — no silent fallback
+    EXPECT_FALSE(result.success);
+    EXPECT_EQ(result.method_used, TransferMethod::DEVICE_TO_HOST);
+    EXPECT_NE(result.error.find("Event wait failed"), std::string::npos);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_ErrorMessageMentionsInvalidEvent)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+    tensor->setDebugName("test_attention_output");
+
+    mock_->setEventWaitFails(true);
+
+    auto result = engine.downloadFull(tensor.get());
+
+    EXPECT_FALSE(result.success);
+    // Error should mention "invalid" to help diagnosis
+    EXPECT_NE(result.error.find("invalid"), std::string::npos);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitFail_NoD2HTransferOccurs)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+
+    mock_->setEventWaitFails(true);
+    mock_->resetTransferStats();
+
+    engine.downloadFull(tensor.get());
+
+    // The D2H transfer should NOT have occurred — we failed before reaching memcpy
+    auto stats = mock_->getTransferStats();
+    EXPECT_EQ(stats.d2h_count, 0u);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, DownloadFull_EventWaitSuccess_TransferSucceeds)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+
+    // Event wait succeeds (default) — download should work
+    mock_->setEventWaitFails(false);
+    mock_->resetTransferStats();
+
+    auto result = engine.downloadFull(tensor.get());
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.method_used, TransferMethod::DEVICE_TO_HOST);
+
+    auto stats = mock_->getTransferStats();
+    EXPECT_EQ(stats.d2h_count, 1u);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, DownloadFull_NoEvent_FallsBackToFullSync)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = TestTensorFactory::createFP32Ones({4, 4});
+    tensor->setBackendForTesting(mock_.get());
+
+    // Upload to device but DON'T set a completion event
+    tensor->ensureOnDevice(DeviceId::cuda(0));
+    tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::cuda(0));
+
+    mock_->resetTransferStats();
+
+    auto result = engine.downloadFull(tensor.get());
+
+    // Should succeed via full device sync (no event to wait on)
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.method_used, TransferMethod::DEVICE_TO_HOST);
+
+    // synchronize() was called as fallback (no event path)
+    EXPECT_GE(mock_->getSyncFallbackCount(), 1u);
+}
+
+// -----------------------------------------------------------------------------
+// uploadFull: event wait failure → HARD ERROR (same as downloadFull)
+// No fallback to full device synchronize — invalid events must fail loudly.
+// -----------------------------------------------------------------------------
+
+TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitFail_ReturnsHardError)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+
+    // Event wait fails — simulates corrupted event from graph capture
+    mock_->setEventWaitFails(true);
+
+    // uploadFull to the SAME device where tensor already resides (triggers event wait path)
+    auto result = engine.uploadFull(tensor.get(), DeviceId::cuda(0));
+
+    // Must be a hard failure — no silent fallback to synchronize
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(result.error.find("Event wait failed"), std::string::npos);
+
+    // synchronize() must NOT have been called as fallback
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitFail_ErrorMessageMentionsInvalidEvent)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+    tensor->setDebugName("test_hidden_state");
+
+    mock_->setEventWaitFails(true);
+
+    auto result = engine.uploadFull(tensor.get(), DeviceId::cuda(0));
+
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(result.error.find("invalid"), std::string::npos);
+}
+
+TEST_F(Test__TransferEngine_EventFailure, UploadFull_EventWaitSuccess_Succeeds)
+{
+    TransferEngine engine(resolver_);
+
+    auto tensor = createTensorOnDeviceWithEvent();
+
+    // Event wait succeeds
+    mock_->setEventWaitFails(false);
+
+    auto result = engine.uploadFull(tensor.get(), DeviceId::cuda(0));
+
+    // Should succeed without needing synchronize fallback
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(mock_->getSyncFallbackCount(), 0u);
+}

@@ -1,344 +1,274 @@
-# Handover: Qwen35 MoE ROCm Decode Parity RoPE Lead
+# Handover: Qwen35 MoE ROCm Decode Parity Continuation
 
 Date: 2026-05-20
 Workspace: `/workspaces/llaminar`
 Branch/HEAD: `feat/qwen35-moe` at `ed903cf2`
-Primary target: `DecodeParity_Qwen35MoE_35B_ROCm_KV_FP16`
-CTest target: `V2_Integration_Parity_Qwen35MoE_SingleDevice_Qwen35MoE_Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_ROCm_KV_FP16`
+Primary decode target: `DecodeParity_Qwen35MoE_35B_ROCm_KV_FP16`
+CTest decode target: `V2_Integration_Parity_Qwen35MoE_SingleDevice_Qwen35MoE_Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_ROCm_KV_FP16`
 Model: `/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf`
 
-This continuation supersedes older status in:
+This document continues from:
 
 ```text
 docs/v2/HANDOVER_QWEN35_MOE_ROCM_DECODE_PARITY_2026-05-20.md
 ```
 
-The earlier doc contains useful background on mixed native-VNNI codebooks and snapshot-table decode guards, but the current debugging lead has moved to Qwen3.5 full-attention RoPE.
-
 ## Current Status
 
-The focused ROCm decode target still fails the strict early-layer gate after current diagnostic instrumentation:
+The decode parity target still passes, but layer/stage cosine shows real remaining drift. The final decode tokens match, yet step 0 logit cosine is still only about `0.980268`.
+
+Latest `decode_steps.csv`:
 
 ```text
-Expected passed_early_layers >= 5, actual: 3 vs 5
-At least 5 of the first 6 layers should pass decode parity at step 3 (cosine >= 0.98000001907348633)
+step 0: cosine=0.980268 kl=0.0671053 token_match=true passed=true
+step 1: cosine=0.994339 kl=0.0725424 token_match=true passed=true
+step 2: cosine=0.990065 kl=0.0622723 token_match=true passed=true
+step 3: cosine=0.986558 kl=0.00976627 token_match=true passed=true
+step 4: cosine=0.994731 kl=0.00156709 token_match=true passed=true
 ```
 
-However, token-level decode parity remains good. Latest `decode_steps.csv` for ROCm:
+The matching prefill parity target is clean:
 
 ```text
-step 0 cosine=0.998363 token_match=true passed=true
-step 1 cosine=0.998215 token_match=true passed=true
-step 2 cosine=0.994591 token_match=true passed=true
-step 3 cosine=0.995518 token_match=true passed=true
-step 4 cosine=0.997980 token_match=true passed=true
+lm_head_cosine=0.994735 lm_head_kl=0.0191821 lm_head_top1=1 lm_head_top5=1 overall_passed=true
+layer0 avg_cosine=0.999923 min_cosine=0.999811 worst_stage=MOE_SHARED_EXPERT_OUTPUT passed=true
 ```
 
-The important finding: FP16 KV cache is not proven as the cause. A prior CPU FP32-KV A/B in this session still showed the same full-attention drop, and the current instrumented CPU CSV shows the same Q_ROPE failure pattern as ROCm.
+## Changes Made In This Continuation
 
-## What Was Fixed Before This Point
+### 1. Native-VNNI GEMV split-K regression coverage
 
-### GDN short-conv in-place prefill scratch
-
-The original layer-0 decode issue was a real in-place prefill hazard in GPU short convolution. Prefill runs over time in parallel, and when input/output alias, one timestep can clobber values another timestep still needs.
-
-Files changed:
+File changed:
 
 ```text
-src/v2/tensors/TensorKernels.h
-src/v2/kernels/KernelFactory.cpp
-src/v2/kernels/cuda/gdn/CUDAShortConvolution.h
-src/v2/kernels/rocm/gdn/ROCmShortConvolution.h
+tests/v2/integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
 ```
 
-Key behavior now:
+Added/changed:
 
-- `ITensorShortConvolution::allocateGPUScratch(int)` was added.
-- `KernelFactory::createHybridKVCache()` preallocates per-layer in-place prefill scratch using `max_seq_len * qkv_dim` during GDN kernel setup.
-- CUDA/ROCm `forward()` no longer grows scratch in the hot path. It fails loudly if in-place prefill scratch was not prepared.
-- Backend headers use existing backend-local `*_gpu_memcpy_async()` wrappers; do not include CUDA and HIP runtimes in these public C++ headers because mixed CUDA/ROCm builds collide on vector types.
+- Added Q8_0 to the native-VNNI GEMV format sweep by using direct `packNativeVNNI()` for Q8_0 instead of the default INT8-VNNI packing path.
+- Added `NativeVNNIGEMVTest.SplitK_KB8MatchesKB1_AllNativeCodebooks`.
+- The new regression forces `KB=1`, then `KB=8`, on the same packed native-VNNI weights and compares outputs for all native codebooks.
 
-After this fix, early GDN stages became essentially perfect:
+Important result:
 
 ```text
-layer0 QKV_PROJECTION        cosine=0.999997
-layer0 GDN_CONV1D_OUTPUT     cosine=1.000000
-layer0 GDN_DELTA_RULE_OUTPUT cosine=1.000000
-layer0 GDN_NORM_GATE_OUTPUT  cosine=1.000000
+Standalone ROCm native-VNNI GEMV split-K does not reproduce the decode corruption.
+KB=8 vs KB=1 passed for Q4/Q5/K/IQ/Q8 native codebooks with cosine=1.0 and tiny rel_l2.
 ```
 
-So the current remaining issue is not the short-conv/GDN path.
+This means a future agent should not keep chasing the bare `rocmGemv_native_vnni_fp32()` split-K reduce path as the current layer-0 decode-cosine root cause unless new evidence appears.
 
-## Diagnostic Instrumentation Added
+### 2. GDN all-codebook projection regression coverage
 
-The next debugging pass added finer snapshot boundaries for Qwen3.5 full attention.
-
-### C++ snapshot dimensions and names
-
-Files changed:
+File changed:
 
 ```text
-src/v2/snapshots/SnapshotCapture.cpp
-src/v2/execution/compute_stages/stages/QGateSplitStage.cpp
-src/v2/execution/compute_stages/stages/AttentionOutputGateStage.cpp
+tests/v2/unit/execution/Test__GDNKernels.cpp
 ```
 
-Important details:
+Added/changed:
 
-- `QGateSplitStage::buildDumpInfoImpl()` now reports logical rows and `n_heads * head_dim`, not arena capacity.
-- `AttentionOutputGateStage::buildDumpInfoImpl()` now reports logical rows and tensor cols, not arena capacity.
-- `SnapshotCapture` maps:
-  - `_q_gate_split` -> `FA_GATE`
-  - `_attn_output_gate` -> `ATTENTION_CONTEXT_GATED`
-  - `_attention` -> `ATTENTION_CONTEXT`
+- Added `ROCmProjectionDecodeAllNativeCodebooksMatchesReference`.
+- The test builds GDN-shaped fused decode projections (`qkv`, `z`, `alpha`, `beta`) for every supported native-VNNI codebook, including Q8_0.
+- It forces `LLAMINAR_ROCM_NVNNI_GEMV_KB=8` and compares ROCm fused projection output against CPU dequantized reference.
+- Uses cosine, relative L2, and scale-normalized max absolute error (`max_abs_ratio`) so low-bit formats with large-magnitude outputs do not fail spuriously.
 
-These fixes made the new diagnostic rows survive parity comparison.
-
-### Python reference snapshots
-
-Files changed:
+Important result:
 
 ```text
-python/reference/pipeline_stages.py
-python/reference/qwen35.py
-python/reference/qwen35_moe.py
+All GDN-shaped projection codebook cases pass under forced KB=8.
+Worst observed max_abs_ratio was below 0.007.
 ```
 
-Added reference stages:
+This covers the concern that the GDN path only worked for the specific Q4_K/Q5_K quantization used by the current model file.
+
+### 3. Strengthened ROCm GDN prefill-to-decode state handoff regression
+
+File changed:
 
 ```text
-FA_GATE
-ATTENTION_CONTEXT_GATED
-Q_NORM
-K_NORM
-Q_ROPE
-K_ROPE
+tests/v2/unit/execution/Test__GDNKernels.cpp
 ```
 
-Reference hooks now capture:
+Updated existing test:
 
-- `FA_GATE` from the q projection split.
-- `ATTENTION_CONTEXT_GATED` from `o_proj` pre-hook input.
-- Raw `ATTENTION_CONTEXT` reconstructed as `gated_context / sigmoid(fa_gate)`.
-- `Q_NORM` and `K_NORM` from HF `q_norm` / `k_norm` outputs.
-- `Q_ROPE` and `K_ROPE` by wrapping HF `apply_rotary_pos_emb` while a full-attention layer is active.
+```text
+Test__GDNKernels.ROCmPrefillMatchesSequentialDecodeQwen35Shape
+```
 
-Snapshot regeneration must be clean to avoid stale `.npy` files:
+The test now compares:
+
+1. One ROCm kernel instance that runs prefill history and then one decode token.
+2. A separate ROCm kernel instance that runs every token via sequential recurrent decode.
+
+Important result:
+
+```text
+The synthetic ROCm prefill-history plus one decode-token handoff passes at Qwen35 dimensions.
+```
+
+So the remaining full-model decode issue is not a generic ROCm GDN hidden-state writeback failure in isolation.
+
+## Focused Verification Already Run
+
+Builds:
 
 ```bash
-rm -rf pytorch_qwen35_moe_snapshots
-python python/reference/generate_qwen35_moe_pipeline_snapshots.py \
-  --model /opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
-  --decode-steps 5 \
-  --output pytorch_qwen35_moe_snapshots
+cmake --build build_v2_integration --config Integration --target v2_integration_rocm_native_vnni_gemv v2_test_gdn_kernels --parallel
+cmake --build build_v2_integration --config Integration --target v2_test_gdn_kernels --parallel
 ```
 
-The latest clean regeneration captured `733` snapshots per prefill/decode pass and `4398` snapshots total.
-
-## Current Decisive Metrics
-
-Latest ROCm decode CSV:
-
-```text
-tests/v2/integration/parity/results/ed903cf2/Qwen35MoE_Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_ROCm_KV_FP16/decode_stages.csv
-```
-
-Decode step 3, layer 3:
-
-```text
-Q_PROJECTION              cosine=0.999989 rel_l2=0.004955 max_abs=0.0962567
-K_PROJECTION              cosine=0.999839 rel_l2=0.018044 max_abs=0.0454114
-V_PROJECTION              cosine=0.999785 rel_l2=0.020771 max_abs=0.049677
-FA_GATE                   cosine=0.999994 rel_l2=0.003769 max_abs=0.0618658
-Q_NORM                    cosine=0.999842 rel_l2=0.017798 max_abs=0.153905
-K_NORM                    cosine=0.999853 rel_l2=0.017167 max_abs=0.0818316
-Q_ROPE                    cosine=0.936985 rel_l2=0.355169 max_abs=7.46706
-K_ROPE                    cosine=0.967511 rel_l2=0.254875 max_abs=3.62645
-ATTENTION_CONTEXT          cosine=0.942799 rel_l2=0.336659 max_abs=1.73968
-ATTENTION_CONTEXT_GATED    cosine=0.932859 rel_l2=0.362430 max_abs=0.0761816
-ATTENTION_OUTPUT           cosine=0.919352 rel_l2=0.394082 max_abs=0.0960874
-```
-
-Decode step 3, layer 7:
-
-```text
-Q_PROJECTION              cosine=0.999051 rel_l2=0.048028 max_abs=1.1274
-K_PROJECTION              cosine=0.992817 rel_l2=0.119735 max_abs=0.266044
-V_PROJECTION              cosine=0.982778 rel_l2=0.187339 max_abs=0.637945
-FA_GATE                   cosine=0.999534 rel_l2=0.036817 max_abs=0.572288
-Q_NORM                    cosine=0.988421 rel_l2=0.152579 max_abs=1.1488
-K_NORM                    cosine=0.993446 rel_l2=0.114593 max_abs=0.542843
-Q_ROPE                    cosine=0.918404 rel_l2=0.404883 max_abs=7.45374
-K_ROPE                    cosine=0.972329 rel_l2=0.235438 max_abs=3.77531
-ATTENTION_CONTEXT          cosine=0.979706 rel_l2=0.200948 max_abs=1.69751
-ATTENTION_CONTEXT_GATED    cosine=0.968802 rel_l2=0.251416 max_abs=0.157096
-ATTENTION_OUTPUT           cosine=0.926555 rel_l2=0.391590 max_abs=0.192169
-```
-
-Current CPU decode CSV shows the same RoPE pattern, so this is probably not ROCm-specific:
-
-```text
-layer3 Q_ROPE cosine=0.936681, K_ROPE cosine=0.967059
-layer7 Q_ROPE cosine=0.918509, K_ROPE cosine=0.971833
-```
-
-Interpretation:
-
-- Q/K/V projections are good before RoPE.
-- Q/K per-head RMSNorm is good before RoPE.
-- `FA_GATE` is good, so the q/gate deinterleave is not the issue.
-- The first large full-attention divergence is `Q_ROPE` / `K_ROPE`.
-- Attention context and Wo projection are downstream amplifiers.
-
-## Commands Already Run
-
-Focused target build:
+Focused gtests:
 
 ```bash
-cmake --build build_v2_integration --config Integration \
-  --target v2_integration_parity_qwen35moe_single_device \
-  --parallel
+./build_v2_integration/tests/v2/v2_integration_rocm_native_vnni_gemv \
+  --gtest_filter='NativeVNNIGEMVTest.SplitK_KB8MatchesKB1_AllNativeCodebooks' \
+  --gtest_brief=1
+
+./build_v2_integration/tests/v2/v2_test_gdn_kernels \
+  --gtest_filter='Test__GDNKernels.ROCmProjectionDecodeAllNativeCodebooksMatchesReference' \
+  --gtest_brief=1
+
+./build_v2_integration/tests/v2/v2_test_gdn_kernels \
+  --gtest_filter='Test__GDNKernels.ROCmPrefillMatchesSequentialDecodeQwen35Shape' \
+  --gtest_brief=1
 ```
 
-Python syntax check:
+Focused CTest:
 
 ```bash
-python -m py_compile \
-  python/reference/pipeline_stages.py \
-  python/reference/qwen35.py \
-  python/reference/qwen35_moe.py
+ctest --test-dir build_v2_integration \
+  -R '^(V2_Integration_ROCm_NativeVNNI_GEMV|V2_Unit_GDNKernels)$' \
+  --output-on-failure --parallel
 ```
 
-Snapshot regeneration:
+Result:
 
-```bash
-rm -rf pytorch_qwen35_moe_snapshots
-python python/reference/generate_qwen35_moe_pipeline_snapshots.py \
-  --model /opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
-  --decode-steps 5 \
-  --output pytorch_qwen35_moe_snapshots
+```text
+100% tests passed, 0 tests failed out of 3
 ```
 
-Focused ROCm decode parity:
+Full parity checks:
 
 ```bash
 ctest --test-dir build_v2_integration \
   -R '^V2_Integration_Parity_Qwen35MoE_SingleDevice_Qwen35MoE_Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_ROCm_KV_FP16$' \
   --output-on-failure
-```
 
-Focused CPU decode parity for backend-independent comparison:
-
-```bash
 ctest --test-dir build_v2_integration \
-  -R '^V2_Integration_Parity_Qwen35MoE_SingleDevice_Qwen35MoE_Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_CPU_KV_FP16$' \
+  -R '^V2_Integration_Parity_Qwen35MoE_SingleDevice_Qwen35MoE_Qwen35MoESingleDeviceParityTest_PrefillParity_Qwen35MoE_35B_ROCm_KV_FP16$' \
   --output-on-failure
 ```
 
-Useful CSV extraction:
+Both passed.
 
-```bash
-csv='tests/v2/integration/parity/results/ed903cf2/Qwen35MoE_Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_ROCm_KV_FP16/decode_stages.csv'
-awk -F',' 'NR==1 {print "step,layer,stage,cosine,drop,rel_l2,max_abs"; next}
-  $2==3 && ($3==3 || $3==7) &&
-  ($4=="Q_PROJECTION" || $4=="K_PROJECTION" || $4=="V_PROJECTION" ||
-   $4=="Q_NORM" || $4=="K_NORM" || $4=="Q_ROPE" || $4=="K_ROPE" ||
-   $4=="FA_GATE" || $4=="ATTENTION_CONTEXT" ||
-   $4=="ATTENTION_CONTEXT_GATED" || $4=="ATTENTION_OUTPUT")
-  {print $2","$3","$4","$5","$6","$7","$8}' "$csv"
-```
-
-Logs saved during this pass:
+Editor diagnostics:
 
 ```text
-/tmp/qwen35moe_rocm_decode_scratch_fix.log
-/tmp/qwen35moe_rocm_decode_gate_shape_fix.log
-/tmp/qwen35moe_rocm_decode_raw_context.log
-/tmp/qwen35moe_rocm_decode_qknorm_context.log
-/tmp/qwen35moe_rocm_decode_rope_context.log
-/tmp/qwen35moe_cpu_decode_rope_context.log
-/tmp/qwen35moe_regen_rope_context.log
+get_errors reported no errors for:
+tests/v2/integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
+tests/v2/unit/execution/Test__GDNKernels.cpp
 ```
+
+## Remaining Decode-Cosine Lead
+
+Layer 0 decode step 0 now points away from projection GEMV and toward full-model decode state/context.
+
+Fresh layer-0 decode-stage metrics:
+
+```text
+ATTENTION_NORM           cos=1.000000 drop=0.000000 rel_l2=0.000000 max_abs=7.62939e-06
+QKV_PROJECTION           cos=0.999997 drop=0.000003 rel_l2=0.002553 max_abs=0.051897
+GDN_Z_PROJECTION         cos=0.999997 drop=-0.000000 rel_l2=0.002361 max_abs=0.0293584
+GDN_DELTA_RULE_OUTPUT    cos=0.983706 drop=0.016292 rel_l2=0.312449 max_abs=0.336776
+GDN_NORM_GATE_OUTPUT     cos=0.981886 drop=0.001819 rel_l2=0.193637 max_abs=0.167211
+ATTENTION_OUTPUT         cos=0.918513 drop=0.063374 rel_l2=0.453615 max_abs=0.0402975
+FFN_NORM                 cos=0.891478 drop=0.027035 rel_l2=0.478803 max_abs=2.03131
+MOE_ROUTER_OUTPUT        cos=0.952972 drop=-0.061494 rel_l2=0.319988 max_abs=0.0295928
+MOE_ROUTING_INDICES      routing_overlap=0.875000 top1=0.000000
+MOE_ROUTING_WEIGHTS      cos=0.989887 rel_l2=0.142273 max_abs=0.0462891
+MOE_EXPERT_OUTPUT        cos=0.619589 rel_l2=0.871965 max_abs=0.0182032
+MOE_SHARED_EXPERT_OUTPUT cos=0.831999 rel_l2=0.702424 max_abs=0.230407
+MOE_SHARED_GATE_OUTPUT   cos=0.831999 rel_l2=0.705534 max_abs=0.0136185
+MOE_COMBINED_OUTPUT      cos=0.702070 drop=0.129929 rel_l2=0.786980 max_abs=0.0193941
+```
+
+Interpretation:
+
+- Projection accuracy is not the immediate issue: QKV and Z are both `0.999997`.
+- The first meaningful decode drop is `GDN_DELTA_RULE_OUTPUT`.
+- `ATTENTION_OUTPUT` then amplifies the drift.
+- MoE routing diverges (`routing_overlap=0.875`, `top1=0`), after which expert output cosine becomes much worse.
+- Prefill layer 0 does not show this problem: `GDN_DELTA_RULE_OUTPUT` and `GDN_NORM_GATE_OUTPUT` are essentially perfect during prefill.
 
 ## Recommended Next Steps
 
-1. Inspect C++ RoPE convention against HuggingFace Qwen3.5.
+1. Investigate full-model decode state/context rather than standalone GEMV.
 
-   Start with:
+   The synthetic GDN prefill-to-decode handoff passes, but full-model decode step 0 drops at `GDN_DELTA_RULE_OUTPUT`. The next likely task is to compare the actual full-model recurrence state consumed by layer 0 at decode step 0 against the PyTorch/reference state or against a CPU Llaminar state produced by the same prefill.
 
-   ```text
-   src/v2/execution/compute_stages/stages/RoPEStage.cpp
-   src/v2/kernels/cpu/ops/CPURoPEKernelT.h
-   src/v2/kernels/rocm/ops/ROCmRoPEKernelT.h
-   src/v2/kernels/cuda/ops/CUDARoPEKernelT.h
-   ```
+2. Add a state dump or checksum around GDN recurrence state.
 
-   Current suspicion is not generic numerical precision. The max_abs values around `7.4` at `Q_ROPE` strongly suggest a convention/layout/positioning issue.
-
-2. Verify partial RoPE semantics for Qwen3.5.
-
-   Qwen3.5 uses partial rotary dimensions. C++ computes:
+   Useful places:
 
    ```text
-   rotary_dim = int(head_dim * partial_rotary_factor)
-   effective_head_dim = rotary_dim when partial_rotary_factor < 1
-   kernel->apply_tensor(... effective_head_dim ..., pos_offset, rotary_dim)
+   src/v2/execution/compute_stages/stages/GDNRecurrenceStage.cpp
+   src/v2/kernels/rocm/gdn/ROCmGatedDeltaNet.h
+   src/v2/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip
    ```
 
-   Compare this against HF `apply_rotary_pos_emb(query_states, key_states, cos, sin)` and the model config's `rope_parameters` / `partial_rotary_factor`. Check whether C++ is rotating the correct elements and whether its rotate-half pairing matches HF.
+   Compare state immediately after prefill and immediately before decode step 0. The stage output dumps show outputs, but not necessarily the hidden recurrence state.
 
-3. Build a tiny direct RoPE comparison.
+3. Check whether parity harness prefill and decode use identical GDN layer state lifecycle on ROCm vs CPU/PyTorch.
 
-   Useful approach:
+   The full-model result suggests a difference that the isolated kernel test does not cover. Possibilities include layer-state object reuse, decode runner reset behavior, graph executor fast-decode coherence, or a mismatch in which Q/K/V/head offset path feeds decode.
 
-   - Dump or load one layer's Q_NORM/K_NORM for decode step 3.
-   - Apply the C++ CPU RoPE kernel in isolation with the same `pos_offset`, `theta_base`, `head_dim`, and `rotary_dim`.
-   - Compare against Python `decode_step3_layer3_Q_ROPE.npy` and `K_ROPE.npy`.
-   - Print first head first 64 dims before/after RoPE. A sign/pairing/offset mismatch should be obvious.
+4. Inspect attention after the GDN drop.
 
-4. Check position offset for decode.
+   `ATTENTION_OUTPUT` has the largest early layer-0 cosine drop after GDN. It may be amplifying a small state issue, or it may have its own decode-only issue once GDN output is slightly perturbed.
 
-   HF derives decode `position_ids` from `past_key_values.get_seq_length()`. C++ passes `params_.pos_offset` into RoPE and also materializes `position_ids_cache_` when needed. Verify decode step 3 uses the same absolute position as HF for the prompt length plus decode history.
+5. Treat MoE expert cosine as downstream until routing is stable.
 
-5. Keep attention/MoE downstream for now.
+   Layer-0 MoE expert output looks bad, but the router already selected a different top-1 expert. Fixing upstream GDN/attention/routing agreement should come before digging into expert math again.
 
-   `ATTENTION_CONTEXT`, `ATTENTION_CONTEXT_GATED`, `ATTENTION_OUTPUT`, and later MoE routing drift are downstream of the RoPE mismatch. Do not chase expert math before RoPE is resolved.
+## Current Worktree Notes
 
-## Worktree Notes
+The worktree is intentionally dirty and contains staged WIP from adjacent ROCm MoE/native-VNNI/prefill graph-capture work. Do not reset, checkout, stash, or revert unrelated changes unless explicitly asked.
 
-The worktree is intentionally dirty and includes unrelated staged WIP. Do not reset, checkout, stash, or revert unrelated files unless explicitly asked.
-
-Relevant files touched in this pass:
+Focused status at handover time included:
 
 ```text
-python/reference/pipeline_stages.py
-python/reference/qwen35.py
-python/reference/qwen35_moe.py
-src/v2/snapshots/SnapshotCapture.cpp
-src/v2/execution/compute_stages/stages/QGateSplitStage.cpp
-src/v2/execution/compute_stages/stages/AttentionOutputGateStage.cpp
-src/v2/tensors/TensorKernels.h
-src/v2/kernels/KernelFactory.cpp
-src/v2/kernels/cuda/gdn/CUDAShortConvolution.h
-src/v2/kernels/rocm/gdn/ROCmShortConvolution.h
+MM src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp
+M  src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip
+MM src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip
+ M tests/v2/integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp
+ M tests/v2/unit/execution/Test__GDNKernels.cpp
+?? docs/v2/HANDOVER_QWEN35_MOE_ROCM_DECODE_PARITY_2026-05-20.md
 ```
 
-`git diff --stat` for the most relevant current diffs before this handover showed roughly:
+Additional staged docs unrelated to this continuation were also present:
 
 ```text
-python/reference/pipeline_stages.py                | 12 +++
-python/reference/qwen35.py                         | 90 ++++++++++++++++++++++
-python/reference/qwen35_moe.py                     | 90 ++++++++++++++++++++++
-AttentionOutputGateStage.cpp                       | 11 ++-
-QGateSplitStage.cpp                                |  9 ++-
-KernelFactory.cpp                                  | 10 +++
-CUDAShortConvolution.h                             | 60 ++++++++++++++-
-ROCmShortConvolution.h                             | 60 ++++++++++++++-
-TensorKernels.h                                    |  7 ++
+A  docs/v2/HANDOVER_ROCM_MOE_NATIVE_VNNI_FORMAT_SUPPORT_2026-05-19.md
+A  docs/v2/HANDOVER_ROCM_QWEN35_MOE_PREFILL_PARITY_ROOT_CAUSE_2026-05-19.md
+A  docs/v2/PREFILL_HIP_GRAPH_CAPTURE_PLAN.md
 ```
 
-Editor diagnostics are noisy for Python reference files because of existing type-checker complaints around HuggingFace constructors/hooks. `python -m py_compile` succeeds for the edited Python modules.
+Diff stat for this continuation's two regression test files before adding this handover document:
 
-## Key Takeaway
+```text
+tests/v2/integration/kernels/rocm/Test__NativeVNNI_GEMV.cpp | 114 +++++-
+tests/v2/unit/execution/Test__GDNKernels.cpp               | 393 +++++++++++++++++++++
+2 files changed, 505 insertions(+), 2 deletions(-)
+```
 
-Do not continue explaining the full-attention drop as FP16 KV cache unless new evidence appears. The current best lead is a Qwen3.5 RoPE convention/position/layout mismatch shared by CPU and ROCm: projections and Q/K norms match, then Q_ROPE/K_ROPE diverge sharply.
+## Useful Memory Note
+
+A repository memory was saved at:
+
+```text
+/memories/repo/qwen35-moe-rocm-decode-layer0.md
+```
+
+It records the current invariant: standalone native-VNNI GEMV split-K now passes all-codebook coverage, while the remaining decode loss starts in full-model layer-0 decode after clean prefill.

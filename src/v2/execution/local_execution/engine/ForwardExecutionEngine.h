@@ -173,6 +173,20 @@ namespace llaminar2
         /** Clear all cache entries (invalidate + remove). */
         void clearCache();
 
+        /**
+         * @brief Reset GPU graph replay state without discarding cached forward graphs.
+         *
+         * Used at request/session boundaries after the orchestrator clears KV and
+         * model recurrent state. Keeping the ComputeGraph avoids weight re-coherence;
+         * resetting captured graph segments ensures the next decode replay lifecycle
+         * starts from the newly cleared session state.
+         */
+        void resetSessionReplayState()
+        {
+            for (auto &entry : cache_)
+                entry.second.resetReplayState();
+        }
+
         /** Check if cache is empty. */
         [[nodiscard]] bool cacheEmpty() const { return cache_.empty(); }
 
@@ -182,7 +196,7 @@ namespace llaminar2
          * @param visitor Callback receiving (IComputeStage*) for each match.
          */
         void forEachCachedStage(ComputeStageType type,
-                                const std::function<void(IComputeStage*)>& visitor) const;
+                                const std::function<void(IComputeStage *)> &visitor) const;
 
         // ----- Mutable Execution Flags -----
 

@@ -43,7 +43,7 @@ TEST(Test__StageRunPolicy, FullPolicy_AllFeaturesEnabled)
     EXPECT_TRUE(p.collective_intercept);
     EXPECT_TRUE(p.stage_dump);
     EXPECT_TRUE(p.snapshot_callback);
-    EXPECT_FALSE(p.timeline);           // Off by default in full
+    EXPECT_TRUE(p.timeline);            // On by default in full (prefill profiling)
     EXPECT_FALSE(p.pointer_validation); // Off by default in full
 }
 

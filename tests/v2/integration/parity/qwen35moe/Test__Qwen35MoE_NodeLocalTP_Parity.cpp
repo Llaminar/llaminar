@@ -54,12 +54,15 @@ static const std::vector<std::string> kNodeLocalTPMoEExcludedStages = {
     "Q_ROPE",
     "K_ROPE",
     "ATTENTION_CONTEXT",
+    "FA_GATE",
+    "ATTENTION_CONTEXT_GATED",
     // --- FFN sharded intermediates (shared expert TP) ---
     "FFN_GATE",
     "FFN_UP",
     "FFN_SWIGLU",
     // --- GDN-specific: column-parallel slices ---
     "QKV_PROJECTION",
+    "GDN_CONV1D_OUTPUT",
     "GDN_Z_PROJECTION",
     "GDN_DELTA_RULE_OUTPUT",
     "GDN_NORM_GATE_OUTPUT",

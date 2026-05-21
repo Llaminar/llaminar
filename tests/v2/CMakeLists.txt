@@ -1191,6 +1191,22 @@ add_v2_test(V2_Unit_StageRunPolicy
     MPI_PROCS 1
 )
 
+# Test: StageTimeline - GPU event-based timeline profiler regression tests
+add_executable(v2_unit_stage_timeline unit/execution/local_execution/graph/Test__StageTimeline.cpp)
+target_include_directories(v2_unit_stage_timeline PRIVATE 
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_unit_stage_timeline 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_StageTimeline
+    COMMAND $<TARGET_FILE:v2_unit_stage_timeline>
+    LABELS "V2;Unit;DeviceGraphExecutor;Execution;StageTimeline;GraphCapture"
+    MPI_PROCS 1
+)
+
 # Test: MockMPIContext - Mock MPI context for unit testing distributed logic
 add_executable(v2_unit_mock_mpi_context unit/mocks/Test__MockMPIContext.cpp)
 target_include_directories(v2_unit_mock_mpi_context PRIVATE 

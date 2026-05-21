@@ -1622,8 +1622,9 @@ namespace llaminar2::test::parity
          * Snapshots with a lower version will be automatically regenerated.
          *   v1: original format (V-head reversal applied to all models)
          *   v2: MoE-only V-head reversal (dense models skip reversal)
+         *   v3: Qwen3.5 prefill GDN conv and Q/K norm snapshots match C++ layout
          */
-        static constexpr int kRequiredSnapshotVersion = 2;
+        static constexpr int kRequiredSnapshotVersion = 3;
 
         /**
          * @brief Read snapshot_version from metadata.txt

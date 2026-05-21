@@ -10,7 +10,7 @@
 #   1. Integration build
 #   2. Unit tests (parallel)
 #   3. Integration tests — develop/master only (excl. Parity & RCCL)
-#   4. Focused parity baseline (27 tests, all model families, sequential)
+#   4. Focused parity baseline (32 tests, all model families, sequential)
 #   5. E2E server integration tests
 #   6. Performance regression benchmarks
 # Override with: git commit --no-verify
@@ -122,7 +122,7 @@ fi
 # and ExpertOverlay (tiered same-layer expert residency).
 # Runs on ALL branches to catch accuracy regressions early.
 if $FULL_SUITE; then PARITY_STEP=4; else PARITY_STEP=3; fi
-echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (30 tests, all model families)...${NC}"
+echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (32 tests, all model families)...${NC}"
 echo ""
 
 set +e
@@ -209,7 +209,7 @@ echo -e "${GREEN}  • Unit tests: OK${NC}"
 if $FULL_SUITE; then
 echo -e "${GREEN}  • Integration tests: OK${NC}"
 fi
-echo -e "${GREEN}  • Parity baseline (27 tests): OK${NC}"
+echo -e "${GREEN}  • Parity baseline (32 tests): OK${NC}"
 echo -e "${GREEN}  • E2E server tests: OK${NC}"
 echo -e "${GREEN}  • Performance benchmarks: OK${NC}"
 echo ""

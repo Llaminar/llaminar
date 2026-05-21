@@ -149,6 +149,15 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
                 return t.transpose(1, 2).contiguous().reshape(t.shape[0], t.shape[2], -1)
             return t
 
+        def _flatten_seq_head_tensor(t):
+            if t.dim() == 4:
+                return t.contiguous().reshape(t.shape[0], t.shape[1], -1)
+            return t
+
+        def _conv1d_prefill_boundary(inp, out):
+            seq_len = inp[0].shape[-1] if isinstance(inp, tuple) and inp else out.shape[-1]
+            return torch.nn.functional.silu(out[:, :, :seq_len]).transpose(1, 2).contiguous()
+
         def _capture_apply_rotary_pos_emb(q, k, cos, sin, *args, **kwargs):
             q_rope, k_rope = original_apply_rotary(q, k, cos, sin, *args, **kwargs)
             layer_idx = self._active_fa_rope_layer
@@ -238,14 +247,14 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
 
                 def _q_norm(mod, inp, out, i=idx):
                     if self._should_capture(PipelineStage.Q_NORM):
-                        self.capture_stage(PipelineStage.Q_NORM, _flatten_head_tensor(out), i)
+                        self.capture_stage(PipelineStage.Q_NORM, _flatten_seq_head_tensor(out), i)
                 self._hook_handles.append(
                     fa.q_norm.register_forward_hook(_q_norm)
                 )
 
                 def _k_norm(mod, inp, out, i=idx):
                     if self._should_capture(PipelineStage.K_NORM):
-                        self.capture_stage(PipelineStage.K_NORM, _flatten_head_tensor(out), i)
+                        self.capture_stage(PipelineStage.K_NORM, _flatten_seq_head_tensor(out), i)
                 self._hook_handles.append(
                     fa.k_norm.register_forward_hook(_k_norm)
                 )
@@ -280,7 +289,7 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
                 # Conv1d output (after SiLU activation)
                 def _conv1d_out(mod, inp, out, i=idx):
                     if self._should_capture(PipelineStage.GDN_CONV1D_OUTPUT):
-                        self.capture_stage(PipelineStage.GDN_CONV1D_OUTPUT, out, i)
+                        self.capture_stage(PipelineStage.GDN_CONV1D_OUTPUT, _conv1d_prefill_boundary(inp, out), i)
                 self._hook_handles.append(
                     gdn.conv1d.register_forward_hook(_conv1d_out)
                 )

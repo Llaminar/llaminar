@@ -475,6 +475,16 @@ namespace llaminar2
 
         ActivationPrecision k_precision() const override { return Precision; }
 
+        /**
+         * @brief Reset ring metadata and scrub persistent device buffers.
+         *
+         * ROCm decode graph reuse keeps the KV cache object alive across chat
+         * requests. Host-side head/count reset is not sufficient when a stale
+         * device-side read path can observe old cache contents, so the ROCm
+         * cache clears its persistent K/V and scratch pool at request boundaries.
+         */
+        void clear() override;
+
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
