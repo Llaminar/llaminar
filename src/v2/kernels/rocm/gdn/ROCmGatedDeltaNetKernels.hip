@@ -255,6 +255,7 @@ void rocm_gdn_chunk_forward_kernel(
     const float *__restrict__ dt_bias,
     float *__restrict__ output,
     float *__restrict__ state,
+    const int *__restrict__ effective_seq_len_ptr,
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm)
 {
@@ -296,6 +297,13 @@ void rocm_gdn_chunk_forward_kernel(
         dt_bias_h = dt_bias[h];
     }
     __syncthreads();
+
+    int effective_seq_len = seq_len;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+    }
 
     // =====================================================================
     // REGISTER-CACHED STATE: Load state into registers ONCE
@@ -358,6 +366,12 @@ void rocm_gdn_chunk_forward_kernel(
         const float *k_src = K + t * qk_stride + h * d_k;
         const float *v_src = V + t * v_stride + h * d_v;
         float *o_dst = output + t * v_stride + h * d_v;
+
+        if (t >= effective_seq_len) {
+            if (vi < d_v && split_id == 0)
+                o_dst[vi] = 0.0f;
+            continue;
+        }
 
         // Load Q and K into shared memory (all threads cooperate)
         for (int i = tid; i < d_k; i += block_size) {
@@ -606,32 +620,49 @@ __global__ void rocm_short_conv1d_prefill_kernel(
     const float *__restrict__ bias,
     float *__restrict__ output,
     float *__restrict__ conv_state,
+    const int *__restrict__ effective_seq_len_ptr,
     int seq_len, int channels, int kernel_size,
     bool apply_silu)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ks_minus1 = kernel_size - 1;
     int total = seq_len * channels;
-    if (idx >= total) return;
+    int state_total = channels * ks_minus1;
+    int total_work = total > state_total ? total : state_total;
+    if (idx >= total_work) return;
 
-    int t = idx / channels;
-    int ch = idx % channels;
-
-    float sum = 0.0f;
-    for (int k = 0; k < kernel_size; k++) {
-        int src_t = t - (kernel_size - 1) + k;
-        float val = (src_t >= 0) ? input[src_t * channels + ch] : 0.0f;
-        sum += val * weight[ch * kernel_size + k];
+    int effective_seq_len = seq_len;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
     }
 
-    if (bias) sum += bias[ch];
-    if (apply_silu)
-        sum = sum / (1.0f + expf(-sum));
-    output[t * channels + ch] = sum;
+    if (idx < total) {
+        int t = idx / channels;
+        int ch = idx % channels;
 
-    int ks_minus1 = kernel_size - 1;
-    if (t >= seq_len - ks_minus1 && conv_state) {
-        int state_idx = t - (seq_len - ks_minus1);
-        conv_state[ch * ks_minus1 + state_idx] = input[t * channels + ch];
+        float sum = 0.0f;
+        if (t < effective_seq_len) {
+            for (int k = 0; k < kernel_size; k++) {
+                int src_t = t - ks_minus1 + k;
+                float val = (src_t >= 0) ? input[src_t * channels + ch] : 0.0f;
+                sum += val * weight[ch * kernel_size + k];
+            }
+
+            if (bias) sum += bias[ch];
+            if (apply_silu)
+                sum = sum / (1.0f + expf(-sum));
+        }
+        output[t * channels + ch] = sum;
+    }
+
+    if (idx < state_total && conv_state) {
+        int ch = idx / ks_minus1;
+        int state_idx = idx % ks_minus1;
+        int src_t = effective_seq_len - ks_minus1 + state_idx;
+        conv_state[ch * ks_minus1 + state_idx] =
+            (src_t >= 0 && src_t < effective_seq_len) ? input[src_t * channels + ch] : 0.0f;
     }
 }
 
@@ -1018,6 +1049,7 @@ bool rocmGDN_chunk_forward(
         dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
         output, state,
+        nullptr,
         seq_len, n_heads, d_k, d_v, use_qk_l2norm);
 
     hipError_t err = hipGetLastError();
@@ -1031,6 +1063,66 @@ bool rocmGDN_chunk_forward(
         if (err != hipSuccess)
         {
             fprintf(stderr, "[rocmGDN_chunk_forward_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rocmGDN_chunk_forward_effective(
+    const float *Q, const float *K, const float *V,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int seq_len, int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    const int *device_effective_seq_len,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE"))
+    {
+        print_pointer_attrs("Q", Q);
+        print_pointer_attrs("K", K);
+        print_pointer_attrs("V", V);
+        print_pointer_attrs("alpha", alpha);
+        print_pointer_attrs("beta", beta_raw);
+        print_pointer_attrs("A_log", A_log);
+        print_pointer_attrs("dt_bias", dt_bias);
+        print_pointer_attrs("output", output);
+        print_pointer_attrs("state", state);
+        print_pointer_attrs("effective_seq_len", device_effective_seq_len);
+    }
+
+    int col_threads = 256;
+    int cols_per_block = col_threads / 4;
+    if (d_v <= 64)
+    {
+        col_threads = 128;
+        cols_per_block = col_threads / 4;
+    }
+    int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+    int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
+
+    hipLaunchKernelGGL(rocm_gdn_chunk_forward_kernel,
+        dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
+        Q, K, V, alpha, beta_raw, A_log, dt_bias,
+        output, state,
+        device_effective_seq_len,
+        seq_len, n_heads, d_k, d_v, use_qk_l2norm);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "[rocmGDN_chunk_forward_effective] %s\n", hipGetErrorString(err));
+        return false;
+    }
+    if (std::getenv("LLAMINAR_ROCM_GDN_SYNC"))
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_chunk_forward_effective_sync] %s\n", hipGetErrorString(err));
             return false;
         }
     }
@@ -1055,17 +1147,58 @@ bool rocmGDN_short_conv1d(
             channels, kernel_size, apply_silu);
     } else {
         int total = seq_len * channels;
+        int state_total = channels * (kernel_size - 1);
+        int total_work = total > state_total ? total : state_total;
         int threads = 256;
-        int blocks = (total + threads - 1) / threads;
+        int blocks = (total_work + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_prefill_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output, conv_state,
+            nullptr,
             seq_len, channels, kernel_size, apply_silu);
     }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         fprintf(stderr, "[rocmGDN_short_conv1d] %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmGDN_short_conv1d_effective(
+    const float *input, const float *weight, const float *bias,
+    float *output, float *conv_state,
+    int seq_len, int channels, int kernel_size,
+    bool apply_silu,
+    const int *device_effective_seq_len,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (seq_len == 1) {
+        int threads = 256;
+        int blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_decode_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, weight, bias, output, conv_state,
+            channels, kernel_size, apply_silu);
+    } else {
+        int total = seq_len * channels;
+        int state_total = channels * (kernel_size - 1);
+        int total_work = total > state_total ? total : state_total;
+        int threads = 256;
+        int blocks = (total_work + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_prefill_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, weight, bias, output, conv_state,
+            device_effective_seq_len,
+            seq_len, channels, kernel_size, apply_silu);
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "[rocmGDN_short_conv1d_effective] %s\n", hipGetErrorString(err));
         return false;
     }
     return true;

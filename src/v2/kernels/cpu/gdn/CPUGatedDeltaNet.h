@@ -26,6 +26,8 @@ namespace llaminar2
     class CPUGatedDeltaNet : public ITensorGatedDeltaNet
     {
     public:
+        bool supportsPaddedPrefillRealLength() const override { return true; }
+
         bool chunk_forward(
             const float *Q, const float *K, const float *V,
             const float *alpha, const float *beta_raw,
@@ -57,9 +59,9 @@ namespace llaminar2
         void ensureScratch(int seq_len, int n_heads, int d_k, int d_v);
 
         // Reusable scratch buffers (grow-only, never shrink during lifetime)
-        std::vector<float> q_scratch_;       ///< Preprocessed Q buffer
-        std::vector<float> k_scratch_;       ///< Preprocessed K buffer
-        std::vector<float> gate_scratch_;    ///< Gate values
+        std::vector<float> q_scratch_;        ///< Preprocessed Q buffer
+        std::vector<float> k_scratch_;        ///< Preprocessed K buffer
+        std::vector<float> gate_scratch_;     ///< Gate values
         std::vector<float> beta_sig_scratch_; ///< Sigmoid of beta
     };
 

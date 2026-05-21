@@ -6,6 +6,8 @@
 #include <gtest/gtest.h>
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
+#include "execution/local_execution/engine/PrefillBucketUtils.h"
+#include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/engine/PrefillGraphCache.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "backends/DeviceId.h"
@@ -38,6 +40,30 @@ class NonCapturableMockStage : public MockComputeStage
 public:
     NonCapturableMockStage(std::string name, DeviceId dev)
         : MockComputeStage(ComputeStageType::GEMM, std::move(name), dev) {}
+
+    bool isGraphCapturable() const override { return false; }
+};
+
+/**
+ * @brief Mock stateful GDN/short-conv stage that implements padded real-length replay.
+ */
+class PaddedRealLengthContractMockStage : public MockComputeStage
+{
+public:
+    PaddedRealLengthContractMockStage(ComputeStageType type, std::string name, DeviceId dev)
+        : MockComputeStage(type, std::move(name), dev) {}
+
+    bool supportsPaddedPrefillRealLengthContract() const override { return true; }
+};
+
+/**
+ * @brief Mock stateful stage that has the real-length contract but is not graph-capturable.
+ */
+class NonCapturablePaddedRealLengthContractMockStage : public PaddedRealLengthContractMockStage
+{
+public:
+    NonCapturablePaddedRealLengthContractMockStage(ComputeStageType type, std::string name, DeviceId dev)
+        : PaddedRealLengthContractMockStage(type, std::move(name), dev) {}
 
     bool isGraphCapturable() const override { return false; }
 };
@@ -182,6 +208,182 @@ TEST(Test__PrefillGraphCache, DefaultConfig_MatchesExpectedDefaults)
     EXPECT_EQ(config.min_seq_len, 256);
     EXPECT_FALSE(config.trace);
     EXPECT_FALSE(config.buckets_enabled);
+    EXPECT_EQ(config.max_cached_entries, 10u);
+}
+
+// =============================================================================
+// Test: Phase 6 bucket selection and chunk planning helpers
+// =============================================================================
+
+TEST(Test__PrefillGraphCache, BucketSelection_ExactBucket)
+{
+    auto selection = selectPrefillGraphBucket(512, defaultPrefillGraphBuckets());
+
+    ASSERT_TRUE(selection);
+    EXPECT_EQ(selection.real_seq_len, 512);
+    EXPECT_EQ(selection.bucket_seq_len, 512);
+    EXPECT_TRUE(selection.exact);
+}
+
+TEST(Test__PrefillGraphCache, BucketSelection_JustOverBucket)
+{
+    auto selection = selectPrefillGraphBucket(513, defaultPrefillGraphBuckets());
+
+    ASSERT_TRUE(selection);
+    EXPECT_EQ(selection.real_seq_len, 513);
+    EXPECT_EQ(selection.bucket_seq_len, 544);
+    EXPECT_FALSE(selection.exact);
+}
+
+TEST(Test__PrefillGraphCache, BucketSelection_RejectsAboveMaximum)
+{
+    auto selection = selectPrefillGraphBucket(5000, defaultPrefillGraphBuckets());
+
+    EXPECT_FALSE(selection);
+    EXPECT_EQ(selection.bucket_seq_len, 0);
+    EXPECT_NE(selection.error.find("largest"), std::string::npos);
+}
+
+TEST(Test__PrefillGraphCache, BucketSelection_NormalizesConfiguredBuckets)
+{
+    const std::vector<int> unsorted = {512, -1, 128, 128, 64, 0, 256};
+    auto normalized = normalizePrefillGraphBuckets(unsorted);
+
+    EXPECT_EQ(normalized, (std::vector<int>{64, 128, 256, 512}));
+
+    auto selection = selectPrefillGraphBucket(129, unsorted);
+    ASSERT_TRUE(selection);
+    EXPECT_EQ(selection.bucket_seq_len, 256);
+}
+
+TEST(Test__PrefillGraphCache, BucketPadding_CopiesRealTokensAndPadsTail)
+{
+    const int tokens[] = {10, 11, 12};
+    auto padded = padPrefillTokensToBucket(tokens, 3, 5, 42);
+
+    EXPECT_EQ(padded, (std::vector<int>{10, 11, 12, 42, 42}));
+}
+
+TEST(Test__PrefillGraphCache, ChunkPlanning_UsesLargestBucketsThenRemainder)
+{
+    const std::vector<int> buckets = {64, 128, 256};
+    auto chunks = planPrefillChunks(600, buckets);
+
+    ASSERT_EQ(chunks.size(), 3u);
+    EXPECT_EQ(chunks[0].token_offset, 0);
+    EXPECT_EQ(chunks[0].real_count, 256);
+    EXPECT_EQ(chunks[0].bucket_seq_len, 256);
+    EXPECT_EQ(chunks[1].token_offset, 256);
+    EXPECT_EQ(chunks[1].real_count, 256);
+    EXPECT_EQ(chunks[1].bucket_seq_len, 256);
+    EXPECT_EQ(chunks[2].token_offset, 512);
+    EXPECT_EQ(chunks[2].real_count, 88);
+    EXPECT_EQ(chunks[2].bucket_seq_len, 128);
+}
+
+TEST(Test__PrefillGraphCache, ChunkPositionIds_ExactChunk)
+{
+    auto position_ids = buildPrefillChunkPositionIds(
+        /*real_count=*/5,
+        /*bucket_seq_len=*/5,
+        /*token_offset=*/0);
+
+    EXPECT_EQ(position_ids, (std::vector<int>{0, 1, 2, 3, 4}));
+}
+
+TEST(Test__PrefillGraphCache, ChunkPositionIds_PaddedFinalChunkUsesAbsolutePositions)
+{
+    auto position_ids = buildPrefillChunkPositionIds(
+        /*real_count=*/3,
+        /*bucket_seq_len=*/5,
+        /*token_offset=*/512);
+
+    EXPECT_EQ(position_ids, (std::vector<int>{512, 513, 514, 515, 516}));
+}
+
+TEST(Test__PrefillGraphCache, ChunkPositionIds_ReplicatesAcrossBatches)
+{
+    auto position_ids = buildPrefillChunkPositionIds(
+        /*real_count=*/3,
+        /*bucket_seq_len=*/4,
+        /*token_offset=*/7,
+        /*batch_size=*/2);
+
+    EXPECT_EQ(position_ids, (std::vector<int>{7, 8, 9, 10, 7, 8, 9, 10}));
+}
+
+TEST(Test__PrefillGraphCache, ChunkPositionIds_RejectsInvalidInputs)
+{
+    EXPECT_TRUE(buildPrefillChunkPositionIds(0, 4, 0).empty());
+    EXPECT_TRUE(buildPrefillChunkPositionIds(5, 4, 0).empty());
+    EXPECT_TRUE(buildPrefillChunkPositionIds(3, 4, -1).empty());
+    EXPECT_TRUE(buildPrefillChunkPositionIds(3, 4, 0, 0).empty());
+}
+
+TEST(Test__PrefillGraphCache, ForwardSignature_BucketedPrefillUsesBucketShape)
+{
+    ForwardGraphSignature first{};
+    first.seq_len = 768;
+    first.batch_size = 1;
+    first.device = makeGPUKey(768).device_id;
+    first.decode = false;
+    first.standard_path = true;
+    first.is_bucketed_prefill = true;
+    first.bucket_seq_len = 768;
+
+    ForwardGraphSignature second = first;
+    ForwardGraphSignature exact_shape_without_bucket = first;
+    exact_shape_without_bucket.is_bucketed_prefill = false;
+    exact_shape_without_bucket.bucket_seq_len = 0;
+    ForwardGraphSignature different_bucket = first;
+    different_bucket.seq_len = 1024;
+    different_bucket.bucket_seq_len = 1024;
+
+    EXPECT_EQ(first, second);
+    EXPECT_NE(first, exact_shape_without_bucket);
+    EXPECT_NE(first, different_bucket);
+    EXPECT_EQ(ForwardGraphSignatureHash{}(first), ForwardGraphSignatureHash{}(second));
+}
+
+TEST(Test__PrefillGraphCache, ChunkExecutionInput_BuildsExactChunkBuffers)
+{
+    const std::vector<int> tokens = {10, 11, 12, 13};
+    const PrefillChunkPlan chunk{0, 4, 4};
+
+    auto input = buildPrefillChunkExecutionInput(tokens.data(), static_cast<int>(tokens.size()), chunk, 99);
+
+    ASSERT_TRUE(input);
+    EXPECT_EQ(input.token_offset, 0);
+    EXPECT_EQ(input.real_count, 4);
+    EXPECT_EQ(input.bucket_seq_len, 4);
+    EXPECT_EQ(input.token_ids, tokens);
+    EXPECT_EQ(input.position_ids, (std::vector<int>{0, 1, 2, 3}));
+}
+
+TEST(Test__PrefillGraphCache, ChunkExecutionInput_BuildsPaddedFinalChunkBuffers)
+{
+    const std::vector<int> tokens = {10, 11, 12, 13, 14, 15};
+    const PrefillChunkPlan chunk{4, 2, 4};
+
+    auto input = buildPrefillChunkExecutionInput(tokens.data(), static_cast<int>(tokens.size()), chunk, 99);
+
+    ASSERT_TRUE(input) << input.error;
+    EXPECT_EQ(input.token_offset, 4);
+    EXPECT_EQ(input.real_count, 2);
+    EXPECT_EQ(input.bucket_seq_len, 4);
+    EXPECT_EQ(input.token_ids, (std::vector<int>{14, 15, 99, 99}));
+    EXPECT_EQ(input.position_ids, (std::vector<int>{4, 5, 6, 7}));
+}
+
+TEST(Test__PrefillGraphCache, ChunkExecutionInput_RejectsOutOfRangeChunk)
+{
+    const std::vector<int> tokens = {10, 11, 12};
+    const PrefillChunkPlan chunk{2, 2, 4};
+
+    auto input = buildPrefillChunkExecutionInput(tokens.data(), static_cast<int>(tokens.size()), chunk, 99);
+
+    EXPECT_FALSE(input);
+    EXPECT_NE(input.error.find("exceeds"), std::string::npos);
 }
 
 // =============================================================================
@@ -335,6 +537,176 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsEmptyCollectiveSet)
     EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWithUnsupportedGDNState)
+{
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+    auto key = makeGPUKey(768);
+    ComputeGraph graph;
+    graph.addNode("gdn_recurrence",
+                  std::make_unique<MockComputeStage>(
+                      ComputeStageType::GDN_RECURRENCE,
+                      "gdn_recurrence",
+                      key.device_id),
+                  key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/513,
+        /*bucket_seq_len=*/768);
+
+    EXPECT_EQ(reason, PrefillGraphRejectReason::GDNWithPaddedBucket);
+    EXPECT_STREQ(toString(reason), "GDNWithPaddedBucket");
+}
+
+TEST(Test__PrefillGraphCache, Preflight_AcceptsPaddedBucketWithSupportedGDNState)
+{
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+    auto key = makeGPUKey(768);
+    ComputeGraph graph;
+    graph.addNode("short_conv",
+                  std::make_unique<PaddedRealLengthContractMockStage>(
+                      ComputeStageType::SHORT_CONV1D,
+                      "short_conv",
+                      key.device_id),
+                  key.device_id);
+    graph.addNode("gdn_recurrence",
+                  std::make_unique<PaddedRealLengthContractMockStage>(
+                      ComputeStageType::GDN_RECURRENCE,
+                      "gdn_recurrence",
+                      key.device_id),
+                  key.device_id);
+    graph.addDependency("gdn_recurrence", "short_conv");
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/513,
+        /*bucket_seq_len=*/768);
+
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketIfAnyGDNStateLacksContract)
+{
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+    auto key = makeGPUKey(768);
+    ComputeGraph graph;
+    graph.addNode("short_conv",
+                  std::make_unique<PaddedRealLengthContractMockStage>(
+                      ComputeStageType::SHORT_CONV1D,
+                      "short_conv",
+                      key.device_id),
+                  key.device_id);
+    graph.addNode("gdn_recurrence",
+                  std::make_unique<MockComputeStage>(
+                      ComputeStageType::GDN_RECURRENCE,
+                      "gdn_recurrence",
+                      key.device_id),
+                  key.device_id);
+    graph.addDependency("gdn_recurrence", "short_conv");
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/513,
+        /*bucket_seq_len=*/768);
+
+    EXPECT_EQ(reason, PrefillGraphRejectReason::GDNWithPaddedBucket);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_RejectsSupportedPaddedGDNWhenStageIsNotCapturable)
+{
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+    auto key = makeGPUKey(768);
+    ComputeGraph graph;
+    graph.addNode("gdn_recurrence",
+                  std::make_unique<NonCapturablePaddedRealLengthContractMockStage>(
+                      ComputeStageType::GDN_RECURRENCE,
+                      "gdn_recurrence",
+                      key.device_id),
+                  key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/513,
+        /*bucket_seq_len=*/768);
+
+    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketWhenBucketsDisabled)
+{
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = false;
+    PrefillGraphCache cache(config);
+    auto key = makeGPUKey(768);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/513,
+        /*bucket_seq_len=*/768);
+
+    EXPECT_EQ(reason, PrefillGraphRejectReason::FeatureDisabled);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_AllowsExactBucketWithGDNState)
+{
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    PrefillGraphCache cache(config);
+    auto key = makeGPUKey(768);
+    ComputeGraph graph;
+    graph.addNode("gdn_recurrence",
+                  std::make_unique<MockComputeStage>(
+                      ComputeStageType::GDN_RECURRENCE,
+                      "gdn_recurrence",
+                      key.device_id),
+                  key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/768,
+        /*bucket_seq_len=*/768);
+
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
 // =============================================================================
 // Test: Invalidation
 // =============================================================================
@@ -464,6 +836,84 @@ TEST(Test__PrefillGraphCache, CacheKey_DifferentSeqLensAreDistinct)
 
     cache.markWarmedUp(key2);
     EXPECT_EQ(cache.size(), 2u);
+}
+
+TEST(Test__PrefillGraphCache, Capacity_EvictsLeastRecentlyUsedBucket)
+{
+    PrefillGraphConfig config;
+    config.max_cached_entries = 2;
+    PrefillGraphCache cache(config);
+
+    auto key64 = makeGPUKey(64);
+    auto key128 = makeGPUKey(128);
+    auto key256 = makeGPUKey(256);
+
+    cache.markWarmedUp(key64);
+    cache.markWarmedUp(key128);
+    EXPECT_EQ(cache.size(), 2u);
+
+    // Touch key64 so key128 is the least-recently-used entry when the third
+    // bucket is inserted.
+    cache.markWarmedUp(key64);
+    cache.markWarmedUp(key256);
+
+    EXPECT_EQ(cache.size(), 2u);
+    EXPECT_EQ(cache.phase(key64), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.phase(key128), PrefillGraphPhase::Cold);
+    EXPECT_EQ(cache.phase(key256), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.evictionCount(), 1u);
+}
+
+TEST(Test__PrefillGraphCache, Capacity_EvictedBucketWarmsAndCapturesAgain)
+{
+    PrefillGraphConfig config;
+    config.max_cached_entries = 1;
+    PrefillGraphCache cache(config);
+    PrefillMockGPUContext gpu_ctx;
+    void *explicit_stream = gpu_ctx.createStream();
+
+    auto key256 = makeGPUKey(256);
+    auto key512 = makeGPUKey(512);
+
+    // First lifecycle for key256: warm up, capture, instantiate, and become ready.
+    cache.markWarmedUp(key256);
+    ASSERT_TRUE(cache.beginCapture(key256, &gpu_ctx, explicit_stream));
+    ASSERT_TRUE(cache.endCaptureAndInstantiate(key256));
+    EXPECT_EQ(cache.phase(key256), PrefillGraphPhase::Ready);
+    EXPECT_EQ(cache.warmupCount(key256), 1u);
+    EXPECT_EQ(cache.captureCount(key256), 1u);
+
+    // Inserting key512 evicts key256 because the cap is one entry.
+    cache.markWarmedUp(key512);
+    EXPECT_EQ(cache.phase(key256), PrefillGraphPhase::Cold);
+    EXPECT_EQ(cache.phase(key512), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.evictionCount(), 1u);
+
+    // A new key256 request must explicitly warm and capture again. Lifetime
+    // counters survive the eviction, so the test distinguishes recapture from
+    // any silent normal-path execution that would leave these counts unchanged.
+    cache.markWarmedUp(key256);
+    ASSERT_TRUE(cache.beginCapture(key256, &gpu_ctx, explicit_stream));
+    ASSERT_TRUE(cache.endCaptureAndInstantiate(key256));
+
+    EXPECT_EQ(cache.phase(key256), PrefillGraphPhase::Ready);
+    EXPECT_EQ(cache.warmupCount(key256), 2u);
+    EXPECT_EQ(cache.captureCount(key256), 2u);
+    EXPECT_EQ(cache.evictionCount(), 2u);
+}
+
+TEST(Test__PrefillGraphCache, Capacity_ZeroMeansUnlimited)
+{
+    PrefillGraphConfig config;
+    config.max_cached_entries = 0;
+    PrefillGraphCache cache(config);
+
+    cache.markWarmedUp(makeGPUKey(64));
+    cache.markWarmedUp(makeGPUKey(128));
+    cache.markWarmedUp(makeGPUKey(256));
+
+    EXPECT_EQ(cache.size(), 3u);
+    EXPECT_EQ(cache.evictionCount(), 0u);
 }
 
 TEST(Test__PrefillGraphCache, CacheKey_PlacementEpochDifference)

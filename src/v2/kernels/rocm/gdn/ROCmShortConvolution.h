@@ -25,6 +25,14 @@ extern "C"
         bool apply_silu,
         int device_idx, void *stream);
 
+    bool rocmGDN_short_conv1d_effective(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *conv_state,
+        int seq_len, int channels, int kernel_size,
+        bool apply_silu,
+        const int *device_effective_seq_len,
+        int device_idx, void *stream);
+
     // GPU memory helpers (implemented in ROCmGatedDeltaNetKernels.hip)
     bool rocmGDN_gpu_malloc(float **ptr, size_t count);
     void rocmGDN_gpu_free(float *ptr);
@@ -54,6 +62,7 @@ namespace llaminar2
         void allocateGPUState(int state_size) override { allocateState(state_size); }
         bool allocateGPUScratch(int scratch_size) override { return allocateScratch(scratch_size); }
         void resetGPUState() override { resetState(); }
+        bool supportsPaddedPrefillRealLength() const override { return true; }
 
         void allocateState(int state_size)
         {
@@ -134,6 +143,54 @@ namespace llaminar2
             const bool ok = rocmGDN_short_conv1d(
                 input, weight, bias, effective_output, effective_state,
                 seq_len, channels, kernel_size, apply_silu,
+                device_ordinal_, stream_);
+            if (!ok)
+                return false;
+
+            if (needs_scratch)
+            {
+                const size_t count = static_cast<size_t>(seq_len) * static_cast<size_t>(channels);
+                rocmGDN_gpu_memcpy_async(output, scratch_, count, stream_);
+            }
+
+            return true;
+        }
+
+        bool forwardWithEffectiveSeqLen(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int channels, int kernel_size,
+            const int *device_effective_seq_len,
+            bool apply_silu = true) override
+        {
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const int required_state_size = channels * (kernel_size - 1);
+            if (!gpu_state_ || state_size_ != required_state_size)
+                allocateState(required_state_size);
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[ROCmShortConvolution] Missing GPU convolution state");
+                return false;
+            }
+
+            float *effective_output = output;
+            const bool needs_scratch = (seq_len > 1 && input == output);
+            if (needs_scratch)
+            {
+                const int required_scratch_size = seq_len * channels;
+                if (!scratch_ || scratch_size_ < required_scratch_size)
+                {
+                    LOG_ERROR("[ROCmShortConvolution] In-place prefill scratch was not preallocated: need "
+                              << required_scratch_size << " floats, have " << scratch_size_);
+                    return false;
+                }
+                effective_output = scratch_;
+            }
+
+            const bool ok = rocmGDN_short_conv1d_effective(
+                input, weight, bias, effective_output, gpu_state_,
+                seq_len, channels, kernel_size, apply_silu,
+                device_effective_seq_len,
                 device_ordinal_, stream_);
             if (!ok)
                 return false;

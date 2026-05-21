@@ -6,6 +6,7 @@
 
 #include "CUDARingKVCacheTQ.h"
 #include "CUDATurboQuantKernels.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../backends/GPUDeviceContextPool.h"
@@ -54,8 +55,8 @@ namespace llaminar2
         v_pos_bytes_ = static_cast<size_t>(n_kv_heads) * v_block_size_;
 
         LOG_DEBUG("CUDARingKVCacheTQ: K block=" << k_block_size_ << "B, V block=" << v_block_size_
-                                               << "B, per-position: K=" << k_pos_bytes_ << "B V=" << v_pos_bytes_ << "B"
-                                               << " (vs FP16: " << (n_kv_heads * head_dim * 2 * 2) << "B)");
+                                                << "B, per-position: K=" << k_pos_bytes_ << "B V=" << v_pos_bytes_ << "B"
+                                                << " (vs FP16: " << (n_kv_heads * head_dim * 2 * 2) << "B)");
 
         // Upload codebooks to constant memory
         cuda_tq_upload_codebooks(0);
@@ -79,9 +80,9 @@ namespace llaminar2
                                 sizeof(float), cudaMemcpyDeviceToHost, init_stream);
                 cudaStreamSynchronize(init_stream);
                 LOG_DEBUG("[CUDARingKVCacheTQ] Rotation check: CPU[0,0]=" << cpu_rot.matrix[0]
-                                                                         << " GPU[0,0]=" << gpu_rot_val
-                                                                         << " match=" << (std::abs(cpu_rot.matrix[0] - gpu_rot_val) < 1e-6f)
-                                                                         << " seed=" << tq_ctx->rotation().seed);
+                                                                          << " GPU[0,0]=" << gpu_rot_val
+                                                                          << " match=" << (std::abs(cpu_rot.matrix[0] - gpu_rot_val) < 1e-6f)
+                                                                          << " seed=" << tq_ctx->rotation().seed);
             }
         }
         else
@@ -116,8 +117,8 @@ namespace llaminar2
                                           max_seq_len * (k_pos_bytes_ + v_pos_bytes_);
             const size_t total_scratch_bytes = static_cast<size_t>(n_layers) * 2 * scratch_bytes;
             LOG_DEBUG("CUDARingKVCacheTQ VRAM: TQ caches="
-                     << (total_tq_bytes / 1024) << "KB, per-layer FP16 scratch="
-                     << (total_scratch_bytes / (1024 * 1024)) << "MB (" << n_layers << " layers)");
+                      << (total_tq_bytes / 1024) << "KB, per-layer FP16 scratch="
+                      << (total_scratch_bytes / (1024 * 1024)) << "MB (" << n_layers << " layers)");
         }
 
         // Pre-allocate temp buffers for GPU-side quantization (avoids per-call cudaMalloc)
@@ -141,8 +142,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("CUDARingKVCacheTQ created: " << n_layers << " layers, "
-                                               << max_seq_len << " max_seq_len, " << n_kv_heads << " KV heads, "
-                                               << head_dim << " head_dim on cuda:" << device_id);
+                                                << max_seq_len << " max_seq_len, " << n_kv_heads << " KV heads, "
+                                                << head_dim << " head_dim on cuda:" << device_id);
     }
 
     CUDARingKVCacheTQ::~CUDARingKVCacheTQ()
@@ -277,9 +278,10 @@ namespace llaminar2
         cached_stream_ = stream; // Cache for get_kv_converted()
 
         TQEntry &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
 
         // One-time warning when ring buffer starts wrapping
-        if (entry.count + num_tokens > max_seq_len_ && !wrap_warned_)
+        if (!capture_active && entry.count + num_tokens > max_seq_len_ && !wrap_warned_)
         {
             LOG_WARN("Context window full (" << max_seq_len_
                                              << " tokens). Sliding window is now overwriting oldest tokens. "
@@ -331,13 +333,17 @@ namespace llaminar2
                     v_row_bytes, cudaMemcpyHostToDevice, stream);
             }
 
-            // Update ring buffer state
-            entry.head = (entry.head + num_tokens) % max_seq_len_;
-            entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+            if (!capture_active)
+            {
+                // Host metadata changes only after real execution; graph capture
+                // records kernels and lets replay callbacks advance by real tokens.
+                entry.head = (entry.head + num_tokens) % max_seq_len_;
+                entry.count = std::min(entry.count + num_tokens, max_seq_len_);
 
-            // Invalidate scratch if it holds data for this (layer, seq)
-            if (layer_scratch_[layer].cached_layer == layer && layer_scratch_[layer].cached_seq == seq_idx)
-                layer_scratch_[layer].invalidate();
+                // Invalidate scratch if it holds data for this (layer, seq)
+                if (layer_scratch_[layer].cached_layer == layer && layer_scratch_[layer].cached_seq == seq_idx)
+                    layer_scratch_[layer].invalidate();
+            }
 
             return true;
         }
@@ -381,8 +387,11 @@ namespace llaminar2
                     ring_pos, n_kv_heads_, head_dim_, stream);
             }
 
-            entry.head = (entry.head + 1) % max_seq_len_;
-            entry.count = std::min(entry.count + 1, max_seq_len_);
+            if (!capture_active)
+            {
+                entry.head = (entry.head + 1) % max_seq_len_;
+                entry.count = std::min(entry.count + 1, max_seq_len_);
+            }
             return ok;
         }
 
@@ -462,9 +471,13 @@ namespace llaminar2
             }
         }
 
-        // Update ring buffer state
-        entry.head = (entry.head + num_tokens) % max_seq_len_;
-        entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+        if (!capture_active)
+        {
+            // Update host metadata only for real execution; captured prefill
+            // launches advance metadata through onGraphReplayed().
+            entry.head = (entry.head + num_tokens) % max_seq_len_;
+            entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+        }
 
         // Invalidate scratch — we wrote new data that the scratch doesn't know about
         // (scratch still holds the OLD dequanted content; new position needs dequant)

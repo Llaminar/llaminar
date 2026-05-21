@@ -21,6 +21,7 @@
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
@@ -64,6 +65,7 @@ namespace llaminar2
         static_assert(StageParamsRequired<Params>);
 
         explicit ShortConv1dStage(Params params);
+        ~ShortConv1dStage() override;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::SHORT_CONV1D; }
@@ -81,13 +83,30 @@ namespace llaminar2
         }
         bool hasDynamicParams() const override { return true; }
 
+        bool hasPrefillReplayParams() const override { return true; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
+        bool supportsPaddedPrefillRealLengthContract() const override;
+
         // Short conv1d operates fully on-device when GPU is active — graph-capturable
         bool isGraphCapturable() const override { return true; }
 
         const Params &getParams() const { return params_; }
 
     private:
+        struct GpuEffectiveSeqLenState;
+
         Params params_;
+        int prefill_effective_seq_len_ = 0;
+        int prefill_bucket_seq_len_ = 0;
+        bool prefill_replay_params_set_ = false;
+        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
+
+        int effectivePrefillSeqLen() const;
+        bool shouldUseRealLengthContract() const;
+        bool ensureGpuEffectiveSeqLenStateInitialized();
+        bool uploadGpuEffectiveSeqLen();
+        void refreshPinnedEffectiveSeqLen();
+        void releaseGpuEffectiveSeqLenState();
     };
 
 } // namespace llaminar2

@@ -650,6 +650,9 @@ namespace llaminar2
         int prefill_graph_min_seq = 256;                                       ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
         bool prefill_graph_trace = false;                                      ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
         bool prefill_graph_buckets = false;                                    ///< Enable bucketed capture for server (env: LLAMINAR_PREFILL_GRAPH_BUCKETS)
+        std::vector<int> prefill_graph_bucket_sizes = {64, 128, 256, 384, 512, 544, 576, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096}; ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
+        int prefill_graph_max_cached_buckets = 10;                             ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
+        int prefill_graph_pad_token_id = 0;                                    ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 
         // =================================================================
         // Device Placement / Heterogeneous Execution
@@ -874,6 +877,44 @@ namespace llaminar2
             if (prefill_graph_buckets_env)
             {
                 prefill_graph_buckets = (std::atoi(prefill_graph_buckets_env) != 0);
+            }
+
+            prefill_graph_bucket_sizes = {64, 128, 256, 384, 512, 544, 576, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096};
+            const char *prefill_graph_bucket_sizes_env = std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
+            if (prefill_graph_bucket_sizes_env && *prefill_graph_bucket_sizes_env)
+            {
+                prefill_graph_bucket_sizes.clear();
+                std::stringstream ss(prefill_graph_bucket_sizes_env);
+                std::string token;
+                while (std::getline(ss, token, ','))
+                {
+                    token.erase(0, token.find_first_not_of(" \t"));
+                    const auto last = token.find_last_not_of(" \t");
+                    if (last == std::string::npos)
+                        continue;
+                    token.erase(last + 1);
+
+                    const int bucket = std::atoi(token.c_str());
+                    if (bucket > 0)
+                        prefill_graph_bucket_sizes.push_back(bucket);
+                }
+                std::sort(prefill_graph_bucket_sizes.begin(), prefill_graph_bucket_sizes.end());
+                prefill_graph_bucket_sizes.erase(
+                    std::unique(prefill_graph_bucket_sizes.begin(), prefill_graph_bucket_sizes.end()),
+                    prefill_graph_bucket_sizes.end());
+            }
+
+            prefill_graph_max_cached_buckets = 10;
+            const char *prefill_graph_max_buckets_env = std::getenv("LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS");
+            if (prefill_graph_max_buckets_env)
+            {
+                prefill_graph_max_cached_buckets = std::max(0, std::atoi(prefill_graph_max_buckets_env));
+            }
+
+            const char *prefill_graph_pad_token_env = std::getenv("LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID");
+            if (prefill_graph_pad_token_env)
+            {
+                prefill_graph_pad_token_id = std::atoi(prefill_graph_pad_token_env);
             }
 
             // Model-level operation flags (embedding, lm_head)

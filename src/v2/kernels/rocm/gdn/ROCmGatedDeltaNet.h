@@ -37,6 +37,16 @@ extern "C"
         bool use_qk_l2norm,
         int device_idx, void *stream);
 
+    bool rocmGDN_chunk_forward_effective(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        const int *device_effective_seq_len,
+        int device_idx, void *stream);
+
     // GPU memory helpers (implemented in ROCmGatedDeltaNetKernels.hip)
     bool rocmGDN_gpu_malloc(float **ptr, size_t count);
     void rocmGDN_gpu_free(float *ptr);
@@ -71,6 +81,7 @@ namespace llaminar2
 
         void allocateGPUState(int state_size) override { allocateState(state_size); }
         void resetGPUState() override { resetState(); }
+        bool supportsPaddedPrefillRealLength() const override { return true; }
         bool isGPUStateReady(int required_state_size) const override
         {
             return gpu_state_ != nullptr && state_size_ == required_state_size;
@@ -150,6 +161,43 @@ namespace llaminar2
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                device_ordinal_, stream_);
+        }
+
+        bool chunkForwardWithEffectiveSeqLen(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *device_effective_seq_len) override
+        {
+            (void)chunk_size;
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const int required_state_size = n_heads * d_k * d_v;
+            if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[ROCmGatedDeltaNet::chunkForwardWithEffectiveSeqLen] GPU state allocation during graph capture "
+                              "(need "
+                              << required_state_size << " floats, have " << state_size_ << ")");
+                    return false;
+                }
+                allocateState(required_state_size);
+            }
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[ROCmGatedDeltaNet] Missing GPU recurrence state");
+                return false;
+            }
+
+            return rocmGDN_chunk_forward_effective(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias,
+                output, gpu_state_,
+                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                device_effective_seq_len,
                 device_ordinal_, stream_);
         }
 

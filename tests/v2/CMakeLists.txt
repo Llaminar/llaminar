@@ -30,9 +30,14 @@ if(HAVE_CUDA AND HAVE_ROCM)
     # the default suite; enable this option when debugging CUDA startup itself.
     set(V2_ENABLE_CUDA_GPU_CONTEXT_TESTS_DEFAULT OFF)
 endif()
+set(V2_CUDA_GPU_CONTEXT_TESTS_OPT_IN_HINT
+    "Reconfigure with -DV2_ENABLE_CUDA_GPU_CONTEXT_TESTS=ON to run the _CUDA split tests")
 option(V2_ENABLE_CUDA_GPU_CONTEXT_TESTS
     "Enable CUDA GPU context/graph-capture split tests in dual-backend builds"
     ${V2_ENABLE_CUDA_GPU_CONTEXT_TESTS_DEFAULT})
+if(HAVE_CUDA AND NOT V2_ENABLE_CUDA_GPU_CONTEXT_TESTS)
+    message(STATUS "V2 Tests: Macro-generated CUDA GPU context/graph-capture split tests will be built but registered disabled. ${V2_CUDA_GPU_CONTEXT_TESTS_OPT_IN_HINT}.")
+endif()
 
 # Build GPU tests as one binary per backend. CUDA and HIP device runtimes can
 # register linked device code before main(), so combined CUDA+ROCm test binaries
@@ -96,7 +101,7 @@ function(add_v2_gpu_backend_test TARGET_BASE SOURCE TEST_BASE)
         if(NOT V2_ENABLE_CUDA_GPU_CONTEXT_TESTS AND TEST ${TEST_BASE}_CUDA)
             set_tests_properties(${TEST_BASE}_CUDA PROPERTIES
                 DISABLED TRUE
-                DISABLED_REASON "CUDA context/graph-capture split tests are opt-in for dual-backend builds"
+                DISABLED_REASON "Macro-generated CUDA context/graph-capture split tests are opt-in for dual-backend builds. ${V2_CUDA_GPU_CONTEXT_TESTS_OPT_IN_HINT}."
             )
         endif()
     endif()
@@ -2303,6 +2308,19 @@ add_v2_test(V2_Unit_CPUFlashAttentionKernelT
     MPI_PROCS 1
 )
 
+# Test: CPU attention padding parity for Phase 6 prefill bucket safety
+add_executable(v2_test_attention_padding_parity unit/kernels/cpu/attention/Test__AttentionPaddingParity.cpp)
+target_link_libraries(v2_test_attention_padding_parity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_AttentionPaddingParity
+    COMMAND $<TARGET_FILE:v2_test_attention_padding_parity>
+    LABELS "V2;Unit;Kernels;Attention;Padding;CausalMask;CPU;Phase6"
+    MPI_PROCS 1
+)
+
 # Test: Q16 decode HEAD_MAJOR layout regression (KV cache addressing)
 add_executable(v2_test_q16_decode_head_major unit/kernels/cpu/attention/Test__Q16DecodeHeadMajor.cpp)
 target_link_libraries(v2_test_q16_decode_head_major
@@ -2651,7 +2669,7 @@ target_link_libraries(v2_test_attention_dynamic_kvlen
 )
 add_v2_test(V2_Unit_AttentionComputeStage_DynamicKVLen 
     COMMAND $<TARGET_FILE:v2_test_attention_dynamic_kvlen>
-    LABELS "V2;Unit;Attention;ComputeStage;DynamicKVLen;GraphBufferManagement;Phase9;CPU"
+    LABELS "V2;Unit;Attention;ComputeStage;DynamicKVLen;GraphBufferManagement;Phase9;Phase6;Padding;DecodeContinuation;CPU"
     MPI_PROCS 1  # Single rank for unit testing
 )
 
@@ -4182,6 +4200,16 @@ add_v2_test(V2_Integration_CUDAResidualAddParity
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
 )
 
+# Test: CUDA HiddenStateRowSelectStage graph capture/replay
+# Verifies bucketed-prefill LM-head row selection can update real length across graph replays.
+add_executable(v2_integration_cuda_hidden_state_row_select_stage integration/kernels/cuda/ops/Test__CUDAHiddenStateRowSelectStage.cpp)
+target_link_libraries(v2_integration_cuda_hidden_state_row_select_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAHiddenStateRowSelectStage
+    COMMAND $<TARGET_FILE:v2_integration_cuda_hidden_state_row_select_stage>
+    LABELS "V2;Integration;CUDA;GraphCapture;RowSelect;LMHead;Phase6;FP32"
+    MPI_PROCS 1
+)
+
 # Test: CUDA Flash Attention Parity
 # Tests Flash Attention 2 (prefill) and Flash Decoding (decode) CUDA kernels
 # against CPU attention reference with cosine similarity metrics
@@ -4192,6 +4220,28 @@ add_v2_test(V2_Integration_CUDAFlashAttentionParity
     LABELS "V2;Integration;CUDA;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity"
     MPI_PROCS 1  # Tests GPU vs CPU parity locally, no MPI needed
 )
+
+# Test: CUDA attention padding parity for Phase 6 prefill bucket safety
+# Verifies causal real-row outputs are unchanged by hostile bucket-tail padding
+add_executable(v2_integration_cuda_attention_padding_parity integration/kernels/cuda/attention/Test__CUDAAttentionPaddingParity.cpp)
+target_link_libraries(v2_integration_cuda_attention_padding_parity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAAttentionPaddingParity
+    COMMAND $<TARGET_FILE:v2_integration_cuda_attention_padding_parity>
+    LABELS "V2;Integration;CUDA;Attention;Padding;CausalMask;Phase6;Parity;FP32"
+    MPI_PROCS 1
+)
+
+if(HAVE_CUDA)
+# Test: CUDA padded GDN real-length semantics
+# Verifies effective-length recurrence and short-conv prefill preserve decode state.
+add_executable(v2_integration_cuda_gdn_padded_real_length integration/kernels/cuda/Test__CUDAGDNPaddedRealLength.cpp)
+target_link_libraries(v2_integration_cuda_gdn_padded_real_length llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDAGDNPaddedRealLength
+    COMMAND $<TARGET_FILE:v2_integration_cuda_gdn_padded_real_length>
+    LABELS "V2;Integration;CUDA;GatedDeltaNet;ShortConv;Padding;Phase6;RealLength;FP32"
+    MPI_PROCS 1
+)
+endif()
 
 # Performance: CUDA Flash Attention Throughput Benchmarks
 # Tests FA3 pipelined, WMMA, and scalar prefill + decode kernels
@@ -8342,6 +8392,23 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm Hybrid KV Cache reset regression tests")
 
+    # Integration Test: ROCm Padded GDN Real-Length Semantics
+    # Verifies effective-length recurrence and short-conv prefill preserve decode state.
+    add_executable(v2_integration_rocm_gdn_padded_real_length
+        integration/kernels/rocm/Test__ROCmGDNPaddedRealLength.cpp
+    )
+    target_link_libraries(v2_integration_rocm_gdn_padded_real_length
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmGDNPaddedRealLength
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+        LABELS "V2;Integration;ROCm;GatedDeltaNet;ShortConv;Padding;Phase6;RealLength;FP32;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm padded GDN real-length integration tests")
+
     # Integration Test: ROCm TurboQuant KV Cache
     # Tests ROCmRingKVCacheTQ: TQ8 K / TQ4 V quantized storage, RoPE-on-read, eviction, shadows
     add_executable(v2_integration_rocm_ring_kv_cache_tq 
@@ -8464,6 +8531,40 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Flash Attention parity tests")
+
+    # Integration Test: ROCm attention padding parity for Phase 6 bucket safety
+    # Verifies causal real-row outputs are unchanged by hostile bucket-tail padding
+    add_executable(v2_integration_rocm_attention_padding_parity
+        integration/kernels/rocm/Test__ROCmAttentionPaddingParity.cpp
+    )
+    target_link_libraries(v2_integration_rocm_attention_padding_parity
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmAttentionPaddingParity
+        COMMAND $<TARGET_FILE:v2_integration_rocm_attention_padding_parity>
+        LABELS "V2;Integration;ROCm;Attention;Padding;CausalMask;Phase6;Parity;FP32;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm attention padding parity tests")
+
+    # Integration Test: ROCm HiddenStateRowSelectStage graph capture/replay
+    # Verifies bucketed-prefill LM-head row selection can update real length across HIP graph replays.
+    add_executable(v2_integration_rocm_hidden_state_row_select_stage
+        integration/kernels/rocm/Test__ROCmHiddenStateRowSelectStage.cpp
+    )
+    target_link_libraries(v2_integration_rocm_hidden_state_row_select_stage
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmHiddenStateRowSelectStage
+        COMMAND $<TARGET_FILE:v2_integration_rocm_hidden_state_row_select_stage>
+        LABELS "V2;Integration;ROCm;GraphCapture;RowSelect;LMHead;Phase6;FP32;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm hidden-state row-select graph replay tests")
 
     # ROCm ResidualAdd Parity Tests
     # =============================================================================
@@ -9434,6 +9535,74 @@ add_v2_gpu_backend_test(
 )
 message(STATUS "V2 Tests: Added GPUGraphCaptureExecution integration tests")
 
+# Tests: PrefillGraphCacheExecution - real GPU exact-bucket prefill graph cache lifecycle.
+# These are explicit per-backend integration tests rather than a macro-generated
+# pair so CTest output is direct: one ROCm test and one CUDA test.
+if(HAVE_ROCM)
+    add_executable(v2_test_prefill_graph_cache_execution_rocm
+        integration/execution/graph/Test__ROCmPrefillGraphCacheExecution.cpp
+    )
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_test_prefill_graph_cache_execution_rocm PRIVATE
+            llaminar2_core
+            GTest::gtest
+            GTest::gtest_main
+        )
+    else()
+        target_link_libraries(v2_test_prefill_graph_cache_execution_rocm PRIVATE
+            -Wl,--start-group
+            llaminar2_core
+            -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive
+            -Wl,--end-group
+            GTest::gtest
+            GTest::gtest_main
+        )
+    endif()
+    add_v2_test(V2_Integration_PrefillGraphCacheExecution_ROCm
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_rocm>
+        LABELS "V2;Integration;Execution;GraphCapture;PrefillGraphCache;Buckets;ROCm"
+        MPI_PROCS 1
+    )
+endif()
+
+if(HAVE_CUDA)
+    add_executable(v2_test_prefill_graph_cache_execution_cuda
+        integration/execution/graph/Test__CUDAPrefillGraphCacheExecution.cpp
+    )
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_test_prefill_graph_cache_execution_cuda PRIVATE
+            llaminar2_core
+            GTest::gtest
+            GTest::gtest_main
+        )
+    else()
+        target_link_libraries(v2_test_prefill_graph_cache_execution_cuda PRIVATE
+            -Wl,--start-group
+            llaminar2_core
+            -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive
+            -Wl,--end-group
+            GTest::gtest
+            GTest::gtest_main
+        )
+    endif()
+    add_v2_test(V2_Integration_PrefillGraphCacheExecution_CUDA
+        COMMAND $<TARGET_FILE:v2_test_prefill_graph_cache_execution_cuda>
+        LABELS "V2;Integration;Execution;GraphCapture;PrefillGraphCache;Buckets;CUDA"
+        MPI_PROCS 1
+    )
+endif()
+
+foreach(_prefill_graph_cache_test
+        V2_Integration_PrefillGraphCacheExecution_ROCm
+        V2_Integration_PrefillGraphCacheExecution_CUDA)
+    if(TEST ${_prefill_graph_cache_test})
+        set_tests_properties(${_prefill_graph_cache_test} PROPERTIES
+            ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0"
+        )
+    endif()
+endforeach()
+message(STATUS "V2 Tests: Added PrefillGraphCacheExecution integration tests")
+
 # Test: SegmentedGraphCaptureExecution - Integration test for segmented GPU graph capture/replay
 add_executable(v2_test_segmented_graph_capture_execution integration/execution/graph/Test__SegmentedGraphCaptureExecution.cpp)
 if(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
@@ -10211,6 +10380,15 @@ target_link_libraries(v2_test_prefill_graph_capture_dynamic_params llaminar2_cor
 add_v2_test(V2_Unit_PrefillGraphCaptureDynamicParams
     COMMAND $<TARGET_FILE:v2_test_prefill_graph_capture_dynamic_params>
     LABELS "V2;Unit;Embedding;KVCache;Stages;GraphCapture"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_hidden_state_row_select_stage unit/stages/Test__HiddenStateRowSelectStage.cpp)
+target_include_directories(v2_test_hidden_state_row_select_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_hidden_state_row_select_stage llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_HiddenStateRowSelectStage
+    COMMAND $<TARGET_FILE:v2_test_hidden_state_row_select_stage>
+    LABELS "V2;Unit;Stages;GraphCapture;RowSelect;LMHead;Phase6"
     MPI_PROCS 1
 )
 

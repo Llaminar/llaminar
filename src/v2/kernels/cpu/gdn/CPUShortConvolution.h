@@ -16,6 +16,8 @@ namespace llaminar2
     class CPUShortConvolution : public ITensorShortConvolution
     {
     public:
+        bool supportsPaddedPrefillRealLength() const override { return true; }
+
         bool forward(
             const float *input, const float *weight, const float *bias,
             float *output, float *conv_state,

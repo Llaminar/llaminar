@@ -40,6 +40,16 @@ extern "C"
         bool use_qk_l2norm,
         int device_idx, void *stream);
 
+    bool cudaGDN_chunk_forward_effective(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        const int *device_effective_seq_len,
+        int device_idx, void *stream);
+
     // GPU memory helpers (implemented in CUDAGatedDeltaNetKernels.cu)
     bool cudaGDN_gpu_malloc(float **ptr, size_t count);
     void cudaGDN_gpu_free(float *ptr);
@@ -63,8 +73,8 @@ namespace llaminar2
     {
     public:
         /// Well-known workspace buffer names for GDN
-        static constexpr const char* WS_GDN_STATE = "gdn_state";
-        static constexpr const char* WS_GDN_DEINTERLEAVE = "gdn_deinterleave_scratch";
+        static constexpr const char *WS_GDN_STATE = "gdn_state";
+        static constexpr const char *WS_GDN_DEINTERLEAVE = "gdn_deinterleave_scratch";
 
         explicit CUDAGatedDeltaNet(int device_ordinal)
             : device_ordinal_(device_ordinal) {}
@@ -78,6 +88,11 @@ namespace llaminar2
 
         void allocateGPUState(int state_size) override { allocateState(state_size); }
         void resetGPUState() override { resetState(); }
+        bool isGPUStateReady(int required_state_size) const override
+        {
+            return gpu_state_ != nullptr && state_size_ == required_state_size;
+        }
+        bool supportsPaddedPrefillRealLength() const override { return true; }
 
         /// Allocate GPU state buffer for the recurrence state [n_heads * d_k * d_v]
         void allocateState(int state_size)
@@ -134,6 +149,27 @@ namespace llaminar2
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                device_ordinal_, stream_);
+        }
+
+        bool chunkForwardWithEffectiveSeqLen(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *device_effective_seq_len) override
+        {
+            (void)chunk_size;
+            cudaGDN_gpu_set_device(device_ordinal_);
+            float *effective_state = gpu_state_ ? gpu_state_ : state;
+
+            return cudaGDN_chunk_forward_effective(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias,
+                output, effective_state,
+                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                device_effective_seq_len,
                 device_ordinal_, stream_);
         }
 
@@ -205,15 +241,15 @@ namespace llaminar2
             WorkspaceRequirements reqs;
             // State buffer: n_heads * d_k * d_v floats (use state_size_ if known, else estimate from m,n,k)
             size_t state_bytes = (state_size_ > 0)
-                ? static_cast<size_t>(state_size_) * sizeof(float)
-                : static_cast<size_t>(m) * static_cast<size_t>(n) * static_cast<size_t>(k) * sizeof(float);
+                                     ? static_cast<size_t>(state_size_) * sizeof(float)
+                                     : static_cast<size_t>(m) * static_cast<size_t>(n) * static_cast<size_t>(k) * sizeof(float);
             if (state_bytes > 0)
                 reqs.buffers.push_back({WS_GDN_STATE, state_bytes, 256, true});
 
             // Deinterleave scratch: estimate based on typical usage (3 × seq × heads × head_dim)
             size_t scratch_bytes = (deinterleave_scratch_size_ > 0)
-                ? deinterleave_scratch_size_ * sizeof(float)
-                : static_cast<size_t>(m) * 3 * sizeof(float);  // Conservative estimate
+                                       ? deinterleave_scratch_size_ * sizeof(float)
+                                       : static_cast<size_t>(m) * 3 * sizeof(float); // Conservative estimate
             if (scratch_bytes > 0)
                 reqs.buffers.push_back({WS_GDN_DEINTERLEAVE, scratch_bytes, 256, false});
 

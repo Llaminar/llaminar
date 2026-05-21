@@ -34,6 +34,7 @@
 
 // Model-level stages
 #include "stages/EmbeddingStage.h"
+#include "stages/HiddenStateRowSelectStage.h"
 #include "stages/LMHeadStage.h"
 
 // MPI communication stages

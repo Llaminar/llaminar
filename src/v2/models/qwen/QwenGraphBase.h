@@ -305,6 +305,37 @@ namespace llaminar2
             const std::vector<ITensorGemm *> &up_gemm,
             const std::vector<ITensorGemm *> &down_gemm) const;
 
+        /**
+         * @brief Insert bucketed-prefill LM-head row selection when needed.
+         *
+         * Bucketed prefill graph replay must not bake a real-length-dependent
+         * LM-head activation offset into the captured GEMM. When the input is a
+         * fixed bucket, this helper adds a row-select stage from final norm into
+         * the one-row LM-head scratch buffer and returns that scratch tensor.
+         * Non-bucket graphs return final_norm_output unchanged.
+         *
+         * @param graph Graph receiving the optional row-select node.
+         * @param dependency_node Node name that produces final_norm_output.
+         * @param final_norm_output Full [seq_len, d_model] final norm output.
+         * @param total_tokens Fixed graph token count for the bucket.
+         * @param real_seq_len Real token count for initial execution (0 = total_tokens).
+         * @param bucket_seq_len Bucket length marker (0 = non-bucket path).
+         * @param device Device assigned to the row-select stage.
+         * @param dependency_out Receives the node name LM head should depend on.
+         * @param input_buffer_id BufferId for final_norm_output.
+         * @return Tensor that LM head should read.
+         */
+        TensorBase *maybeAddLMHeadRowSelect(
+            ComputeGraph &graph,
+            const std::string &dependency_node,
+            TensorBase *final_norm_output,
+            int total_tokens,
+            int real_seq_len,
+            int bucket_seq_len,
+            DeviceId device,
+            std::string &dependency_out,
+            BufferId input_buffer_id = BufferId::NORMALIZED) const;
+
         [[noreturn]] void failMissingGpuExpertGemmEngines(
             DeviceId device,
             int layer_idx,

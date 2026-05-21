@@ -24,6 +24,15 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 
+#ifdef HAVE_CUDA
+#include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
+#endif
+
+#ifdef HAVE_ROCM
+#include "../../../kernels/rocm/ops/ROCmRowSelectKernels.h"
+#endif
+
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -107,9 +116,152 @@ namespace llaminar2
         }
     } // namespace
 
+    struct GDNRecurrenceStage::GpuEffectiveSeqLenState
+    {
+        DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
+        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar captured by H2D memcpy.
+        int *device_effective_seq_len = nullptr; ///< Device scalar read by the recurrence kernel.
+    };
+
     GDNRecurrenceStage::GDNRecurrenceStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    GDNRecurrenceStage::~GDNRecurrenceStage()
+    {
+        releaseGpuEffectiveSeqLenState();
+    }
+
+    int GDNRecurrenceStage::effectivePrefillSeqLen() const
+    {
+        if (params_.seq_len <= 0)
+            return 0;
+        if (!prefill_replay_params_set_ || prefill_effective_seq_len_ <= 0)
+            return params_.seq_len;
+        return std::clamp(prefill_effective_seq_len_, 1, params_.seq_len);
+    }
+
+    bool GDNRecurrenceStage::shouldUseRealLengthContract() const
+    {
+        return params_.seq_len > 1 &&
+               prefill_replay_params_set_ &&
+               params_.kernel &&
+               params_.kernel->supportsPaddedPrefillRealLength();
+    }
+
+    void GDNRecurrenceStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
+    {
+        prefill_replay_params_set_ = true;
+        prefill_bucket_seq_len_ = replay.bucket_seq_len > 0 ? replay.bucket_seq_len : params_.seq_len;
+        const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
+        prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
+        refreshPinnedEffectiveSeqLen();
+    }
+
+    bool GDNRecurrenceStage::supportsPaddedPrefillRealLengthContract() const
+    {
+        return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
+    }
+
+    bool GDNRecurrenceStage::ensureGpuEffectiveSeqLenStateInitialized()
+    {
+        if (gpu_effective_seq_len_state_)
+            return true;
+
+        auto state = std::make_unique<GpuEffectiveSeqLenState>();
+        state->device = params_.device_id;
+
+        bool allocated = false;
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            allocated = cuda::allocateRowSelectParam(
+                params_.device_id.cuda_ordinal(),
+                &state->host_effective_seq_len,
+                &state->device_effective_seq_len);
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            allocated = rocm::allocateRowSelectParam(
+                params_.device_id.rocm_ordinal(),
+                &state->host_effective_seq_len,
+                &state->device_effective_seq_len);
+#endif
+        }
+
+        if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
+        {
+            LOG_ERROR("[GDNRecurrenceStage] Failed to allocate graph-captured effective length scalar on "
+                      << params_.device_id.toString());
+            return false;
+        }
+
+        gpu_effective_seq_len_state_ = std::move(state);
+        refreshPinnedEffectiveSeqLen();
+        return true;
+    }
+
+    void GDNRecurrenceStage::refreshPinnedEffectiveSeqLen()
+    {
+        if (gpu_effective_seq_len_state_ && gpu_effective_seq_len_state_->host_effective_seq_len)
+            *gpu_effective_seq_len_state_->host_effective_seq_len = effectivePrefillSeqLen();
+    }
+
+    bool GDNRecurrenceStage::uploadGpuEffectiveSeqLen()
+    {
+        if (!gpu_effective_seq_len_state_)
+            return false;
+        refreshPinnedEffectiveSeqLen();
+
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            return cuda::uploadRowSelectParam(
+                gpu_effective_seq_len_state_->device_effective_seq_len,
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpuStream());
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            return rocm::uploadRowSelectParam(
+                gpu_effective_seq_len_state_->device_effective_seq_len,
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpuStream());
+#endif
+        }
+        return false;
+    }
+
+    void GDNRecurrenceStage::releaseGpuEffectiveSeqLenState()
+    {
+        if (!gpu_effective_seq_len_state_)
+            return;
+
+        if (gpu_effective_seq_len_state_->device.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            cuda::freeRowSelectParam(
+                gpu_effective_seq_len_state_->device.cuda_ordinal(),
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpu_effective_seq_len_state_->device_effective_seq_len);
+#endif
+        }
+        else if (gpu_effective_seq_len_state_->device.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            rocm::freeRowSelectParam(
+                gpu_effective_seq_len_state_->device.rocm_ordinal(),
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpu_effective_seq_len_state_->device_effective_seq_len);
+#endif
+        }
+
+        gpu_effective_seq_len_state_.reset();
     }
 
     // =========================================================================
@@ -238,19 +390,19 @@ namespace llaminar2
             if (params_.seq_len == 1)
             {
                 LOG_DEBUG("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
-                         << " Q=" << static_cast<const void *>(d_q)
-                         << " K=" << static_cast<const void *>(d_k)
-                         << " V=" << static_cast<const void *>(d_v)
-                         << " alpha=" << static_cast<const void *>(d_alpha)
-                         << " beta=" << static_cast<const void *>(d_beta)
-                         << " A_log=" << static_cast<const void *>(d_alog)
-                         << " dt_bias=" << static_cast<const void *>(d_dtbias)
-                         << " output=" << static_cast<void *>(d_output)
-                         << " state=" << static_cast<void *>(params_.recurrence_state)
-                         << " heads=" << params_.n_heads
-                         << " d_k=" << params_.d_k
-                         << " d_v=" << params_.d_v
-                         << " seq=" << params_.seq_len);
+                                                                            << " Q=" << static_cast<const void *>(d_q)
+                                                                            << " K=" << static_cast<const void *>(d_k)
+                                                                            << " V=" << static_cast<const void *>(d_v)
+                                                                            << " alpha=" << static_cast<const void *>(d_alpha)
+                                                                            << " beta=" << static_cast<const void *>(d_beta)
+                                                                            << " A_log=" << static_cast<const void *>(d_alog)
+                                                                            << " dt_bias=" << static_cast<const void *>(d_dtbias)
+                                                                            << " output=" << static_cast<void *>(d_output)
+                                                                            << " state=" << static_cast<void *>(params_.recurrence_state)
+                                                                            << " heads=" << params_.n_heads
+                                                                            << " d_k=" << params_.d_k
+                                                                            << " d_v=" << params_.d_v
+                                                                            << " seq=" << params_.seq_len);
                 ok = params_.kernel->recurrent_step(
                     d_q, d_k, d_v,
                     d_alpha, d_beta,
@@ -261,27 +413,57 @@ namespace llaminar2
             }
             else
             {
+                const int effective_seq_len = effectivePrefillSeqLen();
+                const bool padded_effective_len =
+                    prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
+                const bool use_real_length_contract = shouldUseRealLengthContract();
+                if (padded_effective_len && !use_real_length_contract)
+                {
+                    LOG_ERROR("[GDNRecurrenceStage] Padded prefill requires a backend real-length contract");
+                    return false;
+                }
+
                 LOG_DEBUG("[GDNRecurrenceStage] GPU launch pointers layer=" << params_.layer_idx
-                         << " Q=" << static_cast<const void *>(d_q)
-                         << " K=" << static_cast<const void *>(d_k)
-                         << " V=" << static_cast<const void *>(d_v)
-                         << " alpha=" << static_cast<const void *>(d_alpha)
-                         << " beta=" << static_cast<const void *>(d_beta)
-                         << " A_log=" << static_cast<const void *>(d_alog)
-                         << " dt_bias=" << static_cast<const void *>(d_dtbias)
-                         << " output=" << static_cast<void *>(d_output)
-                         << " state=" << static_cast<void *>(params_.recurrence_state)
-                         << " heads=" << params_.n_heads
-                         << " d_k=" << params_.d_k
-                         << " d_v=" << params_.d_v
-                         << " seq=" << params_.seq_len);
-                ok = params_.kernel->chunk_forward(
-                    d_q, d_k, d_v,
-                    d_alpha, d_beta,
-                    d_alog, d_dtbias,
-                    d_output, params_.recurrence_state,
-                    params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
-                    params_.chunk_size, params_.use_qk_l2norm);
+                                                                            << " Q=" << static_cast<const void *>(d_q)
+                                                                            << " K=" << static_cast<const void *>(d_k)
+                                                                            << " V=" << static_cast<const void *>(d_v)
+                                                                            << " alpha=" << static_cast<const void *>(d_alpha)
+                                                                            << " beta=" << static_cast<const void *>(d_beta)
+                                                                            << " A_log=" << static_cast<const void *>(d_alog)
+                                                                            << " dt_bias=" << static_cast<const void *>(d_dtbias)
+                                                                            << " output=" << static_cast<void *>(d_output)
+                                                                            << " state=" << static_cast<void *>(params_.recurrence_state)
+                                                                            << " heads=" << params_.n_heads
+                                                                            << " d_k=" << params_.d_k
+                                                                            << " d_v=" << params_.d_v
+                                                                            << " seq=" << params_.seq_len
+                                                                            << " effective_seq=" << effective_seq_len);
+                if (use_real_length_contract)
+                {
+                    if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
+                    {
+                        LOG_ERROR("[GDNRecurrenceStage] Failed to update GPU effective length scalar");
+                        return false;
+                    }
+                    ok = params_.kernel->chunkForwardWithEffectiveSeqLen(
+                        d_q, d_k, d_v,
+                        d_alpha, d_beta,
+                        d_alog, d_dtbias,
+                        d_output, params_.recurrence_state,
+                        params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
+                        params_.chunk_size, params_.use_qk_l2norm,
+                        gpu_effective_seq_len_state_->device_effective_seq_len);
+                }
+                else
+                {
+                    ok = params_.kernel->chunk_forward(
+                        d_q, d_k, d_v,
+                        d_alpha, d_beta,
+                        d_alog, d_dtbias,
+                        d_output, params_.recurrence_state,
+                        params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
+                        params_.chunk_size, params_.use_qk_l2norm);
+                }
             }
 
             if (!ok)
@@ -292,6 +474,7 @@ namespace llaminar2
 
             LOG_DEBUG("[GDNRecurrenceStage] GPU layer=" << params_.layer_idx
                                                         << " seq_len=" << params_.seq_len
+                                                        << " effective_seq_len=" << effectivePrefillSeqLen()
                                                         << " n_heads=" << params_.n_heads
                                                         << " d_k=" << params_.d_k
                                                         << " d_v=" << params_.d_v
@@ -385,13 +568,30 @@ namespace llaminar2
         }
         else
         {
+            const int effective_seq_len = effectivePrefillSeqLen();
+            const int kernel_seq_len = params_.seq_len > 1 ? effective_seq_len : params_.seq_len;
+            const bool padded_effective_len =
+                prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
+            if (padded_effective_len && !supportsPaddedPrefillRealLengthContract())
+            {
+                LOG_ERROR("[GDNRecurrenceStage] Padded CPU prefill requires a real-length contract");
+                return false;
+            }
+
             ok = params_.kernel->chunk_forward(
                 q_data, k_data, v_data,
                 alpha_data, beta_data,
                 alog_data, dtbias_data,
                 output_data, params_.recurrence_state,
-                params_.seq_len, params_.n_heads, params_.d_k, params_.d_v,
+                kernel_seq_len, params_.n_heads, params_.d_k, params_.d_v,
                 params_.chunk_size, params_.use_qk_l2norm);
+
+            if (ok && kernel_seq_len < params_.seq_len)
+            {
+                const size_t first_pad = static_cast<size_t>(kernel_seq_len) * static_cast<size_t>(params_.n_heads * params_.d_v);
+                const size_t pad_count = static_cast<size_t>(params_.seq_len - kernel_seq_len) * static_cast<size_t>(params_.n_heads * params_.d_v);
+                std::memset(output_data + first_pad, 0, pad_count * sizeof(float));
+            }
         }
 
         if (!ok)
@@ -402,6 +602,7 @@ namespace llaminar2
 
         LOG_DEBUG("[GDNRecurrenceStage] layer=" << params_.layer_idx
                                                 << " seq_len=" << params_.seq_len
+                                                << " effective_seq_len=" << effectivePrefillSeqLen()
                                                 << " n_heads=" << params_.n_heads
                                                 << " d_k=" << params_.d_k
                                                 << " d_v=" << params_.d_v

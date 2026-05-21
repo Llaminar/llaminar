@@ -216,6 +216,8 @@ namespace llaminar2
             return BufferId::ATTN_CONTEXT_WORKSPACE;
         if (name == "workspace_mask")
             return BufferId::GEMM_WORKSPACE; // reuse for mask
+        if (name == "lm_head_input_row")
+            return BufferId::LM_HEAD_INPUT_ROW;
         if (name == "gate")
             return BufferId::GATE_PROJ;
         if (name == "up")

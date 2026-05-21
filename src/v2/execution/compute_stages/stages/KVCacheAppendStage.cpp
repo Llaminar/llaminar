@@ -5,6 +5,7 @@
 
 #include "KVCacheAppendStage.h"
 #include "../ComputeStageUtils.h"
+#include "../../local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/SIMDHelpers.h"
@@ -94,11 +95,25 @@ namespace llaminar2
             return false;
         }
 
-        // Determine total tokens to append
+        // Determine the graph-shaped token count first, then narrow to the real
+        // prefix for non-captured padded execution. Captured prefill records the
+        // fixed bucket kernel shape and relies on onGraphReplayed() to advance
+        // host metadata by the real prefix after the graph launch.
         int total_tokens = params_.num_tokens;
         if (total_tokens <= 0)
         {
             total_tokens = static_cast<int>(params_.K->shape()[0]);
+        }
+        const int bucket_tokens = total_tokens;
+        if (!isGraphCaptureActive() && params_.batch_size <= 1 && replay_advance_tokens_ > 0)
+        {
+            if (replay_advance_tokens_ > bucket_tokens)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Replay token count exceeds bucket token count: real="
+                          << replay_advance_tokens_ << " bucket=" << bucket_tokens);
+                return false;
+            }
+            total_tokens = replay_advance_tokens_;
         }
 
         auto append_to_cache = [&](int seq_idx,

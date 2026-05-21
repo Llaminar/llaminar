@@ -8,6 +8,7 @@
 
 #include "ROCmRingKVCacheTQ.h"
 #include "ROCmTurboQuantKernels.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../utils/Logger.h"
@@ -165,6 +166,7 @@ namespace llaminar2
         const auto hip_stream = static_cast<hipStream_t>(stream);
         cached_stream_ = hip_stream; // Cache for get_kv_converted()
         auto &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
 
         const bool k_is_tq = (k->native_type() == TensorType::TQ8 || k->native_type() == TensorType::TQ4);
         const bool v_is_tq = (v->native_type() == TensorType::TQ4);
@@ -206,8 +208,11 @@ namespace llaminar2
                     v_row_bytes, hipMemcpyHostToDevice, hip_stream);
             }
 
-            entry.head = (entry.head + num_tokens) % max_seq_len_;
-            entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+            if (!capture_active)
+            {
+                entry.head = (entry.head + num_tokens) % max_seq_len_;
+                entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+            }
 
             // DON'T invalidate per-layer scratch here — dequant_to_scratch's
             // can_incremental() will detect count == cached_count + 1 and do
@@ -280,7 +285,7 @@ namespace llaminar2
             }
         }
 
-        if (ok)
+        if (ok && !capture_active)
         {
             entry.head = (entry.head + num_tokens) % max_seq_len_;
             entry.count = std::min(entry.count + num_tokens, max_seq_len_);

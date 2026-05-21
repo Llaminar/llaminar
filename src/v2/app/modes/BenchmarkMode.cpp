@@ -16,13 +16,62 @@
 #include "utils/BenchmarkRunner.h"
 #include "app/MPIShutdown.h"
 
+#include <cstdlib>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
     namespace
     {
+        /// @brief Format prefill bucket sizes for the benchmark startup log.
+        std::string formatBucketList(const std::vector<int> &buckets)
+        {
+            std::ostringstream oss;
+            for (size_t i = 0; i < buckets.size(); ++i)
+            {
+                if (i > 0)
+                    oss << ",";
+                oss << buckets[i];
+            }
+            return oss.str();
+        }
+
+        /// @brief Opt benchmark mode into production bucketed prefill defaults.
+        void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx)
+        {
+            const bool user_selected_bucket_mode = std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKETS") != nullptr;
+            const bool user_selected_bucket_sizes = std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES") != nullptr;
+            const bool user_selected_gpu_graphs = std::getenv("LLAMINAR_GPU_GRAPHS") != nullptr;
+            if (!user_selected_bucket_mode)
+            {
+                setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1", 1);
+            }
+            else if (std::atoi(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKETS")) == 0 && !user_selected_gpu_graphs)
+            {
+                setenv("LLAMINAR_GPU_GRAPHS", "0", 1);
+            }
+
+            // Leave LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES unset unless the user
+            // explicitly supplied it. DebugEnv then reloads the production
+            // geometric bucket ladder instead of a benchmark-prompt-sized list.
+            mutableDebugEnv().execution.reload();
+
+            if (mpi_ctx && mpi_ctx->rank() == 0)
+            {
+                const auto &exec = debugEnv().execution;
+                LOG_INFO("[Benchmark] Prefill graph buckets "
+                         << (exec.prefill_graph_buckets ? "enabled" : "disabled")
+                         << "; bucket_sizes=" << formatBucketList(exec.prefill_graph_bucket_sizes)
+                         << (user_selected_bucket_sizes ? " (bucket env override)" : " (production default)")
+                         << "; mode=" << (user_selected_bucket_mode ? "env override" : "benchmark default")
+                         << "; gpu_graphs=" << (exec.gpu_graphs ? "enabled" : "disabled")
+                         << (user_selected_gpu_graphs ? " (env override)" : ""));
+            }
+        }
+
         int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
@@ -70,6 +119,8 @@ namespace llaminar2
         {
             LOG_DEBUG("Running benchmark mode...");
         }
+
+        configureBenchmarkPrefillBuckets(mpi_ctx);
 
         auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
 

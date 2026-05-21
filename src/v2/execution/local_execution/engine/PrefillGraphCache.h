@@ -22,6 +22,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace llaminar2
 {
@@ -65,6 +66,7 @@ namespace llaminar2
         ActiveMoERebalancing,   ///< Rebalance mode is DYNAMIC or OBSERVE
         CollectiveNodesPresent, ///< Graph has TP/PP collective stages
         StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
+        GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
         NoGPUContext,           ///< GPU context unavailable
         InvalidatedByPlacement  ///< Expert placement mutation since last capture
     };
@@ -75,10 +77,12 @@ namespace llaminar2
     /// Configuration for prefill graph cache behavior.
     struct PrefillGraphConfig
     {
-        bool enabled = true;          ///< LLAMINAR_GPU_GRAPHS master flag
-        int min_seq_len = 256;        ///< LLAMINAR_PREFILL_GRAPH_MIN_SEQ
-        bool trace = false;           ///< LLAMINAR_PREFILL_GRAPH_TRACE
-        bool buckets_enabled = false; ///< LLAMINAR_PREFILL_GRAPH_BUCKETS (Phase 6)
+        bool enabled = true;            ///< LLAMINAR_GPU_GRAPHS master flag
+        int min_seq_len = 256;          ///< LLAMINAR_PREFILL_GRAPH_MIN_SEQ
+        bool trace = false;             ///< LLAMINAR_PREFILL_GRAPH_TRACE
+        bool buckets_enabled = false;   ///< LLAMINAR_PREFILL_GRAPH_BUCKETS
+        std::vector<int> bucket_sizes;  ///< LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES
+        size_t max_cached_entries = 10; ///< LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS
     };
 
     /// Per-entry state in the prefill graph cache.
@@ -90,6 +94,14 @@ namespace llaminar2
         size_t node_count = 0;                     ///< Nodes in captured graph
         uint64_t capture_timestamp_ns = 0;         ///< When capture completed
         int replay_count = 0;                      ///< Number of successful replays
+        uint64_t last_access_tick = 0;             ///< Monotonic LRU timestamp
+    };
+
+    /// Lifetime counters for a bucket key, retained even if the graph entry is evicted.
+    struct PrefillGraphLifecycleStats
+    {
+        uint64_t warmup_count = 0;  ///< Number of times this key entered Warmup.
+        uint64_t capture_count = 0; ///< Number of successful captures for this key.
     };
 
     class PrefillGraphCache
@@ -110,7 +122,9 @@ namespace llaminar2
             const PrefillGraphCacheKey &key,
             const std::unordered_set<std::string> *collective_nodes,
             bool snapshots_active,
-            bool moe_rebalancing_active = false) const;
+            bool moe_rebalancing_active = false,
+            int real_seq_len = 0,
+            int bucket_seq_len = 0) const;
 
         /// Mark warmup complete for a key. Transitions Cold → Warmup (arms capture).
         void markWarmedUp(const PrefillGraphCacheKey &key);
@@ -145,10 +159,25 @@ namespace llaminar2
         /// Get replay count for an entry.
         int replayCount(const PrefillGraphCacheKey &key) const;
 
+        /// Get number of entries evicted due to the configured cache cap.
+        uint64_t evictionCount() const { return eviction_count_; }
+
+        /// Get lifetime warmup count for a key, including entries later evicted.
+        uint64_t warmupCount(const PrefillGraphCacheKey &key) const;
+
+        /// Get lifetime successful capture count for a key, including recaptures.
+        uint64_t captureCount(const PrefillGraphCacheKey &key) const;
+
     private:
+        void touchEntry(PrefillGraphEntry &entry);
+        void enforceCapacity(const PrefillGraphCacheKey *exempt_key = nullptr);
+
         PrefillGraphConfig config_;
         std::unordered_map<PrefillGraphCacheKey, PrefillGraphEntry, PrefillGraphCacheKeyHash> entries_;
+        std::unordered_map<PrefillGraphCacheKey, PrefillGraphLifecycleStats, PrefillGraphCacheKeyHash> lifecycle_stats_;
         PrefillGraphRejectReason last_invalidation_reason_ = PrefillGraphRejectReason::None;
+        uint64_t access_counter_ = 0;
+        uint64_t eviction_count_ = 0;
     };
 
 } // namespace llaminar2

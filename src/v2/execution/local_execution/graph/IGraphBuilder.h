@@ -58,6 +58,9 @@ namespace llaminar2
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
         int position_offset = 0;           ///< KV cache position offset (legacy fallback)
+        int real_seq_len = 0;              ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
+        int bucket_seq_len = 0;            ///< Fixed bucket length for graph shape (0 = seq_len)
+        int token_offset = 0;              ///< Chunk offset within the original prompt
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
 

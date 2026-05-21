@@ -12,6 +12,7 @@
 
 #include "CUDARingKVCache.h"
 #include "../../../tensors/GpuTensorView.h"
+#include "../../../tensors/TensorClasses.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KVCacheProfiler.h"
@@ -125,7 +126,8 @@ namespace llaminar2
         if (!d_k)
         {
             auto *k_mut = const_cast<ITensor *>(K);
-            if (!k_mut->ensureOnDevice(target))
+            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
+            if (!(k_tensor ? k_tensor->ensureOnDevice(target) : k_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Failed to ensure K on "
                           << target.toString());
@@ -136,7 +138,8 @@ namespace llaminar2
         if (!d_v)
         {
             auto *v_mut = const_cast<ITensor *>(V);
-            if (!v_mut->ensureOnDevice(target))
+            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
+            if (!(v_tensor ? v_tensor->ensureOnDevice(target) : v_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Failed to ensure V on "
                           << target.toString());
@@ -173,7 +176,8 @@ namespace llaminar2
         if (!d_k)
         {
             auto *k_mut = const_cast<ITensor *>(K);
-            if (!k_mut->ensureOnDevice(target))
+            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
+            if (!(k_tensor ? k_tensor->ensureOnDevice(target, gpu_stream) : k_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure K on "
                           << target.toString());
@@ -184,7 +188,8 @@ namespace llaminar2
         if (!d_v)
         {
             auto *v_mut = const_cast<ITensor *>(V);
-            if (!v_mut->ensureOnDevice(target))
+            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
+            if (!(v_tensor ? v_tensor->ensureOnDevice(target, gpu_stream) : v_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure V on "
                           << target.toString());

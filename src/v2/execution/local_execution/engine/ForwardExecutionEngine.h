@@ -18,6 +18,7 @@
 #pragma once
 
 #include "ForwardGraphTypes.h"
+#include "PrefillBucketUtils.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "../../factory/InferenceRunnerFactory.h" // For FactoryPPStageConfig
@@ -25,6 +26,7 @@
 #include <chrono>
 #include <functional>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -151,6 +153,48 @@ namespace llaminar2
         ForwardExecutionEngine(Config config, DeviceGraphExecutor &executor);
 
         /**
+         * @brief Runtime-facing host descriptor for one bucketed prefill chunk.
+         *
+         * The descriptor is intentionally pure: it selects a bucket, prepares
+         * padded token/position buffers, and records whether padding would be
+         * required. Launching remains gated by execute() and the prefill graph
+         * cache preflight so unsafe padded graphs fail before execution.
+         *
+         * `ok` means the plan is allowed to execute under the current gate.
+         * `chunk.ok` mirrors `ok` only for accepted plans; rejected padded plans
+         * may still contain prepared buffers for diagnostics/tests.
+         */
+        struct PrefillChunkRuntimePlan
+        {
+            bool ok = false;                  ///< True when this chunk may execute under current gates.
+            bool padding_required = false;    ///< True when real_count < bucket_seq_len.
+            PrefillBucketSelection selection; ///< Bucket selection result.
+            PrefillChunkExecutionInput chunk; ///< Prepared host buffers and real/bucket metadata.
+            std::string error;                ///< Failure reason when ok is false.
+
+            /// @brief Convenience conversion for success checks.
+            explicit operator bool() const { return ok; }
+        };
+
+        /**
+         * @brief Prepare one bucketed prefill chunk from a ForwardInput.
+         *
+         * @param input ForwardInput with stable buffers. `input.token_ids` must
+         *        point to the first real token of the current chunk; `token_offset`
+         *        supplies the absolute prompt offset for position IDs and is not
+         *        added to the token pointer.
+         * @param allow_padded_execution Leave false for callers that have not
+         *        opted into fixed-bucket execution. Setting it true prepares
+         *        padded buffers for runPrefillChunk(); graph safety is still
+         *        enforced by PrefillGraphCache preflight before execution/capture.
+         */
+        static PrefillChunkRuntimePlan prepareSinglePrefillChunkRuntimePlan(
+            const ForwardInput &input,
+            const std::vector<int> &bucket_sizes,
+            int pad_token_id,
+            bool allow_padded_execution = false);
+
+        /**
          * @brief Execute a forward pass (cache-aware).
          *
          * @param input  Prepared input (position_ids resolved, external_hidden applied)
@@ -164,6 +208,30 @@ namespace llaminar2
         bool execute(const ForwardInput &input,
                      ForwardOutput &output,
                      IForwardExecutionHost &host);
+
+        /**
+         * @brief Execute one prepared bucketed prefill chunk.
+         *
+         * This Phase 6 boundary consumes the prepared chunk buffers from a
+         * PrefillChunkRuntimePlan and delegates to execute() with fixed-bucket
+         * shape metadata. Padded chunks are allowed only as prepared plans; the
+         * forward graph path must pass PrefillGraphCache preflight before any
+         * padded graph is executed, captured, or replayed.
+         *
+         * @param base_input ForwardInput carrying device, KV cache, PP, and
+         *        batching context to preserve for the chunk execution.
+         * @param plan Prepared runtime plan for the chunk. Must be exact.
+         * @param output Receives logits/hidden pointers on success.
+         * @param host Host interface for model-specific callbacks.
+         * @return true when execute() succeeds; false if the plan is invalid,
+         *         graph preflight rejects padded execution, or the delegated
+         *         execution fails.
+         */
+        bool runPrefillChunk(
+            const ForwardInput &base_input,
+            const PrefillChunkRuntimePlan &plan,
+            ForwardOutput &output,
+            IForwardExecutionHost &host);
 
         // ----- Cache Management -----
 
@@ -197,6 +265,38 @@ namespace llaminar2
          */
         void forEachCachedStage(ComputeStageType type,
                                 const std::function<void(IComputeStage *)> &visitor) const;
+
+        /**
+         * @brief Immutable diagnostic snapshot for one cached prefill graph bucket.
+         *
+         * This is intentionally read-only: callers can observe the warmup,
+         * capture, replay, and eviction counters without reaching into the
+         * ForwardGraphCache internals or mutating graph lifetime state.
+         */
+        struct PrefillGraphCacheSnapshot
+        {
+            bool forward_cache_valid = false;                  ///< True when the matching forward graph entry is valid.
+            bool prefill_cache_initialized = false;            ///< True after the prefill cache has been created for the entry.
+            PrefillGraphPhase phase = PrefillGraphPhase::Cold; ///< Current bucket lifecycle phase.
+            size_t cache_size = 0;                             ///< Number of bucket entries held by the prefill cache.
+            size_t node_count = 0;                             ///< Captured graph node count for Ready entries.
+            int replay_count = 0;                              ///< Successful graph launches for this bucket.
+            uint64_t warmup_count = 0;                         ///< Lifetime warmups for this bucket.
+            uint64_t capture_count = 0;                        ///< Lifetime successful captures for this bucket.
+            uint64_t eviction_count = 0;                       ///< Total prefill bucket evictions observed by this engine.
+        };
+
+        /**
+         * @brief Return diagnostic prefill graph cache state for a cached forward signature.
+         *
+         * Returns `std::nullopt` when the forward graph signature has not been
+         * cached. A present snapshot may still report `prefill_cache_initialized=false`
+         * because the first prefill request builds and caches the forward graph;
+         * prefill graph warmup starts on the following cache hit.
+         */
+        std::optional<PrefillGraphCacheSnapshot> prefillGraphCacheSnapshot(
+            const ForwardGraphSignature &signature,
+            const PrefillGraphCacheKey &key) const;
 
         // ----- Mutable Execution Flags -----
 
@@ -232,6 +332,18 @@ namespace llaminar2
             IDeviceContext *ctx,
             IForwardExecutionHost &host);
 
+        /** @brief Mark a bucketed prefill forward-cache entry as recently used. */
+        void touchBucketedPrefillForwardCache(
+            const ForwardGraphSignature &signature,
+            ForwardGraphCache &cache);
+
+        /** @brief Enforce the engine-level cap for reusable bucketed prefill forward graphs. */
+        void enforceBucketedPrefillForwardCapacity(
+            const ForwardGraphSignature *active_signature = nullptr);
+
+        /** @brief Count valid top-level bucketed prefill forward-cache entries. */
+        size_t bucketedPrefillForwardCacheSize() const;
+
         // ----- GPU Stage Timeline collection -----
         void collectTimeline(
             IDeviceContext *ctx,
@@ -245,6 +357,8 @@ namespace llaminar2
 
         // ----- Cache -----
         std::unordered_map<ForwardGraphSignature, ForwardGraphCache, ForwardGraphSignatureHash> cache_;
+        uint64_t bucketed_prefill_forward_access_counter_ = 0;
+        uint64_t bucketed_prefill_forward_eviction_count_ = 0;
 
         // ----- Mutable execution flags -----
         bool suppress_timeline_ = false;

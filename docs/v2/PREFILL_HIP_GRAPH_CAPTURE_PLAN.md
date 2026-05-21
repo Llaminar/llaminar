@@ -296,7 +296,7 @@ struct PrefillDynamicParams {
 
 The desired end state is that capture records the Embedding stage's H2D copy of `input_ids` as a graph node. Before replay, we write new token IDs to the same pinned buffer, and the captured H2D node re-reads them. The current embedding code does not guarantee this because its preload path can copy token IDs before stage execution and then skip the H2D in `apply_tensor()`, so Tier 1 Phase 3 must make the contract explicit.
 
-For GDN recurrence state and KV cache: these are persistent device buffers that kernels read/write in-place. No parameter update needed — the graph just operates on whatever state is currently in those buffers.
+For exact-length prefill graphs, GDN recurrence state and KV cache tensors remain persistent device buffers that kernels read/write in-place. Host-side metadata is still dynamic: KV append stages need post-replay callbacks, and Phase 6 bucketed replay adds real-token metadata so padded rows do not advance KV/GDN state.
 
 ### Required Code Changes
 
@@ -325,7 +325,7 @@ Additional dynamic-state requirements:
 - `ForwardGraphCache::token_ids` is already stable for cached graphs. Prefill graph replay must update this cache-owned vector, not point embedding at a temporary request vector.
 - `position_ids` must be stable for the captured `seq_len`; if position offset changes in server mode, it becomes another dynamic parameter.
 - KV-cache append stages need replay callbacks. `KVCacheAppendStage` already has `needsOnGraphReplayed()` and `onGraphReplayed()`, but the monolithic graph capture path does not currently call replay callbacks after launch. Add callback collection/execution for prefill monolithic replay so host KV heads/counts advance correctly.
-- GDN recurrence state lives in persistent device buffers; no parameter update is needed, but reset/sequence-boundary semantics must run before capture/replay just as normal prefill does.
+- GDN recurrence state lives in persistent device buffers; reset/sequence-boundary semantics must run before capture/replay just as normal prefill does. Padded bucket replay additionally requires the Phase 6 real-token GDN contract before it can be enabled.
 
 Acceptance gate:
 - Extend `tests/v2/unit/kernels/Test__KernelDynamicStateLifecycle.cpp` or `tests/v2/unit/execution/compute_stages/stages/Test__EmbeddingStage_GraphCapture.cpp` with a ROCm prefill case: capture embedding for `seq_len > 1`, replay with different token IDs, and verify output changes exactly as normal embedding would.
@@ -491,35 +491,37 @@ Acceptance gate:
 For variable-length prompts in server mode:
 
 ```
-Buckets: 64, 128, 256, 512, 768, 1024, 1536, 2048, 3072, 4096
+Buckets: 64, 128, 256, 384, 512, 544, 576, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096
 ```
 
 - Pad input to next bucket with `pad_token_id` (attention causal mask prevents contamination)
-- Cache one graph per bucket (10 graphs max)
+- Cache one graph per bucket/device, capped by `LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS` (default 10)
 - Capture cost: ~550ms per bucket, amortized over hundreds of requests
 - Memory cost: ~50MB per graph instance (kernel metadata, not tensor data)
 
-### Required Code Changes
+### Phase 6 Accepted Status
 
-Files:
-- server mode / request batching code under `src/v2/app/modes/`
-- `ForwardExecutionEngine.cpp`
-- `ForwardGraphTypes.h` / `PrefillGraphCache`
-- tokenizer/prompt preparation code that owns padding and attention metadata
+Phase 6 is accepted for Tier 1 bucketed single-device prefill graph capture. The
+runtime now distinguishes real-token length from bucket length throughout the
+bucketed path, fails loudly for unsupported graph shapes, and keeps bucket
+eviction/recapture observable through logs and telemetry.
 
-Required work:
-- Add a bucket selector controlled by `LLAMINAR_PREFILL_GRAPH_BUCKETS` and a configurable bucket list.
-- Implement bucket execution through a reusable chunking API such as `runPrefillChunk(tokens, start, real_count, bucket_len)`. Tier 1 uses it for padded server buckets; Tier 2 uses the same API to run `<n>` real tokens, rebalance, then run the next `<n>` tokens.
-- Pad token IDs to the selected bucket with `pad_token_id` and ensure the attention/position logic prevents padded tokens from contaminating the real prompt.
-- Ensure logits are read from the last real token, not the padded bucket tail.
-- Add cache eviction or a hard cap for graph entries. Graph metadata is much smaller than tensors, but server mode can see many sequence lengths and model/device combinations.
-- Keep bucketed capture ineligible for TP/PP/collective graphs, sparse overlay MoE, CPU participation, and snapshot builds until those paths have their own gates. If an ineligible request reaches the bucketed graph path with GPU graphs enabled, report a configuration error instead of silently using normal execution.
+Implemented code surface:
+- Bucket selection, token padding, absolute position IDs, chunk planning, and `ForwardExecutionEngine::runPrefillChunk()` all flow through shared helpers and `ForwardInput` real/bucket metadata.
+- Bucketed `ForwardGraphSignature` values are keyed by bucket length and device. `LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS` caps reusable bucketed forward graphs at the `ForwardExecutionEngine` level across bucket lengths/devices, while `PrefillGraphCache` retains per-entry lifecycle accounting.
+- `LMHeadStage`, `HiddenStateRowSelectStage`, `KVCacheAppendStage`, `GDNRecurrenceStage`, and `ShortConv1dStage` consume replay metadata so padded rows do not drive logits, KV host counts, or GDN/short-conv recurrent state.
+- Bucketed graph preflight still rejects unsupported collective, sparse overlay, snapshot, CPU-participation, or placement-mutation paths instead of silently falling back to normal prefill.
 
-Acceptance gate:
-- Unit-test bucket selection and padding, including exact-bucket, just-over-bucket, and above-maximum cases.
-- Unit-test chunked prefill bookkeeping: two chunks should advance positions, KV heads, and GDN recurrence state exactly like one normal prefill over the concatenated tokens.
-- Server/integration test: two prompts with different real lengths but the same bucket should reuse the same captured graph and produce the same logits as unpadded normal execution for each prompt.
-- Stress test cache eviction/cap behavior and verify an evicted bucket is recaptured explicitly on the next eligible request, with no silent normal execution.
+Accepted coverage:
+- CPU, CUDA, and ROCm attention padding parity cover hostile bucket-tail rows.
+- CUDA and ROCm GDN padded real-length tests cover recurrence/short-conv state.
+- CUDA and ROCm row-select/LM-head graph-capture tests cover last-real-token readout across replay.
+- CUDA and ROCm `PrefillGraphCacheExecution` tests cover exact capture/replay, padded same-bucket reuse across real lengths, raw/server-style same-bucket reuse, KV real-token advancement, and cross-bucket eviction/explicit recapture under `LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS=1`.
+
+Operational notes:
+- Evictions are logged at `INFO` with bucket length, device, and configured cap.
+- `prefillGraphCacheSnapshot()` reports engine-level bucket evictions even after the evicted bucket's per-entry cache has been destroyed.
+- Tier 2 work remains about distributed/collective bucket graphs and ExpertParallel rebalance domains, not Tier 1 Phase 6 closeout.
 
 ---
 

@@ -16,6 +16,7 @@
 #include "../graph/IGraphBuilder.h" // For ForwardOutput
 #include "PrefillGraphCache.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -86,6 +87,8 @@ namespace llaminar2
         int pp_last_layer = -1;
         bool pp_has_embedding = false;
         bool pp_has_lm_head = false;
+        bool is_bucketed_prefill = false;
+        int bucket_seq_len = 0;
 
         bool operator==(const ForwardGraphSignature &other) const
         {
@@ -98,7 +101,9 @@ namespace llaminar2
                    pp_first_layer == other.pp_first_layer &&
                    pp_last_layer == other.pp_last_layer &&
                    pp_has_embedding == other.pp_has_embedding &&
-                   pp_has_lm_head == other.pp_has_lm_head;
+                   pp_has_lm_head == other.pp_has_lm_head &&
+                   is_bucketed_prefill == other.is_bucketed_prefill &&
+                   bucket_seq_len == other.bucket_seq_len;
         }
     };
 
@@ -116,6 +121,8 @@ namespace llaminar2
             h ^= (std::hash<int>{}(sig.pp_last_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_has_embedding) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_has_lm_head) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.is_bucketed_prefill) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<int>{}(sig.bucket_seq_len) + 0x9e3779b9 + (h << 6) + (h >> 2));
             return h;
         }
     };
@@ -234,6 +241,12 @@ namespace llaminar2
         std::vector<IComputeStage *> replay_callback_stages;
         bool replay_callback_stages_cached = false;
 
+        // Pre-cached pointers to stages that consume fixed-bucket prefill replay
+        // metadata. These are updated before prefill capture/replay so callback
+        // stages can advance host state by real tokens instead of padded rows.
+        std::vector<IComputeStage *> prefill_replay_param_stages;
+        bool prefill_replay_param_stages_cached = false;
+
         // Tracks whether setGPUStream has been applied to all stages.
         // The capture_stream never changes once set, so we skip the
         // 339-stage loop on subsequent decode steps.
@@ -265,6 +278,9 @@ namespace llaminar2
 
         /// Prefill graph capture/replay cache (keyed by seq_len)
         std::unique_ptr<PrefillGraphCache> prefill_graph_cache;
+
+        /// Monotonic engine-level LRU tick for bucketed prefill forward-cache eviction.
+        uint64_t bucketed_prefill_last_access_tick = 0;
 
         /// Explicit stream for prefill warmup/capture/replay.
         CachedGraphStream prefill_capture_stream;
@@ -314,6 +330,7 @@ namespace llaminar2
             if (prefill_graph_cache)
                 prefill_graph_cache->invalidateAll();
             prefill_capture_stream.reset();
+            bucketed_prefill_last_access_tick = 0;
             graph.reset();
             valid = false;
             token_ids.clear();
@@ -323,6 +340,8 @@ namespace llaminar2
             dynamic_param_stages_cached = false;
             replay_callback_stages.clear();
             replay_callback_stages_cached = false;
+            prefill_replay_param_stages.clear();
+            prefill_replay_param_stages_cached = false;
             gpu_stream_applied = false;
             applied_stream = nullptr;
             phase3_active = false;

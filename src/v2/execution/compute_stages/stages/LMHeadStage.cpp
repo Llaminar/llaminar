@@ -28,12 +28,14 @@ namespace llaminar2
             return true;
         if (!params_.prepared_store || !params_.prepared_ref.has_value())
         {
-            if (error) *error = "LMHeadStage requires PreparedWeightStore and PreparedWeightRef";
+            if (error)
+                *error = "LMHeadStage requires PreparedWeightStore and PreparedWeightRef";
             return false;
         }
         if (!params_.prepared_store->contains(params_.prepared_ref.value()))
         {
-            if (error) *error = "LMHeadStage PreparedWeightRef is not present in PreparedWeightStore";
+            if (error)
+                *error = "LMHeadStage PreparedWeightRef is not present in PreparedWeightStore";
             return false;
         }
         return true;
@@ -55,6 +57,13 @@ namespace llaminar2
             LOG_ERROR("[" << caller << "] PreparedWeightRef was provided but no GEMM kernel was found in PreparedWeightStore");
         }
         return cached_gemm_;
+    }
+
+    int LMHeadStage::activationRowOffsetForLogits() const
+    {
+        if (params_.effective_last_row_idx >= 0)
+            return params_.effective_last_row_idx;
+        return (params_.seq_len > 1) ? (params_.seq_len - 1) : 0;
     }
 
     bool LMHeadStage::execute(IDeviceContext *ctx)
@@ -121,7 +130,13 @@ namespace llaminar2
         //     (e.g., 345 MB → 608 KB for Qwen2.5-7B with vocab_size=152064)
         // The result is written to row 0 of the logits tensor.
         const int lm_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
-        const int lm_activation_offset = (params_.seq_len > 1) ? (params_.seq_len - 1) : 0;
+        const int lm_activation_offset = activationRowOffsetForLogits();
+        if (lm_activation_offset < 0 || lm_activation_offset >= params_.seq_len)
+        {
+            LOG_ERROR("[LMHeadStage] Invalid activation row offset " << lm_activation_offset
+                                                                     << " for seq_len=" << params_.seq_len);
+            return false;
+        }
 
         // Bias is passed directly to GEMM kernel for fused application
         bool success = lm_gemm->multiply_tensor(
@@ -284,8 +299,8 @@ namespace llaminar2
             return {};
 
         auto contract = StageBufferContract::build()
-            .addInput(*params_.input_buffer_id)
-            .addOutput(*params_.output_buffer_id);
+                            .addInput(*params_.input_buffer_id)
+                            .addOutput(*params_.output_buffer_id);
         // Model weight is not arena-managed
         if (params_.lm_head_weight)
             contract.addWeight(const_cast<ITensor *>(params_.lm_head_weight));

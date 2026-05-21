@@ -134,6 +134,9 @@ namespace llaminar2
         int batch_size = 1;
         int seq_len = 0;            ///< Per-sequence length (single) or max length (batched)
         int *seq_lengths = nullptr; ///< Per-sequence lengths for batched (nullptr = all same)
+        int real_seq_len = 0;       ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
+        int bucket_seq_len = 0;     ///< Fixed bucket length for graph shape (0 = seq_len)
+        int token_offset = 0;       ///< Chunk offset within the original prompt
 
         // Position information (for decode mode)
         int *position_ids = nullptr; ///< Position IDs for RoPE (nullptr = auto)

@@ -18,6 +18,7 @@
 #include "stages/KVCacheGatherStage.h"
 #include "stages/AttentionComputeStage.h"
 #include "stages/EmbeddingStage.h"
+#include "stages/HiddenStateRowSelectStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/AllreduceStage.h"
 #include "stages/AllGatherStage.h"
@@ -345,6 +346,18 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createEmbedding(
             const EmbeddingStage::Params &params);
+
+        /**
+         * @brief Create a hidden-state row-select stage for bucketed prefill LM-head input.
+         *
+         * Copies one dynamic source row into a stable one-row scratch tensor so
+         * captured LM-head GEMM can always use activation offset zero.
+         *
+         * @param params Row-select parameters including source, scratch, and dimensions.
+         * @return HiddenStateRowSelectStage instance.
+         */
+        static std::unique_ptr<IComputeStage> createHiddenStateRowSelect(
+            const HiddenStateRowSelectStage::Params &params);
 
         /**
          * @brief Create an LM head projection stage

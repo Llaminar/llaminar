@@ -35,117 +35,117 @@ using namespace llaminar2::testing;
 namespace
 {
 
-// =========================================================================
-// Scoped DebugEnv flag helpers
-// =========================================================================
+    // =========================================================================
+    // Scoped DebugEnv flag helpers
+    // =========================================================================
 
-class ScopedRocmMoEFlags
-{
-public:
-    ScopedRocmMoEFlags(bool grouped_decode, bool device_routed_decode, bool grouped_prefill)
-        : old_grouped_(mutableDebugEnv().rocm.moe_grouped_decode),
-          old_device_routed_(mutableDebugEnv().rocm.moe_device_routed_decode),
-          old_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
+    class ScopedRocmMoEFlags
     {
-        mutableDebugEnv().rocm.moe_grouped_decode = grouped_decode;
-        mutableDebugEnv().rocm.moe_device_routed_decode = device_routed_decode;
-        mutableDebugEnv().rocm.moe_grouped_prefill = grouped_prefill;
-    }
+    public:
+        ScopedRocmMoEFlags(bool grouped_decode, bool device_routed_decode, bool grouped_prefill)
+            : old_grouped_(mutableDebugEnv().rocm.moe_grouped_decode),
+              old_device_routed_(mutableDebugEnv().rocm.moe_device_routed_decode),
+              old_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
+        {
+            mutableDebugEnv().rocm.moe_grouped_decode = grouped_decode;
+            mutableDebugEnv().rocm.moe_device_routed_decode = device_routed_decode;
+            mutableDebugEnv().rocm.moe_grouped_prefill = grouped_prefill;
+        }
 
-    ~ScopedRocmMoEFlags()
+        ~ScopedRocmMoEFlags()
+        {
+            mutableDebugEnv().rocm.moe_grouped_decode = old_grouped_;
+            mutableDebugEnv().rocm.moe_device_routed_decode = old_device_routed_;
+            mutableDebugEnv().rocm.moe_grouped_prefill = old_prefill_;
+        }
+
+    private:
+        bool old_grouped_;
+        bool old_device_routed_;
+        bool old_prefill_;
+    };
+
+    // =========================================================================
+    // Minimal stub IMoEKernel (no actual compute, just satisfies the interface)
+    // =========================================================================
+
+    class StubMoEKernel : public IMoEKernel
     {
-        mutableDebugEnv().rocm.moe_grouped_decode = old_grouped_;
-        mutableDebugEnv().rocm.moe_device_routed_decode = old_device_routed_;
-        mutableDebugEnv().rocm.moe_grouped_prefill = old_prefill_;
-    }
+    public:
+        bool supports_device(int) const override { return true; }
+        bool route(const float *, const float *, int, int, int, int, bool,
+                   MoERoutingResult &) override
+        {
+            return false;
+        }
+        void gatherTokenBatch(const float *, float *, const int *, int, int) override {}
+        void scatterAddWeighted(float *, const float *, const int *, const float *,
+                                int, int) override {}
+        void sharedExpertGate(const float *, const float *, float *, int, int) override {}
+        void swiGLU(float *, const float *, int) override {}
+    };
 
-private:
-    bool old_grouped_;
-    bool old_device_routed_;
-    bool old_prefill_;
-};
+    // =========================================================================
+    // Minimal stub ITensorGatedDeltaNet for GDN tests
+    // =========================================================================
 
-// =========================================================================
-// Minimal stub IMoEKernel (no actual compute, just satisfies the interface)
-// =========================================================================
-
-class StubMoEKernel : public IMoEKernel
-{
-public:
-    bool supports_device(int) const override { return true; }
-    bool route(const float *, const float *, int, int, int, int, bool,
-               MoERoutingResult &) override
+    class StubGDNKernel : public ITensorGatedDeltaNet
     {
-        return false;
-    }
-    void gatherTokenBatch(const float *, float *, const int *, int, int) override {}
-    void scatterAddWeighted(float *, const float *, const int *, const float *,
-                            int, int) override {}
-    void sharedExpertGate(const float *, const float *, float *, int, int) override {}
-    void swiGLU(float *, const float *, int) override {}
-};
+    public:
+        explicit StubGDNKernel(bool state_ready, int state_size = 0)
+            : state_ready_(state_ready), state_size_(state_size) {}
 
-// =========================================================================
-// Minimal stub ITensorGatedDeltaNet for GDN tests
-// =========================================================================
+        bool isGPUStateReady(int required_state_size) const override
+        {
+            return state_ready_ && (state_size_ == required_state_size);
+        }
 
-class StubGDNKernel : public ITensorGatedDeltaNet
-{
-public:
-    explicit StubGDNKernel(bool state_ready, int state_size = 0)
-        : state_ready_(state_ready), state_size_(state_size) {}
+        bool chunk_forward(
+            const float *, const float *, const float *,
+            const float *, const float *,
+            const float *, const float *,
+            float *, float *,
+            int, int, int, int, int, bool) override
+        {
+            return true;
+        }
 
-    bool isGPUStateReady(int required_state_size) const override
+        bool recurrent_step(
+            const float *, const float *, const float *,
+            const float *, const float *,
+            const float *, const float *,
+            float *, float *,
+            int, int, int, bool) override
+        {
+            return true;
+        }
+
+    private:
+        bool state_ready_;
+        int state_size_;
+    };
+
+    // =========================================================================
+    // Minimal stub ITensorGemm for expert GEMM engine checks
+    // =========================================================================
+
+    class StubGemmEngine : public ITensorGemm
     {
-        return state_ready_ && (state_size_ == required_state_size);
-    }
-
-    bool chunk_forward(
-        const float *, const float *, const float *,
-        const float *, const float *,
-        const float *, const float *,
-        float *, float *,
-        int, int, int, int, int, bool) override
-    {
-        return true;
-    }
-
-    bool recurrent_step(
-        const float *, const float *, const float *,
-        const float *, const float *,
-        const float *, const float *,
-        float *, float *,
-        int, int, int, bool) override
-    {
-        return true;
-    }
-
-private:
-    bool state_ready_;
-    int state_size_;
-};
-
-// =========================================================================
-// Minimal stub ITensorGemm for expert GEMM engine checks
-// =========================================================================
-
-class StubGemmEngine : public ITensorGemm
-{
-public:
-    bool supports_device(int) const override { return true; }
-    bool multiply_tensor(
-        const TensorBase *, TensorBase *,
-        int, int, int,
-        bool, float, float,
-        const TensorBase *,
-        const IMPIContext *,
-        int,
-        DeviceWorkspaceManager *,
-        int) override
-    {
-        return true;
-    }
-};
+    public:
+        bool supports_device(int) const override { return true; }
+        bool multiply_tensor(
+            const TensorBase *, TensorBase *,
+            int, int, int,
+            bool, float, float,
+            const TensorBase *,
+            const IMPIContext *,
+            int,
+            DeviceWorkspaceManager *,
+            int) override
+        {
+            return true;
+        }
+    };
 
 } // anonymous namespace
 
@@ -847,6 +847,22 @@ TEST_F(GDNPrefillGraphCapture, PrefillRejectsOnCPU)
 
     EXPECT_FALSE(stage.isGraphCapturable())
         << "GDN prefill should never be capturable on CPU";
+}
+
+TEST_F(GDNPrefillGraphCapture, CUDAPrefillRemainsRejectedBecauseGraphCaptureReadinessIsROCmOnly)
+{
+#ifdef HAVE_CUDA
+    const int required_state_size = N_HEADS * D_K * D_V;
+    StubGDNKernel ready_kernel(true, required_state_size);
+    auto params = makeValidPrefillParams(&ready_kernel);
+    params.device_id = DeviceId::cuda(0);
+    GDNRecurrenceStage stage(params);
+
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "CUDA GDN kernels exist, but prefill graph capture readiness is still ROCm-only.";
+#else
+    GTEST_SKIP() << "CUDA backend not compiled";
+#endif
 }
 
 TEST_F(GDNPrefillGraphCapture, DecodeAlwaysCapturableRegardlessOfState)

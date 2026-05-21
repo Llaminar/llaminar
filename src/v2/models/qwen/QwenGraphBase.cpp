@@ -298,6 +298,54 @@ namespace llaminar2
         return buffers_;
     }
 
+    TensorBase *QwenGraphBase::maybeAddLMHeadRowSelect(
+        ComputeGraph &graph,
+        const std::string &dependency_node,
+        TensorBase *final_norm_output,
+        int total_tokens,
+        int real_seq_len,
+        int bucket_seq_len,
+        DeviceId device,
+        std::string &dependency_out,
+        BufferId input_buffer_id) const
+    {
+        dependency_out = dependency_node;
+
+        // Only bucketed prefill needs a dynamic row-select. Normal exact-shape
+        // prefill and decode preserve the existing LMHeadStage offset behavior.
+        const bool bucketed_prefill = bucket_seq_len > 0 && bucket_seq_len == total_tokens && total_tokens > 1;
+        if (!bucketed_prefill)
+            return final_norm_output;
+
+        TensorBase *scratch_row = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROW);
+        if (!scratch_row)
+        {
+            LOG_ERROR("[QwenGraphBase] Bucketed prefill LM head requires lm_head_input_row scratch buffer");
+            throw std::runtime_error("Bucketed prefill LM head row-select scratch buffer missing");
+        }
+
+        // Initial execution uses the real count available at graph build. Later
+        // cache hits call updatePrefillReplayParams() on the stage, which mutates
+        // the captured pinned scalar before graph replay.
+        const int initial_real_seq_len = real_seq_len > 0 ? real_seq_len : total_tokens;
+        HiddenStateRowSelectStage::Params row_params;
+        row_params.input = final_norm_output;
+        row_params.output = scratch_row;
+        row_params.seq_len = total_tokens;
+        row_params.d_model = config_.d_model;
+        row_params.selected_row_idx = initial_real_seq_len - 1;
+        row_params.device_id = device;
+        row_params.input_buffer_id = input_buffer_id;
+        row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
+
+        graph.addNode("lm_head_row_select",
+                      ComputeStageFactory::createHiddenStateRowSelect(row_params),
+                      device);
+        graph.addDependency("lm_head_row_select", dependency_node);
+        dependency_out = "lm_head_row_select";
+        return scratch_row;
+    }
+
     // =============================================================================
     // GraphConfig Helper Methods
     // =============================================================================
@@ -330,9 +378,13 @@ namespace llaminar2
         qwen_input.position_ids = input.position_ids;
         qwen_input.batch_size = input.batch_size;
         qwen_input.seq_len = input.seq_len;
+        qwen_input.real_seq_len = input.real_seq_len;
+        qwen_input.bucket_seq_len = input.bucket_seq_len;
+        qwen_input.token_offset = input.token_offset;
         qwen_input.position_offset = input.position_offset;
         qwen_input.device = input.device;
         qwen_input.kv_cache = input.kv_cache;
+        qwen_input.sequence_lengths = input.sequence_lengths;
 
         // Adapt generic ForwardOutput to ForwardOutput
         ForwardOutput qwen_output;
@@ -546,6 +598,17 @@ namespace llaminar2
                             prev_node, total_tokens, device);
         prev_node = "final_norm";
 
+        std::string lm_head_dependency = prev_node;
+        TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
+            graph,
+            prev_node,
+            buffers_.layer_buffers.normalized,
+            total_tokens,
+            input.real_seq_len,
+            input.bucket_seq_len,
+            device,
+            lm_head_dependency);
+
         // -------------------------------------------------------------------------
         // Stage 4: LM Head (with optional Column-Parallel + AllGather)
         // -------------------------------------------------------------------------
@@ -564,24 +627,27 @@ namespace llaminar2
                   << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
         LMHeadStage::Params lm_params;
-        // Feed LM head from the final RMSNorm output (FP32).
-        lm_params.hidden_states = buffers_.layer_buffers.normalized;
+        // Feed LM head from either final RMSNorm or the bucket-safe selected row.
+        lm_params.hidden_states = lm_head_input;
         lm_params.lm_head_weight = modelLMHead();
         lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
         lm_params.logits = lm_head_output;
-        lm_params.seq_len = total_tokens;
+        lm_params.seq_len = (lm_head_input == buffers_.layer_buffers.normalized) ? total_tokens : 1;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias_tensor = nullptr; // Qwen2 has no LM head bias
         lm_params.device_id = config_.default_device;
         lm_params.prepared_store = prepared_weight_store_;
-        lm_params.input_buffer_id = BufferId::NORMALIZED;
+        lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
+                                        ? BufferId::NORMALIZED
+                                        : BufferId::LM_HEAD_INPUT_ROW;
         lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+        lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
                       device);
-        graph.addDependency("lm_head", prev_node);
+        graph.addDependency("lm_head", lm_head_dependency);
         prev_node = "lm_head";
 
         // Phase 5: AllGather stage for column-parallel LM head
@@ -881,6 +947,17 @@ namespace llaminar2
                                 prev_node, total_tokens, device);
             prev_node = "final_norm";
 
+            std::string lm_head_dependency = prev_node;
+            TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
+                graph,
+                prev_node,
+                buffers_.layer_buffers.normalized,
+                total_tokens,
+                input.real_seq_len,
+                input.bucket_seq_len,
+                device,
+                lm_head_dependency);
+
             // LM Head (with optional Column-Parallel + AllGather)
             bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
 
@@ -891,23 +968,26 @@ namespace llaminar2
                       << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
             LMHeadStage::Params lm_params;
-            lm_params.hidden_states = buffers_.layer_buffers.normalized;
+            lm_params.hidden_states = lm_head_input;
             lm_params.lm_head_weight = modelLMHead();
             lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
             lm_params.logits = lm_head_output;
-            lm_params.seq_len = total_tokens;
+            lm_params.seq_len = (lm_head_input == buffers_.layer_buffers.normalized) ? total_tokens : 1;
             lm_params.d_model = config_.d_model;
             lm_params.vocab_size = lm_head_vocab_size;
             lm_params.bias_tensor = nullptr;
             lm_params.device_id = config_.default_device;
             lm_params.prepared_store = prepared_weight_store_;
-            lm_params.input_buffer_id = BufferId::NORMALIZED;
+            lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
+                                            ? BufferId::NORMALIZED
+                                            : BufferId::LM_HEAD_INPUT_ROW;
             lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+            lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
 
             graph.addNode("lm_head",
                           ComputeStageFactory::createLMHead(lm_params),
                           device);
-            graph.addDependency("lm_head", prev_node);
+            graph.addDependency("lm_head", lm_head_dependency);
             prev_node = "lm_head";
 
             // AllGather stage for column-parallel LM head
@@ -1224,6 +1304,17 @@ namespace llaminar2
                                     prev_node, total_tokens, stage_device);
                 prev_node = "final_norm";
 
+                std::string lm_head_dependency = prev_node;
+                TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
+                    graph,
+                    prev_node,
+                    buffers_.layer_buffers.normalized,
+                    total_tokens,
+                    input.real_seq_len,
+                    input.bucket_seq_len,
+                    stage_device,
+                    lm_head_dependency);
+
                 // LM Head
                 bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
                 TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
@@ -1233,21 +1324,26 @@ namespace llaminar2
                           << use_column_parallel << " vocab_size=" << lm_head_vocab_size);
 
                 LMHeadStage::Params lm_params;
-                lm_params.hidden_states = buffers_.layer_buffers.normalized;
+                lm_params.hidden_states = lm_head_input;
                 lm_params.lm_head_weight = modelLMHead();
                 lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), stage_device);
                 lm_params.logits = lm_head_output;
-                lm_params.seq_len = total_tokens;
+                lm_params.seq_len = (lm_head_input == buffers_.layer_buffers.normalized) ? total_tokens : 1;
                 lm_params.d_model = config_.d_model;
                 lm_params.vocab_size = lm_head_vocab_size;
                 lm_params.bias_tensor = nullptr;
                 lm_params.device_id = stage_device;
                 lm_params.prepared_store = prepared_weight_store_;
+                lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
+                                                ? BufferId::NORMALIZED
+                                                : BufferId::LM_HEAD_INPUT_ROW;
+                lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+                lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
 
                 graph.addNode("lm_head",
                               ComputeStageFactory::createLMHead(lm_params),
                               stage_device);
-                graph.addDependency("lm_head", prev_node);
+                graph.addDependency("lm_head", lm_head_dependency);
                 prev_node = "lm_head";
 
                 // AllGather stage for column-parallel LM head

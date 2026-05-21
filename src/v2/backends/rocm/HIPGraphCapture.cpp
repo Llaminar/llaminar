@@ -12,16 +12,16 @@ namespace llaminar2
     // diagnostics visible without escalating during shutdown/error rollback,
     // where throwing or logging at ERROR could mask the real failure or trigger
     // std::terminate from a destructor on stack unwind.
-#define HIP_WARN_IF_FAIL(call)                                                      \
-    do                                                                              \
-    {                                                                               \
-        hipError_t _err = (call);                                                   \
-        if (_err != hipSuccess)                                                     \
-        {                                                                           \
-            LOG_WARN("[HIPGraphCapture] " << #call << " failed: "                   \
-                                          << hipGetErrorString(_err) << " ("       \
-                                          << __FILE__ << ":" << __LINE__ << ")");  \
-        }                                                                           \
+#define HIP_WARN_IF_FAIL(call)                                                    \
+    do                                                                            \
+    {                                                                             \
+        hipError_t _err = (call);                                                 \
+        if (_err != hipSuccess)                                                   \
+        {                                                                         \
+            LOG_WARN("[HIPGraphCapture] " << #call << " failed: "                 \
+                                          << hipGetErrorString(_err) << " ("      \
+                                          << __FILE__ << ":" << __LINE__ << ")"); \
+        }                                                                         \
     } while (0)
 
     HIPGraphCapture::HIPGraphCapture(hipStream_t stream) : stream_(stream) {}

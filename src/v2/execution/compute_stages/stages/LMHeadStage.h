@@ -50,6 +50,8 @@ namespace llaminar2
             int seq_len = 0;
             int d_model = 0;
             int vocab_size = 0;
+            int effective_last_row_idx = -1;           ///< Dynamic last real token row for padded prefill replay.
+            bool use_prefill_replay_row_offset = true; ///< False when input is already a one-row scratch.
 
             // Optional bias tensor [vocab_size] - passed to GEMM for fused addition
             const TensorBase *bias_tensor = nullptr;
@@ -76,6 +78,22 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
+
+        bool hasPrefillReplayParams() const override { return params_.use_prefill_replay_row_offset; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override
+        {
+            if (!params_.use_prefill_replay_row_offset)
+                return;
+            // Padded bucket replay executes a fixed bucket shape, but sampling
+            // must read logits for the final real token, not the bucket tail.
+            const bool padded = replay.real_seq_len > 0 &&
+                                replay.bucket_seq_len > 0 &&
+                                replay.real_seq_len < replay.bucket_seq_len;
+            params_.effective_last_row_idx = padded ? replay.real_seq_len - 1 : -1;
+        }
+
+        /// @brief Returns the hidden-state row offset used for the one-row LM-head GEMM.
+        int activationRowOffsetForLogits() const;
 
         /**
          * @brief Return FULL policy - cohere inputs AND allocate output GPU buffers

@@ -13,6 +13,7 @@
 #include "stages/GEMMStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
+#include "stages/HiddenStateRowSelectStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/MoEExpertDispatchStage.h"
 #include "stages/MoEExpertParallelReduceStage.h"
@@ -264,6 +265,12 @@ namespace llaminar2
         const EmbeddingStage::Params &params)
     {
         return std::make_unique<EmbeddingStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createHiddenStateRowSelect(
+        const HiddenStateRowSelectStage::Params &params)
+    {
+        return std::make_unique<HiddenStateRowSelectStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createLMHead(

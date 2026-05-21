@@ -114,13 +114,24 @@ namespace llaminar2
                 params_.kv_cache->setDynamicHead(params_.layer_idx, params_.seq_idx, stream);
             }
         }
+        bool hasPrefillReplayParams() const override { return true; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override
+        {
+            // Captured prefill append kernels may execute a padded bucket in a
+            // later phase. Host cache metadata must advance by the real prompt
+            // prefix only so padded rows remain invisible to attention/decode.
+            replay_advance_tokens_ = replay.real_seq_len > 0 ? replay.real_seq_len : 0;
+        }
         void onGraphReplayed() override
         {
             // Advance the ring buffer head and count on the host side.
             // Called by DeviceGraphExecutor AFTER the captured graph segment replays.
             if (params_.kv_cache)
             {
-                params_.kv_cache->advanceHead(params_.layer_idx, params_.seq_idx, params_.num_tokens);
+                const int advance_tokens = replay_advance_tokens_ > 0
+                                               ? replay_advance_tokens_
+                                               : params_.num_tokens;
+                params_.kv_cache->advanceHead(params_.layer_idx, params_.seq_idx, advance_tokens);
             }
         }
         bool needsOnGraphReplayed() const override { return true; }
@@ -145,6 +156,10 @@ namespace llaminar2
         /// Workspace for kv_rotation: holds FP32 copy for in-place rotation
         /// before Q16_1 quantization. Lazy-allocated, reused across calls.
         std::vector<float> kv_rotation_scratch_;
+
+        /// Real token count to advance after prefill graph replay; 0 falls
+        /// back to params_.num_tokens for decode and legacy exact-shape replay.
+        int replay_advance_tokens_ = 0;
     };
 
 } // namespace llaminar2

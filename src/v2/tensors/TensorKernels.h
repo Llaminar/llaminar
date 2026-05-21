@@ -2753,6 +2753,9 @@ namespace llaminar2
             return true;
         }
 
+        /// Return true when padded prefill can commit state using a dynamic real length.
+        virtual bool supportsPaddedPrefillRealLength() const { return false; }
+
         /// Reset GPU state to zero (no-op for CPU implementations)
         virtual void resetGPUState() {}
 
@@ -2780,6 +2783,34 @@ namespace llaminar2
             float *output, float *conv_state,
             int seq_len, int channels, int kernel_size,
             bool apply_silu = true) = 0;
+
+        /**
+         * @brief Prefill variant whose state commit length is read from device memory.
+         *
+         * GPU graph capture records the H2D copy that updates the device scalar,
+         * then this kernel reads the current real length on each replay. CPU
+         * implementations normally do not use this entry point; stages pass the
+         * effective length directly to forward().
+         */
+        virtual bool forwardWithEffectiveSeqLen(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int channels, int kernel_size,
+            const int *device_effective_seq_len,
+            bool apply_silu = true)
+        {
+            (void)input;
+            (void)weight;
+            (void)bias;
+            (void)output;
+            (void)conv_state;
+            (void)seq_len;
+            (void)channels;
+            (void)kernel_size;
+            (void)device_effective_seq_len;
+            (void)apply_silu;
+            return false;
+        }
     };
 
     /**
@@ -2820,6 +2851,9 @@ namespace llaminar2
             (void)required_state_size;
             return false;
         }
+
+        /// Return true when padded prefill can commit recurrence state using a dynamic real length.
+        virtual bool supportsPaddedPrefillRealLength() const { return false; }
 
         /**
          * @brief Deinterleave merged QKV buffer on device (GPU-only)
@@ -2893,6 +2927,42 @@ namespace llaminar2
             float *output, float *state,
             int seq_len, int n_heads, int d_k, int d_v,
             int chunk_size, bool use_qk_l2norm) = 0;
+
+        /**
+         * @brief Chunk prefill variant with a graph-replay-updated real length.
+         *
+         * The launch shape remains tied to seq_len (the bucket size), while the
+         * kernel reads device_effective_seq_len to decide how many leading rows
+         * advance recurrent state. Padded output rows are inert and must not
+         * affect subsequent decode state.
+         */
+        virtual bool chunkForwardWithEffectiveSeqLen(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            const int *device_effective_seq_len)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)chunk_size;
+            (void)use_qk_l2norm;
+            (void)device_effective_seq_len;
+            return false;
+        }
 
         /**
          * @brief Single-step decode recurrence

@@ -100,6 +100,8 @@ namespace llaminar2
             return "GLOBAL_PP_TRANSFER";
         case ComputeStageType::COPY:
             return "COPY";
+        case ComputeStageType::ROW_SELECT:
+            return "ROW_SELECT";
         case ComputeStageType::DEQUANTIZE:
             return "DEQUANTIZE";
         case ComputeStageType::QUANTIZE:
@@ -220,7 +222,7 @@ namespace llaminar2
             if (count == 0)
             {
                 LOG_DEBUG("[TRACE] " << name() << " INPUT '" << tensor_name
-                                    << "' [empty tensor]");
+                                     << "' [empty tensor]");
                 return;
             }
         }
@@ -298,7 +300,7 @@ namespace llaminar2
             if (count == 0)
             {
                 LOG_DEBUG("[TRACE] " << name() << " OUTPUT '" << tensor_name
-                                    << "' [empty tensor]");
+                                     << "' [empty tensor]");
                 return;
             }
         }
@@ -330,7 +332,7 @@ namespace llaminar2
         if (!data)
         {
             LOG_DEBUG("[TRACE] " << name() << " OUTPUT '" << tensor_name
-                                << "' [no fp32 data available]");
+                                 << "' [no fp32 data available]");
             return;
         }
 

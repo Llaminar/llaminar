@@ -229,7 +229,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsSnapshots)
 
     std::unordered_set<std::string> no_collectives;
     auto reason = cache.preflight(graph, key, &no_collectives,
-                                   /*snapshots_active=*/true, false);
+                                  /*snapshots_active=*/true, false);
     EXPECT_EQ(reason, PrefillGraphRejectReason::SnapshotsActive);
 }
 
@@ -253,7 +253,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsMoERebalancing)
 
     std::unordered_set<std::string> no_collectives;
     auto reason = cache.preflight(graph, key, &no_collectives,
-                                   false, /*moe_rebalancing_active=*/true);
+                                  false, /*moe_rebalancing_active=*/true);
     EXPECT_EQ(reason, PrefillGraphRejectReason::ActiveMoERebalancing);
 }
 
@@ -563,6 +563,7 @@ TEST(Test__PrefillGraphCacheIntegration, RejectReasonToString)
     EXPECT_NE(toString(PrefillGraphRejectReason::ActiveMoERebalancing), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::CollectiveNodesPresent), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::StageNotCapturable), nullptr);
+    EXPECT_NE(toString(PrefillGraphRejectReason::GDNWithPaddedBucket), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::NoGPUContext), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::InvalidatedByPlacement), nullptr);
 }

@@ -16,12 +16,165 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 
+#ifdef HAVE_CUDA
+#include "../../../kernels/cuda/ops/CUDARowSelectKernels.h"
+#endif
+
+#ifdef HAVE_ROCM
+#include "../../../kernels/rocm/ops/ROCmRowSelectKernels.h"
+#endif
+
+#include <algorithm>
+#include <cstring>
+
 namespace llaminar2
 {
+    struct ShortConv1dStage::GpuEffectiveSeqLenState
+    {
+        DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
+        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar captured by H2D memcpy.
+        int *device_effective_seq_len = nullptr; ///< Device scalar read by the short-conv kernel.
+    };
 
     ShortConv1dStage::ShortConv1dStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    ShortConv1dStage::~ShortConv1dStage()
+    {
+        releaseGpuEffectiveSeqLenState();
+    }
+
+    int ShortConv1dStage::effectivePrefillSeqLen() const
+    {
+        if (params_.seq_len <= 0)
+            return 0;
+        if (!prefill_replay_params_set_ || prefill_effective_seq_len_ <= 0)
+            return params_.seq_len;
+        return std::clamp(prefill_effective_seq_len_, 1, params_.seq_len);
+    }
+
+    bool ShortConv1dStage::shouldUseRealLengthContract() const
+    {
+        return params_.seq_len > 1 &&
+               prefill_replay_params_set_ &&
+               params_.kernel &&
+               params_.kernel->supportsPaddedPrefillRealLength();
+    }
+
+    void ShortConv1dStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
+    {
+        prefill_replay_params_set_ = true;
+        prefill_bucket_seq_len_ = replay.bucket_seq_len > 0 ? replay.bucket_seq_len : params_.seq_len;
+        const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
+        prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
+        refreshPinnedEffectiveSeqLen();
+    }
+
+    bool ShortConv1dStage::supportsPaddedPrefillRealLengthContract() const
+    {
+        return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
+    }
+
+    bool ShortConv1dStage::ensureGpuEffectiveSeqLenStateInitialized()
+    {
+        if (gpu_effective_seq_len_state_)
+            return true;
+
+        auto state = std::make_unique<GpuEffectiveSeqLenState>();
+        state->device = params_.device_id;
+
+        bool allocated = false;
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            allocated = cuda::allocateRowSelectParam(
+                params_.device_id.cuda_ordinal(),
+                &state->host_effective_seq_len,
+                &state->device_effective_seq_len);
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            allocated = rocm::allocateRowSelectParam(
+                params_.device_id.rocm_ordinal(),
+                &state->host_effective_seq_len,
+                &state->device_effective_seq_len);
+#endif
+        }
+
+        if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
+        {
+            LOG_ERROR("[ShortConv1dStage] Failed to allocate graph-captured effective length scalar on "
+                      << params_.device_id.toString());
+            return false;
+        }
+
+        gpu_effective_seq_len_state_ = std::move(state);
+        refreshPinnedEffectiveSeqLen();
+        return true;
+    }
+
+    void ShortConv1dStage::refreshPinnedEffectiveSeqLen()
+    {
+        if (gpu_effective_seq_len_state_ && gpu_effective_seq_len_state_->host_effective_seq_len)
+            *gpu_effective_seq_len_state_->host_effective_seq_len = effectivePrefillSeqLen();
+    }
+
+    bool ShortConv1dStage::uploadGpuEffectiveSeqLen()
+    {
+        if (!gpu_effective_seq_len_state_)
+            return false;
+        refreshPinnedEffectiveSeqLen();
+
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            return cuda::uploadRowSelectParam(
+                gpu_effective_seq_len_state_->device_effective_seq_len,
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpuStream());
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            return rocm::uploadRowSelectParam(
+                gpu_effective_seq_len_state_->device_effective_seq_len,
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpuStream());
+#endif
+        }
+        return false;
+    }
+
+    void ShortConv1dStage::releaseGpuEffectiveSeqLenState()
+    {
+        if (!gpu_effective_seq_len_state_)
+            return;
+
+        if (gpu_effective_seq_len_state_->device.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            cuda::freeRowSelectParam(
+                gpu_effective_seq_len_state_->device.cuda_ordinal(),
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpu_effective_seq_len_state_->device_effective_seq_len);
+#endif
+        }
+        else if (gpu_effective_seq_len_state_->device.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            rocm::freeRowSelectParam(
+                gpu_effective_seq_len_state_->device.rocm_ordinal(),
+                gpu_effective_seq_len_state_->host_effective_seq_len,
+                gpu_effective_seq_len_state_->device_effective_seq_len);
+#endif
+        }
+
+        gpu_effective_seq_len_state_.reset();
     }
 
     bool ShortConv1dStage::execute(IDeviceContext *ctx)
@@ -72,11 +225,39 @@ namespace llaminar2
                     d_bias = static_cast<const float *>(bias_base->gpu_data_ptr());
             }
 
-            bool ok = params_.kernel->forward(
-                d_input, d_weight, d_bias,
-                d_output, params_.conv_state,
-                params_.seq_len, params_.channels, params_.kernel_size,
-                /*apply_silu=*/true);
+            const int effective_seq_len = effectivePrefillSeqLen();
+            const bool padded_effective_len =
+                params_.seq_len > 1 && prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
+            const bool use_real_length_contract = shouldUseRealLengthContract();
+            if (padded_effective_len && !use_real_length_contract)
+            {
+                LOG_ERROR("[ShortConv1dStage] Padded prefill requires a backend real-length contract");
+                return false;
+            }
+
+            bool ok = false;
+            if (use_real_length_contract)
+            {
+                if (!ensureGpuEffectiveSeqLenStateInitialized() || !uploadGpuEffectiveSeqLen())
+                {
+                    LOG_ERROR("[ShortConv1dStage] Failed to update GPU effective length scalar");
+                    return false;
+                }
+                ok = params_.kernel->forwardWithEffectiveSeqLen(
+                    d_input, d_weight, d_bias,
+                    d_output, params_.conv_state,
+                    params_.seq_len, params_.channels, params_.kernel_size,
+                    gpu_effective_seq_len_state_->device_effective_seq_len,
+                    /*apply_silu=*/true);
+            }
+            else
+            {
+                ok = params_.kernel->forward(
+                    d_input, d_weight, d_bias,
+                    d_output, params_.conv_state,
+                    params_.seq_len, params_.channels, params_.kernel_size,
+                    /*apply_silu=*/true);
+            }
 
             if (!ok)
             {
@@ -86,6 +267,7 @@ namespace llaminar2
 
             LOG_DEBUG("[ShortConv1dStage] GPU: seq_len=" << params_.seq_len
                                                          << " channels=" << params_.channels
+                                                         << " effective_seq_len=" << effective_seq_len
                                                          << " kernel=" << params_.kernel_size
                                                          << (params_.seq_len == 1 ? " (decode)" : " (prefill)"));
             return true;
@@ -112,10 +294,20 @@ namespace llaminar2
             return false;
         }
 
+        const int effective_seq_len = effectivePrefillSeqLen();
+        const int kernel_seq_len = params_.seq_len > 1 ? effective_seq_len : params_.seq_len;
+        const bool padded_effective_len =
+            params_.seq_len > 1 && prefill_replay_params_set_ && effective_seq_len < params_.seq_len;
+        if (padded_effective_len && !supportsPaddedPrefillRealLengthContract())
+        {
+            LOG_ERROR("[ShortConv1dStage] Padded CPU prefill requires a real-length contract");
+            return false;
+        }
+
         bool ok = params_.kernel->forward(
             input_data, weight_data, bias_data,
             output_data, params_.conv_state,
-            params_.seq_len, params_.channels, params_.kernel_size,
+            kernel_seq_len, params_.channels, params_.kernel_size,
             /*apply_silu=*/true);
 
         if (!ok)
@@ -124,7 +316,15 @@ namespace llaminar2
             return false;
         }
 
+        if (kernel_seq_len < params_.seq_len)
+        {
+            const size_t first_pad = static_cast<size_t>(kernel_seq_len) * static_cast<size_t>(params_.channels);
+            const size_t pad_count = static_cast<size_t>(params_.seq_len - kernel_seq_len) * static_cast<size_t>(params_.channels);
+            std::memset(output_data + first_pad, 0, pad_count * sizeof(float));
+        }
+
         LOG_DEBUG("[ShortConv1dStage] Executed: seq_len=" << params_.seq_len
+                                                          << " effective_seq_len=" << kernel_seq_len
                                                           << " channels=" << params_.channels
                                                           << " kernel=" << params_.kernel_size
                                                           << (params_.seq_len == 1 ? " (decode)" : " (prefill)"));

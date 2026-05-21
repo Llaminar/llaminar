@@ -306,6 +306,7 @@ namespace llaminar2
 
         // Utility
         COPY,
+        ROW_SELECT, ///< Copy one dynamically selected source row into a stable scratch row.
         QUANTIZE,
         DEQUANTIZE,
 
@@ -358,6 +359,22 @@ namespace llaminar2
         {
             const char *name = nullptr;
             const void *ptr = nullptr;
+        };
+
+        /**
+         * @brief Dynamic bookkeeping for fixed-bucket prefill graph replay.
+         *
+         * Bucketed prefill graphs may execute a padded, fixed topology while
+         * only a prefix of that bucket is real prompt data. Stages that update
+         * host-side sequence state after graph replay use this metadata to keep
+         * KV heads, recurrent state, and future row-selection logic aligned to
+         * the real token count rather than the padded execution length.
+         */
+        struct PrefillReplayParams
+        {
+            int real_seq_len = 0;   ///< Real, non-padding token count in this replay.
+            int bucket_seq_len = 0; ///< Fixed graph execution length for this replay.
+            int token_offset = 0;   ///< Offset of this chunk within the original prompt.
         };
 
         /**
@@ -660,6 +677,41 @@ namespace llaminar2
          * ~339 stages with hash lookups on every decode step.
          */
         virtual bool hasDynamicParams() const { return false; }
+
+        /**
+         * @brief Update prefill replay bookkeeping before a captured graph launch.
+         *
+         * The executor calls this on cached prefill graph hits after normal
+         * dynamic params are refreshed and before capture/replay callbacks can
+         * run. Decode graph replay continues to use updateDynamicParams() only.
+         * Stages should ignore this unless their host-side replay callback must
+         * distinguish real tokens from padded bucket rows.
+         *
+         * @param params Real-token and bucket metadata for the upcoming prefill replay.
+         */
+        virtual void updatePrefillReplayParams(const PrefillReplayParams &params)
+        {
+            (void)params;
+        }
+
+        /**
+         * @brief Returns true if this stage consumes updatePrefillReplayParams().
+         *
+         * Used by the forward graph cache to precompute a small stage list and
+         * avoid scanning every graph node before each cached prefill launch.
+         */
+        virtual bool hasPrefillReplayParams() const { return false; }
+
+        /**
+         * @brief Whether this stage can safely execute padded prefill buckets.
+         *
+         * Stateful prefill stages such as GDN recurrence and short convolution
+         * may run fixed bucket-shaped kernels, but their recurrent state must
+         * commit as though only the real prompt prefix executed. Stages return
+         * true here only when their backend implements that real-length
+         * contract for graph replay.
+         */
+        virtual bool supportsPaddedPrefillRealLengthContract() const { return false; }
 
         /**
          * @brief Called after a captured GPU graph segment is replayed.

@@ -10,8 +10,11 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <memory>
 #include <cmath>
+#include <limits>
+#include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
@@ -286,6 +289,75 @@ namespace llaminar2
             std::unique_ptr<FP32Tensor> workspace_mask_;
         };
 
+        /// @brief Reference FP32 single-query GQA attention over a caller-selected KV prefix.
+        std::vector<float> referenceSingleQueryGQAAttention(
+            const float *q_data,
+            const float *k_data,
+            const float *v_data,
+            int kv_len,
+            int num_heads,
+            int num_kv_heads,
+            int head_dim)
+        {
+            std::vector<float> output(static_cast<size_t>(num_heads * head_dim), 0.0f);
+            std::vector<float> scores(static_cast<size_t>(kv_len), 0.0f);
+
+            const int kv_row_stride = num_kv_heads * head_dim;
+            const int gqa_group_size = num_heads / num_kv_heads;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+            for (int head = 0; head < num_heads; ++head)
+            {
+                const int kv_head = head / gqa_group_size;
+                const float *q_head = q_data + head * head_dim;
+
+                float max_score = -std::numeric_limits<float>::infinity();
+                for (int pos = 0; pos < kv_len; ++pos)
+                {
+                    const float *k_head = k_data + pos * kv_row_stride + kv_head * head_dim;
+                    float dot = 0.0f;
+                    for (int dim = 0; dim < head_dim; ++dim)
+                    {
+                        dot += q_head[dim] * k_head[dim];
+                    }
+                    scores[static_cast<size_t>(pos)] = dot * scale;
+                    max_score = std::max(max_score, scores[static_cast<size_t>(pos)]);
+                }
+
+                float denom = 0.0f;
+                for (int pos = 0; pos < kv_len; ++pos)
+                {
+                    const float weight = std::exp(scores[static_cast<size_t>(pos)] - max_score);
+                    scores[static_cast<size_t>(pos)] = weight;
+                    denom += weight;
+                }
+
+                for (int dim = 0; dim < head_dim; ++dim)
+                {
+                    float value = 0.0f;
+                    for (int pos = 0; pos < kv_len; ++pos)
+                    {
+                        const float *v_head = v_data + pos * kv_row_stride + kv_head * head_dim;
+                        value += (scores[static_cast<size_t>(pos)] / denom) * v_head[dim];
+                    }
+                    output[static_cast<size_t>(head * head_dim + dim)] = value;
+                }
+            }
+
+            return output;
+        }
+
+        /// @brief Returns the largest absolute elementwise difference for equal-sized buffers.
+        float maxAbsDiff(const float *actual, const std::vector<float> &expected)
+        {
+            float max_diff = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i)
+            {
+                max_diff = std::max(max_diff, std::abs(actual[i] - expected[i]));
+            }
+            return max_diff;
+        }
+
         /**
          * @test Verify that when kv_cache is provided, execute() queries it dynamically
          *
@@ -349,6 +421,107 @@ namespace llaminar2
                 sum += std::abs(out_data[i]);
             }
             EXPECT_GT(sum, 0.0f) << "Output should have non-zero values after attention";
+        }
+
+        /**
+         * @test Verify decode uses real cached tokens, not padded KV storage rows
+         */
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, DecodeIgnoresHostilePaddedKVRows)
+        {
+            const int layer_idx = 1;
+            const int real_kv_len = 5;
+            const int bucket_kv_len = 9;
+
+            kv_cache_->setCachedTokens(layer_idx, real_kv_len);
+
+            ITensor *K = kv_cache_->get_k(layer_idx, 0);
+            ITensor *V = kv_cache_->get_v(layer_idx, 0);
+            auto *K_fp32 = dynamic_cast<FP32Tensor *>(K);
+            auto *V_fp32 = dynamic_cast<FP32Tensor *>(V);
+            ASSERT_NE(K_fp32, nullptr);
+            ASSERT_NE(V_fp32, nullptr);
+
+            float *q_data = Q_->mutable_data();
+            for (int head = 0; head < kNumHeads; ++head)
+            {
+                for (int dim = 0; dim < kHeadDim; ++dim)
+                {
+                    q_data[head * kHeadDim + dim] = 0.02f * static_cast<float>((head + 1) * (dim % 7 + 1));
+                }
+            }
+
+            float *k_data = K_fp32->mutable_data();
+            float *v_data = V_fp32->mutable_data();
+            for (int pos = 0; pos < real_kv_len; ++pos)
+            {
+                for (int kv_head = 0; kv_head < kNumKVHeads; ++kv_head)
+                {
+                    for (int dim = 0; dim < kHeadDim; ++dim)
+                    {
+                        const int index = pos * kKVDim + kv_head * kHeadDim + dim;
+                        const float sign = ((pos + kv_head + dim) % 2 == 0) ? 1.0f : -1.0f;
+                        k_data[index] = sign * 0.015f * static_cast<float>(1 + ((pos * 11 + kv_head * 5 + dim) % 9));
+                        v_data[index] = 0.025f * static_cast<float>((pos + 1) * (kv_head + 1)) +
+                                        0.001f * static_cast<float>(dim);
+                    }
+                }
+            }
+
+            // Padded rows are deliberately attractive to the query and carry large values.
+            // A stale bucket-length decode would include them and diverge from the prefix reference.
+            for (int pos = real_kv_len; pos < bucket_kv_len; ++pos)
+            {
+                for (int kv_head = 0; kv_head < kNumKVHeads; ++kv_head)
+                {
+                    for (int dim = 0; dim < kHeadDim; ++dim)
+                    {
+                        const int index = pos * kKVDim + kv_head * kHeadDim + dim;
+                        k_data[index] = 4.0f;
+                        v_data[index] = 25.0f + static_cast<float>(pos - real_kv_len) * 3.0f +
+                                        static_cast<float>(kv_head) + 0.1f * static_cast<float>(dim);
+                    }
+                }
+            }
+
+            const std::vector<float> expected_real_prefix = referenceSingleQueryGQAAttention(
+                q_data, k_data, v_data,
+                real_kv_len, kNumHeads, kNumKVHeads, kHeadDim);
+            const std::vector<float> expected_full_bucket = referenceSingleQueryGQAAttention(
+                q_data, k_data, v_data,
+                bucket_kv_len, kNumHeads, kNumKVHeads, kHeadDim);
+
+            AttentionComputeStage::Params params;
+            params.Q = Q_.get();
+            params.K = K;
+            params.V = V;
+            params.output = output_.get();
+            params.batch_size = 1;
+            params.seq_len = 1;
+            params.kv_len = bucket_kv_len; // Intentionally stale padded-bucket hint.
+            params.n_heads = kNumHeads;
+            params.n_kv_heads = kNumKVHeads;
+            params.head_dim = kHeadDim;
+            params.causal = false;
+            params.auto_detect_mode = true;
+            params.workspace_scores = workspace_scores_.get();
+            params.workspace_context = workspace_context_.get();
+            params.workspace_mask = workspace_mask_.get();
+            params.kv_cache = kv_cache_.get();
+            params.layer_idx = layer_idx;
+            params.position_offset = real_kv_len - 1;
+
+            auto stage = ComputeStageFactory::createAttentionCompute(params);
+            ASSERT_NE(stage, nullptr);
+            ASSERT_TRUE(stage->execute(nullptr));
+
+            const float *out_data = output_->data();
+            const float diff_from_real_prefix = maxAbsDiff(out_data, expected_real_prefix);
+            const float diff_from_full_bucket = maxAbsDiff(out_data, expected_full_bucket);
+
+            EXPECT_LT(diff_from_real_prefix, 5e-3f)
+                << "Decode should attend only the real KV-cache prefix";
+            EXPECT_GT(diff_from_full_bucket, 5.0f)
+                << "Hostile padded rows should materially change a stale bucket-length reference";
         }
 
         /**

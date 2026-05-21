@@ -14,8 +14,10 @@
  */
 
 #include "ROCmRingKVCache.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/GpuTensorView.h"
+#include "../../../tensors/TensorClasses.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../ROCmKernelBase.h"
 #include "../../../backends/rocm/HipDeviceGuard.h"
@@ -227,7 +229,8 @@ namespace llaminar2
         if (!d_k)
         {
             auto *k_mut = const_cast<ITensor *>(K);
-            if (!k_mut->ensureOnDevice(target))
+            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
+            if (!(k_tensor ? k_tensor->ensureOnDevice(target) : k_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[IROCmRingKVCache::append(ITensor)] Failed to ensure K on "
                           << target.toString());
@@ -238,7 +241,8 @@ namespace llaminar2
         if (!d_v)
         {
             auto *v_mut = const_cast<ITensor *>(V);
-            if (!v_mut->ensureOnDevice(target))
+            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
+            if (!(v_tensor ? v_tensor->ensureOnDevice(target) : v_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[IROCmRingKVCache::append(ITensor)] Failed to ensure V on "
                           << target.toString());
@@ -275,7 +279,8 @@ namespace llaminar2
         if (!d_k)
         {
             auto *k_mut = const_cast<ITensor *>(K);
-            if (!k_mut->ensureOnDevice(target))
+            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
+            if (!(k_tensor ? k_tensor->ensureOnDevice(target, gpu_stream) : k_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[IROCmRingKVCache::appendWithStream] Failed to ensure K on "
                           << target.toString());
@@ -286,7 +291,8 @@ namespace llaminar2
         if (!d_v)
         {
             auto *v_mut = const_cast<ITensor *>(V);
-            if (!v_mut->ensureOnDevice(target))
+            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
+            if (!(v_tensor ? v_tensor->ensureOnDevice(target, gpu_stream) : v_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[IROCmRingKVCache::appendWithStream] Failed to ensure V on "
                           << target.toString());
@@ -849,13 +855,14 @@ namespace llaminar2
         }
 
         EntryT &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
 
         // Track how many tokens to skip from input (earliest tokens that would be overwritten)
         int tokens_to_skip = 0;
         int tokens_to_write = num_tokens;
 
         // Check if we would exceed capacity (ring buffer overwrites oldest)
-        if (entry.count + num_tokens > max_seq_len_)
+        if (!capture_active && entry.count + num_tokens > max_seq_len_)
         {
             // Calculate how many existing tokens to evict
             int to_evict = entry.count + num_tokens - max_seq_len_;
@@ -906,10 +913,14 @@ namespace llaminar2
             }
         }
 
-        // Update ring buffer state based on actual tokens written
-        entry.head = (entry.head + tokens_to_write) % max_seq_len_;
-        entry.count += tokens_to_write;
-        entry.scratch_valid = false; // Scratch is stale after append
+        if (!capture_active)
+        {
+            // Update host metadata only for real execution. Captured graph
+            // launches use replay callbacks to advance by real (unpadded) tokens.
+            entry.head = (entry.head + tokens_to_write) % max_seq_len_;
+            entry.count += tokens_to_write;
+            entry.scratch_valid = false; // Scratch is stale after append
+        }
 
         return true;
     }

@@ -231,6 +231,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDAFusedOpsKernels.cu       # Fused ops: SwiGLU+Quant, ResidualAdd+RMSNorm
         kernels/cuda/ops/CUDARoPEKernels.cu           # RoPE kernels (FP32, BF16, FP16)
         kernels/cuda/ops/CUDAEmbeddingKernels.cu      # Embedding lookup kernel
+        kernels/cuda/ops/CUDARowSelectKernels.cu      # Graph-capturable one-row hidden-state selection
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
         kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
@@ -467,6 +468,7 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmRoPEKernels.hip                 # RoPE kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmRMSNormKernels.hip              # RMSNorm kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmEmbeddingKernels.hip            # Embedding kernels (FP32, BF16, FP16, Q8_1)
+        kernels/rocm/ops/ROCmRowSelectKernels.hip            # Graph-capturable one-row hidden-state selection
         kernels/rocm/ops/ROCmResidualAddKernels.hip          # Residual Add kernels (FP32, BF16, FP16)
         kernels/rocm/ops/ROCmArgmaxKernels.hip               # Argmax kernel for GPU-side greedy sampling
         kernels/rocm/ops/ROCmSamplingKernels.hip              # Top-K kernel for GPU-side top-k/top-p sampling
@@ -1198,6 +1200,7 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/KVCacheGatherStage.cpp
     execution/compute_stages/stages/AttentionComputeStage.cpp
     execution/compute_stages/stages/EmbeddingStage.cpp
+    execution/compute_stages/stages/HiddenStateRowSelectStage.cpp
     execution/compute_stages/stages/LMHeadStage.cpp
     execution/local_execution/graph/DeviceGraphCaptureController.cpp
     execution/local_execution/graph/ComputeGraph.cpp
@@ -1477,6 +1480,7 @@ add_library(llaminar2_core STATIC
     snapshots/SnapshotCapture.cpp
     # Forward execution engine (Phase 3: extracted from DeviceGraphOrchestrator)
     execution/local_execution/engine/ForwardExecutionEngine.cpp
+    execution/local_execution/engine/PrefillBucketUtils.cpp
     # Prefill graph cache (Phase 4: persistent prefill graph capture/replay)
     execution/local_execution/engine/PrefillGraphCache.cpp
     # NOTE: Legacy GEMM microkernel and instantiation systems removed (gemm v1/v2/v3)

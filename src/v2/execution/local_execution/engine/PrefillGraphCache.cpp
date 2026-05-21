@@ -8,9 +8,34 @@
 
 #include <chrono>
 #include <functional>
+#include <limits>
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        /// @brief Return true when a graph contains GDN state without a real-length contract.
+        bool containsPaddedBucketUnsafeGDNStage(const ComputeGraph &graph)
+        {
+            const auto &order = graph.getExecutionOrder();
+            for (const auto &name : order)
+            {
+                const auto *node = graph.getNode(name);
+                if (!node || !node->stage)
+                    continue;
+
+                const ComputeStageType type = node->stage->type();
+                if (type == ComputeStageType::GDN_RECURRENCE ||
+                    type == ComputeStageType::SHORT_CONV1D)
+                {
+                    if (!node->stage->supportsPaddedPrefillRealLengthContract())
+                        return true;
+                }
+            }
+            return false;
+        }
+    }
 
     // =========================================================================
     // PrefillGraphCacheKey
@@ -64,6 +89,8 @@ namespace llaminar2
             return "CollectiveNodesPresent";
         case PrefillGraphRejectReason::StageNotCapturable:
             return "StageNotCapturable";
+        case PrefillGraphRejectReason::GDNWithPaddedBucket:
+            return "GDNWithPaddedBucket";
         case PrefillGraphRejectReason::NoGPUContext:
             return "NoGPUContext";
         case PrefillGraphRejectReason::InvalidatedByPlacement:
@@ -79,6 +106,47 @@ namespace llaminar2
     PrefillGraphCache::PrefillGraphCache(PrefillGraphConfig config)
         : config_(std::move(config))
     {
+    }
+
+    void PrefillGraphCache::touchEntry(PrefillGraphEntry &entry)
+    {
+        entry.last_access_tick = ++access_counter_;
+    }
+
+    void PrefillGraphCache::enforceCapacity(const PrefillGraphCacheKey *exempt_key)
+    {
+        if (config_.max_cached_entries == 0)
+            return;
+
+        while (entries_.size() > config_.max_cached_entries)
+        {
+            auto victim = entries_.end();
+            uint64_t oldest_tick = std::numeric_limits<uint64_t>::max();
+
+            // Evict the least-recently-used non-exempt entry. Ready entries are
+            // safe to erase because the graph object owns its executable and the
+            // next request for that bucket will explicitly warm/capture again.
+            for (auto it = entries_.begin(); it != entries_.end(); ++it)
+            {
+                if (exempt_key && it->first == *exempt_key)
+                    continue;
+                if (it->second.last_access_tick < oldest_tick)
+                {
+                    oldest_tick = it->second.last_access_tick;
+                    victim = it;
+                }
+            }
+
+            if (victim == entries_.end())
+                return;
+
+            const auto evicted_key = victim->first;
+            entries_.erase(victim);
+            ++eviction_count_;
+            LOG_INFO("[PrefillGraphCache] Evicted prefill graph bucket seq_len="
+                     << evicted_key.seq_len << " device=" << evicted_key.device_id.toString()
+                     << " due to cache cap=" << config_.max_cached_entries);
+        }
     }
 
     PrefillGraphPhase PrefillGraphCache::phase(const PrefillGraphCacheKey &key) const
@@ -102,7 +170,9 @@ namespace llaminar2
         const PrefillGraphCacheKey &key,
         const std::unordered_set<std::string> *collective_nodes,
         bool snapshots_active,
-        bool moe_rebalancing_active) const
+        bool moe_rebalancing_active,
+        int real_seq_len,
+        int bucket_seq_len) const
     {
         if (!config_.enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
@@ -121,6 +191,21 @@ namespace llaminar2
 
         if (collective_nodes && !collective_nodes->empty())
             return PrefillGraphRejectReason::CollectiveNodesPresent;
+
+        const bool padded_bucket =
+            real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
+        if (padded_bucket && !config_.buckets_enabled)
+            return PrefillGraphRejectReason::FeatureDisabled;
+
+        if (padded_bucket && containsPaddedBucketUnsafeGDNStage(graph))
+        {
+            if (config_.trace)
+            {
+                LOG_INFO("[PrefillGraphCache] Rejecting padded bucket with unsupported GDN/short-conv state contract: real_seq_len="
+                         << real_seq_len << " bucket_seq_len=" << bucket_seq_len);
+            }
+            return PrefillGraphRejectReason::GDNWithPaddedBucket;
+        }
 
         // Check all stages are capturable
         const auto &order = graph.getExecutionOrder();
@@ -147,6 +232,9 @@ namespace llaminar2
         auto &entry = entries_[key];
         entry.key = key;
         entry.phase = PrefillGraphPhase::Warmup;
+        lifecycle_stats_[key].warmup_count++;
+        touchEntry(entry);
+        enforceCapacity(&key);
 
         if (config_.trace)
         {
@@ -173,6 +261,7 @@ namespace llaminar2
         }
 
         auto &entry = it->second;
+        touchEntry(entry);
 
         if (!stream)
         {
@@ -218,6 +307,7 @@ namespace llaminar2
         }
 
         auto &entry = it->second;
+        touchEntry(entry);
 
         // End capture
         if (!entry.capture->endCapture())
@@ -240,6 +330,7 @@ namespace llaminar2
         entry.node_count = entry.capture->nodeCount();
         entry.phase = PrefillGraphPhase::Ready;
         entry.replay_count = 0;
+        lifecycle_stats_[key].capture_count++;
 
         auto now = std::chrono::steady_clock::now();
         entry.capture_timestamp_ns = static_cast<uint64_t>(
@@ -261,6 +352,7 @@ namespace llaminar2
         }
 
         auto &entry = it->second;
+        touchEntry(entry);
 
         if (!entry.capture || !entry.capture->hasExecutable())
         {
@@ -332,6 +424,22 @@ namespace llaminar2
         if (it == entries_.end())
             return 0;
         return it->second.replay_count;
+    }
+
+    uint64_t PrefillGraphCache::warmupCount(const PrefillGraphCacheKey &key) const
+    {
+        auto it = lifecycle_stats_.find(key);
+        if (it == lifecycle_stats_.end())
+            return 0;
+        return it->second.warmup_count;
+    }
+
+    uint64_t PrefillGraphCache::captureCount(const PrefillGraphCacheKey &key) const
+    {
+        auto it = lifecycle_stats_.find(key);
+        if (it == lifecycle_stats_.end())
+            return 0;
+        return it->second.capture_count;
     }
 
 } // namespace llaminar2

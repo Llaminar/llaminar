@@ -31,6 +31,7 @@ namespace llaminar2
     // Number of benchmark iterations (after warmup)
     static constexpr int BENCHMARK_ITERATIONS = 3;
     static constexpr int WARMUP_ITERATIONS = 1;
+    static constexpr int PREFILL_GRAPH_WARMUP_ITERATIONS = 2;
 
     // Log GPU memory on all GPUs (enabled via LLAMINAR_BENCH_MEM_LOG=1).
     static void logGPUMemorySnapshot(const char *label)
@@ -378,6 +379,33 @@ namespace llaminar2
         // This eliminates ~405ms of PCIe traffic for TP=2 prefill.
         runner_->setSkipLogitsGatherPrefill(true);
 
+        auto warmPrefillGraphCapture = [&]() -> bool
+        {
+            if (!debugEnv().execution.gpu_graphs)
+                return true;
+
+            if (mpi_ctx_->rank() == 0)
+            {
+                LOG_INFO("Preparing prefill graph capture for steady-state benchmark...");
+            }
+
+            for (int iter = 0; iter < PREFILL_GRAPH_WARMUP_ITERATIONS; ++iter)
+            {
+                runner_->clear_cache();
+                auto [graph_warmup_success, graph_warmup_time] = runPrefill(tokens);
+                if (!graph_warmup_success)
+                {
+                    if (mpi_ctx_->rank() == 0)
+                    {
+                        LOG_ERROR("Prefill graph warmup failed on iteration " << (iter + 1));
+                    }
+                    return false;
+                }
+            }
+
+            return true;
+        };
+
         // Warmup prefill
         auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
         if (!warmup_prefill_success)
@@ -405,6 +433,11 @@ namespace llaminar2
             }
         }
 
+        if (!warmPrefillGraphCapture())
+        {
+            return result;
+        }
+
         if (mpi_ctx_->rank() == 0)
         {
             LOG_INFO("Warmup complete.");
@@ -427,6 +460,10 @@ namespace llaminar2
             {
                 int eos_token = tokenizer_->eos_token();
                 runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
+            }
+            if (rw_ok && !warmPrefillGraphCapture())
+            {
+                return result;
             }
         }
 

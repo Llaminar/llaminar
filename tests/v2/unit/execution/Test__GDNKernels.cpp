@@ -40,6 +40,7 @@
 #include "kernels/rocm/ROCmWeightPacker.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
+#include "kernels/rocm/gdn/ROCmShortConvolution.h"
 #include <hip/hip_runtime.h>
 #endif
 #include "tensors/Tensors.h"
@@ -166,25 +167,44 @@ namespace
     };
 
     static const std::vector<GDNProjectionCodebookSpec> ALL_GDN_PROJECTION_CODEBOOKS = {
-        {"Q4_0", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ4_0Random({rows, cols}); }},
-        {"Q8_0", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ8_0Random({rows, cols}); }},
-        {"IQ4_NL", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ4_NLRandom({rows, cols}); }},
-        {"Q4_1", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ4_1Random({rows, cols}); }},
-        {"Q5_0", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ5_0Random({rows, cols}); }},
-        {"Q5_1", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ5_1Random({rows, cols}); }},
-        {"IQ4_XS", 0.985f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ4_XSRandom({rows, cols}); }},
-        {"Q4_K", 0.985f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ4_KRandom({rows, cols}); }},
-        {"Q5_K", 0.985f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ5_KRandom({rows, cols}); }},
-        {"Q6_K", 0.990f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ6_KRandom({rows, cols}); }},
-        {"Q3_K", 0.980f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ3_KRandom({rows, cols}); }},
-        {"Q2_K", 0.970f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createQ2_KRandom({rows, cols}); }},
-        {"IQ3_S", 0.975f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ3_SRandom({rows, cols}); }},
-        {"IQ3_XXS", 0.970f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ3_XXSRandom({rows, cols}); }},
-        {"IQ2_S", 0.960f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ2_SRandom({rows, cols}); }},
-        {"IQ2_XS", 0.960f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ2_XSRandom({rows, cols}); }},
-        {"IQ2_XXS", 0.950f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ2_XXSRandom({rows, cols}); }},
-        {"IQ1_S", 0.930f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ1_SRandom({rows, cols}); }},
-        {"IQ1_M", 0.930f, [](size_t rows, size_t cols) { return test::TestTensorFactory::createIQ1_MRandom({rows, cols}); }},
+        {"Q4_0", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ4_0Random({rows, cols}); }},
+        {"Q8_0", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ8_0Random({rows, cols}); }},
+        {"IQ4_NL", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ4_NLRandom({rows, cols}); }},
+        {"Q4_1", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ4_1Random({rows, cols}); }},
+        {"Q5_0", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ5_0Random({rows, cols}); }},
+        {"Q5_1", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ5_1Random({rows, cols}); }},
+        {"IQ4_XS", 0.985f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ4_XSRandom({rows, cols}); }},
+        {"Q4_K", 0.985f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ4_KRandom({rows, cols}); }},
+        {"Q5_K", 0.985f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ5_KRandom({rows, cols}); }},
+        {"Q6_K", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ6_KRandom({rows, cols}); }},
+        {"Q3_K", 0.980f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ3_KRandom({rows, cols}); }},
+        {"Q2_K", 0.970f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ2_KRandom({rows, cols}); }},
+        {"IQ3_S", 0.975f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ3_SRandom({rows, cols}); }},
+        {"IQ3_XXS", 0.970f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ3_XXSRandom({rows, cols}); }},
+        {"IQ2_S", 0.960f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ2_SRandom({rows, cols}); }},
+        {"IQ2_XS", 0.960f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ2_XSRandom({rows, cols}); }},
+        {"IQ2_XXS", 0.950f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ2_XXSRandom({rows, cols}); }},
+        {"IQ1_S", 0.930f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ1_SRandom({rows, cols}); }},
+        {"IQ1_M", 0.930f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ1_MRandom({rows, cols}); }},
     };
 
     float vectorCosine(const std::vector<float> &actual, const std::vector<float> &expected)
@@ -1055,6 +1075,253 @@ TEST(Test__GDNKernels, Recurrence_Prefill_MatchesSequentialDecode)
     }
 }
 
+TEST(Test__GDNKernels, ShortConv_PaddedPrefillStateMatchesUnpaddedDecode)
+{
+    const int real_len = 5;
+    const int bucket_len = 8;
+    const int channels = 3;
+    const int kernel_size = 4;
+    const int state_len = kernel_size - 1;
+
+    std::vector<float> bucket_input(static_cast<size_t>(bucket_len * channels));
+    for (int t = 0; t < bucket_len; ++t)
+    {
+        for (int c = 0; c < channels; ++c)
+        {
+            bucket_input[static_cast<size_t>(t * channels + c)] =
+                t < real_len ? 0.1f * static_cast<float>(1 + t * channels + c)
+                             : 100.0f + static_cast<float>(t * channels + c);
+        }
+    }
+    std::vector<float> real_input(bucket_input.begin(), bucket_input.begin() + real_len * channels);
+    std::vector<float> decode_input = {0.33f, -0.21f, 0.17f};
+    std::vector<float> weight(static_cast<size_t>(channels * kernel_size));
+    std::vector<float> bias(static_cast<size_t>(channels));
+    for (int i = 0; i < channels * kernel_size; ++i)
+        weight[static_cast<size_t>(i)] = 0.05f * static_cast<float>((i % 5) + 1);
+    for (int c = 0; c < channels; ++c)
+        bias[static_cast<size_t>(c)] = -0.02f * static_cast<float>(c + 1);
+
+    auto padded_in = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(channels)}, bucket_input.data());
+    auto padded_out = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(channels)});
+    auto real_in = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(channels)}, real_input.data());
+    auto real_out = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(channels)});
+    auto decode_in = makeFP32({1, static_cast<size_t>(channels)}, decode_input.data());
+    auto padded_decode_out = makeFP32({1, static_cast<size_t>(channels)});
+    auto ref_decode_out = makeFP32({1, static_cast<size_t>(channels)});
+    auto weight_t = makeFP32({static_cast<size_t>(channels), static_cast<size_t>(kernel_size)}, weight.data());
+    auto bias_t = makeFP32({static_cast<size_t>(channels)}, bias.data());
+    std::vector<float> padded_state(static_cast<size_t>(channels * state_len), 0.0f);
+    std::vector<float> ref_state(static_cast<size_t>(channels * state_len), 0.0f);
+    auto ctx = makeCPUContext();
+
+    ShortConv1dStage::Params padded_params;
+    padded_params.device_id = DeviceId::cpu();
+    padded_params.input = padded_in.get();
+    padded_params.output = padded_out.get();
+    padded_params.weight = weight_t.get();
+    padded_params.bias = bias_t.get();
+    padded_params.conv_state = padded_state.data();
+    padded_params.seq_len = bucket_len;
+    padded_params.channels = channels;
+    padded_params.kernel_size = kernel_size;
+    padded_params.kernel = &g_cpu_conv;
+    ShortConv1dStage padded_stage(padded_params);
+    IComputeStage::PrefillReplayParams replay;
+    replay.real_seq_len = real_len;
+    replay.bucket_seq_len = bucket_len;
+    padded_stage.updatePrefillReplayParams(replay);
+    ASSERT_TRUE(padded_stage.execute(ctx.get()));
+
+    ShortConv1dStage::Params ref_params = padded_params;
+    ref_params.input = real_in.get();
+    ref_params.output = real_out.get();
+    ref_params.conv_state = ref_state.data();
+    ref_params.seq_len = real_len;
+    ShortConv1dStage ref_stage(ref_params);
+    ASSERT_TRUE(ref_stage.execute(ctx.get()));
+
+    ShortConv1dStage::Params padded_decode = padded_params;
+    padded_decode.input = decode_in.get();
+    padded_decode.output = padded_decode_out.get();
+    padded_decode.seq_len = 1;
+    ShortConv1dStage padded_decode_stage(padded_decode);
+    ASSERT_TRUE(padded_decode_stage.execute(ctx.get()));
+
+    ShortConv1dStage::Params ref_decode = ref_params;
+    ref_decode.input = decode_in.get();
+    ref_decode.output = ref_decode_out.get();
+    ref_decode.seq_len = 1;
+    ShortConv1dStage ref_decode_stage(ref_decode);
+    ASSERT_TRUE(ref_decode_stage.execute(ctx.get()));
+
+    const float *padded_decode_data = padded_decode_out->data();
+    const float *ref_decode_data = ref_decode_out->data();
+    for (int c = 0; c < channels; ++c)
+    {
+        EXPECT_NEAR(padded_decode_data[c], ref_decode_data[c], 1e-6f)
+            << "decode output mismatch at channel " << c;
+    }
+    for (size_t i = 0; i < ref_state.size(); ++i)
+    {
+        EXPECT_NEAR(padded_state[i], ref_state[i], 1e-6f)
+            << "conv state mismatch at index " << i;
+    }
+
+    const float *padded_prefill = padded_out->data();
+    for (int i = real_len * channels; i < bucket_len * channels; ++i)
+        EXPECT_EQ(padded_prefill[i], 0.0f) << "padded output row must be inert";
+}
+
+TEST(Test__GDNKernels, Recurrence_PaddedPrefillStateMatchesUnpaddedDecode)
+{
+    const int real_len = 5;
+    const int bucket_len = 8;
+    const int n_heads = 2;
+    const int d_k = 4;
+    const int d_v = 3;
+    const int qk_dim = n_heads * d_k;
+    const int v_dim = n_heads * d_v;
+
+    auto fill_sequence = [](std::vector<float> &values, float scale, int real_len, int row_width)
+    {
+        for (int row = 0; row < static_cast<int>(values.size()) / row_width; ++row)
+        {
+            for (int col = 0; col < row_width; ++col)
+            {
+                values[static_cast<size_t>(row * row_width + col)] =
+                    row < real_len ? scale * static_cast<float>((row + 1) * (col + 2))
+                                   : 50.0f + scale * static_cast<float>(row * row_width + col);
+            }
+        }
+    };
+
+    std::vector<float> Q_bucket(static_cast<size_t>(bucket_len * qk_dim));
+    std::vector<float> K_bucket(static_cast<size_t>(bucket_len * qk_dim));
+    std::vector<float> V_bucket(static_cast<size_t>(bucket_len * v_dim));
+    std::vector<float> alpha_bucket(static_cast<size_t>(bucket_len * n_heads));
+    std::vector<float> beta_bucket(static_cast<size_t>(bucket_len * n_heads));
+    fill_sequence(Q_bucket, 0.011f, real_len, qk_dim);
+    fill_sequence(K_bucket, -0.009f, real_len, qk_dim);
+    fill_sequence(V_bucket, 0.013f, real_len, v_dim);
+    fill_sequence(alpha_bucket, 0.017f, real_len, n_heads);
+    fill_sequence(beta_bucket, -0.015f, real_len, n_heads);
+
+    std::vector<float> Q_real(Q_bucket.begin(), Q_bucket.begin() + real_len * qk_dim);
+    std::vector<float> K_real(K_bucket.begin(), K_bucket.begin() + real_len * qk_dim);
+    std::vector<float> V_real(V_bucket.begin(), V_bucket.begin() + real_len * v_dim);
+    std::vector<float> alpha_real(alpha_bucket.begin(), alpha_bucket.begin() + real_len * n_heads);
+    std::vector<float> beta_real(beta_bucket.begin(), beta_bucket.begin() + real_len * n_heads);
+    std::vector<float> Q_decode(qk_dim), K_decode(qk_dim), V_decode(v_dim), alpha_decode(n_heads), beta_decode(n_heads);
+    for (int i = 0; i < qk_dim; ++i)
+    {
+        Q_decode[static_cast<size_t>(i)] = 0.02f * static_cast<float>(i + 1);
+        K_decode[static_cast<size_t>(i)] = -0.018f * static_cast<float>(i + 2);
+    }
+    for (int i = 0; i < v_dim; ++i)
+        V_decode[static_cast<size_t>(i)] = 0.014f * static_cast<float>(i + 3);
+    for (int h = 0; h < n_heads; ++h)
+    {
+        alpha_decode[static_cast<size_t>(h)] = 0.07f * static_cast<float>(h + 1);
+        beta_decode[static_cast<size_t>(h)] = -0.04f * static_cast<float>(h + 1);
+    }
+
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto padded_q = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(qk_dim)}, Q_bucket.data());
+    auto padded_k = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(qk_dim)}, K_bucket.data());
+    auto padded_v = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(v_dim)}, V_bucket.data());
+    auto padded_alpha = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(n_heads)}, alpha_bucket.data());
+    auto padded_beta = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(n_heads)}, beta_bucket.data());
+    auto padded_out = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(v_dim)});
+    auto real_q = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(qk_dim)}, Q_real.data());
+    auto real_k = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(qk_dim)}, K_real.data());
+    auto real_v = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(v_dim)}, V_real.data());
+    auto real_alpha = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(n_heads)}, alpha_real.data());
+    auto real_beta = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(n_heads)}, beta_real.data());
+    auto real_out = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(v_dim)});
+    auto decode_q = makeFP32({1, static_cast<size_t>(qk_dim)}, Q_decode.data());
+    auto decode_k = makeFP32({1, static_cast<size_t>(qk_dim)}, K_decode.data());
+    auto decode_v = makeFP32({1, static_cast<size_t>(v_dim)}, V_decode.data());
+    auto decode_alpha = makeFP32({1, static_cast<size_t>(n_heads)}, alpha_decode.data());
+    auto decode_beta = makeFP32({1, static_cast<size_t>(n_heads)}, beta_decode.data());
+    auto padded_decode_out = makeFP32({1, static_cast<size_t>(v_dim)});
+    auto ref_decode_out = makeFP32({1, static_cast<size_t>(v_dim)});
+    std::vector<float> padded_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+    std::vector<float> ref_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+    auto ctx = makeCPUContext();
+
+    GDNRecurrenceStage::Params padded_params;
+    padded_params.device_id = DeviceId::cpu();
+    padded_params.Q = padded_q.get();
+    padded_params.K = padded_k.get();
+    padded_params.V = padded_v.get();
+    padded_params.alpha = padded_alpha.get();
+    padded_params.beta = padded_beta.get();
+    padded_params.A_log = A_log.get();
+    padded_params.dt_bias = dt_bias.get();
+    padded_params.output = padded_out.get();
+    padded_params.recurrence_state = padded_state.data();
+    padded_params.seq_len = bucket_len;
+    padded_params.n_heads = n_heads;
+    padded_params.d_k = d_k;
+    padded_params.d_v = d_v;
+    padded_params.chunk_size = 64;
+    padded_params.kernel = &g_cpu_gdn;
+    GDNRecurrenceStage padded_stage(padded_params);
+    IComputeStage::PrefillReplayParams replay;
+    replay.real_seq_len = real_len;
+    replay.bucket_seq_len = bucket_len;
+    padded_stage.updatePrefillReplayParams(replay);
+    ASSERT_TRUE(padded_stage.execute(ctx.get()));
+
+    GDNRecurrenceStage::Params ref_params = padded_params;
+    ref_params.Q = real_q.get();
+    ref_params.K = real_k.get();
+    ref_params.V = real_v.get();
+    ref_params.alpha = real_alpha.get();
+    ref_params.beta = real_beta.get();
+    ref_params.output = real_out.get();
+    ref_params.recurrence_state = ref_state.data();
+    ref_params.seq_len = real_len;
+    GDNRecurrenceStage ref_stage(ref_params);
+    ASSERT_TRUE(ref_stage.execute(ctx.get()));
+
+    GDNRecurrenceStage::Params padded_decode = padded_params;
+    padded_decode.Q = decode_q.get();
+    padded_decode.K = decode_k.get();
+    padded_decode.V = decode_v.get();
+    padded_decode.alpha = decode_alpha.get();
+    padded_decode.beta = decode_beta.get();
+    padded_decode.output = padded_decode_out.get();
+    padded_decode.seq_len = 1;
+    GDNRecurrenceStage padded_decode_stage(padded_decode);
+    ASSERT_TRUE(padded_decode_stage.execute(ctx.get()));
+
+    GDNRecurrenceStage::Params ref_decode = padded_decode;
+    ref_decode.output = ref_decode_out.get();
+    ref_decode.recurrence_state = ref_state.data();
+    GDNRecurrenceStage ref_decode_stage(ref_decode);
+    ASSERT_TRUE(ref_decode_stage.execute(ctx.get()));
+
+    const float *padded_decode_data = padded_decode_out->data();
+    const float *ref_decode_data = ref_decode_out->data();
+    for (int i = 0; i < v_dim; ++i)
+    {
+        EXPECT_NEAR(padded_decode_data[i], ref_decode_data[i], 1e-5f)
+            << "decode output mismatch at column " << i;
+    }
+    for (size_t i = 0; i < ref_state.size(); ++i)
+    {
+        EXPECT_NEAR(padded_state[i], ref_state[i], 1e-5f)
+            << "recurrence state mismatch at index " << i;
+    }
+
+    const float *padded_prefill = padded_out->data();
+    for (int i = real_len * v_dim; i < bucket_len * v_dim; ++i)
+        EXPECT_EQ(padded_prefill[i], 0.0f) << "padded recurrence output row must be inert";
+}
+
 #ifdef HAVE_ROCM
 TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
 {
@@ -1196,6 +1463,224 @@ TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
     EXPECT_LT(rel_l2, 1e-4) << "ROCm GDN prefill must produce decode-compatible recurrent state";
 }
 
+TEST(Test__GDNKernels, ROCmPaddedGDNRealLengthStateMatchesUnpaddedDecodeAcrossReplayLengths)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int n_heads = 16;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int bucket_len = 41;
+    const int decode_row = bucket_len;
+    const int total_len = bucket_len + 1;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const size_t qk_elems = static_cast<size_t>(total_len) * qk_stride;
+    const size_t v_elems = static_cast<size_t>(total_len) * v_stride;
+    const size_t gate_elems = static_cast<size_t>(total_len) * n_heads;
+    const size_t output_elems = static_cast<size_t>(total_len) * v_stride;
+
+    auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.025f, 2101);
+    auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.025f, 2102);
+    auto V = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)}, 0.0f, 0.025f, 2103);
+    auto alpha = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, -0.1f, 0.15f, 2104);
+    auto beta = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.15f, 2105);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto padded_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
+    auto ref_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
+
+    ASSERT_EQ(Q->numel(), qk_elems);
+    ASSERT_EQ(K->numel(), qk_elems);
+    ASSERT_EQ(V->numel(), v_elems);
+    ASSERT_EQ(alpha->numel(), gate_elems);
+    ASSERT_EQ(beta->numel(), gate_elems);
+    ASSERT_EQ(padded_out->numel(), output_elems);
+    ASSERT_EQ(ref_out->numel(), output_elems);
+
+    ASSERT_TRUE(Q->ensureOnDevice(device));
+    ASSERT_TRUE(K->ensureOnDevice(device));
+    ASSERT_TRUE(V->ensureOnDevice(device));
+    ASSERT_TRUE(alpha->ensureOnDevice(device));
+    ASSERT_TRUE(beta->ensureOnDevice(device));
+    ASSERT_TRUE(A_log->ensureOnDevice(device));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device));
+    ASSERT_TRUE(padded_out->allocateOnDevice(device));
+    ASSERT_TRUE(ref_out->allocateOnDevice(device));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_padded = static_cast<float *>(padded_out->gpu_data_ptr());
+    auto *d_ref = static_cast<float *>(ref_out->gpu_data_ptr());
+
+    int *d_effective_len = nullptr;
+    ASSERT_EQ(hipMalloc(&d_effective_len, sizeof(int)), hipSuccess);
+
+    for (int real_len : {37, 31})
+    {
+        ASSERT_EQ(hipMemcpy(d_effective_len, &real_len, sizeof(int), hipMemcpyHostToDevice), hipSuccess);
+
+        ROCmGatedDeltaNet padded_kernel(0);
+        ASSERT_TRUE(padded_kernel.chunkForwardWithEffectiveSeqLen(
+            d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+            d_padded, nullptr, bucket_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true,
+            d_effective_len));
+        ASSERT_TRUE(padded_kernel.recurrent_step(
+            d_Q + static_cast<size_t>(decode_row) * qk_stride,
+            d_K + static_cast<size_t>(decode_row) * qk_stride,
+            d_V + static_cast<size_t>(decode_row) * v_stride,
+            d_alpha + static_cast<size_t>(decode_row) * n_heads,
+            d_beta + static_cast<size_t>(decode_row) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_padded + static_cast<size_t>(decode_row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+
+        ROCmGatedDeltaNet ref_kernel(0);
+        ASSERT_TRUE(ref_kernel.chunk_forward(
+            d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+            d_ref, nullptr, real_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+        ASSERT_TRUE(ref_kernel.recurrent_step(
+            d_Q + static_cast<size_t>(decode_row) * qk_stride,
+            d_K + static_cast<size_t>(decode_row) * qk_stride,
+            d_V + static_cast<size_t>(decode_row) * v_stride,
+            d_alpha + static_cast<size_t>(decode_row) * n_heads,
+            d_beta + static_cast<size_t>(decode_row) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_ref + static_cast<size_t>(decode_row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+
+        padded_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ASSERT_TRUE(padded_out->ensureOnHost());
+        ASSERT_TRUE(ref_out->ensureOnHost());
+
+        const float *padded = padded_out->data() + static_cast<size_t>(decode_row) * v_stride;
+        const float *ref = ref_out->data() + static_cast<size_t>(decode_row) * v_stride;
+        float max_abs_diff = 0.0f;
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref = 0.0;
+        for (int i = 0; i < v_stride; ++i)
+        {
+            const float diff = std::abs(padded[i] - ref[i]);
+            max_abs_diff = std::max(max_abs_diff, diff);
+            sum_sq_diff += static_cast<double>(diff) * diff;
+            sum_sq_ref += static_cast<double>(ref[i]) * ref[i];
+        }
+        const double rel_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30));
+        EXPECT_LT(max_abs_diff, 2e-4f) << "real_len=" << real_len;
+        EXPECT_LT(rel_l2, 1e-4) << "real_len=" << real_len;
+    }
+
+    hipFree(d_effective_len);
+}
+
+TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAcrossReplayLengths)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int channels = 32;
+    const int kernel_size = 4;
+    const int bucket_len = 17;
+    const int decode_row = bucket_len;
+    const int total_len = bucket_len + 1;
+    auto input = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(channels)}, 0.0f, 0.04f, 2201);
+    auto weight = makeFP32Random({static_cast<size_t>(channels), static_cast<size_t>(kernel_size)}, 0.0f, 0.03f, 2202);
+    auto bias = makeFP32Random({static_cast<size_t>(channels)}, 0.0f, 0.01f, 2203);
+    auto padded_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(channels)});
+    auto ref_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(channels)});
+
+    ASSERT_TRUE(input->ensureOnDevice(device));
+    ASSERT_TRUE(weight->ensureOnDevice(device));
+    ASSERT_TRUE(bias->ensureOnDevice(device));
+    ASSERT_TRUE(padded_out->allocateOnDevice(device));
+    ASSERT_TRUE(ref_out->allocateOnDevice(device));
+
+    auto *d_input = static_cast<const float *>(input->gpu_data_ptr());
+    auto *d_weight = static_cast<const float *>(weight->gpu_data_ptr());
+    auto *d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+    auto *d_padded = static_cast<float *>(padded_out->gpu_data_ptr());
+    auto *d_ref = static_cast<float *>(ref_out->gpu_data_ptr());
+
+    int *d_effective_len = nullptr;
+    ASSERT_EQ(hipMalloc(&d_effective_len, sizeof(int)), hipSuccess);
+
+    for (int real_len : {13, 9})
+    {
+        ASSERT_EQ(hipMemcpy(d_effective_len, &real_len, sizeof(int), hipMemcpyHostToDevice), hipSuccess);
+
+        ROCmShortConvolution padded_kernel(0);
+        ASSERT_TRUE(padded_kernel.forwardWithEffectiveSeqLen(
+            d_input, d_weight, d_bias,
+            d_padded, nullptr,
+            bucket_len, channels, kernel_size,
+            d_effective_len,
+            /*apply_silu=*/true));
+        ASSERT_TRUE(padded_kernel.forward(
+            d_input + static_cast<size_t>(decode_row) * channels,
+            d_weight,
+            d_bias,
+            d_padded + static_cast<size_t>(decode_row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+
+        ROCmShortConvolution ref_kernel(0);
+        ASSERT_TRUE(ref_kernel.forward(
+            d_input, d_weight, d_bias,
+            d_ref, nullptr,
+            real_len, channels, kernel_size,
+            /*apply_silu=*/true));
+        ASSERT_TRUE(ref_kernel.forward(
+            d_input + static_cast<size_t>(decode_row) * channels,
+            d_weight,
+            d_bias,
+            d_ref + static_cast<size_t>(decode_row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+
+        padded_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ASSERT_TRUE(padded_out->ensureOnHost());
+        ASSERT_TRUE(ref_out->ensureOnHost());
+
+        const float *padded = padded_out->data() + static_cast<size_t>(decode_row) * channels;
+        const float *ref = ref_out->data() + static_cast<size_t>(decode_row) * channels;
+        for (int channel = 0; channel < channels; ++channel)
+        {
+            EXPECT_NEAR(padded[channel], ref[channel], 1e-5f)
+                << "real_len=" << real_len << " channel=" << channel;
+        }
+    }
+
+    hipFree(d_effective_len);
+}
+
 TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
 {
     int device_count = 0;
@@ -1314,10 +1799,10 @@ TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
         const float max_abs_ratio = max_abs / std::max(max_ref_abs, 1e-6f);
 
         LOG_INFO("[GDNProjectionNativeVNNI] " << fmt.name
-                                               << " cosine=" << cosine
-                                               << " rel_l2=" << rel_l2
-                               << " max_abs=" << max_abs
-                               << " max_abs_ratio=" << max_abs_ratio);
+                                              << " cosine=" << cosine
+                                              << " rel_l2=" << rel_l2
+                                              << " max_abs=" << max_abs
+                                              << " max_abs_ratio=" << max_abs_ratio);
 
         EXPECT_GT(cosine, fmt.min_cosine)
             << fmt.name << ": GDN fused projection accuracy below threshold";

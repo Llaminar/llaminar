@@ -13,6 +13,7 @@
  */
 
 #include "CUDARingKVCache.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
@@ -632,9 +633,9 @@ namespace llaminar2
           is_sharded_(false), device_ctx_(nullptr)
     {
         LOG_DEBUG("[CUDARingKVCache] Creating cache: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
-                 << ", precision=" << static_cast<int>(Precision));
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
 
@@ -658,8 +659,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[CUDARingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
 
         allocateDeviceParams();
     }
@@ -689,10 +690,10 @@ namespace llaminar2
         device_id_ = ctx->deviceOrdinal();
 
         LOG_DEBUG("[CUDARingKVCache] Creating cache with device context: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
-                 << ", device=" << device_id_
-                 << ", precision=" << static_cast<int>(Precision));
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                  << ", device=" << device_id_
+                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
 
@@ -716,8 +717,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[CUDARingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
 
         allocateDeviceParams();
     }
@@ -736,11 +737,11 @@ namespace llaminar2
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
         LOG_DEBUG("[CUDARingKVCache] Creating sharded cache: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
-                 << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
-                 << ", local_kv_dim=" << kv_dim_
-                 << ", precision=" << static_cast<int>(Precision));
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
+                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
+                  << ", local_kv_dim=" << kv_dim_
+                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
 
@@ -764,8 +765,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[CUDARingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
 
         allocateDeviceParams();
     }
@@ -796,12 +797,12 @@ namespace llaminar2
         device_id_ = ctx->deviceOrdinal();
 
         LOG_DEBUG("[CUDARingKVCache] Creating sharded cache with device context: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
-                 << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
-                 << ", local_kv_dim=" << kv_dim_
-                 << ", device=" << device_id_
-                 << ", precision=" << static_cast<int>(Precision));
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
+                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
+                  << ", local_kv_dim=" << kv_dim_
+                  << ", device=" << device_id_
+                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
 
@@ -825,8 +826,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[CUDARingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
 
         allocateDeviceParams();
     }
@@ -1000,9 +1001,10 @@ namespace llaminar2
         }
 
         EntryT &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
 
         // Check if we would exceed capacity (ring buffer overwrites oldest)
-        if (entry.count + num_tokens > max_seq_len_)
+        if (!capture_active && entry.count + num_tokens > max_seq_len_)
         {
             // Auto-evict oldest tokens to make room
             int to_evict = entry.count + num_tokens - max_seq_len_;
@@ -1036,10 +1038,15 @@ namespace llaminar2
             launch_append_kernel(entry, d_k, d_v, num_tokens, stream);
         }
 
-        // Update ring buffer state
-        entry.head = (entry.head + num_tokens) % max_seq_len_;
-        entry.count += num_tokens;
-        entry.scratch_valid = false; // Scratch is stale after append
+        if (!capture_active)
+        {
+            // Update ring buffer state only for real execution. During graph
+            // capture, kernels are recorded but not executed until launch, and
+            // replay callbacks advance host metadata after that launch.
+            entry.head = (entry.head + num_tokens) % max_seq_len_;
+            entry.count += num_tokens;
+            entry.scratch_valid = false; // Scratch is stale after append
+        }
 
         return true;
     }
