@@ -205,6 +205,11 @@ namespace llaminar2
                isDeviceRoutedPrefillGraphCapturable();
     }
 
+    bool MoERoutingStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return isDeviceRoutedPrefillGraphCaptureSupported();
+    }
+
     void MoERoutingStage::onGraphReplayed()
     {
         recordRuntimeHistogramTokenBoundary();
@@ -244,14 +249,14 @@ namespace llaminar2
 #endif
     }
 
-    bool MoERoutingStage::isDeviceRoutedPrefillGraphCapturable() const
+    bool MoERoutingStage::isDeviceRoutedPrefillGraphCaptureSupported() const
     {
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
         return false;
 #else
-        // Prefill routing is graph-capturable on ROCm when the full path is
-        // device-only: routeWithTensors() in non-snapshot Release builds does
-        // NO D2H and NO hipStreamSynchronize. Data stays device-resident.
+        // Cold padded-bucket preflight can run before ensureMoEKernel() has
+        // been called. Validate the backend, shape, and tensor contract here;
+        // isDeviceRoutedPrefillGraphCapturable() adds warmed-kernel readiness.
         const auto &rocm = debugEnv().rocm;
         return params_.device_id.is_rocm() &&
                params_.seq_len > 1 &&
@@ -263,9 +268,17 @@ namespace llaminar2
                params_.gate_weights &&
                params_.output_indices &&
                params_.output_weights &&
-               rocm.moe_grouped_prefill &&
-               moe_kernel_ != nullptr;
+               rocm.moe_grouped_prefill;
 #endif
+    }
+
+    bool MoERoutingStage::isDeviceRoutedPrefillGraphCapturable() const
+    {
+        // Prefill routing is graph-capturable on ROCm when the full path is
+        // device-only and the lazy MoE kernel has already been resolved during
+        // normal warmup. routeWithTensors() in non-snapshot Release builds does
+        // no D2H and no hipStreamSynchronize, so data stays device-resident.
+        return isDeviceRoutedPrefillGraphCaptureSupported() && moe_kernel_ != nullptr;
     }
 
     bool MoERoutingStage::hasInitializedRuntimeTableIfProvided() const

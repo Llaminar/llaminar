@@ -430,12 +430,12 @@ namespace llaminar2
         if (params_.device_id.is_rocm() && params_.seq_len > 1)
         {
             LOG_ERROR("[MoEExpertComputeStage] ROCm prefill (seq_len=" << params_.seq_len
-                      << ") requires grouped prefill but conditions not met: "
-                      << "moe_grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
-                      << ", fullOwnership=" << hasFullLocalExpertOwnership()
-                      << ", allEnabled=" << expertMaskAllEnabled()
-                      << ", replicas=" << params_.replica_set.num_replicated
-                      << ", layer=" << params_.layer_idx);
+                                                                       << ") requires grouped prefill but conditions not met: "
+                                                                       << "moe_grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
+                                                                       << ", fullOwnership=" << hasFullLocalExpertOwnership()
+                                                                       << ", allEnabled=" << expertMaskAllEnabled()
+                                                                       << ", replicas=" << params_.replica_set.num_replicated
+                                                                       << ", layer=" << params_.layer_idx);
             return false;
         }
 
@@ -1716,14 +1716,15 @@ namespace llaminar2
         return false;
     }
 
-    bool MoEExpertComputeStage::isFixedTopologyPrefillGraphCapturable() const
+    bool MoEExpertComputeStage::supportsFixedTopologyPrefillGraphCapturePreflight() const
     {
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
         return false;
 #else
-        // Fixed-topology grouped prefill is capturable when all buffers are
-        // pre-allocated from warmup and the stage uses the grouped pipeline.
-        // The MoE kernel must have sufficient grouping + scratch capacity.
+        // Cold preflight validates the fixed-topology grouped prefill contract
+        // without requiring lazy warmup resources such as the MoE kernel or its
+        // grouping scratch. Those are checked by isGraphCapturable() before the
+        // actual capture pass begins.
         if (!params_.device_id.is_rocm() || params_.seq_len <= 1)
             return false;
 
@@ -1737,8 +1738,28 @@ namespace llaminar2
         if (params_.replica_set.num_replicated != 0)
             return false;
 
+        if (params_.d_model <= 0 ||
+            params_.expert_intermediate <= 0 ||
+            params_.num_experts <= 0 ||
+            params_.top_k <= 0 ||
+            params_.top_k > params_.num_experts ||
+            !params_.input ||
+            !params_.output ||
+            !params_.routing_indices ||
+            !params_.routing_weights)
+            return false;
+
         // Must have all prepared GEMM engines ready
-        if (!hasAllPreparedExpertGemmEngines())
+        return hasAllPreparedExpertGemmEngines();
+#endif
+    }
+
+    bool MoEExpertComputeStage::isFixedTopologyPrefillGraphCapturable() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+        return false;
+#else
+        if (!supportsFixedTopologyPrefillGraphCapturePreflight())
             return false;
 
         // MoE kernel must exist and have pre-allocated grouping + scratch
@@ -1957,6 +1978,11 @@ namespace llaminar2
         // Fixed-topology grouped prefill path
         return isFixedTopologyPrefillGraphCapturable();
 #endif
+    }
+
+    bool MoEExpertComputeStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return supportsFixedTopologyPrefillGraphCapturePreflight();
     }
 
     StageBufferRequirements MoEExpertComputeStage::getBufferRequirements() const
@@ -2417,6 +2443,25 @@ namespace llaminar2
 #endif
     }
 
+    bool SharedExpertFFNStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+        return false;
+#else
+        const auto &rocm = debugEnv().rocm;
+        return params_.device_id.is_rocm() &&
+               params_.seq_len > 1 &&
+               params_.d_model > 0 &&
+               params_.intermediate > 0 &&
+               params_.input &&
+               params_.gate_w &&
+               params_.up_w &&
+               params_.down_w &&
+               params_.output &&
+               rocm.moe_grouped_prefill;
+#endif
+    }
+
     StageBufferRequirements SharedExpertFFNStage::getBufferRequirements() const
     {
         StageBufferRequirements reqs;
@@ -2609,6 +2654,22 @@ namespace llaminar2
         // because the stage is just a kernel launch with stable device pointers.
         // MoE kernel must already be cached (from warmup execution).
         return params_.device_id.is_rocm() && moe_kernel_ != nullptr;
+#endif
+    }
+
+    bool SharedExpertGateStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+        return false;
+#else
+        const auto &rocm = debugEnv().rocm;
+        return params_.device_id.is_rocm() &&
+               params_.seq_len > 1 &&
+               params_.d_model > 0 &&
+               params_.input &&
+               params_.gate_inp &&
+               params_.shared_output &&
+               rocm.moe_grouped_prefill;
 #endif
     }
 

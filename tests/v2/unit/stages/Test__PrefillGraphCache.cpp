@@ -9,12 +9,16 @@
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/engine/PrefillGraphCache.h"
+#include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "backends/DeviceId.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "mocks/MockComputeStage.h"
+#include "utils/DebugEnv.h"
+#include "utils/TestTensorFactory.h"
 
 using namespace llaminar2;
+using namespace llaminar2::test;
 using namespace llaminar2::testing;
 
 // =============================================================================
@@ -42,6 +46,44 @@ public:
         : MockComputeStage(ComputeStageType::GEMM, std::move(name), dev) {}
 
     bool isGraphCapturable() const override { return false; }
+};
+
+/**
+ * @brief Mock stage with cold padded-prefill support but delayed capture readiness.
+ */
+class ColdPaddedPreflightOnlyMockStage : public MockComputeStage
+{
+public:
+    ColdPaddedPreflightOnlyMockStage(std::string name, DeviceId dev)
+        : MockComputeStage(ComputeStageType::GEMM, std::move(name), dev) {}
+
+    bool supportsPaddedPrefillGraphCapturePreflight() const override { return true; }
+    bool isGraphCapturable() const override { return capture_ready_; }
+    void setCaptureReady(bool ready) { capture_ready_ = ready; }
+
+private:
+    bool capture_ready_ = false;
+};
+
+/**
+ * @brief Temporarily override the ROCm grouped-prefill flag for preflight tests.
+ */
+class ScopedRocmGroupedPrefillFlag
+{
+public:
+    explicit ScopedRocmGroupedPrefillFlag(bool enabled)
+        : old_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
+    {
+        mutableDebugEnv().rocm.moe_grouped_prefill = enabled;
+    }
+
+    ~ScopedRocmGroupedPrefillFlag()
+    {
+        mutableDebugEnv().rocm.moe_grouped_prefill = old_prefill_;
+    }
+
+private:
+    bool old_prefill_;
 };
 
 /**
@@ -195,6 +237,32 @@ static PrefillGraphCacheKey makeGPUKey(int seq_len = 512)
     key.device_id = DeviceId::cuda(0); // placeholder
 #endif
     return key;
+}
+
+static MoERoutingStage::Params makeColdRocmRoutingParams(
+    TensorBase *input,
+    TensorBase *gate_weights,
+    TensorBase *output_indices,
+    TensorBase *output_weights,
+    DeviceId device,
+    int seq_len,
+    int d_model,
+    int num_experts,
+    int top_k)
+{
+    MoERoutingStage::Params params;
+    params.device_id = device;
+    params.input = input;
+    params.gate_weights = gate_weights;
+    params.output_indices = output_indices;
+    params.output_weights = output_weights;
+    params.seq_len = seq_len;
+    params.d_model = d_model;
+    params.num_experts = num_experts;
+    params.top_k = top_k;
+    params.norm_topk_prob = true;
+    params.layer_idx = 0;
+    return params;
 }
 
 // =============================================================================
@@ -510,6 +578,158 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsNonCapturableStage)
 
     auto reason = cache.preflight(graph, key, nullptr, false);
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupReadiness)
+{
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(608);
+    ComputeGraph graph;
+    auto stage = std::make_unique<ColdPaddedPreflightOnlyMockStage>("warmup_ready_stage", key.device_id);
+    auto *stage_ptr = stage.get();
+    graph.addNode("warmup_ready_stage", std::move(stage), key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/608);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+
+    cache.markWarmedUp(key);
+    reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/608);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+
+    stage_ptr->setCaptureReady(true);
+    reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/608);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKernelWarmup)
+{
+    ScopedRocmGroupedPrefillFlag grouped_prefill(true);
+
+    constexpr int seq_len = 608;
+    constexpr int real_seq_len = 595;
+    constexpr int d_model = 64;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+
+    auto input = TestTensorFactory::createFP32({seq_len, d_model});
+    auto gate_weights = TestTensorFactory::createFP32({num_experts, d_model});
+    auto output_indices = TestTensorFactory::createFP32({seq_len * top_k, 1});
+    auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
+
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    PrefillGraphCacheKey key;
+    key.seq_len = seq_len;
+    key.device_id = DeviceId::rocm(0);
+
+    ComputeGraph graph;
+    auto params = makeColdRocmRoutingParams(
+        input.get(),
+        gate_weights.get(),
+        output_indices.get(),
+        output_weights.get(),
+        key.device_id,
+        seq_len,
+        d_model,
+        num_experts,
+        top_k);
+    graph.addNode("layer0_moe_routing", std::make_unique<MoERoutingStage>(params), key.device_id);
+
+    const auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        real_seq_len,
+        seq_len);
+
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+#else
+    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+#endif
+}
+
+TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupported)
+{
+    constexpr int seq_len = 608;
+    constexpr int real_seq_len = 595;
+    constexpr int d_model = 64;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+
+    auto input = TestTensorFactory::createFP32({seq_len, d_model});
+    auto gate_weights = TestTensorFactory::createFP32({num_experts, d_model});
+    auto output_indices = TestTensorFactory::createFP32({seq_len * top_k, 1});
+    auto output_weights = TestTensorFactory::createFP32({seq_len * top_k, 1});
+
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    {
+        ScopedRocmGroupedPrefillFlag grouped_prefill(false);
+        PrefillGraphCacheKey key;
+        key.seq_len = seq_len;
+        key.device_id = DeviceId::rocm(0);
+
+        ComputeGraph graph;
+        auto params = makeColdRocmRoutingParams(
+            input.get(), gate_weights.get(), output_indices.get(), output_weights.get(),
+            key.device_id, seq_len, d_model, num_experts, top_k);
+        graph.addNode("layer0_moe_routing", std::make_unique<MoERoutingStage>(params), key.device_id);
+
+        const auto reason = cache.preflight(
+            graph, key, nullptr, false, false, real_seq_len, seq_len);
+        EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+    }
+
+    {
+        ScopedRocmGroupedPrefillFlag grouped_prefill(true);
+        PrefillGraphCacheKey key;
+        key.seq_len = seq_len;
+        key.device_id = DeviceId::cuda(0);
+
+        ComputeGraph graph;
+        auto params = makeColdRocmRoutingParams(
+            input.get(), gate_weights.get(), output_indices.get(), output_weights.get(),
+            key.device_id, seq_len, d_model, num_experts, top_k);
+        graph.addNode("layer0_moe_routing", std::make_unique<MoERoutingStage>(params), key.device_id);
+
+        const auto reason = cache.preflight(
+            graph, key, nullptr, false, false, real_seq_len, seq_len);
+        EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+    }
 }
 
 TEST(Test__PrefillGraphCache, Preflight_AcceptsAllCapturableGraph)

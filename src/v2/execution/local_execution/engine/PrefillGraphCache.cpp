@@ -194,6 +194,8 @@ namespace llaminar2
 
         const bool padded_bucket =
             real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
+        const bool cold_padded_preflight =
+            padded_bucket && phase(key) == PrefillGraphPhase::Cold;
         if (padded_bucket && !config_.buckets_enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
 
@@ -207,18 +209,26 @@ namespace llaminar2
             return PrefillGraphRejectReason::GDNWithPaddedBucket;
         }
 
-        // Check all stages are capturable
+        // Cold padded-bucket preflight happens before warmup can allocate lazy
+        // graph resources. It validates support only; later Warmup/Ready
+        // preflight still requires isGraphCapturable() readiness.
         const auto &order = graph.getExecutionOrder();
         for (const auto &name : order)
         {
             const auto *node = graph.getNode(name);
             if (!node || !node->stage)
                 continue;
-            if (!node->stage->isGraphCapturable())
+            const bool stage_ok = cold_padded_preflight
+                                      ? node->stage->supportsPaddedPrefillGraphCapturePreflight()
+                                      : node->stage->isGraphCapturable();
+            if (!stage_ok)
             {
                 if (config_.trace)
                 {
-                    LOG_INFO("[PrefillGraphCache] Stage '" << name << "' is not graph-capturable");
+                    LOG_INFO("[PrefillGraphCache] Stage '" << name << "' "
+                                                           << (cold_padded_preflight
+                                                                   ? "does not support cold padded-prefill graph preflight"
+                                                                   : "is not graph-capturable"));
                 }
                 return PrefillGraphRejectReason::StageNotCapturable;
             }

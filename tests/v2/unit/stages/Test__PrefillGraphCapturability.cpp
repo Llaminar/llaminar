@@ -200,9 +200,11 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillCapturableWhenAllConditionsMet)
     stage.setMoEKernelForTesting(&stub_kernel_);
 
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(stage.isGraphCapturable())
         << "Prefill routing should be capturable on ROCm with valid buffers and kernel";
 #else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Prefill routing should not be capturable without ROCm or in snapshot builds";
 #endif
@@ -216,6 +218,12 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
     MoERoutingStage stage(params);
     // moe_kernel_ left as nullptr (default)
 
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "Cold padded preflight should allow routing before kernel warmup";
+#else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#endif
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Prefill routing should not be capturable without cached kernel";
 }
@@ -240,6 +248,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWhenGroupedPrefillDisabled)
     MoERoutingStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Prefill routing should not be capturable when moe_grouped_prefill is disabled";
 }
@@ -331,6 +340,7 @@ TEST_F(MoERoutingPrefillGraphCapture, NeedsOnGraphReplayedForPrefill)
     stage.setMoEKernelForTesting(&stub_kernel_);
 
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(stage.isGraphCapturable());
     EXPECT_TRUE(stage.needsOnGraphReplayed());
 #else
@@ -415,9 +425,11 @@ TEST_F(MoEExpertPrefillGraphCapture, FixedTopologyCapturableWhenReady)
     stage.setMoEKernelForTesting(&stub_kernel_);
 
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(stage.isGraphCapturable())
         << "Fixed-topology grouped prefill should be capturable with all engines ready";
 #else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable());
 #endif
 }
@@ -430,6 +442,12 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
     MoEExpertComputeStage stage(params);
     // moe_kernel_ left nullptr
 
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "Cold padded preflight should allow fixed-topology MoE before kernel warmup";
+#else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#endif
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Should not be capturable without MoE kernel";
 }
@@ -506,6 +524,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithMissingGemmEngines)
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Should reject when any expert GEMM engine is null";
 }
@@ -547,6 +566,58 @@ protected:
         output_ = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});
     }
 };
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportDoesNotRequireWarmScratch)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    SharedExpertFFNStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = SEQ_LEN;
+    params.d_model = D_MODEL;
+    params.intermediate = INTERMEDIATE;
+    params.input = input_.get();
+    params.gate_w = gate_w.get();
+    params.up_w = up_w.get();
+    params.down_w = down_w.get();
+    params.output = output_.get();
+
+    SharedExpertFFNStage stage(params);
+
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#endif
+    EXPECT_FALSE(stage.isGraphCapturable());
+}
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)
+{
+    ScopedRocmMoEFlags flags(true, true, false);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    SharedExpertFFNStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = SEQ_LEN;
+    params.d_model = D_MODEL;
+    params.intermediate = INTERMEDIATE;
+    params.input = input_.get();
+    params.gate_w = gate_w.get();
+    params.up_w = up_w.get();
+    params.down_w = down_w.get();
+    params.output = output_.get();
+
+    SharedExpertFFNStage stage(params);
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+}
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillCapturableWhenScratchReady)
 {
@@ -714,7 +785,29 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)
     SharedExpertGateStage stage(params);
     // moe_kernel_ left nullptr
 
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "Cold padded preflight should allow shared gate before kernel warmup";
+#else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#endif
     EXPECT_FALSE(stage.isGraphCapturable());
+}
+
+TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)
+{
+    ScopedRocmMoEFlags flags(true, true, false);
+
+    SharedExpertGateStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = SEQ_LEN;
+    params.d_model = D_MODEL;
+    params.input = input_.get();
+    params.gate_inp = gate_inp_.get();
+    params.shared_output = shared_output_.get();
+
+    SharedExpertGateStage stage(params);
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
 }
 
 TEST_F(SharedExpertGatePrefillGraphCapture, RejectsOnCPU)

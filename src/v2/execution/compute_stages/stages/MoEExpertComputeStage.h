@@ -225,6 +225,7 @@ namespace llaminar2
 
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+        bool supportsPaddedPrefillGraphCapturePreflight() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -323,6 +324,7 @@ namespace llaminar2
         bool canUseFixedTopologyGroupedPrefill() const;
         bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
+        bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
         bool isFixedTopologyPrefillGraphCapturable() const;
         bool hasFullLocalExpertOwnership() const;
         bool expertMaskAllEnabled() const;
@@ -392,6 +394,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+        bool supportsPaddedPrefillGraphCapturePreflight() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
@@ -485,6 +488,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+        bool supportsPaddedPrefillGraphCapturePreflight() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;

@@ -21,12 +21,17 @@
 #   6. Validates response format (usage, finish_reason)
 #   7. Tests streaming in both modes for thinking models
 #   8. Tests error handling (invalid JSON, missing messages)
-#   9. Measures process RSS / GPU memory and scans the server log for WARN/ERROR
-#  10. Kills server, moves to next backend
+#   9. Optionally runs objective long-context checks for 4B+ models
+#  10. Measures process RSS / GPU memory and scans the server log for WARN/ERROR
+#  11. Kills server, moves to next backend
 #
 # Usage:
 #   ./test_server_e2e.sh [--binary <path>] [--model <path>] [--backends <list>]
 #   ./test_server_e2e.sh [--binary <path>] [--suite "model_path|backend1,backend2[|max_tokens]"] ...
+#   LLAMINAR_E2E_LONG_CONTEXT=1 ./test_server_e2e.sh [options]
+#
+# Optional long-context mode runs only when the model path, basename, or label
+# contains a parsed size >= LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B (default: 4B).
 #
 # Environment:
 #   LLAMINAR_BINARY     Override binary path
@@ -35,6 +40,13 @@
 #   LLAMINAR_LOG_LEVEL  Log level for server (default: WARN; ERROR is promoted
 #                       to WARN so this harness can catch warnings)
 #   LLAMINAR_E2E_LOG_DIR Override per-case server log directory
+#   LLAMINAR_E2E_LONG_CONTEXT Enable optional long-context checks (default: 0)
+#   LLAMINAR_E2E_LONG_CONTEXT_TIER lite|full long-context tier (default: lite)
+#   LLAMINAR_E2E_CONTEXT_LENGTH Context length passed with -c for eligible models (default: 4096)
+#   LLAMINAR_E2E_LONG_MAX_TOKENS Long-generation max_tokens (default: 512)
+#   LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS Minimum helper prompt tokens (default: 900)
+#   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: REQUEST_TIMEOUT)
+#   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
 # =============================================================================
 
 set -euo pipefail
@@ -114,6 +126,16 @@ STARTUP_TIMEOUT=300   # seconds to wait for server startup. Most models load in
                       # ~5s either way, so this is just an upper bound.
 REQUEST_TIMEOUT=180   # seconds per curl request
 
+# Optional long-context helper controls. The helper is intentionally gated to
+# 4B+ models by default so small smoke-test suites keep their fast behavior.
+LONG_CONTEXT_ENABLED="${LLAMINAR_E2E_LONG_CONTEXT:-0}"
+LONG_CONTEXT_TIER="${LLAMINAR_E2E_LONG_CONTEXT_TIER:-lite}"
+CONTEXT_LENGTH="${LLAMINAR_E2E_CONTEXT_LENGTH:-4096}"
+LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-512}"
+LONG_MIN_PROMPT_TOKENS="${LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS:-900}"
+LONG_REQUEST_TIMEOUT="${LLAMINAR_E2E_LONG_REQUEST_TIMEOUT:-$REQUEST_TIMEOUT}"
+LONG_MIN_MODEL_SIZE_B="${LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B:-4}"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -152,6 +174,72 @@ is_thinking_model() {
 is_gpu_backend() {
     local backend="$1"
     [[ "$backend" == cuda:* || "$backend" == rocm:* ]]
+}
+
+parse_model_size_b() {
+    local model="$1"
+    local label="$2"
+
+    python3 - "$model" "$label" <<'PY'
+import os
+import re
+import sys
+
+model = sys.argv[1]
+label = sys.argv[2]
+text = " ".join([model, os.path.basename(model), label])
+sizes = [float(match.group(1)) for match in re.finditer(r"(?i)(?<![0-9.])(\d+(?:\.\d+)?)\s*b(?![a-z0-9.])", text)]
+if sizes:
+    print(f"{max(sizes):g}")
+PY
+}
+
+model_size_meets_threshold() {
+    local size_b="$1"
+    local threshold_b="$2"
+
+    python3 - "$size_b" "$threshold_b" <<'PY'
+import sys
+
+try:
+    size_b = float(sys.argv[1])
+    threshold_b = float(sys.argv[2])
+except ValueError:
+    sys.exit(1)
+
+sys.exit(0 if size_b >= threshold_b else 1)
+PY
+}
+
+print_long_context_gate() {
+    local tag="$1"
+    local model_size_b="$2"
+
+    if [ -z "$model_size_b" ]; then
+        echo -e "  ${YELLOW}SKIP${NC} [${tag}] Long-context: no model size parsed from path/label; require >= ${LONG_MIN_MODEL_SIZE_B}B"
+    else
+        echo -e "  ${YELLOW}SKIP${NC} [${tag}] Long-context: parsed model size ${model_size_b}B below ${LONG_MIN_MODEL_SIZE_B}B threshold"
+    fi
+}
+
+run_long_context_checks() {
+    local tag="$1"
+    local port="$2"
+    local thinking_model="$3"
+
+    if python3 "$SCRIPT_DIR/long_context_checks.py" \
+        --base-url "http://127.0.0.1:${port}" \
+        --tag "$tag" \
+        --tier "$LONG_CONTEXT_TIER" \
+        --min-prompt-tokens "$LONG_MIN_PROMPT_TOKENS" \
+        --long-max-tokens "$LONG_MAX_TOKENS" \
+        --context-length "$CONTEXT_LENGTH" \
+        --request-timeout "$LONG_REQUEST_TIMEOUT" \
+        --thinking-model "$thinking_model"; then
+        pass "[${tag}] Long-context checks (${LONG_CONTEXT_TIER})"
+    else
+        fail "[${tag}] Long-context checks (${LONG_CONTEXT_TIER})"
+    fi
 }
 
 mode_name() {
@@ -706,6 +794,18 @@ run_backend_tests() {
 
     echo -e "${YELLOW}─── ${tag} (port ${port}) ───${NC}"
 
+    local long_context_run="false"
+    local model_size_b=""
+    if [ "$LONG_CONTEXT_ENABLED" = "1" ]; then
+        model_size_b=$(parse_model_size_b "$model" "$label")
+        if model_size_meets_threshold "$model_size_b" "$LONG_MIN_MODEL_SIZE_B"; then
+            long_context_run="true"
+            echo -e "  ${BLUE}INFO${NC} [${tag}] Long-context enabled: size ${model_size_b}B, tier ${LONG_CONTEXT_TIER}, context ${CONTEXT_LENGTH}"
+        else
+            print_long_context_gate "$tag" "$model_size_b"
+        fi
+    fi
+
     # Build device flag — always explicit to prevent auto-detection
     local device_flag="-d ${backend}"
     local safe_tag log_path gpu_before_mb
@@ -714,8 +814,13 @@ run_backend_tests() {
     gpu_before_mb=$(get_total_gpu_memory_mb)
 
     # Start server
+    local context_args=()
+    if [ "$long_context_run" = "true" ]; then
+        context_args=(-c "$CONTEXT_LENGTH")
+    fi
+
     LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" serve --port "$port" \
-        $device_flag -m "$model" >"$log_path" 2>&1 &
+        "${context_args[@]}" $device_flag -m "$model" >"$log_path" 2>&1 &
     local server_pid=$!
 
     # Wait for health
@@ -806,6 +911,11 @@ print(d.get('error', {}).get('type', ''))
         fail "[${tag}] Error handling: expected invalid_request_error, got '${error_msg}'"
     fi
 
+    # ─── Optional Long-Context Checks ─────────────────────────────────
+    if [ "$long_context_run" = "true" ]; then
+        run_long_context_checks "$tag" "$port" "$thinking_model"
+    fi
+
     # ─── Test 10: Memory and server log hygiene ───────────────────────
     check_memory_usage "$tag" "$backend" "$model" "$server_pid" "$gpu_before_mb"
     scan_server_log "$tag" "$log_path"
@@ -823,6 +933,11 @@ echo ""
 echo -e "  Binary: ${BINARY}"
 echo -e "  Server logs: ${LOG_DIR}"
 echo -e "  Server log level: ${LOG_LEVEL}"
+if [ "$LONG_CONTEXT_ENABLED" = "1" ]; then
+    echo -e "  Long-context: enabled, tier=${LONG_CONTEXT_TIER}, context=${CONTEXT_LENGTH}, max_tokens=${LONG_MAX_TOKENS}, min_model_size=${LONG_MIN_MODEL_SIZE_B}B"
+else
+    echo -e "  Long-context: disabled"
+fi
 echo -e "  Suites: ${#SUITES[@]}"
 for suite in "${SUITES[@]}"; do
     IFS='|' read -r local_model local_backends _ <<< "$suite"

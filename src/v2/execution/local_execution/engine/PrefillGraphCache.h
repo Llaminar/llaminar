@@ -65,7 +65,7 @@ namespace llaminar2
         SnapshotsActive,        ///< ENABLE_PIPELINE_SNAPSHOTS build
         ActiveMoERebalancing,   ///< Rebalance mode is DYNAMIC or OBSERVE
         CollectiveNodesPresent, ///< Graph has TP/PP collective stages
-        StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
+        StageNotCapturable,     ///< One or more stages fail graph-capture support/readiness checks
         GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
         NoGPUContext,           ///< GPU context unavailable
         InvalidatedByPlacement  ///< Expert placement mutation since last capture

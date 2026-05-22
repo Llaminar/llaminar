@@ -714,6 +714,22 @@ namespace llaminar2
         virtual bool supportsPaddedPrefillRealLengthContract() const { return false; }
 
         /**
+         * @brief Whether cold padded-prefill graph preflight may allow this stage.
+         *
+         * Padded bucket preflight can run before the first normal warmup pass,
+         * while some stages intentionally allocate kernels, descriptor tables,
+         * or scratch buffers during that warmup. Such stages should return true
+         * here when their backend and shape support fixed-bucket prefill capture
+         * in principle, and keep isGraphCapturable() as the stricter
+         * capture-time readiness check.
+         *
+         * The default preserves legacy behavior for existing stages: if a stage
+         * has no separate cold-support contract, padded preflight still requires
+         * normal graph-capture readiness.
+         */
+        virtual bool supportsPaddedPrefillGraphCapturePreflight() const { return isGraphCapturable(); }
+
+        /**
          * @brief Called after a captured GPU graph segment is replayed.
          *
          * This method is invoked by DeviceGraphExecutor after launching a graph segment

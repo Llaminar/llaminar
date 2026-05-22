@@ -614,6 +614,53 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     EXPECT_EQ(host.last_forward_input.position_offset, 200);
 }
 
+TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucketedGraphCache)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,128,256"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "256"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+
+    std::vector<int> tokens;
+    std::vector<int> positions;
+    tokens.reserve(35);
+    positions.reserve(35);
+    for (int token_index = 0; token_index < 35; ++token_index)
+    {
+        tokens.push_back(500 + token_index);
+        positions.push_back(1000 + token_index);
+    }
+
+    auto input = makeTestInput(35, 1, DeviceId::cuda(0), tokens.data(), positions.data());
+    input.position_offset = 1000;
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.execute(input, output, host));
+
+    ASSERT_TRUE(host.has_last_forward_input);
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    EXPECT_EQ(host.last_token_ids_pointer, tokens.data());
+    EXPECT_EQ(host.last_position_ids_pointer, positions.data());
+    EXPECT_EQ(host.last_token_ids, tokens);
+    EXPECT_EQ(host.last_position_ids, positions);
+    EXPECT_EQ(host.last_forward_input.seq_len, 35);
+    EXPECT_EQ(host.last_forward_input.real_seq_len, 0);
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0);
+    EXPECT_TRUE(engine.cacheEmpty())
+        << "Short raw prefill should bypass graph-cache population entirely.";
+}
+
 TEST_F(Test__ForwardExecutionEngine, Execute_RawPaddedGpuBucketRequiresGpuGraphs)
 {
     ScopedDebugEnv env({

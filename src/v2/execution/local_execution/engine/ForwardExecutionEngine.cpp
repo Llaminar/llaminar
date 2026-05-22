@@ -409,7 +409,15 @@ namespace llaminar2
             ((input.token_ids != nullptr) && (input.position_ids != nullptr)) ||
             (is_pp_non_embedding_stage && (input.position_ids != nullptr));
 
-        // Prefill graph caching: eligible for GPU devices with gpu_graphs enabled
+        const auto &env = debugEnv();
+        const int input_real_seq_len = effectiveRealSeqLen(input);
+        const bool prefill_graph_min_seq_met =
+            input_real_seq_len >= env.execution.prefill_graph_min_seq;
+
+        // Prefill graph caching: eligible for GPU devices with gpu_graphs enabled.
+        // The minimum-length gate is evaluated against the caller's real input
+        // before any bucket padding so ordinary short prompts take the normal
+        // prefill path instead of becoming unsupported padded graph attempts.
         const bool prefill_cache_eligible =
             config_.cache_config.enabled &&
             !is_decode &&
@@ -417,14 +425,14 @@ namespace llaminar2
             has_stable_forward_inputs &&
             (is_standard_path || is_partial_pp_path) &&
             input.device.is_gpu() &&
-            debugEnv().execution.gpu_graphs;
+            env.execution.gpu_graphs &&
+            prefill_graph_min_seq_met;
 
         ForwardInput effective_input = input;
         std::optional<PrefillChunkRuntimePlan> raw_bucket_plan;
         bool bucketed_prefill = false;
         int bucketed_prefill_seq_len = input.seq_len;
 
-        const auto &env = debugEnv();
         if (!is_decode && input.bucket_seq_len > 0 && isPaddedBucketExecution(input) &&
             (!prefill_cache_eligible || !env.execution.prefill_graph_buckets))
         {
@@ -436,9 +444,9 @@ namespace llaminar2
         }
 
         if (!is_decode && input.bucket_seq_len <= 0 && env.execution.prefill_graph_buckets &&
-            input.token_ids && input.batch_size == 1)
+            prefill_graph_min_seq_met && input.token_ids && input.batch_size == 1)
         {
-            const int real_seq_len = effectiveRealSeqLen(input);
+            const int real_seq_len = input_real_seq_len;
             const auto selection = selectPrefillGraphBucket(
                 real_seq_len,
                 env.execution.prefill_graph_bucket_sizes);

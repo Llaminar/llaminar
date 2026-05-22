@@ -74,6 +74,7 @@ namespace llaminar2
 
         bool allowsZeroOutput() const override { return false; }
         bool isGraphCapturable() const override;
+        bool supportsPaddedPrefillGraphCapturePreflight() const override;
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
@@ -101,6 +102,7 @@ namespace llaminar2
 
         IMoEKernel *ensureMoEKernel() const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
+        bool isDeviceRoutedPrefillGraphCaptureSupported() const;
         bool isDeviceRoutedPrefillGraphCapturable() const;
         bool hasInitializedRuntimeTableIfProvided() const;
         void recordRuntimeHistogramTokenBoundary() const;
