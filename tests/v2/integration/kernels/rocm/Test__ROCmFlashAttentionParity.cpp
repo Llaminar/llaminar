@@ -8,7 +8,7 @@
  * **Tests**:
  * - Flash Attention 2 (prefill) vs CPU attention
  * - Flash Decoding (decode) vs CPU attention
- * - Various head dimensions (64, 128)
+ * - Various head dimensions (64, 128, 256)
  * - GQA configurations (n_heads != n_kv_heads)
  *
  * **Pass Criteria**:
@@ -906,6 +906,127 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
     LOG_INFO("[FlashDecode_FP32_LargeKVLen_GQA] PASSED");
 }
 
+TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen35LongKVLen)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int seq_len = 1;
+    constexpr int kv_len = 1024;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 4;
+    constexpr int head_dim = 256;
+    constexpr int gqa_ratio = n_heads / n_kv_heads;
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    // Long-context generation reads an FP16 KV cache with a single FP32 query.
+    // This is the decode path used immediately after a long Qwen3.5 prefill.
+    auto Q_data = randomFP32Scaled(q_size, 0.35f);
+    auto K_data_fp32 = randomFP32Scaled(kv_size, 0.35f);
+    auto V_data_fp32 = randomFP32Scaled(kv_size, 0.35f);
+    std::vector<uint16_t> K_data_fp16(kv_size);
+    std::vector<uint16_t> V_data_fp16(kv_size);
+    quantizeToFP16(K_data_fp32.data(), K_data_fp16.data(), kv_size);
+    quantizeToFP16(V_data_fp32.data(), V_data_fp16.data(), kv_size);
+
+    std::vector<float> K_ref_fp32(kv_size);
+    std::vector<float> V_ref_fp32(kv_size);
+    dequantizeFP16(K_data_fp16.data(), K_ref_fp32.data(), kv_size);
+    dequantizeFP16(V_data_fp16.data(), V_ref_fp32.data(), kv_size);
+
+    std::vector<float> cpu_output(out_size, 0.0f);
+    for (int head = 0; head < n_heads; ++head)
+    {
+        const int kv_head = head / gqa_ratio;
+        const float *q = Q_data.data() + static_cast<size_t>(head) * head_dim;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        std::vector<float> scores(static_cast<size_t>(kv_len));
+        float max_score = -std::numeric_limits<float>::infinity();
+
+        for (int kv_pos = 0; kv_pos < kv_len; ++kv_pos)
+        {
+            const float *k = K_ref_fp32.data() +
+                             (static_cast<size_t>(kv_pos) * n_kv_heads + kv_head) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d)
+            {
+                dot += q[d] * k[d];
+            }
+            const float score = dot * scale;
+            scores[static_cast<size_t>(kv_pos)] = score;
+            max_score = std::max(max_score, score);
+        }
+
+        double sum_exp = 0.0;
+        float *out = cpu_output.data() + static_cast<size_t>(head) * head_dim;
+        for (int kv_pos = 0; kv_pos < kv_len; ++kv_pos)
+        {
+            const float weight = std::exp(scores[static_cast<size_t>(kv_pos)] - max_score);
+            const float *v = V_ref_fp32.data() +
+                             (static_cast<size_t>(kv_pos) * n_kv_heads + kv_head) * head_dim;
+            sum_exp += static_cast<double>(weight);
+            for (int d = 0; d < head_dim; ++d)
+            {
+                out[d] += weight * v[d];
+            }
+        }
+
+        const float inv_sum = static_cast<float>(1.0 / std::max(sum_exp, 1e-30));
+        for (int d = 0; d < head_dim; ++d)
+        {
+            out[d] *= inv_sum;
+        }
+    }
+
+    auto q_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    auto k_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)},
+        K_data_fp16);
+    auto v_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)},
+        V_data_fp16);
+    auto output_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    std::copy(Q_data.begin(), Q_data.end(), q_tensor->mutable_data());
+
+    const DeviceId gpu_device = DeviceId::rocm(0);
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device,
+        {q_tensor.get(), k_tensor.get(), v_tensor.get()},
+        {output_tensor.get()},
+        [&]
+        {
+            return rocm_kernel.compute_tensor(
+                q_tensor.get(), k_tensor.get(), v_tensor.get(), output_tensor.get(),
+                1, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
+                false, -1, nullptr, nullptr, &mpi_ctx_, 0);
+        }));
+
+    const float *rocm_output = output_tensor->data();
+    ASSERT_NE(rocm_output, nullptr);
+    ASSERT_FALSE(hasNaNOrInf(rocm_output, out_size));
+
+    const double cosine = cosineSimilarity(rocm_output, cpu_output.data(), out_size);
+    const double l2_error = relativeL2Error(rocm_output, cpu_output.data(), out_size);
+    const double max_error = maxAbsError(rocm_output, cpu_output.data(), out_size);
+
+    printComparisonStats("FlashDecode native FP16 KV Qwen3.5 long KVLen", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.998);
+    EXPECT_LE(l2_error, 0.02);
+    EXPECT_LE(max_error, 0.03);
+
+    cleanupWorkspace(rocm_kernel);
+}
+
 TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
 {
     if (!hasROCm())
@@ -1300,6 +1421,275 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Large)
     EXPECT_LE(l2_error, 0.05);
 
     LOG_INFO("[FlashAttn2_FP32_Large] PASSED");
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Qwen35LongPrefillSampledRows)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int seq_len = 1024;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 4;
+    constexpr int head_dim = 256;
+    constexpr int gqa_ratio = n_heads / n_kv_heads;
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    // This mirrors the Qwen3.5 35B FA buffer geometry while keeping the CPU
+    // oracle cheap by checking only representative causal rows.
+    auto Q_data = randomFP32Scaled(q_size, 0.35f);
+    auto K_data = randomFP32Scaled(kv_size, 0.35f);
+    auto V_data = randomFP32Scaled(kv_size, 0.35f);
+    std::vector<float> rocm_output(out_size, 0.0f);
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+
+    float *d_Q = nullptr;
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    float *d_output = nullptr;
+    ASSERT_EQ(hipMalloc(&d_Q, q_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_K, kv_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_V, kv_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_output, out_size * sizeof(float)), hipSuccess);
+
+    ASSERT_EQ(hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(d_output, 0, out_size * sizeof(float)), hipSuccess);
+
+    const bool rocm_success = rocm_kernel.compute(
+        d_Q, d_K, d_V, d_output,
+        seq_len, n_heads, n_kv_heads, head_dim,
+        true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_TRUE(rocm_success);
+    ASSERT_EQ(hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+
+    hipFree(d_Q);
+    hipFree(d_K);
+    hipFree(d_V);
+    hipFree(d_output);
+
+    ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
+
+    auto computeReferenceRow = [&](int query_row, int head) -> std::vector<float>
+    {
+        std::vector<float> scores(static_cast<size_t>(query_row + 1));
+        const int kv_head = head / gqa_ratio;
+        const float *q = Q_data.data() +
+                         (static_cast<size_t>(query_row) * n_heads + head) * head_dim;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        float max_score = -std::numeric_limits<float>::infinity();
+
+        // First pass: stable causal score maximum for this sampled row/head.
+        for (int kv_pos = 0; kv_pos <= query_row; ++kv_pos)
+        {
+            const float *k = K_data.data() +
+                             (static_cast<size_t>(kv_pos) * n_kv_heads + kv_head) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d)
+            {
+                dot += q[d] * k[d];
+            }
+            const float score = dot * scale;
+            scores[static_cast<size_t>(kv_pos)] = score;
+            max_score = std::max(max_score, score);
+        }
+
+        std::vector<float> ref(static_cast<size_t>(head_dim), 0.0f);
+        double sum_exp = 0.0;
+
+        // Second pass: normalize scores and accumulate the V-weighted row.
+        for (int kv_pos = 0; kv_pos <= query_row; ++kv_pos)
+        {
+            const float weight = std::exp(scores[static_cast<size_t>(kv_pos)] - max_score);
+            const float *v = V_data.data() +
+                             (static_cast<size_t>(kv_pos) * n_kv_heads + kv_head) * head_dim;
+            sum_exp += static_cast<double>(weight);
+            for (int d = 0; d < head_dim; ++d)
+            {
+                ref[static_cast<size_t>(d)] += weight * v[d];
+            }
+        }
+
+        const float inv_sum = static_cast<float>(1.0 / std::max(sum_exp, 1e-30));
+        for (float &value : ref)
+        {
+            value *= inv_sum;
+        }
+        return ref;
+    };
+
+    const std::vector<int> sampled_rows = {0, 127, 511, 1023};
+    double worst_cosine = 1.0;
+    double worst_l2 = 0.0;
+    double worst_max_error = 0.0;
+    for (int row : sampled_rows)
+    {
+        for (int head = 0; head < n_heads; ++head)
+        {
+            const std::vector<float> ref = computeReferenceRow(row, head);
+            const float *actual = rocm_output.data() +
+                                  (static_cast<size_t>(row) * n_heads + head) * head_dim;
+            const double cosine = cosineSimilarity(actual, ref.data(), ref.size());
+            const double l2_error = relativeL2Error(actual, ref.data(), ref.size());
+            const double max_error = maxAbsError(actual, ref.data(), ref.size());
+            worst_cosine = std::min(worst_cosine, cosine);
+            worst_l2 = std::max(worst_l2, l2_error);
+            worst_max_error = std::max(worst_max_error, max_error);
+        }
+    }
+
+    printComparisonStats("FlashAttn2 FP32 Qwen3.5 long prefill sampled rows",
+                         worst_cosine, worst_l2, worst_max_error,
+                         sampled_rows.size() * n_heads * head_dim);
+
+    EXPECT_GE(worst_cosine, 0.999);
+    EXPECT_LE(worst_l2, 0.01);
+    EXPECT_LE(worst_max_error, 0.01);
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen35LongPrefillSampledRows)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int seq_len = 1024;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 4;
+    constexpr int head_dim = 256;
+    constexpr int gqa_ratio = n_heads / n_kv_heads;
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    // Production ROCm prefill reads K/V back from the FP16 KV cache, so cover
+    // the native FP16-KV dispatch separately from the all-FP32 path above.
+    auto Q_data = randomFP32Scaled(q_size, 0.35f);
+    auto K_data_fp32 = randomFP32Scaled(kv_size, 0.35f);
+    auto V_data_fp32 = randomFP32Scaled(kv_size, 0.35f);
+    std::vector<uint16_t> K_data_fp16(kv_size);
+    std::vector<uint16_t> V_data_fp16(kv_size);
+    quantizeToFP16(K_data_fp32.data(), K_data_fp16.data(), kv_size);
+    quantizeToFP16(V_data_fp32.data(), V_data_fp16.data(), kv_size);
+
+    std::vector<float> K_ref_fp32(kv_size);
+    std::vector<float> V_ref_fp32(kv_size);
+    dequantizeFP16(K_data_fp16.data(), K_ref_fp32.data(), kv_size);
+    dequantizeFP16(V_data_fp16.data(), V_ref_fp32.data(), kv_size);
+
+    auto q_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    auto k_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)},
+        K_data_fp16);
+    auto v_tensor = std::make_shared<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_kv_heads * head_dim)},
+        V_data_fp16);
+    auto output_tensor = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    std::copy(Q_data.begin(), Q_data.end(), q_tensor->mutable_data());
+
+    const DeviceId gpu_device = DeviceId::rocm(0);
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device,
+        {q_tensor.get(), k_tensor.get(), v_tensor.get()},
+        {output_tensor.get()},
+        [&]
+        {
+            return rocm_kernel.compute_tensor(
+                q_tensor.get(), k_tensor.get(), v_tensor.get(), output_tensor.get(),
+                1, seq_len, seq_len, n_heads, n_kv_heads, head_dim,
+                true, -1, nullptr, nullptr, &mpi_ctx_, 0);
+        }));
+
+    const float *rocm_output = output_tensor->data();
+    ASSERT_NE(rocm_output, nullptr);
+    ASSERT_FALSE(hasNaNOrInf(rocm_output, out_size));
+
+    auto computeReferenceRow = [&](int query_row, int head) -> std::vector<float>
+    {
+        std::vector<float> scores(static_cast<size_t>(query_row + 1));
+        const int kv_head = head / gqa_ratio;
+        const float *q = Q_data.data() +
+                         (static_cast<size_t>(query_row) * n_heads + head) * head_dim;
+        const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+        float max_score = -std::numeric_limits<float>::infinity();
+
+        // Match the runtime path: FP32 Q, FP16-cache K/V dequantized to FP32,
+        // causal attention over all preceding prompt positions.
+        for (int kv_pos = 0; kv_pos <= query_row; ++kv_pos)
+        {
+            const float *k = K_ref_fp32.data() +
+                             (static_cast<size_t>(kv_pos) * n_kv_heads + kv_head) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d)
+            {
+                dot += q[d] * k[d];
+            }
+            const float score = dot * scale;
+            scores[static_cast<size_t>(kv_pos)] = score;
+            max_score = std::max(max_score, score);
+        }
+
+        std::vector<float> ref(static_cast<size_t>(head_dim), 0.0f);
+        double sum_exp = 0.0;
+        for (int kv_pos = 0; kv_pos <= query_row; ++kv_pos)
+        {
+            const float weight = std::exp(scores[static_cast<size_t>(kv_pos)] - max_score);
+            const float *v = V_ref_fp32.data() +
+                             (static_cast<size_t>(kv_pos) * n_kv_heads + kv_head) * head_dim;
+            sum_exp += static_cast<double>(weight);
+            for (int d = 0; d < head_dim; ++d)
+            {
+                ref[static_cast<size_t>(d)] += weight * v[d];
+            }
+        }
+
+        const float inv_sum = static_cast<float>(1.0 / std::max(sum_exp, 1e-30));
+        for (float &value : ref)
+        {
+            value *= inv_sum;
+        }
+        return ref;
+    };
+
+    const std::vector<int> sampled_rows = {0, 127, 511, 1023};
+    double worst_cosine = 1.0;
+    double worst_l2 = 0.0;
+    double worst_max_error = 0.0;
+    for (int row : sampled_rows)
+    {
+        for (int head = 0; head < n_heads; ++head)
+        {
+            const std::vector<float> ref = computeReferenceRow(row, head);
+            const float *actual = rocm_output +
+                                  (static_cast<size_t>(row) * n_heads + head) * head_dim;
+            const double cosine = cosineSimilarity(actual, ref.data(), ref.size());
+            const double l2_error = relativeL2Error(actual, ref.data(), ref.size());
+            const double max_error = maxAbsError(actual, ref.data(), ref.size());
+            worst_cosine = std::min(worst_cosine, cosine);
+            worst_l2 = std::max(worst_l2, l2_error);
+            worst_max_error = std::max(worst_max_error, max_error);
+        }
+    }
+
+    printComparisonStats("FlashAttn2 native FP16 KV Qwen3.5 long prefill sampled rows",
+                         worst_cosine, worst_l2, worst_max_error,
+                         sampled_rows.size() * n_heads * head_dim);
+
+    EXPECT_GE(worst_cosine, 0.998);
+    EXPECT_LE(worst_l2, 0.02);
+    EXPECT_LE(worst_max_error, 0.03);
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_NativeFP16KV_Qwen2ScaleStress)

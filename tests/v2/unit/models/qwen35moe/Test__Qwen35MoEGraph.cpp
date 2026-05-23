@@ -7,7 +7,9 @@
 
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
+#include "kernels/KernelFactory.h"
 #include "mocks/MockLocalTPContext.h"
+#include "mocks/MockMPIContext.h"
 #include "utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -82,6 +84,22 @@ namespace
         return layer;
     }
 
+    LayerWeights makeFALayerWeights(TensorArena &arena, const GraphConfig &config)
+    {
+        LayerWeights layer;
+        const int q_width = config.n_heads * config.head_dim * 2;
+        const int kv_width = config.n_kv_heads * config.head_dim;
+
+        layer.attn_norm = arena.fp32({static_cast<size_t>(config.d_model)});
+        layer.wq = arena.fp32({static_cast<size_t>(q_width), static_cast<size_t>(config.d_model)});
+        layer.wk = arena.fp32({static_cast<size_t>(kv_width), static_cast<size_t>(config.d_model)});
+        layer.wv = arena.fp32({static_cast<size_t>(kv_width), static_cast<size_t>(config.d_model)});
+        layer.wo = arena.fp32({static_cast<size_t>(config.d_model), static_cast<size_t>(config.d_model)});
+        layer.q_norm = arena.fp32({static_cast<size_t>(config.head_dim)});
+        layer.k_norm = arena.fp32({static_cast<size_t>(config.head_dim)});
+        return layer;
+    }
+
     ActivationBuffers makeActivationBuffers(TensorArena &arena, int tokens, int d_model, int num_experts, int top_k)
     {
         ActivationBuffers buffers;
@@ -95,6 +113,25 @@ namespace
         buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(d_model)});
         buffers.extensions[BufferId::MOE_GATE_SCRATCH] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(num_experts)});
         buffers.extensions[BufferId::MOE_UP_SCRATCH] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(num_experts)});
+        return buffers;
+    }
+
+    ActivationBuffers makeFAActivationBuffers(TensorArena &arena, int tokens, const GraphConfig &config)
+    {
+        ActivationBuffers buffers;
+        const int q_width = config.n_heads * config.head_dim;
+        const int q_raw_width = q_width * 2;
+        const int kv_width = config.n_kv_heads * config.head_dim;
+
+        buffers.current_hidden = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(config.d_model)});
+        buffers.normalized = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(config.d_model)});
+        buffers.Q = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(q_width)});
+        buffers.K = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(kv_width)});
+        buffers.V = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(kv_width)});
+        buffers.attn_output = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(q_width)});
+        buffers.attn_proj = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(config.d_model)});
+        buffers.extensions[BufferId::FA_Q_RAW] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(q_raw_width)});
+        buffers.extensions[BufferId::FA_GATE] = arena.fp32({static_cast<size_t>(tokens), static_cast<size_t>(q_width)});
         return buffers;
     }
 }
@@ -159,4 +196,42 @@ TEST(Test__Qwen35MoEGraph, SchemaDefaultsRoutedExpertWeightsToExpertParallel)
     EXPECT_EQ(sharding.getMode("blk.0.ffn_gate_exps.weight"), WeightShardingMode::ExpertParallel);
     EXPECT_EQ(sharding.getMode("blk.0.ffn_up_exps.weight"), WeightShardingMode::ExpertParallel);
     EXPECT_EQ(sharding.getMode("blk.0.ffn_down_exps.weight"), WeightShardingMode::ExpertParallel);
+}
+
+TEST(Test__Qwen35MoEGraph, FARopeOnReadAppendsNormalizedKToCache)
+{
+    GraphConfig config = makeMoEConfig();
+    config.layer_types = {"full_attention", "gdn"};
+    config.partial_rotary_factor = 0.5f;
+    config.rope_on_read = true;
+
+    Qwen35MoEGraph graph_builder(config, nullptr);
+    TensorArena arena;
+    auto layer = makeFALayerWeights(arena, config);
+    auto buffers = makeFAActivationBuffers(arena, /*tokens=*/2, config);
+
+    MockMPIContext mpi_ctx;
+    llaminar::v2::kernels::KVCacheConfig kv_config;
+    kv_config.precision = ActivationPrecision::FP16;
+    kv_config.device = DeviceId::cpu();
+    kv_config.num_layers = 1;
+    kv_config.batch_size = 1;
+    kv_config.max_seq_len = 8;
+    kv_config.n_kv_heads = config.n_kv_heads;
+    kv_config.head_dim = config.head_dim;
+    kv_config.mpi_ctx = &mpi_ctx;
+    auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+    ASSERT_NE(kv_cache, nullptr);
+
+    ComputeGraph graph = graph_builder.buildAttentionGraph(
+        layer, buffers, /*layer_idx=*/0, /*seq_len=*/2, /*batch_size=*/1,
+        kv_cache.get(), /*position_ids=*/nullptr, DeviceId::cpu());
+
+    ASSERT_NE(graph.getNode("layer0_kv_append"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_rope"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_k_norm"), nullptr);
+
+    EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_k_norm"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_rope"))
+        << "rope_on_read stores pre-RoPE K, but it must still wait for K norm";
 }

@@ -578,6 +578,79 @@ TEST_F(Test__ROCmRoPEParity, RoPE_BF16_Small)
     EXPECT_LE(l2_error_k, 0.02);
 }
 
+TEST_F(Test__ROCmRoPEParity, RoPE_FP32_Qwen35LongPartialRotary)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int seq_len = 2048;
+    constexpr int n_heads = 16;
+    constexpr int n_kv_heads = 4;
+    constexpr int head_dim = 256;
+    constexpr int rotary_dim = 128;
+    constexpr float rope_theta = 1000000.0f;
+    const size_t total_q = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t total_k = static_cast<size_t>(seq_len) * n_kv_heads * head_dim;
+
+    // Qwen3.5 FA layers use a 256-wide physical head with only the first 128
+    // channels rotated, so this catches long-position partial-RoPE regressions.
+    auto q_data = randomFP32(total_q);
+    auto k_data = randomFP32(total_k);
+
+    std::vector<int> position_ids(seq_len);
+    for (int i = 0; i < seq_len; ++i)
+        position_ids[static_cast<size_t>(i)] = i;
+
+    std::vector<float> cpu_q = q_data;
+    std::vector<float> cpu_k = k_data;
+    std::vector<float> rocm_q = q_data;
+    std::vector<float> rocm_k = k_data;
+
+    CPURoPEKernelT<ActivationPrecision::FP32> cpu_kernel;
+    ASSERT_TRUE(cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
+                                       seq_len, n_heads, n_kv_heads, head_dim,
+                                       rope_theta, -1, rotary_dim));
+
+    rocm::ROCmRoPEKernelT<ActivationPrecision::FP32> rocm_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), 16 * 1024 * 1024);
+    auto reqs = rocm_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    rocm_kernel.bindWorkspace(&workspace);
+
+    float *d_q = nullptr;
+    float *d_k = nullptr;
+    ASSERT_EQ(hipMalloc(&d_q, total_q * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_k, total_k * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_q, rocm_q.data(), total_q * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_k, rocm_k.data(), total_k * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+
+    ASSERT_TRUE(rocm_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len, n_heads, n_kv_heads,
+                                        head_dim, rope_theta, 0, rotary_dim));
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    ASSERT_EQ(hipMemcpy(rocm_q.data(), d_q, total_q * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipMemcpy(rocm_k.data(), d_k, total_k * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+    hipFree(d_q);
+    hipFree(d_k);
+
+    ASSERT_FALSE(hasNaNOrInf(rocm_q.data(), total_q)) << "ROCm Q output contains NaN/Inf";
+    ASSERT_FALSE(hasNaNOrInf(rocm_k.data(), total_k)) << "ROCm K output contains NaN/Inf";
+
+    const double cosine_q = cosineSimilarity(rocm_q.data(), cpu_q.data(), total_q);
+    const double l2_error_q = relativeL2Error(rocm_q.data(), cpu_q.data(), total_q);
+    const double cosine_k = cosineSimilarity(rocm_k.data(), cpu_k.data(), total_k);
+    const double l2_error_k = relativeL2Error(rocm_k.data(), cpu_k.data(), total_k);
+
+    std::cout << "  RoPE FP32 Qwen3.5 partial Q: cosine=" << cosine_q
+              << ", L2_error=" << l2_error_q << std::endl;
+    std::cout << "  RoPE FP32 Qwen3.5 partial K: cosine=" << cosine_k
+              << ", L2_error=" << l2_error_k << std::endl;
+
+    EXPECT_GE(cosine_q, 0.9999);
+    EXPECT_GE(cosine_k, 0.9999);
+    EXPECT_LE(l2_error_q, 0.01);
+    EXPECT_LE(l2_error_k, 0.01);
+}
+
 TEST_F(Test__ROCmRoPEParity, RoPE_FP32_RealQwen2Layer3ProjectionInputs)
 {
     SKIP_IF_NO_ROCM();

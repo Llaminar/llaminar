@@ -92,12 +92,19 @@ namespace
     class StubGDNKernel : public ITensorGatedDeltaNet
     {
     public:
-        explicit StubGDNKernel(bool state_ready, int state_size = 0)
-            : state_ready_(state_ready), state_size_(state_size) {}
+        explicit StubGDNKernel(bool state_ready, int state_size = 0, bool supports_padded_real_length = true)
+            : state_ready_(state_ready),
+              state_size_(state_size),
+              supports_padded_real_length_(supports_padded_real_length) {}
 
         bool isGPUStateReady(int required_state_size) const override
         {
             return state_ready_ && (state_size_ == required_state_size);
+        }
+
+        bool supportsPaddedPrefillRealLength() const override
+        {
+            return supports_padded_real_length_;
         }
 
         bool chunk_forward(
@@ -123,6 +130,7 @@ namespace
     private:
         bool state_ready_;
         int state_size_;
+        bool supports_padded_real_length_;
     };
 
     // =========================================================================
@@ -897,6 +905,67 @@ TEST_F(GDNPrefillGraphCapture, PrefillCapturableWhenGPUStateReady)
         << "GDN prefill should be capturable when GPU state is ready";
 #else
     EXPECT_FALSE(stage.isGraphCapturable());
+#endif
+}
+
+TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightAllowsROCmWhenRealLengthKernelReadyButStateIsNot)
+{
+    StubGDNKernel not_ready_kernel(false, 0, true);
+    auto params = makeValidPrefillParams(&not_ready_kernel);
+    GDNRecurrenceStage stage(params);
+
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.supportsPaddedPrefillRealLengthContract());
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "Cold padded preflight should validate ROCm GDN support without requiring warmed GPU state";
+#else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+#endif
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "Actual graph capture must still wait for warmup to allocate GPU recurrence state";
+}
+
+TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightRejectsKernelWithoutRealLengthContract)
+{
+    const int required_state_size = N_HEADS * D_K * D_V;
+    StubGDNKernel unsupported_kernel(true, required_state_size, false);
+    auto params = makeValidPrefillParams(&unsupported_kernel);
+    GDNRecurrenceStage stage(params);
+
+    EXPECT_FALSE(stage.supportsPaddedPrefillRealLengthContract());
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "Padded bucket GDN preflight must reject kernels that cannot commit only the real prompt prefix";
+}
+
+TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightRejectsNullKernel)
+{
+    auto params = makeValidPrefillParams(nullptr);
+    GDNRecurrenceStage stage(params);
+
+    EXPECT_FALSE(stage.supportsPaddedPrefillRealLengthContract());
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "GDN padded preflight needs an explicit backend real-length contract";
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "GDN prefill should reject when kernel is null";
+}
+
+TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightRejectsCPUAndCUDA)
+{
+    const int required_state_size = N_HEADS * D_K * D_V;
+    StubGDNKernel ready_kernel(true, required_state_size, true);
+
+    auto cpu_params = makeValidPrefillParams(&ready_kernel);
+    cpu_params.device_id = DeviceId::cpu();
+    GDNRecurrenceStage cpu_stage(cpu_params);
+    EXPECT_FALSE(cpu_stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "CPU GDN real-length execution does not imply GPU graph prefill support";
+
+#ifdef HAVE_CUDA
+    auto cuda_params = makeValidPrefillParams(&ready_kernel);
+    cuda_params.device_id = DeviceId::cuda(0);
+    GDNRecurrenceStage cuda_stage(cuda_params);
+    EXPECT_FALSE(cuda_stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "CUDA GDN prefill graph support remains disabled until explicitly implemented";
 #endif
 }
 

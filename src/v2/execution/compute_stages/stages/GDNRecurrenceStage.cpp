@@ -164,6 +164,21 @@ namespace llaminar2
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
     }
 
+    bool GDNRecurrenceStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        if (params_.seq_len == 1)
+            return isGraphCapturable();
+
+#if !defined(HAVE_ROCM)
+        return false;
+#else
+        return params_.seq_len > 1 &&
+               params_.device_id.is_rocm() &&
+               params_.kernel &&
+               params_.kernel->supportsPaddedPrefillRealLength();
+#endif
+    }
+
     bool GDNRecurrenceStage::ensureGpuEffectiveSeqLenStateInitialized()
     {
         if (gpu_effective_seq_len_state_)

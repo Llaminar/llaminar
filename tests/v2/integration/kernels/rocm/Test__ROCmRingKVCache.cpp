@@ -643,6 +643,115 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP16)
     LOG_INFO("[BasicAppendRetrieve_FP16] PASSED");
 }
 
+TEST(Test__ROCmRingKVCache, FP16RoPEOnRead_Qwen35LongPartialRotary)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 1024;
+    const int num_tokens = 1024;
+    const int n_kv_heads = 4;
+    const int head_dim = 256;
+    const int rope_dim = 128;
+    const int half_rope = rope_dim / 2;
+    const int kv_dim = n_kv_heads * head_dim;
+    const float rope_theta = 1000000.0f;
+    const size_t total = static_cast<size_t>(num_tokens) * kv_dim;
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP16>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+
+    auto h_K_fp32 = generateRandomFP32(total, 3551);
+    auto h_V_fp32 = generateRandomFP32(total, 3552);
+    std::vector<_Float16> h_K(total);
+    std::vector<_Float16> h_V(total);
+    for (size_t i = 0; i < total; ++i)
+    {
+        h_K[i] = static_cast<_Float16>(h_K_fp32[i]);
+        h_V[i] = static_cast<_Float16>(h_V_fp32[i]);
+    }
+
+    std::vector<float> expected_K(total);
+    std::vector<float> expected_V(total);
+    for (int pos = 0; pos < num_tokens; ++pos)
+    {
+        for (int head = 0; head < n_kv_heads; ++head)
+        {
+            const size_t base = (static_cast<size_t>(pos) * n_kv_heads + head) * head_dim;
+            for (int dim = 0; dim < head_dim; ++dim)
+            {
+                expected_K[base + dim] = static_cast<float>(h_K[base + dim]);
+                expected_V[base + dim] = static_cast<float>(h_V[base + dim]);
+            }
+            for (int pair = 0; pair < half_rope; ++pair)
+            {
+                const float freq = 1.0f / std::pow(rope_theta,
+                                                   static_cast<float>(2 * pair) / static_cast<float>(rope_dim));
+                const float angle = static_cast<float>(pos) * freq;
+                const float cos_val = std::cos(angle);
+                const float sin_val = std::sin(angle);
+                const size_t idx0 = base + static_cast<size_t>(pair);
+                const size_t idx1 = base + static_cast<size_t>(pair + half_rope);
+                const float x = static_cast<float>(h_K[idx0]);
+                const float y = static_cast<float>(h_K[idx1]);
+                expected_K[idx0] = static_cast<float>(static_cast<_Float16>(x * cos_val - y * sin_val));
+                expected_K[idx1] = static_cast<float>(static_cast<_Float16>(x * sin_val + y * cos_val));
+            }
+        }
+    }
+
+    _Float16 *d_K = nullptr;
+    _Float16 *d_V = nullptr;
+    ASSERT_EQ(hipMalloc(&d_K, total * sizeof(_Float16)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_V, total * sizeof(_Float16)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_K, h_K.data(), total * sizeof(_Float16), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_V, h_V.data(), total * sizeof(_Float16), hipMemcpyHostToDevice), hipSuccess);
+
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
+
+    IKVCache::KVReadParams rope_params;
+    rope_params.rope_theta = rope_theta;
+    rope_params.position_start = 0;
+    rope_params.n_kv_heads = n_kv_heads;
+    rope_params.head_dim = head_dim;
+    rope_params.rope_dim = rope_dim;
+
+    ITensor *out_k = nullptr;
+    ITensor *out_v = nullptr;
+    int kv_len = 0;
+    ASSERT_TRUE(cache->get_kv_converted(0, 0, ActivationPrecision::FP16,
+                                        &out_k, &out_v, &kv_len, &rope_params));
+    ASSERT_EQ(kv_len, num_tokens);
+    ASSERT_NE(out_k, nullptr);
+    ASSERT_NE(out_v, nullptr);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    std::vector<_Float16> actual_K(total);
+    std::vector<_Float16> actual_V(total);
+    ASSERT_EQ(hipMemcpy(actual_K.data(), out_k->gpu_data_ptr(), total * sizeof(_Float16), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipMemcpy(actual_V.data(), out_v->gpu_data_ptr(), total * sizeof(_Float16), hipMemcpyDeviceToHost), hipSuccess);
+
+    float max_k_error = 0.0f;
+    float max_v_error = 0.0f;
+    for (size_t i = 0; i < total; ++i)
+    {
+        max_k_error = std::max(max_k_error, std::abs(static_cast<float>(actual_K[i]) - expected_K[i]));
+        max_v_error = std::max(max_v_error, std::abs(static_cast<float>(actual_V[i]) - expected_V[i]));
+    }
+
+    hipFree(d_K);
+    hipFree(d_V);
+
+    EXPECT_LE(max_k_error, 0.01f) << "RoPE-on-read K mismatch";
+    EXPECT_LE(max_v_error, 0.0f) << "RoPE-on-read should not alter V";
+}
+
 // =============================================================================
 // Test: Linearization Statistics
 // =============================================================================

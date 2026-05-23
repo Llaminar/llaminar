@@ -389,17 +389,23 @@ def build_needle_prompt(
         "middle": "middle",
         "end": "omega",
     }
+    target_value_by_placement = {
+        "beginning": "LCJSON-ALPHA-314159",
+        "middle": "LCJSON-MIDDLE-271828",
+        "end": "LCJSON-OMEGA-161803",
+    }
     target_key = target_key_by_placement[placement]
+    target_value = target_value_by_placement[placement]
 
     records: list[str] = []
     codes: list[str] = []
     for index in range(count):
-        code = deterministic_code(namespace, index)
+        code = target_value if index == target_index else deterministic_code(namespace, index)
         codes.append(code)
         if index == target_index:
             records.append(
-                f"Ledger item {index:04d}: sentinel {target_key} has exact value \"{code}\". "
-                "This is the only requested sentinel."
+                f"Ledger item {index:04d}: REQUIRED_JSON_FIELD {target_key} has exact value {code}. "
+                "This is the only requested field."
             )
         else:
             records.append(make_audit_record(index, code, namespace))
@@ -412,22 +418,28 @@ def build_needle_prompt(
 
     user_prompt = "\n".join(
         [
-            "The following ledger contains many filler facts plus one requested sentinel value.",
-            f"Only the sentinel named {target_key} matters for the final answer.",
-            'Return exactly one minified JSON object with this shape: {"answer":"VALUE_FROM_RECORD"}.',
+            "Task: read the ledger and return one minified JSON object.",
+            "The only allowed key is answer.",
+            f"Only the REQUIRED_JSON_FIELD named {target_key} matters for the final answer.",
             *records,
-            f"Question: Return the JSON answer for sentinel {target_key}.",
+            "Return exactly one minified JSON object and no prose.",
+            'The object shape is {"answer":"VALUE_FROM_LEDGER"}.',
+            f"Use the exact REQUIRED_JSON_FIELD value for {target_key} from the ledger.",
         ]
     )
     messages = [
-        {"role": "system", "content": "You are an exact lookup engine. Output JSON only."},
+        {"role": "system", "content": "You are a strict JSON renderer. Output JSON only."},
         {"role": "user", "content": user_prompt},
     ]
     return messages, codes[target_index], distractors, count
 
 
+def needle_max_tokens(long_max_tokens: int) -> int:
+    return min(128, max(64, long_max_tokens // 2))
+
+
 def run_needle_check(args: argparse.Namespace, placement: str) -> str:
-    max_tokens = min(32, max(8, args.long_max_tokens // 8))
+    max_tokens = needle_max_tokens(args.long_max_tokens)
     messages, target_code, distractors, count = build_needle_prompt(
         placement,
         args.min_prompt_tokens,
@@ -823,7 +835,7 @@ def run_oversized_boundary(args: argparse.Namespace) -> str:
 def expected_sentinels(args: argparse.Namespace, settings: TierSettings) -> list[str]:
     sentinels: list[str] = []
     for placement in ("beginning", "middle", "end"):
-        max_tokens = min(32, max(8, args.long_max_tokens // 8))
+        max_tokens = needle_max_tokens(args.long_max_tokens)
         _, target, distractors, _ = build_needle_prompt(
             placement,
             args.min_prompt_tokens,

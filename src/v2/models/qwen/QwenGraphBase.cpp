@@ -2380,10 +2380,10 @@ namespace llaminar2
                           }),
                           device);
 
-            if (!config_.rope_on_read)
-                graph.addDependency(prefix + "kv_append", rope_dependency);
-            else if (has_qkv_proj)
-                graph.addDependency(prefix + "kv_append", prefix + "qkv_proj");
+            // In rope-on-read mode the RoPE stage skips K mutation, but it still
+            // carries the Q/K norm dependencies. Appending directly after QKV GEMM
+            // can cache pre-normalized K on Qwen3.5 FA layers.
+            graph.addDependency(prefix + "kv_append", rope_dependency);
         }
 
         // --- Determine K/V source for attention ---
