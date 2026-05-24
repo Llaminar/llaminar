@@ -95,6 +95,16 @@ namespace llaminar2
             }
         }
 
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            if (cached_kernel_)
+            {
+                cached_kernel_->resetDynamicState();
+                cached_kernel_->setGPUStream(nullptr);
+            }
+        }
+
         /// Check if this stage is ready for prefill graph capture.
         /// Requires: GPU device, workspace bound, kernel created.
         bool isPrefillGraphCaptureReady() const

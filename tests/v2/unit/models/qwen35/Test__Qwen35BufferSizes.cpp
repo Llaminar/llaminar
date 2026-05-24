@@ -65,8 +65,8 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    // Qwen3.5 has 19 layer buffers (no conditional precision buffers)
-    EXPECT_EQ(reqs.buffers.size(), 19u) << "Expected 19 layer buffers";
+    // Qwen3.5 has 20 layer buffers, including the stable LM-head input row.
+    EXPECT_EQ(reqs.buffers.size(), 20u) << "Expected 20 layer buffers";
 
     // ── Shared buffers ──
 
@@ -210,6 +210,13 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     ASSERT_EQ(ws_mask->shape.size(), 2u);
     EXPECT_EQ(ws_mask->shape[0], 4096u);
     EXPECT_EQ(ws_mask->shape[1], 4096u);
+
+    // lm_head_input_row: [1, d_model] = [1, 2560]
+    auto *lm_head_input_row = findBuf(reqs, "lm_head_input_row");
+    ASSERT_NE(lm_head_input_row, nullptr);
+    ASSERT_EQ(lm_head_input_row->shape.size(), 2u);
+    EXPECT_EQ(lm_head_input_row->shape[0], 1u);
+    EXPECT_EQ(lm_head_input_row->shape[1], 2560u);
 }
 
 // ============================================================================
@@ -297,9 +304,9 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     config.head_dim = 256;
     config.seq_len = 4096;
     config.batch_size = 1;
-    config.local_n_heads = 8;      // 16/2
-    config.local_n_kv_heads = 2;   // 4/2
-    config.local_d_ff = 4608;      // 9216/2
+    config.local_n_heads = 8;    // 16/2
+    config.local_n_kv_heads = 2; // 4/2
+    config.local_d_ff = 4608;    // 9216/2
 
     // GDN formulas under TP=2 (n_k=8, n_v=16, d_k=128)
     // key_dim = 8*128 = 1024
@@ -315,7 +322,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    EXPECT_EQ(reqs.buffers.size(), 19u);
+    EXPECT_EQ(reqs.buffers.size(), 20u);
 
     // Q: [4096, 8*256=2048] under TP=2
     auto *Q = findBuf(reqs, "Q");
@@ -346,4 +353,9 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     auto *ws_scores = findBuf(reqs, "workspace_scores");
     ASSERT_NE(ws_scores, nullptr);
     EXPECT_EQ(ws_scores->shape[0], 32768u);
+
+    auto *lm_head_input_row = findBuf(reqs, "lm_head_input_row");
+    ASSERT_NE(lm_head_input_row, nullptr);
+    EXPECT_EQ(lm_head_input_row->shape[0], 1u);
+    EXPECT_EQ(lm_head_input_row->shape[1], 2560u);
 }

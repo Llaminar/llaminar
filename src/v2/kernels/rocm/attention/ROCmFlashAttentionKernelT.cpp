@@ -19,6 +19,7 @@
 #include "../../../utils/ROCmKernelProfiler.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -117,6 +118,12 @@ namespace llaminar2
     {
         // Default number of splits for Flash Decoding
         constexpr int DEFAULT_NUM_SPLITS = 8;
+
+        bool attentionEnvFlag(const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value && std::atoi(value) != 0;
+        }
 
         // =====================================================================
         // FP32 Specialization Implementation
@@ -250,6 +257,35 @@ namespace llaminar2
             partial_m_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_M);
             partial_l_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_L);
             max_splits_ = num_splits;
+
+            const size_t required_partial_output =
+                static_cast<size_t>(std::max(1, n_heads)) *
+                static_cast<size_t>(std::max(1, num_splits)) *
+                static_cast<size_t>(std::max(1, head_dim)) * sizeof(float);
+            const size_t required_partial_meta =
+                static_cast<size_t>(std::max(1, n_heads)) *
+                static_cast<size_t>(std::max(1, num_splits)) * sizeof(float);
+            if (workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_OUTPUT) < required_partial_output ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_M) < required_partial_meta ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_L) < required_partial_meta)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Bound attention workspace is too small: "
+                          << "required partial_output=" << required_partial_output
+                          << " partial_m/l=" << required_partial_meta
+                          << " bytes for n_heads=" << n_heads
+                          << " head_dim=" << head_dim
+                          << " num_splits=" << num_splits
+                          << "; available partial_output="
+                          << workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_OUTPUT)
+                          << " partial_m="
+                          << workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_M)
+                          << " partial_l="
+                          << workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_L));
+                partial_output_buf_ = nullptr;
+                partial_m_buf_ = nullptr;
+                partial_l_buf_ = nullptr;
+                return;
+            }
 
             LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Using managed workspace buffers");
         }
@@ -395,8 +431,11 @@ namespace llaminar2
 
             int result;
 
-            // Choose algorithm based on seq_len
-            if (seq_len == 1)
+            // Choose algorithm based on seq_len. Split-K flash decode remains
+            // the default decode path; LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL is
+            // an explicit diagnostic/reference mode only.
+            const bool decode_via_prefill = attentionEnvFlag("LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL");
+            if (seq_len == 1 && !decode_via_prefill)
             {
                 // Flash Decoding for single-token decode
                 int num_splits = DEFAULT_NUM_SPLITS;
@@ -433,7 +472,9 @@ namespace llaminar2
             }
             else
             {
-                // Flash Attention 2 for prefill
+                // Flash Attention 2 for prefill. When explicitly requested via
+                // LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL=1, this branch is also a
+                // diagnostic/reference path for single-token decode.
                 LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Using Flash Attention 2 (MI50): "
                           << "batch=" << batch_size << " seq_len=" << seq_len << " kv_len=" << kv_len);
 
@@ -527,9 +568,14 @@ namespace llaminar2
             const float *V_ptr = static_cast<const float *>(V->gpu_data_ptr());
             float *O_ptr = static_cast<float *>(output->gpu_data_ptr());
 
-            // Track whether native KV dispatch is possible (FP16/Q8_1 → no conversion)
+            // Track whether native KV dispatch is possible (FP16/Q8_1 → no conversion).
+            // LLAMINAR_ROCM_FA_DISABLE_NATIVE_KV is a diagnostic escape hatch for
+            // long-context decode parity triage: it forces the existing FP32
+            // conversion path so native FP16/Q8_1 flash decode can be isolated.
             bool use_native_kv = false;
             TensorType kv_native_type = TensorType::FP32;
+            const bool disable_native_kv = attentionEnvFlag("LLAMINAR_ROCM_FA_DISABLE_NATIVE_KV");
+            const bool decode_via_prefill = attentionEnvFlag("LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL");
 
             if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32)
             {
@@ -544,7 +590,8 @@ namespace llaminar2
 
                 // For prefill (head_dim >= 64) or decode, dispatch to
                 // native FP16/Q8_1 kernel — eliminates FP32 conversion pipeline entirely
-                if (head_dim >= 64 &&
+                if (!disable_native_kv &&
+                    head_dim >= 64 &&
                     (kv_native_type == TensorType::FP16 ||
                      (kv_native_type == TensorType::Q8_1 && head_dim % 32 == 0)))
                 {
@@ -677,12 +724,13 @@ namespace llaminar2
                 if (hipFlashAttn_setDevice(dev) != 0)
                 {
                     LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
-                              "Failed to set device " << dev << " for native KV dispatch");
+                              "Failed to set device "
+                              << dev << " for native KV dispatch");
                     return false;
                 }
 
                 int result;
-                if (seq_len == 1)
+                if (seq_len == 1 && !decode_via_prefill)
                 {
                     // Flash Decoding with native KV cache
                     int num_splits = DEFAULT_NUM_SPLITS;
@@ -732,7 +780,10 @@ namespace llaminar2
                 }
                 else
                 {
-                    // Prefill with native KV
+                    // Prefill with native KV. With
+                    // LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL=1, this path is also
+                    // an explicit diagnostic/reference path for single-token
+                    // decode.
                     ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::FLASH_ATTN_PREFILL,
                                                      static_cast<hipStream_t>(stream_));
                     if (kv_native_type == TensorType::FP16)

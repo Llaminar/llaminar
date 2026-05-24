@@ -15,6 +15,7 @@
 #include "../../../kernels/cpu/rotation/ActivationRotation.h"
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
+#include <algorithm>
 #include <limits>
 #include <fstream>
 #include <filesystem>
@@ -78,6 +79,31 @@ namespace llaminar2
             return nullptr;
         }
         return dynamic_cast<IWorkspaceConsumer *>(kernel);
+    }
+
+    WorkspaceRequirements AttentionComputeStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        auto *self = const_cast<AttentionComputeStage *>(this);
+        auto *consumer = self->getKernelAsWorkspaceConsumer();
+        if (!consumer)
+        {
+            LOG_TRACE("[AttentionComputeStage] No attention kernel available for workspace requirements");
+            return WorkspaceRequirements{};
+        }
+
+        // The generic workspace allocator only has model-level sizing hints.
+        // Qwen3.5 MoE uses local/tensor-parallel attention dimensions that can
+        // differ from those hints.  Size attention scratch from the stage's
+        // actual runtime shape so split-decode partial buffers cannot be
+        // undersized and overlap PARTIAL_M/PARTIAL_L.
+        const int workspace_batch = std::max({1, m, params_.batch_size});
+        const int workspace_heads = std::max(n, params_.n_heads);
+        const int workspace_head_dim = std::max(k, params_.head_dim);
+
+        return consumer->getWorkspaceRequirements(
+            workspace_batch,
+            workspace_heads,
+            workspace_head_dim);
     }
 
     bool AttentionComputeStage::execute(IDeviceContext *ctx)
@@ -216,6 +242,7 @@ namespace llaminar2
                         read_params.n_kv_heads = params_.n_kv_heads;
                         read_params.head_dim = params_.head_dim;
                         read_params.turboquant_ctx = params_.turboquant_ctx;
+                        read_params.gpu_stream = gpuStream();
 
                         int kv_len_out = 0;
                         if (params_.kv_cache->get_kv_converted(
@@ -295,6 +322,7 @@ namespace llaminar2
                         read_params.n_kv_heads = params_.n_kv_heads;
                         read_params.head_dim = params_.head_dim;
                         read_params.turboquant_ctx = params_.turboquant_ctx;
+                        read_params.gpu_stream = gpuStream();
 
                         int kv_len_out = 0;
                         if (params_.kv_cache->get_kv_converted(

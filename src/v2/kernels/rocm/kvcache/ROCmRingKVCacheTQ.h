@@ -135,6 +135,7 @@ namespace llaminar2
         {
             (void)seq_idx;
             layer_scratch_[layer].invalidate();
+            cached_stream_ = nullptr;
         }
         void onAdvanceComplete(int layer, int seq_idx) override
         {
@@ -225,7 +226,7 @@ namespace llaminar2
         HIPTQDequantDynamicParams *d_dequant_params_ = nullptr; ///< Device array [n_layers_]
         HIPTQDequantDynamicParams *h_dequant_params_ = nullptr; ///< Pinned host array [n_layers_]
 
-        mutable hipStream_t cached_stream_ = nullptr; ///< Stream from last append(), reused in get_kv_converted()
+        mutable hipStream_t cached_stream_ = nullptr; ///< Legacy fallback when callers omit KVReadParams::gpu_stream.
     };
 
 } // namespace llaminar2

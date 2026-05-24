@@ -73,7 +73,9 @@ namespace llaminar2
         // ----- Workspace -----
 
         /** Ensure GPU workspace is allocated for GEMM kernels in the graph. */
-        virtual bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) = 0;
+        virtual bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &graph,
+            int workspace_seq_len = 0) = 0;
 
         /**
          * @brief Called once after the first graph build completes and workspace
@@ -242,17 +244,17 @@ namespace llaminar2
         void clearCache();
 
         /**
-         * @brief Reset GPU graph replay state without discarding cached forward graphs.
+         * @brief Reset request/replay state without discarding cached forward graphs.
          *
          * Used at request/session boundaries after the orchestrator clears KV and
          * model recurrent state. Keeping the ComputeGraph avoids weight re-coherence;
-         * resetting captured graph segments ensures the next decode replay lifecycle
-         * starts from the newly cleared session state.
+         * resetting stage dynamic state and captured graph segments ensures the
+         * next prompt starts from the newly cleared session state.
          */
         void resetSessionReplayState()
         {
             for (auto &entry : cache_)
-                entry.second.resetReplayState();
+                entry.second.resetSessionState();
         }
 
         /** Check if cache is empty. */

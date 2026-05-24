@@ -164,7 +164,7 @@ namespace llaminar2
 
         hipSetDevice(device_id_);
         const auto hip_stream = static_cast<hipStream_t>(stream);
-        cached_stream_ = hip_stream; // Cache for get_kv_converted()
+        cached_stream_ = hip_stream; // Legacy fallback; graph stages pass streams explicitly via KVReadParams.
         auto &entry = entries_[layer][seq_idx];
         const bool capture_active = isGraphCaptureActive();
 
@@ -528,7 +528,10 @@ namespace llaminar2
 
         const float rope_theta = (rope && rope->rope_theta > 0.0f) ? rope->rope_theta : 0.0f;
         const int position_start = (rope && rope_theta > 0.0f) ? rope->position_start : 0;
-        bool ok = dequant_to_scratch(layer, seq_idx, rope_theta, position_start, cached_stream_);
+        hipStream_t stream = (rope && rope->gpu_stream)
+                                 ? static_cast<hipStream_t>(rope->gpu_stream)
+                                 : cached_stream_;
+        bool ok = dequant_to_scratch(layer, seq_idx, rope_theta, position_start, stream);
         if (!ok)
             return false;
 

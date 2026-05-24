@@ -65,7 +65,7 @@ namespace llaminar2
         SnapshotsActive,        ///< ENABLE_PIPELINE_SNAPSHOTS build
         ActiveMoERebalancing,   ///< Rebalance mode is DYNAMIC or OBSERVE
         CollectiveNodesPresent, ///< Graph has TP/PP collective stages
-        StageNotCapturable,     ///< One or more stages fail graph-capture support/readiness checks
+        StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
         GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
         NoGPUContext,           ///< GPU context unavailable
         InvalidatedByPlacement  ///< Expert placement mutation since last capture
@@ -77,12 +77,12 @@ namespace llaminar2
     /// Configuration for prefill graph cache behavior.
     struct PrefillGraphConfig
     {
-        bool enabled = true;            ///< LLAMINAR_GPU_GRAPHS master flag
-        int min_seq_len = 256;          ///< LLAMINAR_PREFILL_GRAPH_MIN_SEQ
-        bool trace = false;             ///< LLAMINAR_PREFILL_GRAPH_TRACE
-        bool buckets_enabled = false;   ///< LLAMINAR_PREFILL_GRAPH_BUCKETS
-        std::vector<int> bucket_sizes;  ///< LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES
-        size_t max_cached_entries = 10; ///< LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS
+        bool enabled = true;                 ///< LLAMINAR_GPU_GRAPHS master flag
+        int min_seq_len = 256;               ///< LLAMINAR_PREFILL_GRAPH_MIN_SEQ
+        bool trace = false;                  ///< LLAMINAR_PREFILL_GRAPH_TRACE
+        bool buckets_enabled = false;        ///< LLAMINAR_PREFILL_GRAPH_BUCKETS
+        std::vector<int> bucket_sizes;       ///< LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES
+        size_t max_cached_entries = 10;      ///< LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS
     };
 
     /// Per-entry state in the prefill graph cache.

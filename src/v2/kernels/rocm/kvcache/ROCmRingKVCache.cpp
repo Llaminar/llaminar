@@ -1834,7 +1834,8 @@ namespace llaminar2
         }
 
         hipSetDevice(device_id_);
-        const hipStream_t stream = getEffectiveStream(nullptr);
+        const hipStream_t stream = getEffectiveStream(
+            rope ? static_cast<hipStream_t>(rope->gpu_stream) : nullptr);
 
         ensureRoPEShadow(layer, seq_idx);
         auto &shadow = rope_shadows_[layer][seq_idx];

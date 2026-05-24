@@ -96,9 +96,12 @@ namespace
             (void)seq_idx;
             (void)K;
             (void)V;
-            cached_tokens_ += num_tokens;
+            if (!isGraphCaptureActive())
+                cached_tokens_ += num_tokens;
             return true;
         }
+
+        bool isGraphCaptureReady() const override { return true; }
 
         void advanceHead(int layer, int seq_idx, int num_tokens) override
         {
@@ -591,6 +594,63 @@ namespace
         EXPECT_EQ(kv_cache.advanceCalls(), 1);
         EXPECT_EQ(kv_cache.lastAdvanceTokens(), 4);
         EXPECT_EQ(kv_cache.get_cached_tokens(0), 4);
+    }
+
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_CaptureWithoutHostBookkeepingWaitsForReplay)
+    {
+        RecordingKVCache kv_cache;
+        auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4});
+        auto V = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4});
+
+        KVCacheAppendStage::Params kv_params{};
+        kv_params.device_id = DeviceId::cpu();
+        kv_params.kv_cache = &kv_cache;
+        kv_params.K = K.get();
+        kv_params.V = V.get();
+        kv_params.layer_idx = 0;
+        kv_params.seq_idx = 0;
+        kv_params.num_tokens = 2;
+
+        KVCacheAppendStage stage(kv_params);
+
+        {
+            GraphCaptureGuard guard;
+            ASSERT_TRUE(stage.execute(nullptr));
+        }
+
+        EXPECT_EQ(kv_cache.advanceCalls(), 0);
+        EXPECT_EQ(kv_cache.get_cached_tokens(0), 0)
+            << "plain capture (prefill-style) must rely on onGraphReplayed()";
+    }
+
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, KVCacheAppend_SegmentedCaptureHostBookkeepingAdvancesImmediately)
+    {
+        RecordingKVCache kv_cache;
+        auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4});
+        auto V = std::make_unique<FP32Tensor>(std::vector<size_t>{2, 4});
+
+        KVCacheAppendStage::Params kv_params{};
+        kv_params.device_id = DeviceId::cpu();
+        kv_params.kv_cache = &kv_cache;
+        kv_params.K = K.get();
+        kv_params.V = V.get();
+        kv_params.layer_idx = 0;
+        kv_params.seq_idx = 0;
+        kv_params.num_tokens = 2;
+
+        KVCacheAppendStage stage(kv_params);
+
+        {
+            GraphCaptureGuard guard(/*host_bookkeeping=*/true);
+            ASSERT_TRUE(stage.execute(nullptr));
+        }
+
+        EXPECT_EQ(kv_cache.advanceCalls(), 1);
+        EXPECT_EQ(kv_cache.lastLayer(), 0);
+        EXPECT_EQ(kv_cache.lastSeqIdx(), 0);
+        EXPECT_EQ(kv_cache.lastAdvanceTokens(), 2);
+        EXPECT_EQ(kv_cache.get_cached_tokens(0), 2)
+            << "segmented capture needs logical metadata before downstream captured attention";
     }
 
     TEST_F(Test__PrefillGraphCaptureDynamicParams, LMHead_ReplayUsesLastRealTokenForPaddedBucket)

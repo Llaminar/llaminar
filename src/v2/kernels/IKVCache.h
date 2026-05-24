@@ -463,6 +463,7 @@ namespace llaminar2
             int head_dim = 0;                                  ///< Dimension per attention head
             int rope_dim = 0;                                  ///< Number of dimensions to rotate per head (0 = full head_dim)
             const TurboQuantContext *turboquant_ctx = nullptr; ///< Required for TQ cache dequant (optional otherwise)
+            void *gpu_stream = nullptr;                        ///< Optional GPU stream for fused conversion/read kernels
         };
 
         /**

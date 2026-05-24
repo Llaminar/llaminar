@@ -3044,42 +3044,26 @@ namespace llaminar
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
 
-                // Reset embedding kernels (the primary holders of dynamic state)
-                for (auto &[key, kernel] : embedding_cache_)
+                auto reset_kernel_cache = [](auto &cache)
                 {
-                    if (kernel)
+                    for (auto &[_, kernel] : cache)
                     {
+                        if (!kernel)
+                            continue;
                         kernel->resetDynamicState();
+                        kernel->setGPUStream(nullptr);
                     }
-                }
+                };
 
-                // Reset attention kernels (may cache position-dependent state)
-                for (auto &[key, kernel] : attention_cache_)
-                {
-                    if (kernel)
-                    {
-                        kernel->resetDynamicState();
-                    }
-                }
-
-                // Reset RoPE kernels (position-dependent)
-                for (auto &[key, kernel] : rope_cache_)
-                {
-                    if (kernel)
-                    {
-                        kernel->resetDynamicState();
-                    }
-                }
-
-                // Reset MoE kernels' request-scoped host metadata while keeping
-                // device scratch addresses stable for captured prefill graphs.
-                for (auto &[key, kernel] : moe_cache_)
-                {
-                    if (kernel)
-                    {
-                        kernel->resetDynamicState();
-                    }
-                }
+                reset_kernel_cache(fused_gate_up_cache_);
+                reset_kernel_cache(rope_cache_);
+                reset_kernel_cache(rmsnorm_cache_);
+                reset_kernel_cache(swiglu_cache_);
+                reset_kernel_cache(softmax_cache_);
+                reset_kernel_cache(residual_add_cache_);
+                reset_kernel_cache(attention_cache_);
+                reset_kernel_cache(embedding_cache_);
+                reset_kernel_cache(moe_cache_);
 
 #if LLAMINAR_ASSERTIONS_ACTIVE
                 // Post-reset assertion: no kernel should retain stale dynamic state

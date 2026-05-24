@@ -101,6 +101,18 @@ namespace llaminar2
             /// Update the pos_offset in pinned host memory for graph replay
             void setDynamicPosOffset(int pos_offset) override;
 
+            /// @brief Drop request-scoped RoPE workspace state at a session boundary.
+            void resetDynamicState() override
+            {
+                inv_freq_initialized_ = false;
+                inv_freq_head_dim_ = 0;
+                inv_freq_theta_ = 0.0f;
+                if (h_device_params_)
+                {
+                    h_device_params_->pos_offset = 0;
+                }
+            }
+
             // ===== ITensorRoPE interface =====
 
             // ===== Tensor API (for RoPEStage) =====
@@ -228,6 +240,18 @@ namespace llaminar2
             /// Update the pos_offset in pinned host memory for graph replay
             void setDynamicPosOffset(int pos_offset) override;
 
+            /// @brief Drop request-scoped RoPE workspace state at a session boundary.
+            void resetDynamicState() override
+            {
+                inv_freq_initialized_ = false;
+                inv_freq_head_dim_ = 0;
+                inv_freq_theta_ = 0.0f;
+                if (h_device_params_)
+                {
+                    h_device_params_->pos_offset = 0;
+                }
+            }
+
             // ===== ITensorRoPE interface =====
 
             // ===== Tensor API (for RoPEStage) =====
@@ -331,6 +355,18 @@ namespace llaminar2
 
             /// Update the pos_offset in pinned host memory for graph replay
             void setDynamicPosOffset(int pos_offset) override;
+
+            /// @brief Drop request-scoped RoPE workspace state at a session boundary.
+            void resetDynamicState() override
+            {
+                inv_freq_initialized_ = false;
+                inv_freq_head_dim_ = 0;
+                inv_freq_theta_ = 0.0f;
+                if (h_device_params_)
+                {
+                    h_device_params_->pos_offset = 0;
+                }
+            }
 
             // ===== ITensorRoPE interface =====
 

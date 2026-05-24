@@ -159,6 +159,22 @@ namespace llaminar2
                 KVCacheProfiler::record(KVCacheOpType::APPEND, duration_ns, tokens, bytes);
             }
 
+            if (success &&
+                isGraphCaptureActive() &&
+                isGraphCaptureHostBookkeepingActive() &&
+                params_.kv_cache->isGraphCaptureReady())
+            {
+                // Segmented decode capture records GPU append kernels, but the
+                // immediate launch-after-capture deliberately skips
+                // onGraphReplayed(). Advance host metadata during recording so
+                // subsequent captured stages see the appended token in
+                // get_cached_tokens()/dynamic dequant params, matching normal
+                // execution. Prefill capture and collective Phase-2 capture keep
+                // this guard disabled and continue to use replay callbacks or
+                // real post-capture execution instead.
+                params_.kv_cache->advanceHead(params_.layer_idx, seq_idx, num_tokens);
+            }
+
             return success;
         };
 

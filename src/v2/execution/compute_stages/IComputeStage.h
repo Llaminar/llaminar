@@ -679,6 +679,21 @@ namespace llaminar2
         virtual bool hasDynamicParams() const { return false; }
 
         /**
+         * @brief Reset request-scoped stage state without discarding the graph.
+         *
+         * Cached ComputeGraphs persist across prompt boundaries, so any stage
+         * state that depends on the previous request must be cleared when the
+         * orchestrator runs clear_cache(). Topology, tensor bindings, workspace
+         * bindings, and model weights must remain intact so graph reuse still
+         * works. Derived stages should reset only dynamic host metadata and
+         * kernel stream bindings here.
+         */
+        virtual void resetSessionState()
+        {
+            gpu_stream_ = nullptr;
+        }
+
+        /**
          * @brief Update prefill replay bookkeeping before a captured graph launch.
          *
          * The executor calls this on cached prefill graph hits after normal

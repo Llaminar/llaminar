@@ -445,9 +445,10 @@ namespace
             return {{device_, ctx_}};
         }
 
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &) override
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
         {
             ++ensure_workspace_calls;
+            last_workspace_seq_len = workspace_seq_len;
             return true;
         }
 
@@ -496,6 +497,7 @@ namespace
         int get_context_calls = 0;
         int ensure_workspace_calls = 0;
         int sync_logits_calls = 0;
+        int last_workspace_seq_len = -1;
         int last_build_seq_len = 0;
         int last_build_bucket_seq_len = 0;
         int last_build_real_seq_len = 0;
@@ -670,6 +672,7 @@ namespace
         EXPECT_EQ(host_->last_build_seq_len, kExactBucketSeqLen);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen);
         EXPECT_EQ(host_->last_build_bucket_seq_len, kExactBucketSeqLen);
+        EXPECT_EQ(host_->last_workspace_seq_len, kExactBucketSeqLen);
         expectProbeOutputMatches(*host_, kExactBucketSeqLen);
 
         auto after_build = engine_->prefillGraphCacheSnapshot(signature, key);
@@ -782,6 +785,7 @@ namespace
         EXPECT_EQ(host_->last_build_seq_len, kExactBucketSeqLen);
         EXPECT_EQ(host_->last_build_real_seq_len, kExactBucketSeqLen - 3);
         EXPECT_EQ(host_->last_build_bucket_seq_len, kExactBucketSeqLen);
+        EXPECT_EQ(host_->last_workspace_seq_len, kExactBucketSeqLen);
         ASSERT_NE(host_->rowSelectStage(), nullptr);
         ASSERT_NE(host_->kvAppendStage(), nullptr);
         EXPECT_EQ(host_->rowSelectStage()->selectedRowForTesting(), kExactBucketSeqLen - 4);

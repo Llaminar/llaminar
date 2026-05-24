@@ -109,6 +109,8 @@ namespace llaminar2
 
         explicit AttentionComputeStage(Params params);
 
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::ATTENTION; }
         size_t estimatedFlops() const override;
@@ -165,6 +167,17 @@ namespace llaminar2
                 params_.kv_cache->setDynamicDequantParams(
                     params_.layer_idx, 0, dequant_rope_theta,
                     0, gpuStream());
+            }
+        }
+
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            params_.position_offset = 0;
+            if (cached_kernel_)
+            {
+                cached_kernel_->resetDynamicState();
+                cached_kernel_->setGPUStream(nullptr);
             }
         }
 

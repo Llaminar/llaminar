@@ -108,6 +108,17 @@ namespace llaminar2
             }
         }
 
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            params_.pos_offset = 0;
+            if (cached_kernel_)
+            {
+                cached_kernel_->resetDynamicState();
+                cached_kernel_->setGPUStream(nullptr);
+            }
+        }
+
         const Params &getParams() const { return params_; }
 
         // IWorkspaceConsumerStage implementation

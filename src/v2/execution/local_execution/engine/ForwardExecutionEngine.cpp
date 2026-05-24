@@ -710,6 +710,32 @@ namespace llaminar2
             forward_cache.applied_stream = replay_stream;
         }
 
+        if (!is_decode && input.device.is_gpu())
+        {
+            IDeviceContext *prefill_ctx = host.getDeviceContext(input.device);
+            if (prefill_ctx && prefill_ctx->deviceId().is_gpu())
+            {
+                auto &pool = GPUDeviceContextPool::instance();
+                IWorkerGPUContext &gpu_ctx = pool.getContext(prefill_ctx->deviceId());
+                if (forward_cache.prefill_capture_stream.ensure(&gpu_ctx))
+                {
+                    void *prefill_stream = forward_cache.prefill_capture_stream.stream;
+                    if (prefill_stream && forward_cache.applied_stream != prefill_stream)
+                    {
+                        const auto &order = forward_cache.graph->getExecutionOrder();
+                        for (const auto &node_name : order)
+                        {
+                            ComputeNode *node = forward_cache.graph->getNode(node_name);
+                            if (node && node->stage)
+                                node->stage->setGPUStream(prefill_stream);
+                        }
+                        forward_cache.gpu_stream_applied = true;
+                        forward_cache.applied_stream = prefill_stream;
+                    }
+                }
+            }
+        }
+
         // Update position-dependent params using cached stage pointers.
         // Only ~4 stages override updateDynamicParams() — avoids iterating
         // all ~339 stages with hash lookups on every decode step.
@@ -1252,8 +1278,11 @@ namespace llaminar2
             updatePrefillReplayParamStages(effective_input, prefill_replay_param_stages);
         }
 
-        // Ensure GPU workspace is allocated for GEMM kernels (lazy initialization)
-        host.ensureDeviceWorkspaceAllocated(graph);
+        // Ensure GPU workspace is allocated for the current execution shape.
+        // Bucketed prefill graphs can be much smaller than the configured
+        // context limit, so sizing GEMM scratch to the active bucket avoids
+        // retaining 4k-only workspace during 1k/1.5k captures.
+        host.ensureDeviceWorkspaceAllocated(graph, effective_input.seq_len);
 
         // Notify host that graph is ready — allows releasing transient resources
         // (e.g., mmap pages) before execution allocates large activation buffers.

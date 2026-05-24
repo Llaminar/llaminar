@@ -179,12 +179,12 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Initialized with dependencies, caching="
-                 << (cache_config_.enabled ? "enabled" : "disabled")
-                 << ", topology=" << (injected_topology_ ? "provided" : "none")
-                 << ", collective=" << (injected_collective_ctx_ ? "provided" : "none")
-                 << ", turboquant=" << (turboquant_ctx_ ? "provided" : "none")
-                 << ", pp_stage=" << (pp_stage_config_.has_value() ? "configured" : "none")
-                 << ", pipeline=" << (pipeline_config_ ? "provided" : "none"));
+                  << (cache_config_.enabled ? "enabled" : "disabled")
+                  << ", topology=" << (injected_topology_ ? "provided" : "none")
+                  << ", collective=" << (injected_collective_ctx_ ? "provided" : "none")
+                  << ", turboquant=" << (turboquant_ctx_ ? "provided" : "none")
+                  << ", pp_stage=" << (pp_stage_config_.has_value() ? "configured" : "none")
+                  << ", pipeline=" << (pipeline_config_ ? "provided" : "none"));
     }
 
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(
@@ -209,7 +209,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Initialized with graph builder, caching="
-                 << (cache_config_.enabled ? "enabled" : "disabled"));
+                  << (cache_config_.enabled ? "enabled" : "disabled"));
     }
 
     DeviceGraphOrchestrator::~DeviceGraphOrchestrator() = default;
@@ -620,8 +620,8 @@ namespace llaminar2
         auto [original, optimized] = BufferAllocator::estimateMemorySavings(schema, resolver_config);
         double savings = (original > 0) ? 100.0 * (original - optimized) / original : 0.0;
         LOG_DEBUG("[DeviceGraphOrchestrator] Theoretical aliasing savings: "
-                 << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
-                 << " (" << savings << "% reduction)");
+                  << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
+                  << " (" << savings << "% reduction)");
 
         return true;
     }
@@ -813,9 +813,9 @@ namespace llaminar2
             if (summary_store)
             {
                 LOG_DEBUG("[DGO] Released raw expert weights after eager graph build across "
-                         << stage_count << " MoE stages: " << (total_freed >> 20)
-                         << " MB stage-owned + " << (cached_freed >> 20)
-                         << " MB WeightManager-cached freed");
+                          << stage_count << " MoE stages: " << (total_freed >> 20)
+                          << " MB stage-owned + " << (cached_freed >> 20)
+                          << " MB WeightManager-cached freed");
             }
             return result;
         };
@@ -1066,7 +1066,9 @@ namespace llaminar2
         return executor_.execute(graph, ctx);
     }
 
-    bool DeviceGraphOrchestrator::ensureDeviceWorkspaceAllocated(const ComputeGraph &graph)
+    bool DeviceGraphOrchestrator::ensureDeviceWorkspaceAllocated(
+        const ComputeGraph &graph,
+        int workspace_seq_len)
     {
         const auto &config = graph_builder_->config();
         if (!workspace_allocator_)
@@ -1075,7 +1077,8 @@ namespace llaminar2
         }
 
         WorkspaceSizingHints hints;
-        hints.max_seq_len = config.max_seq_len > 0 ? config.max_seq_len : 4096;
+        const int default_workspace_seq_len = config.max_seq_len > 0 ? config.max_seq_len : 4096;
+        hints.max_seq_len = workspace_seq_len > 0 ? workspace_seq_len : default_workspace_seq_len;
         hints.n_heads = config.n_heads > 0 ? config.n_heads : 128;
         hints.head_dim = config.d_model > 0 && config.n_heads > 0
                              ? config.d_model / config.n_heads
@@ -1515,7 +1518,7 @@ namespace llaminar2
                 invalidateGraphCache(-1);
             }
             LOG_DEBUG("[DeviceGraphOrchestrator] Graph caching "
-                     << (enabled ? "enabled" : "disabled"));
+                      << (enabled ? "enabled" : "disabled"));
         }
     }
 
@@ -1729,9 +1732,9 @@ namespace llaminar2
         state_.device_id = device;
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Inference state initialized from arena: "
-                 << "batch_size=" << batch_size
-                 << " max_seq_len=" << max_seq_len
-                 << " device=" << device.toString());
+                  << "batch_size=" << batch_size
+                  << " max_seq_len=" << max_seq_len
+                  << " device=" << device.toString());
         return true;
     }
 
@@ -2377,7 +2380,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DGO] Expert payload provider initialized and wired to "
-                 << wired << " MoE stages");
+                  << wired << " MoE stages");
     }
 
     void DeviceGraphOrchestrator::initializePreparedWeightStore(DeviceId device)
@@ -2530,8 +2533,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DGO] Prepared weight store initialized with "
-                 << prepared_weight_store_->size() << " entries for device " << device.toString()
-                 << " (new=" << registered << ")");
+                  << prepared_weight_store_->size() << " entries for device " << device.toString()
+                  << " (new=" << registered << ")");
         if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
             concrete_weight_manager->logHostMemorySummary("after base preparation");
 
@@ -2637,14 +2640,14 @@ namespace llaminar2
             stage->applyExpertMask(masks[layer]);
 
         LOG_DEBUG("[DGO] Applied expert masks to " << applied.load()
-                                                  << " MoEExpertComputeStages across " << masks.size() << " layers");
+                                                   << " MoEExpertComputeStages across " << masks.size() << " layers");
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double prep_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
         if (moe_rebalance_controller_)
             moe_rebalance_controller_->recordPrepDuration(prep_ms);
         LOG_DEBUG("[DGO] Expert mask application + engine prep took "
-                 << std::fixed << std::setprecision(1) << prep_ms << " ms");
+                  << std::fixed << std::setprecision(1) << prep_ms << " ms");
     }
 
     ReceivedWeightsMap DeviceGraphOrchestrator::collectExpertWeightsForMasks(
@@ -2705,7 +2708,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DGO] Set expert replica info (" << replicas.num_replicated
-                                                   << " replicas) on " << count << " MoE stages (socket " << socket_id << ")");
+                                                    << " replicas) on " << count << " MoE stages (socket " << socket_id << ")");
     }
 
     size_t DeviceGraphOrchestrator::releaseRawExpertWeights()
@@ -2732,7 +2735,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DGO] Released raw expert weights across " << stage_count
-                                                             << " MoE stages: " << (total_freed >> 20) << " MB freed");
+                                                              << " MoE stages: " << (total_freed >> 20) << " MB freed");
         if (summary_store)
             if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
                 concrete_weight_manager->logHostMemorySummary("after rebalance raw release");
@@ -2813,9 +2816,9 @@ namespace llaminar2
 
         const size_t stage_count = result.graph().size();
         LOG_DEBUG("[DGO] Eagerly materialized forward graph for "
-                 << (graph_builder_ ? graph_builder_->architectureName() : std::string("unknown"))
-                 << " shape=[batch=" << batch_size << ", seq=" << seq_len << "]"
-                 << " stages=" << stage_count);
+                  << (graph_builder_ ? graph_builder_->architectureName() : std::string("unknown"))
+                  << " shape=[batch=" << batch_size << ", seq=" << seq_len << "]"
+                  << " stages=" << stage_count);
         return true;
     }
 
@@ -2911,7 +2914,7 @@ namespace llaminar2
             return {};
 
         LOG_DEBUG("[DGO] Transferring " << replicas.num_replicated
-                                       << " replicated experts × " << num_layers << " layers via MPI");
+                                        << " replicated experts × " << num_layers << " layers via MPI");
 
         // Collect MoE stages by layer
         std::unordered_map<int, MoEExpertComputeStage *> moe_by_layer;
@@ -2966,8 +2969,8 @@ namespace llaminar2
         if (tp_config_)
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] TensorParallelConfig set: "
-                     << "world_size=" << tp_config_->worldSize()
-                     << ", proportional=" << (tp_config_->isProportional() ? "yes" : "no"));
+                      << "world_size=" << tp_config_->worldSize()
+                      << ", proportional=" << (tp_config_->isProportional() ? "yes" : "no"));
 
             // If we have a graph builder, propagate the config to it
             if (graph_builder_)
@@ -2994,10 +2997,10 @@ namespace llaminar2
         if (domain_config_)
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] MultiDomainTPConfig set: "
-                     << "domains=" << domain_config_->domains().size()
-                     << ", has_gpu=" << (domain_config_->gpuDomain() ? "yes" : "no")
-                     << ", has_cpu=" << (domain_config_->cpuDomain() ? "yes" : "no")
-                     << ", cross_rank=" << (domain_config_->hasCrossRankTP() ? "yes" : "no"));
+                      << "domains=" << domain_config_->domains().size()
+                      << ", has_gpu=" << (domain_config_->gpuDomain() ? "yes" : "no")
+                      << ", has_cpu=" << (domain_config_->cpuDomain() ? "yes" : "no")
+                      << ", cross_rank=" << (domain_config_->hasCrossRankTP() ? "yes" : "no"));
 
             // Propagate domain config to graph builder if present
             if (graph_builder_)
@@ -3030,9 +3033,9 @@ namespace llaminar2
         pp_stage_config_ = config;
 
         LOG_DEBUG("[DeviceGraphOrchestrator] PP stage configured: "
-                 << "layers=[" << config.first_layer << ", " << config.last_layer << ") "
-                 << "has_embedding=" << (config.has_embedding ? "yes" : "no")
-                 << " has_lm_head=" << (config.has_lm_head ? "yes" : "no"));
+                  << "layers=[" << config.first_layer << ", " << config.last_layer << ") "
+                  << "has_embedding=" << (config.has_embedding ? "yes" : "no")
+                  << " has_lm_head=" << (config.has_lm_head ? "yes" : "no"));
     }
 
     // =========================================================================
@@ -3305,9 +3308,9 @@ namespace llaminar2
         if (pipeline_config_)
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] Unified pipeline configured: "
-                     << pipeline_config_->numStages() << " PP stages, "
-                     << pipeline_config_->tp_domains.size() << " TP domains, "
-                     << pipeline_config_->total_layers << " total layers");
+                      << pipeline_config_->numStages() << " PP stages, "
+                      << pipeline_config_->tp_domains.size() << " TP domains, "
+                      << pipeline_config_->total_layers << " total layers");
 
             // Propagate to graph builder via setter
             graph_builder_->setPipelineConfig(pipeline_config_);
@@ -3358,8 +3361,8 @@ namespace llaminar2
         const bool has_internal_tp = pipeline_config_->hasTP();
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Initializing PP contexts for "
-                 << (pipeline_config_->numStages() - 1) << " inter-stage transfers"
-                 << (has_internal_tp ? " (with TP domains)" : "") << "...");
+                  << (pipeline_config_->numStages() - 1) << " inter-stage transfers"
+                  << (has_internal_tp ? " (with TP domains)" : "") << "...");
 
         // Create PP context for each adjacent pair of stages
         for (int stage = 0; stage < pipeline_config_->numStages() - 1; ++stage)
@@ -3517,7 +3520,7 @@ namespace llaminar2
 
         pp_contexts_initialized_ = true;
         LOG_DEBUG("[DeviceGraphOrchestrator] Initialized " << pp_contexts_.size() << " PP contexts"
-                                                          << (has_internal_tp ? " (hierarchical)" : " (flat)"));
+                                                           << (has_internal_tp ? " (hierarchical)" : " (flat)"));
         return true;
     }
 
@@ -3537,7 +3540,7 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Initializing TP contexts for "
-                 << pipeline_config_->tp_domains.size() << " domains...");
+                  << pipeline_config_->tp_domains.size() << " domains...");
 
         // Create TP context for each domain that has degree > 1
         for (const auto &domain : pipeline_config_->tp_domains)

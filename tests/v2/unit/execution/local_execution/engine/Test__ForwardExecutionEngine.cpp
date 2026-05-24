@@ -94,6 +94,7 @@ namespace
         int build_forward_graph_calls = 0;
         int get_device_context_calls = 0;
         int ensure_workspace_calls = 0;
+        int last_workspace_seq_len = -1;
         int sync_logits_calls = 0;
         int logits_tensor_calls = 0;
         int build_decode_policy_calls = 0;
@@ -179,9 +180,10 @@ namespace
             return result;
         }
 
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) override
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
         {
             ensure_workspace_calls++;
+            last_workspace_seq_len = workspace_seq_len;
             return true;
         }
 
@@ -467,6 +469,7 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_ExactPlanDelegatesWithChunk
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, plan.chunk.bucket_seq_len);
     EXPECT_EQ(host.last_forward_input.token_offset, plan.chunk.token_offset);
     EXPECT_EQ(host.last_forward_input.position_offset, plan.chunk.token_offset);
+    EXPECT_EQ(host.last_workspace_seq_len, plan.chunk.bucket_seq_len);
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedPlanDelegatesWithBucketMetadata)
@@ -513,6 +516,7 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedPlanDelegatesWithBuck
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
     EXPECT_EQ(host.last_forward_input.token_offset, 88);
     EXPECT_EQ(host.last_forward_input.position_offset, 88);
+    EXPECT_EQ(host.last_workspace_seq_len, 4);
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedGDNOrShortConvRejectedBeforeExecution)
@@ -612,6 +616,7 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
     EXPECT_EQ(host.last_forward_input.token_offset, 200);
     EXPECT_EQ(host.last_forward_input.position_offset, 200);
+    EXPECT_EQ(host.last_workspace_seq_len, 4);
 }
 
 TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucketedGraphCache)
@@ -657,6 +662,7 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucket
     EXPECT_EQ(host.last_forward_input.seq_len, 35);
     EXPECT_EQ(host.last_forward_input.real_seq_len, 0);
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0);
+    EXPECT_EQ(host.last_workspace_seq_len, 35);
     EXPECT_TRUE(engine.cacheEmpty())
         << "Short raw prefill should bypass graph-cache population entirely.";
 }

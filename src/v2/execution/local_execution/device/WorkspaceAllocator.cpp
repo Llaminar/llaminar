@@ -66,9 +66,9 @@ namespace llaminar2
         budget = std::min(budget, config.max_budget);
 
         LOG_DEBUG("[WorkspaceAllocator] " << device.toString()
-                                         << " available=" << (available / (1024 * 1024)) << "MB"
-                                         << ", budget=" << (budget / (1024 * 1024)) << "MB"
-                                         << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
+                                          << " available=" << (available / (1024 * 1024)) << "MB"
+                                          << ", budget=" << (budget / (1024 * 1024)) << "MB"
+                                          << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
 
         return budget;
     }
@@ -213,9 +213,10 @@ namespace llaminar2
             auto existing = device_workspaces_.find(device);
             if (existing != device_workspaces_.end() && existing->second)
             {
-                // Check if new consumers need buffers not yet in the existing workspace.
-                // This happens when per-layer graphs create new GEMM kernel instances
-                // with unique per-instance buffer names (e.g., gemm_temp_c_fp32_<id>).
+                // Check if new consumers need buffers that are absent or larger
+                // than the existing workspace allocation. Bucketed prefill can
+                // warm a smaller graph before a larger bucket arrives; name-only
+                // reuse would bind undersized scratch to the larger graph.
                 bool needs_realloc = false;
                 for (const auto &consumer_binding : consumers)
                 {
@@ -225,7 +226,8 @@ namespace llaminar2
                         consumer_binding.k);
                     for (const auto &buf : reqs.buffers)
                     {
-                        if (!existing->second->hasBuffer(buf.name))
+                        if (!existing->second->hasBuffer(buf.name) ||
+                            existing->second->getBufferSize(buf.name) < buf.size_bytes)
                         {
                             needs_realloc = true;
                             break;
@@ -285,10 +287,10 @@ namespace llaminar2
                 }
 
                 LOG_DEBUG("[WorkspaceAllocator] Reallocating workspace on "
-                         << device.toString() << " with "
-                         << combined.buffers.size() << " buffers ("
-                         << (needed / (1024 * 1024)) << "MB needed, budget="
-                         << (budget / (1024 * 1024)) << "MB)");
+                          << device.toString() << " with "
+                          << combined.buffers.size() << " buffers ("
+                          << (needed / (1024 * 1024)) << "MB needed, budget="
+                          << (budget / (1024 * 1024)) << "MB)");
 
                 auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
                 if (!manager->allocate(combined))
@@ -306,8 +308,8 @@ namespace llaminar2
                 }
 
                 LOG_DEBUG("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
-                                                             << "MB workspace on " << device.toString()
-                                                             << " (" << manager->bufferCount() << " buffers)");
+                                                              << "MB workspace on " << device.toString()
+                                                              << " (" << manager->bufferCount() << " buffers)");
 
                 device_workspace_budgets_[device] = budget;
                 device_workspaces_[device] = std::move(manager);
@@ -348,10 +350,10 @@ namespace llaminar2
                 if (needed <= max_expandable)
                 {
                     LOG_DEBUG("[WorkspaceAllocator] Expanding budget on "
-                             << device.toString() << " from "
-                             << (budget / (1024 * 1024)) << "MB to "
-                             << (needed / (1024 * 1024)) << "MB (available="
-                             << (available / (1024 * 1024)) << "MB)");
+                              << device.toString() << " from "
+                              << (budget / (1024 * 1024)) << "MB to "
+                              << (needed / (1024 * 1024)) << "MB (available="
+                              << (available / (1024 * 1024)) << "MB)");
                     budget = needed;
                 }
             }
@@ -372,8 +374,8 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
-                                                       << "MB workspace on " << device.toString()
-                                                       << " (" << manager->bufferCount() << " buffers, model-aware budget)");
+                                                        << "MB workspace on " << device.toString()
+                                                        << " (" << manager->bufferCount() << " buffers, model-aware budget)");
 
             device_workspace_budgets_[device] = budget;
             device_workspaces_[device] = std::move(manager);
@@ -462,8 +464,8 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
-                                                       << "MB workspace on " << device.toString()
-                                                       << " (" << manager->bufferCount() << " buffers)");
+                                                        << "MB workspace on " << device.toString()
+                                                        << " (" << manager->bufferCount() << " buffers)");
 
             device_workspace_budgets_[device] = budget;
             device_workspaces_[device] = std::move(manager);

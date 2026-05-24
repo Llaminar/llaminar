@@ -101,6 +101,7 @@ namespace llaminar2
         bool hasDynamicParams() const override { return true; }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
+            (void)pos_offset;
             params_.seq_len = seq_len;
             if (params_.kv_cache)
             {
@@ -135,6 +136,11 @@ namespace llaminar2
             }
         }
         bool needsOnGraphReplayed() const override { return true; }
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            replay_advance_tokens_ = 0;
+        }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;
         std::vector<BufferDescriptor> getDeclaredOutputs() const override;

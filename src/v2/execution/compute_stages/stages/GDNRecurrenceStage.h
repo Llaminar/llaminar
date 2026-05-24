@@ -124,6 +124,15 @@ namespace llaminar2
             params_.seq_len = seq_len;
         }
         bool hasDynamicParams() const override { return true; }
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
+            prefill_replay_params_set_ = false;
+            if (params_.kernel)
+                params_.kernel->setGPUStream(nullptr);
+        }
 
         bool hasPrefillReplayParams() const override { return true; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;

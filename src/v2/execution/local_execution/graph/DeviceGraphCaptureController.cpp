@@ -870,9 +870,11 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphCaptureController] Segment initial launch failed");
             return false;
         }
-        // Capture phase: pass skip_replay_callbacks=true because execute() already
-        // ran host-side bookkeeping during capture recording. onGraphReplayed()
-        // must only run during the replay phase (Phase 3).
+        // Capture phase: pass skip_replay_callbacks=true because segmented
+        // capture runs logical host-side bookkeeping while recording. This keeps
+        // later stages in the same capture (e.g. attention after KV append)
+        // seeing normal-execution cache metadata. onGraphReplayed() must only
+        // run during replay (Phase 3) or host state would double-advance.
         post_launch_cb(segment, capture_stream);
         // Use stream-level sync (not device-wide) — capture_stream is where
         // the graph was launched, and hipDeviceSynchronize is illegal during
@@ -1155,62 +1157,74 @@ namespace llaminar2
                     return result;
                 }
 
-                // Set capture-active flag BEFORE beginCapture() to minimize the
-                // race window where another device's thread might call synchronize()
-                // on this context after HIP starts capturing but before the flag is set.
-                gpu_ctx->setGraphCaptureActive(true);
-                GraphCaptureGuard capture_guard;
-
-                // Clear any sticky HIP error left over from warmup or prior
-                // operations on this stream. Without this, the first kernel
-                // launch after beginCapture would see the stale error and fail
-                // with "operation failed due to a previous error during capture".
-                gpu_ctx->clearLastError();
-
-                if (!seg.capture->beginCapture())
-                {
-                    gpu_ctx->setGraphCaptureActive(false);
-                    LOG_ERROR("[DeviceGraphCaptureController] beginCapture failed for segment");
-                    result.reset_cache = true;
-                    result.fallback_to_fast_decode = true;
-                    return result;
-                }
-
                 bool exec_ok = true;
-                for (const auto &stage_name : seg.stage_names)
-                {
-                    auto *node = graph.getNode(stage_name);
-                    if (!node || !node->stage || !node->stage->execute(ctx))
-                    {
-                        LOG_ERROR("[DeviceGraphCaptureController] Stage failed during segmented capture: " << stage_name);
-                        exec_ok = false;
-                        break;
-                    }
-                    graph.markCompleted(stage_name);
-                }
-
-                // Clear capture-active flag BEFORE endCapture so that
-                // post-capture operations can sync normally.
-                gpu_ctx->setGraphCaptureActive(false);
-
-                // If a stage failed mid-capture, we MUST still call endCapture()
-                // to exit capture mode on the stream. Otherwise the stream
-                // remains in capture state and any subsequent
-                // synchronizeStream()/clearLastError()/kernel launch will fail
-                // with "operation not permitted when stream is capturing",
-                // cascading into a SIGSEGV inside libcudart when it tries to
-                // cuMemcpyHtoDAsync on a still-capturing stream.
                 bool end_capture_ok = true;
-                if (!exec_ok)
                 {
-                    // Call endCapture() for its side-effect (exit capture mode);
-                    // the resulting graph is unusable because the stage failed.
-                    seg.capture->endCapture();
-                    end_capture_ok = false;
-                }
-                else
-                {
-                    end_capture_ok = seg.capture->endCapture();
+                    // Set capture-active flags only for the actual stream-capture
+                    // interval. Segmented non-collective capture skips replay
+                    // callbacks on the immediate launch, so stateful stages must
+                    // apply logical host bookkeeping while recording. Collective
+                    // Phase-2 capture re-executes stages after capture, and
+                    // prefill capture uses replay callbacks, so both leave this
+                    // bookkeeping flag disabled.
+                    const bool capture_exec_updates_host_state = !has_collective_nodes;
+
+                    // Set capture-active flag BEFORE beginCapture() to minimize
+                    // the race window where another device's thread might call
+                    // synchronize() on this context after HIP starts capturing
+                    // but before the flag is set.
+                    gpu_ctx->setGraphCaptureActive(true);
+                    GraphCaptureGuard capture_guard(capture_exec_updates_host_state);
+
+                    // Clear any sticky HIP error left over from warmup or prior
+                    // operations on this stream. Without this, the first kernel
+                    // launch after beginCapture would see the stale error and fail
+                    // with "operation failed due to a previous error during capture".
+                    gpu_ctx->clearLastError();
+
+                    if (!seg.capture->beginCapture())
+                    {
+                        gpu_ctx->setGraphCaptureActive(false);
+                        LOG_ERROR("[DeviceGraphCaptureController] beginCapture failed for segment");
+                        result.reset_cache = true;
+                        result.fallback_to_fast_decode = true;
+                        return result;
+                    }
+
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (!node || !node->stage || !node->stage->execute(ctx))
+                        {
+                            LOG_ERROR("[DeviceGraphCaptureController] Stage failed during segmented capture: " << stage_name);
+                            exec_ok = false;
+                            break;
+                        }
+                        graph.markCompleted(stage_name);
+                    }
+
+                    // Clear capture-active flag BEFORE endCapture so that
+                    // post-capture operations can sync normally.
+                    gpu_ctx->setGraphCaptureActive(false);
+
+                    // If a stage failed mid-capture, we MUST still call endCapture()
+                    // to exit capture mode on the stream. Otherwise the stream
+                    // remains in capture state and any subsequent
+                    // synchronizeStream()/clearLastError()/kernel launch will fail
+                    // with "operation not permitted when stream is capturing",
+                    // cascading into a SIGSEGV inside libcudart when it tries to
+                    // cuMemcpyHtoDAsync on a still-capturing stream.
+                    if (!exec_ok)
+                    {
+                        // Call endCapture() for its side-effect (exit capture mode);
+                        // the resulting graph is unusable because the stage failed.
+                        seg.capture->endCapture();
+                        end_capture_ok = false;
+                    }
+                    else
+                    {
+                        end_capture_ok = seg.capture->endCapture();
+                    }
                 }
 
                 if (!exec_ok || !end_capture_ok)

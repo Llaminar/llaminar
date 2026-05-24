@@ -1023,9 +1023,9 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveLayerBuffers)
         return nullptr;
     };
 
-    // Qwen2 has 16 layer_buffers in schema, but 3 are conditional (Q_rope, K_rope, V_dequant)
-    // which are filtered out at default precision. So 13 should be resolved.
-    EXPECT_EQ(reqs.buffers.size(), 13u) << "Expected 13 layer buffers (16 - 3 conditional)";
+    // Qwen2 has 17 layer_buffers in schema, but 3 are conditional (Q_rope, K_rope, V_dequant)
+    // which are filtered out at default precision. So 14 should be resolved.
+    EXPECT_EQ(reqs.buffers.size(), 14u) << "Expected 14 layer buffers (17 - 3 conditional)";
 
     // ── Verify exact shapes for each buffer ──
 
@@ -1119,6 +1119,13 @@ TEST(Test__QwenStandardGraphSchema, BufferAllocator_ResolveLayerBuffers)
     ASSERT_EQ(ws_mask->shape.size(), 2u);
     EXPECT_EQ(ws_mask->shape[0], 512u);
     EXPECT_EQ(ws_mask->shape[1], 512u);
+
+    // lm_head_input_row: [1, d_model] = [1, 896]
+    auto *lm_head_input_row = findBuf("lm_head_input_row");
+    ASSERT_NE(lm_head_input_row, nullptr);
+    ASSERT_EQ(lm_head_input_row->shape.size(), 2u);
+    EXPECT_EQ(lm_head_input_row->shape[0], 1u);
+    EXPECT_EQ(lm_head_input_row->shape[1], 896u);
 
     // Conditional buffers should NOT be present at default precision
     EXPECT_EQ(findBuf("Q_rope"), nullptr) << "Q_rope should be filtered out at default precision";

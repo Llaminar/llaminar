@@ -221,6 +221,11 @@ namespace llaminar2
     {
         dynamic_params_active_ = false;
         dynamic_token_count_ = 0;
+        preload_stream_ = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            stream_by_device_.clear();
+        }
         // h_token_ids_ buffer is preserved — it's reusable for the next session
     }
 
@@ -304,11 +309,11 @@ namespace llaminar2
             }
 
             LOG_DEBUG("[ROCmEmbeddingKernelT] Host token stats: num_tokens=" << num_tokens
-                                                                            << " vocab_size=" << vocab_size
-                                                                            << " min_id=" << min_id
-                                                                            << " max_id=" << max_id
-                                                                            << " first_id=" << token_ids[0]
-                                                                            << " last_id=" << token_ids[num_tokens - 1]);
+                                                                             << " vocab_size=" << vocab_size
+                                                                             << " min_id=" << min_id
+                                                                             << " max_id=" << max_id
+                                                                             << " first_id=" << token_ids[0]
+                                                                             << " last_id=" << token_ids[num_tokens - 1]);
 
             if (first_invalid_pos >= 0)
             {
@@ -714,10 +719,10 @@ namespace llaminar2
                         cached_embed_table_by_device_[dev] = embed_table;
                     }
                     LOG_DEBUG("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
-                             << tensorTypeName(embed_table->native_type()) << " "
-                             << repacked.vocab_size << "x" << d_model
-                             << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                             << " (" << repacked.blocks_per_row << " blocks/row)");
+                              << tensorTypeName(embed_table->native_type()) << " "
+                              << repacked.vocab_size << "x" << d_model
+                              << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                              << " (" << repacked.blocks_per_row << " blocks/row)");
                 }
                 else
                 {

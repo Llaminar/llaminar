@@ -265,7 +265,15 @@ namespace llaminar2
                 rocmGDN_gpu_free(deinterleave_scratch_);
                 if (!rocmGDN_gpu_malloc(&deinterleave_scratch_, total))
                 {
-                    LOG_ERROR("[ROCmGatedDeltaNet] deinterleave scratch malloc failed");
+                    LOG_ERROR("[ROCmGatedDeltaNet] deinterleave scratch malloc failed"
+                              << " (requested=" << (total * sizeof(float)) << " bytes"
+                              << ", seq_len=" << seq_len
+                              << ", n_k_heads=" << n_k_heads
+                              << ", n_v_heads=" << n_v_heads
+                              << ", head_dim_k=" << head_dim_k
+                              << ", head_dim_v=" << head_dim_v
+                              << ", previous=" << (deinterleave_scratch_size_ * sizeof(float))
+                              << " bytes)");
                     deinterleave_scratch_ = nullptr;
                     deinterleave_scratch_size_ = 0;
                     return false;

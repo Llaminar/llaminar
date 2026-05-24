@@ -1634,8 +1634,9 @@ namespace llaminar2
          * @brief Clear KV cache (IInferenceRunner override)
          *
          * Resets inference state (KV cache, positions, model recurrence) while
-         * preserving cached ComputeGraphs. Captured replay state is dropped so
-         * the next request re-warms/re-captures against freshly reset state.
+         * preserving cached ComputeGraphs. Cached stages and GPU replay segments
+         * are reset in-place so the next prompt reuses the graph topology without
+         * inheriting request-scoped KV/GDN/RoPE/kernel state.
          */
         void clear_cache() override
         {
@@ -1651,10 +1652,6 @@ namespace llaminar2
             }
             if (forward_engine_)
             {
-                // Preserve cached ComputeGraphs, but drop captured graph
-                // segments. HIP graph captures span many decode steps; a
-                // new request needs a fresh replay lifecycle after cache
-                // state is cleared below.
                 forward_engine_->resetSessionReplayState();
             }
             last_pos_offset_ = -1;
@@ -2052,9 +2049,12 @@ namespace llaminar2
          * to GEMM kernels, eliminating hot-path allocations on GPU.
          *
          * @param graph The compute graph whose stages need workspace
+         * @param workspace_seq_len Optional active execution length for shape-sized scratch.
          * @return true if allocation succeeded (or was already done)
          */
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) override;
+        bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &graph,
+            int workspace_seq_len = 0) override;
 
         /**
          * @brief Called once after the first graph build + workspace allocation.

@@ -54,6 +54,7 @@ namespace
         int build_calls = 0;
         int get_context_calls = 0;
         int ensure_workspace_calls = 0;
+        int last_workspace_seq_len = -1;
         int sync_logits_calls = 0;
         int logits_tensor_calls = 0;
         int build_decode_policy_calls = 0;
@@ -116,9 +117,10 @@ namespace
             return result;
         }
 
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) override
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
         {
             ensure_workspace_calls++;
+            last_workspace_seq_len = workspace_seq_len;
             call_sequence.push_back("ensureWorkspace");
             return true;
         }
@@ -265,6 +267,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, CacheMiss_WorkspaceEnsured)
     engine.execute(ti.input, output, host);
 
     EXPECT_GE(host.ensure_workspace_calls, 1);
+    EXPECT_EQ(host.last_workspace_seq_len, 1);
 }
 
 TEST_F(Test__ForwardExecutionEngineAdvanced, CacheMiss_SyncLogitsCalled)
@@ -351,6 +354,36 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, SameDecodeShape_CacheHitOnSecondCal
     engine.execute(decode2.input, output, host);
     // On cache HIT, buildForwardGraph is NOT called
     EXPECT_EQ(host.build_calls, 1) << "Second decode with same shape should hit cache";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, ResetSessionReplayState_PreservesCachedGraphAndResetsStages)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+
+    TestInput decode1(1);
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(decode1.input, output, host));
+    ASSERT_EQ(host.build_calls, 1);
+    ASSERT_FALSE(engine.cacheEmpty());
+
+    engine.resetSessionReplayState();
+
+    int reset_count = 0;
+    engine.forEachCachedStage(ComputeStageType::GEMM, [&](IComputeStage *stage)
+                              {
+        auto *mock_stage = dynamic_cast<llaminar2::testing::MockComputeStage *>(stage);
+        ASSERT_NE(mock_stage, nullptr);
+        reset_count += mock_stage->resetSessionStateCount(); });
+    EXPECT_EQ(reset_count, 3)
+        << "Request reset must clear cached stage state without dropping the graph";
+    EXPECT_FALSE(engine.cacheEmpty());
+
+    TestInput decode2(1);
+    ASSERT_TRUE(engine.execute(decode2.input, output, host));
+    EXPECT_EQ(host.build_calls, 1)
+        << "The next same-shape decode should reuse the cached graph after reset";
 }
 
 TEST_F(Test__ForwardExecutionEngineAdvanced, CachingDisabled_AlwaysBuilds)

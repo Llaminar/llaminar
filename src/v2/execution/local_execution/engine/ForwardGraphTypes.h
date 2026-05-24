@@ -324,6 +324,35 @@ namespace llaminar2
             phase3_active = false;
         }
 
+        /**
+         * @brief Reset request-scoped state while preserving reusable graph objects.
+         *
+         * This is the request-boundary counterpart to invalidate(): it keeps the
+         * cached ComputeGraph, stable token buffers, workspace bindings, and
+         * prefill graph entries, but clears stage/kernels' dynamic metadata and
+         * replay lifecycle state so the next prompt starts from cleared KV/GDN
+         * model state.
+         */
+        void resetSessionState()
+        {
+            resetReplayState();
+
+            if (graph)
+            {
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            }
+
+            gpu_stream_applied = false;
+            applied_stream = nullptr;
+            gpu_stream = nullptr;
+            gpu_ctx = nullptr;
+        }
+
         void invalidate()
         {
             resetReplayState();
@@ -344,6 +373,8 @@ namespace llaminar2
             prefill_replay_param_stages_cached = false;
             gpu_stream_applied = false;
             applied_stream = nullptr;
+            gpu_stream = nullptr;
+            gpu_ctx = nullptr;
             phase3_active = false;
             pp_external_hidden_state = nullptr;
             pp_working_buffer = nullptr;

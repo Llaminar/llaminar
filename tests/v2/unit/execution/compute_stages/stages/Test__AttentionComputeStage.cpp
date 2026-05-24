@@ -19,11 +19,25 @@
 #include "v2/tensors/TensorFactory.h"
 #include "v2/utils/MPIContext.h"
 
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
+#endif
+
 using namespace llaminar2;
 
 namespace
 {
     constexpr float TOLERANCE = 1e-4f;
+
+#ifdef HAVE_ROCM
+    bool hasROCm()
+    {
+        int count = 0;
+        hipError_t err = hipGetDeviceCount(&count);
+        return (err == hipSuccess && count > 0);
+    }
+#endif
 
     class Test__AttentionComputeStage : public ::testing::Test
     {
@@ -416,5 +430,94 @@ namespace
         ASSERT_NE(stage, nullptr);
         EXPECT_EQ(stage->type(), ComputeStageType::ATTENTION);
     }
+
+#ifdef HAVE_ROCM
+    TEST_F(Test__AttentionComputeStage, ROCmWorkspaceRequirementsUseStageAttentionShape)
+    {
+        if (!hasROCm())
+        {
+            GTEST_SKIP() << "ROCm not available";
+        }
+
+        TensorFactory factory(mpi_ctx_);
+
+        // Regression for Qwen3.5 MoE long-context decode: the graph-level
+        // workspace hints can describe the model-local shard as 8 heads, while
+        // the concrete attention stage executes a 16-head local Q projection.
+        // Split decode needs partial buffers sized by the stage shape.  If this
+        // delegates the allocator hint through unchanged, attn_partial_output is
+        // half-sized and overwrites PARTIAL_M/PARTIAL_L during 8-way reduction.
+        constexpr int seq_len = 1;
+        constexpr int kv_len = 513;
+        constexpr int stage_heads = 16;
+        constexpr int hinted_heads = 8;
+        constexpr int n_kv_heads = 2;
+        constexpr int head_dim = 256;
+        constexpr int default_decode_splits = 8;
+
+        auto Q = factory.createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(stage_heads * head_dim)},
+            DeviceId::cpu());
+        auto K = factory.createFP32(
+            {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)},
+            DeviceId::cpu());
+        auto V = factory.createFP32(
+            {static_cast<size_t>(kv_len), static_cast<size_t>(n_kv_heads * head_dim)},
+            DeviceId::cpu());
+        auto output = factory.createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(stage_heads * head_dim)},
+            DeviceId::cpu());
+
+        AttentionComputeStage::Params params;
+        params.Q = Q.get();
+        params.K = K.get();
+        params.V = V.get();
+        params.output = output.get();
+        params.batch_size = 1;
+        params.seq_len = seq_len;
+        params.kv_len = kv_len;
+        params.n_heads = stage_heads;
+        params.n_kv_heads = n_kv_heads;
+        params.head_dim = head_dim;
+        params.causal = false;
+        params.device_id = DeviceId::rocm(0);
+        params.mpi_ctx = &mpi_ctx_;
+
+        AttentionComputeStage stage(params);
+        WorkspaceRequirements reqs = stage.getWorkspaceRequirements(
+            /*m=*/seq_len,
+            /*n=*/hinted_heads,
+            /*k=*/head_dim);
+
+        const auto *partial_output = reqs.find(rocm::AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
+        const auto *partial_m = reqs.find(rocm::AttentionWorkspaceBuffers::PARTIAL_M);
+        const auto *partial_l = reqs.find(rocm::AttentionWorkspaceBuffers::PARTIAL_L);
+        ASSERT_NE(partial_output, nullptr);
+        ASSERT_NE(partial_m, nullptr);
+        ASSERT_NE(partial_l, nullptr);
+
+        const size_t expected_partial_output = static_cast<size_t>(seq_len) *
+                                               static_cast<size_t>(stage_heads) *
+                                               static_cast<size_t>(default_decode_splits) *
+                                               static_cast<size_t>(head_dim) *
+                                               sizeof(float);
+        const size_t expected_partial_meta = static_cast<size_t>(seq_len) *
+                                             static_cast<size_t>(stage_heads) *
+                                             static_cast<size_t>(default_decode_splits) *
+                                             sizeof(float);
+        const size_t old_underallocated_partial_output = static_cast<size_t>(seq_len) *
+                                                         static_cast<size_t>(hinted_heads) *
+                                                         static_cast<size_t>(default_decode_splits) *
+                                                         static_cast<size_t>(head_dim) *
+                                                         sizeof(float);
+
+        EXPECT_GE(partial_output->size_bytes, expected_partial_output);
+        EXPECT_GE(partial_m->size_bytes, expected_partial_meta);
+        EXPECT_GE(partial_l->size_bytes, expected_partial_meta);
+        EXPECT_GT(partial_output->size_bytes, old_underallocated_partial_output)
+            << "Attention workspace must be sized from the stage's n_heads, "
+               "not a smaller graph-level model hint";
+    }
+#endif
 
 } // namespace

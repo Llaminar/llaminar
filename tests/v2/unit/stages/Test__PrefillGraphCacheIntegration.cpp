@@ -429,7 +429,7 @@ namespace
         }
         IDeviceContext *getDeviceContext(DeviceId) override { return nullptr; }
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override { return {}; }
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &) override { return true; }
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int) override { return true; }
         void syncLogitsAtBoundary(IDeviceContext *) override {}
         TensorBase *logitsTensor() override { return nullptr; }
         DeviceGraphExecutor::DecodeCapturePolicy buildDecodeCapturePolicy(
