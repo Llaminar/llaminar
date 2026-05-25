@@ -140,6 +140,12 @@ namespace llaminar2
         {
             IComputeStage::resetSessionState();
             replay_advance_tokens_ = 0;
+            debug_append_source_k_snapshot_.clear();
+            debug_append_source_v_snapshot_.clear();
+            debug_append_source_k_rows_ = 0;
+            debug_append_source_k_cols_ = 0;
+            debug_append_source_v_rows_ = 0;
+            debug_append_source_v_cols_ = 0;
         }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;
@@ -162,6 +168,22 @@ namespace llaminar2
         /// Workspace for kv_rotation: holds FP32 copy for in-place rotation
         /// before Q16_1 quantization. Lazy-allocated, reused across calls.
         std::vector<float> kv_rotation_scratch_;
+
+        /// Debug-only post-append KV snapshots. Populated only when
+        /// LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT is enabled, so normal dump/coherence
+        /// paths do not copy persistent cache state back to host.
+        mutable std::vector<float> debug_cache_k_snapshot_;
+        mutable std::vector<float> debug_cache_v_snapshot_;
+
+        /// Debug-only source K/V copies captured immediately before append.
+        /// This avoids reading persistent cache views while still proving what
+        /// each request wrote into the cache append path.
+        std::vector<float> debug_append_source_k_snapshot_;
+        std::vector<float> debug_append_source_v_snapshot_;
+        size_t debug_append_source_k_rows_ = 0;
+        size_t debug_append_source_k_cols_ = 0;
+        size_t debug_append_source_v_rows_ = 0;
+        size_t debug_append_source_v_cols_ = 0;
 
         /// Real token count to advance after prefill graph replay; 0 falls
         /// back to params_.num_tokens for decode and legacy exact-shape replay.

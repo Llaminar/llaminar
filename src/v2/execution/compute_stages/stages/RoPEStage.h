@@ -99,6 +99,8 @@ namespace llaminar2
         {
             params_.pos_offset = pos_offset;
             params_.seq_len = seq_len;
+            params_.position_ids = nullptr;
+            position_ids_cache_.clear();
             if (cached_kernel_)
             {
                 // Propagate current stage stream to kernel so setDynamicPosOffset
@@ -112,6 +114,9 @@ namespace llaminar2
         {
             IComputeStage::resetSessionState();
             params_.pos_offset = 0;
+            params_.seq_len = 0;
+            params_.position_ids = nullptr;
+            position_ids_cache_.clear();
             if (cached_kernel_)
             {
                 cached_kernel_->resetDynamicState();

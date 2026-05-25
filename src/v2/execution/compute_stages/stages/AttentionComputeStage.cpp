@@ -10,6 +10,9 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../tensors/TQ8Tensor.h"
 #include "../../../tensors/TQ4Tensor.h"
+#include "../../../tensors/FP16Utils.h"
+#include "../../../tensors/SIMDHelpers.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
 #include "../../../kernels/cpu/rotation/ActivationRotation.h"
@@ -19,6 +22,7 @@
 #include <limits>
 #include <fstream>
 #include <filesystem>
+#include <cstdlib>
 
 #if defined(HAVE_CUDA)
 #include "../../../kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
@@ -27,6 +31,119 @@
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        bool debugEffectiveKVSnapshotEnabled()
+        {
+            const char *env = std::getenv("LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT");
+            return env && std::atoi(env) != 0;
+        }
+
+        bool debugEffectiveKVSnapshotLayerSelected(int layer_idx)
+        {
+            const char *env = std::getenv("LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER");
+            if (!env || *env == '\0')
+                return true;
+            return std::atoi(env) == layer_idx;
+        }
+
+        size_t debugElementSize(TensorType type)
+        {
+            switch (type)
+            {
+            case TensorType::FP32:
+                return sizeof(float);
+            case TensorType::FP16:
+            case TensorType::BF16:
+                return sizeof(uint16_t);
+            default:
+                return 0;
+            }
+        }
+
+        bool copyTensorBytesForAttentionSnapshot(
+            const ITensor *tensor,
+            DeviceId device,
+            void *stream,
+            std::vector<uint8_t> &bytes)
+        {
+            if (!tensor || bytes.empty())
+                return false;
+
+            if (const void *host = tensor->raw_data())
+            {
+                std::memcpy(bytes.data(), host, bytes.size());
+                return true;
+            }
+
+            const void *device_ptr = tensor->gpu_data_ptr();
+            if (!device_ptr || !device.is_gpu())
+                return false;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+                return false;
+
+            return backend->deviceToHostFast(
+                bytes.data(), device_ptr, bytes.size(), device.toKernelDeviceIndex(), stream);
+        }
+
+        bool tensorToFP32AttentionSnapshot(
+            const ITensor *tensor,
+            DeviceId device,
+            void *stream,
+            size_t rows,
+            size_t cols,
+            std::vector<float> &out)
+        {
+            if (!tensor || rows == 0 || cols == 0)
+            {
+                out.clear();
+                return false;
+            }
+
+            const size_t count = rows * cols;
+            const size_t elem_size = debugElementSize(tensor->native_type());
+            if (elem_size == 0)
+            {
+                out.clear();
+                return false;
+            }
+
+            std::vector<uint8_t> bytes(count * elem_size);
+            if (!copyTensorBytesForAttentionSnapshot(tensor, device, stream, bytes))
+            {
+                out.clear();
+                return false;
+            }
+
+            out.resize(count);
+            switch (tensor->native_type())
+            {
+            case TensorType::FP32:
+                std::memcpy(out.data(), bytes.data(), count * sizeof(float));
+                return true;
+            case TensorType::FP16:
+            {
+                const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
+                for (size_t i = 0; i < count; ++i)
+                    out[i] = fp16_to_fp32(src[i]);
+                return true;
+            }
+            case TensorType::BF16:
+            {
+                const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
+                for (size_t i = 0; i < count; ++i)
+                    out[i] = simd::bf16_to_fp32(src[i]);
+                return true;
+            }
+            default:
+                out.clear();
+                return false;
+            }
+        }
+    } // namespace
 
     // =============================================================================
     // AttentionComputeStage Implementation
@@ -125,6 +242,13 @@ namespace llaminar2
 
     bool AttentionComputeStage::execute(IDeviceContext *ctx)
     {
+        const bool gpu_stage = params_.device_id.is_gpu();
+        if (gpu_stage && !gpuStream())
+        {
+            LOG_ERROR("[AttentionComputeStage] GPU attention/KV read requires an explicit non-null stage stream");
+            return false;
+        }
+
         // Dynamic kv_len: query from KV cache at execution time if available
         // This enables declarative graph construction where the stage runs after
         // KVCacheAppendStage has already appended tokens
@@ -245,7 +369,8 @@ namespace llaminar2
                         }
                     }
 
-                    // Fallback: dequant via get_kv_converted for unsupported formats or rope_on_read
+                    // Converted-cache path: dequantize through get_kv_converted
+                    // when fused raw attention cannot consume the cache format.
                     if (effective_K == params_.K) // not overridden by any fused path above
                     {
                         IKVCache::KVReadParams read_params;
@@ -276,16 +401,11 @@ namespace llaminar2
                         }
                         else
                         {
-                            LOG_WARN("[AttentionComputeStage] get_kv_converted failed, falling back to raw cache");
-                            cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-                            cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-                            if (cache_k && cache_v)
-                            {
-                                effective_K = cache_k;
-                                effective_V = cache_v;
-                            }
+                            LOG_ERROR("[AttentionComputeStage] get_kv_converted failed for layer "
+                                      << params_.layer_idx << "; failing instead of substituting raw cache tensors");
+                            return false;
                         }
-                    } // end fallback get_kv_converted
+                    } // end converted-cache get_kv_converted
                 }
                 else
                 {
@@ -356,14 +476,9 @@ namespace llaminar2
                         }
                         else
                         {
-                            LOG_WARN("[AttentionComputeStage] GPU: get_kv_converted failed, falling back to raw cache");
-                            cache_k = params_.kv_cache->get_k(params_.layer_idx, 0);
-                            cache_v = params_.kv_cache->get_v(params_.layer_idx, 0);
-                            if (cache_k && cache_v)
-                            {
-                                effective_K = cache_k;
-                                effective_V = cache_v;
-                            }
+                            LOG_ERROR("[AttentionComputeStage] GPU get_kv_converted failed for layer "
+                                      << params_.layer_idx << "; failing instead of substituting raw cache tensors");
+                            return false;
                         }
                     }
                     else
@@ -379,7 +494,9 @@ namespace llaminar2
                         }
                         else
                         {
-                            LOG_TRACE("[AttentionComputeStage] Cache K/V not available yet, using wired tensors");
+                            LOG_ERROR("[AttentionComputeStage] Requested cache K/V for layer "
+                                      << params_.layer_idx << " but cache tensors are unavailable");
+                            return false;
                         }
                     }
                 }
@@ -501,8 +618,8 @@ namespace llaminar2
 
         if (!ensureRequiredPointers("AttentionComputeStage", {
                                                                  {"Q", params_.Q},
-                                                                 {"K", params_.K},
-                                                                 {"V", params_.V},
+                                                                 {"K", effective_K},
+                                                                 {"V", effective_V},
                                                                  {"output", params_.output},
                                                              }))
         {
@@ -704,6 +821,35 @@ namespace llaminar2
             }
         }
 
+        if (debugEffectiveKVSnapshotEnabled() &&
+            debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
+        {
+            const size_t k_rows = static_cast<size_t>(effective_kv_len);
+            const size_t v_rows = static_cast<size_t>(effective_kv_len);
+            // CPU get_kv_converted() shadows are flat [max_seq_len * kv_dim]
+            // tensors, while ROCm cache views are [kv_len, kv_dim]. Compare
+            // the logical attention layout consumed by the kernel.
+            const size_t logical_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            const size_t k_cols = effective_K ? logical_kv_cols : 0;
+            const size_t v_cols = effective_V ? logical_kv_cols : 0;
+            const bool have_k = tensorToFP32AttentionSnapshot(
+                effective_K, params_.device_id, gpuStream(), k_rows, k_cols,
+                debug_effective_k_snapshot_);
+            const bool have_v = tensorToFP32AttentionSnapshot(
+                effective_V, params_.device_id, gpuStream(), v_rows, v_cols,
+                debug_effective_v_snapshot_);
+
+            debug_effective_k_rows_ = have_k ? k_rows : 0;
+            debug_effective_k_cols_ = have_k ? k_cols : 0;
+            debug_effective_v_rows_ = have_v ? v_rows : 0;
+            debug_effective_v_cols_ = have_v ? v_cols : 0;
+
+            // Snapshot callbacks reuse dump info first built before execute()
+            // for coherence. Force post-execute getDumpInfo() to include these
+            // just-captured vectors.
+            invalidateDumpInfoCache();
+        }
+
         bool success = kernel->compute_tensor(
             params_.Q, effective_K, effective_V, params_.output,
             params_.batch_size,
@@ -791,19 +937,56 @@ namespace llaminar2
         // Q shape: [batch_size * seq_len, n_heads * head_dim]
         // K/V shape: [batch_size * kv_len, n_kv_heads * head_dim]
         const size_t total_q_tokens = static_cast<size_t>(params_.batch_size * params_.seq_len);
-        const size_t total_kv_tokens = static_cast<size_t>(params_.batch_size * params_.kv_len);
+        size_t total_kv_tokens = static_cast<size_t>(params_.batch_size * params_.kv_len);
+        const ITensor *dump_K = params_.K;
+        const ITensor *dump_V = params_.V;
+
+        // Decode graph construction may cache GpuTensorView pointers while the
+        // KV cache still has N rows. The immediately preceding kv_append stage
+        // can replace those wrappers with N+1-row views, leaving params_.K/V
+        // stale before execute() has a chance to re-query the cache. Snapshot
+        // and validation metadata must therefore refresh cache-backed K/V views
+        // here, mirroring the execution path's live-cache read.
+        if (params_.kv_cache && params_.layer_idx >= 0)
+        {
+            const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+            const bool should_read_cache = cached_tokens > 0 &&
+                                           (params_.read_kv_from_cache ||
+                                            cached_tokens > params_.seq_len ||
+                                            params_.apply_rope_to_k);
+
+            if (should_read_cache)
+            {
+                ITensor *cache_k = nullptr;
+                ITensor *cache_v = nullptr;
+                int cache_kv_len = 0;
+                if (params_.kv_cache->get_kv(params_.layer_idx, 0, &cache_k, &cache_v, &cache_kv_len) &&
+                    cache_k && cache_v && cache_kv_len > 0)
+                {
+                    dump_K = cache_k;
+                    dump_V = cache_v;
+                    total_kv_tokens = static_cast<size_t>(params_.batch_size * cache_kv_len);
+                }
+                else if (cache_kv_len == 0)
+                {
+                    dump_K = nullptr;
+                    dump_V = nullptr;
+                    total_kv_tokens = 0;
+                }
+            }
+        }
 
         if (params_.Q)
         {
             info.addInput("Q", params_.Q, total_q_tokens, params_.n_heads * params_.head_dim);
         }
-        if (params_.K)
+        if (dump_K)
         {
-            info.addInput("K", params_.K, total_kv_tokens, params_.n_kv_heads * params_.head_dim);
+            info.addInput("K", dump_K, total_kv_tokens, params_.n_kv_heads * params_.head_dim);
         }
-        if (params_.V)
+        if (dump_V)
         {
-            info.addInput("V", params_.V, total_kv_tokens, params_.n_kv_heads * params_.head_dim);
+            info.addInput("V", dump_V, total_kv_tokens, params_.n_kv_heads * params_.head_dim);
         }
 
         // Output: attention context
@@ -822,6 +1005,21 @@ namespace llaminar2
         else
         {
             LOG_DEBUG("[AttentionComputeStage::getDumpInfo] output is NULL");
+        }
+
+        if (debugEffectiveKVSnapshotEnabled() &&
+            debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
+        {
+            if (!debug_effective_k_snapshot_.empty() && debug_effective_k_rows_ > 0 && debug_effective_k_cols_ > 0)
+            {
+                info.addOutput("effective_k", debug_effective_k_snapshot_.data(),
+                               debug_effective_k_rows_, debug_effective_k_cols_);
+            }
+            if (!debug_effective_v_snapshot_.empty() && debug_effective_v_rows_ > 0 && debug_effective_v_cols_ > 0)
+            {
+                info.addOutput("effective_v", debug_effective_v_snapshot_.data(),
+                               debug_effective_v_rows_, debug_effective_v_cols_);
+            }
         }
 
         // Scalars capture all necessary info for debugging

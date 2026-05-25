@@ -261,7 +261,8 @@ namespace llaminar2
                                    const ITensor *K, const ITensor *V,
                                    int num_tokens)
     {
-        return appendWithStream(layer, seq_idx, K, V, num_tokens, nullptr);
+        LOG_ERROR("[CUDARingKVCacheTQ::append] Explicit stream required; use appendWithStream()");
+        return false;
     }
 
     bool CUDARingKVCacheTQ::appendWithStream(int layer, int seq_idx,
@@ -272,10 +273,15 @@ namespace llaminar2
             return false;
         if (num_tokens <= 0)
             return true;
+        if (!gpu_stream)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::appendWithStream] Null stream is not allowed");
+            return false;
+        }
 
         cudaSetDevice(device_id_);
         cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream);
-        cached_stream_ = stream; // Cache for get_kv_converted()
+        cached_stream_ = stream;
 
         TQEntry &entry = entries_[layer][seq_idx];
         const bool capture_active = isGraphCaptureActive();
@@ -498,6 +504,172 @@ namespace llaminar2
     // Per-Layer Scratch Buffer Management
     // =========================================================================
 
+    cudaStream_t CUDARingKVCacheTQ::clearStream() const
+    {
+        if (cached_stream_)
+            return cached_stream_;
+        return static_cast<cudaStream_t>(
+            GPUDeviceContextPool::instance().getNvidiaContext(device_id_).defaultStream());
+    }
+
+    void CUDARingKVCacheTQ::clearEntryStorage(int layer, int seq_idx, cudaStream_t stream)
+    {
+        auto &entry = entries_[layer][seq_idx];
+        const size_t k_bytes = static_cast<size_t>(max_seq_len_) * k_pos_bytes_;
+        const size_t v_bytes = static_cast<size_t>(max_seq_len_) * v_pos_bytes_;
+
+        if (entry.d_K)
+        {
+            cudaError_t err = cudaMemsetAsync(entry.d_K, 0, k_bytes, stream);
+            if (err != cudaSuccess)
+                LOG_WARN("[CUDARingKVCacheTQ::clear] K memset failed: " << cudaGetErrorString(err));
+        }
+        if (entry.d_V)
+        {
+            cudaError_t err = cudaMemsetAsync(entry.d_V, 0, v_bytes, stream);
+            if (err != cudaSuccess)
+                LOG_WARN("[CUDARingKVCacheTQ::clear] V memset failed: " << cudaGetErrorString(err));
+        }
+    }
+
+    void CUDARingKVCacheTQ::clearScratchStorage(int layer, cudaStream_t stream)
+    {
+        auto &scratch = layer_scratch_[layer];
+        const size_t scratch_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(__half);
+
+        if (scratch.d_K)
+        {
+            cudaError_t err = cudaMemsetAsync(scratch.d_K, 0, scratch_bytes, stream);
+            if (err != cudaSuccess)
+                LOG_WARN("[CUDARingKVCacheTQ::clear] scratch K memset failed: " << cudaGetErrorString(err));
+        }
+        if (scratch.d_V)
+        {
+            cudaError_t err = cudaMemsetAsync(scratch.d_V, 0, scratch_bytes, stream);
+            if (err != cudaSuccess)
+                LOG_WARN("[CUDARingKVCacheTQ::clear] scratch V memset failed: " << cudaGetErrorString(err));
+        }
+
+        scratch.k_view.reset();
+        scratch.v_view.reset();
+        scratch.invalidate();
+    }
+
+    void CUDARingKVCacheTQ::clearDynamicParams(int layer, int seq_idx, cudaStream_t stream)
+    {
+        const int entry_idx = layer * batch_size_ + seq_idx;
+        if (h_head_params_)
+            h_head_params_[entry_idx] = 0;
+        if (d_head_params_)
+        {
+            cudaError_t err = cudaMemsetAsync(&d_head_params_[entry_idx], 0, sizeof(int), stream);
+            if (err != cudaSuccess)
+                LOG_WARN("[CUDARingKVCacheTQ::clear] head param memset failed: " << cudaGetErrorString(err));
+        }
+
+        if (h_dequant_params_)
+            std::memset(&h_dequant_params_[layer], 0, sizeof(TQDequantDynamicParams));
+        if (d_dequant_params_)
+        {
+            cudaError_t err = cudaMemsetAsync(&d_dequant_params_[layer], 0,
+                                              sizeof(TQDequantDynamicParams), stream);
+            if (err != cudaSuccess)
+                LOG_WARN("[CUDARingKVCacheTQ::clear] dequant param memset failed: " << cudaGetErrorString(err));
+        }
+    }
+
+    void CUDARingKVCacheTQ::clear_sequence(int layer, int seq_idx)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        cudaSetDevice(device_id_);
+        cudaStream_t stream = clearStream();
+        clearEntryStorage(layer, seq_idx, stream);
+        clearScratchStorage(layer, stream);
+        clearDynamicParams(layer, seq_idx, stream);
+
+        cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess)
+            LOG_WARN("[CUDARingKVCacheTQ::clear_sequence] sync failed: " << cudaGetErrorString(sync_err));
+
+        cached_stream_ = nullptr;
+        CUDARingKVCacheBase::clear_sequence(layer, seq_idx);
+    }
+
+    void CUDARingKVCacheTQ::clear_layer(int layer)
+    {
+        if (layer < 0 || layer >= n_layers_)
+            return;
+
+        cudaSetDevice(device_id_);
+        cudaStream_t stream = clearStream();
+        for (int seq = 0; seq < batch_size_; ++seq)
+        {
+            clearEntryStorage(layer, seq, stream);
+            clearDynamicParams(layer, seq, stream);
+        }
+        clearScratchStorage(layer, stream);
+
+        cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess)
+            LOG_WARN("[CUDARingKVCacheTQ::clear_layer] sync failed: " << cudaGetErrorString(sync_err));
+
+        cached_stream_ = nullptr;
+        for (int seq = 0; seq < batch_size_; ++seq)
+            CUDARingKVCacheBase::clear_sequence(layer, seq);
+    }
+
+    void CUDARingKVCacheTQ::clear_sequence(int seq_idx)
+    {
+        if (seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        cudaSetDevice(device_id_);
+        cudaStream_t stream = clearStream();
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            clearEntryStorage(layer, seq_idx, stream);
+            clearScratchStorage(layer, stream);
+            clearDynamicParams(layer, seq_idx, stream);
+        }
+
+        cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess)
+            LOG_WARN("[CUDARingKVCacheTQ::clear_sequence] sync failed: " << cudaGetErrorString(sync_err));
+
+        cached_stream_ = nullptr;
+        for (int layer = 0; layer < n_layers_; ++layer)
+            CUDARingKVCacheBase::clear_sequence(layer, seq_idx);
+    }
+
+    void CUDARingKVCacheTQ::clear()
+    {
+        cudaSetDevice(device_id_);
+        cudaStream_t stream = clearStream();
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                clearEntryStorage(layer, seq, stream);
+                clearDynamicParams(layer, seq, stream);
+            }
+            clearScratchStorage(layer, stream);
+        }
+
+        cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess)
+            LOG_WARN("[CUDARingKVCacheTQ::clear] sync failed: " << cudaGetErrorString(sync_err));
+
+        cached_stream_ = nullptr;
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            for (int seq = 0; seq < batch_size_; ++seq)
+                CUDARingKVCacheBase::clear_sequence(layer, seq);
+        }
+    }
+
     bool CUDARingKVCacheTQ::dequant_to_scratch(
         int layer, int seq_idx, float rope_theta, int position_start, cudaStream_t stream) const
     {
@@ -625,7 +797,7 @@ namespace llaminar2
         cudaSetDevice(device_id_);
 
         // Dequant into per-layer scratch (no RoPE for raw get_k)
-        dequant_to_scratch(layer, seq_idx, 0.0f, 0, cached_stream_);
+        dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
 
         auto &scratch = layer_scratch_[layer];
         const auto &entry = entries_[layer][seq_idx];
@@ -656,7 +828,7 @@ namespace llaminar2
 
         cudaSetDevice(device_id_);
 
-        dequant_to_scratch(layer, seq_idx, 0.0f, 0, cached_stream_);
+        dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
 
         auto &scratch = layer_scratch_[layer];
         const auto &entry = entries_[layer][seq_idx];
@@ -735,6 +907,10 @@ namespace llaminar2
         const auto &entry = entries_[layer][seq_idx];
         if (entry.count == 0)
         {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
             if (out_kv_len)
                 *out_kv_len = 0;
             return true;
@@ -751,9 +927,11 @@ namespace llaminar2
             position_start = rope->position_start;
         }
 
-        // Dequant to per-layer FP32 scratch with optional RoPE
-        // IMPORTANT: Must use cached_stream_ (set by append()), NOT nullptr.
-        bool ok = dequant_to_scratch(layer, seq_idx, rope_theta, position_start, cached_stream_);
+        // Dequant to per-layer FP32 scratch with optional RoPE on an explicit stream.
+        cudaStream_t stream = (rope && rope->gpu_stream)
+                                  ? static_cast<cudaStream_t>(rope->gpu_stream)
+                                  : clearStream();
+        bool ok = dequant_to_scratch(layer, seq_idx, rope_theta, position_start, stream);
         if (!ok)
             return false;
 

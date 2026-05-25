@@ -12,6 +12,7 @@
 #include "../execution/config/RuntimeConfig.h" // ActivationPrecision
 #include "../tensors/ITensor.h"                // Lightweight interface (no MPI)
 #include "../tensors/TensorLayout.h"
+#include "../utils/Logger.h"
 #include <vector>
 
 namespace llaminar2
@@ -238,7 +239,10 @@ namespace llaminar2
          * This is critical for GPU graph capture where all operations must
          * execute on the same stream.
          *
-         * CPU caches ignore the stream and forward to the regular append.
+         * Implementations that support stream-aware append must override this
+         * method. The base implementation fails so GPU callers cannot silently
+         * drop to append(), which may use the default stream or skip required
+         * format conversion.
          *
          * @param layer Layer index
          * @param seq_idx Sequence index
@@ -251,8 +255,14 @@ namespace llaminar2
         virtual bool appendWithStream(int layer, int seq_idx, const ITensor *K, const ITensor *V,
                                       int num_tokens, void *gpu_stream)
         {
+            (void)layer;
+            (void)seq_idx;
+            (void)K;
+            (void)V;
+            (void)num_tokens;
             (void)gpu_stream;
-            return append(layer, seq_idx, K, V, num_tokens);
+            LOG_ERROR("[IKVCache::appendWithStream] Stream-aware append is not implemented by this cache");
+            return false;
         }
 
         // =================================================================
@@ -491,10 +501,18 @@ namespace llaminar2
                                       int *out_kv_len = nullptr,
                                       const KVReadParams *rope = nullptr)
         {
-            // Default: ignore target precision and RoPE, return raw cache tensors
+            // No base fallback: callers that request converted/RoPE-applied KV
+            // require an implementation that owns the necessary scratch buffers.
             (void)target;
             (void)rope;
-            return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
+            if (out_kv_len)
+                *out_kv_len = 0;
+            LOG_ERROR("[IKVCache::get_kv_converted] Converted KV read is not implemented by this cache");
+            return false;
         }
 
         /**

@@ -88,6 +88,25 @@ namespace
         CudaBuffer &operator=(const CudaBuffer &) = delete;
     };
 
+    // RAII wrapper for the explicit stream required by ITensor KV appends.
+    struct ScopedCudaStream
+    {
+        cudaStream_t stream = nullptr;
+
+        ScopedCudaStream()
+        {
+            EXPECT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+        }
+
+        ~ScopedCudaStream()
+        {
+            if (stream)
+                cudaStreamDestroy(stream);
+        }
+
+        void *opaque() const { return static_cast<void *>(stream); }
+    };
+
 } // namespace
 
 // =============================================================================
@@ -495,7 +514,13 @@ TEST(Test__CUDARingKVCache_Comprehensive, IKVCache_PolymorphismCompliance)
     k_tensor->ensureOnDevice(cuda_dev);
     v_tensor->ensureOnDevice(cuda_dev);
 
-    ASSERT_TRUE(cache->append(0, 0, k_tensor.get(), v_tensor.get(), 5));
+    // The generic ITensor append path must fail closed unless a caller supplies
+    // the execution stream used by the graph/stage path.
+    EXPECT_FALSE(cache->append(0, 0, k_tensor.get(), v_tensor.get(), 5));
+
+    ScopedCudaStream stream;
+    ASSERT_TRUE(cache->appendWithStream(0, 0, k_tensor.get(), v_tensor.get(), 5, stream.opaque()));
+    ASSERT_EQ(cudaStreamSynchronize(stream.stream), cudaSuccess);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 5);
 
     // Clear via IKVCache

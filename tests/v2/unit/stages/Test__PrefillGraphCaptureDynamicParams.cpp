@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -22,6 +23,7 @@
 #include "execution/compute_stages/stages/EmbeddingStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
+#include "execution/compute_stages/stages/RoPEStage.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -651,6 +653,52 @@ namespace
         EXPECT_EQ(kv_cache.lastAdvanceTokens(), 2);
         EXPECT_EQ(kv_cache.get_cached_tokens(0), 2)
             << "segmented capture needs logical metadata before downstream captured attention";
+    }
+
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, IKVCacheBaseDefaultsFailClosed)
+    {
+        RecordingKVCache kv_cache;
+        auto K = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 4});
+        auto V = std::make_unique<FP32Tensor>(std::vector<size_t>{1, 4});
+
+        EXPECT_FALSE(kv_cache.appendWithStream(0, 0, K.get(), V.get(), 1,
+                                               reinterpret_cast<void *>(static_cast<uintptr_t>(0x1))))
+            << "Base appendWithStream must not silently delegate to append()";
+        EXPECT_EQ(kv_cache.get_cached_tokens(0), 0);
+
+        ITensor *out_k = reinterpret_cast<ITensor *>(static_cast<uintptr_t>(0x1));
+        ITensor *out_v = reinterpret_cast<ITensor *>(static_cast<uintptr_t>(0x1));
+        int kv_len = -1;
+        EXPECT_FALSE(kv_cache.get_kv_converted(0, 0, ActivationPrecision::FP16,
+                                               &out_k, &out_v, &kv_len, nullptr))
+            << "Base get_kv_converted must not return raw K/V as a fallback";
+        EXPECT_EQ(out_k, nullptr);
+        EXPECT_EQ(out_v, nullptr);
+        EXPECT_EQ(kv_len, 0);
+    }
+
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, RoPEStageResetClearsDynamicPositionState)
+    {
+        std::vector<int> stale_positions{17, 18, 19};
+
+        RoPEStage::Params params{};
+        params.device_id = DeviceId::cpu();
+        params.seq_len = static_cast<int>(stale_positions.size());
+        params.pos_offset = 17;
+        params.position_ids = stale_positions.data();
+
+        RoPEStage stage(params);
+        stage.updateDynamicParams(/*pos_offset=*/33, /*seq_len=*/1);
+        EXPECT_EQ(stage.getParams().pos_offset, 33);
+        EXPECT_EQ(stage.getParams().seq_len, 1);
+        EXPECT_EQ(stage.getParams().position_ids, nullptr)
+            << "Dynamic graph replay must not keep stale per-token position IDs";
+
+        stage.resetSessionState();
+        EXPECT_EQ(stage.getParams().pos_offset, 0);
+        EXPECT_EQ(stage.getParams().seq_len, 0);
+        EXPECT_EQ(stage.getParams().position_ids, nullptr)
+            << "Request reset must clear any cached position-id state";
     }
 
     TEST_F(Test__PrefillGraphCaptureDynamicParams, LMHead_ReplayUsesLastRealTokenForPaddedBucket)

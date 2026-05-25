@@ -140,6 +140,8 @@ namespace llaminar2
         virtual bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                                void *stream = nullptr,
                                                bool reset_runtime_counts = true) = 0;
+        virtual void resetDecodeHistogramCounts(void *stream = nullptr) = 0;
+        virtual void resetDecodeRuntimeState(void *stream = nullptr) = 0;
     };
 
     class DeviceMoERuntimeTable final : public IMoERuntimeTable
@@ -178,6 +180,8 @@ namespace llaminar2
         bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                        void *stream = nullptr,
                                        bool reset_runtime_counts = true) override;
+        void resetDecodeHistogramCounts(void *stream = nullptr) override;
+        void resetDecodeRuntimeState(void *stream = nullptr) override;
         void ensurePrefillRouteScratchCapacity(int token_capacity, void *stream = nullptr);
 
         const DeviceId &deviceId() const noexcept { return device_id_; }

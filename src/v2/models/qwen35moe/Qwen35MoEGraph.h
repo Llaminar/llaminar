@@ -58,6 +58,9 @@ namespace llaminar2
         /// Override resolver config to register MoE buffer IDs and formulas
         GraphResolverConfig getResolverConfig(int seq_len) const override;
 
+        /// Reset MoE runtime state between independent inference sessions.
+        void resetState() override;
+
     private:
         IMoERuntimeTable *moeRuntimeTableForDevice(DeviceId device,
                                                    int prefill_token_capacity = 0,

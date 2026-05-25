@@ -64,6 +64,12 @@ namespace llaminar2
             return false;
         }
 
+        if (params_.device_id.is_gpu() && !gpuStream())
+        {
+            LOG_ERROR("[RoPEStage] GPU RoPE requires an explicit non-null stage stream");
+            return false;
+        }
+
         // Cast ITensor* to TensorBase* for CPU operations
         auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
         if (!Q_base)

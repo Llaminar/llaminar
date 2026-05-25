@@ -107,6 +107,24 @@ namespace llaminar2
                               const ITensor *K, const ITensor *V,
                               int num_tokens, void *gpu_stream) override;
 
+        /**
+         * @brief Clear all TQ ring entries, scratch views, and device storage.
+         *
+         * The common CUDA base resets host ring metadata, but TQ also owns
+         * compressed ring buffers and FP16 dequant scratch that must not carry
+         * request-local rows across prompt boundaries.
+         */
+        void clear() override;
+
+        /// @brief Clear one layer's TQ ring entries and per-layer scratch storage.
+        void clear_layer(int layer) override;
+
+        /// @brief Clear one sequence across all TQ cache layers.
+        void clear_sequence(int seq_idx) override;
+
+        /// @brief Clear one sequence entry and invalidate this layer's shared scratch.
+        void clear_sequence(int layer, int seq_idx) override;
+
         // Converted read (dequant + optional RoPE)
         bool get_kv_converted(int layer, int seq_idx,
                               ActivationPrecision target,
@@ -122,8 +140,8 @@ namespace llaminar2
 
         // TQ-specific graph capture support (dynamic dequant params)
         void setDynamicDequantParams(int layer, int seq_idx,
-                                      float rope_theta, int position_start,
-                                      void *gpu_stream) override;
+                                     float rope_theta, int position_start,
+                                     void *gpu_stream) override;
 
         // Eviction
         void evict_oldest(int layer, int seq_idx, int num_tokens);
@@ -185,7 +203,8 @@ namespace llaminar2
 
             bool is_wrapped(int max_seq_len) const
             {
-                if (count == 0) return false;
+                if (count == 0)
+                    return false;
                 int t = tail(max_seq_len);
                 return t >= head && count > 0;
             }
@@ -277,7 +296,7 @@ namespace llaminar2
         TQDequantDynamicParams *d_dequant_params_ = nullptr; ///< [n_layers_] device
         TQDequantDynamicParams *h_dequant_params_ = nullptr; ///< [n_layers_] pinned host
 
-        mutable cudaStream_t cached_stream_ = nullptr; ///< Stream from last append(), reused in get_kv_converted()
+        mutable cudaStream_t cached_stream_ = nullptr; ///< Last explicit stream used by append/read operations.
 
         // =====================================================================
         // CUDARingKVCacheBase entry accessors and hooks
@@ -320,6 +339,18 @@ namespace llaminar2
         // Helpers
         void allocate_entry(TQEntry &entry);
         void free_entry(TQEntry &entry);
+
+        /// @brief Return the stream used for clear-time memset operations.
+        cudaStream_t clearStream() const;
+
+        /// @brief Zero the compressed TQ ring storage for one layer/sequence entry.
+        void clearEntryStorage(int layer, int seq_idx, cudaStream_t stream);
+
+        /// @brief Zero and invalidate the FP16 dequant scratch owned by one layer.
+        void clearScratchStorage(int layer, cudaStream_t stream);
+
+        /// @brief Reset graph-capture sidecar params for one layer/sequence entry.
+        void clearDynamicParams(int layer, int seq_idx, cudaStream_t stream);
 
         /// Dequantize a layer's TQ ring into the shared scratch buffer.
         /// Returns false on kernel launch failure.

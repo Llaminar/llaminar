@@ -814,6 +814,14 @@ namespace llaminar2
                 entries_[layer][seq_idx].size = 0;
             }
         }
+        for (auto &layer_shadows : fp32_shadows_)
+        {
+            for (auto &shadow : layer_shadows)
+            {
+                shadow.converted_rows = 0;
+                shadow.last_head = -1;
+            }
+        }
         wrap_warned_ = false;
     }
 
@@ -826,6 +834,11 @@ namespace llaminar2
         }
         entries_[layer][seq_idx].head = 0;
         entries_[layer][seq_idx].size = 0;
+        if (!fp32_shadows_.empty())
+        {
+            fp32_shadows_[layer][seq_idx].converted_rows = 0;
+            fp32_shadows_[layer][seq_idx].last_head = -1;
+        }
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
@@ -839,6 +852,14 @@ namespace llaminar2
         {
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].size = 0;
+        }
+        if (!fp32_shadows_.empty())
+        {
+            for (auto &shadow : fp32_shadows_[layer])
+            {
+                shadow.converted_rows = 0;
+                shadow.last_head = -1;
+            }
         }
     }
 

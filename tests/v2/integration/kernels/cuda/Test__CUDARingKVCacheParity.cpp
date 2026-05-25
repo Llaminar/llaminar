@@ -36,6 +36,35 @@ namespace
         return (err == cudaSuccess && count > 0);
     }
 
+    /**
+     * @brief Owns a CUDA stream for integration tests that exercise stream-aware KV APIs.
+     */
+    class ScopedCudaStream
+    {
+    public:
+        ScopedCudaStream()
+        {
+            EXPECT_EQ(cudaStreamCreate(&stream_), cudaSuccess);
+        }
+
+        ~ScopedCudaStream()
+        {
+            if (stream_)
+                cudaStreamDestroy(stream_);
+        }
+
+        void *opaque() const { return static_cast<void *>(stream_); }
+
+        void synchronize() const
+        {
+            ASSERT_NE(stream_, nullptr);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+    };
+
     // Generate random FP32 data
     std::vector<float> generateRandomFP32(size_t count, unsigned seed = 42)
     {
@@ -720,13 +749,14 @@ TEST(Test__CUDARingKVCache, AppendWithStream_FP32_to_FP16_Conversion)
     ASSERT_NE(K_tensor->gpu_data_ptr(), nullptr);
     ASSERT_NE(V_tensor->gpu_data_ptr(), nullptr);
 
-    // Use appendWithStream (the correct GPU path)
-    // This should detect FP32→FP16 mismatch and convert on GPU
-    cudaStream_t stream = nullptr; // default stream
+    // Use appendWithStream (the correct GPU path). This should detect
+    // FP32→FP16 mismatch and convert on the caller's explicit stream.
+    ScopedCudaStream stream;
     ASSERT_TRUE(cache->appendWithStream(0, 0,
                                         static_cast<const ITensor *>(K_tensor.get()),
                                         static_cast<const ITensor *>(V_tensor.get()),
-                                        num_tokens, stream));
+                                        num_tokens, stream.opaque()));
+    stream.synchronize();
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
@@ -789,18 +819,12 @@ TEST(Test__CUDARingKVCache, AppendWithStream_FP32_to_FP16_Conversion)
 // =============================================================================
 // REGRESSION TEST: FP32 ITensor → FP16 cache via append (non-stream)
 //
-// Validates that the non-stream append(ITensor*) path also correctly handles
-// FP32 data being written to an FP16 cache. Without appendWithStream, the
-// data flows through the raw pointer path which should still produce valid
-// results (the raw FP32 pointer would be passed directly, potentially causing
-// corruption if no conversion occurs).
-//
-// This test serves as a canary: if it starts producing large errors, the
-// non-stream append path has a type mismatch bug similar to the one fixed
-// in appendWithStream.
+// Locks in the fail-fast behavior for the legacy non-stream GPU append path.
+// GPU cache writes must use appendWithStream() so residency, format conversion,
+// and graph-capture ordering all happen on the caller's explicit stream.
 // =============================================================================
 
-TEST(Test__CUDARingKVCache, Append_ITensor_FP32_to_FP16_DetectsCorruption)
+TEST(Test__CUDARingKVCache, Append_ITensor_FP32_to_FP16_RequiresExplicitStream)
 {
     if (!hasCUDA())
     {
@@ -836,43 +860,59 @@ TEST(Test__CUDARingKVCache, Append_ITensor_FP32_to_FP16_DetectsCorruption)
     ASSERT_TRUE(K_tensor->ensureOnDevice(cuda_dev));
     ASSERT_TRUE(V_tensor->ensureOnDevice(cuda_dev));
 
-    // Use the non-stream ITensor append path
-    // NOTE: This path passes raw GPU pointers without type conversion!
-    // The cache sees FP32 bytes as FP16 - this WILL produce wrong values.
-    // We test this to document the known limitation: only appendWithStream()
-    // performs the conversion correctly.
+    // The non-stream ITensor append path used to reinterpret FP32 bytes as
+    // FP16 and write corrupted cache rows. It now fails before touching cache
+    // state, forcing callers onto appendWithStream().
     bool append_ok = cache->append(0, 0,
                                    static_cast<const ITensor *>(K_tensor.get()),
                                    static_cast<const ITensor *>(V_tensor.get()),
                                    num_tokens);
-    ASSERT_TRUE(append_ok) << "append(ITensor) should succeed";
+    ASSERT_FALSE(append_ok) << "GPU append(ITensor) must require appendWithStream()";
+}
 
-    // Read back and verify the data is corrupted (raw FP32→FP16 reinterpret)
-    const void *d_K_out, *d_V_out;
-    int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+TEST(Test__CUDARingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
 
-    std::vector<uint16_t> h_K_out(num_tokens * kv_dim);
-    cudaMemcpy(h_K_out.data(), d_K_out,
-               num_tokens * kv_dim * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 32;
+    const int n_kv_heads = 2;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 4;
 
-    // The non-stream path passes raw FP32 pointers to the FP16 ring buffer.
-    // This reinterprets 4-byte floats as pairs of 2-byte __half values.
-    // 0.5f = 0x3F000000 → first half = 0x0000 (0.0), second half = 0x3F00 (1.875)
-    // So the data will be garbage - not matching the original 0.5f values.
-    float k_cached = fp16_to_fp32(h_K_out[0]);
-    float expected_correct = 0.5f;
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP16,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
 
-    // Document the known limitation: non-stream append does NOT convert types
-    LOG_INFO("[Append_ITensor_FP32_to_FP16] first cached value=" << k_cached
-                                                                 << " (expected if correct: " << expected_correct << ")");
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < num_tokens * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.125f * static_cast<float>((i % 7) - 3);
+        V_tensor->mutable_data()[i] = -0.0625f * static_cast<float>((i % 5) - 2);
+    }
 
-    // If someone fixes the non-stream path to also convert, this test
-    // should be updated to check for correctness instead.
-    // For now, we just verify the call doesn't crash.
+    EXPECT_FALSE(cache->appendWithStream(0, 0,
+                                         static_cast<const ITensor *>(K_tensor.get()),
+                                         static_cast<const ITensor *>(V_tensor.get()),
+                                         num_tokens, nullptr));
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 
-    LOG_INFO("[Append_ITensor_FP32_to_FP16_DetectsCorruption] PASSED - "
-             "append(ITensor) completed without crash");
+    ScopedCudaStream stream;
+    ASSERT_TRUE(cache->appendWithStream(0, 0,
+                                        static_cast<const ITensor *>(K_tensor.get()),
+                                        static_cast<const ITensor *>(V_tensor.get()),
+                                        num_tokens, stream.opaque()));
+    stream.synchronize();
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 }
 
 // =============================================================================

@@ -66,6 +66,24 @@ namespace llaminar2
                               const ITensor *K, const ITensor *V,
                               int num_tokens, void *gpu_stream) override;
 
+        /**
+         * @brief Clear all TQ ring entries, scratch views, and device storage.
+         *
+         * The common ROCm base resets host ring metadata, but TQ owns compressed
+         * ring buffers and FP16 dequant scratch that can otherwise retain rows
+         * across request boundaries.
+         */
+        void clear() override;
+
+        /// @brief Clear one layer's TQ ring entries and per-layer scratch storage.
+        void clear_layer(int layer) override;
+
+        /// @brief Clear one sequence across all TQ cache layers.
+        void clear_sequence(int seq_idx) override;
+
+        /// @brief Clear one sequence entry and invalidate this layer's shared scratch.
+        void clear_sequence(int layer, int seq_idx) override;
+
         // Converted read (dequant + optional RoPE)
         bool get_kv_converted(int layer, int seq_idx,
                               ActivationPrecision target,
@@ -208,6 +226,18 @@ namespace llaminar2
 
         bool dequant_to_scratch(int layer, int seq_idx, float rope_theta = 0.0f, int position_start = 0, hipStream_t stream = nullptr) const;
 
+        /// @brief Return the stream used for clear-time memset operations.
+        hipStream_t clearStream() const;
+
+        /// @brief Zero the compressed TQ ring storage for one layer/sequence entry.
+        void clearEntryStorage(int layer, int seq_idx, hipStream_t stream);
+
+        /// @brief Zero and invalidate the FP16 dequant scratch owned by one layer.
+        void clearScratchStorage(int layer, hipStream_t stream);
+
+        /// @brief Reset graph-capture sidecar params for one layer/sequence entry.
+        void clearDynamicParams(int layer, int seq_idx, hipStream_t stream);
+
         size_t tq8_block_size_;
         size_t tq4_block_size_;
 
@@ -226,7 +256,7 @@ namespace llaminar2
         HIPTQDequantDynamicParams *d_dequant_params_ = nullptr; ///< Device array [n_layers_]
         HIPTQDequantDynamicParams *h_dequant_params_ = nullptr; ///< Pinned host array [n_layers_]
 
-        mutable hipStream_t cached_stream_ = nullptr; ///< Legacy fallback when callers omit KVReadParams::gpu_stream.
+        mutable hipStream_t cached_stream_ = nullptr; ///< Last explicit stream used by append/read operations.
     };
 
 } // namespace llaminar2

@@ -82,6 +82,18 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
+        /**
+         * @brief Clear per-request routing metadata while preserving kernel handles.
+         */
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            routing_indices_f32_.clear();
+            routing_weights_.clear();
+            router_logits_.clear();
+            cached_routing_ = MoERoutingResult{};
+        }
+
         // Test accessors
         void setMoEKernelForTesting(IMoEKernel *kernel) { moe_kernel_ = kernel; }
 

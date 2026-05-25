@@ -92,6 +92,55 @@ namespace llaminar2
             return;
         }
 
+        // Handle debug-only KV append cache snapshots. These outputs are
+        // populated only when LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT is enabled and
+        // expose the post-append persistent cache rows that attention consumes.
+        if (name.find("_kv_append") != std::string::npos)
+        {
+            size_t pos = name.find("_kv_append");
+            std::string prefix = name.substr(0, pos);
+
+            auto storeRowsForSmallAppendSource = [&](const std::string &base_key,
+                                                     const StageDumpInfo::OutputBuffer &output)
+            {
+                if (!output.data || output.rows == 0 || output.cols == 0 || output.rows > 16)
+                    return;
+                if (std::string(output.dtype ? output.dtype : "") != "FP32")
+                    return;
+
+                const auto *fp32 = static_cast<const float *>(output.data);
+                for (size_t row = 0; row < output.rows; ++row)
+                {
+                    auto row_output = output;
+                    row_output.data = fp32 + row * output.cols;
+                    row_output.rows = 1;
+                    row_output.byte_size = output.cols * sizeof(float);
+                    row_output.element_size = sizeof(float);
+                    storeOutput(base_key + "_ROW" + std::to_string(row), row_output);
+                }
+            };
+
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "cache_k" && output.data)
+                    storeOutput(prefix + "_KV_CACHE_K", output);
+                else if (output_name == "cache_v" && output.data)
+                    storeOutput(prefix + "_KV_CACHE_V", output);
+                else if (output_name == "source_k" && output.data)
+                {
+                    storeOutput(prefix + "_KV_APPEND_SOURCE_K", output);
+                    storeRowsForSmallAppendSource(prefix + "_KV_APPEND_SOURCE_K", output);
+                }
+                else if (output_name == "source_v" && output.data)
+                {
+                    storeOutput(prefix + "_KV_APPEND_SOURCE_V", output);
+                    storeRowsForSmallAppendSource(prefix + "_KV_APPEND_SOURCE_V", output);
+                }
+            }
+            return;
+        }
+
         // Handle Qwen3.5 full-attention output gate. This is the gated context
         // immediately before Wo, matching HuggingFace o_proj's pre-hook input.
         if (name.find("_attn_output_gate") != std::string::npos)
@@ -101,6 +150,53 @@ namespace llaminar2
 
             if (!dump.outputs.empty() && dump.outputs[0].data)
                 storeOutput(prefix + "_ATTENTION_CONTEXT_GATED", dump.outputs[0]);
+            return;
+        }
+
+        // Handle attention stage debug snapshots. The normal output is the
+        // attention context; optional named outputs expose effective K/V after
+        // cache read/conversion, immediately before the attention kernel.
+        if (name.find("_attention") != std::string::npos)
+        {
+            size_t pos = name.find("_attention");
+            std::string prefix = name.substr(0, pos);
+
+            auto storeRowsForSmallEffectiveKV = [&](const std::string &base_key,
+                                                    const StageDumpInfo::OutputBuffer &output)
+            {
+                if (!output.data || output.rows == 0 || output.cols == 0 || output.rows > 16)
+                    return;
+                if (std::string(output.dtype ? output.dtype : "") != "FP32")
+                    return;
+
+                const auto *fp32 = static_cast<const float *>(output.data);
+                for (size_t row = 0; row < output.rows; ++row)
+                {
+                    auto row_output = output;
+                    row_output.data = fp32 + row * output.cols;
+                    row_output.rows = 1;
+                    row_output.byte_size = output.cols * sizeof(float);
+                    row_output.element_size = sizeof(float);
+                    storeOutput(base_key + "_ROW" + std::to_string(row), row_output);
+                }
+            };
+
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "output" && output.data)
+                    storeOutput(prefix + "_ATTENTION_CONTEXT", output);
+                else if (output_name == "effective_k" && output.data)
+                {
+                    storeOutput(prefix + "_ATTENTION_EFFECTIVE_K", output);
+                    storeRowsForSmallEffectiveKV(prefix + "_ATTENTION_EFFECTIVE_K", output);
+                }
+                else if (output_name == "effective_v" && output.data)
+                {
+                    storeOutput(prefix + "_ATTENTION_EFFECTIVE_V", output);
+                    storeRowsForSmallEffectiveKV(prefix + "_ATTENTION_EFFECTIVE_V", output);
+                }
+            }
             return;
         }
 

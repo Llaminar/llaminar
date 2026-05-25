@@ -109,6 +109,35 @@ namespace llaminar2
             cached_seq_len = 0;
             valid = false;
         }
+
+        /**
+         * @brief Reset request-scoped state while preserving cached graph topology.
+         *
+         * The decode graph cache is intended to survive prompt boundaries. Stages
+         * inside the cached graphs can still own request-derived metadata (for
+         * example stashed routing snapshots, dynamic stream pointers, or replay
+         * callbacks), so clear_cache() must reset that state explicitly instead
+         * of marking every cached graph invalid and rebuilding the topology.
+         */
+        void resetSessionState()
+        {
+            auto reset_graph = [](std::unique_ptr<ComputeGraph> &graph)
+            {
+                if (!graph)
+                    return;
+
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            };
+
+            reset_graph(attention_decode);
+            reset_graph(ffn_decode);
+        }
     };
 
     /**
@@ -1645,14 +1674,15 @@ namespace llaminar2
                 if (ctx && dev.is_gpu())
                     ctx->synchronize();
             }
-            // Invalidate layer graph caches (lightweight, just validity flags)
+            // Layer decode graphs may own per-request stage/kernel state, so
+            // make them rebuild for the next independent prompt.
             for (auto &entry : layer_graph_cache_)
             {
-                entry.valid = false;
+                entry.invalidate();
             }
             if (forward_engine_)
             {
-                forward_engine_->resetSessionReplayState();
+                forward_engine_->clearCache();
             }
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};

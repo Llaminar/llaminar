@@ -110,52 +110,13 @@ namespace llaminar2
                                   const ITensor *K, const ITensor *V,
                                   int num_tokens)
     {
-        if (!K || !V)
-        {
-            LOG_DEBUG("[ICUDARingKVCache::append(ITensor)] Null K or V tensor");
-            return false;
-        }
-
-        const auto target = DeviceId::cuda(device_id());
-
-        // Try existing GPU pointers first
-        const void *d_k = K->gpu_data_ptr();
-        const void *d_v = V->gpu_data_ptr();
-
-        // If missing, force residency on cache device
-        if (!d_k)
-        {
-            auto *k_mut = const_cast<ITensor *>(K);
-            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
-            if (!(k_tensor ? k_tensor->ensureOnDevice(target) : k_mut->ensureOnDevice(target)))
-            {
-                LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Failed to ensure K on "
-                          << target.toString());
-                return false;
-            }
-            d_k = K->gpu_data_ptr();
-        }
-        if (!d_v)
-        {
-            auto *v_mut = const_cast<ITensor *>(V);
-            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
-            if (!(v_tensor ? v_tensor->ensureOnDevice(target) : v_mut->ensureOnDevice(target)))
-            {
-                LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Failed to ensure V on "
-                          << target.toString());
-                return false;
-            }
-            d_v = V->gpu_data_ptr();
-        }
-
-        if (!d_k || !d_v)
-        {
-            LOG_ERROR("[ICUDARingKVCache::append(ITensor)] K or V tensor lacks GPU data after ensureOnDevice().");
-            return false;
-        }
-
-        // Delegate to the device pointer version (with default stream 0)
-        return append(layer, seq_idx, d_k, d_v, num_tokens, 0);
+        (void)layer;
+        (void)seq_idx;
+        (void)K;
+        (void)V;
+        (void)num_tokens;
+        LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Explicit CUDA stream required; use appendWithStream()");
+        return false;
     }
 
     bool ICUDARingKVCache::appendWithStream(int layer, int seq_idx,
@@ -165,6 +126,11 @@ namespace llaminar2
         if (!K || !V)
         {
             LOG_DEBUG("[ICUDARingKVCache::appendWithStream] Null K or V tensor");
+            return false;
+        }
+        if (!gpu_stream)
+        {
+            LOG_ERROR("[ICUDARingKVCache::appendWithStream] Null CUDA stream is not allowed");
             return false;
         }
 
@@ -721,12 +687,17 @@ namespace llaminar2
         const auto &entry = entries_[layer][seq_idx];
         if (entry.count == 0)
         {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
             if (out_kv_len)
                 *out_kv_len = 0;
             return true;
         }
 
-        // If no RoPE requested, fall back to raw cache tensors.
+        // If no RoPE is requested, the raw cache tensors already have the
+        // required representation.
         // Use qualified call to avoid virtual dispatch — CUDAHybridRingKVCache
         // overrides get_kv() with layer remapping, but the layer index passed here
         // has already been remapped by the hybrid override of get_kv_converted().
@@ -737,7 +708,8 @@ namespace llaminar2
         }
 
         cudaSetDevice(device_id_);
-        const cudaStream_t stream = getEffectiveStream(nullptr);
+        const cudaStream_t stream = getEffectiveStream(
+            rope ? static_cast<cudaStream_t>(rope->gpu_stream) : nullptr);
 
         ensureRoPEShadow(layer, seq_idx);
         auto &shadow = rope_shadows_[layer][seq_idx];

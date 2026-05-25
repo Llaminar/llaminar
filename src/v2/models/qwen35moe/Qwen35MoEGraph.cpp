@@ -190,6 +190,21 @@ namespace llaminar2
     {
     }
 
+    void Qwen35MoEGraph::resetState()
+    {
+        Qwen35Graph::resetState();
+
+        if (config_.moe.decode_histogram)
+            config_.moe.decode_histogram->resetWindow();
+
+        for (auto &[key, table] : moe_runtime_tables_)
+        {
+            (void)key;
+            if (table)
+                table->resetDecodeRuntimeState();
+        }
+    }
+
     IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(DeviceId device,
                                                                int prefill_token_capacity,
                                                                const std::string &key_suffix)

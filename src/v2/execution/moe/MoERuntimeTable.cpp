@@ -261,6 +261,68 @@ namespace llaminar2
         return true;
     }
 
+    void DeviceMoERuntimeTable::resetDecodeHistogramCounts(void *stream)
+    {
+        for (auto &state : host_layers_)
+            std::fill(state.decode_histogram, state.decode_histogram + num_experts_, 0ULL);
+
+        if (!mirror_to_device_)
+            return;
+
+#ifdef HAVE_ROCM
+        const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
+        throwOnHipError(set_err, "[MoERuntimeTable] hipSetDevice failed for decode histogram reset");
+        auto hip_stream = static_cast<hipStream_t>(stream);
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            auto *dst = device_layers_[layer_idx].decode_histogram;
+            throwOnHipError(hipMemsetAsync(dst,
+                                           0,
+                                           static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                                           hip_stream),
+                            layerPrefix(layer_idx) + "hipMemsetAsync failed for decode histogram reset");
+        }
+        throwOnHipError(hipStreamSynchronize(hip_stream),
+                        "[MoERuntimeTable] hipStreamSynchronize failed for decode histogram reset");
+#else
+        (void)stream;
+        throw std::runtime_error("[MoERuntimeTable] ROCm decode histogram reset requested but HAVE_ROCM is not enabled");
+#endif
+    }
+
+    void DeviceMoERuntimeTable::resetDecodeRuntimeState(void *stream)
+    {
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+        {
+            auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+            const auto &scratch = prefill_route_scratch_.empty()
+                                      ? PrefillRouteScratchAllocation{}
+                                      : prefill_route_scratch_[static_cast<size_t>(layer_idx)];
+
+            resetLayer(state);
+            state.route_expert_ids = scratch.route_expert_ids;
+            state.route_weights = scratch.route_weights;
+            state.expert_counts = scratch.expert_counts;
+            state.expert_offsets = scratch.expert_offsets;
+            state.grouped_token_ids = scratch.grouped_token_ids;
+            state.grouped_route_weights = scratch.grouped_route_weights;
+            state.prefill_token_capacity = scratch.token_capacity;
+            state.prefill_route_capacity = scratch.route_capacity;
+        }
+
+        if (!mirror_to_device_)
+            return;
+
+#ifdef HAVE_ROCM
+        for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
+            uploadLayerState(layer_idx, stream);
+        synchronizeHipStream(stream, "[MoERuntimeTable] hipStreamSynchronize failed for decode runtime reset");
+#else
+        (void)stream;
+        throw std::runtime_error("[MoERuntimeTable] ROCm decode runtime reset requested but HAVE_ROCM is not enabled");
+#endif
+    }
+
     void DeviceMoERuntimeTable::ensurePrefillRouteScratchCapacity(int token_capacity, void *stream)
     {
         if (token_capacity <= 0)

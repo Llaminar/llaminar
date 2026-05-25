@@ -214,51 +214,13 @@ namespace llaminar2
                                   const ITensor *K, const ITensor *V,
                                   int num_tokens)
     {
-        if (!K || !V)
-        {
-            LOG_DEBUG("[IROCmRingKVCache::append(ITensor)] Null K or V tensor");
-            return false;
-        }
-
-        const auto target = DeviceId::rocm(device_id());
-
-        // Get GPU data pointers from tensors via ITensor interface
-        const void *d_k = K->gpu_data_ptr();
-        const void *d_v = V->gpu_data_ptr();
-
-        if (!d_k)
-        {
-            auto *k_mut = const_cast<ITensor *>(K);
-            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
-            if (!(k_tensor ? k_tensor->ensureOnDevice(target) : k_mut->ensureOnDevice(target)))
-            {
-                LOG_ERROR("[IROCmRingKVCache::append(ITensor)] Failed to ensure K on "
-                          << target.toString());
-                return false;
-            }
-            d_k = K->gpu_data_ptr();
-        }
-        if (!d_v)
-        {
-            auto *v_mut = const_cast<ITensor *>(V);
-            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
-            if (!(v_tensor ? v_tensor->ensureOnDevice(target) : v_mut->ensureOnDevice(target)))
-            {
-                LOG_ERROR("[IROCmRingKVCache::append(ITensor)] Failed to ensure V on "
-                          << target.toString());
-                return false;
-            }
-            d_v = V->gpu_data_ptr();
-        }
-
-        if (!d_k || !d_v)
-        {
-            LOG_ERROR("[IROCmRingKVCache::append(ITensor)] K or V tensor lacks GPU data after ensureOnDevice().");
-            return false;
-        }
-
-        // Delegate to the device pointer version (with default stream 0)
-        return append(layer, seq_idx, d_k, d_v, num_tokens, 0);
+        (void)layer;
+        (void)seq_idx;
+        (void)K;
+        (void)V;
+        (void)num_tokens;
+        LOG_ERROR("[IROCmRingKVCache::append(ITensor)] Explicit HIP stream required; use appendWithStream()");
+        return false;
     }
 
     bool IROCmRingKVCache::appendWithStream(int layer, int seq_idx,
@@ -268,6 +230,11 @@ namespace llaminar2
         if (!K || !V)
         {
             LOG_DEBUG("[IROCmRingKVCache::appendWithStream] Null K or V tensor");
+            return false;
+        }
+        if (!gpu_stream)
+        {
+            LOG_ERROR("[IROCmRingKVCache::appendWithStream] Null HIP stream is not allowed");
             return false;
         }
 
@@ -866,11 +833,13 @@ namespace llaminar2
             const DataT *d_k_adjusted = d_k + static_cast<size_t>(tokens_to_skip) * kv_storage_dim_;
             const DataT *d_v_adjusted = d_v + static_cast<size_t>(tokens_to_skip) * kv_storage_dim_;
 
-            // Use dynamic head params when available and stream is provided.
-            // This path is graph-capturable: the H2D copy and kernel launch are
-            // recorded in the graph, and on replay setDynamicHead() updates the
-            // pinned host buffer before the captured H2D re-reads it.
-            if (d_head_params_ && h_head_params_ && stream)
+            // Use dynamic head params only while recording a graph. In regular
+            // execution, the scalar-head append path avoids an unnecessary
+            // pinned-host H2D dependency and snapshots the host head value at
+            // launch time. Captured graphs still need the dynamic path so replay
+            // can refresh the head through setDynamicHead() before the captured
+            // H2D copy runs.
+            if (capture_active && d_head_params_ && h_head_params_ && stream)
             {
                 int idx = layer * batch_size_ + seq_idx;
                 h_head_params_[idx] = entry.head;
@@ -1791,12 +1760,17 @@ namespace llaminar2
         const auto &entry = entries_[layer][seq_idx];
         if (entry.count == 0)
         {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
             if (out_kv_len)
                 *out_kv_len = 0;
             return true;
         }
 
-        // If no RoPE requested, fall back to raw cache tensors.
+        // If no RoPE is requested, the raw cache tensors already have the
+        // required representation.
         // Use qualified call to avoid virtual dispatch — ROCmHybridRingKVCache
         // overrides get_kv() with layer remapping, but the layer index passed here
         // has already been remapped by the hybrid override of get_kv_converted().

@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
@@ -174,6 +175,12 @@ namespace llaminar2
         {
             IComputeStage::resetSessionState();
             params_.position_offset = 0;
+            debug_effective_k_snapshot_.clear();
+            debug_effective_v_snapshot_.clear();
+            debug_effective_k_rows_ = 0;
+            debug_effective_k_cols_ = 0;
+            debug_effective_v_rows_ = 0;
+            debug_effective_v_cols_ = 0;
             if (cached_kernel_)
             {
                 cached_kernel_->resetDynamicState();
@@ -203,6 +210,16 @@ namespace llaminar2
         /// Cached attention kernel for workspace binding
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
+
+        /// Debug-only FP32 copies of the effective K/V tensors passed to the
+        /// attention kernel. Populated only when
+        /// LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT is enabled.
+        mutable std::vector<float> debug_effective_k_snapshot_;
+        mutable std::vector<float> debug_effective_v_snapshot_;
+        mutable size_t debug_effective_k_rows_ = 0;
+        mutable size_t debug_effective_k_cols_ = 0;
+        mutable size_t debug_effective_v_rows_ = 0;
+        mutable size_t debug_effective_v_cols_ = 0;
 
         /**
          * @brief Get or create the attention kernel

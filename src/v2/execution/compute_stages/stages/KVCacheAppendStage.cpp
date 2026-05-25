@@ -19,10 +19,12 @@
 
 #include "../../../utils/KVCacheProfiler.h"
 #include "../../../tensors/GpuTensorView.h"
+#include "../../../backends/BackendManager.h"
 
 #include <immintrin.h>
 #include <cstring>
 #include <chrono>
+#include <cstdlib>
 
 namespace
 {
@@ -63,6 +65,130 @@ namespace
             return sizeof(llaminar2::Q8_1Block);
         default:
             return 0;
+        }
+    }
+
+    static bool debugKVCacheSnapshotEnabled()
+    {
+        const char *env = std::getenv("LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT");
+        return env && std::atoi(env) != 0;
+    }
+
+    static bool debugKVCacheSnapshotLayerSelected(int layer_idx)
+    {
+        const char *env = std::getenv("LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT_LAYER");
+        if (!env || *env == '\0')
+        {
+            return true;
+        }
+        return std::atoi(env) == layer_idx;
+    }
+
+    static bool debugKVAppendSourceSnapshotEnabled()
+    {
+        const char *env = std::getenv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT");
+        return env && std::atoi(env) != 0;
+    }
+
+    static bool debugKVAppendSourceSnapshotLayerSelected(int layer_idx)
+    {
+        const char *env = std::getenv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_LAYER");
+        if (!env || *env == '\0')
+        {
+            return true;
+        }
+        return std::atoi(env) == layer_idx;
+    }
+
+    static bool copyTensorBytesForDebugSnapshot(
+        const llaminar2::ITensor *tensor,
+        llaminar2::DeviceId device,
+        void *stream,
+        std::vector<uint8_t> &bytes)
+    {
+        if (!tensor || bytes.empty())
+        {
+            return false;
+        }
+
+        const void *device_ptr = tensor->gpu_data_ptr();
+        if (device_ptr && device.is_gpu())
+        {
+            llaminar2::IBackend *backend = llaminar2::getBackendFor(device);
+            if (!backend)
+            {
+                return false;
+            }
+
+            return backend->deviceToHostFast(
+                bytes.data(), device_ptr, bytes.size(), device.toKernelDeviceIndex(), stream);
+        }
+
+        if (const void *host = tensor->raw_data())
+        {
+            std::memcpy(bytes.data(), host, bytes.size());
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool tensorToFP32DebugSnapshot(
+        const llaminar2::ITensor *tensor,
+        llaminar2::DeviceId device,
+        void *stream,
+        size_t rows,
+        size_t cols,
+        std::vector<float> &out)
+    {
+        if (!tensor || rows == 0 || cols == 0)
+        {
+            out.clear();
+            return false;
+        }
+
+        const size_t count = rows * cols;
+        const size_t elem_size = elementSizeForTensorType(tensor->native_type());
+        if (elem_size == 0)
+        {
+            out.clear();
+            return false;
+        }
+
+        std::vector<uint8_t> bytes(count * elem_size);
+        if (!copyTensorBytesForDebugSnapshot(tensor, device, stream, bytes))
+        {
+            out.clear();
+            return false;
+        }
+
+        out.resize(count);
+        switch (tensor->native_type())
+        {
+        case llaminar2::TensorType::FP32:
+            std::memcpy(out.data(), bytes.data(), count * sizeof(float));
+            return true;
+        case llaminar2::TensorType::FP16:
+        {
+            const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
+            for (size_t i = 0; i < count; ++i)
+            {
+                out[i] = llaminar2::fp16_to_fp32(src[i]);
+            }
+            return true;
+        }
+        case llaminar2::TensorType::BF16:
+        {
+            const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
+            for (size_t i = 0; i < count; ++i)
+            {
+                out[i] = llaminar2::simd::bf16_to_fp32(src[i]);
+            }
+            return true;
+        }
+        default:
+            out.clear();
+            return false;
         }
     }
 }
@@ -131,6 +257,40 @@ namespace llaminar2
 
             bool success = false;
             void *stream = gpuStream();
+            if (params_.device_id.is_gpu() && !stream)
+            {
+                LOG_ERROR("[KVCacheAppendStage] GPU KV append requires an explicit non-null stage stream");
+                return false;
+            }
+
+            if (debugKVAppendSourceSnapshotEnabled() &&
+                debugKVAppendSourceSnapshotLayerSelected(params_.layer_idx))
+            {
+                const size_t rows = static_cast<size_t>(num_tokens);
+                const size_t k_cols = k_tensor->shape().size() > 1 ? k_tensor->shape()[1] : k_tensor->cols();
+                const size_t v_cols = v_tensor->shape().size() > 1 ? v_tensor->shape()[1] : v_tensor->cols();
+                const bool have_k = tensorToFP32DebugSnapshot(
+                    k_tensor, params_.device_id, stream, rows, k_cols,
+                    debug_append_source_k_snapshot_);
+                const bool have_v = tensorToFP32DebugSnapshot(
+                    v_tensor, params_.device_id, stream, rows, v_cols,
+                    debug_append_source_v_snapshot_);
+
+                debug_append_source_k_rows_ = have_k ? rows : 0;
+                debug_append_source_k_cols_ = have_k ? k_cols : 0;
+                debug_append_source_v_rows_ = have_v ? rows : 0;
+                debug_append_source_v_cols_ = have_v ? v_cols : 0;
+            }
+            else
+            {
+                debug_append_source_k_snapshot_.clear();
+                debug_append_source_v_snapshot_.clear();
+                debug_append_source_k_rows_ = 0;
+                debug_append_source_k_cols_ = 0;
+                debug_append_source_v_rows_ = 0;
+                debug_append_source_v_cols_ = 0;
+            }
+
             if (stream || params_.device_id.is_gpu())
             {
                 // GPU path: fine-grained profiling handled inside appendWithStream
@@ -173,6 +333,15 @@ namespace llaminar2
                 // this guard disabled and continue to use replay callbacks or
                 // real post-capture execution instead.
                 params_.kv_cache->advanceHead(params_.layer_idx, seq_idx, num_tokens);
+            }
+
+            if (success)
+            {
+                // Snapshot callbacks may request KV cache contents from
+                // buildDumpInfoImpl().  The executor often builds dump info
+                // before execute() for coherence, so force a post-append
+                // rebuild when debug cache/source snapshots are enabled.
+                invalidateDumpInfoCache();
             }
 
             return success;
@@ -1368,6 +1537,54 @@ namespace llaminar2
         if (params_.V_dequant_out)
         {
             info.addOutput("V_dequant", params_.V_dequant_out, params_.V_dequant_out->rows(), params_.V_dequant_out->cols());
+        }
+
+        if (debugKVAppendSourceSnapshotEnabled() &&
+            debugKVAppendSourceSnapshotLayerSelected(params_.layer_idx))
+        {
+            if (!debug_append_source_k_snapshot_.empty() &&
+                debug_append_source_k_rows_ > 0 && debug_append_source_k_cols_ > 0)
+            {
+                info.addOutput("source_k", debug_append_source_k_snapshot_.data(),
+                               debug_append_source_k_rows_, debug_append_source_k_cols_);
+            }
+            if (!debug_append_source_v_snapshot_.empty() &&
+                debug_append_source_v_rows_ > 0 && debug_append_source_v_cols_ > 0)
+            {
+                info.addOutput("source_v", debug_append_source_v_snapshot_.data(),
+                               debug_append_source_v_rows_, debug_append_source_v_cols_);
+            }
+        }
+
+        if (debugKVCacheSnapshotEnabled() &&
+            debugKVCacheSnapshotLayerSelected(params_.layer_idx) &&
+            params_.kv_cache)
+        {
+            ITensor *cache_k = nullptr;
+            ITensor *cache_v = nullptr;
+            int kv_len = 0;
+            if (params_.kv_cache->get_kv(
+                    params_.layer_idx, params_.seq_idx, &cache_k, &cache_v, &kv_len) &&
+                kv_len > 0 && cache_k && cache_v)
+            {
+                const size_t rows = static_cast<size_t>(kv_len);
+                const size_t k_cols = cache_k->cols();
+                const size_t v_cols = cache_v->cols();
+                void *stream = gpuStream();
+                const bool have_k = tensorToFP32DebugSnapshot(
+                    cache_k, params_.device_id, stream, rows, k_cols, debug_cache_k_snapshot_);
+                const bool have_v = tensorToFP32DebugSnapshot(
+                    cache_v, params_.device_id, stream, rows, v_cols, debug_cache_v_snapshot_);
+
+                if (have_k)
+                {
+                    info.addOutput("cache_k", debug_cache_k_snapshot_.data(), rows, k_cols);
+                }
+                if (have_v)
+                {
+                    info.addOutput("cache_v", debug_cache_v_snapshot_.data(), rows, v_cols);
+                }
+            }
         }
 
         info.addScalarInt("layer_idx", params_.layer_idx);

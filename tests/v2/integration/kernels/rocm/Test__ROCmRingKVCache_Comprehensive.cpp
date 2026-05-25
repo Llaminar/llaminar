@@ -86,6 +86,25 @@ namespace
         HipBuffer &operator=(const HipBuffer &) = delete;
     };
 
+    // RAII wrapper for the explicit stream required by ITensor KV appends.
+    struct ScopedHipStream
+    {
+        hipStream_t stream = nullptr;
+
+        ScopedHipStream()
+        {
+            EXPECT_EQ(hipStreamCreate(&stream), hipSuccess);
+        }
+
+        ~ScopedHipStream()
+        {
+            if (stream)
+                hipStreamDestroy(stream);
+        }
+
+        void *opaque() const { return static_cast<void *>(stream); }
+    };
+
 } // namespace
 
 // =============================================================================
@@ -493,7 +512,13 @@ TEST(Test__ROCmRingKVCache_Comprehensive, IKVCache_PolymorphismCompliance)
     k_tensor->ensureOnDevice(rocm_dev);
     v_tensor->ensureOnDevice(rocm_dev);
 
-    ASSERT_TRUE(cache->append(0, 0, k_tensor.get(), v_tensor.get(), 5));
+    // The generic ITensor append path must fail closed unless a caller supplies
+    // the execution stream used by the graph/stage path.
+    EXPECT_FALSE(cache->append(0, 0, k_tensor.get(), v_tensor.get(), 5));
+
+    ScopedHipStream stream;
+    ASSERT_TRUE(cache->appendWithStream(0, 0, k_tensor.get(), v_tensor.get(), 5, stream.opaque()));
+    ASSERT_EQ(hipStreamSynchronize(stream.stream), hipSuccess);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 5);
 
     // Clear via IKVCache
@@ -670,9 +695,12 @@ TEST(Test__ROCmRingKVCache_Comprehensive, FP16_BasicAppendRetrieve)
         uint16_t sign = (bits >> 16) & 0x8000;
         int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
         uint16_t frac = (bits >> 13) & 0x03FF;
-        if (exp <= 0) h_K_fp16[i] = sign;
-        else if (exp >= 31) h_K_fp16[i] = sign | 0x7C00;
-        else h_K_fp16[i] = sign | (static_cast<uint16_t>(exp) << 10) | frac;
+        if (exp <= 0)
+            h_K_fp16[i] = sign;
+        else if (exp >= 31)
+            h_K_fp16[i] = sign | 0x7C00;
+        else
+            h_K_fp16[i] = sign | (static_cast<uint16_t>(exp) << 10) | frac;
     }
 
     uint16_t *d_K, *d_V;

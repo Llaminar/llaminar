@@ -120,7 +120,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_RoPEChangesK)
     ITensor *out_k_rope = nullptr;
     ITensor *out_v_rope = nullptr;
     ASSERT_TRUE(cache->get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                         &out_k_rope, &out_v_rope, &kv_len, &rope_params));
+                                        &out_k_rope, &out_v_rope, &kv_len, &rope_params));
     ASSERT_NE(out_k_rope, nullptr);
     EXPECT_EQ(kv_len, num_tokens);
 
@@ -183,7 +183,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_VUnchangedByRoPE)
     ITensor *out_v = nullptr;
     int kv_len = 0;
     ASSERT_TRUE(cache->get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                         &out_k, &out_v, &kv_len, &rope_params));
+                                        &out_k, &out_v, &kv_len, &rope_params));
 
     // V values should match original (within FP16 precision)
     auto v_out = downloadFP16ToFP32(out_v->gpu_data_ptr(), num_tokens * kv_dim);
@@ -235,10 +235,13 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, Q8_1_RoPEChangesK)
     ASSERT_TRUE(V_tensor->ensureOnDevice(cuda_dev));
 
     cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
     ASSERT_TRUE(cache->appendWithStream(0, 0,
                                         static_cast<const ITensor *>(K_tensor.get()),
                                         static_cast<const ITensor *>(V_tensor.get()),
                                         num_tokens, stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 
     // Get with RoPE
     IKVCache::KVReadParams rope_params;
@@ -251,7 +254,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, Q8_1_RoPEChangesK)
     ITensor *out_v = nullptr;
     int kv_len = 0;
     ASSERT_TRUE(cache->get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                         &out_k, &out_v, &kv_len, &rope_params));
+                                        &out_k, &out_v, &kv_len, &rope_params));
     ASSERT_NE(out_k, nullptr);
     EXPECT_EQ(kv_len, num_tokens);
 
@@ -307,7 +310,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP32_RoPEConvertsToFP16)
     ITensor *out_v = nullptr;
     int kv_len = 0;
     ASSERT_TRUE(cache->get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                         &out_k, &out_v, &kv_len, &rope_params));
+                                        &out_k, &out_v, &kv_len, &rope_params));
     ASSERT_NE(out_k, nullptr);
     EXPECT_EQ(kv_len, num_tokens);
 

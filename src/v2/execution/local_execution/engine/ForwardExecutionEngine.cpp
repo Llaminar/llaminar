@@ -381,6 +381,8 @@ namespace llaminar2
 
         // Classify the execution path
         const bool is_decode = (input.seq_len == 1 && input.batch_size <= 1);
+        const int first_position = input.position_ids ? input.position_ids[0] : input.position_offset;
+        const bool decode_has_history = is_decode && first_position > 0;
         const bool has_unified_pp = config_.has_unified_pp;
         const bool is_standard_path = !has_unified_pp && !config_.pp_stage_config.has_value();
         const bool is_partial_pp_path = !has_unified_pp && config_.pp_stage_config.has_value();
@@ -534,6 +536,7 @@ namespace llaminar2
                 effective_input.batch_size,
                 effective_input.device,
                 is_decode,
+                decode_has_history,
                 is_standard_path,
                 config_.pp_stage_config.has_value(),
                 pp_first_layer,
@@ -1405,6 +1408,7 @@ namespace llaminar2
                       << ", batch_size=" << signature.batch_size
                       << ", device=" << signature.device.to_string()
                       << ", decode=" << signature.decode
+                      << ", decode_has_history=" << signature.decode_has_history
                       << "] (" << build_cache->graph->size() << " stages)");
 
             if (signature.is_bucketed_prefill)

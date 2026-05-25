@@ -27,6 +27,7 @@
 #include "kernels/rocm/kvcache/ROCmRingKVCacheFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/DeviceId.h"
+#include "tensors/Tensors.h"
 #include "utils/Logger.h"
 
 using namespace llaminar2;
@@ -40,6 +41,35 @@ namespace
         hipError_t err = hipGetDeviceCount(&count);
         return (err == hipSuccess && count > 0);
     }
+
+    /**
+     * @brief Owns a HIP stream for tests that exercise stream-aware KV cache APIs.
+     */
+    class ScopedHipStream
+    {
+    public:
+        ScopedHipStream()
+        {
+            EXPECT_EQ(hipStreamCreate(&stream_), hipSuccess);
+        }
+
+        ~ScopedHipStream()
+        {
+            if (stream_)
+                hipStreamDestroy(stream_);
+        }
+
+        void *opaque() const { return static_cast<void *>(stream_); }
+
+        void synchronize() const
+        {
+            ASSERT_NE(stream_, nullptr);
+            ASSERT_EQ(hipStreamSynchronize(stream_), hipSuccess);
+        }
+
+    private:
+        hipStream_t stream_ = nullptr;
+    };
 
     // Generate random FP32 data
     std::vector<float> generateRandomFP32(size_t count, unsigned seed = 42)
@@ -563,6 +593,54 @@ TEST(Test__ROCmRingKVCache, Clear_FP32)
     hipFree(d_V);
 
     LOG_INFO("[Clear_FP32] PASSED");
+}
+
+TEST(Test__ROCmRingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 32;
+    const int n_kv_heads = 2;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 4;
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP16>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < num_tokens * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.125f * static_cast<float>((i % 7) - 3);
+        V_tensor->mutable_data()[i] = -0.0625f * static_cast<float>((i % 5) - 2);
+    }
+
+    EXPECT_FALSE(cache->append(0, 0,
+                               static_cast<const ITensor *>(K_tensor.get()),
+                               static_cast<const ITensor *>(V_tensor.get()),
+                               num_tokens));
+    EXPECT_FALSE(cache->appendWithStream(0, 0,
+                                         static_cast<const ITensor *>(K_tensor.get()),
+                                         static_cast<const ITensor *>(V_tensor.get()),
+                                         num_tokens, nullptr));
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
+
+    ScopedHipStream stream;
+    ASSERT_TRUE(cache->appendWithStream(0, 0,
+                                        static_cast<const ITensor *>(K_tensor.get()),
+                                        static_cast<const ITensor *>(V_tensor.get()),
+                                        num_tokens, stream.opaque()));
+    stream.synchronize();
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 }
 
 // =============================================================================

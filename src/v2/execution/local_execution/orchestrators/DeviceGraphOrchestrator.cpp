@@ -2307,25 +2307,22 @@ namespace llaminar2
     {
         state_.clear();
 
-        // Invalidate the forward graph cache. Cached prefill/decode graphs hold
-        // stage objects whose internal state (arena coherence flags, GPU graph
-        // captures, weight-cohered flags on ComputeNodes) assumes continuity
-        // within a single inference sequence. When the sequence is reset (new
-        // prompt), reusing these cached graphs causes the executeFastDecode()
-        // path to skip coherence management that was performed only on the
-        // original cache-miss executeNode() path, leading to stale buffer
-        // state and incorrect inference results on the second forward pass.
+        // Full forward graphs can bake in request-shaped stage wiring, so drop
+        // them at prompt boundaries. Lower-level layer graph caches are reset
+        // in-place below because their dynamic state hooks cover the reused data.
         if (forward_engine_)
             forward_engine_->clearCache();
 
-        // Clear layer graph caches and device contexts
+        // Layer decode graphs can hold per-request stage/kernel state, so make
+        // them rebuild after the request boundary.
         for (auto &cache : layer_graph_cache_)
         {
             cache.invalidate();
         }
-        device_contexts_.clear();
 
-        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (all caches cleared)");
+        resetKernelDynamicState();
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (forward graph cache dropped)");
     }
 
     // =========================================================================
