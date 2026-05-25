@@ -152,7 +152,8 @@ TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeL
     int callback_calls = 0;
     ModelWeights weights;
     weights.embedding_table = embedding.get();
-    weights.get_layer_weights = [&](int layer_idx) {
+    weights.get_layer_weights = [&](int layer_idx)
+    {
         ++callback_calls;
         LayerWeights layer;
         layer.wq = attn_q.get();
@@ -229,7 +230,8 @@ TEST_F(Test__DeviceGraphOrchestrator, SetFrozenWeightSetConfiguresBindingsDirect
     auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
     auto attn_q = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
 
-    auto make_binding = [](const std::string &name, WeightRole role, TensorBase *tensor) {
+    auto make_binding = [](const std::string &name, WeightRole role, TensorBase *tensor)
+    {
         WeightBinding binding;
         binding.identity = makeSourceWeightIdentity(name, ModelContextId{42});
         binding.identity.role = role;
@@ -1402,6 +1404,43 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
     EXPECT_EQ(gpu_ptr->getLastM(), 2048) << "max_seq_len should be passed as m dimension";
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesExplicitRequestWhenProvided)
+{
+    DeviceId gpu_device = DeviceId::cpu();
+    if (DeviceManager::instance().cuda_device_count() > 0)
+    {
+        gpu_device = DeviceId::cuda(0);
+    }
+    else if (DeviceManager::instance().rocm_device_count() > 0)
+    {
+        gpu_device = DeviceId::rocm(0);
+    }
+    else
+    {
+        GTEST_SKIP() << "No GPU backend available for workspace allocation sizing test";
+    }
+
+    auto custom_config = config_;
+    custom_config.max_seq_len = 2048;
+
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
+
+    ComputeGraph graph;
+    auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("bucket_gemm", gpu_device, 4096);
+    auto *gpu_ptr = gpu_stage.get();
+    graph.addNode("bucket_node", std::move(gpu_stage), gpu_device);
+
+    IForwardExecutionHost &host = *orchestrator;
+    ASSERT_TRUE(host.ensureDeviceWorkspaceAllocated(graph, 768));
+
+    // Bucketed prefill passes the active bucket shape so ROCm long-context
+    // warmup can avoid reserving the full configured max context up front.
+    // ForwardExecutionEngine handles later workspace growth by rebinding cached
+    // graphs and invalidating captured replay state.
+    EXPECT_EQ(gpu_ptr->getLastM(), 768);
+    EXPECT_TRUE(gpu_ptr->wasBound());
+}
+
 // NOTE: The following tests are DISABLED because they test an aspirational feature
 // (passing n_heads/head_dim to workspace consumers) that was never implemented.
 // The current implementation intentionally passes 0 for N/K, letting kernels
@@ -2012,7 +2051,8 @@ TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, SingleDeviceResolvesLo
     weights.embedding_table = nullptr;
     weights.final_norm = nullptr;
     weights.lm_head = nullptr;
-    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights {
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights
+    {
         resolved_indices.push_back(idx);
         LayerWeights lw;
         // Use attn_norm as a marker to verify which layer was resolved
@@ -2042,7 +2082,8 @@ TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPStage1ResolvesGlobal
     weights.embedding_table = nullptr;
     weights.final_norm = nullptr;
     weights.lm_head = nullptr;
-    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights {
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights
+    {
         resolved_indices.push_back(idx);
         return LayerWeights{};
     };
@@ -2079,7 +2120,8 @@ TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, FrozenLambdaReturnsCor
     weights.embedding_table = nullptr;
     weights.final_norm = nullptr;
     weights.lm_head = nullptr;
-    weights.get_layer_weights = [&markers](int idx) -> LayerWeights {
+    weights.get_layer_weights = [&markers](int idx) -> LayerWeights
+    {
         // Map global index 12..23 to marker 0..11
         int local = idx - 12;
         if (local < 0 || local >= 12)
@@ -2127,7 +2169,8 @@ TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPStage0ResolvesFromZe
     weights.embedding_table = nullptr;
     weights.final_norm = nullptr;
     weights.lm_head = nullptr;
-    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights {
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights
+    {
         resolved_indices.push_back(idx);
         return LayerWeights{};
     };
@@ -2154,7 +2197,8 @@ TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPCallbackRejectingOut
     weights.embedding_table = nullptr;
     weights.final_norm = nullptr;
     weights.lm_head = nullptr;
-    weights.get_layer_weights = [](int idx) -> LayerWeights {
+    weights.get_layer_weights = [](int idx) -> LayerWeights
+    {
         if (idx < 20 || idx >= 40)
             return LayerWeights{}; // Reject out-of-range
         LayerWeights lw;

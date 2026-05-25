@@ -603,6 +603,31 @@ namespace llaminar2
     {
         // ===== CACHE HIT: Reuse cached decode graph =====
 
+        if (input.device.is_gpu() && forward_cache.graph)
+        {
+            if (!host.ensureDeviceWorkspaceAllocated(*forward_cache.graph, input.seq_len))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Failed to refresh cached graph workspace for "
+                          << input.device.toString() << " seq_len=" << input.seq_len);
+                return false;
+            }
+
+            const uint64_t current_workspace_generation = host.workspaceGeneration(input.device);
+            if (current_workspace_generation != forward_cache.workspace_generation)
+            {
+                if (forward_cache.workspace_generation != 0)
+                {
+                    LOG_DEBUG("[ForwardExecutionEngine] Workspace generation changed on "
+                              << input.device.toString()
+                              << " from " << forward_cache.workspace_generation
+                              << " to " << current_workspace_generation
+                              << "; dropping captured replay state for cached graph");
+                    forward_cache.resetReplayStateAfterWorkspaceRebind();
+                }
+                forward_cache.workspace_generation = current_workspace_generation;
+            }
+        }
+
         // Update stable buffers — stages hold pointers to these, so the
         // pointed-to values change but the pointers remain valid
         const int total_tokens = input.batch_size * input.seq_len;
@@ -1278,11 +1303,16 @@ namespace llaminar2
             updatePrefillReplayParamStages(effective_input, prefill_replay_param_stages);
         }
 
-        // Ensure GPU workspace is allocated for the current execution shape.
-        // Bucketed prefill graphs can be much smaller than the configured
-        // context limit, so sizing GEMM scratch to the active bucket avoids
-        // retaining 4k-only workspace during 1k/1.5k captures.
-        host.ensureDeviceWorkspaceAllocated(graph, effective_input.seq_len);
+        // Ensure GPU workspace is allocated for this graph. Cache hits repeat
+        // this step because another bucket can grow the shared per-device
+        // workspace and leave this cached graph's stages bound to old pointers.
+        if (!host.ensureDeviceWorkspaceAllocated(graph, effective_input.seq_len))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Failed to allocate workspace for forward graph on "
+                      << effective_input.device.toString() << " seq_len=" << effective_input.seq_len);
+            return false;
+        }
+        const uint64_t workspace_generation = host.workspaceGeneration(effective_input.device);
 
         // Notify host that graph is ready — allows releasing transient resources
         // (e.g., mmap pages) before execution allocates large activation buffers.
@@ -1344,6 +1374,7 @@ namespace llaminar2
         {
             build_cache->graph = std::make_unique<ComputeGraph>(std::move(graph));
             build_cache->output = output;
+            build_cache->workspace_generation = workspace_generation;
 
             // Pre-compute collective node set for fast decode intercept and
             // padded-prefill safety checks on later same-bucket cache hits.

@@ -4,6 +4,15 @@
 #include "utils/Logger.h"
 #include "utils/WeightLoadingProfiler.h"
 
+/**
+ * @file LoadOrchestrator.cpp
+ * @brief Implementation of the GPU weight loading orchestration lifecycle.
+ *
+ * The orchestrator separates model-weight lifetime from temporary upload staging:
+ * registered GEMM kernels keep this object alive for persistent pool pointers, while
+ * finalize() drops staging VRAM and pinned host rings once the pipeline has drained.
+ */
+
 // Backend-specific kernel headers (linked conditionally)
 #ifdef HAVE_ROCM
 #include "kernels/rocm/repack/VnniRepackKernels.h"
@@ -285,6 +294,17 @@ namespace llaminar2
             }
 
             ctx.pending_jobs.clear();
+        }
+    }
+
+    void LoadOrchestrator::finalize()
+    {
+        for (auto &ctx : devices_)
+        {
+            if (ctx.pool)
+                ctx.pool->releaseStaging();
+            if (ctx.pinned_ring)
+                ctx.pinned_ring->release();
         }
     }
 

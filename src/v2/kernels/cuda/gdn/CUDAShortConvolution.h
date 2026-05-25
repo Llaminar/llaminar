@@ -118,13 +118,13 @@ namespace llaminar2
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
-                if (!scratch_ || scratch_size_ < required_scratch_size)
+                if (!scratchPointer() || scratchCapacity() < required_scratch_size)
                 {
                     LOG_ERROR("[CUDAShortConvolution] In-place prefill scratch was not preallocated: need "
-                              << required_scratch_size << " floats, have " << scratch_size_);
+                              << required_scratch_size << " floats, have " << scratchCapacity());
                     return false;
                 }
-                effective_output = scratch_;
+                effective_output = scratchPointer();
             }
 
             // All pointers are device pointers — pass directly to CUDA kernel.
@@ -138,7 +138,7 @@ namespace llaminar2
             if (needs_scratch)
             {
                 const size_t count = static_cast<size_t>(seq_len) * static_cast<size_t>(channels);
-                cudaGDN_gpu_memcpy_async(output, scratch_, count, stream_);
+                cudaGDN_gpu_memcpy_async(output, scratchPointer(), count, stream_);
             }
 
             return true;
@@ -159,13 +159,13 @@ namespace llaminar2
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
-                if (!scratch_ || scratch_size_ < required_scratch_size)
+                if (!scratchPointer() || scratchCapacity() < required_scratch_size)
                 {
                     LOG_ERROR("[CUDAShortConvolution] In-place prefill scratch was not preallocated: need "
-                              << required_scratch_size << " floats, have " << scratch_size_);
+                              << required_scratch_size << " floats, have " << scratchCapacity());
                     return false;
                 }
-                effective_output = scratch_;
+                effective_output = scratchPointer();
             }
 
             const bool ok = cudaGDN_short_conv1d_effective(
@@ -179,13 +179,19 @@ namespace llaminar2
             if (needs_scratch)
             {
                 const size_t count = static_cast<size_t>(seq_len) * static_cast<size_t>(channels);
-                cudaGDN_gpu_memcpy_async(output, scratch_, count, stream_);
+                cudaGDN_gpu_memcpy_async(output, scratchPointer(), count, stream_);
             }
 
             return true;
         }
 
         void setGPUStream(void *stream) override { stream_ = stream; }
+
+        void bindScratchWorkspace(float *scratch, int scratch_size) override
+        {
+            bound_scratch_ = scratch;
+            bound_scratch_size_ = scratch_size;
+        }
 
     private:
         int device_ordinal_;
@@ -194,9 +200,23 @@ namespace llaminar2
         int state_size_ = 0;
         float *scratch_ = nullptr;
         int scratch_size_ = 0;
+        float *bound_scratch_ = nullptr;
+        int bound_scratch_size_ = 0;
+
+        float *scratchPointer() const
+        {
+            return bound_scratch_ ? bound_scratch_ : scratch_;
+        }
+
+        int scratchCapacity() const
+        {
+            return bound_scratch_ ? bound_scratch_size_ : scratch_size_;
+        }
 
         bool allocateScratch(int scratch_size)
         {
+            if (bound_scratch_ && bound_scratch_size_ >= scratch_size)
+                return true;
             if (scratch_ && scratch_size_ >= scratch_size)
                 return true;
             if (scratch_)

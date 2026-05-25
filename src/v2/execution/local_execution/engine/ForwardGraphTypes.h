@@ -211,6 +211,9 @@ namespace llaminar2
         ForwardOutput output;                ///< Cached output (logits pointer)
         bool valid = false;                  ///< Whether cache is usable
 
+        /// Workspace generation recorded after the graph's stages were bound.
+        uint64_t workspace_generation = 0;
+
         // Stable buffers — stages point to these, contents updated each step
         std::vector<int> token_ids;    ///< Persistent decode token storage
         std::vector<int> position_ids; ///< Persistent decode position IDs
@@ -325,6 +328,23 @@ namespace llaminar2
         }
 
         /**
+         * @brief Drop captured replay state after workspace buffers are rebound.
+         *
+         * The cached ComputeGraph remains valid, but HIP/CUDA graph captures
+         * encode raw workspace addresses. Rebinding stages to a new workspace
+         * manager therefore requires throwing away any captured decode segments
+         * and monolithic prefill graph entries before the next launch.
+         */
+        void resetReplayStateAfterWorkspaceRebind()
+        {
+            resetReplayState();
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll();
+            gpu_stream_applied = false;
+            applied_stream = nullptr;
+        }
+
+        /**
          * @brief Reset request-scoped state while preserving reusable graph objects.
          *
          * This is the request-boundary counterpart to invalidate(): it keeps the
@@ -362,6 +382,7 @@ namespace llaminar2
             bucketed_prefill_last_access_tick = 0;
             graph.reset();
             valid = false;
+            workspace_generation = 0;
             token_ids.clear();
             position_ids.clear();
             collective_nodes.clear();

@@ -1,5 +1,15 @@
 #pragma once
 
+/**
+ * @file LoadOrchestrator.h
+ * @brief Coordinates GPU weight planning, staging, pipeline loading, and finalization.
+ *
+ * LoadOrchestrator owns one WeightVRAMPool per target device plus pinned host rings
+ * for upload overlap. Prepared GEMM kernels retain the orchestrator as a lifetime
+ * owner so persistent pool allocations outlive model execution; finalize() releases
+ * only temporary staging resources after all queued weight jobs have completed.
+ */
+
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "loaders/gpu_pipeline/PinnedRingBuffer.h"
 #include "loaders/gpu_pipeline/DeviceLoadPipeline.h"
@@ -63,8 +73,8 @@ namespace llaminar2
         /// @param progress_cb  Optional per-job progress callback (bytes_loaded, total_bytes)
         void load(DeviceLoadPipeline::ProgressCallback progress_cb = nullptr);
 
-        /// Release staging regions after loading completes.
-        void finalize() {}
+        /// Release temporary staging regions after loading completes.
+        void finalize();
 
         /// Release all resources.
         void release();

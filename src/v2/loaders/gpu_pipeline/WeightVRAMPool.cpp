@@ -1,12 +1,41 @@
 #include "loaders/gpu_pipeline/WeightVRAMPool.h"
 #include "backends/IBackend.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+
+/**
+ * @file WeightVRAMPool.cpp
+ * @brief Implementation of the GPU weight pool and releasable staging allocation.
+ *
+ * Persistent prepared weights and temporary load staging are allocated separately.
+ * This keeps registered GEMM payload/scales pointers stable while allowing the
+ * staging allocation to be freed immediately after DeviceLoadPipeline drains.
+ */
 
 #include <algorithm>
 #include <stdexcept>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /// @brief Emit a coarse VRAM checkpoint when LLAMINAR_VRAM_TRACE is enabled.
+        void logVramTrace(IBackend *backend, int device_id, const char *label, size_t bytes = 0)
+        {
+            if (!debugEnv().vram_trace || !backend || device_id < 0)
+                return;
+
+            const size_t free_bytes = backend->deviceMemoryFree(device_id);
+            const size_t total_bytes = backend->deviceMemoryTotal(device_id);
+            const size_t used_bytes = total_bytes > free_bytes ? total_bytes - free_bytes : 0;
+            LOG_INFO("[VRAM_TRACE] " << label
+                                     << " device=" << device_id
+                                     << " used_mib=" << (used_bytes / (1024 * 1024))
+                                     << " free_mib=" << (free_bytes / (1024 * 1024))
+                                     << " total_mib=" << (total_bytes / (1024 * 1024))
+                                     << " bytes=" << bytes);
+        }
+    }
 
     WeightVRAMPool::WeightVRAMPool() = default;
 
@@ -14,8 +43,9 @@ namespace llaminar2
 
     WeightVRAMPool::WeightVRAMPool(WeightVRAMPool &&other) noexcept
         : d_base_(other.d_base_),
+          d_staging_base_(other.d_staging_base_),
           total_bytes_(other.total_bytes_),
-          staging_region_offset_(other.staging_region_offset_),
+          weight_region_bytes_(other.weight_region_bytes_),
           staging_region_bytes_(other.staging_region_bytes_),
           staging_slot_count_(other.staging_slot_count_),
           max_staging_slot_bytes_(other.max_staging_slot_bytes_),
@@ -27,8 +57,13 @@ namespace llaminar2
           weight_order_(std::move(other.weight_order_))
     {
         other.d_base_ = nullptr;
+        other.d_staging_base_ = nullptr;
         other.allocated_ = false;
         other.total_bytes_ = 0;
+        other.weight_region_bytes_ = 0;
+        other.staging_region_bytes_ = 0;
+        other.staging_slot_count_ = 0;
+        other.max_staging_slot_bytes_ = 0;
         other.backend_ = nullptr;
     }
 
@@ -38,8 +73,9 @@ namespace llaminar2
         {
             release();
             d_base_ = other.d_base_;
+            d_staging_base_ = other.d_staging_base_;
             total_bytes_ = other.total_bytes_;
-            staging_region_offset_ = other.staging_region_offset_;
+            weight_region_bytes_ = other.weight_region_bytes_;
             staging_region_bytes_ = other.staging_region_bytes_;
             staging_slot_count_ = other.staging_slot_count_;
             max_staging_slot_bytes_ = other.max_staging_slot_bytes_;
@@ -50,8 +86,13 @@ namespace llaminar2
             plans_ = std::move(other.plans_);
             weight_order_ = std::move(other.weight_order_);
             other.d_base_ = nullptr;
+            other.d_staging_base_ = nullptr;
             other.allocated_ = false;
             other.total_bytes_ = 0;
+            other.weight_region_bytes_ = 0;
+            other.staging_region_bytes_ = 0;
+            other.staging_slot_count_ = 0;
+            other.max_staging_slot_bytes_ = 0;
             other.backend_ = nullptr;
         }
         return *this;
@@ -167,9 +208,13 @@ namespace llaminar2
         backend_ = backend;
         device_id_ = device_id;
 
-        // Compute staging region
+        // The persistent weight allocation is aligned independently so every
+        // offset returned by getSlot() remains stable for the lifetime of kernels.
         size_t max_staging = 0;
-        staging_region_offset_ = alignUp(current_offset_, kAlignment);
+        weight_region_bytes_ = alignUp(current_offset_, kAlignment);
+
+        // Staging is temporary upload scratch. It uses its own allocation so
+        // LoadOrchestrator::finalize() can free it after all pipeline streams drain.
         if (staging_slot_count > 0 && !plans_.empty())
         {
             for (const auto &[name, plan] : plans_)
@@ -181,7 +226,7 @@ namespace llaminar2
         staging_slot_count_ = staging_slot_count;
         max_staging_slot_bytes_ = max_staging;
 
-        total_bytes_ = staging_region_offset_ + staging_region_bytes_;
+        total_bytes_ = weight_region_bytes_ + staging_region_bytes_;
 
         if (total_bytes_ == 0)
         {
@@ -192,17 +237,50 @@ namespace llaminar2
 
         if (backend_)
         {
+            logVramTrace(backend_, device_id_, "weight_pool.before_allocate", total_bytes_);
             if (!backend_->setDevice(device_id_))
             {
                 LOG_ERROR("WeightVRAMPool: setDevice(" << device_id_ << ") failed");
                 return false;
             }
 
-            d_base_ = backend_->allocate(total_bytes_, device_id_);
-            if (!d_base_)
+            if (weight_region_bytes_ > 0)
             {
-                LOG_ERROR("WeightVRAMPool: allocate(" << total_bytes_ << " bytes) failed");
-                return false;
+                d_base_ = backend_->allocate(weight_region_bytes_, device_id_);
+                if (!d_base_)
+                {
+                    LOG_ERROR("WeightVRAMPool: allocate persistent weights ("
+                              << weight_region_bytes_ << " bytes) failed");
+                    total_bytes_ = 0;
+                    weight_region_bytes_ = 0;
+                    staging_region_bytes_ = 0;
+                    staging_slot_count_ = 0;
+                    max_staging_slot_bytes_ = 0;
+                    return false;
+                }
+                logVramTrace(backend_, device_id_, "weight_pool.after_persistent_allocate", weight_region_bytes_);
+            }
+
+            if (staging_region_bytes_ > 0)
+            {
+                d_staging_base_ = backend_->allocate(staging_region_bytes_, device_id_);
+                if (!d_staging_base_)
+                {
+                    LOG_ERROR("WeightVRAMPool: allocate staging ("
+                              << staging_region_bytes_ << " bytes) failed");
+                    if (d_base_)
+                    {
+                        backend_->free(d_base_, device_id_);
+                        d_base_ = nullptr;
+                    }
+                    total_bytes_ = 0;
+                    weight_region_bytes_ = 0;
+                    staging_region_bytes_ = 0;
+                    staging_slot_count_ = 0;
+                    max_staging_slot_bytes_ = 0;
+                    return false;
+                }
+                logVramTrace(backend_, device_id_, "weight_pool.after_staging_allocate", staging_region_bytes_);
             }
         }
         else
@@ -262,6 +340,8 @@ namespace llaminar2
 
     void WeightVRAMPool::release()
     {
+        releaseStaging();
+
         if (d_base_)
         {
             if (backend_)
@@ -273,16 +353,47 @@ namespace llaminar2
         }
         allocated_ = false;
         total_bytes_ = 0;
+        weight_region_bytes_ = 0;
+    }
+
+    void WeightVRAMPool::releaseStaging()
+    {
+        const size_t released_bytes = staging_region_bytes_;
+
+        if (released_bytes > 0)
+            logVramTrace(backend_, device_id_, "weight_pool.before_staging_release", released_bytes);
+
+        if (d_staging_base_)
+        {
+            if (backend_)
+            {
+                backend_->setDevice(device_id_);
+                backend_->free(d_staging_base_, device_id_);
+            }
+            d_staging_base_ = nullptr;
+        }
+
+        if (released_bytes > 0)
+        {
+            total_bytes_ = total_bytes_ >= released_bytes ? total_bytes_ - released_bytes : weight_region_bytes_;
+            LOG_DEBUG("WeightVRAMPool: released " << released_bytes
+                                                  << " bytes of temporary staging on device " << device_id_);
+            logVramTrace(backend_, device_id_, "weight_pool.after_staging_release", released_bytes);
+        }
+
+        staging_region_bytes_ = 0;
+        staging_slot_count_ = 0;
+        max_staging_slot_bytes_ = 0;
     }
 
     uint8_t *WeightVRAMPool::getStagingSlot(int slot_index) const
     {
-        if (!allocated_ || !d_base_ || slot_index < 0 || slot_index >= staging_slot_count_)
+        if (!allocated_ || !d_staging_base_ || slot_index < 0 || slot_index >= staging_slot_count_)
             return nullptr;
         if (max_staging_slot_bytes_ == 0)
             return nullptr;
-        auto *base = static_cast<uint8_t *>(d_base_);
-        return base + staging_region_offset_ + static_cast<size_t>(slot_index) * max_staging_slot_bytes_;
+        auto *base = static_cast<uint8_t *>(d_staging_base_);
+        return base + static_cast<size_t>(slot_index) * max_staging_slot_bytes_;
     }
 
     int WeightVRAMPool::stagingSlotCount() const { return staging_slot_count_; }

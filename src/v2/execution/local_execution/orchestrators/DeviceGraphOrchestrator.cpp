@@ -46,6 +46,29 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        /// @brief Emit a coarse VRAM checkpoint for orchestrator allocation phases.
+        void logOrchestratorVramTrace(DeviceId device, const char *label)
+        {
+            if (!debugEnv().vram_trace || !device.is_gpu())
+                return;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+                return;
+
+            const int ordinal = device.gpu_ordinal();
+            const size_t free_bytes = backend->deviceMemoryFree(ordinal);
+            const size_t total_bytes = backend->deviceMemoryTotal(ordinal);
+            const size_t used_bytes = total_bytes > free_bytes ? total_bytes - free_bytes : 0;
+            LOG_INFO("[VRAM_TRACE] " << label
+                                     << " device=" << device.toString()
+                                     << " used_mib=" << (used_bytes / (1024 * 1024))
+                                     << " free_mib=" << (free_bytes / (1024 * 1024))
+                                     << " total_mib=" << (total_bytes / (1024 * 1024)));
+        }
+    }
 
     // =========================================================================
     // Shared Executor Configuration
@@ -601,11 +624,13 @@ namespace llaminar2
         // =====================================================================
         // Allocate all registered buffers
         // =====================================================================
+        logOrchestratorVramTrace(state_.device_id, "arena.before_allocate");
         if (!arena_->allocate())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] BufferArena allocation failed");
             return false;
         }
+        logOrchestratorVramTrace(state_.device_id, "arena.after_allocate");
 
         // Wire arena directly to graph builder (replaces bindArenaToManagedBuffers + setBuffers shim)
         graph_builder_->setArena(arena_.get());
@@ -1078,6 +1103,11 @@ namespace llaminar2
 
         WorkspaceSizingHints hints;
         const int default_workspace_seq_len = config.max_seq_len > 0 ? config.max_seq_len : 4096;
+
+        // Bucketed prefill asks for the active bucket length so workspace can
+        // grow with observed shapes instead of reserving the full configured
+        // context up front. ForwardExecutionEngine tracks the allocator
+        // generation and invalidates captured replay state after any grow.
         hints.max_seq_len = workspace_seq_len > 0 ? workspace_seq_len : default_workspace_seq_len;
         hints.n_heads = config.n_heads > 0 ? config.n_heads : 128;
         hints.head_dim = config.d_model > 0 && config.n_heads > 0
@@ -1105,6 +1135,11 @@ namespace llaminar2
 
         WorkspaceBudgetConfig workspace_budget;
         return workspace_allocator_->allocateForGraph(graph, hints, extras, workspace_budget);
+    }
+
+    uint64_t DeviceGraphOrchestrator::workspaceGeneration(DeviceId device) const
+    {
+        return workspace_allocator_ ? workspace_allocator_->deviceGeneration(device) : 0;
     }
 
     void DeviceGraphOrchestrator::onFirstGraphReady()

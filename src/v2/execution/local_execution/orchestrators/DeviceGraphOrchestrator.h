@@ -2057,6 +2057,11 @@ namespace llaminar2
             int workspace_seq_len = 0) override;
 
         /**
+         * @brief Return the current workspace generation for a device.
+         */
+        uint64_t workspaceGeneration(DeviceId device) const override;
+
+        /**
          * @brief Called once after the first graph build + workspace allocation.
          *
          * Releases mmap physical pages via madvise(MADV_DONTNEED) before

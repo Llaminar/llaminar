@@ -194,6 +194,12 @@ namespace llaminar2
 
         void setGPUStream(void *stream) override { stream_ = stream; }
 
+        void bindDeinterleaveWorkspace(float *scratch, size_t scratch_size) override
+        {
+            bound_deinterleave_scratch_ = scratch;
+            bound_deinterleave_scratch_size_ = scratch_size;
+        }
+
         bool deinterleave_qkv_device(
             const float *d_merged_qkv,
             float *&d_q, float *&d_k, float *&d_v,
@@ -207,8 +213,16 @@ namespace llaminar2
             size_t v_elems = static_cast<size_t>(seq_len) * n_v_heads * head_dim_v;
             size_t total = q_elems + k_elems + v_elems;
 
-            // Grow-only scratch allocation
-            if (total > deinterleave_scratch_size_)
+            float *scratch = bound_deinterleave_scratch_;
+            if (scratch)
+            {
+                if (total > bound_deinterleave_scratch_size_)
+                {
+                    LOG_ERROR("[CUDAGatedDeltaNet] bound deinterleave workspace too small");
+                    return false;
+                }
+            }
+            else if (total > deinterleave_scratch_size_)
             {
                 cudaGDN_gpu_free(deinterleave_scratch_);
                 if (!cudaGDN_gpu_malloc(&deinterleave_scratch_, total))
@@ -219,11 +233,16 @@ namespace llaminar2
                     return false;
                 }
                 deinterleave_scratch_size_ = total;
+                scratch = deinterleave_scratch_;
+            }
+            else
+            {
+                scratch = deinterleave_scratch_;
             }
 
-            d_q = deinterleave_scratch_;
-            d_k = deinterleave_scratch_ + q_elems;
-            d_v = deinterleave_scratch_ + q_elems + k_elems;
+            d_q = scratch;
+            d_k = scratch + q_elems;
+            d_v = scratch + q_elems + k_elems;
 
             return cudaGDN_deinterleave_qkv(
                 d_merged_qkv, d_q, d_k, d_v,
@@ -267,6 +286,8 @@ namespace llaminar2
         int state_size_ = 0;
         float *deinterleave_scratch_ = nullptr;
         size_t deinterleave_scratch_size_ = 0;
+        float *bound_deinterleave_scratch_ = nullptr;
+        size_t bound_deinterleave_scratch_size_ = 0;
         DeviceWorkspaceManager *workspace_ = nullptr;
     };
 

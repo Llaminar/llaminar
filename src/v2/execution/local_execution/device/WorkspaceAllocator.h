@@ -15,6 +15,7 @@
 #include "DeviceWorkspaceManager.h"
 #include "WorkspaceDescriptor.h"
 #include "../../../backends/DeviceId.h"
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -183,6 +184,18 @@ namespace llaminar2
          */
         DeviceWorkspaceManager *getDeviceWorkspace(DeviceId device);
 
+        /**
+         * @brief Return the current workspace address epoch for a device.
+         *
+         * The epoch changes whenever the device workspace manager is replaced
+         * or released. Cached graphs use this to detect that captured GPU graph
+         * replay state contains stale raw workspace pointers.
+         *
+         * @param device Target device.
+         * @return Monotonic generation for the device, or 0 if it has never had workspace.
+         */
+        uint64_t deviceGeneration(DeviceId device) const;
+
         // =====================================================================
         // Metrics
         // =====================================================================
@@ -208,6 +221,17 @@ namespace llaminar2
 
         /// Per-device workspace budgets (for metrics)
         std::unordered_map<DeviceId, size_t> device_workspace_budgets_;
+
+        /// Per-device workspace address epochs for cached-graph invalidation.
+        std::unordered_map<DeviceId, uint64_t> device_workspace_generations_;
+
+        /// Monotonic source for device workspace generations.
+        uint64_t next_workspace_generation_ = 1;
+
+        /**
+         * @brief Advance the generation for a device after workspace addresses change.
+         */
+        void bumpDeviceGeneration(DeviceId device);
 
         /**
          * @brief Compute model-aware minimum budget floor

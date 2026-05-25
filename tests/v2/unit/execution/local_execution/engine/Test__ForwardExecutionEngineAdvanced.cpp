@@ -16,6 +16,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -55,6 +56,7 @@ namespace
         int get_context_calls = 0;
         int ensure_workspace_calls = 0;
         int last_workspace_seq_len = -1;
+        uint64_t workspace_generation = 0;
         int sync_logits_calls = 0;
         int logits_tensor_calls = 0;
         int build_decode_policy_calls = 0;
@@ -93,8 +95,8 @@ namespace
                 auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
                     ComputeStageType::GEMM,
                     "stage_" + std::to_string(i),
-                    DeviceId::cpu());
-                graph.addNode("node_" + std::to_string(i), std::move(stage), DeviceId::cpu());
+                    input.device);
+                graph.addNode("node_" + std::to_string(i), std::move(stage), input.device);
             }
 
             return GraphBuildResult(std::move(graph), output);
@@ -123,6 +125,12 @@ namespace
             last_workspace_seq_len = workspace_seq_len;
             call_sequence.push_back("ensureWorkspace");
             return true;
+        }
+
+        uint64_t workspaceGeneration(DeviceId device) const override
+        {
+            (void)device;
+            return workspace_generation;
         }
 
         void syncLogitsAtBoundary(IDeviceContext *ctx) override
@@ -339,21 +347,24 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillThenDecode_TwoSeparateBuilds
 TEST_F(Test__ForwardExecutionEngineAdvanced, SameDecodeShape_CacheHitOnSecondCall)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
-    TrackingHost host(&mock_ctx_);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    TrackingHost host(&gpu_ctx);
     host.graph_node_count = 3;
 
     // First decode: cache miss → build
-    TestInput decode1(1);
+    TestInput decode1(1, 1, DeviceId::cuda(0));
     ForwardOutput output{};
     engine.execute(decode1.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
     EXPECT_FALSE(engine.cacheEmpty());
 
     // Second decode (same shape): should be cache hit → no build
-    TestInput decode2(1);
+    TestInput decode2(1, 1, DeviceId::cuda(0));
     engine.execute(decode2.input, output, host);
     // On cache HIT, buildForwardGraph is NOT called
     EXPECT_EQ(host.build_calls, 1) << "Second decode with same shape should hit cache";
+    EXPECT_EQ(host.ensure_workspace_calls, 2)
+        << "Cache hits must rebind workspace in case another cached bucket replaced it";
 }
 
 TEST_F(Test__ForwardExecutionEngineAdvanced, ResetSessionReplayState_PreservesCachedGraphAndResetsStages)

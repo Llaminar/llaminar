@@ -12,6 +12,8 @@
  */
 
 #include "ShortConv1dStage.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
@@ -26,6 +28,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace llaminar2
 {
@@ -44,6 +47,57 @@ namespace llaminar2
     ShortConv1dStage::~ShortConv1dStage()
     {
         releaseGpuEffectiveSeqLenState();
+    }
+
+    WorkspaceRequirements ShortConv1dStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        (void)n;
+        (void)k;
+
+        WorkspaceRequirements reqs;
+        if (!params_.device_id.is_gpu() || params_.channels <= 0)
+            return reqs;
+
+        const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
+        if (max_seq_len <= 1)
+            return reqs;
+
+        const size_t bytes = static_cast<size_t>(max_seq_len) *
+                             static_cast<size_t>(params_.channels) * sizeof(float);
+        reqs.buffers.push_back({WS_INPLACE_PREFILL_SCRATCH, bytes, 256, true});
+        return reqs;
+    }
+
+    void ShortConv1dStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        bound_workspace_ = workspace;
+        bindKernelWorkspace();
+    }
+
+    void ShortConv1dStage::unbindWorkspace()
+    {
+        bound_workspace_ = nullptr;
+        bindKernelWorkspace();
+    }
+
+    void ShortConv1dStage::bindKernelWorkspace()
+    {
+        if (!params_.kernel)
+            return;
+
+        float *scratch = nullptr;
+        int scratch_floats = 0;
+        if (bound_workspace_ && bound_workspace_->hasBuffer(WS_INPLACE_PREFILL_SCRATCH))
+        {
+            scratch = static_cast<float *>(bound_workspace_->getBuffer(WS_INPLACE_PREFILL_SCRATCH));
+            const size_t available_floats =
+                bound_workspace_->getBufferSize(WS_INPLACE_PREFILL_SCRATCH) / sizeof(float);
+            scratch_floats = static_cast<int>(std::min<size_t>(
+                available_floats,
+                static_cast<size_t>(std::numeric_limits<int>::max())));
+        }
+
+        params_.kernel->bindScratchWorkspace(scratch, scratch_floats);
     }
 
     int ShortConv1dStage::effectivePrefillSeqLen() const
@@ -196,6 +250,7 @@ namespace llaminar2
 
         // Bind stage stream to kernel before execution
         params_.kernel->setGPUStream(gpuStream());
+        bindKernelWorkspace();
 
         auto *input_base = requireTensorBasePtr(params_.input, "input");
         auto *output_base = requireTensorBasePtr(params_.output, "output");

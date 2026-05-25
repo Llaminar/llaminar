@@ -647,12 +647,12 @@ namespace llaminar2
         // =================================================================
         // Prefill Graph Capture Configuration
         // =================================================================
-        int prefill_graph_min_seq = 256;                                       ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
-        bool prefill_graph_trace = false;                                      ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
-        bool prefill_graph_buckets = false;                                    ///< Enable bucketed capture for server (env: LLAMINAR_PREFILL_GRAPH_BUCKETS)
+        int prefill_graph_min_seq = 256;                                                                                                                          ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
+        bool prefill_graph_trace = false;                                                                                                                         ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
+        bool prefill_graph_buckets = false;                                                                                                                       ///< Enable bucketed capture for server (env: LLAMINAR_PREFILL_GRAPH_BUCKETS)
         std::vector<int> prefill_graph_bucket_sizes = {64, 128, 256, 384, 512, 544, 576, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096}; ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
-        int prefill_graph_max_cached_buckets = 10;                             ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
-        int prefill_graph_pad_token_id = 0;                                    ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
+        int prefill_graph_max_cached_buckets = 10;                                                                                                                ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
+        int prefill_graph_pad_token_id = 0;                                                                                                                       ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 
         // =================================================================
         // Device Placement / Heterogeneous Execution
@@ -3036,6 +3036,10 @@ namespace llaminar2
         /// Enable model weight lifecycle trace events (env: LLAMINAR_WEIGHT_LIFECYCLE_TRACE=1)
         bool weight_lifecycle_trace = false;
 
+        /// Emit coarse GPU VRAM checkpoints around major allocation phases.
+        /// (env: LLAMINAR_VRAM_TRACE=1)
+        bool vram_trace = false;
+
         static std::string normalizedEnvValue(const char *value)
         {
             if (!value)
@@ -3109,6 +3113,7 @@ namespace llaminar2
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             const char *weight_trace = std::getenv("LLAMINAR_WEIGHT_LIFECYCLE_TRACE");
             weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
+            vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
@@ -3170,6 +3175,7 @@ namespace llaminar2
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             const char *weight_trace = std::getenv("LLAMINAR_WEIGHT_LIFECYCLE_TRACE");
             weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
+            vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             activation_rotation = true; // default on

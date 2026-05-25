@@ -20,6 +20,7 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 
 #include <memory>
 #include <optional>
@@ -37,9 +38,11 @@ namespace llaminar2
      *
      * Delegates to ITensorShortConvolution* kernel for the actual computation.
      */
-    class ShortConv1dStage : public IComputeStage
+    class ShortConv1dStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
+        static constexpr const char *WS_INPLACE_PREFILL_SCRATCH = "gdn_shortconv_inplace_scratch";
+
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -76,6 +79,12 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
+
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             (void)pos_offset; // Conv1d doesn't use position offsets
@@ -109,6 +118,7 @@ namespace llaminar2
         int prefill_bucket_seq_len_ = 0;
         bool prefill_replay_params_set_ = false;
         std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
 
         int effectivePrefillSeqLen() const;
         bool shouldUseRealLengthContract() const;
@@ -116,6 +126,7 @@ namespace llaminar2
         bool uploadGpuEffectiveSeqLen();
         void refreshPinnedEffectiveSeqLen();
         void releaseGpuEffectiveSeqLenState();
+        void bindKernelWorkspace();
     };
 
 } // namespace llaminar2

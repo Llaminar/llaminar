@@ -10,12 +10,37 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../compute_stages/IComputeStage.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include <algorithm>
 #include <cctype>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /// @brief Emit a coarse per-device VRAM checkpoint when LLAMINAR_VRAM_TRACE is enabled.
+        void logWorkspaceVramTrace(DeviceId device, const char *label, size_t bytes = 0)
+        {
+            if (!debugEnv().vram_trace || !device.is_gpu())
+                return;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+                return;
+
+            const int ordinal = device.gpu_ordinal();
+            const size_t free_bytes = backend->deviceMemoryFree(ordinal);
+            const size_t total_bytes = backend->deviceMemoryTotal(ordinal);
+            const size_t used_bytes = total_bytes > free_bytes ? total_bytes - free_bytes : 0;
+            LOG_INFO("[VRAM_TRACE] " << label
+                                     << " device=" << device.toString()
+                                     << " used_mib=" << (used_bytes / (1024 * 1024))
+                                     << " free_mib=" << (free_bytes / (1024 * 1024))
+                                     << " total_mib=" << (total_bytes / (1024 * 1024))
+                                     << " bytes=" << bytes);
+        }
+    }
 
     // =========================================================================
     // Memory Query
@@ -291,6 +316,7 @@ namespace llaminar2
                           << combined.buffers.size() << " buffers ("
                           << (needed / (1024 * 1024)) << "MB needed, budget="
                           << (budget / (1024 * 1024)) << "MB)");
+                logWorkspaceVramTrace(device, "workspace.before_reallocate", needed);
 
                 auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
                 if (!manager->allocate(combined))
@@ -310,8 +336,10 @@ namespace llaminar2
                 LOG_DEBUG("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
                                                               << "MB workspace on " << device.toString()
                                                               << " (" << manager->bufferCount() << " buffers)");
+                logWorkspaceVramTrace(device, "workspace.after_reallocate", manager->used());
 
                 device_workspace_budgets_[device] = budget;
+                bumpDeviceGeneration(device);
                 device_workspaces_[device] = std::move(manager);
                 continue;
             }
@@ -359,6 +387,7 @@ namespace llaminar2
             }
 
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            logWorkspaceVramTrace(device, "workspace.before_allocate", needed);
             if (!manager->allocate(combined))
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to allocate workspace on "
@@ -376,8 +405,10 @@ namespace llaminar2
             LOG_DEBUG("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
                                                         << "MB workspace on " << device.toString()
                                                         << " (" << manager->bufferCount() << " buffers, model-aware budget)");
+            logWorkspaceVramTrace(device, "workspace.after_allocate", manager->used());
 
             device_workspace_budgets_[device] = budget;
+            bumpDeviceGeneration(device);
             device_workspaces_[device] = std::move(manager);
         }
 
@@ -449,6 +480,7 @@ namespace llaminar2
                                                      << combined.total_bytes_with_alignment() << " bytes needed");
 
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            logWorkspaceVramTrace(device, "workspace.before_allocate_legacy", combined.total_bytes_with_alignment());
             if (!manager->allocate(combined))
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to allocate workspace on "
@@ -466,6 +498,7 @@ namespace llaminar2
             LOG_DEBUG("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
                                                         << "MB workspace on " << device.toString()
                                                         << " (" << manager->bufferCount() << " buffers)");
+            logWorkspaceVramTrace(device, "workspace.after_allocate_legacy", manager->used());
 
             device_workspace_budgets_[device] = budget;
             device_workspaces_[device] = std::move(manager);
@@ -482,6 +515,11 @@ namespace llaminar2
                                                         << " workspace managers");
         }
 
+        for (const auto &[device, _manager] : device_workspaces_)
+        {
+            bumpDeviceGeneration(device);
+        }
+
         device_workspaces_.clear();
         device_workspace_budgets_.clear();
     }
@@ -494,6 +532,12 @@ namespace llaminar2
     {
         auto it = device_workspaces_.find(device);
         return (it != device_workspaces_.end()) ? it->second.get() : nullptr;
+    }
+
+    uint64_t WorkspaceAllocator::deviceGeneration(DeviceId device) const
+    {
+        auto it = device_workspace_generations_.find(device);
+        return (it != device_workspace_generations_.end()) ? it->second : 0;
     }
 
     // =========================================================================
@@ -514,6 +558,11 @@ namespace llaminar2
     {
         auto it = device_workspaces_.find(device);
         return (it != device_workspaces_.end()) ? it->second->used() : 0;
+    }
+
+    void WorkspaceAllocator::bumpDeviceGeneration(DeviceId device)
+    {
+        device_workspace_generations_[device] = next_workspace_generation_++;
     }
 
 } // namespace llaminar2

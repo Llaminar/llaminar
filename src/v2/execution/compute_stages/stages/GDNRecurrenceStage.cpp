@@ -20,6 +20,8 @@
  */
 
 #include "GDNRecurrenceStage.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
@@ -131,6 +133,62 @@ namespace llaminar2
     GDNRecurrenceStage::~GDNRecurrenceStage()
     {
         releaseGpuEffectiveSeqLenState();
+    }
+
+    WorkspaceRequirements GDNRecurrenceStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        (void)n;
+        (void)k;
+
+        WorkspaceRequirements reqs;
+        if (!params_.device_id.is_gpu() || params_.n_heads <= 0 || params_.d_k <= 0 || params_.d_v <= 0)
+            return reqs;
+
+        const bool merged_qkv = params_.Q == params_.K && params_.K == params_.V;
+        if (!merged_qkv)
+            return reqs;
+
+        const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
+        const int n_k_heads = params_.n_k_heads > 0 ? params_.n_k_heads : params_.n_heads;
+        const bool decode_zero_copy = max_seq_len == 1 &&
+                                      n_k_heads == params_.n_heads &&
+                                      params_.global_v_head_offset == 0;
+        if (decode_zero_copy)
+            return reqs;
+
+        const size_t row_floats = static_cast<size_t>(params_.n_heads) *
+                                  static_cast<size_t>((2 * params_.d_k) + params_.d_v);
+        const size_t bytes = static_cast<size_t>(max_seq_len) * row_floats * sizeof(float);
+        reqs.buffers.push_back({WS_DEINTERLEAVE_SCRATCH, bytes, 256, true});
+        return reqs;
+    }
+
+    void GDNRecurrenceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        bound_workspace_ = workspace;
+        bindKernelWorkspace();
+    }
+
+    void GDNRecurrenceStage::unbindWorkspace()
+    {
+        bound_workspace_ = nullptr;
+        bindKernelWorkspace();
+    }
+
+    void GDNRecurrenceStage::bindKernelWorkspace()
+    {
+        if (!params_.kernel)
+            return;
+
+        float *scratch = nullptr;
+        size_t scratch_floats = 0;
+        if (bound_workspace_ && bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH))
+        {
+            scratch = static_cast<float *>(bound_workspace_->getBuffer(WS_DEINTERLEAVE_SCRATCH));
+            scratch_floats = bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH) / sizeof(float);
+        }
+
+        params_.kernel->bindDeinterleaveWorkspace(scratch, scratch_floats);
     }
 
     int GDNRecurrenceStage::effectivePrefillSeqLen() const
@@ -307,6 +365,7 @@ namespace llaminar2
 
         // Bind stage stream to kernel before execution
         params_.kernel->setGPUStream(gpuStream());
+        bindKernelWorkspace();
 
         auto *q_base = requireTensorBasePtr(params_.Q, "Q");
         auto *k_base = requireTensorBasePtr(params_.K, "K");

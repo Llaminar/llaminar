@@ -78,6 +78,19 @@ namespace llaminar2
             int workspace_seq_len = 0) = 0;
 
         /**
+         * @brief Return the workspace generation for a device, if the host tracks it.
+         *
+         * A generation change means raw workspace addresses may have changed.
+         * Cached graphs can still be reused, but captured GPU graph replay state
+         * must be discarded and stages must be rebound before execution.
+         */
+        virtual uint64_t workspaceGeneration(DeviceId device) const
+        {
+            (void)device;
+            return 0;
+        }
+
+        /**
          * @brief Called once after the first graph build completes and workspace
          *        is allocated, but before execution starts.
          *

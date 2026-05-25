@@ -7,6 +7,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 
 #include <optional>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -163,6 +164,8 @@ TEST(Test__WorkspaceAllocator, ReallocatesExistingWorkspaceWhenNamedBufferGrows)
 
     auto *initial_workspace = allocator.getDeviceWorkspace(*device);
     ASSERT_NE(initial_workspace, nullptr);
+    const uint64_t initial_generation = allocator.deviceGeneration(*device);
+    EXPECT_GT(initial_generation, 0u);
     ASSERT_TRUE(initial_workspace->hasBuffer("shared_scratch"));
     ASSERT_TRUE(initial_workspace->hasBuffer("old_only_scratch"));
     EXPECT_EQ(initial_workspace->getBufferSize("shared_scratch"), 1024u);
@@ -181,6 +184,7 @@ TEST(Test__WorkspaceAllocator, ReallocatesExistingWorkspaceWhenNamedBufferGrows)
 
     auto *reallocated_workspace = allocator.getDeviceWorkspace(*device);
     ASSERT_NE(reallocated_workspace, nullptr);
+    EXPECT_GT(allocator.deviceGeneration(*device), initial_generation);
 
     // Regression coverage for the old name-only reuse check: the buffer existed
     // before, but it was too small.  The allocator must rebuild the workspace
@@ -225,6 +229,8 @@ TEST(Test__WorkspaceAllocator, ReusesExistingWorkspaceWhenAllRequestedBuffersFit
 
     auto *initial_workspace = allocator.getDeviceWorkspace(*device);
     ASSERT_NE(initial_workspace, nullptr);
+    const uint64_t initial_generation = allocator.deviceGeneration(*device);
+    EXPECT_GT(initial_generation, 0u);
 
     MockWorkspaceConsumer smaller_consumer({
         {"shared_scratch", 1024, 256, true},
@@ -238,6 +244,7 @@ TEST(Test__WorkspaceAllocator, ReusesExistingWorkspaceWhenAllRequestedBuffersFit
 
     auto *reused_workspace = allocator.getDeviceWorkspace(*device);
     ASSERT_NE(reused_workspace, nullptr);
+    EXPECT_EQ(allocator.deviceGeneration(*device), initial_generation);
     EXPECT_EQ(reused_workspace, initial_workspace);
     EXPECT_EQ(smaller_consumer.boundWorkspace(), initial_workspace);
     EXPECT_EQ(smaller_consumer.bindCalls(), 1);

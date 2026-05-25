@@ -2753,6 +2753,22 @@ namespace llaminar2
             return true;
         }
 
+        /**
+         * @brief Bind a caller-owned scratch buffer for in-place prefill.
+         *
+         * GPU implementations use this shared workspace instead of allocating
+         * one persistent scratch buffer per layer. Passing nullptr unbinds the
+         * shared buffer and restores the implementation's fallback behavior.
+         *
+         * @param scratch Device pointer to [max_seq_len * channels] floats.
+         * @param scratch_size Number of float elements available in scratch.
+         */
+        virtual void bindScratchWorkspace(float *scratch, int scratch_size)
+        {
+            (void)scratch;
+            (void)scratch_size;
+        }
+
         /// Return true when padded prefill can commit state using a dynamic real length.
         virtual bool supportsPaddedPrefillRealLength() const { return false; }
 
@@ -2895,6 +2911,22 @@ namespace llaminar2
             (void)head_dim_v;
             (void)global_v_head_offset;
             return false;
+        }
+
+        /**
+         * @brief Bind caller-owned scratch for merged-QKV deinterleaving.
+         *
+         * GPU implementations use this workspace instead of keeping a private
+         * grow-only deinterleave buffer per GDN layer. Passing nullptr unbinds
+         * the shared buffer and restores the implementation's fallback behavior.
+         *
+         * @param scratch Device pointer to the deinterleave scratch buffer.
+         * @param scratch_size Number of float elements available in scratch.
+         */
+        virtual void bindDeinterleaveWorkspace(float *scratch, size_t scratch_size)
+        {
+            (void)scratch;
+            (void)scratch_size;
         }
 
         /**

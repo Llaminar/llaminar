@@ -313,6 +313,45 @@ TEST(GDNROCmConfig, SharedExpertGroupedDecodeFlagDefaultsOffAndParsesEnv)
     EXPECT_FALSE(debugEnv().rocm.shared_expert_grouped_decode);
 }
 
+TEST(Test__GDNKernels, ShortConv_WorkspaceRequirementUsesActiveSeqLen)
+{
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = 1;
+    p.channels = 8192;
+
+    ShortConv1dStage stage(p);
+    const auto reqs = stage.getWorkspaceRequirements(/*m=*/1536);
+
+    const auto *scratch = reqs.find(ShortConv1dStage::WS_INPLACE_PREFILL_SCRATCH);
+    ASSERT_NE(scratch, nullptr);
+    EXPECT_EQ(scratch->size_bytes,
+              static_cast<size_t>(1536) * static_cast<size_t>(8192) * sizeof(float));
+    EXPECT_TRUE(scratch->required);
+}
+
+TEST(Test__GDNKernels, Recurrence_WorkspaceRequirementSharesMergedQKVScratch)
+{
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = 1;
+    p.n_heads = 32;
+    p.n_k_heads = 4;
+    p.d_k = 128;
+    p.d_v = 128;
+    p.global_v_head_offset = 8;
+
+    GDNRecurrenceStage stage(p);
+    const auto reqs = stage.getWorkspaceRequirements(/*m=*/1536);
+
+    const auto *scratch = reqs.find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH);
+    ASSERT_NE(scratch, nullptr);
+    const size_t row_floats = static_cast<size_t>(32) * static_cast<size_t>((2 * 128) + 128);
+    EXPECT_EQ(scratch->size_bytes,
+              static_cast<size_t>(1536) * row_floats * sizeof(float));
+    EXPECT_TRUE(scratch->required);
+}
+
 // ============================================================================
 // Mock Kernels for verifying stage delegation
 // ============================================================================

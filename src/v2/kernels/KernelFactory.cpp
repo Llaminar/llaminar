@@ -4383,16 +4383,10 @@ namespace llaminar
                         // (no-op for CPU via virtual dispatch)
                         gdn_state->conv_kernel->allocateGPUState(
                             static_cast<int>(gdn_state->conv_state.size()));
-                        if (gdn_state->conv_kernel_size > 1 && !gdn_state->conv_state.empty())
-                        {
-                            const size_t qkv_dim = gdn_state->conv_state.size() /
-                                                   static_cast<size_t>(gdn_state->conv_kernel_size - 1);
-                            const int scratch_size = static_cast<int>(static_cast<size_t>(config.max_seq_len) * qkv_dim);
-                            if (!gdn_state->conv_kernel->allocateGPUScratch(scratch_size))
-                            {
-                                throw std::runtime_error("KernelFactory::createHybridKVCache: failed to allocate GDN conv scratch");
-                            }
-                        }
+                        // In-place prefill scratch is supplied by ShortConv1dStage
+                        // through DeviceWorkspaceManager. Keeping it out of the
+                        // per-layer KV-cache state avoids one persistent
+                        // max_seq_len * qkv_dim allocation for every GDN layer.
                         gdn_state->rec_kernel->allocateGPUState(
                             static_cast<int>(gdn_state->recurrence_state.size()));
                     }
