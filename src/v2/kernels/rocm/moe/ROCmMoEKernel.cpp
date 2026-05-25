@@ -738,21 +738,6 @@ namespace llaminar2
             hipFree(d_prefill_up_);
             d_prefill_up_ = nullptr;
         }
-        if (d_prefill_swiglu_int8_)
-        {
-            hipFree(d_prefill_swiglu_int8_);
-            d_prefill_swiglu_int8_ = nullptr;
-        }
-        if (d_prefill_swiglu_scales_)
-        {
-            hipFree(d_prefill_swiglu_scales_);
-            d_prefill_swiglu_scales_ = nullptr;
-        }
-        if (d_prefill_down_out_)
-        {
-            hipFree(d_prefill_down_out_);
-            d_prefill_down_out_ = nullptr;
-        }
     }
 
     void ROCmMoEKernel::resetDynamicState()
@@ -4094,48 +4079,26 @@ namespace llaminar2
             hipFree(d_prefill_up_);
             d_prefill_up_ = nullptr;
         }
-        if (d_prefill_swiglu_int8_)
-        {
-            hipFree(d_prefill_swiglu_int8_);
-            d_prefill_swiglu_int8_ = nullptr;
-        }
-        if (d_prefill_swiglu_scales_)
-        {
-            hipFree(d_prefill_swiglu_scales_);
-            d_prefill_swiglu_scales_ = nullptr;
-        }
-        if (d_prefill_down_out_)
-        {
-            hipFree(d_prefill_down_out_);
-            d_prefill_down_out_ = nullptr;
-        }
-
         const int max_dim = (d_model > intermediate) ? d_model : intermediate;
         const int max_blocks = max_dim / 32;
-        const int inter_blocks = intermediate / 32;
 
         hipError_t err = hipSuccess;
-        // A_int8: used for both gather→quant (K=d_model) and swiglu→quant (K=intermediate)
-        // Allocate for the larger dimension
+        // K1 produces A_int8/scales and K2 consumes them before K3 starts.
+        // Reuse the same buffers for K3's SwiGLU quantized output to avoid
+        // holding a second full route-slot INT8 activation at prefill length.
         err = hipMalloc(&d_prefill_A_int8_, static_cast<size_t>(total_slots) * max_dim * sizeof(int8_t));
         if (err != hipSuccess)
             goto fail;
         err = hipMalloc(&d_prefill_A_scales_, static_cast<size_t>(total_slots) * max_blocks * sizeof(float));
         if (err != hipSuccess)
             goto fail;
-        err = hipMalloc(&d_prefill_gate_, static_cast<size_t>(total_slots) * intermediate * sizeof(float));
+
+        // K2 writes gate/up; K3 consumes both, then K4 can reuse gate as the
+        // down-projection output buffer because it is sized for max(d_model,intermediate).
+        err = hipMalloc(&d_prefill_gate_, static_cast<size_t>(total_slots) * max_dim * sizeof(float));
         if (err != hipSuccess)
             goto fail;
         err = hipMalloc(&d_prefill_up_, static_cast<size_t>(total_slots) * intermediate * sizeof(float));
-        if (err != hipSuccess)
-            goto fail;
-        err = hipMalloc(&d_prefill_swiglu_int8_, static_cast<size_t>(total_slots) * intermediate * sizeof(int8_t));
-        if (err != hipSuccess)
-            goto fail;
-        err = hipMalloc(&d_prefill_swiglu_scales_, static_cast<size_t>(total_slots) * inter_blocks * sizeof(float));
-        if (err != hipSuccess)
-            goto fail;
-        err = hipMalloc(&d_prefill_down_out_, static_cast<size_t>(total_slots) * d_model * sizeof(float));
         if (err != hipSuccess)
             goto fail;
 
@@ -4167,21 +4130,6 @@ namespace llaminar2
         {
             hipFree(d_prefill_up_);
             d_prefill_up_ = nullptr;
-        }
-        if (d_prefill_swiglu_int8_)
-        {
-            hipFree(d_prefill_swiglu_int8_);
-            d_prefill_swiglu_int8_ = nullptr;
-        }
-        if (d_prefill_swiglu_scales_)
-        {
-            hipFree(d_prefill_swiglu_scales_);
-            d_prefill_swiglu_scales_ = nullptr;
-        }
-        if (d_prefill_down_out_)
-        {
-            hipFree(d_prefill_down_out_);
-            d_prefill_down_out_ = nullptr;
         }
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
@@ -4271,9 +4219,9 @@ namespace llaminar2
             d_prefill_A_scales_,
             d_prefill_gate_,
             d_prefill_up_,
-            d_prefill_swiglu_int8_,
-            d_prefill_swiglu_scales_,
-            d_prefill_down_out_,
+            d_prefill_A_int8_,
+            d_prefill_A_scales_,
+            d_prefill_gate_,
             d_output,
             num_experts,
             d_model,

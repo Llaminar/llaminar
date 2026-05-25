@@ -100,10 +100,27 @@ namespace llaminar2
         const int workspace_heads = std::max(n, params_.n_heads);
         const int workspace_head_dim = std::max(k, params_.head_dim);
 
-        return consumer->getWorkspaceRequirements(
+        auto reqs = consumer->getWorkspaceRequirements(
             workspace_batch,
             workspace_heads,
             workspace_head_dim);
+
+        const int workspace_kv_heads = std::max(1, params_.n_kv_heads);
+        const size_t kv_convert_bytes = static_cast<size_t>(workspace_batch) *
+                                        4096ULL *
+                                        static_cast<size_t>(workspace_kv_heads) *
+                                        static_cast<size_t>(workspace_head_dim) *
+                                        sizeof(float);
+        for (auto &buffer : reqs.buffers)
+        {
+            if (buffer.name == "attn_k_tmp_fp32" ||
+                buffer.name == "attn_v_tmp_fp32")
+            {
+                buffer.size_bytes = kv_convert_bytes;
+            }
+        }
+
+        return reqs;
     }
 
     bool AttentionComputeStage::execute(IDeviceContext *ctx)

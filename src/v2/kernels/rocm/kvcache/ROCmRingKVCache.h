@@ -342,11 +342,6 @@ namespace llaminar2
         int head = 0;  ///< Next write position
         int count = 0; ///< Number of valid tokens
 
-        // Per-sequence scratch buffers for linearization
-        DataT *d_K_scratch = nullptr; ///< Linearized K when wrapped
-        DataT *d_V_scratch = nullptr; ///< Linearized V when wrapped
-        bool scratch_valid = false;   ///< True if scratch contains current linearized data
-
         /**
          * @brief Get tail (oldest token) position
          */
@@ -651,7 +646,6 @@ namespace llaminar2
         {
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].count = 0;
-            entries_[layer][seq_idx].scratch_valid = false;
         }
 
         void onEviction(int layer, int seq_idx, int num_evicted) override
@@ -664,7 +658,6 @@ namespace llaminar2
         }
         void onAdvanceComplete(int layer, int seq_idx) override
         {
-            entries_[layer][seq_idx].scratch_valid = false;
         }
 
     private:
@@ -685,9 +678,9 @@ namespace llaminar2
         std::vector<std::vector<EntryT>> entries_;
 
         // Pooled device memory for all KV cache entries.
-        // Single hipMalloc replaces n_layers × batch_size × 4 individual calls.
-        // Layout: [n_layers][batch_size][4_buffers][max_seq_len × kv_storage_dim]
-        // where 4 buffers are: K, V, K_scratch, V_scratch
+        // Single hipMalloc replaces n_layers × batch_size × 2 individual calls.
+        // Layout: [n_layers][batch_size][2_buffers][max_seq_len × kv_storage_dim]
+        // Wrapped-ring linearization uses the cache-level conversion scratch on demand.
         void *pool_base_ = nullptr;
         size_t pool_size_ = 0;
 
@@ -732,7 +725,7 @@ namespace llaminar2
         void allocate_entry(EntryT &entry); // Legacy: individual hipMalloc per entry
         void free_entry(EntryT &entry);     // Nulls pointers (no hipFree if pooled)
         void allocate_all_entries();        // Pool + assign entries + tensor_views + device_params
-        void linearize_entry(EntryT &entry, hipStream_t stream);
+        bool linearize_entry(EntryT &entry, hipStream_t stream);
 
         /**
          * @brief Get effective stream for kernel launches

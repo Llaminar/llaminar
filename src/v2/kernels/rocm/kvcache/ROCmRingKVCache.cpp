@@ -639,8 +639,6 @@ namespace llaminar2
                 {
                     entry.d_K = nullptr;
                     entry.d_V = nullptr;
-                    entry.d_K_scratch = nullptr;
-                    entry.d_V_scratch = nullptr;
                 }
             }
         }
@@ -663,8 +661,10 @@ namespace llaminar2
         size_t buffer_size = static_cast<size_t>(max_seq_len_) *
                              static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
         size_t total_entries = static_cast<size_t>(n_layers_) * static_cast<size_t>(batch_size_);
-        // 4 buffers per entry: K, V, K_scratch, V_scratch
-        pool_size_ = total_entries * 4 * buffer_size;
+        // 2 buffers per entry: persistent K and V. Wrapped-ring reads borrow
+        // the cache-level conversion scratch instead of reserving per-entry
+        // linearization buffers for every full-attention layer.
+        pool_size_ = total_entries * 2 * buffer_size;
 
         if (pool_size_ == 0)
         {
@@ -690,9 +690,9 @@ namespace llaminar2
         hipStreamSynchronize(init_stream);
 
         LOG_DEBUG("[ROCmRingKVCache] Pooled KV cache: 1 hipMalloc for "
-                  << total_entries << " entries × 4 buffers = "
+                  << total_entries << " entries × 2 buffers = "
                   << (pool_size_ / (1024 * 1024)) << " MB (replaced "
-                  << (total_entries * 4) << " individual hipMalloc calls)");
+                  << (total_entries * 2) << " individual hipMalloc calls)");
     }
 
     template <ActivationPrecision Precision>
@@ -717,15 +717,12 @@ namespace llaminar2
         size_t buffer_size = static_cast<size_t>(max_seq_len_) *
                              static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
         char *base = static_cast<char *>(pool_base_);
-        size_t entry_offset = static_cast<size_t>(linear_index) * 4 * buffer_size;
+        size_t entry_offset = static_cast<size_t>(linear_index) * 2 * buffer_size;
 
         entry.d_K = reinterpret_cast<DataT *>(base + entry_offset + 0 * buffer_size);
         entry.d_V = reinterpret_cast<DataT *>(base + entry_offset + 1 * buffer_size);
-        entry.d_K_scratch = reinterpret_cast<DataT *>(base + entry_offset + 2 * buffer_size);
-        entry.d_V_scratch = reinterpret_cast<DataT *>(base + entry_offset + 3 * buffer_size);
         entry.head = 0;
         entry.count = 0;
-        entry.scratch_valid = false;
     }
 
     template <ActivationPrecision Precision>
@@ -760,8 +757,8 @@ namespace llaminar2
         }
 
         LOG_DEBUG("[ROCmRingKVCache] Allocated "
-                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                  << " MB total (including scratch)");
+                  << (n_layers_ * batch_size_ * 2 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total");
 
         allocateDeviceParams(); // Base class method (ROCmRingKVCacheBase)
     }
@@ -775,14 +772,9 @@ namespace llaminar2
         hipMalloc(&entry.d_K, buffer_size);
         hipMalloc(&entry.d_V, buffer_size);
 
-        // Per-sequence scratch buffers for linearization
-        hipMalloc(&entry.d_K_scratch, buffer_size);
-        hipMalloc(&entry.d_V_scratch, buffer_size);
-
         // Initialize state
         entry.head = 0;
         entry.count = 0;
-        entry.scratch_valid = false;
     }
 
     template <ActivationPrecision Precision>
@@ -804,27 +796,8 @@ namespace llaminar2
                 fprintf(stderr, "WARNING: hipFree(d_V) failed: %s\n", hipGetErrorString(err));
             }
         }
-        if (entry.d_K_scratch)
-        {
-            hipError_t err = hipFree(entry.d_K_scratch);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_K_scratch) failed: %s\n", hipGetErrorString(err));
-            }
-        }
-        if (entry.d_V_scratch)
-        {
-            hipError_t err = hipFree(entry.d_V_scratch);
-            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
-            {
-                fprintf(stderr, "WARNING: hipFree(d_V_scratch) failed: %s\n", hipGetErrorString(err));
-            }
-        }
-
         entry.d_K = nullptr;
         entry.d_V = nullptr;
-        entry.d_K_scratch = nullptr;
-        entry.d_V_scratch = nullptr;
     }
 
     // get_cached_tokens(), get_head_position(), is_wrapped() are now
@@ -919,7 +892,6 @@ namespace llaminar2
             // launches use replay callbacks to advance by real (unpadded) tokens.
             entry.head = (entry.head + tokens_to_write) % max_seq_len_;
             entry.count += tokens_to_write;
-            entry.scratch_valid = false; // Scratch is stale after append
         }
 
         return true;
@@ -1052,23 +1024,29 @@ namespace llaminar2
             return true;
         }
 
-        // Buffer is wrapped - need to linearize
-        if (!entry.scratch_valid)
-        {
-            linearize_entry(entry, stream);
-            entry.scratch_valid = true;
-            ++linearization_count_;
-        }
+        if (!linearize_entry(entry, stream))
+            return false;
 
-        *d_k_out = entry.d_K_scratch;
-        *d_v_out = entry.d_V_scratch;
+        *d_k_out = static_cast<DataT *>(conv_scratch_k_);
+        *d_v_out = static_cast<DataT *>(conv_scratch_v_);
+        ++linearization_count_;
         return true;
     }
 
     template <ActivationPrecision Precision>
-    void ROCmRingKVCache<Precision>::linearize_entry(EntryT &entry, hipStream_t stream)
+    bool ROCmRingKVCache<Precision>::linearize_entry(EntryT &entry, hipStream_t stream)
     {
-        launch_linearize_kernel(entry, entry.d_K_scratch, entry.d_V_scratch, stream);
+        const size_t buffer_size = static_cast<size_t>(max_seq_len_) *
+                                   static_cast<size_t>(kv_storage_dim_) *
+                                   sizeof(DataT);
+        if (!ensureConvScratch(buffer_size))
+            return false;
+
+        launch_linearize_kernel(entry,
+                                static_cast<DataT *>(conv_scratch_k_),
+                                static_cast<DataT *>(conv_scratch_v_),
+                                stream);
+        return true;
     }
 
     template <ActivationPrecision Precision>
@@ -1158,7 +1136,6 @@ namespace llaminar2
 
         // O(1) eviction - just update count (tail moves implicitly)
         entry.count -= to_evict;
-        entry.scratch_valid = false;
         total_evicted_ += to_evict;
     }
 
@@ -1408,10 +1385,6 @@ namespace llaminar2
                         hipMemsetAsync(entry.d_K, 0, buffer_size, clear_stream);
                     if (entry.d_V)
                         hipMemsetAsync(entry.d_V, 0, buffer_size, clear_stream);
-                    if (entry.d_K_scratch)
-                        hipMemsetAsync(entry.d_K_scratch, 0, buffer_size, clear_stream);
-                    if (entry.d_V_scratch)
-                        hipMemsetAsync(entry.d_V_scratch, 0, buffer_size, clear_stream);
                 }
             }
         }

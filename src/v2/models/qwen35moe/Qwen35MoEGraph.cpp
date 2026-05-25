@@ -190,51 +190,50 @@ namespace llaminar2
     {
     }
 
-        IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(DeviceId device,
-                                                                   int prefill_token_capacity,
-                                                                   const std::string &key_suffix)
-        {
-    #if !defined(HAVE_ROCM)
-            (void)device;
-            (void)prefill_token_capacity;
-            (void)key_suffix;
+    IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(DeviceId device,
+                                                               int prefill_token_capacity,
+                                                               const std::string &key_suffix)
+    {
+#if !defined(HAVE_ROCM)
+        (void)device;
+        (void)prefill_token_capacity;
+        (void)key_suffix;
+        return nullptr;
+#else
+        if (!device.is_rocm() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || config_.n_layers <= 0)
             return nullptr;
-    #else
-            if (!device.is_rocm() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || config_.n_layers <= 0)
-                return nullptr;
 
-            const std::string key = key_suffix.empty()
-                                        ? device.to_string()
-                                        : device.to_string() + "#" + key_suffix;
-            auto it = moe_runtime_tables_.find(key);
-            if (it != moe_runtime_tables_.end())
-            {
-                if (prefill_token_capacity > 0)
-                    it->second->ensurePrefillRouteScratchCapacity(prefill_token_capacity);
-                return it->second.get();
-            }
-
-            DeviceMoERuntimeTable::Config table_config;
-            table_config.device_id = device;
-            table_config.num_layers = config_.n_layers;
-            table_config.num_experts = config_.moe.num_experts;
-            table_config.top_k = config_.moe.top_k;
-            table_config.mirror_to_device = true;
-            table_config.prefill_token_capacity = std::max(0, prefill_token_capacity);
-
-            auto table = std::make_unique<MoERuntimeTable>(table_config);
-            IMoERuntimeTable *ptr = table.get();
-            if (config_.moe.decode_histogram)
-            {
-                auto *histogram = config_.moe.decode_histogram;
-                histogram->registerRuntimeHistogramSync([ptr, histogram]() {
-                    return ptr->syncDecodeHistogramToHost(*histogram);
-                });
-            }
-            moe_runtime_tables_.emplace(key, std::move(table));
-            return ptr;
-    #endif
+        const std::string key = key_suffix.empty()
+                                    ? device.to_string()
+                                    : device.to_string() + "#" + key_suffix;
+        auto it = moe_runtime_tables_.find(key);
+        if (it != moe_runtime_tables_.end())
+        {
+            if (prefill_token_capacity > 0)
+                it->second->ensurePrefillRouteScratchCapacity(prefill_token_capacity);
+            return it->second.get();
         }
+
+        DeviceMoERuntimeTable::Config table_config;
+        table_config.device_id = device;
+        table_config.num_layers = config_.n_layers;
+        table_config.num_experts = config_.moe.num_experts;
+        table_config.top_k = config_.moe.top_k;
+        table_config.mirror_to_device = true;
+        table_config.prefill_token_capacity = std::max(0, prefill_token_capacity);
+
+        auto table = std::make_unique<MoERuntimeTable>(table_config);
+        IMoERuntimeTable *ptr = table.get();
+        if (config_.moe.decode_histogram)
+        {
+            auto *histogram = config_.moe.decode_histogram;
+            histogram->registerRuntimeHistogramSync([ptr, histogram]()
+                                                    { return ptr->syncDecodeHistogramToHost(*histogram); });
+        }
+        moe_runtime_tables_.emplace(key, std::move(table));
+        return ptr;
+#endif
+    }
 
     // =========================================================================
     // Schema
@@ -334,9 +333,9 @@ namespace llaminar2
                 !domainContainsDevice(continuation_domain, device))
             {
                 LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
-                                                   << " using MoE overlay continuation_domain root device "
-                                                   << continuation_device.to_string()
-                                                   << " instead of caller device " << device.to_string());
+                                                    << " using MoE overlay continuation_domain root device "
+                                                    << continuation_device.to_string()
+                                                    << " instead of caller device " << device.to_string());
                 device = continuation_device;
             }
         }
@@ -349,7 +348,11 @@ namespace llaminar2
         }
         else if (total_tokens > 1 && rocm_env.moe_grouped_prefill)
         {
-            moe_runtime_table = moeRuntimeTableForDevice(device, total_tokens);
+            // Fixed-topology grouped prefill consumes the routing tensors
+            // directly and does not read DeviceMoELayerRuntime prefill scratch.
+            // Keep the mirrored table available for decode/histogram users, but
+            // avoid preallocating per-layer prefill route buffers here.
+            moe_runtime_table = moeRuntimeTableForDevice(device);
         }
 
         // =====================================================================
@@ -1000,7 +1003,6 @@ namespace llaminar2
                 graph.addDependency(prefix + "shared_expert_gate", shared_ffn_last);
                 shared_ffn_last = prefix + "shared_expert_gate";
             }
-
         }
 
         // =====================================================================
