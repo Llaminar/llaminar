@@ -2286,7 +2286,12 @@ static bool launch_native_vnni_gemm(
             }
 
             if (eff_n128) {
-                NVNNI_LAUNCH_MT(128)
+                // M_TILE > 32 is NOT viable with N128 (A-LDS 2-way bank conflicts
+                // at THREADS_M=16, empirically 2.5× slower).  Cap to M32.
+                switch (eff_mt <= 32 ? eff_mt : 32) {
+                    case 16: NVNNI_LAUNCH_MB(128, 16)
+                    default: NVNNI_LAUNCH_MB(128, 32)
+                }
             } else {
                 NVNNI_LAUNCH_MT(64)
             }
@@ -2445,6 +2450,11 @@ static bool launch_native_vnni_gemm(
 
         // Hybrid N128 dispatch: M16/3-wave for small grids, M32/2-wave for large
         //
+        // Guard with if constexpr: only dual_scale (non-asym) formats reach here
+        // at runtime (Q6_K, Q3_K, IQ2_S, IQ2_XS, IQ1_M), but without the guard
+        // the compiler still instantiates launch3 for all formats — causing
+        // occupancy failures for Q2_K (drops to 1-wave at N128/M16/3w).
+        //
         // NOTE: M_TILE > 32 is NOT viable on N128 due to A-LDS bank conflicts.
         // gfx906 has 32 LDS banks at 4-byte granularity.  With M_PER_THREAD=4,
         // each thread reads 4 consecutive int32 from banks (t_m*4)%32 through
@@ -2455,6 +2465,8 @@ static bool launch_native_vnni_gemm(
         // The A-data reuse gain from N_PER_THREAD 4→8 is completely eaten by
         // the bank conflict stalls.  Empirically: M64/N128 and M128/N64 both
         // regressed LM_Head from 0.88× to 0.30-0.37× (2.5× slower).
+        if constexpr (!NVNNIGemmTraits<FMT>::is_dual_scale_asym &&
+                      !NVNNIGemmTraits<FMT>::is_asymmetric) {
         const int n128_blocks = (N + 127) / 128;
         const int m16_blocks  = (M + 15) / 16;
         const int total_wgs_m16 = n128_blocks * m16_blocks;
@@ -2469,6 +2481,7 @@ static bool launch_native_vnni_gemm(
                 return launch3(N128{}, M16{});
             else
                 return launch(N128{}, M32{});
+        }
         }
     } else {
         // Dual-scale-asymmetric formats (Pattern DA: Q2_K only): force M16 on N64.
