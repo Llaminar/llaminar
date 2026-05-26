@@ -23,7 +23,6 @@
 #include <sstream>
 #include <mpi.h>
 #include <numeric>
-#include <cstdlib>
 
 namespace llaminar2
 {
@@ -36,8 +35,7 @@ namespace llaminar2
     // Log GPU memory on all GPUs (enabled via LLAMINAR_BENCH_MEM_LOG=1).
     static void logGPUMemorySnapshot(const char *label)
     {
-        static const bool enabled = std::getenv("LLAMINAR_BENCH_MEM_LOG") != nullptr;
-        if (!enabled)
+        if (!debugEnv().runtime_debug.benchmark_memory_log)
             return;
 
         auto log_backend = [&](IBackend *b, const char *name)

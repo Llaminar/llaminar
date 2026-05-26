@@ -18,7 +18,6 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
-#include <cstdlib>
 #include <iomanip>
 #include <mutex>
 #include <numeric>
@@ -1306,7 +1305,7 @@ namespace llaminar2
 
         const size_t bytes = effective_count * sizeof(float);
 
-        if (std::getenv("LLAMINAR_TP_HOST_ALLREDUCE_TRACE"))
+        if (debugEnv().runtime_debug.tp_host_allreduce_trace)
         {
             for (int i = 0; i < num_participants; ++i)
             {

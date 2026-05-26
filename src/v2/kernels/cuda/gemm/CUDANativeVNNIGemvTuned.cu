@@ -25,6 +25,7 @@
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "utils/DebugEnv.h"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -229,8 +230,7 @@ namespace
         static int enabled = -1;
         if (enabled < 0)
         {
-            const char *env = std::getenv("LLAMINAR_CUDA_GEMV_ROWPAR");
-            enabled = (env && env[0] == '0') ? 0 : 1;
+            enabled = llaminar2::debugEnv().gemm.cuda_gemv_rowpar ? 1 : 0;
         }
         return enabled == 1;
     }
@@ -1001,8 +1001,7 @@ namespace
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * N * sizeof(float);
         static const bool s_deterministic = []()
         {
-            const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
-            return env && std::atoi(env) != 0;
+            return llaminar2::debugEnv().gemm.deterministic;
         }();
         const bool use_two_phase = s_deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
 

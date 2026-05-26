@@ -4,9 +4,9 @@
  */
 #include "app/Splash.h"
 #include "utils/MPIBootstrap.h"
+#include "utils/DebugEnv.h"
 
 #include <cstdio>
-#include <cstdlib>
 #include <iostream>
 #include <unistd.h>
 
@@ -31,10 +31,10 @@ namespace llaminar2
             if (!isatty(fileno(stdout)))
                 return false;
             // 2. Skip if user opted out.
-            if (std::getenv("LLAMINAR_NO_SPLASH"))
+            if (debugEnv().runtime_debug.no_splash)
                 return false;
-            // 3. Honour NO_COLOR (https://no-color.org/).
-            if (std::getenv("NO_COLOR"))
+            // 3. Honour NO_COLOR (https://no-color.org/) and Llaminar's color opt-out.
+            if (debugEnv().runtime_debug.no_color_output)
                 return false;
             // 4. Skip on MPI-spawned ranks; only the original launcher prints.
             auto info = MPIBootstrap::detectMPIEnvironment();
@@ -60,20 +60,20 @@ namespace llaminar2
         std::cout
             << '\n'
             // ── 6 parallel streams + fixed-column wordmark ────────────────
-            <<                          kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "         "
+            << kAqua << "\\  \\  \\  \\  \\  \\" << kReset << "         "
             << kBold << kOcean << "██╗     ██╗      █████╗ ███╗   ███╗██╗███╗   ██╗ █████╗ ██████╗" << kReset << '\n'
-            << " "                  << kAqua  << "\\  \\  \\  \\  \\  \\"  << kReset << "        "
+            << " " << kAqua << "\\  \\  \\  \\  \\  \\" << kReset << "        "
             << kBold << kOcean << "██║     ██║     ██╔══██╗████╗ ████║██║████╗  ██║██╔══██╗██╔══██╗" << kReset << '\n'
-            << "  "                 << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "       "
+            << "  " << kAzure << "\\  \\  \\  \\  \\  \\" << kReset << "       "
             << kBold << kOcean << "██║     ██║     ███████║██╔████╔██║██║██╔██╗ ██║███████║██████╔╝" << kReset << '\n'
-            << "   "                << kAzure << "\\  \\  \\  \\  \\  \\"  << kReset << "      "
-            << kBold << kDeep  << "██║     ██║     ██╔══██║██║╚██╔╝██║██║██║╚██╗██║██╔══██║██╔══██╗" << kReset << '\n'
-            << "    "               << kOcean << "\\  \\  \\  \\  \\  \\"  << kReset << "     "
-            << kBold << kDeep  << "███████╗███████╗██║  ██║██║ ╚═╝ ██║██║██║ ╚████║██║  ██║██║  ██║" << kReset << '\n'
-            << "     "              << kDeep  << "\\  \\  \\  \\  \\  \\"  << kReset << "    "
-            << kDim           << "╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝" << kReset << '\n'
+            << "   " << kAzure << "\\  \\  \\  \\  \\  \\" << kReset << "      "
+            << kBold << kDeep << "██║     ██║     ██╔══██║██║╚██╔╝██║██║██║╚██╗██║██╔══██║██╔══██╗" << kReset << '\n'
+            << "    " << kOcean << "\\  \\  \\  \\  \\  \\" << kReset << "     "
+            << kBold << kDeep << "███████╗███████╗██║  ██║██║ ╚═╝ ██║██║██║ ╚████║██║  ██║██║  ██║" << kReset << '\n'
+            << "     " << kDeep << "\\  \\  \\  \\  \\  \\" << kReset << "    "
+            << kDim << "╚══════╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝" << kReset << '\n'
             // ── ripples beneath the landing zone + tagline ────────────────
-            << "      "             << kDim  << "~  ~  ~  ~  ~  ~" << kReset << "                "
+            << "      " << kDim << "~  ~  ~  ~  ~  ~" << kReset << "                "
             << kDim << "l l m   i n f e r e n c e" << kReset << '\n'
             << '\n';
         std::cout.flush();

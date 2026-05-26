@@ -25,7 +25,6 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <iomanip>
 #include <optional>
 #include <print>
@@ -543,7 +542,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (ctx->isGPU() && std::getenv("LLAMINAR_SYNC_AFTER_STAGE"))
+            if (ctx->isGPU() && debugEnv().runtime_debug.sync_after_stage)
             {
                 LOG_DEBUG("[DeviceGraphExecutor] sync after stage: " << node->name);
                 ctx->synchronize();

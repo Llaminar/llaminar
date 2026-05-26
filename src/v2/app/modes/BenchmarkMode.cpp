@@ -42,14 +42,15 @@ namespace llaminar2
         /// @brief Opt benchmark mode into production bucketed prefill defaults.
         void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx)
         {
-            const bool user_selected_bucket_mode = std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKETS") != nullptr;
-            const bool user_selected_bucket_sizes = std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES") != nullptr;
-            const bool user_selected_gpu_graphs = std::getenv("LLAMINAR_GPU_GRAPHS") != nullptr;
+            const auto &env = debugEnv();
+            const bool user_selected_bucket_mode = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKETS");
+            const bool user_selected_bucket_sizes = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
+            const bool user_selected_gpu_graphs = env.presence.has("LLAMINAR_GPU_GRAPHS");
             if (!user_selected_bucket_mode)
             {
                 setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1", 1);
             }
-            else if (std::atoi(std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKETS")) == 0 && !user_selected_gpu_graphs)
+            else if (!env.execution.prefill_graph_buckets && !user_selected_gpu_graphs)
             {
                 setenv("LLAMINAR_GPU_GRAPHS", "0", 1);
             }
@@ -57,7 +58,9 @@ namespace llaminar2
             // Leave LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES unset unless the user
             // explicitly supplied it. DebugEnv then reloads the production
             // geometric bucket ladder instead of a benchmark-prompt-sized list.
-            mutableDebugEnv().execution.reload();
+            auto &mutable_env = mutableDebugEnv();
+            mutable_env.presence.reload();
+            mutable_env.execution.reload();
 
             if (mpi_ctx && mpi_ctx->rank() == 0)
             {

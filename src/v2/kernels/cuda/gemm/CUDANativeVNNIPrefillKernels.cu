@@ -11,6 +11,7 @@
 
 #include "CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "utils/DebugEnv.h"
 
 #include <algorithm>
 #include <atomic>
@@ -2463,16 +2464,14 @@ namespace
     // Set via LLAMINAR_DETERMINISTIC=1 env var.
     static bool g_deterministic_mode = []()
     {
-        const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
-        return env && std::atoi(env) != 0;
+        return llaminar2::debugEnv().gemm.deterministic;
     }();
 
     // BK256 mode: 0=auto (heuristic), 1=force ON, -1=force OFF
     // Set via LLAMINAR_BK256_MODE env var or extern C API.
     static int g_bk256_force_mode = []()
     {
-        const char *env = std::getenv("LLAMINAR_BK256_MODE");
-        return env ? std::atoi(env) : 0;
+        return llaminar2::debugEnv().gemm.cuda_bk256_mode;
     }();
 
     // ─── Format complexity classification ─────────────────────────────
@@ -2973,8 +2972,7 @@ namespace
     // =========================================================================
     static int g_stream_k_force_mode = []()
     {
-        const char *env = std::getenv("LLAMINAR_STREAM_K");
-        return env ? std::atoi(env) : 0;
+        return llaminar2::debugEnv().gemm.cuda_stream_k_mode;
     }();
 
     // =========================================================================

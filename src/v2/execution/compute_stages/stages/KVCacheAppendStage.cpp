@@ -24,7 +24,6 @@
 #include <immintrin.h>
 #include <cstring>
 #include <chrono>
-#include <cstdlib>
 
 namespace
 {
@@ -66,38 +65,6 @@ namespace
         default:
             return 0;
         }
-    }
-
-    static bool debugKVCacheSnapshotEnabled()
-    {
-        const char *env = std::getenv("LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT");
-        return env && std::atoi(env) != 0;
-    }
-
-    static bool debugKVCacheSnapshotLayerSelected(int layer_idx)
-    {
-        const char *env = std::getenv("LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT_LAYER");
-        if (!env || *env == '\0')
-        {
-            return true;
-        }
-        return std::atoi(env) == layer_idx;
-    }
-
-    static bool debugKVAppendSourceSnapshotEnabled()
-    {
-        const char *env = std::getenv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT");
-        return env && std::atoi(env) != 0;
-    }
-
-    static bool debugKVAppendSourceSnapshotLayerSelected(int layer_idx)
-    {
-        const char *env = std::getenv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_LAYER");
-        if (!env || *env == '\0')
-        {
-            return true;
-        }
-        return std::atoi(env) == layer_idx;
     }
 
     static bool copyTensorBytesForDebugSnapshot(
@@ -263,8 +230,8 @@ namespace llaminar2
                 return false;
             }
 
-            if (debugKVAppendSourceSnapshotEnabled() &&
-                debugKVAppendSourceSnapshotLayerSelected(params_.layer_idx))
+            if (debugEnv().attention.debug_kv_append_source_snapshot &&
+                debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
             {
                 const size_t rows = static_cast<size_t>(num_tokens);
                 const size_t k_cols = k_tensor->shape().size() > 1 ? k_tensor->shape()[1] : k_tensor->cols();
@@ -1539,8 +1506,8 @@ namespace llaminar2
             info.addOutput("V_dequant", params_.V_dequant_out, params_.V_dequant_out->rows(), params_.V_dequant_out->cols());
         }
 
-        if (debugKVAppendSourceSnapshotEnabled() &&
-            debugKVAppendSourceSnapshotLayerSelected(params_.layer_idx))
+        if (debugEnv().attention.debug_kv_append_source_snapshot &&
+            debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
         {
             if (!debug_append_source_k_snapshot_.empty() &&
                 debug_append_source_k_rows_ > 0 && debug_append_source_k_cols_ > 0)
@@ -1556,8 +1523,8 @@ namespace llaminar2
             }
         }
 
-        if (debugKVCacheSnapshotEnabled() &&
-            debugKVCacheSnapshotLayerSelected(params_.layer_idx) &&
+        if (debugEnv().attention.debug_kv_cache_snapshot &&
+            debugEnv().attention.debugKVCacheSnapshotLayerSelected(params_.layer_idx) &&
             params_.kv_cache)
         {
             ITensor *cache_k = nullptr;

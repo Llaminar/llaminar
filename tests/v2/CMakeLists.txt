@@ -240,6 +240,16 @@ if(NOT V2_PERF_TESTS_ONLY)
         LABELS "V2;Unit;StaticAnalysis;Weights;PreparedWeights;KernelFactory;Embedding"
         TIMEOUT 30
     )
+
+    add_test(
+        NAME V2_Unit_Static_NoDirectGetenvOutsideDebugEnv
+        COMMAND bash ${PROJECT_ROOT}/scripts/check_no_direct_getenv_outside_debugenv.sh ${PROJECT_ROOT}
+        WORKING_DIRECTORY ${PROJECT_ROOT}
+    )
+    set_tests_properties(V2_Unit_Static_NoDirectGetenvOutsideDebugEnv PROPERTIES
+        LABELS "V2;Unit;StaticAnalysis;DebugEnv;Environment"
+        TIMEOUT 30
+    )
 endif()
 
 # =============================================================================

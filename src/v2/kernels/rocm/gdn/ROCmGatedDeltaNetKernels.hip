@@ -18,7 +18,7 @@
 #include <hip/hip_fp16.h>
 #include <cstdio>
 #include <cstdint>
-#include <cstdlib>
+#include "../../../utils/DebugEnv.h"
 
 namespace {
 
@@ -905,7 +905,7 @@ bool rocmGDN_deinterleave_qkv(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    if (std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE"))
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
     {
         print_pointer_attrs("merged", merged);
         print_pointer_attrs("out_q", out_q);
@@ -932,7 +932,7 @@ bool rocmGDN_deinterleave_qkv(
         fprintf(stderr, "[rocmGDN_deinterleave_qkv] %s\n", hipGetErrorString(err));
         return false;
     }
-    if (std::getenv("LLAMINAR_ROCM_GDN_SYNC"))
+    if (llaminar2::debugEnv().rocm.gdn_sync)
     {
         err = hipStreamSynchronize((hipStream_t)stream);
         if (err != hipSuccess)
@@ -963,7 +963,7 @@ bool rocmGDN_recurrent_step(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    if (std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE"))
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
     {
         print_pointer_attrs("q", q);
         print_pointer_attrs("k", k);
@@ -995,7 +995,7 @@ bool rocmGDN_recurrent_step(
         fprintf(stderr, "[rocmGDN_recurrent_step] %s\n", hipGetErrorString(err));
         return false;
     }
-    if (std::getenv("LLAMINAR_ROCM_GDN_SYNC"))
+    if (llaminar2::debugEnv().rocm.gdn_sync)
     {
         err = hipStreamSynchronize((hipStream_t)stream);
         if (err != hipSuccess)
@@ -1018,7 +1018,7 @@ bool rocmGDN_chunk_forward(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    if (std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE"))
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
     {
         print_pointer_attrs("Q", Q);
         print_pointer_attrs("K", K);
@@ -1057,7 +1057,7 @@ bool rocmGDN_chunk_forward(
         fprintf(stderr, "[rocmGDN_chunk_forward] %s\n", hipGetErrorString(err));
         return false;
     }
-    if (std::getenv("LLAMINAR_ROCM_GDN_SYNC"))
+    if (llaminar2::debugEnv().rocm.gdn_sync)
     {
         err = hipStreamSynchronize((hipStream_t)stream);
         if (err != hipSuccess)
@@ -1081,7 +1081,7 @@ bool rocmGDN_chunk_forward_effective(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    if (std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE"))
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
     {
         print_pointer_attrs("Q", Q);
         print_pointer_attrs("K", K);
@@ -1117,7 +1117,7 @@ bool rocmGDN_chunk_forward_effective(
         fprintf(stderr, "[rocmGDN_chunk_forward_effective] %s\n", hipGetErrorString(err));
         return false;
     }
-    if (std::getenv("LLAMINAR_ROCM_GDN_SYNC"))
+    if (llaminar2::debugEnv().rocm.gdn_sync)
     {
         err = hipStreamSynchronize((hipStream_t)stream);
         if (err != hipSuccess)

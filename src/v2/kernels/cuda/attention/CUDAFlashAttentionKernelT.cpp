@@ -14,6 +14,7 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <cuda_runtime_api.h>
 #include <cstring>
@@ -829,8 +830,7 @@ namespace llaminar2
                 // Check for cuBLAS attention override (env: LLAMINAR_CUBLAS_ATTN=1)
                 static const int use_cublas_attn = []()
                 {
-                    const char *env = std::getenv("LLAMINAR_CUBLAS_ATTN");
-                    return (env && atoi(env) == 1) ? 1 : 0;
+                    return debugEnv().attention.cuda_cublas_attn ? 1 : 0;
                 }();
 
                 if (use_cublas_attn && n_heads % n_kv_heads == 0)

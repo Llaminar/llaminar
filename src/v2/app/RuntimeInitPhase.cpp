@@ -97,8 +97,7 @@ namespace llaminar2
 
             const bool strict_assert = []()
             {
-                const char *value = std::getenv("LLAMINAR_ASSERT_THREAD_AFFINITY");
-                return value != nullptr && std::string(value) == "1";
+                return debugEnv().runtime_debug.assert_thread_affinity;
             }();
 
             if (!affinity_ok)

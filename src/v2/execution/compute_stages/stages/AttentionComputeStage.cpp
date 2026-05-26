@@ -22,7 +22,6 @@
 #include <limits>
 #include <fstream>
 #include <filesystem>
-#include <cstdlib>
 
 #if defined(HAVE_CUDA)
 #include "../../../kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
@@ -34,20 +33,6 @@ namespace llaminar2
 
     namespace
     {
-        bool debugEffectiveKVSnapshotEnabled()
-        {
-            const char *env = std::getenv("LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT");
-            return env && std::atoi(env) != 0;
-        }
-
-        bool debugEffectiveKVSnapshotLayerSelected(int layer_idx)
-        {
-            const char *env = std::getenv("LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER");
-            if (!env || *env == '\0')
-                return true;
-            return std::atoi(env) == layer_idx;
-        }
-
         size_t debugElementSize(TensorType type)
         {
             switch (type)
@@ -639,10 +624,9 @@ namespace llaminar2
         // Dumps layer 0 data (or all layers with LLAMINAR_DUMP_EFFECTIVE_KV_ALL=1)
         // =====================================================================
         {
-            static const bool dump_enabled = (std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV") &&
-                                              std::atoi(std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV")) != 0);
-            static const bool dump_all = (std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV_ALL") &&
-                                          std::atoi(std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV_ALL")) != 0);
+            const auto &env = debugEnv().attention;
+            const bool dump_enabled = env.dump_effective_kv;
+            const bool dump_all = env.dump_effective_kv_all;
 
             if (dump_enabled && (dump_all || params_.layer_idx == 0) && is_decode_mode)
             {
@@ -736,7 +720,8 @@ namespace llaminar2
         // LLAMINAR_ENABLE_FUSED_TQ_ATTN=1 for testing.
         // =====================================================================
 #if defined(HAVE_CUDA)
-        if (is_decode_mode && params_.device_id.is_gpu() && params_.kv_cache && std::getenv("LLAMINAR_ENABLE_FUSED_TQ_ATTN"))
+        if (is_decode_mode && params_.device_id.is_gpu() && params_.kv_cache &&
+            debugEnv().attention.enable_fused_tq_attention)
         {
             const auto kp = params_.kv_cache->k_precision();
             const auto vp = params_.kv_cache->v_precision();
@@ -821,8 +806,8 @@ namespace llaminar2
             }
         }
 
-        if (debugEffectiveKVSnapshotEnabled() &&
-            debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
+        if (debugEnv().attention.debug_effective_kv_snapshot &&
+            debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
         {
             const size_t k_rows = static_cast<size_t>(effective_kv_len);
             const size_t v_rows = static_cast<size_t>(effective_kv_len);
@@ -1007,8 +992,8 @@ namespace llaminar2
             LOG_DEBUG("[AttentionComputeStage::getDumpInfo] output is NULL");
         }
 
-        if (debugEffectiveKVSnapshotEnabled() &&
-            debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
+        if (debugEnv().attention.debug_effective_kv_snapshot &&
+            debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
         {
             if (!debug_effective_k_snapshot_.empty() && debug_effective_k_rows_ > 0 && debug_effective_k_cols_ > 0)
             {

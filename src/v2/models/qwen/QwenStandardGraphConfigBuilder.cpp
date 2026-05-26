@@ -9,6 +9,7 @@
 #include "QwenStandardGraph.h" // For GraphConfig definition (via GraphTypes.h)
 #include "../../interfaces/IModelContext.h"
 #include "../../loaders/WeightManager.h"
+#include "../../utils/DebugEnv.h"
 #include "../qwen35/Qwen35GraphConfigBuilder.h"
 #include "../qwen35moe/Qwen35MoEGraphConfigBuilder.h"
 #include <algorithm>
@@ -131,8 +132,7 @@ namespace llaminar2
         // (get_kv_converted applies RoPE during incremental dequant)
         // Supported on CPU (all precisions) and GPU (via get_kv_converted override)
         {
-            const char *ror_env = std::getenv("LLAMINAR_ROPE_ON_READ");
-            config.rope_on_read = ror_env ? (std::atoi(ror_env) != 0) : true;
+            config.rope_on_read = debugEnv().runtime_debug.rope_on_read;
         }
 
         // Configure TP for attention

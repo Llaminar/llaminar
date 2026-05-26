@@ -12,9 +12,9 @@
 #include "app/StartupBanner.h"
 #include "backends/CPUSocketInfo.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
+#include "utils/DebugEnv.h"
 #include "fort.hpp"
 
-#include <cstdlib>
 #include <map>
 #include <sstream>
 #include <unistd.h>
@@ -570,9 +570,7 @@ namespace llaminar2
 
     bool StartupBanner::shouldUseColor()
     {
-        if (std::getenv("NO_COLOR"))
-            return false;
-        if (std::getenv("LLAMINAR_NO_COLOR"))
+        if (debugEnv().runtime_debug.no_color_output)
             return false;
         // Check if stderr is a TTY (LOG_INFO goes to stderr)
         return isatty(fileno(stderr)) != 0;

@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../utils/DebugEnv.h"
 
 namespace
 {
@@ -137,14 +138,6 @@ namespace
     inline int clampInt(int v, int lo, int hi)
     {
         return (v < lo) ? lo : ((v > hi) ? hi : v);
-    }
-
-    inline int envIntClamped(const char *name, int fallback, int lo, int hi)
-    {
-        const char *value = std::getenv(name);
-        if (!value || !*value)
-            return fallback;
-        return clampInt(std::atoi(value), lo, hi);
     }
 
     inline int roundUpPow2Clamped(int value, int max_allowed)
@@ -409,18 +402,15 @@ namespace
             : FD_MAX_SPLITS_SUPPORTED;
         const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
 
-        if (std::getenv("LLAMINAR_ROCM_FA_DECODE_NUM_SPLITS"))
+        const auto &rocm_env = llaminar2::debugEnv().rocm;
+        if (rocm_env.fa_decode_num_splits_present)
         {
-            const int forced_splits = envIntClamped(
-                "LLAMINAR_ROCM_FA_DECODE_NUM_SPLITS",
-                heuristic_splits,
-                1,
-                max_allowed);
-            const int forced_tpb = envIntClamped(
-                "LLAMINAR_ROCM_FA_DECODE_TPB",
-                chooseDecodeThreadsPerBlock(head_dim, kv_len, forced_splits),
-                64,
-                256);
+            const int forced_splits = rocm_env.fa_decode_num_splits
+                ? clampInt(*rocm_env.fa_decode_num_splits, 1, max_allowed)
+                : heuristic_splits;
+            const int forced_tpb = rocm_env.fa_decode_tpb
+                ? clampInt(*rocm_env.fa_decode_tpb, 64, 256)
+                : chooseDecodeThreadsPerBlock(head_dim, kv_len, forced_splits);
             selection.config = {forced_splits, forced_tpb};
             return selection;
         }

@@ -1828,7 +1828,7 @@ LOG_TRACE("Verbose execution tracing");
 
 ### Centralized Environment Access (debugEnv)
 
-All hot-path code MUST use `debugEnv()` instead of `std::getenv`:
+Direct environment access is prohibited in C++ source. Do not call `std::getenv`, `::getenv`, or add local wrappers around environment reads outside `src/v2/utils/DebugEnv.h`. The required pattern is to add the variable to the appropriate `DebugEnv` config struct, parse it once in that struct's `reload()` method, and read it through `debugEnv()` at call sites. Unavoidable bootstrap or circular-dependency exceptions must stay explicit and covered by the static hygiene allowlist.
 
 ```cpp
 // BEFORE (bad)

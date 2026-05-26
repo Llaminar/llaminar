@@ -208,7 +208,7 @@ namespace llaminar2
                 cudaQuantGemm_createEvent(&quant_ready, dev_id);
                 initialized = true;
                 LOG_DEBUG("[CUDAConcurrentPrefillPool] Initialized " << count
-                                                                    << " streams on device " << dev_id);
+                                                                     << " streams on device " << dev_id);
             }
 
             /// Ensure per-stream scratch buffer has at least `elements` int32s.
@@ -674,8 +674,8 @@ namespace llaminar2
               cuda_device_id_(cuda_device_id),
               N_(static_cast<size_t>(N)),
               K_(static_cast<size_t>(K)),
-              weights_converted_(true),    // Already on device
-              owns_weight_memory_(false),  // Shared batch allocation owns it
+              weights_converted_(true),   // Already on device
+              owns_weight_memory_(false), // Shared batch allocation owns it
               impl_(std::make_unique<Impl>())
         {
             impl_->d_weights_native_vnni = d_vnni;
@@ -802,7 +802,7 @@ namespace llaminar2
                     static std::once_flag vnni_only_once;
                     std::call_once(vnni_only_once, [&]()
                                    { LOG_DEBUG("[CUDAQuantisedGemmKernel] NativeVNNI-only mode (codebook "
-                                              << static_cast<int>(packed_->native_codebook_id) << ")"); });
+                                               << static_cast<int>(packed_->native_codebook_id) << ")"); });
 
                     if (!uploadNativePackedWeights(*packed_, upload, cuda_device_id_))
                     {
@@ -880,10 +880,10 @@ namespace llaminar2
             if (N_ == 64 && K_ == 896) // This is the K weight shape for LOCAL TP
             {
                 LOG_DEBUG("[CUDAQuantisedGemmKernel DEBUG] K weight N=" << N_ << " K=" << K_
-                                                                       << " device=" << cuda_device_id_
-                                                                       << " first 5 weights[0]: " << h_weights_fp32[0] << ", "
-                                                                       << h_weights_fp32[1] << ", " << h_weights_fp32[2] << ", "
-                                                                       << h_weights_fp32[3] << ", " << h_weights_fp32[4]);
+                                                                        << " device=" << cuda_device_id_
+                                                                        << " first 5 weights[0]: " << h_weights_fp32[0] << ", "
+                                                                        << h_weights_fp32[1] << ", " << h_weights_fp32[2] << ", "
+                                                                        << h_weights_fp32[3] << ", " << h_weights_fp32[4]);
             }
 
             CUDAPackedWeights legacy_packed;
@@ -1300,9 +1300,8 @@ namespace llaminar2
             // the multi-stream fused path still proved unstable in local-PP
             // parity runs. Keep the fast path for larger prompt lengths where
             // concurrent projection dispatch is most useful.
-            const char *deterministic_env = std::getenv("LLAMINAR_DETERMINISTIC");
             const bool deterministic_prefill = cudaNativeVNNIPrefill_getDeterministicMode() ||
-                                               (deterministic_env && std::atoi(deterministic_env) != 0);
+                                               debugEnv().gemm.deterministic;
             const bool small_m_stage_stream = (gpu_stream_ != nullptr) && (m <= 16);
 
             const bool concurrent_eligible = use_blockwise && m > 16 &&
@@ -1835,8 +1834,7 @@ namespace llaminar2
             // then cuBLAS FP16 tensor-core GEMM with FP32 accumulation.
             static const bool use_cublas_gemm = []()
             {
-                const char *env = std::getenv("LLAMINAR_CUBLAS_GEMM");
-                return (env && atoi(env) == 1);
+                return debugEnv().gemm.cuda_cublas_gemm;
             }();
 
             if (use_cublas_gemm && m > 1 && impl_->d_weights_native_vnni && impl_->d_weights_native_scales)

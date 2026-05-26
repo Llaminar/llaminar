@@ -17,9 +17,9 @@
 #include "../ROCmKernelBase.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/ROCmKernelProfiler.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
-#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -118,12 +118,6 @@ namespace llaminar2
     {
         // Default number of splits for Flash Decoding
         constexpr int DEFAULT_NUM_SPLITS = 8;
-
-        bool attentionEnvFlag(const char *name)
-        {
-            const char *value = std::getenv(name);
-            return value && std::atoi(value) != 0;
-        }
 
         // =====================================================================
         // FP32 Specialization Implementation
@@ -434,7 +428,7 @@ namespace llaminar2
             // Choose algorithm based on seq_len. Split-K flash decode remains
             // the default decode path; LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL is
             // an explicit diagnostic/reference mode only.
-            const bool decode_via_prefill = attentionEnvFlag("LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL");
+            const bool decode_via_prefill = debugEnv().rocm.fa_decode_via_prefill;
             if (seq_len == 1 && !decode_via_prefill)
             {
                 // Flash Decoding for single-token decode
@@ -574,8 +568,9 @@ namespace llaminar2
             // conversion path so native FP16/Q8_1 flash decode can be isolated.
             bool use_native_kv = false;
             TensorType kv_native_type = TensorType::FP32;
-            const bool disable_native_kv = attentionEnvFlag("LLAMINAR_ROCM_FA_DISABLE_NATIVE_KV");
-            const bool decode_via_prefill = attentionEnvFlag("LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL");
+            const auto &rocm_env = debugEnv().rocm;
+            const bool disable_native_kv = rocm_env.fa_disable_native_kv;
+            const bool decode_via_prefill = rocm_env.fa_decode_via_prefill;
 
             if (K->native_type() != TensorType::FP32 || V->native_type() != TensorType::FP32)
             {

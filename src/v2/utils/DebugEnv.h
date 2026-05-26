@@ -39,6 +39,118 @@ namespace llaminar2
 {
 
     /**
+     * @brief Tracks whether selected environment variables were present at the last reload.
+     *
+     * Some call sites need to distinguish a parsed default from an explicit user override.
+     * This snapshot centralizes those presence checks so std::getenv remains contained in
+     * DebugEnv.h while parsed config structs continue to expose normalized values.
+     */
+    struct EnvPresenceConfig
+    {
+        std::set<std::string> present; ///< Environment variable names present at the last reload.
+
+        EnvPresenceConfig()
+        {
+            reload();
+        }
+
+        /// @brief Returns true when the tracked environment variable was present at the last reload.
+        bool has(const char *name) const
+        {
+            return name != nullptr && present.find(name) != present.end();
+        }
+
+        /// @brief Rebuilds the presence snapshot from the tracked environment variable list.
+        void reload()
+        {
+            present.clear();
+            for (const char *name : trackedNames())
+            {
+                if (std::getenv(name) != nullptr)
+                    present.insert(name);
+            }
+        }
+
+    private:
+        /// @brief Names whose explicit presence is semantically significant to call sites.
+        static const std::vector<const char *> &trackedNames()
+        {
+            static const std::vector<const char *> names = {
+                "LLAMINAR_PREFILL_GRAPH_BUCKETS",
+                "LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
+                "LLAMINAR_GPU_GRAPHS",
+                "LLAMINAR_MOE_REBALANCE",
+                "LLAMINAR_MOE_REBALANCE_WINDOW",
+                "LLAMINAR_MOE_REBALANCE_MAX_WINDOW",
+                "LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH",
+                "LLAMINAR_MOE_REBALANCE_REPLICAS",
+            };
+            return names;
+        }
+    };
+
+    /**
+     * @brief Miscellaneous non-kernel runtime/debug environment switches.
+     *
+     * This group covers app display toggles, benchmark diagnostics, and local
+     * execution debug flags that do not belong to the kernel-specific config
+     * groups. Presence-based flags preserve their historical "set means on"
+     * behavior unless noted otherwise.
+     */
+    struct RuntimeDebugConfig
+    {
+        bool no_splash = false;               ///< Disable startup splash when LLAMINAR_NO_SPLASH is present.
+        bool no_color_output = false;         ///< Disable ANSI color when NO_COLOR or LLAMINAR_NO_COLOR is present.
+        bool assert_thread_affinity = false;  ///< Fail affinity verification only when LLAMINAR_ASSERT_THREAD_AFFINITY=1.
+        bool benchmark_memory_log = false;    ///< Emit benchmark GPU memory snapshots when LLAMINAR_BENCH_MEM_LOG is present.
+        bool rope_on_read = true;             ///< Enable RoPE-on-read unless LLAMINAR_ROPE_ON_READ parses to 0.
+        bool sync_after_stage = false;        ///< Synchronize GPU after every stage when LLAMINAR_SYNC_AFTER_STAGE is present.
+        bool serialize_tp_forward = false;    ///< Serialize local TP forwards when LLAMINAR_SERIALIZE_TP_FORWARD is present.
+        bool tp_host_allreduce_trace = false; ///< Trace host allreduce tensor slots when LLAMINAR_TP_HOST_ALLREDUCE_TRACE is present.
+        bool layer_trace = false;             ///< Emit temporary per-layer residual trace when LLAMINAR_LAYER_TRACE is present.
+
+        RuntimeDebugConfig()
+        {
+            reload();
+        }
+
+        /// @brief Reloads all miscellaneous runtime/debug switches from the process environment.
+        void reload()
+        {
+            no_splash = isPresent("LLAMINAR_NO_SPLASH");
+            no_color_output = isPresent("NO_COLOR") || isPresent("LLAMINAR_NO_COLOR");
+            assert_thread_affinity = isExactlyOne("LLAMINAR_ASSERT_THREAD_AFFINITY");
+            benchmark_memory_log = isPresent("LLAMINAR_BENCH_MEM_LOG");
+            rope_on_read = readBoolDefaultTrue("LLAMINAR_ROPE_ON_READ");
+            sync_after_stage = isPresent("LLAMINAR_SYNC_AFTER_STAGE");
+            serialize_tp_forward = isPresent("LLAMINAR_SERIALIZE_TP_FORWARD");
+            tp_host_allreduce_trace = isPresent("LLAMINAR_TP_HOST_ALLREDUCE_TRACE");
+            layer_trace = isPresent("LLAMINAR_LAYER_TRACE");
+        }
+
+    private:
+        /// @brief Returns true when an environment variable exists, regardless of value.
+        static bool isPresent(const char *name)
+        {
+            return std::getenv(name) != nullptr;
+        }
+
+        /// @brief Returns true only for the historical strict value "1".
+        static bool isExactlyOne(const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value != nullptr && std::strcmp(value, "1") == 0;
+        }
+
+        /// @brief Returns true when unset, otherwise follows historical std::atoi boolean parsing.
+        static bool readBoolDefaultTrue(const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value == nullptr || std::atoi(value) != 0;
+        }
+    };
+
+    /**
      * @brief Dequantization configuration group
      */
     struct DequantConfig
@@ -191,6 +303,12 @@ namespace llaminar2
         bool gemm_dynamic_schedule = false; ///< Use dynamic OMP scheduling (static is better)
         int gemm_n_tile = 0;                ///< N-dimension tile size (0=no tiling is optimal for large batches)
 
+        bool deterministic = false;    ///< Enable deterministic CUDA GEMM dispatch when LLAMINAR_DETERMINISTIC is non-zero.
+        bool cuda_cublas_gemm = false; ///< Use cuBLAS FP16 GEMM path only when LLAMINAR_CUBLAS_GEMM=1.
+        bool cuda_gemv_rowpar = true;  ///< Enable CUDA GEMV row-parallel layout unless LLAMINAR_CUDA_GEMV_ROWPAR starts with '0'.
+        int cuda_bk256_mode = 0;       ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
+        int cuda_stream_k_mode = 0;    ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
+
         GemmConfig()
         {
             reload();
@@ -295,6 +413,21 @@ namespace llaminar2
             const char *fused_trace_env = std::getenv("LLAMINAR_CUDA_FUSED_GEMM_TRACE");
             if (fused_trace_env)
                 cuda_fused_gemm_trace = (std::atoi(fused_trace_env) != 0);
+
+            const char *deterministic_env = std::getenv("LLAMINAR_DETERMINISTIC");
+            deterministic = deterministic_env && std::atoi(deterministic_env) != 0;
+
+            const char *cublas_gemm_env = std::getenv("LLAMINAR_CUBLAS_GEMM");
+            cuda_cublas_gemm = cublas_gemm_env && std::atoi(cublas_gemm_env) == 1;
+
+            const char *gemv_rowpar_env = std::getenv("LLAMINAR_CUDA_GEMV_ROWPAR");
+            cuda_gemv_rowpar = !(gemv_rowpar_env && gemv_rowpar_env[0] == '0');
+
+            const char *bk256_env = std::getenv("LLAMINAR_BK256_MODE");
+            cuda_bk256_mode = bk256_env ? std::atoi(bk256_env) : 0;
+
+            const char *stream_k_env = std::getenv("LLAMINAR_STREAM_K");
+            cuda_stream_k_mode = stream_k_env ? std::atoi(stream_k_env) : 0;
         }
 
         bool trace_q8_1_direct = false;      ///< Enable detailed Q8_1 JIT kernel tracing
@@ -429,6 +562,18 @@ namespace llaminar2
     {
         bool fp32_scores = false; ///< Use FP32 for Q·K score computation (default: integer)
 
+        bool debug_effective_kv_snapshot = false;             ///< Capture effective K/V tensors when LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT is non-zero.
+        std::optional<int> debug_effective_kv_snapshot_layer; ///< Selected layer for effective K/V snapshots; nullopt means all layers.
+        bool dump_effective_kv = false;                       ///< Dump effective K/V binary files when LLAMINAR_DUMP_EFFECTIVE_KV is non-zero.
+        bool dump_effective_kv_all = false;                   ///< Dump every layer instead of layer 0 when LLAMINAR_DUMP_EFFECTIVE_KV_ALL is non-zero.
+        bool enable_fused_tq_attention = false;               ///< Enable fused TQ attention when LLAMINAR_ENABLE_FUSED_TQ_ATTN is present.
+        bool debug_kv_cache_snapshot = false;                 ///< Capture KV cache tensors when LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT is non-zero.
+        std::optional<int> debug_kv_cache_snapshot_layer;     ///< Selected layer for KV cache snapshots; nullopt means all layers.
+        bool debug_kv_append_source_snapshot = false;         ///< Capture source K/V tensors before append when LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT is non-zero.
+        std::optional<int> debug_kv_append_source_layer;      ///< Selected layer for source K/V snapshots; nullopt means all layers.
+        int cuda_fa2_tile_kv = 0;                             ///< CUDA FA2 KV tile override (LLAMINAR_FA2_TILE_KV, default 0=auto).
+        bool cuda_cublas_attn = false;                        ///< Use CUDA cuBLAS attention path only when LLAMINAR_CUBLAS_ATTN=1.
+
         // Wo projection mode (JIT backend only)
         // When enabled, Wo weights are expected to be passed as packed QuantisedPackedWeights
         // and Wo projection is executed via gemm (AVX-512 VNNI) with on-the-fly activation quantization.
@@ -449,6 +594,24 @@ namespace llaminar2
         AttentionConfig()
         {
             reload();
+        }
+
+        /// @brief Returns true when effective K/V snapshots should include the given layer.
+        bool debugEffectiveKVSnapshotLayerSelected(int layer_idx) const
+        {
+            return !debug_effective_kv_snapshot_layer || *debug_effective_kv_snapshot_layer == layer_idx;
+        }
+
+        /// @brief Returns true when KV cache snapshots should include the given layer.
+        bool debugKVCacheSnapshotLayerSelected(int layer_idx) const
+        {
+            return !debug_kv_cache_snapshot_layer || *debug_kv_cache_snapshot_layer == layer_idx;
+        }
+
+        /// @brief Returns true when KV append source snapshots should include the given layer.
+        bool debugKVAppendSourceLayerSelected(int layer_idx) const
+        {
+            return !debug_kv_append_source_layer || *debug_kv_append_source_layer == layer_idx;
         }
 
         void reload()
@@ -515,6 +678,41 @@ namespace llaminar2
             {
                 flash_prefill_i16_i12_max_head_dim = std::max(1, std::atoi(flash_i16_max_hd_env));
             }
+
+            const char *effective_kv_snapshot_env = std::getenv("LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT");
+            debug_effective_kv_snapshot = effective_kv_snapshot_env && std::atoi(effective_kv_snapshot_env) != 0;
+            debug_effective_kv_snapshot_layer = selectedLayerFromEnv("LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT_LAYER");
+
+            const char *dump_effective_kv_env = std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV");
+            dump_effective_kv = dump_effective_kv_env && std::atoi(dump_effective_kv_env) != 0;
+            const char *dump_effective_kv_all_env = std::getenv("LLAMINAR_DUMP_EFFECTIVE_KV_ALL");
+            dump_effective_kv_all = dump_effective_kv_all_env && std::atoi(dump_effective_kv_all_env) != 0;
+
+            enable_fused_tq_attention = std::getenv("LLAMINAR_ENABLE_FUSED_TQ_ATTN") != nullptr;
+
+            const char *kv_cache_snapshot_env = std::getenv("LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT");
+            debug_kv_cache_snapshot = kv_cache_snapshot_env && std::atoi(kv_cache_snapshot_env) != 0;
+            debug_kv_cache_snapshot_layer = selectedLayerFromEnv("LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT_LAYER");
+
+            const char *kv_append_source_snapshot_env = std::getenv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT");
+            debug_kv_append_source_snapshot = kv_append_source_snapshot_env && std::atoi(kv_append_source_snapshot_env) != 0;
+            debug_kv_append_source_layer = selectedLayerFromEnv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_LAYER");
+
+            const char *cuda_fa2_tile_kv_env = std::getenv("LLAMINAR_FA2_TILE_KV");
+            cuda_fa2_tile_kv = cuda_fa2_tile_kv_env ? std::atoi(cuda_fa2_tile_kv_env) : 0;
+
+            const char *cuda_cublas_attn_env = std::getenv("LLAMINAR_CUBLAS_ATTN");
+            cuda_cublas_attn = cuda_cublas_attn_env && std::atoi(cuda_cublas_attn_env) == 1;
+        }
+
+    private:
+        /// @brief Parses optional layer selectors where unset or empty means every layer.
+        static std::optional<int> selectedLayerFromEnv(const char *name)
+        {
+            const char *value = std::getenv(name);
+            if (!value || *value == '\0')
+                return std::nullopt;
+            return std::atoi(value);
         }
     };
 
@@ -2298,19 +2496,26 @@ namespace llaminar2
      */
     struct ROCmConfig
     {
-        bool trace_coherence = false;           ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
-        bool trace_kernels = false;             ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
-        bool sync_after_kernel = false;         ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
-        std::string gemv_mode = "fp32";         ///< GEMV mode: fp32 (default), fp16, int8
-        std::string gemv_layout = "row";        ///< GEMV weight layout: row (default), vnni
-        bool pack_vnni_only_host = false;       ///< Prefer VNNI-only host packed buffers (LLAMINAR_ROCM_PACK_VNNI_ONLY)
-        bool vnni_prefill_grid_kpar = false;    ///< Enable INT8 prefill grid-kpar split-K variant (LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR)
-        int vnni_prefill_grid_kpar_splits = 0;  ///< Split-K slices for grid-kpar variant (`0` = auto)
-        int vnni_prefill_cpt = 1;               ///< Outputs-per-thread for INT8 prefill kernels (1,2,4)
-        int vnni_prefill_grid_kpar_kb = 0;      ///< Grid-kpar K-block count override (0=auto)
-        int vnni_prefill_variant = -1;          ///< Baseline prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
-        int vnni_prefill_grid_variant = -1;     ///< Grid-kpar prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
-        bool vnni_prefill_ffn_override = false; ///< Enable FFN-wide policy override for INT8 prefill
+        bool trace_coherence = false;              ///< Log detailed coherence timings (LLAMINAR_ROCM_TRACE_COHERENCE)
+        bool trace_kernels = false;                ///< Log per-kernel timing breakdown (LLAMINAR_ROCM_TRACE_KERNELS)
+        bool sync_after_kernel = false;            ///< Force sync after each kernel (LLAMINAR_ROCM_SYNC_AFTER_KERNEL)
+        bool fa_decode_num_splits_present = false; ///< True when LLAMINAR_ROCM_FA_DECODE_NUM_SPLITS is present, even if empty.
+        std::optional<int> fa_decode_num_splits;   ///< Raw requested ROCm flash decode split count; dynamic call sites clamp it.
+        std::optional<int> fa_decode_tpb;          ///< Raw requested ROCm flash decode TPB; dynamic call sites clamp it to 64..256.
+        bool fa_decode_via_prefill = false;        ///< Route ROCm single-token decode through prefill when LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL is non-zero.
+        bool fa_disable_native_kv = false;         ///< Disable ROCm native KV flash attention when LLAMINAR_ROCM_FA_DISABLE_NATIVE_KV is non-zero.
+        bool gdn_ptr_trace = false;                ///< Print ROCm GDN pointer attributes when LLAMINAR_ROCM_GDN_PTR_TRACE is present.
+        bool gdn_sync = false;                     ///< Synchronize ROCm GDN streams after launches when LLAMINAR_ROCM_GDN_SYNC is present.
+        std::string gemv_mode = "fp32";            ///< GEMV mode: fp32 (default), fp16, int8
+        std::string gemv_layout = "row";           ///< GEMV weight layout: row (default), vnni
+        bool pack_vnni_only_host = false;          ///< Prefer VNNI-only host packed buffers (LLAMINAR_ROCM_PACK_VNNI_ONLY)
+        bool vnni_prefill_grid_kpar = false;       ///< Enable INT8 prefill grid-kpar split-K variant (LLAMINAR_ROCM_VNNI_PREFILL_GRID_KPAR)
+        int vnni_prefill_grid_kpar_splits = 0;     ///< Split-K slices for grid-kpar variant (`0` = auto)
+        int vnni_prefill_cpt = 1;                  ///< Outputs-per-thread for INT8 prefill kernels (1,2,4)
+        int vnni_prefill_grid_kpar_kb = 0;         ///< Grid-kpar K-block count override (0=auto)
+        int vnni_prefill_variant = -1;             ///< Baseline prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
+        int vnni_prefill_grid_variant = -1;        ///< Grid-kpar prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
+        bool vnni_prefill_ffn_override = false;    ///< Enable FFN-wide policy override for INT8 prefill
         int vnni_prefill_ffn_override_grid_kpar = -1;
         int vnni_prefill_ffn_override_splits = 0;
         int vnni_prefill_ffn_override_cpt = 0;
@@ -2375,6 +2580,13 @@ namespace llaminar2
             trace_coherence = false;
             trace_kernels = false;
             sync_after_kernel = false;
+            fa_decode_num_splits_present = false;
+            fa_decode_num_splits.reset();
+            fa_decode_tpb.reset();
+            fa_decode_via_prefill = false;
+            fa_disable_native_kv = false;
+            gdn_ptr_trace = false;
+            gdn_sync = false;
             gemv_mode = "fp32";
             gemv_layout = "row";
             pack_vnni_only_host = false;
@@ -2454,6 +2666,28 @@ namespace llaminar2
             {
                 sync_after_kernel = (std::atoi(sync_env) != 0);
             }
+
+            const char *fa_decode_splits_env = std::getenv("LLAMINAR_ROCM_FA_DECODE_NUM_SPLITS");
+            fa_decode_num_splits_present = fa_decode_splits_env != nullptr;
+            if (fa_decode_splits_env && *fa_decode_splits_env)
+            {
+                fa_decode_num_splits = std::atoi(fa_decode_splits_env);
+            }
+
+            const char *fa_decode_tpb_env = std::getenv("LLAMINAR_ROCM_FA_DECODE_TPB");
+            if (fa_decode_tpb_env && *fa_decode_tpb_env)
+            {
+                fa_decode_tpb = std::atoi(fa_decode_tpb_env);
+            }
+
+            const char *fa_decode_via_prefill_env = std::getenv("LLAMINAR_ROCM_FA_DECODE_VIA_PREFILL");
+            fa_decode_via_prefill = fa_decode_via_prefill_env && std::atoi(fa_decode_via_prefill_env) != 0;
+
+            const char *fa_disable_native_kv_env = std::getenv("LLAMINAR_ROCM_FA_DISABLE_NATIVE_KV");
+            fa_disable_native_kv = fa_disable_native_kv_env && std::atoi(fa_disable_native_kv_env) != 0;
+
+            gdn_ptr_trace = std::getenv("LLAMINAR_ROCM_GDN_PTR_TRACE") != nullptr;
+            gdn_sync = std::getenv("LLAMINAR_ROCM_GDN_SYNC") != nullptr;
 
             const char *gemv_env = std::getenv("LLAMINAR_ROCM_GEMV_MODE");
             if (gemv_env)
@@ -2927,6 +3161,8 @@ namespace llaminar2
      */
     struct DebugEnv
     {
+        EnvPresenceConfig presence;       ///< Explicit env-var presence snapshot for override-sensitive config.
+        RuntimeDebugConfig runtime_debug; ///< Miscellaneous app/runtime debug environment switches.
         DequantConfig dequant;
         GemmConfig gemm;
         CPUVNNIConfig cpu_vnni; ///< CPU NativeVNNI tile dispatch overrides
@@ -3154,6 +3390,8 @@ namespace llaminar2
 
         void reload()
         {
+            presence.reload();
+            runtime_debug.reload();
             const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
             tp_timing = tp_env && std::string(tp_env) == "1";
             const char *skip_ar = std::getenv("LLAMINAR_SKIP_ALLREDUCE");

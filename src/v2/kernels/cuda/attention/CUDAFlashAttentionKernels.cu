@@ -30,6 +30,7 @@
 #include <atomic>
 
 #include "../../attention/AttentionDeviceParams.h"
+#include "utils/DebugEnv.h"
 
 // WMMA namespace for Tensor Core operations
 using namespace nvcuda;
@@ -198,10 +199,7 @@ namespace
         }
 
         // Check for env-var tile_kv override (for parameter sweeps)
-        int forced_tile_kv = 0;
-        const char *env_tkv = getenv("LLAMINAR_FA2_TILE_KV");
-        if (env_tkv)
-            forced_tile_kv = atoi(env_tkv);
+        const int forced_tile_kv = llaminar2::debugEnv().attention.cuda_fa2_tile_kv;
 
         // tile_kv candidates: must be multiple of WMMA_N=16.
         // Occupancy-aware selection: prefer tile_kv that maximizes blocks/SM
@@ -369,8 +367,8 @@ namespace
         // when gqa_n_rep == 0 KV heads are SHARDED (use local indexing only).
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
         const int kv_head_idx = (gqa_n_rep > 0)
-            ? (head_start + head_idx) / effective_gqa
-            : head_idx / effective_gqa;
+                                    ? (head_start + head_idx) / effective_gqa
+                                    : head_idx / effective_gqa;
 
         // Q row range
         const int q_block_start = q_tile_idx * tile_q;
@@ -926,8 +924,8 @@ namespace
 
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
         const int kv_head_idx = (gqa_n_rep > 0)
-            ? (head_start + head_idx) / effective_gqa
-            : head_idx / effective_gqa;
+                                    ? (head_start + head_idx) / effective_gqa
+                                    : head_idx / effective_gqa;
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1184,8 +1182,8 @@ namespace
 
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
         const int kv_head_idx = (gqa_n_rep > 0)
-            ? (head_start + head_idx) / effective_gqa
-            : head_idx / effective_gqa;
+                                    ? (head_start + head_idx) / effective_gqa
+                                    : head_idx / effective_gqa;
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1378,8 +1376,8 @@ namespace
 
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
         const int kv_head_idx = (gqa_n_rep > 0)
-            ? (head_start + head_idx) / effective_gqa
-            : head_idx / effective_gqa;
+                                    ? (head_start + head_idx) / effective_gqa
+                                    : head_idx / effective_gqa;
 
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
         const int kv_start = split_idx * split_size;
@@ -1649,8 +1647,8 @@ namespace
 
         const int effective_gqa = (gqa_n_rep > 0) ? gqa_n_rep : ((n_heads == n_kv_heads) ? 1 : (n_heads / n_kv_heads));
         const int kv_head_idx = (gqa_n_rep > 0)
-            ? (head_start + head_idx) / effective_gqa
-            : head_idx / effective_gqa;
+                                    ? (head_start + head_idx) / effective_gqa
+                                    : head_idx / effective_gqa;
 
         int kv_count_rt = kv_count;
         if (device_params)

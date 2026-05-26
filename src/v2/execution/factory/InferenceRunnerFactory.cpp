@@ -859,7 +859,7 @@ namespace llaminar2
         MoERebalanceRuntimeConfig result = config.moe_rebalance;
         const auto &env = debugEnv();
 
-        if (std::getenv("LLAMINAR_MOE_REBALANCE"))
+        if (env.presence.has("LLAMINAR_MOE_REBALANCE"))
         {
             if (auto parsed = parseMoERebalanceRuntimeMode(env.moe_rebalance.mode))
                 result.mode = *parsed;
@@ -867,11 +867,11 @@ namespace llaminar2
                 LOG_WARN("[InferenceRunner] Ignoring invalid LLAMINAR_MOE_REBALANCE='"
                          << env.moe_rebalance.mode << "'");
         }
-        if (std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW"))
+        if (env.presence.has("LLAMINAR_MOE_REBALANCE_WINDOW"))
             result.window_size = env.moe_rebalance.window_size;
-        if (std::getenv("LLAMINAR_MOE_REBALANCE_MAX_WINDOW"))
+        if (env.presence.has("LLAMINAR_MOE_REBALANCE_MAX_WINDOW"))
             result.max_window_size = env.moe_rebalance.max_window_size;
-        if (std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH"))
+        if (env.presence.has("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH"))
             result.window_growth_factor = env.moe_rebalance.window_growth_factor;
         result.release_raw_expert_weights = result.release_raw_expert_weights ||
                                             env.moe_rebalance.release_raw_weights;
@@ -1626,7 +1626,7 @@ namespace llaminar2
                         graph_config.moe.num_experts,
                         mode == MoERebalanceMode::DYNAMIC);
                     const auto &env = debugEnv();
-                    if (std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS"))
+                    if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
                         effective_replicas = std::max(0, env.moe_rebalance.max_replicas);
                     ctrl_config.max_replicas = effective_replicas;
                     ctrl_config.sockets = std::move(sockets);

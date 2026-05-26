@@ -363,7 +363,7 @@ namespace llaminar2
             }
 
             LOG_DEBUG("RankOrchestrator: Creating with pre-existing TP context, "
-                     << tp_ctx_->degree() << " devices");
+                      << tp_ctx_->degree() << " devices");
 
             initializeDeviceRunners();
 
@@ -375,9 +375,9 @@ namespace llaminar2
             mode_ = config_.effectiveMode();
 
             LOG_DEBUG("RankOrchestrator: Creating with mode="
-                     << (mode_ == ParallelismMode::TP ? "TP" : mode_ == ParallelismMode::PP ? "PP"
-                                                                                            : "TP_PP")
-                     << ", backend=" << static_cast<int>(config_.backend));
+                      << (mode_ == ParallelismMode::TP ? "TP" : mode_ == ParallelismMode::PP ? "PP"
+                                                                                             : "TP_PP")
+                      << ", backend=" << static_cast<int>(config_.backend));
 
             if (mode_ == ParallelismMode::TP)
             {
@@ -526,9 +526,9 @@ namespace llaminar2
                         wm_config.dimensions.gdn_n_v_heads = gdn_time_step_rank;
                         wm_config.dimensions.gdn_d_state = gdn_state_size;
                         LOG_DEBUG("RankOrchestrator: GDN dimensions for FusedQKV slicing"
-                                 << " (group_count=" << gdn_group_count
-                                 << " time_step_rank=" << gdn_time_step_rank
-                                 << " state_size=" << gdn_state_size << ")");
+                                  << " (group_count=" << gdn_group_count
+                                  << " time_step_rank=" << gdn_time_step_rank
+                                  << " state_size=" << gdn_state_size << ")");
                     }
                 }
 
@@ -536,9 +536,9 @@ namespace llaminar2
                 weight_mgr->configure(wm_config);
 
                 LOG_DEBUG("RankOrchestrator: Configured WeightManager for LOCAL TP ("
-                         << tp_ctx_->degree() << " devices, "
-                         << "heads=" << n_heads << ", kv_heads=" << n_kv_heads
-                         << ", d_ff=" << d_ff << ", vocab=" << vocab_size << ")");
+                          << tp_ctx_->degree() << " devices, "
+                          << "heads=" << n_heads << ", kv_heads=" << n_kv_heads
+                          << ", d_ff=" << d_ff << ", vocab=" << vocab_size << ")");
 
                 // Print per-device assignments for debugging TP parity issues
                 for (int dev_idx = 0; dev_idx < tp_ctx_->degree(); ++dev_idx)
@@ -549,12 +549,12 @@ namespace llaminar2
                     {
                         const auto &assignment = tp_config->forDevice(dev_id);
                         LOG_DEBUG("RankOrchestrator: Device " << dev_idx << " (" << dev_id.to_string() << ") assignment:"
-                                                             << " head_start=" << assignment.head_start
-                                                             << " head_count=" << assignment.head_count
-                                                             << " kv_head_start=" << assignment.kv_head_start
-                                                             << " kv_head_count=" << assignment.kv_head_count
-                                                             << " d_ff_start=" << assignment.d_ff_start
-                                                             << " d_ff_count=" << assignment.d_ff_count);
+                                                              << " head_start=" << assignment.head_start
+                                                              << " head_count=" << assignment.head_count
+                                                              << " kv_head_start=" << assignment.kv_head_start
+                                                              << " kv_head_count=" << assignment.kv_head_count
+                                                              << " d_ff_start=" << assignment.d_ff_start
+                                                              << " d_ff_count=" << assignment.d_ff_count);
                     }
                     catch (const std::out_of_range &e)
                     {
@@ -571,8 +571,8 @@ namespace llaminar2
                     stage_sharding_map_["V_PROJECTION"] = SnapshotShardingMode::REPLICATED;
                     stage_sharding_map_["K_ROPE"] = SnapshotShardingMode::REPLICATED;
                     LOG_DEBUG("RankOrchestrator: GQA override: K/V stages set to REPLICATED "
-                             "(n_kv_heads="
-                             << n_kv_heads << " < tp_degree=" << tp_ctx_->degree() << ")");
+                              "(n_kv_heads="
+                              << n_kv_heads << " < tp_degree=" << tp_ctx_->degree() << ")");
                 }
             }
         }
@@ -597,10 +597,10 @@ namespace llaminar2
             if (tp_ctx_->reserveTempBufferBytes(buffer_with_margin))
             {
                 LOG_DEBUG("RankOrchestrator: Reserved collective temp buffer: "
-                         << buffer_with_margin << " bytes ("
-                         << "max_seq_len=" << config_.max_seq_len
-                         << ", hidden_size=" << hidden_size
-                         << ", precision=" << activationPrecisionToString(config_.activation_precision) << ")");
+                          << buffer_with_margin << " bytes ("
+                          << "max_seq_len=" << config_.max_seq_len
+                          << ", hidden_size=" << hidden_size
+                          << ", precision=" << activationPrecisionToString(config_.activation_precision) << ")");
             }
             else
             {
@@ -649,8 +649,8 @@ namespace llaminar2
                 if (config_.nested_pp_stage_config.has_value())
                 {
                     LOG_DEBUG("RankOrchestrator: Preloading weights for "
-                             << device_ids.size() << " nested TP-in-PP devices"
-                             << " (binding-driven preparation deferred to runner materialization)");
+                              << device_ids.size() << " nested TP-in-PP devices"
+                              << " (binding-driven preparation deferred to runner materialization)");
                     if (!weight_mgr->preloadForDevices(device_ids))
                     {
                         LOG_WARN("RankOrchestrator: Weight preload failed; runner materialization may fail");
@@ -659,8 +659,8 @@ namespace llaminar2
                 else
                 {
                     LOG_DEBUG("RankOrchestrator: Finalizing weights for "
-                             << device_ids.size() << " devices"
-                             << " (release_host_data=false, deferred until after graph build)");
+                              << device_ids.size() << " devices"
+                              << " (release_host_data=false, deferred until after graph build)");
                     if (!weight_mgr->finalizeForDevices(device_ids, /*release_host_data=*/false))
                     {
                         LOG_WARN("RankOrchestrator: Weight finalization failed; prepared kernels may be unavailable");
@@ -821,7 +821,7 @@ namespace llaminar2
                     if (released > 0)
                     {
                         LOG_DEBUG("RankOrchestrator: Host weight release after graph materialization: "
-                                 << released << " tensors released");
+                                  << released << " tensors released");
 #ifdef __linux__
                         ::malloc_trim(0);
 #endif
@@ -831,7 +831,7 @@ namespace llaminar2
             else
             {
                 LOG_DEBUG("RankOrchestrator: Retaining host weight data "
-                         "(nested TP-in-PP; outer caller will release)");
+                          "(nested TP-in-PP; outer caller will release)");
             }
         }
 
@@ -893,7 +893,7 @@ namespace llaminar2
             {
                 tp_ctx_->setComputeStreams(compute_streams);
                 LOG_DEBUG("RankOrchestrator: Registered " << compute_streams.size()
-                                                         << " compute streams for event-based collective sync");
+                                                          << " compute streams for event-based collective sync");
             }
         }
     }
@@ -950,8 +950,8 @@ namespace llaminar2
             if (isCrossVendorTransfer(config_.pp_stages[i], config_.pp_stages[i + 1]))
             {
                 LOG_DEBUG("RankOrchestrator: PP stage " << i
-                                                       << " outputs to cross-vendor stage " << (i + 1)
-                                                       << " - will use host-staged transfer");
+                                                        << " outputs to cross-vendor stage " << (i + 1)
+                                                        << " - will use host-staged transfer");
             }
         }
 
@@ -1011,7 +1011,7 @@ namespace llaminar2
                 // TP Domain Stage: Create nested RankOrchestrator in TP mode
                 // =====================================================================
                 LOG_DEBUG("RankOrchestrator: PP stage " << stage_idx
-                                                       << " is a TP domain with " << stage_config.stage_devices.size() << " devices");
+                                                        << " is a TP domain with " << stage_config.stage_devices.size() << " devices");
 
                 // Build TP configuration for the nested orchestrator
                 Config nested_config;
@@ -1051,8 +1051,8 @@ namespace llaminar2
                 pp_stage_runners_.push_back(std::move(nested_mdo));
 
                 LOG_DEBUG("RankOrchestrator: Created TP domain PP stage " << stage_idx
-                                                                         << " with " << stage_config.stage_devices.size() << " devices"
-                                                                         << " (layers " << stage_config.first_layer << "-" << stage_config.last_layer << ")");
+                                                                          << " with " << stage_config.stage_devices.size() << " devices"
+                                                                          << " (layers " << stage_config.first_layer << "-" << stage_config.last_layer << ")");
             }
             else
             {
@@ -1074,8 +1074,8 @@ namespace llaminar2
                 pp_stage_runners_.push_back(std::move(runner));
 
                 LOG_DEBUG("RankOrchestrator: Created PP stage " << stage_idx
-                                                               << " runner on device " << primary_device.to_string()
-                                                               << " (layers " << stage_config.first_layer << "-" << stage_config.last_layer << ")");
+                                                                << " runner on device " << primary_device.to_string()
+                                                                << " (layers " << stage_config.first_layer << "-" << stage_config.last_layer << ")");
             }
         }
 
@@ -1144,8 +1144,8 @@ namespace llaminar2
             else
             {
                 LOG_DEBUG("RankOrchestrator: PPActivationContract built with "
-                         << pp_activation_contract_->numTransfers() << " transfers"
-                         << " (embedding=" << embedding_dim << ", max_seq=" << max_seq_len << ")");
+                          << pp_activation_contract_->numTransfers() << " transfers"
+                          << " (embedding=" << embedding_dim << ", max_seq=" << max_seq_len << ")");
             }
         }
 
@@ -1380,7 +1380,7 @@ namespace llaminar2
 
         // DIAGNOSTIC: Run forward passes SEQUENTIALLY to test if concurrency causes crash.
         // If sequential execution works but parallel crashes, it's a concurrent HIP issue.
-        const bool serialize_devices = (std::getenv("LLAMINAR_SERIALIZE_TP_FORWARD") != nullptr);
+        const bool serialize_devices = debugEnv().runtime_debug.serialize_tp_forward;
 
         bool all_success = true;
         std::exception_ptr first_exception = nullptr;
@@ -1440,7 +1440,7 @@ namespace llaminar2
                 }
 
                 LOG_DEBUG("[TPWorkerPool] Created " << device_runners_.size()
-                                                   << " persistent worker threads");
+                                                    << " persistent worker threads");
             }
 
             // Dispatch parallel forward passes to persistent worker threads.
@@ -1476,10 +1476,10 @@ namespace llaminar2
                     if (debugEnv().tp_collective_contract_trace)
                     {
                         LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_enter"
-                                 << " worker=" << i
-                                 << " device=" << device_id.toString()
-                                 << " runner=" << static_cast<void *>(runner_iface)
-                                 << " seq_len=" << seq_len);
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " runner=" << static_cast<void *>(runner_iface)
+                                  << " seq_len=" << seq_len);
                     }
                     try
                     {
@@ -1487,9 +1487,9 @@ namespace llaminar2
                         if (debugEnv().tp_collective_contract_trace)
                         {
                             LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_leave"
-                                     << " worker=" << i
-                                     << " device=" << device_id.toString()
-                                     << " success=" << (ok ? 1 : 0));
+                                      << " worker=" << i
+                                      << " device=" << device_id.toString()
+                                      << " success=" << (ok ? 1 : 0));
                         }
                         return ok;
                     }
@@ -1616,9 +1616,9 @@ namespace llaminar2
                 if (tp_timing)
                 {
                     LOG_DEBUG("[DECODE_BREAKDOWN] launch=" << std::fixed << std::setprecision(1)
-                                                          << launch_us << "us"
-                                                          << " wait=" << wait_us << "us"
-                                                          << " total=" << total_us << "us");
+                                                           << launch_us << "us"
+                                                           << " wait=" << wait_us << "us"
+                                                           << " total=" << total_us << "us");
                 }
             }
         }
@@ -1645,7 +1645,7 @@ namespace llaminar2
                 if (!logged_prefill_skip)
                 {
                     LOG_DEBUG("[forwardTP] Skipping prefill logits gather (seq_len="
-                             << seq_len << ") — prefill logits are not consumed");
+                              << seq_len << ") — prefill logits are not consumed");
                     logged_prefill_skip = true;
                 }
             }
@@ -1690,9 +1690,9 @@ namespace llaminar2
             if (tp_timing)
             {
                 LOG_DEBUG("[TP_TIMING] seq_len=" << seq_len
-                                                << " forward=" << std::fixed << std::setprecision(3) << forward_ms << "ms"
-                                                << " gather=" << std::fixed << std::setprecision(3) << gather_ms << "ms"
-                                                << " total=" << std::fixed << std::setprecision(3) << total_ms << "ms");
+                                                 << " forward=" << std::fixed << std::setprecision(3) << forward_ms << "ms"
+                                                 << " gather=" << std::fixed << std::setprecision(3) << gather_ms << "ms"
+                                                 << " total=" << std::fixed << std::setprecision(3) << total_ms << "ms");
             }
 
             // Accumulate TP decode stats for profiling summary at benchmark end.
@@ -2575,10 +2575,10 @@ namespace llaminar2
 
             // Debug: log data pointer and first 4 values to verify each device has different data
             LOG_DEBUG("RankOrchestrator::getTPSnapshot: device " << i
-                                                                << " key=" << key << " ptr=" << static_cast<const void *>(snap.data)
-                                                                << " size=" << snap.size
-                                                                << " shape=[" << snap.rows << "x" << snap.cols << "]"
-                                                                << " val[0-3]=" << snap.data[0] << "," << snap.data[1] << "," << snap.data[2] << "," << snap.data[3]);
+                                                                 << " key=" << key << " ptr=" << static_cast<const void *>(snap.data)
+                                                                 << " size=" << snap.size
+                                                                 << " shape=[" << snap.rows << "x" << snap.cols << "]"
+                                                                 << " val[0-3]=" << snap.data[0] << "," << snap.data[1] << "," << snap.data[2] << "," << snap.data[3]);
 
             DeviceSnapshotData dev_data;
             // Use device type from config if available, otherwise default to CUDA
@@ -2889,7 +2889,7 @@ namespace llaminar2
             }
         }
         LOG_DEBUG("[RankOrchestrator] Applied LocalTP MoE expert masks to "
-                 << applied << "/" << device_runners_.size() << " device runners");
+                  << applied << "/" << device_runners_.size() << " device runners");
     }
 
     void RankOrchestrator::setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas)
