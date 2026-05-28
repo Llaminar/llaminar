@@ -32,6 +32,7 @@
 #include "../graph/IGraphBuilder.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../backends/IGPUGraphCapture.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "IInferenceRunner.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
@@ -1104,6 +1105,13 @@ namespace llaminar2
 
         void flushStageTimeline() override
         {
+            // Print forward pass wall-clock profiler (always, when profiling is on)
+            if (forward_engine_ && forward_engine_->forwardPassProfiler().hasData())
+            {
+                std::string dev_str = state_.device_id.toString();
+                forward_engine_->forwardPassProfiler().printAndReset(dev_str.c_str());
+            }
+
             if (!debugEnv().gpu_stage_timing)
             {
                 MoEExpertOverlayProfiler::flush();
@@ -1314,11 +1322,19 @@ namespace llaminar2
             if (!state_.logits_local)
                 return {};
             const auto &shape = state_.logits_local->shape();
+            auto device_opt = state_.logits_local->current_device();
+            // Resolve the explicit worker stream for this device to avoid NULL stream races
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = GPUDeviceContextPool::instance().getContext(*device_opt).defaultStream();
+            }
             return LogitsLocalInfo{
                 state_.logits_local->gpu_data_ptr(),
-                state_.logits_local->current_device(),
+                device_opt,
                 shape.size() >= 2 ? shape[1] : 0,
-                state_.logits_local.get()};
+                state_.logits_local.get(),
+                stream};
         }
 
         /**

@@ -274,6 +274,11 @@ namespace llaminar2::test::parity::qwen2
                     pp_children.push_back(Device(all_devices[i], owning_rank));
                 }
                 tree.root = PP("local_pp", std::move(pp_children));
+                // Apply proportional layer split weights if specified
+                if (!cfg.pp_weights.empty())
+                {
+                    tree.root.tp_weights = cfg.pp_weights;
+                }
             }
             break;
         }

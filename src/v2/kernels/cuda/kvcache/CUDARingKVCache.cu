@@ -867,6 +867,109 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
+    void CUDARingKVCache<Precision>::clear()
+    {
+        cudaSetDevice(device_id_);
+        cudaStream_t clear_stream = getEffectiveStream(nullptr);
+
+        // Drop conversion scratch so shorter follow-up requests cannot observe
+        // stale lanes from a previous longer append/read conversion path.
+        freeConvScratch();
+
+        // Keep dynamic-head allocations stable for graph caches, but reset both
+        // host and device values to match empty ring entries before next append.
+        const int num_entries = n_layers_ * batch_size_;
+        if (h_head_params_ && num_entries > 0)
+        {
+            std::memset(h_head_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
+        }
+        if (d_head_params_ && num_entries > 0)
+        {
+            cudaError_t head_err = cudaMemsetAsync(d_head_params_, 0,
+                                                   static_cast<size_t>(num_entries) * sizeof(int),
+                                                   clear_stream);
+            if (head_err != cudaSuccess)
+            {
+                LOG_WARN("[CUDARingKVCache::clear] head params memset failed: "
+                         << cudaGetErrorString(head_err));
+            }
+        }
+
+        // RoPE-on-read shadows and tensor views are request-scoped wrappers over
+        // cache contents. Reset them so no stale view can survive a cache clear.
+        for (auto &layer_shadows : rope_shadows_)
+        {
+            for (auto &shadow : layer_shadows)
+            {
+                if (shadow.d_K)
+                {
+                    cudaFree(shadow.d_K);
+                    shadow.d_K = nullptr;
+                }
+                if (shadow.d_V)
+                {
+                    cudaFree(shadow.d_V);
+                    shadow.d_V = nullptr;
+                }
+                shadow.converted_count = 0;
+                shadow.last_head = -1;
+                shadow.rope_applied = false;
+                shadow.k_view.reset();
+                shadow.v_view.reset();
+            }
+        }
+        rope_shadows_.clear();
+        for (auto &layer_views : tensor_views_)
+        {
+            for (auto &views : layer_views)
+            {
+                views[0].reset();
+                views[1].reset();
+            }
+        }
+
+        // Scrub persistent device storage and linearization scratch. Metadata
+        // reset alone should be sufficient logically, but zeroing matches a new
+        // cache object and protects snapshot/debug read paths from stale rows.
+        const size_t buffer_size = static_cast<size_t>(max_seq_len_) *
+                                   static_cast<size_t>(kv_storage_dim_) *
+                                   sizeof(DataT);
+        for (auto &layer_entries : entries_)
+        {
+            for (auto &entry : layer_entries)
+            {
+                if (entry.d_K)
+                    cudaMemsetAsync(entry.d_K, 0, buffer_size, clear_stream);
+                if (entry.d_V)
+                    cudaMemsetAsync(entry.d_V, 0, buffer_size, clear_stream);
+                if (entry.d_K_scratch)
+                    cudaMemsetAsync(entry.d_K_scratch, 0, buffer_size, clear_stream);
+                if (entry.d_V_scratch)
+                    cudaMemsetAsync(entry.d_V_scratch, 0, buffer_size, clear_stream);
+            }
+        }
+
+        cudaError_t sync_err = cudaStreamSynchronize(clear_stream);
+        if (sync_err != cudaSuccess)
+        {
+            LOG_WARN("[CUDARingKVCache::clear] KV buffer clear sync failed: "
+                     << cudaGetErrorString(sync_err));
+        }
+
+        // Reset compressed entries directly. Calling CUDARingKVCacheBase::clear()
+        // would dispatch through virtual clear_layer(), which hybrid caches map
+        // through global model layer ids instead of compressed FA indices.
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                CUDARingKVCacheBase::clear_sequence(layer, seq);
+            }
+        }
+        wrap_warned_ = false;
+    }
+
+    template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::allocate_entry(EntryT &entry)
     {
         size_t buffer_size = static_cast<size_t>(max_seq_len_) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);

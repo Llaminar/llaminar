@@ -118,7 +118,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(float), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(float), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_f32(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_f32(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<float> result(count);
@@ -158,7 +158,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(float), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(float), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_f32(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_f32(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<float> result(count);
@@ -220,7 +220,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(__half), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(__half), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_f16(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_f16(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<__half> result(count);
@@ -264,7 +264,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(__half), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(__half), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_f16(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_f16(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<__half> result(count);
@@ -318,7 +318,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(__half), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(__half), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_f16(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_f16(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<__half> result(count);
@@ -371,7 +371,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_bf16(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_bf16(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<__nv_bfloat16> result(count);
@@ -415,7 +415,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_bf16(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_bf16(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<__nv_bfloat16> result(count);
@@ -469,7 +469,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(int8_t), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(int8_t), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_i8(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_i8(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<int8_t> result(count);
@@ -511,7 +511,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(int8_t), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(int8_t), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_i8(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_i8(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<int8_t> result(count);
@@ -550,7 +550,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(int8_t), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(int8_t), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_i8(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_i8(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<int8_t> result(count);
@@ -602,7 +602,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_i32(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_i32(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<int32_t> result(count);
@@ -639,7 +639,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_i32(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_i32(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<int32_t> result(count);
@@ -686,7 +686,7 @@ namespace llaminar2
             cudaMemcpy(d_output, output_host.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice);
             cudaMemcpy(d_input, input_host.data(), count * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_i32(d_output, d_input, count));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_i32(d_output, d_input, count, 0));
             cudaDeviceSynchronize();
 
             std::vector<int32_t> result(count);
@@ -710,11 +710,11 @@ namespace llaminar2
         {
 #ifdef HAVE_CUDA
             // All kernels should handle count=0 gracefully
-            EXPECT_TRUE(cuda::launchVectorAddInplace_f32(nullptr, nullptr, 0));
-            EXPECT_TRUE(cuda::launchVectorAddInplace_f16(nullptr, nullptr, 0));
-            EXPECT_TRUE(cuda::launchVectorAddInplace_bf16(nullptr, nullptr, 0));
-            EXPECT_TRUE(cuda::launchVectorAddInplace_i8(nullptr, nullptr, 0));
-            EXPECT_TRUE(cuda::launchVectorAddInplace_i32(nullptr, nullptr, 0));
+            EXPECT_TRUE(cuda::launchVectorAddInplace_f32(nullptr, nullptr, 0, 0));
+            EXPECT_TRUE(cuda::launchVectorAddInplace_f16(nullptr, nullptr, 0, 0));
+            EXPECT_TRUE(cuda::launchVectorAddInplace_bf16(nullptr, nullptr, 0, 0));
+            EXPECT_TRUE(cuda::launchVectorAddInplace_i8(nullptr, nullptr, 0, 0));
+            EXPECT_TRUE(cuda::launchVectorAddInplace_i32(nullptr, nullptr, 0, 0));
 #endif
         }
 
@@ -729,7 +729,7 @@ namespace llaminar2
             cudaMemcpy(d_f32_out, &f32_out, sizeof(float), cudaMemcpyHostToDevice);
             cudaMemcpy(d_f32_in, &f32_in, sizeof(float), cudaMemcpyHostToDevice);
 
-            ASSERT_TRUE(cuda::launchVectorAddInplace_f32(d_f32_out, d_f32_in, 1));
+            ASSERT_TRUE(cuda::launchVectorAddInplace_f32(d_f32_out, d_f32_in, 1, 0));
             cudaDeviceSynchronize();
 
             float result;

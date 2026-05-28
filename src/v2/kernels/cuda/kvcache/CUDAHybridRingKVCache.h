@@ -191,7 +191,7 @@ namespace llaminar2
         // CUDA-specific append (device pointer version)
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,
-                    int num_tokens, cudaStream_t stream = 0) override
+                    int num_tokens, cudaStream_t stream) override
         {
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx < 0)
@@ -201,7 +201,7 @@ namespace llaminar2
 
         bool get_kv_for_attention(int layer, int seq_idx,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, cudaStream_t stream = 0) override
+                                  int *kv_len, cudaStream_t stream) override
         {
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx < 0)
@@ -219,7 +219,7 @@ namespace llaminar2
 
         bool linearize_to(int layer, int seq_idx,
                           void *d_k_out, void *d_v_out,
-                          int *kv_len, cudaStream_t stream = 0) override
+                          int *kv_len, cudaStream_t stream) override
         {
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx < 0)
@@ -246,7 +246,7 @@ namespace llaminar2
         int gather_kv_batched(int layer, int num_seqs,
                               void *d_k_out, void *d_v_out,
                               int *kv_lens, int max_kv_len,
-                              cudaStream_t stream = 0) override
+                              cudaStream_t stream) override
         {
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx < 0)
@@ -257,18 +257,10 @@ namespace llaminar2
 
         void clear() override
         {
-            // CUDARingKVCacheBase::clear() loops through virtual clear_layer().
-            // Hybrid clear_layer() accepts global model layer ids, while the
-            // parent cache stores only compressed FA layer indices. Clear those
-            // compressed entries directly to keep full-attention metadata from
-            // surviving a hybrid request reset.
-            for (int kv_idx = 0; kv_idx < layer_map_.kvLayerCount(); ++kv_idx)
-            {
-                for (int seq = 0; seq < this->batch_size_; ++seq)
-                {
-                    CUDARingKVCacheBase::clear_sequence(kv_idx, seq);
-                }
-            }
+            // Base::clear() resets compressed FA entries directly and scrubs
+            // CUDA sidecar/device buffers without dispatching through the hybrid
+            // global-layer clear_layer() override.
+            Base::clear();
             for (auto &state : gdn_states_)
             {
                 state.reset();

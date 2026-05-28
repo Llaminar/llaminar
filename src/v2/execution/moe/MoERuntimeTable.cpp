@@ -624,11 +624,21 @@ namespace llaminar2
 #ifdef HAVE_ROCM
         const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
         throwOnHipError(set_err, "[MoERuntimeTable] hipSetDevice failed for ROCm runtime table initial upload");
+
+        // Create a dedicated one-shot stream for the bulk initialization upload.
+        // We avoid the default stream (nullptr/0) to maintain stream hygiene —
+        // all async GPU work must use an explicit stream for correctness and overlap.
+        hipStream_t init_stream;
+        throwOnHipError(hipStreamCreate(&init_stream),
+                        "[MoERuntimeTable] hipStreamCreate failed for ROCm runtime table initial upload");
+
         const size_t bytes = host_layers_.size() * sizeof(DeviceMoELayerRuntime);
-        throwOnHipError(hipMemcpyAsync(device_layers_, host_layers_.data(), bytes, hipMemcpyHostToDevice, nullptr),
+        throwOnHipError(hipMemcpyAsync(device_layers_, host_layers_.data(), bytes, hipMemcpyHostToDevice, init_stream),
                         "[MoERuntimeTable] hipMemcpyAsync failed for ROCm runtime table initial upload");
-        throwOnHipError(hipStreamSynchronize(nullptr),
+        throwOnHipError(hipStreamSynchronize(init_stream),
                         "[MoERuntimeTable] hipStreamSynchronize failed for ROCm runtime table initial upload");
+        throwOnHipError(hipStreamDestroy(init_stream),
+                        "[MoERuntimeTable] hipStreamDestroy failed for ROCm runtime table initial upload");
 #else
         throw std::runtime_error("[MoERuntimeTable] ROCm device mirroring requested but HAVE_ROCM is not enabled");
 #endif

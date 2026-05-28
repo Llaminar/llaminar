@@ -4,9 +4,12 @@
 #include "../coherence/StageCoherence.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/ForwardPassProfiler.h"
+#include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 
@@ -469,13 +472,31 @@ namespace llaminar2
             return false;
         }
 
+        const bool profiling = KernelProfiler::isEnabled();
+
+        // Time the graph launch itself
+        auto launch_t0 = std::chrono::high_resolution_clock::now();
         if (!segment.capture->launch())
         {
             LOG_ERROR("[DeviceGraphCaptureController] Segment graph launch failed on replay");
             return false;
         }
+        if (profiling)
+        {
+            auto launch_t1 = std::chrono::high_resolution_clock::now();
+            ForwardPassProfiler::addReplayLaunchNs(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count()));
+        }
 
+        // Time post-launch callbacks (markOutputsDirty + onGraphReplayed)
+        auto post_t0 = std::chrono::high_resolution_clock::now();
         post_launch_cb(segment, capture_stream);
+        if (profiling)
+        {
+            auto post_t1 = std::chrono::high_resolution_clock::now();
+            ForwardPassProfiler::addReplayPostLaunchNs(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(post_t1 - post_t0).count()));
+        }
 
         if (needs_segment_sync)
         {
@@ -1339,6 +1360,13 @@ namespace llaminar2
             return result;
         }
 
+        // Reset thread-local replay profiling state for this iteration
+        const bool profiling = KernelProfiler::isEnabled();
+        if (profiling)
+        {
+            ForwardPassProfiler::resetReplayTimings();
+        }
+
         void *capture_stream = segment_cache.capture_stream;
         const auto &exec_cfg = debugEnv().execution;
         const bool verify_mode = exec_cfg.gpu_graph_verify;
@@ -1424,8 +1452,17 @@ namespace llaminar2
         // Graph segments replayed on capture_stream; manual segments (embedding)
         // ran on defaultStream. Syncing only these two is cheaper than a
         // device-wide barrier and avoids interference with global capture mode.
-        gpu_ctx->synchronizeStream(capture_stream);
-        gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
+        {
+            auto sync_t0 = std::chrono::high_resolution_clock::now();
+            gpu_ctx->synchronizeStream(capture_stream);
+            gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
+            if (profiling)
+            {
+                auto sync_t1 = std::chrono::high_resolution_clock::now();
+                ForwardPassProfiler::addReplayStreamSyncNs(
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()));
+            }
+        }
         if (trace_replay)
         {
             LOG_DEBUG("[ReplayTrace] " << device_id.toString()
@@ -1503,7 +1540,31 @@ namespace llaminar2
         // Use flags-only dirty marking — no hipEventRecord per output tensor.
         // The final gpu_ctx->synchronize() in executeReplayPhase ensures all
         // GPU work completes before the caller reads the output.
-        markOutputsDirtyFlagsOnly(segment.cached_all_output_buffers);
+        //
+        // OPTIMIZATION: On first call, cache pre-cast TensorBase* pointers to
+        // eliminate ~786 dynamic_casts per decode step (524 stages × ~1.5 outputs).
+        if (!segment.dirty_bases_cached)
+        {
+            segment.cached_dirty_tensor_bases.clear();
+            segment.cached_dirty_tensor_bases.reserve(segment.cached_all_output_buffers.size());
+            for (const auto &buf : segment.cached_all_output_buffers)
+            {
+                if (!buf.tensor)
+                    continue;
+                auto *tensor_base = dynamic_cast<TensorBase *>(buf.tensor);
+                if (tensor_base)
+                    segment.cached_dirty_tensor_bases.push_back(tensor_base);
+            }
+            segment.dirty_bases_cached = true;
+            LOG_DEBUG("[DeviceGraphCaptureController] Cached " << segment.cached_dirty_tensor_bases.size()
+                                                               << " pre-cast TensorBase* for dirty marking");
+        }
+
+        // Fast path: transition all cached bases without dynamic_cast
+        for (auto *tb : segment.cached_dirty_tensor_bases)
+        {
+            tb->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        }
 
         // Skip replay callbacks during the capture phase: execute() already ran
         // all host-side bookkeeping (e.g., KV cache head/count advancement).

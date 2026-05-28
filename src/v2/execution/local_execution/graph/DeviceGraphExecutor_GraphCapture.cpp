@@ -311,6 +311,56 @@ namespace llaminar2
             segment_cache.decode_step);
         const uint64_t current_step = phase_transition.decode_step;
 
+        // ===== FAST PATH: Phase 3 (Replay) =====
+        // During steady-state replay, only the post_launch hook is invoked
+        // (cohere_inputs is skipped for capturable segments, execute_node is
+        // unused). Avoid constructing unused lambdas and skip phase 1/2 checks
+        // to minimize host overhead on the hot decode path.
+        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay)
+        {
+            DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
+
+            DeviceGraphCaptureController::ReplayHooks fast_hooks{
+                nullptr, // cohere_inputs — skipped during normal replay (skip_coherence=true)
+                [&](ComputeNode &node) -> bool
+                {
+                    return executeNode(node, ctx);
+                },
+                [&](DeviceGraphExecutor::GraphSegment &seg, void *stream)
+                {
+                    // postCapturedSegmentLaunch uses its internal cached dirty
+                    // marking (cached_dirty_tensor_bases), so the per-node
+                    // mark_stage_outputs_dirty_cb is never called. Pass a no-op.
+                    DeviceGraphCaptureController::postCapturedSegmentLaunch(
+                        graph, seg, current_step, stream,
+                        [](ComputeNode &, void *) {});
+                }};
+
+            const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
+                graph, segment_cache, ctx, gpu_ctx,
+                has_collective_nodes, current_step, fast_hooks);
+
+            if (!replay_result.success)
+            {
+                if (replay_result.launch_failure_fallback)
+                {
+                    segment_cache.consecutive_failures++;
+                    if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
+                    {
+                        LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
+                        segment_cache.reset();
+                    }
+                    graph.reset();
+                    return executeFastDecode(graph, ctx, collective_nodes);
+                }
+                return false;
+            }
+
+            segment_cache.consecutive_failures = 0;
+            return true;
+        }
+
+        // ===== SLOW PATH: Phase 1 (Warmup) or Phase 2 (Capture) =====
         auto mark_stage_outputs_dirty = [&](ComputeNode &node, void *stream)
         {
             if (!arena_)
@@ -522,46 +572,10 @@ namespace llaminar2
             return true;
         }
 
-        // ===== Phase 3: Replay — just launch() capturable segments directly =====
-        // SYNCHRONIZATION STRATEGY (Unified-Stream):
-        // ALL work — both graph launches and manual stages — runs on capture_stream.
-        // Since all GPU operations are on the SAME stream, the GPU guarantees
-        // in-order execution. NO intermediate CPU-side synchronization is needed.
-        //
-        // Manual stages' CPU code (metadata reads, mask creation) doesn't depend
-        // on GPU results being visible — it only reads CPU-side state that was
-        // updated during previous execute() calls (e.g., KV cache entry.count).
-        //
-        // The ONLY sync point is the final device sync after all segments,
-        // ensuring GPU work completes before the caller reads output tensors.
-
-        const auto replay_phase_result = DeviceGraphCaptureController::executeReplayPhase(
-            graph,
-            segment_cache,
-            ctx,
-            gpu_ctx,
-            has_collective_nodes,
-            current_step,
-            replay_hooks);
-
-        if (!replay_phase_result.success)
-        {
-            if (replay_phase_result.launch_failure_fallback)
-            {
-                segment_cache.consecutive_failures++;
-                if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
-                {
-                    LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
-                    segment_cache.reset();
-                }
-                graph.reset();
-                return executeFastDecode(graph, ctx, collective_nodes);
-            }
-            return false;
-        }
-
-        segment_cache.consecutive_failures = 0;
-        return true;
+        // Phase 3 is handled by the fast path above; this point is unreachable
+        // after Phase 1 and Phase 2 both early-return.
+        LOG_ERROR("[DeviceGraphExecutor] Unexpected phase in segmented graph capture");
+        return false;
     }
 
 } // namespace llaminar2

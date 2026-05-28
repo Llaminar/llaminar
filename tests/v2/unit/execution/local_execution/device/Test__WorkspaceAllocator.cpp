@@ -92,6 +92,7 @@ namespace
         {
             bound_workspace_ = workspace;
             ++bind_calls_;
+            bind_sequence_.push_back(workspace);
         }
 
         void unbindWorkspace() override
@@ -112,13 +113,17 @@ namespace
         int bindCalls() const { return bind_calls_; }
         int requirementsCalls() const { return requirements_calls_; }
         DeviceWorkspaceManager *boundWorkspace() const { return bound_workspace_; }
+        const std::vector<DeviceWorkspaceManager *> &bindSequence() const { return bind_sequence_; }
         int lastM() const { return last_m_; }
         int lastN() const { return last_n_; }
         int lastK() const { return last_k_; }
 
+        void setBuffers(std::vector<WorkspaceDescriptor> buffers) { buffers_ = std::move(buffers); }
+
     private:
         std::vector<WorkspaceDescriptor> buffers_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        std::vector<DeviceWorkspaceManager *> bind_sequence_;
         int bind_calls_ = 0;
         mutable int requirements_calls_ = 0;
         mutable int last_m_ = -1;
@@ -196,7 +201,9 @@ TEST(Test__WorkspaceAllocator, ReallocatesExistingWorkspaceWhenNamedBufferGrows)
     EXPECT_EQ(reallocated_workspace->getBufferSize("old_only_scratch"), 2048u);
     EXPECT_EQ(reallocated_workspace->getBufferSize("new_only_scratch"), 512u);
     EXPECT_EQ(larger_consumer.boundWorkspace(), reallocated_workspace);
-    EXPECT_EQ(larger_consumer.bindCalls(), 1);
+    // 2 bindWorkspace calls: first nullptr (ABA protection before old workspace
+    // destruction), then the actual new workspace pointer.
+    EXPECT_EQ(larger_consumer.bindCalls(), 2);
     EXPECT_GE(larger_consumer.requirementsCalls(), 1);
     EXPECT_EQ(larger_consumer.lastM(), 7);
     EXPECT_EQ(larger_consumer.lastN(), 11);
@@ -252,4 +259,69 @@ TEST(Test__WorkspaceAllocator, ReusesExistingWorkspaceWhenAllRequestedBuffersFit
     EXPECT_TRUE(reused_workspace->hasBuffer("old_only_scratch"));
     EXPECT_EQ(reused_workspace->getBufferSize("shared_scratch"), 4096u);
     EXPECT_EQ(reused_workspace->getBufferSize("old_only_scratch"), 2048u);
+}
+
+// Regression test for ABA pointer aliasing bug: when the old workspace is freed
+// and the new one is allocated at the same heap address, kernels that gate state
+// invalidation on `if (workspace_ != workspace)` would skip re-initialization
+// (e.g., RoPE inv_freq upload). The allocator must call bindWorkspace(nullptr)
+// before destroying the old workspace so the subsequent bind to the new workspace
+// always triggers the state-invalidation path regardless of address reuse.
+TEST(Test__WorkspaceAllocator, ReallocUnbindsBeforeDestroyToPreventABAPointerAliasing)
+{
+    auto device = selectAvailableGpuWithMemory();
+    if (!device)
+    {
+        GTEST_SKIP() << "No CUDA/ROCm GPU with enough free memory for WorkspaceAllocator unit test";
+    }
+
+    WorkspaceAllocator allocator;
+    ComputeGraph graph;
+    const auto hints = tinyHints();
+    const auto config = unitBudgetConfig();
+
+    // Use the same consumer for both allocations (simulates a persistent kernel
+    // singleton that survives across graph rebuilds).
+    MockWorkspaceConsumer consumer({
+        {"scratch", 1024, 256, true},
+    });
+
+    // First allocation — consumer gets bound to workspace W1.
+    ASSERT_TRUE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {requestFor(consumer, *device)},
+        config));
+
+    auto *w1 = consumer.boundWorkspace();
+    ASSERT_NE(w1, nullptr);
+    EXPECT_EQ(consumer.bindCalls(), 1);
+    EXPECT_EQ(consumer.bindSequence().size(), 1u);
+    EXPECT_EQ(consumer.bindSequence()[0], w1);
+
+    // Grow the consumer's requirements so the second allocateForGraph triggers
+    // the realloc path (existing "scratch" buffer is too small at 1024).
+    consumer.setBuffers({
+        {"scratch", 4096, 256, true},
+        {"extra", 2048, 256, true},
+    });
+
+    ASSERT_TRUE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {requestFor(consumer, *device)},
+        config));
+
+    auto *w2 = consumer.boundWorkspace();
+    ASSERT_NE(w2, nullptr);
+
+    // Verify the bind sequence: initial bind (W1), nullptr unbind (ABA
+    // protection), then new bind (W2).
+    ASSERT_EQ(consumer.bindSequence().size(), 3u)
+        << "Expected 3 bindWorkspace calls: initial, nullptr (ABA), new";
+    EXPECT_EQ(consumer.bindSequence()[0], w1);
+    EXPECT_EQ(consumer.bindSequence()[1], nullptr)
+        << "Realloc must call bindWorkspace(nullptr) before destroying old workspace";
+    EXPECT_EQ(consumer.bindSequence()[2], w2);
+    EXPECT_NE(consumer.bindSequence()[2], nullptr);
 }

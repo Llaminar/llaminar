@@ -83,7 +83,7 @@ namespace llaminar2
             if (!backend->argmaxF32(info.gpu_ptr,
                                     static_cast<int>(info.vocab_local),
                                     info.device->gpu_ordinal(),
-                                    &max_val, &max_idx))
+                                    &max_val, &max_idx, info.stream))
             {
                 LOG_TRACE("[DeviceSampler::sampleGreedy] argmaxF32 failed for device "
                           << info.device->toString());
@@ -116,8 +116,8 @@ namespace llaminar2
         if (!logged_once)
         {
             LOG_DEBUG("[DeviceSampler::sampleGreedy] GPU-side argmax active ("
-                     << runners.size() << " devices, vocab_local="
-                     << infos[0].vocab_local << " each)");
+                      << runners.size() << " devices, vocab_local="
+                      << infos[0].vocab_local << " each)");
             logged_once = true;
         }
 
@@ -198,7 +198,7 @@ namespace llaminar2
                                   effective_k,
                                   info.device->gpu_ordinal(),
                                   topk_values.data(),
-                                  topk_indices.data()))
+                                  topk_indices.data(), info.stream))
             {
                 LOG_TRACE("[DeviceSampler::sample] topKF32 failed for device "
                           << info.device->toString());
@@ -301,8 +301,8 @@ namespace llaminar2
         if (!logged_once)
         {
             LOG_DEBUG("[DeviceSampler::sample] GPU-side top-k/top-p active ("
-                     << runners.size() << " devices, k=" << effective_k
-                     << ", vocab_local=" << infos[0].vocab_local << " each)");
+                      << runners.size() << " devices, k=" << effective_k
+                      << ", vocab_local=" << infos[0].vocab_local << " each)");
             logged_once = true;
         }
 

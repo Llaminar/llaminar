@@ -255,7 +255,7 @@ namespace
         auto *cuda_cache = dynamic_cast<llaminar2::ICUDARingKVCache *>(cache);
         if (!cuda_cache)
             throw std::runtime_error("hybrid cache does not expose ICUDARingKVCache");
-        if (!cuda_cache->append(layer, 0, d_k.ptr, d_v.ptr, tokens))
+        if (!cuda_cache->append(layer, 0, d_k.ptr, d_v.ptr, tokens, 0))
             throw std::runtime_error("ICUDARingKVCache append failed");
         checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize after KV append");
     }

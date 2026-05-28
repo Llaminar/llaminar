@@ -240,7 +240,7 @@ namespace
         HipFloatBuffer d_k(k), d_v(v);
         auto *rocm_cache = dynamic_cast<llaminar2::IROCmRingKVCache *>(cache);
         ASSERT_NE(rocm_cache, nullptr);
-        ASSERT_TRUE(rocm_cache->append(layer, 0, d_k.ptr, d_v.ptr, tokens));
+        ASSERT_TRUE(rocm_cache->append(layer, 0, d_k.ptr, d_v.ptr, tokens, 0));
     }
 #endif
 } // namespace

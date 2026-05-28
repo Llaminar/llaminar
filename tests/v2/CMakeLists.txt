@@ -250,6 +250,16 @@ if(NOT V2_PERF_TESTS_ONLY)
         LABELS "V2;Unit;StaticAnalysis;DebugEnv;Environment"
         TIMEOUT 30
     )
+
+    add_test(
+        NAME V2_Unit_Static_NoDefaultStreamInGPUCode
+        COMMAND bash ${PROJECT_ROOT}/scripts/check_no_default_stream_in_gpu_code.sh ${PROJECT_ROOT}
+        WORKING_DIRECTORY ${PROJECT_ROOT}
+    )
+    set_tests_properties(V2_Unit_Static_NoDefaultStreamInGPUCode PROPERTIES
+        LABELS "V2;Unit;StaticAnalysis;GPU;CUDA;ROCm;Streams"
+        TIMEOUT 30
+    )
 endif()
 
 # =============================================================================
@@ -2584,6 +2594,23 @@ add_v2_test(V2_Unit_Sampler
     COMMAND $<TARGET_FILE:v2_test_sampler>
     LABELS "V2;Unit;Sampling;Generation;BasicFeatures;Greedy;Temperature;TopK;TopP"
     MPI_PROCS 1  # Sampler is single-rank only
+)
+
+# Test: BenchmarkRunnerCPU (CPU device handling in benchmark runner)
+add_executable(v2_test_benchmark_runner_cpu unit/utils/Test__BenchmarkRunnerCPU.cpp)
+target_include_directories(v2_test_benchmark_runner_cpu PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_benchmark_runner_cpu
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    GTest::gmock
+)
+add_v2_test(V2_Unit_BenchmarkRunnerCPU
+    COMMAND $<TARGET_FILE:v2_test_benchmark_runner_cpu>
+    LABELS "V2;Unit;Benchmark;CPU;Regression"
+    MPI_PROCS 1
 )
 
 # Test: ChatTemplate (chat template detection and formatting)
@@ -9154,6 +9181,27 @@ add_v2_test(V2_Unit_OrchestrationRunner_MoEOverlayPlan
 )
 message(STATUS "V2 Tests: Added OrchestrationRunner MoE overlay plan unit tests")
 
+# Model file validation unit tests
+# Locks in that OrchestrationRunner hard-fails on missing/invalid model files
+# instead of silently falling back to defaults.
+add_executable(v2_unit_orchestration_runner_model_validation
+    unit/execution/runner/Test__OrchestrationRunnerModelValidation.cpp
+)
+target_include_directories(v2_unit_orchestration_runner_model_validation PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_unit_orchestration_runner_model_validation
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_OrchestrationRunner_ModelValidation
+    COMMAND $<TARGET_FILE:v2_unit_orchestration_runner_model_validation>
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;ModelValidation"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added OrchestrationRunner model validation unit tests")
+
 # Node-leader page cache coordination unit tests
 # Tests the per-node-leader page cache prepopulation logic using MockMPITopology.
 add_executable(v2_unit_node_leader_page_cache
@@ -10244,6 +10292,20 @@ target_include_directories(v2_test_weight_manager_host_release PRIVATE
 add_v2_test(V2_Unit_WeightManagerHostRelease
     COMMAND $<TARGET_FILE:v2_test_weight_manager_host_release>
     LABELS "V2;Unit;WeightManager;HostRelease;Memory;Lifecycle"
+    MPI_PROCS 1
+)
+
+# Test: WeightManagerCpuHostRelease — Verifies that quantized TensorSlice raw data
+# is released after binding-driven CPU VNNI packing, while FP32, embeddings, norms,
+# and biases are retained. Locks in the memory optimization fix.
+add_executable(v2_test_weight_manager_cpu_host_release unit/loaders/Test__WeightManagerCpuHostRelease.cpp)
+target_link_libraries(v2_test_weight_manager_cpu_host_release llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_weight_manager_cpu_host_release PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+add_v2_test(V2_Unit_WeightManagerCpuHostRelease
+    COMMAND $<TARGET_FILE:v2_test_weight_manager_cpu_host_release>
+    LABELS "V2;Unit;WeightManager;HostRelease;Memory;Lifecycle;CPU"
     MPI_PROCS 1
 )
 

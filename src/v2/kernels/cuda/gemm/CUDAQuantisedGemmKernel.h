@@ -111,6 +111,18 @@ namespace llaminar2
             static void clearSharedPrefillPools();
 
             /**
+             * @brief Release input-dependent CUDA execution contexts.
+             *
+             * Keeps packed weights resident, but drops per-session GEMV, prefill,
+             * and cuBLAS scratch/handles so a new request cannot inherit state
+             * from the previous prompt shape or capture stream.
+             */
+            void resetDynamicState() override;
+
+            /// @brief Returns true when any CUDA execution context is live.
+            bool hasDynamicStateActive() const override;
+
+            /**
              * @brief Construct kernel for quantized weight tensor (lazy conversion)
              *
              * @param weights Any quantized tensor (must be on GPU)

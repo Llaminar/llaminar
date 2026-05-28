@@ -10,7 +10,7 @@
 #   1. Integration build
 #   2. Unit tests (parallel)
 #   3. Integration tests — develop/master only (excl. Parity & RCCL)
-#   4. Focused parity baseline (32 tests, all model families, sequential)
+#   4. Focused parity baseline (38 tests, all model families, sequential)
 #   5. E2E server integration tests
 #   6. Performance regression benchmarks
 # Override with: git commit --no-verify
@@ -43,13 +43,14 @@ else
 fi
 echo ""
 
-# Build directory
+# Build directories
 BUILD_V2_INTEGRATION="build_v2_integration"
+BUILD_V2_RELEASE="build_v2_release"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 if $FULL_SUITE; then
-    TOTAL_STEPS=6
+    TOTAL_STEPS=7
 else
-    TOTAL_STEPS=5
+    TOTAL_STEPS=6
 fi
 
 # Step 1: Build Integration (Release optimizations + debug symbols + assertions)
@@ -116,13 +117,14 @@ if $FULL_SUITE; then
     echo ""
 fi
 
-# Step 3/4: Run Focused Parity Baseline (30 tests, all model families, sequential)
-# Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 MoE (sparse),
-# NodeLocalTP (multi-device), HybridPPTP (pipeline+tensor parallel),
+# Step 3/4: Run Focused Parity Baseline (38 tests, all model families, sequential)
+# Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
+# Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
+# HybridPPTP (pipeline+tensor parallel),
 # and ExpertOverlay (tiered same-layer expert residency).
 # Runs on ALL branches to catch accuracy regressions early.
 if $FULL_SUITE; then PARITY_STEP=4; else PARITY_STEP=3; fi
-echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (32 tests, all model families)...${NC}"
+echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (38 tests, all model families)...${NC}"
 echo ""
 
 set +e
@@ -145,16 +147,40 @@ fi
 echo -e "${GREEN}✓ Parity baseline passed${NC}"
 echo ""
 
-# Step 4: E2E Server Integration Tests (~2 min)
+# Step 4: Build Release (for E2E — no assertions/debug overhead = faster inference)
+if $FULL_SUITE; then E2E_BUILD_STEP=5; else E2E_BUILD_STEP=4; fi
+echo -e "${YELLOW}[${E2E_BUILD_STEP}/${TOTAL_STEPS}] Building V2 Release for E2E tests...${NC}"
+if ! cmake -B "$BUILD_V2_RELEASE" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1; then
+    echo -e "${RED}❌ CMake configuration failed (Release)${NC}"
+    exit 1
+fi
+
+if ! cmake --build "$BUILD_V2_RELEASE" --parallel > /dev/null 2>&1; then
+    echo -e "${RED}❌ Build failed (Release)${NC}"
+    echo -e "${YELLOW}Run manually to see errors: cmake --build $BUILD_V2_RELEASE --parallel${NC}"
+    exit 1
+fi
+echo -e "${GREEN}✓ Release build successful${NC}"
+echo ""
+
+# Step 5: E2E Server Integration Tests (Release binary — no assertions = faster inference)
 # Spins up llaminar2 --serve on CPU, CUDA, and ROCm, validates multi-turn
-# inference via the REST API with curl.
-if $FULL_SUITE; then E2E_STEP=5; else E2E_STEP=4; fi
-echo -e "${YELLOW}[${E2E_STEP}/${TOTAL_STEPS}] Running E2E Server integration tests (cpu, cuda:0, rocm:0)...${NC}"
+# inference via the REST API with curl, and runs long-context checks for the
+# default 35B CPU/ROCm suites. The 30B gate keeps smaller smoke models fast.
+if $FULL_SUITE; then E2E_STEP=6; else E2E_STEP=5; fi
+echo -e "${YELLOW}[${E2E_STEP}/${TOTAL_STEPS}] Running E2E Server integration tests (cpu, cuda:0, rocm:0 + 35B long-context)...${NC}"
 echo ""
 
 set +e
+LLAMINAR_E2E_LONG_CONTEXT=1 \
+LLAMINAR_E2E_LONG_CONTEXT_TIER="${LLAMINAR_E2E_LONG_CONTEXT_TIER:-lite}" \
+LLAMINAR_E2E_CONTEXT_LENGTH="${LLAMINAR_E2E_CONTEXT_LENGTH:-4096}" \
+LLAMINAR_E2E_LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-1024}" \
+LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS="${LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS:-900}" \
+LLAMINAR_E2E_LONG_REQUEST_TIMEOUT="${LLAMINAR_E2E_LONG_REQUEST_TIMEOUT:-1800}" \
+LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B="${LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B:-4}" \
 tests/v2/e2e/server/test_server_e2e.sh \
-    --binary "$BUILD_V2_INTEGRATION/llaminar2" \
+    --binary "$BUILD_V2_RELEASE/llaminar2" \
     --backends "cpu,cuda:0,rocm:0"
 SERVER_EXIT_CODE=$?
 set -e
@@ -174,11 +200,11 @@ fi
 echo -e "${GREEN}✓ E2E server tests passed${NC}"
 echo ""
 
-# Step 5: Performance Regression Benchmarks
+# Step 6: Performance Regression Benchmarks
 # Runs 'llaminar2 benchmark' for each model × device combination defined in
 # benchmark_baseline.json and compares prefill/decode throughput against
 # canonical baselines. Devices that are unavailable are skipped gracefully.
-if $FULL_SUITE; then BENCH_STEP=6; else BENCH_STEP=5; fi
+if $FULL_SUITE; then BENCH_STEP=7; else BENCH_STEP=6; fi
 echo -e "${YELLOW}[${BENCH_STEP}/${TOTAL_STEPS}] Running performance regression benchmarks...${NC}"
 echo ""
 

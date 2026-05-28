@@ -35,7 +35,7 @@ namespace llaminar2
      * Must be called once before any TQ kernel launch.
      * Thread-safe (uses internal flag to skip redundant uploads).
      */
-    void cuda_tq_upload_codebooks(cudaStream_t stream = 0);
+    void cuda_tq_upload_codebooks(cudaStream_t stream);
 
     // =========================================================================
     // Dynamic Params for Graph-Capturable Incremental Dequant
@@ -110,7 +110,7 @@ namespace llaminar2
     CUDATurboQuantRotations cuda_tq_create_rotations(
         int n_layers, int n_kv_heads, int head_dim,
         uint64_t rotation_seed, int device_id,
-        cudaStream_t stream = 0);
+        cudaStream_t stream);
 
     /**
      * @brief Free GPU rotation matrices.

@@ -99,13 +99,13 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_RoPEChangesK)
     cudaMemcpy(d_K, h_K_fp16.data(), num_tokens * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_fp16.data(), num_tokens * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
 
     // Get raw K data via get_kv_for_attention (the void* API)
     const void *d_K_raw_ptr = nullptr;
     const void *d_V_raw_ptr = nullptr;
     int kv_len = 0;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_raw_ptr, &d_V_raw_ptr, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_raw_ptr, &d_V_raw_ptr, &kv_len, 0));
     ASSERT_NE(d_K_raw_ptr, nullptr);
 
     auto k_no_rope = downloadFP16ToFP32(d_K_raw_ptr, num_tokens * kv_dim);
@@ -171,7 +171,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP16_VUnchangedByRoPE)
     cudaMalloc(&d_V, num_tokens * kv_dim * sizeof(__half));
     cudaMemcpy(d_K, h_K_fp16.data(), num_tokens * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_fp16.data(), num_tokens * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
 
     IKVCache::KVReadParams rope_params;
     rope_params.rope_theta = 10000.0f;
@@ -298,7 +298,7 @@ TEST(Test__CUDARingKVCache_RoPEOnRead, FP32_RoPEConvertsToFP16)
     cudaMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
     cudaMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
 
     IKVCache::KVReadParams rope_params;
     rope_params.rope_theta = 10000.0f;

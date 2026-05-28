@@ -191,7 +191,7 @@ namespace llaminar2
         // ROCm-specific append (device pointer version)
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,
-                    int num_tokens, hipStream_t stream = 0) override
+                    int num_tokens, hipStream_t stream) override
         {
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx < 0)
@@ -201,7 +201,7 @@ namespace llaminar2
 
         bool get_kv_for_attention(int layer, int seq_idx,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, hipStream_t stream = 0) override
+                                  int *kv_len, hipStream_t stream) override
         {
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx < 0)
@@ -219,7 +219,7 @@ namespace llaminar2
 
         bool linearize_to(int layer, int seq_idx,
                           void *d_k_out, void *d_v_out,
-                          int *kv_len, hipStream_t stream = 0) override
+                          int *kv_len, hipStream_t stream) override
         {
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx < 0)
@@ -246,7 +246,7 @@ namespace llaminar2
         int gather_kv_batched(int layer, int num_seqs,
                               void *d_k_out, void *d_v_out,
                               int *kv_lens, int max_kv_len,
-                              hipStream_t stream = 0) override
+                              hipStream_t stream) override
         {
             int kv_idx = layer_map_.toKVIndex(layer);
             if (kv_idx < 0)

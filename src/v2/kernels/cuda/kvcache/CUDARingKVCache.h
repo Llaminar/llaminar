@@ -162,11 +162,11 @@ namespace llaminar2
          */
         virtual bool append(int layer, int seq_idx,
                             const void *d_k, const void *d_v,
-                            int num_tokens, cudaStream_t stream = 0) = 0;
+                            int num_tokens, cudaStream_t stream) = 0;
 
         // Convenience for single-sequence mode
         bool append(int layer, const void *d_k, const void *d_v,
-                    int num_tokens, cudaStream_t stream = 0)
+                    int num_tokens, cudaStream_t stream)
         {
             return append(layer, 0, d_k, d_v, num_tokens, stream);
         }
@@ -176,12 +176,12 @@ namespace llaminar2
          */
         virtual bool get_kv_for_attention(int layer, int seq_idx,
                                           const void **d_k_out, const void **d_v_out,
-                                          int *kv_len, cudaStream_t stream = 0) = 0;
+                                          int *kv_len, cudaStream_t stream) = 0;
 
         // Convenience for single-sequence mode
         bool get_kv_for_attention(int layer,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, cudaStream_t stream = 0)
+                                  int *kv_len, cudaStream_t stream)
         {
             return get_kv_for_attention(layer, 0, d_k_out, d_v_out, kv_len, stream);
         }
@@ -191,7 +191,7 @@ namespace llaminar2
          */
         virtual bool linearize_to(int layer, int seq_idx,
                                   void *d_k_out, void *d_v_out,
-                                  int *kv_len, cudaStream_t stream = 0) = 0;
+                                  int *kv_len, cudaStream_t stream) = 0;
 
         // =====================================================================
         // Eviction (O(1) - pointer arithmetic only)
@@ -213,7 +213,7 @@ namespace llaminar2
         virtual int gather_kv_batched(int layer, int num_seqs,
                                       void *d_k_out, void *d_v_out,
                                       int *kv_lens, int max_kv_len,
-                                      cudaStream_t stream = 0) = 0;
+                                      cudaStream_t stream) = 0;
 
         // Bring in IKVCache::gather_kv_batched(ITensor*) to avoid hiding
         using IKVCache::gather_kv_batched;
@@ -442,6 +442,16 @@ namespace llaminar2
 
         ActivationPrecision k_precision() const override { return Precision; }
 
+        /**
+         * @brief Reset ring metadata and request-scoped CUDA sidecar buffers.
+         *
+         * Clears host/device dynamic head params, conversion scratch, RoPE shadow
+         * views, tensor wrappers, and persistent K/V storage. This preserves the
+         * same empty-cache invariant as reconstructing the cache while keeping
+         * stable device pointers for cached compute graphs.
+         */
+        void clear() override;
+
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
@@ -472,15 +482,15 @@ namespace llaminar2
 
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,
-                    int num_tokens, cudaStream_t stream = 0) override;
+                    int num_tokens, cudaStream_t stream) override;
 
         bool get_kv_for_attention(int layer, int seq_idx,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, cudaStream_t stream = 0) override;
+                                  int *kv_len, cudaStream_t stream) override;
 
         bool linearize_to(int layer, int seq_idx,
                           void *d_k_out, void *d_v_out,
-                          int *kv_len, cudaStream_t stream = 0) override;
+                          int *kv_len, cudaStream_t stream) override;
 
         void evict_oldest(int layer, int seq_idx, int num_tokens) override;
         void evict_oldest_layer(int layer, int num_tokens) override;
@@ -488,7 +498,7 @@ namespace llaminar2
         int gather_kv_batched(int layer, int num_seqs,
                               void *d_k_out, void *d_v_out,
                               int *kv_lens, int max_kv_len,
-                              cudaStream_t stream = 0) override;
+                              cudaStream_t stream) override;
 
         int get_total_evicted() const override { return total_evicted_; }
         void reset_eviction_counter() override { total_evicted_ = 0; }
@@ -501,11 +511,11 @@ namespace llaminar2
 
         bool get_kv_typed(int layer, int seq_idx,
                           const DataT **d_k_out, const DataT **d_v_out,
-                          int *kv_len, cudaStream_t stream = 0);
+                          int *kv_len, cudaStream_t stream);
 
         bool append_typed(int layer, int seq_idx,
                           const DataT *d_k, const DataT *d_v,
-                          int num_tokens, cudaStream_t stream = 0);
+                          int num_tokens, cudaStream_t stream);
 
         // =====================================================================
         // IWorkspaceConsumer Interface

@@ -156,9 +156,9 @@ namespace llaminar2
         block_size_ = total_size;
 
         LOG_DEBUG("[WORKSPACE_ALLOC] block_ptr=" << block_
-                  << " bytes=" << total_size
-                  << " device=" << device_.to_string()
-                  << " ordinal=" << device_ordinal);
+                                                 << " bytes=" << total_size
+                                                 << " device=" << device_.to_string()
+                                                 << " ordinal=" << device_ordinal);
 
         // Suballocate buffers at aligned offsets
         size_t current_offset = 0;
@@ -173,10 +173,10 @@ namespace llaminar2
 
             void *buf_ptr = static_cast<char *>(block_) + current_offset;
             LOG_DEBUG("[WORKSPACE_SUBALLOC] '" << buf->name << "'"
-                      << " ptr=" << buf_ptr
-                      << " offset=" << current_offset
-                      << " size=" << buf->size_bytes
-                      << " device=" << device_.to_string());
+                                               << " ptr=" << buf_ptr
+                                               << " offset=" << current_offset
+                                               << " size=" << buf->size_bytes
+                                               << " device=" << device_.to_string());
 
             current_offset += buf->size_bytes;
         }

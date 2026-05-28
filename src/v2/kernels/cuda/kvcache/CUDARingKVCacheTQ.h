@@ -296,7 +296,7 @@ namespace llaminar2
         TQDequantDynamicParams *d_dequant_params_ = nullptr; ///< [n_layers_] device
         TQDequantDynamicParams *h_dequant_params_ = nullptr; ///< [n_layers_] pinned host
 
-        mutable cudaStream_t cached_stream_ = nullptr; ///< Last explicit stream used by append/read operations.
+        mutable cudaStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
 
         // =====================================================================
         // CUDARingKVCacheBase entry accessors and hooks
@@ -355,9 +355,9 @@ namespace llaminar2
         /// Dequantize a layer's TQ ring into the shared scratch buffer.
         /// Returns false on kernel launch failure.
         bool dequant_to_scratch(int layer, int seq_idx,
-                                float rope_theta = 0.0f,
-                                int position_start = 0,
-                                cudaStream_t stream = nullptr) const;
+                                float rope_theta,
+                                int position_start,
+                                cudaStream_t stream) const;
     };
 
 } // namespace llaminar2

@@ -1,5 +1,22 @@
 #pragma once
 
+/**
+ * @file PreparedWeightStore.h
+ * @brief Model-owned prepared weight and kernel lifetime registry.
+ *
+ * Owns prepared GEMM handles, fused gate/up adapters, prepared embeddings, and
+ * MoE expert slabs for a single model context. The store separates long-lived
+ * weight residency from per-request kernel execution state so orchestrators can
+ * reset dynamic state at session boundaries without unloading weights.
+ *
+ * Thread-safety: Public methods acquire an internal mutex. Expert slab entries
+ * additionally use per-slab shared mutexes for expert-level availability.
+ *
+ * Lifecycle: Created by DeviceGraphOrchestrator/WeightManager and kept for the
+ * model lifetime. releaseAllPreparedState() frees all owned prepared state at
+ * model teardown.
+ */
+
 #include "ExpertSlabTypes.h"
 #include "WeightPlan.h"
 #include "../kernels/KernelFactory.h"
@@ -114,6 +131,14 @@ namespace llaminar2
         bool contains(const PreparedWeightRef &ref) const;
         std::optional<WeightBinding> binding(const PreparedWeightRef &ref) const;
         size_t size() const;
+        /**
+         * @brief Reset input-dependent state on all prepared kernels.
+         *
+         * Preserves packed weights and prepared handles, but clears request-local
+         * stream bindings, scratch contexts, and cached execution state held by
+         * GEMM engines or fused adapters.
+         */
+        void resetDynamicState();
         void clear();
 
         /**

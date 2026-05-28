@@ -39,6 +39,7 @@ namespace llaminar2
         std::optional<DeviceId> device; ///< GPU device for backend lookup
         size_t vocab_local = 0;         ///< Local vocab size (columns in logits_local)
         TensorBase *tensor = nullptr;   ///< Tensor pointer for CPU fallback (data())
+        void *stream = nullptr;         ///< Explicit GPU stream (must match forward pass stream)
 
         /// True if this info is valid (has a tensor)
         explicit operator bool() const { return tensor != nullptr; }

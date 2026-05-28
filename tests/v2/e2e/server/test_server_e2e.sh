@@ -7,9 +7,12 @@
 #
 # Default test suites:
 #   Suite 1: Qwen2.5 1.5B Q8_0 on cpu, cuda:0, rocm:0
-#   Suite 2: Qwen3.5 4B   Q8_0 on cpu
+#   Suite 2: Qwen3.5 4B   Q8_0 on cpu, cuda:0, rocm:0
 #   Suite 3: Qwen3.5 35B MoE Q4_K_XL on cpu
 #   Suite 4: Qwen3.5 35B MoE Q4_K_XL on rocm:0
+#   Suite 5: Qwen3.5 27B dense Q4_K_M on cpu, rocm:0 (too large for single 24GB CUDA GPU)
+#   Suite 6: Qwen3.5 27B dense Q4_K_M TP2 on rocm:0,rocm:1
+#   Suite 7: Qwen3.5 27B dense Q4_K_M PP2 on cuda:0+rocm:0 (equal 32/32 layer split)
 #
 # Each backend test:
 #   1. Starts llaminar2 serve on a unique port
@@ -62,15 +65,18 @@ if [[ "${LOG_LEVEL^^}" == "ERROR" ]]; then
 fi
 BASE_PORT=19080
 
-HOST_RSS_CPU_MODEL_MULTIPLIER="${LLAMINAR_E2E_HOST_RSS_CPU_MODEL_MULTIPLIER:-4}"
+HOST_RSS_CPU_MODEL_MULTIPLIER="${LLAMINAR_E2E_HOST_RSS_CPU_MODEL_MULTIPLIER:-5}"
 HOST_RSS_GPU_MODEL_MULTIPLIER="${LLAMINAR_E2E_HOST_RSS_GPU_MODEL_MULTIPLIER:-2}"
-HOST_RSS_EXTRA_MB="${LLAMINAR_E2E_HOST_RSS_EXTRA_MB:-4096}"
+HOST_RSS_EXTRA_MB="${LLAMINAR_E2E_HOST_RSS_EXTRA_MB:-5120}"
 CPU_GPU_DELTA_LIMIT_MB="${LLAMINAR_E2E_CPU_GPU_DELTA_LIMIT_MB:-128}"
 GPU_ACTIVE_MIN_MB="${LLAMINAR_E2E_GPU_ACTIVE_MIN_MB:-256}"
 THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS:-}"
 
-# Model suites: "model_path|backend1,backend2,...[|max_tokens]"
+# Model suites: "model_path|backend1,backend2,...[|max_tokens[|extra_flags]]"
+#   or shorthand: "model_path|backend1,backend2,...|extra_flags" (max_tokens omitted → defaults to 10)
 # Uses '|' as delimiter (not ':') because device names contain colons (cuda:0).
+# The optional 4th field (extra_flags) is passed verbatim to the server command.
+# If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 10).
 # Each --suite flag appends to the list. If none given, defaults are used.
 declare -a SUITES=()
 OVERRIDE_MODEL=""
@@ -95,12 +101,12 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S1_BACKENDS="${OVERRIDE_BACKENDS:-${LLAMINAR_BACKENDS:-cpu,cuda:0,rocm:0}}"
     SUITES+=("${S1_MODEL}|${S1_BACKENDS}")
 
-    # Suite 2: Qwen3.5 4B (hybrid GDN/FA architecture — CPU only for speed)
+    # Suite 2: Qwen3.5 4B (hybrid GDN/FA architecture — all backends)
     # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
     # <think>...</think> tags before the actual answer.
     S2_MODEL="${REPO_ROOT}/models/Qwen3.5-4B-Q8_0.gguf"
     if [ -f "$S2_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
-        SUITES+=("${S2_MODEL}|cpu|200")
+        SUITES+=("${S2_MODEL}|cpu,cuda:0,rocm:0|200")
     fi
 
     # Suite 3: Qwen3.5 35B MoE (MoE + GDN/FA architecture — CPU only)
@@ -118,12 +124,37 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     if [ -f "$S4_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
         SUITES+=("${S4_MODEL}|rocm:0|200")
     fi
+
+    # Suite 5: Qwen3.5 27B dense (hybrid GDN/FA architecture — all backends)
+    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
+    # <think>...</think> tags before the actual answer.
+    S5_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
+    if [ -f "$S5_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
+        SUITES+=("${S5_MODEL}|cpu,rocm:0|200")
+    fi
+
+    # Suite 6: Qwen3.5 27B dense TP2 on ROCm (tensor parallel across 2 GPUs)
+    # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
+    # <think>...</think> tags before the actual answer.
+    S6_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
+    if [ -f "$S6_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
+        SUITES+=("${S6_MODEL}|tp|200|--tp-devices rocm:0,rocm:1")
+    fi
+
+    # Suite 7: Qwen3.5 27B dense PP2 (pipeline parallel: cuda:0 + rocm:0, equal layer split)
+    # 64 layers total: layers 0-31 on cuda:0, layers 32-63 on rocm:0.
+    # Uses max_tokens=200 because Qwen3.5 is a thinking model.
+    S7_MODEL="/opt/llaminar-models/Qwen3.5-27B-Q4_K_M.gguf"
+    if [ -f "$S7_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
+        SUITES+=("${S7_MODEL}|pp|200|--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-31 --pp-stage 1=rocm_pp:32-63")
+    fi
 fi
 
 STARTUP_TIMEOUT=300   # seconds to wait for server startup. Most models load in
                       # <10s; the 4B Qwen3.5 GGUF on CPU needs ~60-120s for
                       # weight load + GDN init. The smaller suites finish in
                       # ~5s either way, so this is just an upper bound.
+SHUTDOWN_TIMEOUT=15   # seconds to wait for graceful SIGTERM shutdown
 REQUEST_TIMEOUT=180   # seconds per curl request
 
 # Optional long-context helper controls. The helper is intentionally gated to
@@ -173,7 +204,7 @@ is_thinking_model() {
 
 is_gpu_backend() {
     local backend="$1"
-    [[ "$backend" == cuda:* || "$backend" == rocm:* ]]
+    [[ "$backend" == cuda:* || "$backend" == rocm:* || "$backend" == "tp" || "$backend" == "pp" ]]
 }
 
 parse_model_size_b() {
@@ -268,10 +299,102 @@ cleanup_server() {
     fi
 }
 
+# Graceful shutdown with exit code, VRAM release, and crash validation.
+# Called at the end of each test case instead of bare cleanup_server.
+shutdown_and_validate() {
+    local tag="$1"
+    local pid="$2"
+    local gpu_before_mb="$3"
+
+    # ─── Check 1: Clean SIGTERM exit ─────────────────────────────────
+    local exit_code=0
+    if kill -0 "$pid" 2>/dev/null; then
+        # Kill the entire process tree (TP/PP spawns child ranks via mpirun)
+        local tree_pids
+        tree_pids=$(collect_process_tree_pids "$pid" | xargs || echo "$pid")
+        kill $tree_pids 2>/dev/null || true
+
+        # Wait with timeout — poll until root process exits or deadline
+        local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
+        while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
+            sleep 0.2
+        done
+
+        if kill -0 "$pid" 2>/dev/null; then
+            # Process didn't exit gracefully — force kill entire tree
+            fail "[${tag}] Shutdown: process did not exit within ${SHUTDOWN_TIMEOUT}s after SIGTERM, sending SIGKILL"
+            kill -9 $tree_pids 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return
+        fi
+
+        # Reap and get exit code (may be non-zero for SIGTERM, so suppress errexit)
+        wait "$pid" 2>/dev/null && exit_code=0 || exit_code=$?
+    else
+        # Process already exited — get its status
+        wait "$pid" 2>/dev/null && exit_code=0 || exit_code=$?
+    fi
+
+    # ─── Check 2: No crash/segfault on exit ──────────────────────────
+    # exit_code meanings:
+    #   0       = clean exit
+    #   143     = killed by SIGTERM (128 + 15) — acceptable for servers
+    #   139     = SIGSEGV (segfault)
+    #   134     = SIGABRT (abort/assertion)
+    #   136     = SIGFPE (floating point exception)
+    #   132     = SIGILL (illegal instruction)
+    local crash_signals="139 134 136 132"
+    local is_crash=false
+    for sig in $crash_signals; do
+        if [ "$exit_code" -eq "$sig" ]; then
+            is_crash=true
+            break
+        fi
+    done
+
+    if [ "$is_crash" = "true" ]; then
+        local signal_name="unknown"
+        case "$exit_code" in
+            139) signal_name="SIGSEGV (segfault)" ;;
+            134) signal_name="SIGABRT (abort)" ;;
+            136) signal_name="SIGFPE" ;;
+            132) signal_name="SIGILL" ;;
+        esac
+        fail "[${tag}] Shutdown: process crashed with ${signal_name} (exit code ${exit_code})"
+    elif [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 1 ] || [ "$exit_code" -eq 143 ]; then
+        # 0 = clean exit, 1 = mpirun wrapper reporting child signal (normal),
+        # 143 = killed by SIGTERM directly (128+15)
+        pass "[${tag}] Shutdown: clean exit (code ${exit_code})"
+    else
+        fail "[${tag}] Shutdown: unexpected exit code ${exit_code}"
+    fi
+
+    # ─── Check 3: GPU VRAM fully released ────────────────────────────
+    # Give the driver time to reclaim memory. Multi-GPU (TP/PP) needs more
+    # time as each device independently tears down its allocations.
+    sleep 2
+    local gpu_after_mb
+    gpu_after_mb=$(get_total_gpu_memory_mb)
+    local gpu_leaked_mb=$((gpu_after_mb - gpu_before_mb))
+
+    # Allow small variance (driver overhead, context caching) — 64 MiB tolerance
+    local VRAM_LEAK_TOLERANCE_MB=64
+    if [ "$gpu_leaked_mb" -le "$VRAM_LEAK_TOLERANCE_MB" ]; then
+        pass "[${tag}] Shutdown: GPU VRAM released (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, delta=${gpu_leaked_mb} MiB)"
+    else
+        fail "[${tag}] Shutdown: GPU VRAM leak detected (before=${gpu_before_mb} MiB, after=${gpu_after_mb} MiB, leaked=${gpu_leaked_mb} MiB)"
+    fi
+}
+
 wait_for_health() {
     local port=$1
+    local pid=${2:-}
     local deadline=$((SECONDS + STARTUP_TIMEOUT))
     while [ $SECONDS -lt $deadline ]; do
+        # If we have a PID, check if the server process is still alive
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            return 1  # Server process already exited
+        fi
         if curl -s --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
             return 0
         fi
@@ -544,6 +667,9 @@ get_process_tree_gpu_memory_mb() {
 scan_server_log() {
     local tag="$1"
     local log_path="$2"
+    local has_failure=false
+
+    # Check 1: Application-level errors (our logging framework)
     local matches count
     matches=$(grep -nE '\[(WARN ?|ERROR|FATAL)\]' "$log_path" 2>/dev/null || true)
 
@@ -556,8 +682,23 @@ scan_server_log() {
             echo "    ... (${count} total matches; see ${log_path})"
         fi
         echo "    ─────────────────────"
-    else
-        pass "[${tag}] Server log: no WARN/ERROR entries (${log_path})"
+        has_failure=true
+    fi
+
+    # Check 2: mpirun crash detection — this message only appears when the child
+    # process exits non-zero ON ITS OWN (real error). It does NOT appear when we
+    # SIGTERM mpirun externally (our normal shutdown path).
+    local mpi_crash
+    mpi_crash=$(grep -c "mpirun detected that one or more processes exited with non-zero status" "$log_path" 2>/dev/null || true)
+    if [ "$mpi_crash" -gt 0 ]; then
+        local mpi_exit_code
+        mpi_exit_code=$(grep -oP 'Exit code:\s+\K\d+' "$log_path" 2>/dev/null | head -1 || echo "unknown")
+        fail "[${tag}] Server log: mpirun detected child process crashed (exit code: ${mpi_exit_code})"
+        has_failure=true
+    fi
+
+    if [ "$has_failure" = "false" ]; then
+        pass "[${tag}] Server log: clean (${log_path})"
     fi
 }
 
@@ -786,6 +927,7 @@ run_backend_tests() {
     local port="$3"
     local label="$4"
     local max_tokens="${5:-10}"
+    local extra_flags="${6:-}"
     local tag="${label}/${backend}"
     local thinking_model="false"
     if is_thinking_model "$label"; then
@@ -806,8 +948,12 @@ run_backend_tests() {
         fi
     fi
 
-    # Build device flag — always explicit to prevent auto-detection
-    local device_flag="-d ${backend}"
+    # Build device flag — always explicit to prevent auto-detection.
+    # For TP/PP suites, backend is "tp" or "pp" and extra_flags contains device config.
+    local device_flag=""
+    if [[ "$backend" != "tp" && "$backend" != "pp" ]]; then
+        device_flag="-d ${backend}"
+    fi
     local safe_tag log_path gpu_before_mb
     safe_tag=$(sanitize_name "$tag")
     log_path="${LOG_DIR}/$(date +%Y%m%d_%H%M%S)_${safe_tag}_port${port}.log"
@@ -820,11 +966,11 @@ run_backend_tests() {
     fi
 
     LLAMINAR_LOG_LEVEL="$LOG_LEVEL" "$BINARY" serve --port "$port" \
-        "${context_args[@]}" $device_flag -m "$model" >"$log_path" 2>&1 &
+        "${context_args[@]}" $device_flag $extra_flags -m "$model" >"$log_path" 2>&1 &
     local server_pid=$!
 
-    # Wait for health
-    if ! wait_for_health "$port"; then
+    # Wait for health (pass PID so we detect early exit / OOM)
+    if ! wait_for_health "$port" "$server_pid"; then
         fail "[${tag}] Server failed to start within ${STARTUP_TIMEOUT}s"
         echo "    ── Last 80 lines of server log (${log_path}) ──"
         tail -n 80 "$log_path" 2>/dev/null | sed 's/^/    /' || echo "    (server log not available)"
@@ -918,10 +1064,15 @@ print(d.get('error', {}).get('type', ''))
 
     # ─── Test 10: Memory and server log hygiene ───────────────────────
     check_memory_usage "$tag" "$backend" "$model" "$server_pid" "$gpu_before_mb"
-    scan_server_log "$tag" "$log_path"
 
-    # Cleanup
-    cleanup_server "$server_pid"
+    # ─── Test 11: Graceful shutdown validation ────────────────────────
+    shutdown_and_validate "$tag" "$server_pid" "$gpu_before_mb"
+
+    # ─── Test 12: Server log hygiene (after shutdown) ─────────────────
+    # Scan AFTER shutdown so we catch errors during teardown too.
+    # This covers exit code 1 from mpirun — if the child actually crashed
+    # or errored, the log will have [ERROR]/[FATAL] entries.
+    scan_server_log "$tag" "$log_path"
     echo ""
 }
 
@@ -940,18 +1091,36 @@ else
 fi
 echo -e "  Suites: ${#SUITES[@]}"
 for suite in "${SUITES[@]}"; do
-    IFS='|' read -r local_model local_backends _ <<< "$suite"
-    echo -e "    $(basename "$local_model")  →  ${local_backends}"
+    IFS='|' read -r local_model local_backends local_third local_extra <<< "$suite"
+    # If third field isn't numeric, it's extra_flags (max_tokens was omitted)
+    if [[ -n "$local_third" && ! "$local_third" =~ ^[0-9]+$ ]]; then
+        local_extra="$local_third"
+    elif [[ -z "$local_extra" ]]; then
+        local_extra=""
+    fi
+    local_suffix=""
+    if [ -n "$local_extra" ]; then local_suffix=" [${local_extra}]"; fi
+    echo -e "    $(basename "$local_model")  →  ${local_backends}${local_suffix}"
 done
 echo ""
 
 PORT=$BASE_PORT
 
 for suite in "${SUITES[@]}"; do
-    # Parse suite: "model_path|backends[|max_tokens]"
-    IFS='|' read -r SUITE_MODEL SUITE_BACKENDS SUITE_MAX_TOKENS <<< "$suite"
-    SUITE_MAX_TOKENS="${SUITE_MAX_TOKENS:-10}"  # Default: 10 tokens
+    # Parse suite: "model_path|backends[|max_tokens[|extra_flags]]"
+    # If the third field is not numeric, treat it as extra_flags (max_tokens defaults to 200).
+    IFS='|' read -r SUITE_MODEL SUITE_BACKENDS SUITE_MAX_TOKENS SUITE_EXTRA_FLAGS <<< "$suite"
+    if [[ -n "$SUITE_MAX_TOKENS" && ! "$SUITE_MAX_TOKENS" =~ ^[0-9]+$ ]]; then
+        # Third field is not a number — it's extra_flags with max_tokens omitted
+        SUITE_EXTRA_FLAGS="$SUITE_MAX_TOKENS"
+        SUITE_MAX_TOKENS="200"
+    fi
+    SUITE_MAX_TOKENS="${SUITE_MAX_TOKENS:-200}"  # Default: 200 tokens (enough for thinking models)
+    SUITE_EXTRA_FLAGS="${SUITE_EXTRA_FLAGS:-}"   # Default: no extra flags
     SUITE_LABEL="$(basename "$SUITE_MODEL" .gguf)"
+    if [ -n "$SUITE_EXTRA_FLAGS" ]; then
+        SUITE_LABEL="${SUITE_LABEL} [${SUITE_EXTRA_FLAGS}]"
+    fi
 
     # Validate model exists
     if [ ! -f "$SUITE_MODEL" ]; then
@@ -967,7 +1136,7 @@ for suite in "${SUITES[@]}"; do
     for BACKEND in "${BACKEND_LIST[@]}"; do
         BACKEND=$(echo "$BACKEND" | xargs)  # trim whitespace
         PORT=$((PORT + 1))
-        run_backend_tests "$SUITE_MODEL" "$BACKEND" "$PORT" "$SUITE_LABEL" "$SUITE_MAX_TOKENS"
+        run_backend_tests "$SUITE_MODEL" "$BACKEND" "$PORT" "$SUITE_LABEL" "$SUITE_MAX_TOKENS" "$SUITE_EXTRA_FLAGS"
     done
 done
 

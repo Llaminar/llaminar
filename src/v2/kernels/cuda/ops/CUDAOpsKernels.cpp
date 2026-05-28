@@ -58,54 +58,6 @@ extern "C"
         const uint16_t *gate, const uint16_t *up, uint16_t *output,
         int size, int device_idx, void *stream);
 
-    // RoPE (legacy - requires position_ids array copy)
-    bool cudaOps_rope_fp32(
-        float *Q, float *K, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
-    bool cudaOps_rope_bf16(
-        uint16_t *Q, uint16_t *K, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
-    bool cudaOps_rope_fp16(
-        uint16_t *Q, uint16_t *K, const int *position_ids,
-        int seq_len, int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
-
-    // RoPE DECODE (seq_len=1, scalar position - NO MEMCPY)
-    bool cudaOps_rope_fp32_decode(
-        float *Q, float *K, int pos,
-        int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
-    bool cudaOps_rope_bf16_decode(
-        uint16_t *Q, uint16_t *K, int pos,
-        int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
-    bool cudaOps_rope_fp16_decode(
-        uint16_t *Q, uint16_t *K, int pos,
-        int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx);
-
-    // RoPE CONTIGUOUS (pos computed on GPU - ZERO MEMCPY)
-    bool cudaOps_rope_fp32_contiguous(
-        float *Q, float *K, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx,
-        void *stream = nullptr,
-        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
-    bool cudaOps_rope_bf16_contiguous(
-        uint16_t *Q, uint16_t *K, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx,
-        void *stream = nullptr,
-        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
-    bool cudaOps_rope_fp16_contiguous(
-        uint16_t *Q, uint16_t *K, int pos_offset, int seq_len,
-        int n_heads, int n_kv_heads, int head_dim,
-        float rope_theta, int device_idx,
-        void *stream = nullptr,
-        const llaminar2::rope::RoPEDeviceParams *device_params = nullptr);
-
     // RoPE WORKSPACE-AWARE (v3 - external inv_freq buffer)
     bool cudaOps_rope_populate_inv_freq(
         float *d_inv_freq, int head_dim, float freq_base, int device_idx, cudaStream_t stream);

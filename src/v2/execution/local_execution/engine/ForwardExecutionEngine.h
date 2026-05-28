@@ -22,6 +22,7 @@
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "../../factory/InferenceRunnerFactory.h" // For FactoryPPStageConfig
+#include "../../../utils/ForwardPassProfiler.h"
 
 #include <chrono>
 #include <functional>
@@ -318,6 +319,9 @@ namespace llaminar2
         void setSuppressTimeline(bool v) { suppress_timeline_ = v; }
         void setAccumulatePrefill(bool v) { accumulate_prefill_ = v; }
 
+        /** Access the forward pass profiler for flushing at benchmark end. */
+        ForwardPassProfiler &forwardPassProfiler() { return forward_pass_profiler_; }
+
     private:
         // ----- Cache HIT execution path -----
         bool executeCacheHit(
@@ -379,6 +383,9 @@ namespace llaminar2
         bool suppress_timeline_ = false;
         bool accumulate_prefill_ = false;
         bool first_graph_ready_fired_ = false;
+
+        // ----- Forward pass wall-clock profiler -----
+        ForwardPassProfiler forward_pass_profiler_;
     };
 
 } // namespace llaminar2

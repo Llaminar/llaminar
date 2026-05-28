@@ -2723,6 +2723,40 @@ namespace llaminar2
                 markDevicePreparationComplete();
             LOG_DEBUG("[WeightManager] Binding-driven CPU preparation registered "
                       << registered << " GEMM bindings for " << device.to_string());
+
+            // Release raw host data for quantized weights now that VNNI packing
+            // is complete. The kernel owns its own packed buffer (native_interleaved
+            // + payload); the original Q4_K/Q5_K/Q6_K/etc TensorSlice heap data is
+            // no longer needed. FP32/oneDNN weights are not IINT8Unpackable so
+            // the dynamic_cast fails and they are retained.
+            size_t released_count = 0;
+            for (const auto &binding : frozen_weights.bindings())
+            {
+                if (!binding.prepared.has_value() || binding.prepared->device != device)
+                    continue;
+                if (!binding.tensor || binding.tensor->shape().size() != 2)
+                    continue;
+                if (binding.identity.role == WeightRole::Embedding ||
+                    binding.identity.role == WeightRole::Norm ||
+                    binding.identity.role == WeightRole::Bias)
+                {
+                    continue;
+                }
+                if (dynamic_cast<IINT8Unpackable *>(binding.tensor))
+                {
+                    binding.tensor->release_host_weight_data();
+                    ++released_count;
+                }
+            }
+#ifdef __linux__
+            if (released_count > 0)
+            {
+                ::malloc_trim(0);
+            }
+#endif
+            LOG_DEBUG("[WeightManager] Released raw host data for " << released_count
+                      << " quantized CPU weights after VNNI packing");
+
             return true;
         }
 
@@ -2823,12 +2857,23 @@ namespace llaminar2
                 }
             }
 
-            gemm_ok = packGemmWeights(device, cpu_progress_cb, /*release_raw_data=*/false, layer_filter);
+            gemm_ok = packGemmWeights(device, cpu_progress_cb, /*release_raw_data=*/true, layer_filter);
 
             if (weight_load_progress_ && cpu_progress_idx >= 0)
             {
                 weight_load_progress_->finish(cpu_progress_idx);
             }
+
+            // Return freed memory to the OS after releasing raw quantized weight data.
+            // VNNI packing creates its own packed buffer; the original Q4_K/Q5_K/Q6_K/etc
+            // heap data (from TensorSlice sharding) is now released. Without
+            // malloc_trim, glibc retains these freed pages in its arena indefinitely.
+#ifdef __linux__
+            if (gemm_ok)
+            {
+                ::malloc_trim(0);
+            }
+#endif
         }
 
         if (!gemm_ok)
@@ -2864,7 +2909,8 @@ namespace llaminar2
             markDevicePreparationComplete();
         }
 
-        // Phase 2: Release host copies (only for GPU, since CPU reads from host)
+        // Phase 2: Release host copies (GPU only — CPU quantized weights are
+        // released inline during packGemmWeights via release_raw_data=true).
         if (is_gpu && ok)
         {
             size_t released = releaseAllHostWeightData();

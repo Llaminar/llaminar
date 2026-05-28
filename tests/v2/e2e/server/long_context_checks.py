@@ -213,7 +213,7 @@ def tier_settings(tier: str, long_max_tokens: int) -> TierSettings:
             boundary_close_ratio=0.70,
         )
 
-    min_lines = max(40, min(120, long_max_tokens // 12))
+    min_lines = max(40, min(120, long_max_tokens // 14))
     requested_lines = max(140, min(220, long_max_tokens // 6))
     min_completion = max(256, int(long_max_tokens * 0.65))
     return TierSettings(

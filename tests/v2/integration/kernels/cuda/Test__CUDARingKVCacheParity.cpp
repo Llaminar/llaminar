@@ -130,14 +130,14 @@ TEST(Test__CUDARingKVCache, BasicAppendRetrieve_FP32)
     cudaMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
     // Append to cache (layer 0)
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
     EXPECT_FALSE(cache->is_wrapped(0, 0)); // Should not be wrapped yet
 
     // Retrieve K/V
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     // Copy back and verify
@@ -197,7 +197,7 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     cudaMemcpy(d_K, h_K1.data(), phase1_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V1.data(), phase1_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase1_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase1_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 6);
     EXPECT_EQ(cache->get_head_position(0, 0), 6);
     EXPECT_FALSE(cache->is_wrapped(0, 0));
@@ -213,7 +213,7 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     cudaMemcpy(d_K, h_K2.data(), phase2_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V2.data(), phase2_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase2_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase2_tokens, 0));
 
     // Should have evicted 2 tokens (T0, T1), keeping 8
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 8);
@@ -231,7 +231,7 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     // Retrieve and verify linearization happens
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 8);
     EXPECT_EQ(cache->get_linearization_count(), 1); // Should have linearized
 
@@ -303,7 +303,7 @@ TEST(Test__CUDARingKVCache, Eviction_O1)
     cudaMemcpy(d_K, h_K.data(), 50 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), 50 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    cache->append(0, 0, d_K, d_V, 50);
+    cache->append(0, 0, d_K, d_V, 50, 0);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 50);
 
     // Evict 20 tokens - should be O(1), no kernel launch
@@ -318,7 +318,7 @@ TEST(Test__CUDARingKVCache, Eviction_O1)
     // Retrieve remaining 30 tokens
     const void *d_K_out, *d_V_out;
     int kv_len;
-    cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len);
+    cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0);
     EXPECT_EQ(kv_len, 30);
 
     // Verify content: should have T20-T49
@@ -379,7 +379,7 @@ TEST(Test__CUDARingKVCache, SlidingWindow)
         cudaMemcpy(d_V, h_V.data(), kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
         // Append 1 token
-        cache->append(0, 0, d_K, d_V, 1);
+        cache->append(0, 0, d_K, d_V, 1, 0);
 
         // Cache should never exceed window size (auto-evicts)
         EXPECT_LE(cache->get_cached_tokens(0, 0), max_seq_len);
@@ -436,7 +436,7 @@ TEST(Test__CUDARingKVCache, BatchedGather)
         cudaMemcpy(d_K, h_Ks[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_V, h_Vs[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-        cache->append(0, seq, d_K, d_V, seq_lens[seq]);
+        cache->append(0, seq, d_K, d_V, seq_lens[seq], 0);
     }
 
     // Verify individual sequence lengths
@@ -454,7 +454,7 @@ TEST(Test__CUDARingKVCache, BatchedGather)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len);
+                                              kv_lens.data(), max_kv_len, 0);
 
     EXPECT_EQ(actual_max, 25); // Max across sequences
 
@@ -521,7 +521,7 @@ TEST(Test__CUDARingKVCache, ContiguousOptimization)
     cudaMemcpy(d_K, h_K.data(), 30 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), 30 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    cache->append(0, 0, d_K, d_V, 30);
+    cache->append(0, 0, d_K, d_V, 30, 0);
 
     // Should NOT be wrapped
     EXPECT_FALSE(cache->is_wrapped(0, 0));
@@ -529,7 +529,7 @@ TEST(Test__CUDARingKVCache, ContiguousOptimization)
     // Get K/V - should return direct pointer (no linearization)
     const void *d_K_out, *d_V_out;
     int kv_len;
-    cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len);
+    cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0);
 
     // No linearizations should have occurred
     EXPECT_EQ(cache->get_linearization_count(), 0);
@@ -537,7 +537,7 @@ TEST(Test__CUDARingKVCache, ContiguousOptimization)
     // Multiple retrievals should still not linearize
     for (int i = 0; i < 10; ++i)
     {
-        cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len);
+        cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0);
     }
     EXPECT_EQ(cache->get_linearization_count(), 0);
 
@@ -583,7 +583,7 @@ TEST(Test__CUDARingKVCache, ClearOperations)
     {
         for (int seq = 0; seq < batch_size; ++seq)
         {
-            cache->append(layer, seq, d_K, d_V, 10);
+            cache->append(layer, seq, d_K, d_V, 10, 0);
         }
     }
 
@@ -664,12 +664,12 @@ TEST(Test__CUDARingKVCache, MultiPrecision_FP16)
     cudaMemcpy(d_K, h_K_fp16.data(), 10 * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_fp16.data(), 10 * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 10);
 
     // Verify content
@@ -763,7 +763,7 @@ TEST(Test__CUDARingKVCache, AppendWithStream_FP32_to_FP16_Conversion)
     // Retrieve cached data
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     // Read back FP16 data from cache
@@ -957,12 +957,12 @@ TEST(Test__CUDARingKVCache, MultiPrecision_BF16)
     cudaMemcpy(d_K, h_K_bf16.data(), 10 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_bf16.data(), 10 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 10);
 
     // Verify content
@@ -1145,7 +1145,7 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
         int seq_len = 5 + seq * 3; // 5 and 8 tokens
         cudaMemcpy(d_K, h_K.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_V, h_V.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-        cache->append(0, seq, d_K, d_V, seq_len);
+        cache->append(0, seq, d_K, d_V, seq_len, 0);
     }
 
     // Gather without workspace - should fall back to per-call allocation
@@ -1157,7 +1157,7 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len);
+                                              kv_lens.data(), max_kv_len, 0);
 
     EXPECT_GT(actual_max, 0);
     EXPECT_EQ(kv_lens[0], 5);

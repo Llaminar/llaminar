@@ -1,8 +1,9 @@
 #!/bin/bash
-# Focused parity baseline — 32 tests covering all model families.
+# Focused parity baseline — 38 tests covering all model families.
 #
-# Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 MoE (sparse),
-#         NodeLocalTP (multi-device), HybridPPTP (pipeline+tensor parallel),
+# Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
+#         Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
+#         HybridPPTP (pipeline+tensor parallel),
 #         and ExpertOverlay (tiered same-layer expert residency).
 #
 # Tests run sequentially (parity tests share GPU resources and use
@@ -45,6 +46,13 @@ TESTS=(
   "Qwen35SingleDeviceParityTest_DecodeParity_Qwen35_4B_CUDA_KV_FP16$"
   "Qwen35SingleDeviceParityTest_PrefillParity_Qwen35_4B_ROCm_KV_FP16$"
   "Qwen35SingleDeviceParityTest_DecodeParity_Qwen35_4B_ROCm_KV_FP16$"
+  # Qwen3.5 LocalPP 27B Q4_K_M CUDA/ROCm (6)
+  "Qwen35LocalPPParityTest_PrefillParity_LocalPP_NCCL_2xCUDA_27B$"
+  "Qwen35LocalPPParityTest_DecodeParity_LocalPP_NCCL_2xCUDA_27B$"
+  "Qwen35LocalPPParityTest_PrefillParity_LocalPP_RCCL_2xROCm_27B$"
+  "Qwen35LocalPPParityTest_DecodeParity_LocalPP_RCCL_2xROCm_27B$"
+  "Qwen35LocalPPParityTest_PrefillParity_LocalPP_HETEROGENEOUS_CUDA_ROCm_27B$"
+  "Qwen35LocalPPParityTest_DecodeParity_LocalPP_HETEROGENEOUS_CUDA_ROCm_27B$"
   # Qwen3.5 MoE SingleDevice CPU (2)
   "Qwen35MoESingleDeviceParityTest_PrefillParity_Qwen35MoE_35B_CPU_KV_FP16$"
   "Qwen35MoESingleDeviceParityTest_DecodeParity_Qwen35MoE_35B_CPU_KV_FP16$"
@@ -87,8 +95,9 @@ for i in "${!TESTS[@]}"; do
   printf "[%2d/${TOTAL}] %-70s " "$NUM" "$DISPLAY_NAME"
 
   # MoE 35B decode tests need longer timeout (model is large on CPU)
+  # 27B dense LocalPP tests also need extended timeout (large model + PP overhead)
   TIMEOUT=300
-  if [[ "$TEST" == *MoE* ]] || [[ "$TEST" == *HybridPPTP* ]]; then
+  if [[ "$TEST" == *MoE* ]] || [[ "$TEST" == *HybridPPTP* ]] || [[ "$TEST" == *27B* ]]; then
     TIMEOUT=600
   fi
 

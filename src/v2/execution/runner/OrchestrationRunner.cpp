@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <fstream>
 #include <print>
 #include <sstream>
 #if defined(__GLIBC__)
@@ -501,9 +502,11 @@ namespace llaminar2
             // This avoids processing the last token twice (which corrupts GDN
             // recurrence state and creates duplicate KV cache entries).
             prefill_logits_ready_ = false;
+            LOG_TRACE("[decodeStep] Using prefill logits (skipping forward)");
         }
         else
         {
+            LOG_TRACE("[decodeStep] Running forward with last_token_=" << last_token_);
             // Run single-token forward with last token
             if (!runner_->forward(&last_token_, 1))
             {
@@ -586,6 +589,8 @@ namespace llaminar2
 
         // Record token for presence/frequency penalty tracking
         sampler_.record_token(token);
+
+        LOG_TRACE("[decodeStep] sampled token=" << token << " stop_tokens_size=" << stop_tokens_.size());
 
         result.tokens.push_back(token);
         last_token_ = token; // Store for next decode step
@@ -827,6 +832,16 @@ namespace llaminar2
         ModelConfig model_config;
         if (!config_.model_path.empty())
         {
+            // Hard fail immediately if the model file does not exist — downstream
+            // stages (PP layer boundaries, memory planning) require accurate metadata.
+            // Falling back to defaults would silently produce invalid configurations.
+            std::ifstream probe(config_.model_path, std::ios::binary);
+            if (!probe.good())
+            {
+                return setError("Model file not found: " + config_.model_path);
+            }
+            probe.close();
+
             std::shared_ptr<IMPIContext> metadata_mpi_ctx = mpi_ctx_;
             if (!metadata_mpi_ctx)
             {
@@ -842,34 +857,27 @@ namespace llaminar2
             }
             catch (const std::exception &e)
             {
-                LOG_WARN("Failed to read model metadata from " << config_.model_path
-                                                               << " (" << e.what() << "), using defaults for plan building");
-                metadata_ok = false;
+                return setError("Failed to read model metadata from " + config_.model_path
+                                + ": " + e.what());
             }
-            if (metadata_ok)
+            if (!metadata_ok)
             {
-                model_config.n_layers = static_cast<int>(metadata_loader.blockCount());
-                model_config.n_heads = static_cast<int>(metadata_loader.headCount());
-                model_config.n_kv_heads = static_cast<int>(metadata_loader.headCountKV());
-                model_config.hidden_size = static_cast<int>(metadata_loader.embeddingLength());
-                LOG_DEBUG("Model metadata for plan building: n_layers=" << model_config.n_layers
-                                                                        << " n_heads=" << model_config.n_heads
-                                                                        << " n_kv_heads=" << model_config.n_kv_heads
-                                                                        << " hidden_size=" << model_config.hidden_size);
+                return setError("Failed to read model metadata from " + config_.model_path
+                                + " (file exists but GGUF parsing failed)");
             }
-            else
-            {
-                LOG_WARN("Failed to read model metadata from " << config_.model_path
-                                                               << ", using defaults for plan building");
-                model_config.n_layers = 24;
-                model_config.n_heads = 32;
-                model_config.n_kv_heads = 8;
-                model_config.hidden_size = 4096;
-            }
+
+            model_config.n_layers = static_cast<int>(metadata_loader.blockCount());
+            model_config.n_heads = static_cast<int>(metadata_loader.headCount());
+            model_config.n_kv_heads = static_cast<int>(metadata_loader.headCountKV());
+            model_config.hidden_size = static_cast<int>(metadata_loader.embeddingLength());
+            LOG_DEBUG("Model metadata for plan building: n_layers=" << model_config.n_layers
+                                                                    << " n_heads=" << model_config.n_heads
+                                                                    << " n_kv_heads=" << model_config.n_kv_heads
+                                                                    << " hidden_size=" << model_config.hidden_size);
         }
         else
         {
-            // No model path (testing) - use defaults
+            // No model path (testing only) - use defaults
             model_config.n_layers = 24;
             model_config.n_heads = 32;
             model_config.n_kv_heads = 8;
@@ -1298,7 +1306,47 @@ namespace llaminar2
             return cfg;
         };
 
-        if (plan_.usesLocalTP())
+        if (plan_.usesLocalPP())
+        {
+            // LOCAL PP: each PP stage has its own layer range. Create per-device
+            // configs with the correct layer boundaries for each stage.
+            const auto &pp_devices = plan_.local_pp_devices;
+            const auto &boundaries = plan_.local_pp_layer_boundaries;
+            const auto &stage_tp = plan_.local_pp_stage_tp_info;
+
+            for (size_t stage = 0; stage < pp_devices.size(); ++stage)
+            {
+                int stage_first = boundaries[stage];
+                int stage_last = boundaries[stage + 1] - 1;
+
+                // Check if this PP stage has TP composition (multiple devices per stage)
+                if (stage < stage_tp.size() && stage_tp[stage].devices.size() > 1)
+                {
+                    // PP+TP: each device in this stage gets the stage's layer range + TP shard
+                    const auto &tp_info = stage_tp[stage];
+                    int tp_degree = static_cast<int>(tp_info.devices.size());
+                    for (int tp_idx = 0; tp_idx < tp_degree; ++tp_idx)
+                    {
+                        auto cfg = makeConfigForDevice(
+                            tp_info.devices[tp_idx].toLocalDeviceId(),
+                            tp_idx, tp_degree);
+                        cfg.first_layer = stage_first;
+                        cfg.last_layer = stage_last;
+                        device_configs.push_back(cfg);
+                    }
+                }
+                else
+                {
+                    // PP only: single device per stage with that stage's full layer range
+                    auto cfg = makeConfigForDevice(
+                        pp_devices[stage].toLocalDeviceId(), 0, 1);
+                    cfg.first_layer = stage_first;
+                    cfg.last_layer = stage_last;
+                    device_configs.push_back(cfg);
+                }
+            }
+        }
+        else if (plan_.usesLocalTP())
         {
             const int total_shards = static_cast<int>(plan_.local_tp_devices.size());
             device_configs.reserve(plan_.local_tp_devices.size());

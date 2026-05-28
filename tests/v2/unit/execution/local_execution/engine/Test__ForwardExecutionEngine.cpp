@@ -667,8 +667,10 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawPrefillBelowMinSeqBypassesBucket
         << "Short raw prefill should bypass graph-cache population entirely.";
 }
 
-TEST_F(Test__ForwardExecutionEngine, Execute_RawPaddedGpuBucketRequiresGpuGraphs)
+TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketGpuWithoutGpuGraphs_FallsThrough)
 {
+    // When GPU graphs are disabled, non-exact auto-bucket selection should
+    // gracefully skip bucketing and proceed with unbucketed execution.
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "0"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
@@ -687,13 +689,21 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawPaddedGpuBucketRequiresGpuGraphs
     input.position_offset = 300;
 
     ForwardOutput output{};
-    EXPECT_FALSE(engine.execute(input, output, host));
-    EXPECT_EQ(host.build_forward_graph_calls, 0)
-        << "Raw padded GPU bucket requests must reject before normal graph build when GPU graphs are disabled.";
+    EXPECT_TRUE(engine.execute(input, output, host))
+        << "Non-exact bucket with GPU graphs disabled should fall through to unbucketed execution.";
+    EXPECT_EQ(host.build_forward_graph_calls, 1)
+        << "Engine should proceed to build an unbucketed forward graph.";
+    EXPECT_EQ(host.last_forward_input.seq_len, 3)
+        << "Unbucketed fallthrough should use the original seq_len, not the bucket size.";
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0)
+        << "No bucket should be applied in the fallthrough path.";
 }
 
-TEST_F(Test__ForwardExecutionEngine, Execute_RawPaddedCpuBucketRequiresPrefillGraphEligibility)
+TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketOnCpu_FallsThrough)
 {
+    // When the device is CPU, non-exact auto-bucket selection should gracefully
+    // skip bucketing and proceed with unbucketed prefill execution. This is the
+    // fix for CPU benchmarks failing when prefill_graph_buckets is enabled globally.
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
@@ -711,9 +721,14 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawPaddedCpuBucketRequiresPrefillGr
     input.position_offset = 400;
 
     ForwardOutput output{};
-    EXPECT_FALSE(engine.execute(input, output, host));
-    EXPECT_EQ(host.build_forward_graph_calls, 0)
-        << "Raw padded CPU bucket requests must reject before normal graph build.";
+    EXPECT_TRUE(engine.execute(input, output, host))
+        << "Non-exact bucket on CPU should fall through to unbucketed execution.";
+    EXPECT_EQ(host.build_forward_graph_calls, 1)
+        << "Engine should proceed to build an unbucketed forward graph.";
+    EXPECT_EQ(host.last_forward_input.seq_len, 3)
+        << "Unbucketed fallthrough should use the original seq_len, not the bucket size.";
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0)
+        << "No bucket should be applied in the fallthrough path.";
 }
 
 // =========================================================================

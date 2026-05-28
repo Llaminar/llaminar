@@ -23,6 +23,17 @@ namespace llaminar2
     {
         if (enabled_)
         {
+            // Skip event timing if the stream is currently in graph capture mode.
+            // cudaEventRecord/cudaEventSynchronize are not permitted on capturing
+            // streams and would poison the capture context.
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            if (stream_ && cudaStreamIsCapturing(stream_, &capture_status) == cudaSuccess &&
+                capture_status != cudaStreamCaptureStatusNone)
+            {
+                enabled_ = false;
+                return;
+            }
+
             cudaError_t err;
             err = cudaEventCreate(&start_event_);
             if (err != cudaSuccess)
@@ -144,6 +155,15 @@ namespace llaminar2
     {
         if (enabled_ && !started_)
         {
+            // Skip if the stream is in graph capture mode — event timing is
+            // incompatible with stream capture.
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            if (stream && cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess &&
+                capture_status != cudaStreamCaptureStatusNone)
+            {
+                return;
+            }
+
             stream_ = stream;
             cudaError_t err = cudaEventRecord(start_event_, stream_);
             if (err == cudaSuccess)

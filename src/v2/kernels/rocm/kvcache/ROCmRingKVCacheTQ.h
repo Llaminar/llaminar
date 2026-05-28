@@ -224,7 +224,7 @@ namespace llaminar2
             }
         };
 
-        bool dequant_to_scratch(int layer, int seq_idx, float rope_theta = 0.0f, int position_start = 0, hipStream_t stream = nullptr) const;
+        bool dequant_to_scratch(int layer, int seq_idx, float rope_theta, int position_start, hipStream_t stream) const;
 
         /// @brief Return the stream used for clear-time memset operations.
         hipStream_t clearStream() const;
@@ -256,7 +256,7 @@ namespace llaminar2
         HIPTQDequantDynamicParams *d_dequant_params_ = nullptr; ///< Device array [n_layers_]
         HIPTQDequantDynamicParams *h_dequant_params_ = nullptr; ///< Pinned host array [n_layers_]
 
-        mutable hipStream_t cached_stream_ = nullptr; ///< Last explicit stream used by append/read operations.
+        mutable hipStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
     };
 
 } // namespace llaminar2

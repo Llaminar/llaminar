@@ -129,8 +129,21 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
         KEY="${mi}:${DEVICE}"
         echo -ne "  Benchmarking ${BOLD}${DEVICE}${NC} ... "
 
+        # Optional per-device extra CLI flags (e.g. TP/PP configuration)
+        EXTRA_FLAGS=""
+        if jq -e ".models[$mi].devices[\"$DEVICE\"].extra_flags" "$BASELINE_FILE" > /dev/null 2>&1; then
+            EXTRA_FLAGS=$(jq -r ".models[$mi].devices[\"$DEVICE\"].extra_flags" "$BASELINE_FILE")
+        fi
+
+        # Build device argument — special devices "tp" and "pp" rely on
+        # extra_flags for their full config and don't pass -d at all.
+        DEVICE_ARG="-d $DEVICE"
+        if [[ "$DEVICE" == "tp" || "$DEVICE" == "pp" ]]; then
+            DEVICE_ARG=""
+        fi
+
         set +e
-        BENCH_OUTPUT=$(env $ENV_PREFIX "$RELEASE_BIN" benchmark -d "$DEVICE" -m "$MODEL_PATH" -n "$DECODE_TOKENS" 2>&1)
+        BENCH_OUTPUT=$(env $ENV_PREFIX "$RELEASE_BIN" benchmark $DEVICE_ARG -m "$MODEL_PATH" -n "$DECODE_TOKENS" $EXTRA_FLAGS 2>&1)
         BENCH_EXIT=$?
         set -e
 
@@ -272,6 +285,13 @@ check_regression() {
     local model_idx="$1" model_name="$2" device="$3" phase="$4" baseline="$5" current="$6"
 
     if [[ "$current" == "0" || -z "$current" ]]; then
+        return
+    fi
+
+    # Skip regression check if baseline is a placeholder (0 = not yet measured)
+    if [[ "$baseline" == "0" ]]; then
+        printf "  %-10s  %-10s  %10s    %10.1f    %8s  " "$device" "$phase" "(new)" "$current" "-"
+        echo -e "${YELLOW}~ no baseline${NC}"
         return
     fi
 

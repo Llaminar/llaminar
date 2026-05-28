@@ -281,6 +281,19 @@ namespace llaminar2
 
                 // Release old workspace so we can reallocate with merged requirements
                 size_t old_budget = existing->second->budget();
+
+                // Unbind consumers BEFORE destroying old workspace to prevent
+                // ABA pointer aliasing: if the new DeviceWorkspaceManager host
+                // object is allocated at the same heap address as the old one,
+                // kernels' `if (workspace_ != workspace)` guard would falsely
+                // evaluate to false and skip re-initialization of GPU buffers
+                // (e.g., RoPE inv_freq). Nulling first ensures the subsequent
+                // bindWorkspace(new_ptr) always triggers state invalidation.
+                for (const auto &consumer_binding : consumers)
+                {
+                    consumer_binding.consumer->bindWorkspace(nullptr);
+                }
+
                 existing->second->release();
                 existing->second.reset();
                 device_workspaces_.erase(device);

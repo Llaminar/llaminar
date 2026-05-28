@@ -1,10 +1,19 @@
 #include "PreparedWeightStore.h"
-
 #include "../tensors/TensorClasses.h"
 #include "../tensors/TensorKernels.h"
 
 #include <stdexcept>
 #include <utility>
+
+/**
+ * @file PreparedWeightStore.cpp
+ * @brief Implementation of model-owned prepared weight and kernel state storage.
+ *
+ * The store owns prepared handles for model-weight kernels and provides lookup
+ * APIs used by graph stages during execution. It also participates in session
+ * cleanup by resetting dynamic kernel state while preserving long-lived packed
+ * weights.
+ */
 
 namespace llaminar2
 {
@@ -389,6 +398,55 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return entries_.size();
+    }
+
+    void PreparedWeightStore::resetDynamicState()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        for (auto &[_, entry] : entries_)
+        {
+            auto *handle = entry.activeHandle();
+            if (handle && handle->prepared_weights && handle->prepared_weights->kernel)
+            {
+                handle->prepared_weights->kernel->resetDynamicState();
+                handle->prepared_weights->kernel->setGPUStream(nullptr);
+            }
+        }
+
+        for (auto &[_, fused] : fused_cache_)
+        {
+            if (fused)
+            {
+                fused->resetDynamicState();
+                fused->setGPUStream(nullptr);
+            }
+        }
+
+        for (auto &[_, sliced] : sliced_cache_)
+        {
+            if (sliced)
+            {
+                sliced->resetDynamicState();
+                sliced->setGPUStream(nullptr);
+            }
+        }
+
+        for (auto &[_, slab] : expert_slabs_)
+        {
+            if (!slab)
+                continue;
+
+            std::unique_lock<std::shared_mutex> slab_lock(slab->slab_mutex);
+            for (auto &expert : slab->experts)
+            {
+                if (expert.engine)
+                {
+                    expert.engine->resetDynamicState();
+                    expert.engine->setGPUStream(nullptr);
+                }
+            }
+        }
     }
 
     void PreparedWeightStore::dumpEntries(const char *prefix) const

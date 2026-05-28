@@ -2475,11 +2475,9 @@ namespace llaminar2
             attn_params.mpi_ctx = mpi_ctx_.get();
             attn_params.q_buffer_id = BufferId::Q_PROJ;
             attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
-            if (!device.is_gpu())
-            {
-                attn_params.workspace_scores_buffer_id = BufferId::ATTN_SCORES_WORKSPACE;
-                attn_params.workspace_context_buffer_id = BufferId::ATTN_CONTEXT_WORKSPACE;
-            }
+            // NOTE: workspace_scores/workspace_context are no longer registered in
+            // the arena (CPUFlashAttentionKernelT doesn't use them — O(S²) dead
+            // buffers removed). Don't set buffer_ids for the contract.
             attn_params.turboquant_ctx = config_.turboquant_ctx;
             attn_params.kv_rotation = config_.kv_rotation;
 

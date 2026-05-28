@@ -733,6 +733,35 @@ namespace llaminar2
             sharedPrefillPools().clear();
         }
 
+        void CUDAQuantisedGemmKernel::resetDynamicState()
+        {
+            if (!impl_)
+                return;
+
+            if (impl_->gemv_ctx)
+            {
+                cudaGemvContext_destroy(impl_->gemv_ctx);
+                impl_->gemv_ctx = nullptr;
+            }
+            if (impl_->prefill_ctx)
+            {
+                cudaPrefillContext_destroy(impl_->prefill_ctx);
+                impl_->prefill_ctx = nullptr;
+            }
+            if (impl_->cublas_ctx)
+            {
+                cudaCuBLASContext_destroy(impl_->cublas_ctx);
+                impl_->cublas_ctx = nullptr;
+            }
+
+            gpu_stream_ = nullptr;
+        }
+
+        bool CUDAQuantisedGemmKernel::hasDynamicStateActive() const
+        {
+            return impl_ && (impl_->gemv_ctx || impl_->prefill_ctx || impl_->cublas_ctx || gpu_stream_ != nullptr);
+        }
+
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAQuantisedGemmKernel &&other) noexcept
             : weights_(other.weights_),
               packed_(other.packed_),
@@ -2066,12 +2095,19 @@ namespace llaminar2
             if (k == 0)
                 k = static_cast<int>(K_);
 
+            // Native prefill kernels execute row tiles up to 128 rows. Edge
+            // tiles guard logical output writes, but their scratch paths share
+            // the same buffers as full tiles. Size by tile-padded M so a short
+            // prompt cannot leave the CUDA workspace under-provisioned while
+            // keeping active/bucket sizing for the rest of the graph.
+            const int workspace_m = (m > 1) ? ((m + 127) & ~127) : m;
+
             // INT8 path needs quantization + accumulator buffers
-            size_t quant_a_bytes = static_cast<size_t>(m) * k * sizeof(int8_t);
-            size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
+            size_t quant_a_bytes = static_cast<size_t>(workspace_m) * k * sizeof(int8_t);
+            size_t scales_a_bytes = static_cast<size_t>(workspace_m) * sizeof(float);
             // NativeVNNI doesn't use INT32 accumulator split-K, so 1 chunk is sufficient.
             constexpr size_t partial_chunk_blocks = 1;
-            size_t acc_int32_bytes = static_cast<size_t>(m) * n * partial_chunk_blocks * sizeof(int32_t);
+            size_t acc_int32_bytes = static_cast<size_t>(workspace_m) * n * partial_chunk_blocks * sizeof(int32_t);
 
             reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
@@ -2079,13 +2115,13 @@ namespace llaminar2
 
             // Blockwise activation quantization scales: one float per 32-element block
             size_t num_blocks_per_row = static_cast<size_t>((k + 31) / 32);
-            size_t scales_a_blockwise_bytes = static_cast<size_t>(m) * num_blocks_per_row * sizeof(float);
+            size_t scales_a_blockwise_bytes = static_cast<size_t>(workspace_m) * num_blocks_per_row * sizeof(float);
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
 
             // FP32 output workspace for mapped memory redirect
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
             // This buffer provides an HBM target; we bulk-DMA to mapped memory after.
-            size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
+            size_t temp_c_fp32_bytes = static_cast<size_t>(workspace_m) * n * sizeof(float);
             reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
 
             // GEMV kpar partials for decode (M=1): two-phase K-parallel reduction
@@ -2111,6 +2147,10 @@ namespace llaminar2
 
         void CUDAQuantisedGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
         {
+            if (workspace_ && workspace_ != workspace)
+            {
+                resetDynamicState();
+            }
             workspace_ = workspace;
             if (workspace)
             {

@@ -143,14 +143,14 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
     hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     // Append to cache (layer 0)
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
     EXPECT_FALSE(cache->is_wrapped(0, 0)); // Should not be wrapped yet
 
     // Retrieve K/V
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     // Copy back and verify
@@ -210,7 +210,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
     hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     // Append all 12 tokens - should wrap and auto-evict oldest 4
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
 
     // Should have max_seq_len=8 tokens, with oldest 4 evicted
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
@@ -219,7 +219,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
     // Retrieve and verify we have the LAST 8 tokens
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, max_seq_len);
 
     // Copy back
@@ -285,14 +285,14 @@ TEST(Test__ROCmRingKVCache, WrapAround_ExactlyDouble_FP32)
     hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, max_seq_len);
 
     std::vector<float> h_K_out(max_seq_len * kv_dim);
@@ -351,14 +351,14 @@ TEST(Test__ROCmRingKVCache, WrapAround_BarelyOver_FP32)
     hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, max_seq_len);
 
     std::vector<float> h_K_out(max_seq_len * kv_dim);
@@ -416,14 +416,14 @@ TEST(Test__ROCmRingKVCache, WrapAround_TripleBuffer_FP32)
     hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, max_seq_len);
 
     std::vector<float> h_K_out(max_seq_len * kv_dim);
@@ -483,7 +483,7 @@ TEST(Test__ROCmRingKVCache, Eviction_FP32)
     hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     // Evict 3 oldest tokens
@@ -494,7 +494,7 @@ TEST(Test__ROCmRingKVCache, Eviction_FP32)
     // Retrieve and verify we have the LAST 7 tokens
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 7);
 
     // Copy back
@@ -560,7 +560,7 @@ TEST(Test__ROCmRingKVCache, Clear_FP32)
     {
         for (int seq = 0; seq < batch_size; ++seq)
         {
-            ASSERT_TRUE(cache->append(layer, seq, d_K, d_V, num_tokens));
+            ASSERT_TRUE(cache->append(layer, seq, d_K, d_V, num_tokens, 0));
             EXPECT_EQ(cache->get_cached_tokens(layer, seq), num_tokens);
         }
     }
@@ -690,13 +690,13 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP16)
     hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(_Float16), hipMemcpyHostToDevice);
 
     // Append
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     // Retrieve
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     // Copy back
@@ -790,7 +790,7 @@ TEST(Test__ROCmRingKVCache, FP16RoPEOnRead_Qwen35LongPartialRotary)
     ASSERT_EQ(hipMemcpy(d_K, h_K.data(), total * sizeof(_Float16), hipMemcpyHostToDevice), hipSuccess);
     ASSERT_EQ(hipMemcpy(d_V, h_V.data(), total * sizeof(_Float16), hipMemcpyHostToDevice), hipSuccess);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     IKVCache::KVReadParams rope_params;
@@ -867,19 +867,19 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
     hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_TRUE(cache->is_wrapped(0, 0));
     EXPECT_EQ(cache->get_total_evicted(), 4); // 12 - 8 = 4 evicted
 
     // Get K/V should trigger linearization
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(cache->get_linearization_count(), 1);
 
     // Subsequent gets may re-linearize now that wrapped-ring scratch is shared
     // on demand instead of being retained per entry; correctness is what matters.
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_GE(cache->get_linearization_count(), 1);
 
     // Reset counters
@@ -932,7 +932,7 @@ TEST(Test__ROCmRingKVCache, SlidingWindow)
         hipMemcpy(d_V, h_V.data(), kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
         // Append 1 token
-        ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 1));
+        ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 1, 0));
 
         // Cache should never exceed window size (auto-evicts)
         EXPECT_LE(cache->get_cached_tokens(0, 0), max_seq_len);
@@ -989,7 +989,7 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
         hipMemcpy(d_K, h_Ks[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), hipMemcpyHostToDevice);
         hipMemcpy(d_V, h_Vs[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-        ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq]));
+        ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq], 0));
     }
 
     // Verify individual sequence lengths
@@ -1013,7 +1013,7 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len);
+                                              kv_lens.data(), max_kv_len, 0);
 
     EXPECT_EQ(actual_max, 25); // Max across sequences
 
@@ -1102,7 +1102,7 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
 
         hipMemcpy(d_K, h_K[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
         hipMemcpy(d_V, h_V[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
-        ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq]));
+        ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq], 0));
     }
 
     auto reqs = cache->getWorkspaceRequirements(batch_size, 0, 0);
@@ -1119,7 +1119,7 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len);
+                                              kv_lens.data(), max_kv_len, 0);
 
     EXPECT_EQ(actual_max, 7);
     for (int seq = 0; seq < batch_size; ++seq)
@@ -1184,7 +1184,7 @@ TEST(Test__ROCmRingKVCache, ContiguousOptimization)
     hipMemcpy(d_K, h_K.data(), 30 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V.data(), 30 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 30));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 30, 0));
 
     // Should NOT be wrapped
     EXPECT_FALSE(cache->is_wrapped(0, 0));
@@ -1192,7 +1192,7 @@ TEST(Test__ROCmRingKVCache, ContiguousOptimization)
     // Get K/V - should return direct pointer (no linearization)
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
 
     // No linearizations should have occurred
     EXPECT_EQ(cache->get_linearization_count(), 0);
@@ -1200,7 +1200,7 @@ TEST(Test__ROCmRingKVCache, ContiguousOptimization)
     // Multiple retrievals should still not linearize
     for (int i = 0; i < 10; ++i)
     {
-        ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+        ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     }
     EXPECT_EQ(cache->get_linearization_count(), 0);
 
@@ -1253,12 +1253,12 @@ TEST(Test__ROCmRingKVCache, MultiPrecision_BF16)
     hipMemcpy(d_K, h_K_bf16.data(), num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V_bf16.data(), num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     // Verify content - convert hip_bfloat16 to float via union
@@ -1340,13 +1340,13 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_Q81)
     hipMemcpy(d_K, h_K.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     const void *d_K_out = nullptr;
     const void *d_V_out = nullptr;
     int kv_len = 0;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     std::vector<Q8_1Block> h_K_out(block_count);
@@ -1410,7 +1410,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     hipMemcpy(d_K, h_K_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_V_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
     EXPECT_EQ(cache->get_total_evicted(), total_tokens - max_seq_len);
@@ -1418,7 +1418,7 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     const void *d_K_out = nullptr;
     const void *d_V_out = nullptr;
     int kv_len = 0;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, max_seq_len);
 
     const size_t kept_blocks = static_cast<size_t>(max_seq_len) * static_cast<size_t>(kv_blocks);

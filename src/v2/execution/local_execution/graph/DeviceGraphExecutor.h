@@ -363,6 +363,12 @@ namespace llaminar2
             // per step for Qwen2.5-7B with 338 capturable stages).
             std::vector<CoherenceBuffer> cached_all_output_buffers; ///< Flattened outputs of all stages
             bool replay_buffers_cached = false;                     ///< True after first post-launch caching
+
+            // ── Pre-cast dirty marking cache (eliminates per-step dynamic_cast) ──
+            // For 524 stages × ~1.5 outputs = ~786 dynamic_casts per decode step.
+            // Pre-casting to TensorBase* saves ~100-200μs/step on large models.
+            std::vector<TensorBase *> cached_dirty_tensor_bases; ///< Pre-cast TensorBase pointers
+            bool dirty_bases_cached = false;                     ///< True after first dirty marking pass
         };
 
         /**

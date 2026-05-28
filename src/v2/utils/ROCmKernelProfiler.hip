@@ -23,6 +23,18 @@ namespace llaminar2
     {
         if (enabled_)
         {
+            // Skip event timing if the stream is currently in graph capture mode.
+            // hipEventRecord/hipEventSynchronize are not permitted on capturing
+            // streams and would poison the capture context, causing subsequent
+            // kernel launches to fail.
+            hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+            if (stream_ && hipStreamIsCapturing(stream_, &capture_status) == hipSuccess &&
+                capture_status != hipStreamCaptureStatusNone)
+            {
+                enabled_ = false;
+                return;
+            }
+
             hipError_t err;
             err = hipEventCreate(&start_event_);
             if (err != hipSuccess)
@@ -145,6 +157,15 @@ namespace llaminar2
     {
         if (enabled_)
         {
+            // Skip if the stream is in graph capture mode — event timing is
+            // incompatible with stream capture.
+            hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+            if (stream && hipStreamIsCapturing(stream, &capture_status) == hipSuccess &&
+                capture_status != hipStreamCaptureStatusNone)
+            {
+                return;
+            }
+
             stream_ = stream;
             hipError_t err = hipEventRecord(start_event_, stream_);
             if (err == hipSuccess)

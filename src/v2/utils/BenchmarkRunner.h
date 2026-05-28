@@ -33,6 +33,21 @@ namespace llaminar2
 {
 
     /**
+     * @brief Inter-step overhead profiling data from the decode loop.
+     *
+     * Tracks time spent BETWEEN forward() calls: sampling, token broadcast,
+     * and other loop housekeeping. Printed as part of the LLAMINAR_PROFILING output.
+     */
+    struct DecodeLoopProfile
+    {
+        double sampler_total_us = 0.0;     ///< Total sampling time (argmax or GPU argmax)
+        double inter_step_total_us = 0.0;  ///< Total time between forward() return and next forward() call
+        int decode_tokens = 0;             ///< Number of decode iterations measured
+
+        bool empty() const { return decode_tokens == 0; }
+    };
+
+    /**
      * @brief Results from a benchmark run
      */
     struct BenchmarkResult
@@ -123,6 +138,7 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx_;
         std::function<void()> post_warmup_cb_;
         std::function<void()> decode_step_cb_;
+        DecodeLoopProfile decode_loop_profile_; ///< Accumulated across benchmark iterations
 
         /**
          * @brief Generate a default benchmark prompt if none provided

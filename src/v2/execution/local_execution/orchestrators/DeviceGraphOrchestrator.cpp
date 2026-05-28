@@ -560,21 +560,15 @@ namespace llaminar2
                 }
             }
 
-            // Skip GPU-unused attention workspace buffers to save VRAM.
-            // GPU flash attention kernels don't use these O(S²) buffers.
-            if (state_.device_id.is_gpu() &&
-                (id == BufferId::ATTN_SCORES_WORKSPACE || id == BufferId::ATTN_CONTEXT_WORKSPACE))
+            // Skip unused O(S²) attention workspace buffers.
+            // All flash attention kernels (CPU, CUDA, ROCm) use tiled online
+            // softmax and never read these buffers — they accept them as
+            // optional parameters and (void)-cast them.  Skipping avoids
+            // allocating seq_len² × n_heads × sizeof(float) bytes that would
+            // otherwise dominate memory at long context lengths.
+            if (id == BufferId::ATTN_SCORES_WORKSPACE || id == BufferId::ATTN_CONTEXT_WORKSPACE)
             {
-                LOG_DEBUG("[DeviceGraphOrchestrator] Skipping GPU-unused buffer: " << bufferIdName(id));
-                continue;
-            }
-
-            // Skip GPU-unused attention workspace buffers to save VRAM.
-            // GPU flash attention kernels don't use these O(S²) buffers.
-            if (state_.device_id.is_gpu() &&
-                (id == BufferId::ATTN_SCORES_WORKSPACE || id == BufferId::ATTN_CONTEXT_WORKSPACE))
-            {
-                LOG_DEBUG("[DeviceGraphOrchestrator] Skipping GPU-unused buffer: " << bufferIdName(id));
+                LOG_DEBUG("[DeviceGraphOrchestrator] Skipping unused O(S²) buffer: " << bufferIdName(id));
                 continue;
             }
 
@@ -1527,6 +1521,10 @@ namespace llaminar2
     void DeviceGraphOrchestrator::resetKernelDynamicState()
     {
         llaminar::v2::kernels::KernelFactory::resetAllDynamicState();
+        if (prepared_weight_store_)
+        {
+            prepared_weight_store_->resetDynamicState();
+        }
     }
 
     bool DeviceGraphOrchestrator::hasValidCachedGraph(int layer_idx, bool is_attention) const

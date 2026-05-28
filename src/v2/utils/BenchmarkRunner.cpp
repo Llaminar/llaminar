@@ -18,6 +18,7 @@
 #include "../backends/BackendManager.h"
 #include "../backends/IBackend.h"
 #include "fort.hpp"
+#include <algorithm>
 #include <iomanip>
 #include <print>
 #include <sstream>
@@ -155,12 +156,15 @@ namespace llaminar2
         // Sampler profiling (enabled when LLAMINAR_PROFILING=1)
         const bool profile_sampler = debugEnv().profile.enabled;
         double sampler_total_us = 0.0;
+        double inter_step_total_us = 0.0;
 
         // Synchronize before timing decode phase (skip for single-rank)
         if (mpi_ctx_->world_size() > 1)
             mpi_ctx_->barrier();
 
         auto start = std::chrono::high_resolution_clock::now();
+        // Track the end of the last forward() call for inter-step measurement
+        auto last_forward_end = start;
 
         for (int i = 0; i < n_tokens; ++i)
         {
@@ -176,15 +180,20 @@ namespace llaminar2
 
                 if (next_token < 0)
                 {
-                    // GPU argmax failed. If we skipped logits gather (which we do
-                    // in benchmark mode), the CPU fallback would read stale/null data.
-                    // Treat this as a hard decode error — a failure is not a success.
-                    LOG_ERROR("GPU-side argmax failed at decode step " << i
-                                                                       << ". Cannot fall back to CPU sampling because logits "
-                                                                       << "gather was skipped (setSkipLogitsGatherDecode=true).");
-                    auto end = std::chrono::high_resolution_clock::now();
-                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                    return {false, time_ms, tokens_generated, generated_text};
+                    // GPU argmax not available (CPU device or unsupported backend).
+                    // Fall back to host-side argmax over gathered logits.
+                    const float *logit_data = runner_->logits();
+                    if (!logit_data)
+                    {
+                        LOG_ERROR("CPU sampling fallback failed at decode step " << i
+                                                                                 << ": logits() returned nullptr.");
+                        auto end = std::chrono::high_resolution_clock::now();
+                        double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                        return {false, time_ms, tokens_generated, generated_text};
+                    }
+                    const int vs = runner_->vocab_size();
+                    next_token = static_cast<int>(
+                        std::distance(logit_data, std::max_element(logit_data, logit_data + vs)));
                 }
 
                 if (profile_sampler)
@@ -212,8 +221,19 @@ namespace llaminar2
 
             tokens_generated++;
 
+            // Measure inter-step gap: time from last forward() return to this forward() call
+            if (profile_sampler && i > 0)
+            {
+                auto pre_forward = std::chrono::high_resolution_clock::now();
+                inter_step_total_us += std::chrono::duration<double, std::micro>(pre_forward - last_forward_end).count();
+            }
+
             // Forward the token through pipeline
             const bool forward_success = runner_->forward(&next_token, 1);
+
+            if (profile_sampler)
+                last_forward_end = std::chrono::high_resolution_clock::now();
+
             if (!synchronizeSuccess(forward_success, "decode forward"))
             {
                 auto end = std::chrono::high_resolution_clock::now();
@@ -235,9 +255,13 @@ namespace llaminar2
         if (!decode_success)
             return {false, time_ms, tokens_generated, generated_text};
 
-        // Report sampler overhead
+        // Accumulate inter-step profiling data across benchmark iterations
         if (profile_sampler && mpi_ctx_->rank() == 0 && tokens_generated > 0)
         {
+            decode_loop_profile_.sampler_total_us += sampler_total_us;
+            decode_loop_profile_.inter_step_total_us += inter_step_total_us;
+            decode_loop_profile_.decode_tokens += tokens_generated;
+
             double avg_us = sampler_total_us / tokens_generated;
             double pct = (sampler_total_us / 1000.0) / time_ms * 100.0;
             LOG_INFO("Sampler profiling: " << std::fixed << std::setprecision(1)
@@ -352,8 +376,10 @@ namespace llaminar2
         }
 
         // Enable GPU-side greedy sampling to skip D2H logits gather during decode.
-        // sampleGreedyOnDevice() returns -1 when unsupported, triggering CPU fallback.
-        runner_->setSkipLogitsGatherDecode(true);
+        // Only enabled on GPU — CPU has no device-side argmax, so logits must be
+        // gathered to host for CPU-side sampling.
+        const bool has_gpu = runner_->primaryDeviceId().is_gpu();
+        runner_->setSkipLogitsGatherDecode(has_gpu);
 
         // ========================================================================
         // Warmup Phase - Run once to warm up caches, JIT, etc.
@@ -746,6 +772,52 @@ namespace llaminar2
             {
                 std::print("{}", wl_summary);
             }
+        }
+
+        // Print decode loop inter-step overhead (sampling + broadcast + housekeeping)
+        if (KernelProfiler::isEnabled() && !decode_loop_profile_.empty())
+        {
+            const auto &dlp = decode_loop_profile_;
+            double avg_sampler_us = dlp.sampler_total_us / dlp.decode_tokens;
+            double avg_inter_step_us = dlp.inter_step_total_us / dlp.decode_tokens;
+            double avg_other_us = avg_inter_step_us - avg_sampler_us;
+            if (avg_other_us < 0) avg_other_us = 0;
+            double decode_wall_ms = result.decode_time_ms;
+            double inter_step_pct = (dlp.inter_step_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0;
+
+            fort::utf8_table tbl;
+            tbl.set_border_style(FT_DOUBLE2_STYLE);
+            tbl << fort::header << "DECODE LOOP OVERHEAD" << "AVG/token" << "% of decode" << fort::endr;
+            {
+                std::ostringstream s;
+                s << std::fixed << std::setprecision(1) << avg_sampler_us << " μs";
+                std::ostringstream p;
+                p << std::fixed << std::setprecision(1)
+                  << (dlp.sampler_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0 << "%";
+                tbl << "  Sampling (argmax)" << s.str() << p.str() << fort::endr;
+            }
+            {
+                std::ostringstream s;
+                s << std::fixed << std::setprecision(1) << avg_other_us << " μs";
+                std::ostringstream p;
+                double other_total_us = dlp.inter_step_total_us - dlp.sampler_total_us;
+                if (other_total_us < 0) other_total_us = 0;
+                p << std::fixed << std::setprecision(1)
+                  << (other_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0 << "%";
+                tbl << "  Other (broadcast, prep)" << s.str() << p.str() << fort::endr;
+            }
+            tbl << fort::separator;
+            {
+                std::ostringstream s;
+                s << std::fixed << std::setprecision(1) << avg_inter_step_us << " μs";
+                std::ostringstream p;
+                p << std::fixed << std::setprecision(1) << inter_step_pct << "%";
+                tbl << "  TOTAL inter-step" << s.str() << p.str() << fort::endr;
+            }
+            tbl.column(0).set_cell_text_align(fort::text_align::left);
+            tbl.column(1).set_cell_text_align(fort::text_align::right);
+            tbl.column(2).set_cell_text_align(fort::text_align::right);
+            std::print("{}", tbl.to_string());
         }
 
         // Status

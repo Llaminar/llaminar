@@ -330,6 +330,94 @@ TEST(Test__MemoryPlanner, Diagnostics_WarnsOnTightHeadroom)
     EXPECT_FALSE(plan.diagnostics.empty());
 }
 
+TEST(Test__MemoryPlanner, PP2_DoesNotFit_WithoutLayerSplit)
+{
+    // Regression test: verifies that PP must actually set per-device layer ranges.
+    // A model that doesn't fit on one 24 GB GPU MUST fail if both devices get
+    // all layers (the bug: global first_layer/last_layer assigned to all devices).
+    auto profile = createTestProfile();  // 24 layers
+
+    // Full model on a single 24 GB GPU that doesn't have enough free memory
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::cuda(0);
+    cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
+    cfg.device_free_bytes = 1ULL * 1024 * 1024 * 1024;  // Only 1 GB free
+    cfg.batch_size = 1;
+    cfg.max_seq_len = 4096;
+    cfg.kv_precision = "fp16";
+    cfg.first_layer = 0;
+    cfg.last_layer = 23;  // All layers
+
+    auto full_plan = MemoryPlanner::plan(profile, {cfg});
+    ASSERT_FALSE(full_plan.fits()) << "Precondition: model must NOT fit on 1 GB free";
+
+    // BUG scenario: two devices but both get ALL layers (no PP layer split)
+    DevicePlanConfig bad_stage0 = cfg;
+    bad_stage0.first_layer = 0;
+    bad_stage0.last_layer = 23;  // All layers — WRONG for PP
+
+    DevicePlanConfig bad_stage1 = cfg;
+    bad_stage1.device = DeviceId::cuda(1);
+    bad_stage1.first_layer = 0;
+    bad_stage1.last_layer = 23;  // All layers — WRONG for PP
+
+    auto bad_plan = MemoryPlanner::plan(profile, {bad_stage0, bad_stage1});
+    // Both devices still don't fit (each sees full weight)
+    EXPECT_FALSE(bad_plan.devices[0].fits());
+    EXPECT_FALSE(bad_plan.devices[1].fits());
+
+    // CORRECT: PP2 with proper layer split — each device gets half
+    DevicePlanConfig good_stage0 = cfg;
+    good_stage0.first_layer = 0;
+    good_stage0.last_layer = 11;
+
+    DevicePlanConfig good_stage1 = cfg;
+    good_stage1.device = DeviceId::cuda(1);
+    good_stage1.first_layer = 12;
+    good_stage1.last_layer = 23;
+
+    auto good_plan = MemoryPlanner::plan(profile, {good_stage0, good_stage1});
+    // Each device should have less weight than the full model
+    EXPECT_LT(good_plan.devices[0].weight_bytes, full_plan.devices[0].weight_bytes);
+    EXPECT_LT(good_plan.devices[1].weight_bytes, full_plan.devices[0].weight_bytes);
+}
+
+TEST(Test__MemoryPlanner, PP_LayerRange_ReducesWeightEstimate_Proportionally)
+{
+    // Validates that setting first_layer/last_layer to half the layers
+    // reduces weight estimate to approximately half (plus non-layer weights).
+    auto profile = createTestProfile();  // 24 layers
+
+    // Full model
+    DevicePlanConfig full;
+    full.device = DeviceId::cuda(0);
+    full.device_total_bytes = 48ULL * 1024 * 1024 * 1024;
+    full.device_free_bytes = 48ULL * 1024 * 1024 * 1024;
+    full.batch_size = 1;
+    full.max_seq_len = 4096;
+    full.kv_precision = "fp16";
+    full.first_layer = 0;
+    full.last_layer = 23;
+
+    auto full_plan = MemoryPlanner::plan(profile, {full});
+    size_t full_weight = full_plan.devices[0].weight_bytes;
+
+    // Half layers (0-11)
+    DevicePlanConfig half = full;
+    half.first_layer = 0;
+    half.last_layer = 11;
+
+    auto half_plan = MemoryPlanner::plan(profile, {half});
+    size_t half_weight = half_plan.devices[0].weight_bytes;
+
+    // Half should have less weight than full
+    EXPECT_LT(half_weight, full_weight);
+    // Should be roughly 50-70% of full (has non-layer tensors like embed/output)
+    double ratio = static_cast<double>(half_weight) / full_weight;
+    EXPECT_GT(ratio, 0.40) << "Half layers should be at least 40% of full weight";
+    EXPECT_LT(ratio, 0.75) << "Half layers should be less than 75% of full weight";
+}
+
 TEST(Test__MemoryPlanner, DeviceMemoryPlan_Summary)
 {
     DeviceMemoryPlan plan;

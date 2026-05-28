@@ -342,11 +342,11 @@ For low-level GPU kernel analysis, use NVIDIA's Nsight tools:
 
 Both tools are located at `/usr/local/cuda/bin/` and require `sudo` for hardware counter access.
 
-### CRITICAL: Use `--no-mpi-bootstrap` for llaminar2
+### CRITICAL: `--no-mpi-bootstrap` option in llaminar2 
 
 Llaminar auto-bootstraps MPI via `mpirun` when launched directly. Profiling tools like `ncu` and `nsys` will attach to the **mpirun wrapper process** instead of the actual `llaminar2` GPU process unless you disable this.
 
-> **⚠️ WARNING**: `--no-mpi-bootstrap` is **ONLY for debugging and profiling** (ncu, nsys, perf, GDB). **NEVER** use it for benchmarks, real inference, or performance measurements. MPI bootstrapping configures critical thread pinning, socket binding, and NUMA-aware placement (`OMP_PLACES`, `OMP_PROC_BIND`, `OMPI_MCA` settings). Without it, threads may migrate across NUMA nodes causing severe performance degradation and misleading results.
+> **⚠️ WARNING**: `--no-mpi-bootstrap` is **ONLY for explicit `gdb` debugger attachment, kernel `perf` profiling, and GPU profiling with `ncu`/`nsys`/`rocprof`**. **NEVER** use it in any other situation. MPI bootstrapping configures critical thread pinning, socket binding, and NUMA-aware placement (`OMP_PLACES`, `OMP_PROC_BIND`, `OMPI_MCA` settings). Without it, threads may migrate across NUMA nodes causing severe performance degradation, strange memory planner reporting, and misleading results.
 
 **Always pass `--no-mpi-bootstrap`** when profiling `llaminar2` directly:
 

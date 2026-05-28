@@ -623,6 +623,11 @@ namespace llaminar2::test::parity
         /// Empty means one device per stage (pure PP) or all devices in one domain (pure TP)
         std::vector<int> pp_stage_sizes;
 
+        /// Proportional layer split weights for PP stages.
+        /// Example: {0.31, 0.69} gives stage 0 ~31% of layers and stage 1 ~69%.
+        /// Empty means equal split. Must match num_pp_stages() if set.
+        std::vector<float> pp_weights;
+
         /// TP backend for stages that are TP domains (only used when pp_stage_sizes has entries > 1)
         Collective tp_collective = Collective::None;
 
