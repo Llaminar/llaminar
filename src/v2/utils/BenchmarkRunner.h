@@ -40,9 +40,9 @@ namespace llaminar2
      */
     struct DecodeLoopProfile
     {
-        double sampler_total_us = 0.0;     ///< Total sampling time (argmax or GPU argmax)
-        double inter_step_total_us = 0.0;  ///< Total time between forward() return and next forward() call
-        int decode_tokens = 0;             ///< Number of decode iterations measured
+        double sampler_total_us = 0.0;    ///< Total sampling time (argmax or GPU argmax)
+        double inter_step_total_us = 0.0; ///< Total time between forward() return and next forward() call
+        int decode_tokens = 0;            ///< Number of decode iterations measured
 
         bool empty() const { return decode_tokens == 0; }
     };

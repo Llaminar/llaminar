@@ -2755,7 +2755,7 @@ namespace llaminar2
             }
 #endif
             LOG_DEBUG("[WeightManager] Released raw host data for " << released_count
-                      << " quantized CPU weights after VNNI packing");
+                                                                    << " quantized CPU weights after VNNI packing");
 
             return true;
         }

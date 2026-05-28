@@ -309,13 +309,13 @@ TEST_F(Test__WeightManagerCpuHostRelease, MixedBindingsReleasesOnlyQuantized)
 
     std::vector<WeightBinding> bindings;
     bindings.push_back(makeBinding(1, q4_sliced.get(), "blk.0.attn_q.weight",
-                    WeightRole::AttentionQ, 0, cpu, true));
+                                   WeightRole::AttentionQ, 0, cpu, true));
     bindings.push_back(makeBinding(2, gate_sliced.get(), "blk.0.ffn_gate.weight",
-                    WeightRole::FFNGate, 0, cpu, true));
+                                   WeightRole::FFNGate, 0, cpu, true));
     bindings.push_back(makeBinding(3, fp32_tensor.get(), "blk.0.attn_output.weight",
-                    WeightRole::AttentionWO, 0, cpu, true));
+                                   WeightRole::AttentionWO, 0, cpu, true));
     bindings.push_back(makeBinding(4, embd_sliced.get(), "token_embd.weight",
-                    WeightRole::Embedding, -1, cpu, true));
+                                   WeightRole::Embedding, -1, cpu, true));
 
     // Pre-register all as prepared so actual packing is skipped
     for (const auto &b : bindings)

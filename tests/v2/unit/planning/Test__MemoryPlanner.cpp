@@ -9,58 +9,59 @@ using namespace llaminar2;
 namespace
 {
 
-ModelMemoryProfile createTestProfile()
-{
-    ModelMemoryProfile p;
-    p.architecture = "qwen2";
-    p.n_layers = 24;
-    p.d_model = 896;
-    p.d_ff = 4864;
-    p.n_heads = 14;
-    p.n_kv_heads = 2;
-    p.head_dim = 64;
-    p.vocab_size = 151936;
-    p.max_seq_len = 4096;
-    p.total_native_bytes = 0;
-
-    auto addTensor = [&](const std::string& name, size_t rows, size_t cols,
-                         const std::string& quant, int layer = -1) {
-        TensorSizeInfo t;
-        t.name = name;
-        t.elements = rows * cols;
-        t.K = cols;
-        t.quant_type = quant;
-        if (quant == "Q8_0")
-            t.native_bytes = rows * cols * 34 / 32;
-        else if (quant == "F32")
-            t.native_bytes = rows * cols * 4;
-        else
-            t.native_bytes = rows * cols;
-        t.layer_index = layer;
-        p.total_native_bytes += t.native_bytes;
-        p.tensors.push_back(t);
-    };
-
-    addTensor("token_embd.weight", 896, 151936, "Q8_0");
-    addTensor("output.weight", 896, 151936, "Q8_0");
-    addTensor("output_norm.weight", 1, 896, "F32");
-
-    for (int layer = 0; layer < 24; ++layer)
+    ModelMemoryProfile createTestProfile()
     {
-        std::string prefix = "blk." + std::to_string(layer) + ".";
-        addTensor(prefix + "attn_q.weight", 896, 896, "Q8_0", layer);
-        addTensor(prefix + "attn_k.weight", 128, 896, "Q8_0", layer);
-        addTensor(prefix + "attn_v.weight", 128, 896, "Q8_0", layer);
-        addTensor(prefix + "attn_output.weight", 896, 896, "Q8_0", layer);
-        addTensor(prefix + "ffn_gate.weight", 4864, 896, "Q8_0", layer);
-        addTensor(prefix + "ffn_up.weight", 4864, 896, "Q8_0", layer);
-        addTensor(prefix + "ffn_down.weight", 896, 4864, "Q8_0", layer);
-        addTensor(prefix + "attn_norm.weight", 1, 896, "F32", layer);
-        addTensor(prefix + "ffn_norm.weight", 1, 896, "F32", layer);
-    }
+        ModelMemoryProfile p;
+        p.architecture = "qwen2";
+        p.n_layers = 24;
+        p.d_model = 896;
+        p.d_ff = 4864;
+        p.n_heads = 14;
+        p.n_kv_heads = 2;
+        p.head_dim = 64;
+        p.vocab_size = 151936;
+        p.max_seq_len = 4096;
+        p.total_native_bytes = 0;
 
-    return p;
-}
+        auto addTensor = [&](const std::string &name, size_t rows, size_t cols,
+                             const std::string &quant, int layer = -1)
+        {
+            TensorSizeInfo t;
+            t.name = name;
+            t.elements = rows * cols;
+            t.K = cols;
+            t.quant_type = quant;
+            if (quant == "Q8_0")
+                t.native_bytes = rows * cols * 34 / 32;
+            else if (quant == "F32")
+                t.native_bytes = rows * cols * 4;
+            else
+                t.native_bytes = rows * cols;
+            t.layer_index = layer;
+            p.total_native_bytes += t.native_bytes;
+            p.tensors.push_back(t);
+        };
+
+        addTensor("token_embd.weight", 896, 151936, "Q8_0");
+        addTensor("output.weight", 896, 151936, "Q8_0");
+        addTensor("output_norm.weight", 1, 896, "F32");
+
+        for (int layer = 0; layer < 24; ++layer)
+        {
+            std::string prefix = "blk." + std::to_string(layer) + ".";
+            addTensor(prefix + "attn_q.weight", 896, 896, "Q8_0", layer);
+            addTensor(prefix + "attn_k.weight", 128, 896, "Q8_0", layer);
+            addTensor(prefix + "attn_v.weight", 128, 896, "Q8_0", layer);
+            addTensor(prefix + "attn_output.weight", 896, 896, "Q8_0", layer);
+            addTensor(prefix + "ffn_gate.weight", 4864, 896, "Q8_0", layer);
+            addTensor(prefix + "ffn_up.weight", 4864, 896, "Q8_0", layer);
+            addTensor(prefix + "ffn_down.weight", 896, 4864, "Q8_0", layer);
+            addTensor(prefix + "attn_norm.weight", 1, 896, "F32", layer);
+            addTensor(prefix + "ffn_norm.weight", 1, 896, "F32", layer);
+        }
+
+        return p;
+    }
 
 } // anonymous namespace
 
@@ -70,8 +71,8 @@ TEST(Test__MemoryPlanner, SingleGPU_Fits)
 
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
-    cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024;  // 24 GB
-    cfg.device_free_bytes = 23ULL * 1024 * 1024 * 1024;   // 23 GB free
+    cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024; // 24 GB
+    cfg.device_free_bytes = 23ULL * 1024 * 1024 * 1024;  // 23 GB free
     cfg.batch_size = 1;
     cfg.max_seq_len = 4096;
     cfg.kv_precision = "fp16";
@@ -93,8 +94,8 @@ TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)
 
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
-    cfg.device_total_bytes = 1ULL * 1024 * 1024 * 1024;  // 1 GB
-    cfg.device_free_bytes = 512ULL * 1024 * 1024;         // 512 MB free
+    cfg.device_total_bytes = 1ULL * 1024 * 1024 * 1024; // 1 GB
+    cfg.device_free_bytes = 512ULL * 1024 * 1024;       // 512 MB free
     cfg.batch_size = 1;
     cfg.max_seq_len = 4096;
     cfg.kv_precision = "fp16";
@@ -174,7 +175,7 @@ TEST(Test__MemoryPlanner, TP2_ReducesKVCachePerDevice)
 
 TEST(Test__MemoryPlanner, PP2_SplitsLayersAcrossDevices)
 {
-    auto profile = createTestProfile();  // 24 layers
+    auto profile = createTestProfile(); // 24 layers
 
     // Stage 0: layers 0-11
     DevicePlanConfig stage0;
@@ -223,7 +224,7 @@ TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
 
     DevicePlanConfig cuda_cfg;
     cuda_cfg.device = DeviceId::cuda(0);
-    cuda_cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024;   // 24 GB (RTX 3090)
+    cuda_cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024; // 24 GB (RTX 3090)
     cuda_cfg.device_free_bytes = 23ULL * 1024 * 1024 * 1024;
     cuda_cfg.batch_size = 1;
     cuda_cfg.max_seq_len = 4096;
@@ -233,7 +234,7 @@ TEST(Test__MemoryPlanner, MixedDevices_CUDAAndROCm)
 
     DevicePlanConfig rocm_cfg;
     rocm_cfg.device = DeviceId::rocm(0);
-    rocm_cfg.device_total_bytes = 32ULL * 1024 * 1024 * 1024;   // 32 GB (MI60)
+    rocm_cfg.device_total_bytes = 32ULL * 1024 * 1024 * 1024; // 32 GB (MI60)
     rocm_cfg.device_free_bytes = 31ULL * 1024 * 1024 * 1024;
     rocm_cfg.batch_size = 1;
     rocm_cfg.max_seq_len = 4096;
@@ -335,18 +336,18 @@ TEST(Test__MemoryPlanner, PP2_DoesNotFit_WithoutLayerSplit)
     // Regression test: verifies that PP must actually set per-device layer ranges.
     // A model that doesn't fit on one 24 GB GPU MUST fail if both devices get
     // all layers (the bug: global first_layer/last_layer assigned to all devices).
-    auto profile = createTestProfile();  // 24 layers
+    auto profile = createTestProfile(); // 24 layers
 
     // Full model on a single 24 GB GPU that doesn't have enough free memory
     DevicePlanConfig cfg;
     cfg.device = DeviceId::cuda(0);
     cfg.device_total_bytes = 24ULL * 1024 * 1024 * 1024;
-    cfg.device_free_bytes = 1ULL * 1024 * 1024 * 1024;  // Only 1 GB free
+    cfg.device_free_bytes = 1ULL * 1024 * 1024 * 1024; // Only 1 GB free
     cfg.batch_size = 1;
     cfg.max_seq_len = 4096;
     cfg.kv_precision = "fp16";
     cfg.first_layer = 0;
-    cfg.last_layer = 23;  // All layers
+    cfg.last_layer = 23; // All layers
 
     auto full_plan = MemoryPlanner::plan(profile, {cfg});
     ASSERT_FALSE(full_plan.fits()) << "Precondition: model must NOT fit on 1 GB free";
@@ -354,12 +355,12 @@ TEST(Test__MemoryPlanner, PP2_DoesNotFit_WithoutLayerSplit)
     // BUG scenario: two devices but both get ALL layers (no PP layer split)
     DevicePlanConfig bad_stage0 = cfg;
     bad_stage0.first_layer = 0;
-    bad_stage0.last_layer = 23;  // All layers — WRONG for PP
+    bad_stage0.last_layer = 23; // All layers — WRONG for PP
 
     DevicePlanConfig bad_stage1 = cfg;
     bad_stage1.device = DeviceId::cuda(1);
     bad_stage1.first_layer = 0;
-    bad_stage1.last_layer = 23;  // All layers — WRONG for PP
+    bad_stage1.last_layer = 23; // All layers — WRONG for PP
 
     auto bad_plan = MemoryPlanner::plan(profile, {bad_stage0, bad_stage1});
     // Both devices still don't fit (each sees full weight)
@@ -386,7 +387,7 @@ TEST(Test__MemoryPlanner, PP_LayerRange_ReducesWeightEstimate_Proportionally)
 {
     // Validates that setting first_layer/last_layer to half the layers
     // reduces weight estimate to approximately half (plus non-layer weights).
-    auto profile = createTestProfile();  // 24 layers
+    auto profile = createTestProfile(); // 24 layers
 
     // Full model
     DevicePlanConfig full;
@@ -422,7 +423,7 @@ TEST(Test__MemoryPlanner, DeviceMemoryPlan_Summary)
 {
     DeviceMemoryPlan plan;
     plan.device = DeviceId::cuda(0);
-    plan.weight_bytes = 1024 * 1024 * 100;  // 100 MB
+    plan.weight_bytes = 1024 * 1024 * 100; // 100 MB
     plan.kv_cache_bytes = 1024 * 1024 * 50;
     plan.activation_bytes = 1024 * 1024 * 30;
     plan.workspace_bytes = 1024 * 1024 * 200;

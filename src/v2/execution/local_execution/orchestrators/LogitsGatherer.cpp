@@ -17,7 +17,8 @@
 namespace llaminar2
 {
 
-    LogitsGatherer::LogitsGatherer(int vocab_size, size_t max_tokens)
+    LogitsGatherer::LogitsGatherer(int vocab_size, size_t max_tokens, BackendResolver backend_resolver)
+        : backend_resolver_(backend_resolver)
     {
         if (vocab_size > 0 && max_tokens > 0)
         {
@@ -27,25 +28,26 @@ namespace llaminar2
         }
     }
 
+    IBackend *LogitsGatherer::resolveBackend(DeviceId device) const
+    {
+        if (backend_resolver_)
+            return backend_resolver_(device);
+        return getBackendFor(device);
+    }
+
     LogitsGatherer::~LogitsGatherer()
     {
         if (pinned_ && buffer_)
         {
-            // Retrieve the backend that was used for pinning to unpin
-            // We iterate device types since we don't store the original device.
-            // Try CUDA first, then ROCm, then give up.
-            IBackend *backend = nullptr;
-            for (auto type : {DeviceType::CUDA, DeviceType::ROCm})
-            {
-                DeviceId probe{type, 0};
-                backend = getBackendFor(probe);
-                if (backend)
-                    break;
-            }
+            // Use the stored device type from pinForDevice() to select the correct
+            // backend for unpinning. Previously this probed CUDA first, which caused
+            // cudaHostUnregister failures when the buffer was actually pinned via HIP.
+            DeviceId probe{pinned_device_type_, 0};
+            IBackend *backend = resolveBackend(probe);
             if (backend)
             {
                 backend->unpinHostMemory(buffer_->mutable_data());
-                LOG_DEBUG("LogitsGatherer: Unpinned buffer");
+                LOG_DEBUG("LogitsGatherer: Unpinned buffer via " << probe.toString());
             }
             pinned_ = false;
         }
@@ -59,7 +61,7 @@ namespace llaminar2
         if (pinned_ || !buffer_ || !device.is_gpu())
             return;
 
-        IBackend *backend = getBackendFor(device);
+        IBackend *backend = resolveBackend(device);
         if (!backend)
             return;
 
@@ -67,6 +69,7 @@ namespace llaminar2
         if (backend->pinHostMemory(buffer_->mutable_data(), pin_bytes))
         {
             pinned_ = true;
+            pinned_device_type_ = device.type; // Remember which backend pinned it
             LOG_DEBUG("LogitsGatherer: Pinned buffer (" << (pin_bytes / 1024) << " KB) for "
                                                         << device.toString());
         }
@@ -178,7 +181,7 @@ namespace llaminar2
 
                 if (info.gpu_ptr && info.device.has_value())
                 {
-                    IBackend *backend = getBackendFor(*info.device);
+                    IBackend *backend = resolveBackend(*info.device);
                     if (backend)
                     {
                         backend->deviceToHostFast(dst, info.gpu_ptr, copy_bytes,
@@ -214,7 +217,7 @@ namespace llaminar2
 
             if (info.gpu_ptr && info.device.has_value())
             {
-                IBackend *backend = getBackendFor(*info.device);
+                IBackend *backend = resolveBackend(*info.device);
                 if (backend)
                 {
                     size_t copy_bytes = seq_len * info.vocab_local * sizeof(float);

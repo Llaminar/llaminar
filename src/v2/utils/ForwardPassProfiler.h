@@ -54,21 +54,21 @@ namespace llaminar2
          */
         struct PhaseTimings
         {
-            uint64_t setup_ns = 0;       ///< Workspace check, token copy, stream setup, dynamic params, graph reset
-            uint64_t execute_ns = 0;     ///< Total graph execution (includes all sub-phases below)
-            uint64_t sync_ns = 0;        ///< Post-execution sync + timeline collection
+            uint64_t setup_ns = 0;   ///< Workspace check, token copy, stream setup, dynamic params, graph reset
+            uint64_t execute_ns = 0; ///< Total graph execution (includes all sub-phases below)
+            uint64_t sync_ns = 0;    ///< Post-execution sync + timeline collection
 
             // Sub-phases of setup
-            uint64_t setup_workspace_ns = 0;   ///< Workspace allocation check + generation
-            uint64_t setup_token_copy_ns = 0;  ///< Token ID + position ID memcpy
-            uint64_t setup_stream_ns = 0;      ///< GPU stream assignment to stages
+            uint64_t setup_workspace_ns = 0;      ///< Workspace allocation check + generation
+            uint64_t setup_token_copy_ns = 0;     ///< Token ID + position ID memcpy
+            uint64_t setup_stream_ns = 0;         ///< GPU stream assignment to stages
             uint64_t setup_dynamic_params_ns = 0; ///< updateDynamicParams() calls
-            uint64_t setup_graph_reset_ns = 0; ///< graph->reset() call
+            uint64_t setup_graph_reset_ns = 0;    ///< graph->reset() call
 
             // Sub-phases of execute (graph replay path only)
-            uint64_t graph_launch_ns = 0;    ///< hipGraphLaunch / cudaGraphLaunch
-            uint64_t post_launch_ns = 0;     ///< markOutputsDirty + onGraphReplayed callbacks
-            uint64_t stream_sync_ns = 0;     ///< synchronizeStream() at end of replay phase
+            uint64_t graph_launch_ns = 0; ///< hipGraphLaunch / cudaGraphLaunch
+            uint64_t post_launch_ns = 0;  ///< markOutputsDirty + onGraphReplayed callbacks
+            uint64_t stream_sync_ns = 0;  ///< synchronizeStream() at end of replay phase
         };
 
         /**

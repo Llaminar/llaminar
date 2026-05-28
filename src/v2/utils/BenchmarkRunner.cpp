@@ -781,7 +781,8 @@ namespace llaminar2
             double avg_sampler_us = dlp.sampler_total_us / dlp.decode_tokens;
             double avg_inter_step_us = dlp.inter_step_total_us / dlp.decode_tokens;
             double avg_other_us = avg_inter_step_us - avg_sampler_us;
-            if (avg_other_us < 0) avg_other_us = 0;
+            if (avg_other_us < 0)
+                avg_other_us = 0;
             double decode_wall_ms = result.decode_time_ms;
             double inter_step_pct = (dlp.inter_step_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0;
 
@@ -801,7 +802,8 @@ namespace llaminar2
                 s << std::fixed << std::setprecision(1) << avg_other_us << " μs";
                 std::ostringstream p;
                 double other_total_us = dlp.inter_step_total_us - dlp.sampler_total_us;
-                if (other_total_us < 0) other_total_us = 0;
+                if (other_total_us < 0)
+                    other_total_us = 0;
                 p << std::fixed << std::setprecision(1)
                   << (other_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0 << "%";
                 tbl << "  Other (broadcast, prep)" << s.str() << p.str() << fort::endr;

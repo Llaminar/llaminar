@@ -1,131 +1,131 @@
 {
-  "_comment": "Canonical performance baselines. Update with: .githooks/run_benchmark_check.sh --update-baseline",
-  "regression_threshold_pct": 10,
-  "models": [
-    {
-      "name": "Qwen 2.5 7B Instruct Q8_0",
-      "model": "models/Qwen2.5-7B-Instruct-Q8_0.gguf",
-      "decode_tokens": 128,
-      "devices": {
-        "cuda:0": {
-          "prefill_tok_s": 4894.57,
-          "decode_tok_s": 95.16,
-          "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+    "_comment": "Canonical performance baselines. Update with: .githooks/run_benchmark_check.sh --update-baseline",
+    "regression_threshold_pct": 10,
+    "models": [
+        {
+            "name": "Qwen 2.5 7B Instruct Q8_0",
+            "model": "models/Qwen2.5-7B-Instruct-Q8_0.gguf",
+            "decode_tokens": 128,
+            "devices": {
+                "cuda:0": {
+                    "prefill_tok_s": 4894.57,
+                    "decode_tok_s": 95.16,
+                    "regression_threshold_pct": 5,
+                    "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                },
+                "rocm:0": {
+                    "prefill_tok_s": 1214.71,
+                    "decode_tok_s": 78.94,
+                    "regression_threshold_pct": 5,
+                    "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                },
+                "cpu": {
+                    "prefill_tok_s": 337.99,
+                    "decode_tok_s": 19.78,
+                    "regression_threshold_pct": 25,
+                    "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                }
+            }
         },
-        "rocm:0": {
-          "prefill_tok_s": 1214.71,
-          "decode_tok_s": 78.94,
-          "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        {
+            "name": "Qwen 3.5 4B Q8_0",
+            "model": "models/Qwen3.5-4B-Q8_0.gguf",
+            "decode_tokens": 128,
+            "devices": {
+                "cpu": {
+                    "prefill_tok_s": 453.80,
+                    "decode_tok_s": 28.41,
+                    "regression_threshold_pct": 25,
+                    "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                },
+                "cuda:0": {
+                    "prefill_tok_s": 0,
+                    "decode_tok_s": 0,
+                    "regression_threshold_pct": 10,
+                    "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                },
+                "rocm:0": {
+                    "prefill_tok_s": 0,
+                    "decode_tok_s": 0,
+                    "regression_threshold_pct": 10,
+                    "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                }
+            }
         },
-        "cpu": {
-          "prefill_tok_s": 337.99,
-          "decode_tok_s": 19.78,
-          "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        {
+            "name": "Qwen 3.5 35B MoE Q4_K_XL",
+            "model": "models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+            "decode_tokens": 128,
+            "env": {
+                "LLAMINAR_MOE_REBALANCE": "off"
+            },
+            "devices": {
+                "cpu:0": {
+                    "prefill_tok_s": 158.47,
+                    "decode_tok_s": 19.48,
+                    "regression_threshold_pct": 25,
+                    "_comment": "High-water mark set at commit 3a03cfd2 on 2026-05-06. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                },
+                "cpu": {
+                    "prefill_tok_s": 234.49,
+                    "decode_tok_s": 27.92,
+                    "regression_threshold_pct": 25,
+                    "_comment": "High-water mark set at commit fb4d70b2 on 2026-05-03. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                },
+                "rocm:0": {
+                    "prefill_tok_s": 1281.57,
+                    "decode_tok_s": 79.38,
+                    "regression_threshold_pct": 10,
+                    "_comment": "High-water mark set at commit 90795754 on 2026-05-28. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                }
+            }
+        },
+        {
+            "name": "Qwen 3.5 27B Dense Q4_K_M",
+            "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+            "decode_tokens": 128,
+            "devices": {
+                "cpu": {
+                    "prefill_tok_s": 0,
+                    "decode_tok_s": 0,
+                    "regression_threshold_pct": 25,
+                    "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                },
+                "rocm:0": {
+                    "prefill_tok_s": 0,
+                    "decode_tok_s": 0,
+                    "regression_threshold_pct": 10,
+                    "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                }
+            }
+        },
+        {
+            "name": "Qwen 3.5 27B Dense Q4_K_M TP2 ROCm",
+            "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+            "decode_tokens": 128,
+            "devices": {
+                "tp": {
+                    "prefill_tok_s": 0,
+                    "decode_tok_s": 0,
+                    "regression_threshold_pct": 10,
+                    "extra_flags": "--tp-devices rocm:0,rocm:1",
+                    "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                }
+            }
+        },
+        {
+            "name": "Qwen 3.5 27B Dense Q4_K_M PP2 CUDA+ROCm",
+            "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+            "decode_tokens": 128,
+            "devices": {
+                "pp": {
+                    "prefill_tok_s": 0,
+                    "decode_tok_s": 0,
+                    "regression_threshold_pct": 10,
+                    "extra_flags": "--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-15 --pp-stage 1=rocm_pp:16-63",
+                    "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+                }
+            }
         }
-      }
-    },
-    {
-      "name": "Qwen 3.5 4B Q8_0",
-      "model": "models/Qwen3.5-4B-Q8_0.gguf",
-      "decode_tokens": 128,
-      "devices": {
-        "cpu": {
-          "prefill_tok_s": 453.80,
-          "decode_tok_s": 28.41,
-          "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        },
-        "cuda:0": {
-          "prefill_tok_s": 0,
-          "decode_tok_s": 0,
-          "regression_threshold_pct": 10,
-          "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        },
-        "rocm:0": {
-          "prefill_tok_s": 0,
-          "decode_tok_s": 0,
-          "regression_threshold_pct": 10,
-          "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        }
-      }
-    },
-    {
-      "name": "Qwen 3.5 35B MoE Q4_K_XL",
-      "model": "models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
-      "decode_tokens": 128,
-      "env": {
-        "LLAMINAR_MOE_REBALANCE": "off"
-      },
-      "devices": {
-        "cpu:0": {
-          "prefill_tok_s": 158.47,
-          "decode_tok_s": 19.48,
-          "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit 3a03cfd2 on 2026-05-06. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        },
-        "cpu": {
-          "prefill_tok_s": 234.49,
-          "decode_tok_s": 27.92,
-          "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit fb4d70b2 on 2026-05-03. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        },
-        "rocm:0": {
-          "prefill_tok_s": 1281.57,
-          "decode_tok_s": 79.38,
-          "regression_threshold_pct": 10,
-          "_comment": "High-water mark set at commit 90795754 on 2026-05-28. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        }
-      }
-    },
-    {
-      "name": "Qwen 3.5 27B Dense Q4_K_M",
-      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
-      "decode_tokens": 128,
-      "devices": {
-        "cpu": {
-          "prefill_tok_s": 0,
-          "decode_tok_s": 0,
-          "regression_threshold_pct": 25,
-          "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        },
-        "rocm:0": {
-          "prefill_tok_s": 0,
-          "decode_tok_s": 0,
-          "regression_threshold_pct": 10,
-          "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        }
-      }
-    },
-    {
-      "name": "Qwen 3.5 27B Dense Q4_K_M TP2 ROCm",
-      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
-      "decode_tokens": 128,
-      "devices": {
-        "tp": {
-          "prefill_tok_s": 0,
-          "decode_tok_s": 0,
-          "regression_threshold_pct": 10,
-          "extra_flags": "--tp-devices rocm:0,rocm:1",
-          "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        }
-      }
-    },
-    {
-      "name": "Qwen 3.5 27B Dense Q4_K_M PP2 CUDA+ROCm",
-      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
-      "decode_tokens": 128,
-      "devices": {
-        "pp": {
-          "prefill_tok_s": 0,
-          "decode_tok_s": 0,
-          "regression_threshold_pct": 10,
-          "extra_flags": "--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-15 --pp-stage 1=rocm_pp:16-63",
-          "_comment": "Placeholder — run --update-baseline to set initial values. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-        }
-      }
-    }
-  ]
+    ]
 }

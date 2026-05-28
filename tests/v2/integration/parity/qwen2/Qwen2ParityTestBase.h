@@ -1191,8 +1191,8 @@ namespace llaminar2::test::parity::qwen2
             model_ctx_ = ModelContext::create(
                 config_.model_path,
                 mpi_ctx_,
-                nullptr,            // placement_map
-                nullptr,            // factory
+                nullptr, // placement_map
+                nullptr, // factory
                 getWeightStrategy());
             if (!model_ctx_)
             {
@@ -1322,7 +1322,7 @@ namespace llaminar2::test::parity::qwen2
             go_config.rank = rank;
             go_config.world_size = world_size;
             go_config.mpi_ctx = mpi_ctx_.get();
-            go_config.rank_runner = std::move(runner_);  // Transfer ownership
+            go_config.rank_runner = std::move(runner_); // Transfer ownership
             go_config.vocab_size = vocab_size;
             go_config.d_model = d_model;
             go_config.architecture_name = arch_name;
@@ -1336,7 +1336,7 @@ namespace llaminar2::test::parity::qwen2
             runner_ = std::move(go);
 
             LOG_INFO("[Parity] GlobalOrchestrator setup complete (rank " << rank
-                     << "/" << world_size << ")");
+                                                                         << "/" << world_size << ")");
 
             // Step 5: Also create GlobalTPContext for infrastructure tests
             // (allreduce, broadcast, barrier verification).

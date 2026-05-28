@@ -617,7 +617,8 @@ namespace llaminar2
         Clock::time_point setup_dynamic_params_t0, setup_dynamic_params_t1;
         Clock::time_point setup_graph_reset_t0, setup_graph_reset_t1;
 
-        if (profiling_setup) setup_workspace_t0 = Clock::now();
+        if (profiling_setup)
+            setup_workspace_t0 = Clock::now();
 
         if (input.device.is_gpu() && forward_cache.graph)
         {
@@ -656,7 +657,11 @@ namespace llaminar2
             }
         }
 
-        if (profiling_setup) { setup_workspace_t1 = Clock::now(); setup_token_copy_t0 = setup_workspace_t1; }
+        if (profiling_setup)
+        {
+            setup_workspace_t1 = Clock::now();
+            setup_token_copy_t0 = setup_workspace_t1;
+        }
 
         // Update stable buffers — stages hold pointers to these, so the
         // pointed-to values change but the pointers remain valid
@@ -710,7 +715,11 @@ namespace llaminar2
             }
         }
 
-        if (profiling_setup) { setup_token_copy_t1 = Clock::now(); setup_stream_t0 = setup_token_copy_t1; }
+        if (profiling_setup)
+        {
+            setup_token_copy_t1 = Clock::now();
+            setup_stream_t0 = setup_token_copy_t1;
+        }
 
         // For GPU graph replay: set the capture stream on all stages.
         // Normally the capture_stream never changes between decode steps,
@@ -793,7 +802,11 @@ namespace llaminar2
             }
         }
 
-        if (profiling_setup) { setup_stream_t1 = Clock::now(); setup_dynamic_params_t0 = setup_stream_t1; }
+        if (profiling_setup)
+        {
+            setup_stream_t1 = Clock::now();
+            setup_dynamic_params_t0 = setup_stream_t1;
+        }
 
         // Update position-dependent params using cached stage pointers.
         // Only ~4 stages override updateDynamicParams() — avoids iterating
@@ -846,7 +859,11 @@ namespace llaminar2
             updatePrefillReplayParamStages(input, forward_cache.prefill_replay_param_stages);
         }
 
-        if (profiling_setup) { setup_dynamic_params_t1 = Clock::now(); setup_graph_reset_t0 = setup_dynamic_params_t1; }
+        if (profiling_setup)
+        {
+            setup_dynamic_params_t1 = Clock::now();
+            setup_graph_reset_t0 = setup_dynamic_params_t1;
+        }
 
         // Skip graph reset when Phase 3 replay is active — Phase 3 doesn't
         // call markCompleted(), so all flags are already false from last reset.
@@ -855,7 +872,10 @@ namespace llaminar2
             forward_cache.graph->reset();
         }
 
-        if (profiling_setup) { setup_graph_reset_t1 = Clock::now(); }
+        if (profiling_setup)
+        {
+            setup_graph_reset_t1 = Clock::now();
+        }
 
         output = forward_cache.output;
 
