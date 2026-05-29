@@ -42,6 +42,7 @@
 // Now include test utils
 #include "../../../utils/CUDATestUtils.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/GpuPreparedGemmHarness.h"
 
 #include <vector>
 #include <cmath>
@@ -65,6 +66,25 @@ namespace
 
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
     {
+        // GPU INT8-packed (quantized native-VNNI) weights cannot go through
+        // KernelFactory::prepareGemmHandleLocal() — that path is guarded and throws
+        // because such kernels must be built from VRAM-resident, repacked payloads
+        // owned by a WeightVRAMPool. Route those through the shared production-pipeline
+        // helper instead, and keep the returned lifetime owners alive in a static list.
+        auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
+        const bool is_gpu_quantized =
+            (device_id.is_cuda() || device_id.is_rocm()) &&
+            unpackable != nullptr &&
+            const_cast<IINT8Unpackable *>(unpackable)->vnniFormatInfo() != nullptr;
+
+        if (is_gpu_quantized)
+        {
+            static std::vector<llaminar2::test::GpuPreparedGemm> gpu_prepared;
+            gpu_prepared.push_back(
+                llaminar2::test::makeGpuPreparedGemm(const_cast<TensorBase *>(tensor), device_id));
+            return gpu_prepared.back().kernel;
+        }
+
         static std::vector<std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>> handles;
         auto prepared = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(tensor, device_id);
         if (!prepared)

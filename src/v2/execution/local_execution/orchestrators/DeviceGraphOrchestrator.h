@@ -1334,7 +1334,13 @@ namespace llaminar2
                 device_opt,
                 shape.size() >= 2 ? shape[1] : 0,
                 state_.logits_local.get(),
-                stream};
+                stream,
+                // Expose this runner's arena-owned argmax scratch so the
+                // multi-device sampler can drive the multi-block reduction
+                // without any hot-path allocation.
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
         }
 
         /**
@@ -2081,6 +2087,13 @@ namespace llaminar2
 
         /// Unified buffer arena — owns and tracks coherence for all activation buffers
         std::unique_ptr<BufferArena> arena_;
+
+        /// Cached device pointers for the arena-owned argmax partial-reduction
+        /// scratch (two-pass GPU greedy sampling). Resolved once after arena
+        /// allocation so the per-decode-step hot path avoids any arena lookups.
+        void *argmax_partial_vals_dev_ = nullptr; ///< FP32 [1, argmax_partial_capacity_]
+        void *argmax_partial_idxs_dev_ = nullptr; ///< INT32 [1, argmax_partial_capacity_]
+        int argmax_partial_capacity_ = 0;         ///< Entries in the partial scratch (0 = unavailable)
 
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;

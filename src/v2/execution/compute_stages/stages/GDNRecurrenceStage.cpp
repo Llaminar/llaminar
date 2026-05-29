@@ -227,14 +227,29 @@ namespace llaminar2
         if (params_.seq_len == 1)
             return isGraphCapturable();
 
-#if !defined(HAVE_ROCM)
-        return false;
-#else
-        return params_.seq_len > 1 &&
-               params_.device_id.is_rocm() &&
-               params_.kernel &&
-               params_.kernel->supportsPaddedPrefillRealLength();
+        if (params_.seq_len <= 1 || !params_.device_id.is_gpu() || !params_.kernel ||
+            !params_.kernel->supportsPaddedPrefillRealLength())
+            return false;
+
+        if (params_.device_id.is_cuda())
+        {
+    #ifdef HAVE_CUDA
+            return true;
+    #else
+            return false;
 #endif
+        }
+
+        if (params_.device_id.is_rocm())
+        {
+    #ifdef HAVE_ROCM
+            return true;
+    #else
+            return false;
+    #endif
+        }
+
+        return false;
     }
 
     bool GDNRecurrenceStage::ensureGpuEffectiveSeqLenStateInitialized()
@@ -731,17 +746,34 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::isGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
-        return params_.seq_len == 1;
+#if defined(ENABLE_PIPELINE_SNAPSHOTS)
+        return params_.seq_len == 1 && params_.device_id.is_gpu();
 #else
         // Decode: always capturable (single kernel launch, stable pointers)
         if (params_.seq_len == 1)
-            return true;
+            return params_.device_id.is_gpu();
 
-        // Prefill: capturable only on ROCm when GPU state is pre-allocated.
+        // Prefill: capturable only on compiled GPU backends when GPU state is pre-allocated.
         // chunk_forward() will skip its lazy allocateState() if state is ready.
-        if (!params_.device_id.is_rocm() || !params_.kernel)
+        if (!params_.device_id.is_gpu() || !params_.kernel)
             return false;
+
+        if (params_.device_id.is_cuda())
+        {
+#ifndef HAVE_CUDA
+            return false;
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifndef HAVE_ROCM
+            return false;
+#endif
+        }
+        else
+        {
+            return false;
+        }
 
         const int required_state_size = params_.n_heads * params_.d_k * params_.d_v;
         return params_.kernel->isGPUStateReady(required_state_size);

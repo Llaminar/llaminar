@@ -83,6 +83,10 @@ namespace llaminar2
         FA_GATE,            ///< FA sigmoid gate (extracted from Q projection) [seq_len, n_heads * d_head]
         FA_Q_RAW,           ///< FA raw Q GEMM output (query+gate interleaved) [seq_len, n_heads * d_head * 2]
 
+        // ── Sampling scratch buffers ────────────────────────────────────────
+        ARGMAX_PARTIAL_VALS, ///< Per-block partial max values for two-pass GPU argmax [1, kArgmaxPartials]
+        ARGMAX_PARTIAL_IDXS, ///< Per-block partial max indices for two-pass GPU argmax [1, kArgmaxPartials]
+
         _COUNT ///< Sentinel – must be last
     };
 
@@ -157,6 +161,10 @@ namespace llaminar2
             return "MOE_SHARED_EXPERT_OUTPUT";
         case BufferId::MOE_SHARED_GATE_OUTPUT:
             return "MOE_SHARED_GATE_OUTPUT";
+        case BufferId::ARGMAX_PARTIAL_VALS:
+            return "ARGMAX_PARTIAL_VALS";
+        case BufferId::ARGMAX_PARTIAL_IDXS:
+            return "ARGMAX_PARTIAL_IDXS";
         case BufferId::MOE_GATE_SCRATCH:
             return "MOE_GATE_SCRATCH";
         case BufferId::MOE_UP_SCRATCH:

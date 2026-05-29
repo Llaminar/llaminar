@@ -41,6 +41,14 @@ namespace llaminar2
         TensorBase *tensor = nullptr;   ///< Tensor pointer for CPU fallback (data())
         void *stream = nullptr;         ///< Explicit GPU stream (must match forward pass stream)
 
+        // Device-resident scratch for the multi-block argmax reduction (owned by
+        // the runner's BufferArena). Supplied to IBackend::argmaxF32() so the
+        // CUDA two-pass reduction never has to allocate on the hot path. Null /
+        // zero capacity means GPU-side argmax is unavailable for this runner.
+        void *argmax_partial_vals = nullptr; ///< FP32 scratch [argmax_partial_capacity]
+        void *argmax_partial_idxs = nullptr; ///< INT32 scratch [argmax_partial_capacity]
+        int argmax_partial_capacity = 0;     ///< Number of entries in the scratch buffers
+
         /// True if this info is valid (has a tensor)
         explicit operator bool() const { return tensor != nullptr; }
     };

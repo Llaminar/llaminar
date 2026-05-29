@@ -88,6 +88,17 @@ namespace
 
         void TearDown() override
         {
+            // Release the argmax partial-reduction scratch allocated on first use.
+            if (backend_)
+            {
+                if (argmax_partial_vals_)
+                    backend_->free(argmax_partial_vals_, device_id_);
+                if (argmax_partial_idxs_)
+                    backend_->free(argmax_partial_idxs_, device_id_);
+            }
+            argmax_partial_vals_ = nullptr;
+            argmax_partial_idxs_ = nullptr;
+            argmax_partial_capacity_ = 0;
             backend_ = nullptr;
         }
 
@@ -121,8 +132,37 @@ namespace
                 backend_->free(d_ptr, device_id_);
         }
 
+        // ------------------------------------------------------------------
+        // Helper: argmax with mandatory device scratch (multi-block reduction).
+        //
+        // Production callers always supply arena-owned partial-reduction scratch,
+        // so the CUDA backend has no single-block fallback. These tests mirror
+        // that contract: a persistent scratch pair is allocated lazily on first
+        // use and reused across calls, then freed in TearDown.
+        // ------------------------------------------------------------------
+        bool argmaxF32(void *d_ptr, int n, int device_id,
+                       float *out_value, int *out_index)
+        {
+            if (!argmax_partial_vals_)
+            {
+                argmax_partial_capacity_ = 1024;
+                argmax_partial_vals_ =
+                    backend_->allocate(argmax_partial_capacity_ * sizeof(float), device_id_);
+                argmax_partial_idxs_ =
+                    backend_->allocate(argmax_partial_capacity_ * sizeof(int), device_id_);
+            }
+            return backend_->argmaxF32(d_ptr, n, device_id, out_value, out_index,
+                                       nullptr, argmax_partial_vals_,
+                                       argmax_partial_idxs_, argmax_partial_capacity_);
+        }
+
         IBackend *backend_ = nullptr;
         int device_id_ = 0;
+
+        // Persistent argmax partial-reduction scratch (allocated on first use).
+        void *argmax_partial_vals_ = nullptr;
+        void *argmax_partial_idxs_ = nullptr;
+        int argmax_partial_capacity_ = 0;
 
         std::vector<float> standard_logits_;
         std::vector<float> uniform_logits_;
@@ -153,7 +193,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(standard_logits_.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(standard_logits_.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok) << "argmaxF32 not supported on " << GetParam();
 
@@ -171,7 +211,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(uniform_logits_.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(uniform_logits_.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -189,7 +229,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, 1, device_id_, &out_value, &out_index);
+        bool ok = argmaxF32(d_ptr, 1, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(out_index, 0);
@@ -206,7 +246,7 @@ namespace
 
         int first_index = -1;
         float first_value = 0.0f;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(standard_logits_.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(standard_logits_.size()),
                                       device_id_, &first_value, &first_index);
         ASSERT_TRUE(ok);
 
@@ -214,7 +254,7 @@ namespace
         {
             float out_value = 0.0f;
             int out_index = -1;
-            ok = backend_->argmaxF32(d_ptr, static_cast<int>(standard_logits_.size()),
+            ok = argmaxF32(d_ptr, static_cast<int>(standard_logits_.size()),
                                      device_id_, &out_value, &out_index);
             ASSERT_TRUE(ok);
             EXPECT_EQ(out_index, first_index) << "Iteration " << i;
@@ -232,7 +272,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(peaked_logits_.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(peaked_logits_.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -251,7 +291,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(negative.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(negative.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -270,7 +310,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(extreme.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(extreme.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -288,7 +328,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(zeros.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(zeros.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -306,7 +346,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(uniform_logits_.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(uniform_logits_.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -329,7 +369,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(large.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(large.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -348,7 +388,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(small.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(small.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -367,7 +407,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, static_cast<int>(mixed.size()),
+        bool ok = argmaxF32(d_ptr, static_cast<int>(mixed.size()),
                                       device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
@@ -393,7 +433,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+        bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(out_index, 12345);
@@ -416,7 +456,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+        bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(out_index, 256) << "Argmax should pick global max";
@@ -437,7 +477,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+        bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(out_index, n - 1);
@@ -458,7 +498,7 @@ namespace
 
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+        bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(out_index, 0);
@@ -1024,7 +1064,7 @@ namespace
 
         float argmax_value = 0.0f;
         int argmax_index = -1;
-        bool ok1 = backend_->argmaxF32(d_ptr, static_cast<int>(standard_logits_.size()),
+        bool ok1 = argmaxF32(d_ptr, static_cast<int>(standard_logits_.size()),
                                        device_id_, &argmax_value, &argmax_index);
 
         float topk_value = 0.0f;
@@ -1054,7 +1094,7 @@ namespace
         float argmax_value = 0.0f, topk_value = 0.0f;
         int argmax_index = -1, topk_index = -1;
 
-        bool ok1 = backend_->argmaxF32(d_ptr, n, device_id_, &argmax_value, &argmax_index);
+        bool ok1 = argmaxF32(d_ptr, n, device_id_, &argmax_value, &argmax_index);
         bool ok2 = backend_->topKF32(d_ptr, n, 1, device_id_, &topk_value, &topk_index);
 
         if (ok1 && ok2)
@@ -1138,7 +1178,7 @@ namespace
         // Argmax on local shard
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+        bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
         EXPECT_EQ(out_index, 50000);
         EXPECT_FLOAT_EQ(out_value, 14.5f);
@@ -1173,7 +1213,7 @@ namespace
         {
             float out_value = 0.0f;
             int out_index = -1;
-            bool ok = backend_->argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+            bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
             ASSERT_TRUE(ok) << "Decode step " << step;
             EXPECT_EQ(out_index, 256) << "Decode step " << step << " should produce consistent token";
             EXPECT_FLOAT_EQ(out_value, 14.54f);
@@ -1209,7 +1249,7 @@ namespace
         // Argmax should find the planted peak
         float out_value = 0.0f;
         int out_index = -1;
-        bool ok = backend_->argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+        bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
         ASSERT_TRUE(ok);
         EXPECT_EQ(out_index, 256) << "Argmax should find the planted peak in noisy data";
         EXPECT_FLOAT_EQ(out_value, 15.0f);
@@ -1246,7 +1286,7 @@ namespace
 
             float out_value = 0.0f;
             int out_index = -1;
-            bool ok = backend_->argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+            bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
             ASSERT_TRUE(ok) << "Iteration " << iter;
 
             EXPECT_EQ(out_index, iter % n) << "Iteration " << iter;
@@ -1442,7 +1482,7 @@ namespace
         // Verify initial argmax is token 0
         float val = 0;
         int idx = -1;
-        backend_->argmaxF32(d_ptr, static_cast<int>(logits.size()),
+        argmaxF32(d_ptr, static_cast<int>(logits.size()),
                             device_id_, &val, &idx);
         EXPECT_EQ(idx, 0) << "Before penalty, argmax should be token 0";
 
@@ -1456,7 +1496,7 @@ namespace
         ASSERT_TRUE(ok);
 
         // After penalty, argmax should shift to token 1
-        backend_->argmaxF32(d_ptr, static_cast<int>(logits.size()),
+        argmaxF32(d_ptr, static_cast<int>(logits.size()),
                             device_id_, &val, &idx);
         EXPECT_EQ(idx, 1) << "After penalty, argmax should shift to token 1 (9.5 > 8.0)";
         EXPECT_FLOAT_EQ(val, 9.5f);
@@ -1489,7 +1529,7 @@ namespace
         // token 1000: 8.0 - 0.5 = 7.5
         float val = 0;
         int idx = -1;
-        backend_->argmaxF32(d_ptr, vocab_size, device_id_, &val, &idx);
+        argmaxF32(d_ptr, vocab_size, device_id_, &val, &idx);
         EXPECT_EQ(idx, 42) << "After penalties, token 42 (8.0) should beat token 0 (5.0)";
 
         freeDevice(d_ptr);
@@ -1973,7 +2013,7 @@ namespace
 
         float gpu_val = 0;
         int gpu_argmax = -1;
-        ok = backend_->argmaxF32(d_ptr, vocab_size, device_id_, &gpu_val, &gpu_argmax);
+        ok = argmaxF32(d_ptr, vocab_size, device_id_, &gpu_val, &gpu_argmax);
         ASSERT_TRUE(ok);
 
         EXPECT_EQ(gpu_argmax, cpu_argmax)

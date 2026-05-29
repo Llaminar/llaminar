@@ -17,6 +17,7 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 
 // Forward declarations of extern "C" kernel wrappers
@@ -99,6 +100,13 @@ namespace llaminar2
         {
             if (gpu_state_ && state_size_ == state_size)
                 return;
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] GPU state allocation during graph capture "
+                          "(need "
+                          << state_size << " floats, have " << state_size_ << ")");
+                return;
+            }
             if (gpu_state_)
             {
                 cudaGDN_gpu_set_device(device_ordinal_);
@@ -140,7 +148,24 @@ namespace llaminar2
         {
             (void)chunk_size;
             cudaGDN_gpu_set_device(device_ordinal_);
-            float *effective_state = gpu_state_ ? gpu_state_ : state;
+            const int required_state_size = n_heads * d_k * d_v;
+            if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDAGatedDeltaNet::chunk_forward] GPU state allocation during graph capture "
+                              "(need "
+                              << required_state_size << " floats, have " << state_size_ << ")");
+                    return false;
+                }
+                allocateState(required_state_size);
+            }
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
+                return false;
+            }
+            float *effective_state = gpu_state_;
 
             // All pointers are device pointers — pass directly to CUDA kernel.
             // No H2D/D2H copies, no scratch buffer, no stream synchronization.
@@ -163,7 +188,24 @@ namespace llaminar2
         {
             (void)chunk_size;
             cudaGDN_gpu_set_device(device_ordinal_);
-            float *effective_state = gpu_state_ ? gpu_state_ : state;
+            const int required_state_size = n_heads * d_k * d_v;
+            if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDAGatedDeltaNet::chunkForwardWithEffectiveSeqLen] GPU state allocation during graph capture "
+                              "(need "
+                              << required_state_size << " floats, have " << state_size_ << ")");
+                    return false;
+                }
+                allocateState(required_state_size);
+            }
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
+                return false;
+            }
+            float *effective_state = gpu_state_;
 
             return cudaGDN_chunk_forward_effective(
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
@@ -182,7 +224,24 @@ namespace llaminar2
             bool use_qk_l2norm) override
         {
             cudaGDN_gpu_set_device(device_ordinal_);
-            float *effective_state = gpu_state_ ? gpu_state_ : state;
+            const int required_state_size = n_heads * d_k * d_v;
+            if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDAGatedDeltaNet::recurrent_step] GPU state allocation during graph capture "
+                              "(need "
+                              << required_state_size << " floats, have " << state_size_ << ")");
+                    return false;
+                }
+                allocateState(required_state_size);
+            }
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[CUDAGatedDeltaNet] Missing GPU recurrence state");
+                return false;
+            }
+            float *effective_state = gpu_state_;
 
             // All pointers are device pointers — pass directly to CUDA kernel.
             return cudaGDN_recurrent_step(
@@ -224,6 +283,13 @@ namespace llaminar2
             }
             else if (total > deinterleave_scratch_size_)
             {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDAGatedDeltaNet::deinterleave_qkv_device] deinterleave scratch realloc during graph capture "
+                              "(need "
+                              << total << " floats, have " << deinterleave_scratch_size_ << ")");
+                    return false;
+                }
                 cudaGDN_gpu_free(deinterleave_scratch_);
                 if (!cudaGDN_gpu_malloc(&deinterleave_scratch_, total))
                 {

@@ -566,10 +566,21 @@ namespace llaminar2
          * @param device_id Device where data resides
          * @param out_value Receives the maximum value
          * @param out_index Receives the index of the maximum element
+         * @param stream Optional device stream to enqueue work on
+         * @param partial_vals Optional device scratch [partial_capacity] for the
+         *        two-pass multi-block reduction (per-block partial max values).
+         *        When null (or capacity < 1), backends fall back to a single-block
+         *        reduction. Supplied by the caller's workspace/arena, not allocated
+         *        by the backend.
+         * @param partial_idxs Optional device scratch [partial_capacity] for the
+         *        per-block partial max indices (paired with @p partial_vals).
+         * @param partial_capacity Number of entries in the partial scratch buffers.
          * @return true if executed on device, false if not supported (caller should fall back)
          */
         virtual bool argmaxF32(const void *data_device, int n, int device_id,
-                               float *out_value, int *out_index, void *stream = nullptr)
+                               float *out_value, int *out_index, void *stream = nullptr,
+                               void *partial_vals = nullptr, void *partial_idxs = nullptr,
+                               int partial_capacity = 0)
         {
             (void)data_device;
             (void)n;
@@ -577,6 +588,9 @@ namespace llaminar2
             (void)out_value;
             (void)out_index;
             (void)stream;
+            (void)partial_vals;
+            (void)partial_idxs;
+            (void)partial_capacity;
             return false; // Not supported by default
         }
 

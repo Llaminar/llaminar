@@ -76,7 +76,9 @@ namespace llaminar2
 
         // GPU-side argmax for greedy sampling
         bool argmaxF32(const void *data_device, int n, int device_id,
-                       float *out_value, int *out_index, void *stream = nullptr) override;
+                       float *out_value, int *out_index, void *stream = nullptr,
+                       void *partial_vals = nullptr, void *partial_idxs = nullptr,
+                       int partial_capacity = 0) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,

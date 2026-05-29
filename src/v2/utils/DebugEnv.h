@@ -308,6 +308,8 @@ namespace llaminar2
         bool cuda_gemv_rowpar = true;  ///< Enable CUDA GEMV row-parallel layout unless LLAMINAR_CUDA_GEMV_ROWPAR starts with '0'.
         int cuda_bk256_mode = 0;       ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
         int cuda_stream_k_mode = 0;    ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
+        int cuda_force_prefill_tile = -1; ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
+        int cuda_force_prefill_split_k = 0; ///< CUDA native-VNNI prefill split-K override (LLAMINAR_FORCE_PREFILL_SPLIT_K, 0=auto, 1..8=forced).
 
         GemmConfig()
         {
@@ -410,6 +412,10 @@ namespace llaminar2
             if (cuda_concurrent_env)
                 cuda_concurrent_prefill = (std::atoi(cuda_concurrent_env) != 0);
 
+            const char *cuda_concurrent_decode_env = std::getenv("LLAMINAR_CUDA_CONCURRENT_DECODE");
+            if (cuda_concurrent_decode_env)
+                cuda_concurrent_decode = (std::atoi(cuda_concurrent_decode_env) != 0);
+
             const char *fused_trace_env = std::getenv("LLAMINAR_CUDA_FUSED_GEMM_TRACE");
             if (fused_trace_env)
                 cuda_fused_gemm_trace = (std::atoi(fused_trace_env) != 0);
@@ -428,10 +434,17 @@ namespace llaminar2
 
             const char *stream_k_env = std::getenv("LLAMINAR_STREAM_K");
             cuda_stream_k_mode = stream_k_env ? std::atoi(stream_k_env) : 0;
+
+            const char *force_tile_env = std::getenv("LLAMINAR_FORCE_PREFILL_TILE");
+            cuda_force_prefill_tile = force_tile_env ? std::atoi(force_tile_env) : -1;
+
+            const char *force_split_k_env = std::getenv("LLAMINAR_FORCE_PREFILL_SPLIT_K");
+            cuda_force_prefill_split_k = force_split_k_env ? std::atoi(force_split_k_env) : 0;
         }
 
         bool trace_q8_1_direct = false;      ///< Enable detailed Q8_1 JIT kernel tracing
         bool cuda_concurrent_prefill = true; ///< Multi-stream concurrent fused GEMM projections during CUDA prefill (LLAMINAR_CUDA_CONCURRENT_PREFILL, default ON)
+        bool cuda_concurrent_decode = true;  ///< Multi-stream concurrent fused GEMV projections during CUDA decode (m==1), e.g. GDN q/k/v/z/alpha/beta (LLAMINAR_CUDA_CONCURRENT_DECODE, default ON)
         bool cuda_fused_gemm_trace = false;  ///< Trace fused GEMM output checksums for debugging (LLAMINAR_CUDA_FUSED_GEMM_TRACE)
     };
 
@@ -848,7 +861,7 @@ namespace llaminar2
         int prefill_graph_min_seq = 256;                                                                                                                          ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
         bool prefill_graph_trace = false;                                                                                                                         ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
         bool prefill_graph_buckets = false;                                                                                                                       ///< Enable bucketed capture for server (env: LLAMINAR_PREFILL_GRAPH_BUCKETS)
-        std::vector<int> prefill_graph_bucket_sizes = {64, 128, 256, 384, 512, 544, 576, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096}; ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
+        std::vector<int> prefill_graph_bucket_sizes = {64, 128, 256, 384, 512, 544, 576, 600, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096}; ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
         int prefill_graph_max_cached_buckets = 10;                                                                                                                ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
         int prefill_graph_pad_token_id = 0;                                                                                                                       ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 
@@ -1077,7 +1090,7 @@ namespace llaminar2
                 prefill_graph_buckets = (std::atoi(prefill_graph_buckets_env) != 0);
             }
 
-            prefill_graph_bucket_sizes = {64, 128, 256, 384, 512, 544, 576, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096};
+            prefill_graph_bucket_sizes = {64, 128, 256, 384, 512, 544, 576, 600, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096};
             const char *prefill_graph_bucket_sizes_env = std::getenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
             if (prefill_graph_bucket_sizes_env && *prefill_graph_bucket_sizes_env)
             {

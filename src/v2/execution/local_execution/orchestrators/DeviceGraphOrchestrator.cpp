@@ -616,6 +616,31 @@ namespace llaminar2
         }
 
         // =====================================================================
+        // Register argmax partial-reduction scratch (GPU greedy sampling)
+        // =====================================================================
+        // The two-pass GPU argmax (sampleGreedyOnDevice) needs a small device
+        // scratch holding one (value, index) partial per pass-1 block. We allocate
+        // it through the arena (the V2 central buffer manager) instead of doing a
+        // lazy cudaMalloc inside the backend. Capacity bounds the pass-1 grid;
+        // 1024 partials far exceeds the ~74 blocks a 152K vocab needs.
+        if (state_.device_id.is_gpu())
+        {
+            constexpr size_t kArgmaxPartialCapacity = 1024;
+            if (!arena_->registerBuffer(BufferId::ARGMAX_PARTIAL_VALS, 1, kArgmaxPartialCapacity,
+                                        "FP32", state_.device_id))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register ARGMAX_PARTIAL_VALS buffer");
+                return false;
+            }
+            if (!arena_->registerBuffer(BufferId::ARGMAX_PARTIAL_IDXS, 1, kArgmaxPartialCapacity,
+                                        "INT32", state_.device_id))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register ARGMAX_PARTIAL_IDXS buffer");
+                return false;
+            }
+        }
+
+        // =====================================================================
         // Allocate all registered buffers
         // =====================================================================
         logOrchestratorVramTrace(state_.device_id, "arena.before_allocate");
@@ -625,6 +650,22 @@ namespace llaminar2
             return false;
         }
         logOrchestratorVramTrace(state_.device_id, "arena.after_allocate");
+
+        // Resolve the argmax partial scratch device pointers once, up front, so
+        // the per-decode-step greedy-sampling hot path never touches the arena.
+        // prepareForWrite forces device-side allocation; the buffers are pure
+        // scratch (overwritten every call) so no coherence tracking is needed.
+        if (state_.device_id.is_gpu() &&
+            arena_->isRegistered(BufferId::ARGMAX_PARTIAL_VALS) &&
+            arena_->isRegistered(BufferId::ARGMAX_PARTIAL_IDXS))
+        {
+            arena_->prepareForWrite(BufferId::ARGMAX_PARTIAL_VALS, state_.device_id);
+            arena_->prepareForWrite(BufferId::ARGMAX_PARTIAL_IDXS, state_.device_id);
+            argmax_partial_vals_dev_ = arena_->getDevicePtr(BufferId::ARGMAX_PARTIAL_VALS, state_.device_id);
+            argmax_partial_idxs_dev_ = arena_->getDevicePtr(BufferId::ARGMAX_PARTIAL_IDXS, state_.device_id);
+            if (argmax_partial_vals_dev_ && argmax_partial_idxs_dev_)
+                argmax_partial_capacity_ = static_cast<int>(arena_->getCols(BufferId::ARGMAX_PARTIAL_VALS));
+        }
 
         // Wire arena directly to graph builder (replaces bindArenaToManagedBuffers + setBuffers shim)
         graph_builder_->setArena(arena_.get());
@@ -2159,9 +2200,14 @@ namespace llaminar2
         float max_val = 0.0f;
         int max_idx = 0;
 
+        // Supply the arena-owned partial-reduction scratch so the backend can use
+        // its fast two-pass multi-block argmax. If the scratch is unavailable the
+        // pointers are null and the backend falls back to a single-block reduction.
         if (!backend->argmaxF32(target_row, static_cast<int>(vocab),
                                 state_.device_id.gpu_ordinal(),
-                                &max_val, &max_idx))
+                                &max_val, &max_idx, nullptr,
+                                argmax_partial_vals_dev_, argmax_partial_idxs_dev_,
+                                argmax_partial_capacity_))
             return -1;
 
         return max_idx;

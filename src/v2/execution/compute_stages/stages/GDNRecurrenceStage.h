@@ -146,7 +146,7 @@ namespace llaminar2
         bool hasPrefillReplayParams() const override { return true; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool supportsPaddedPrefillRealLengthContract() const override;
-        /// @brief Allows cold ROCm padded-prefill graph preflight before warmup allocates GPU recurrence state.
+        /// @brief Allows cold GPU padded-prefill graph preflight before warmup allocates recurrence state.
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
 
         bool isGraphCapturable() const override;

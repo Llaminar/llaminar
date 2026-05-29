@@ -1,8 +1,8 @@
 /**
  * @file Test__PrefillGraphCapturability.cpp
- * @brief Phase 1 acceptance gate tests for prefill HIP graph capturability predicates.
+ * @brief Phase 1 acceptance gate tests for prefill GPU graph capturability predicates.
  *
- * Tests that isGraphCapturable() returns true for prefill (seq_len > 1) on ROCm
+ * Tests that isGraphCapturable() returns true for prefill (seq_len > 1) on GPU
  * when all readiness conditions are met, and false when any condition is violated.
  *
  * Covers:
@@ -908,7 +908,7 @@ TEST_F(GDNPrefillGraphCapture, PrefillCapturableWhenGPUStateReady)
 #endif
 }
 
-TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightAllowsROCmWhenRealLengthKernelReadyButStateIsNot)
+TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightAllowsCompiledGPUWhenRealLengthKernelReadyButStateIsNot)
 {
     StubGDNKernel not_ready_kernel(false, 0, true);
     auto params = makeValidPrefillParams(&not_ready_kernel);
@@ -923,6 +923,16 @@ TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightAllowsROCmWhenRealLengt
 #endif
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Actual graph capture must still wait for warmup to allocate GPU recurrence state";
+
+#ifdef HAVE_CUDA
+    auto cuda_params = makeValidPrefillParams(&not_ready_kernel);
+    cuda_params.device_id = DeviceId::cuda(0);
+    GDNRecurrenceStage cuda_stage(cuda_params);
+    EXPECT_TRUE(cuda_stage.supportsPaddedPrefillGraphCapturePreflight())
+        << "Cold padded preflight should validate CUDA GDN support without requiring warmed GPU state";
+    EXPECT_FALSE(cuda_stage.isGraphCapturable())
+        << "Actual CUDA graph capture must still wait for warmup to allocate GPU recurrence state";
+#endif
 }
 
 TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightRejectsKernelWithoutRealLengthContract)
@@ -949,7 +959,7 @@ TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightRejectsNullKernel)
         << "GDN prefill should reject when kernel is null";
 }
 
-TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightRejectsCPUAndCUDA)
+TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightRejectsCPU)
 {
     const int required_state_size = N_HEADS * D_K * D_V;
     StubGDNKernel ready_kernel(true, required_state_size, true);
@@ -959,14 +969,6 @@ TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightRejectsCPUAndCUDA)
     GDNRecurrenceStage cpu_stage(cpu_params);
     EXPECT_FALSE(cpu_stage.supportsPaddedPrefillGraphCapturePreflight())
         << "CPU GDN real-length execution does not imply GPU graph prefill support";
-
-#ifdef HAVE_CUDA
-    auto cuda_params = makeValidPrefillParams(&ready_kernel);
-    cuda_params.device_id = DeviceId::cuda(0);
-    GDNRecurrenceStage cuda_stage(cuda_params);
-    EXPECT_FALSE(cuda_stage.supportsPaddedPrefillGraphCapturePreflight())
-        << "CUDA GDN prefill graph support remains disabled until explicitly implemented";
-#endif
 }
 
 TEST_F(GDNPrefillGraphCapture, PrefillRejectsWhenGPUStateNotReady)
@@ -1011,7 +1013,7 @@ TEST_F(GDNPrefillGraphCapture, PrefillRejectsOnCPU)
         << "GDN prefill should never be capturable on CPU";
 }
 
-TEST_F(GDNPrefillGraphCapture, CUDAPrefillRemainsRejectedBecauseGraphCaptureReadinessIsROCmOnly)
+TEST_F(GDNPrefillGraphCapture, CUDAPrefillCapturableWhenGPUStateReady)
 {
 #ifdef HAVE_CUDA
     const int required_state_size = N_HEADS * D_K * D_V;
@@ -1020,8 +1022,12 @@ TEST_F(GDNPrefillGraphCapture, CUDAPrefillRemainsRejectedBecauseGraphCaptureRead
     params.device_id = DeviceId::cuda(0);
     GDNRecurrenceStage stage(params);
 
-    EXPECT_FALSE(stage.isGraphCapturable())
-        << "CUDA GDN kernels exist, but prefill graph capture readiness is still ROCm-only.";
+#ifndef ENABLE_PIPELINE_SNAPSHOTS
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "CUDA GDN prefill graph capture should be enabled once recurrence state is ready.";
+#else
+    EXPECT_FALSE(stage.isGraphCapturable());
+#endif
 #else
     GTEST_SKIP() << "CUDA backend not compiled";
 #endif

@@ -2453,8 +2453,14 @@ namespace
     //   g_force_tile_id: -1 = auto (heuristic), 0..5 = TileId enum value
     //   g_force_split_k:  0 = auto (heuristic), 1..8 = forced split-K value
     // =========================================================================
-    static int g_force_tile_id = -1;
-    static int g_force_split_k = 0;
+    static int g_force_tile_id = []()
+    {
+        return llaminar2::debugEnv().gemm.cuda_force_prefill_tile;
+    }();
+    static int g_force_split_k = []()
+    {
+        return llaminar2::debugEnv().gemm.cuda_force_prefill_split_k;
+    }();
 
     // Deterministic mode: disables stream-K and caps BK64 split-K to 1 on
     // shapes where split-K rounding drift is known to affect parity.

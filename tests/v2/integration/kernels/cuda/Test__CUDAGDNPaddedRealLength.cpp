@@ -14,6 +14,7 @@
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -125,6 +126,61 @@ namespace
         CudaIntBuffer(const CudaIntBuffer &) = delete;
         CudaIntBuffer &operator=(const CudaIntBuffer &) = delete;
     };
+
+    /// @brief RAII wrapper for a non-blocking CUDA stream used for live graph capture.
+    struct CudaStreamHandle
+    {
+        cudaStream_t stream = nullptr; ///< CUDA stream owned by this wrapper.
+
+        CudaStreamHandle()
+        {
+            checkCuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreateWithFlags");
+        }
+
+        ~CudaStreamHandle()
+        {
+            if (stream)
+                (void)cudaStreamDestroy(stream);
+        }
+
+        CudaStreamHandle(const CudaStreamHandle &) = delete;
+        CudaStreamHandle &operator=(const CudaStreamHandle &) = delete;
+    };
+
+    /// @brief Captures already-preallocated CUDA work, instantiates the graph, and launches it once.
+    template <typename Fn>
+    void captureAndLaunchOnce(cudaStream_t stream, Fn &&record_work)
+    {
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+
+        checkCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), "cudaStreamBeginCapture");
+        bool recorded = false;
+        {
+            // The production prefill graph controller sets this guard while recording stages.
+            // The direct kernel test mirrors that contract so hidden allocations/syncs fail here.
+            GraphCaptureGuard guard;
+            recorded = record_work();
+        }
+        const cudaError_t end_status = cudaStreamEndCapture(stream, &graph);
+
+        ASSERT_TRUE(recorded) << "Kernel wrapper rejected execution during CUDA graph capture";
+        ASSERT_EQ(end_status, cudaSuccess) << "cudaStreamEndCapture failed: " << cudaGetErrorString(end_status);
+        ASSERT_NE(graph, nullptr);
+
+        size_t node_count = 0;
+        checkCuda(cudaGraphGetNodes(graph, nullptr, &node_count), "cudaGraphGetNodes");
+        EXPECT_GT(node_count, 0u) << "Captured GDN graph should contain kernel nodes";
+
+        checkCuda(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "cudaGraphInstantiate");
+        checkCuda(cudaGraphLaunch(executable, stream), "cudaGraphLaunch");
+        checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(graph launch)");
+
+        if (executable)
+            checkCuda(cudaGraphExecDestroy(executable), "cudaGraphExecDestroy");
+        if (graph)
+            checkCuda(cudaGraphDestroy(graph), "cudaGraphDestroy");
+    }
 
     /**
      * @brief Builds row-major sequence data with hostile padding rows.
@@ -263,11 +319,16 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedD
         const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
         const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
 
-        CudaFloatBuffer d_Q(Q);
-        CudaFloatBuffer d_K(K);
-        CudaFloatBuffer d_V(V);
-        CudaFloatBuffer d_alpha(alpha);
-        CudaFloatBuffer d_beta(beta);
+        CudaFloatBuffer d_Q_padded(Q);
+        CudaFloatBuffer d_K_padded(K);
+        CudaFloatBuffer d_V_padded(V);
+        CudaFloatBuffer d_alpha_padded(alpha);
+        CudaFloatBuffer d_beta_padded(beta);
+        CudaFloatBuffer d_Q_ref(Q);
+        CudaFloatBuffer d_K_ref(K);
+        CudaFloatBuffer d_V_ref(V);
+        CudaFloatBuffer d_alpha_ref(alpha);
+        CudaFloatBuffer d_beta_ref(beta);
         CudaFloatBuffer d_A_log(A_log);
         CudaFloatBuffer d_dt_bias(dt_bias);
         CudaFloatBuffer d_padded_out(output_elems, 123.0f);
@@ -277,18 +338,18 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedD
         CUDAGatedDeltaNet padded_kernel(cuda_ordinal_);
         padded_kernel.allocateGPUState(n_heads * d_k * d_v);
         ASSERT_TRUE(padded_kernel.chunkForwardWithEffectiveSeqLen(
-            d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_Q_padded.ptr, d_K_padded.ptr, d_V_padded.ptr, d_alpha_padded.ptr, d_beta_padded.ptr, d_A_log.ptr, d_dt_bias.ptr,
             d_padded_out.ptr, nullptr,
             bucket_len, n_heads, d_k, d_v,
             /*chunk_size=*/64, /*use_qk_l2norm=*/true,
             d_effective_len.ptr));
         checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(padded recurrence prefill)");
         ASSERT_TRUE(padded_kernel.recurrent_step(
-            d_Q.ptr + static_cast<size_t>(decode_row) * qk_stride,
-            d_K.ptr + static_cast<size_t>(decode_row) * qk_stride,
-            d_V.ptr + static_cast<size_t>(decode_row) * v_stride,
-            d_alpha.ptr + static_cast<size_t>(decode_row) * n_heads,
-            d_beta.ptr + static_cast<size_t>(decode_row) * n_heads,
+            d_Q_padded.ptr + static_cast<size_t>(decode_row) * qk_stride,
+            d_K_padded.ptr + static_cast<size_t>(decode_row) * qk_stride,
+            d_V_padded.ptr + static_cast<size_t>(decode_row) * v_stride,
+            d_alpha_padded.ptr + static_cast<size_t>(decode_row) * n_heads,
+            d_beta_padded.ptr + static_cast<size_t>(decode_row) * n_heads,
             d_A_log.ptr,
             d_dt_bias.ptr,
             d_padded_out.ptr + static_cast<size_t>(decode_row) * v_stride,
@@ -300,17 +361,17 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedD
         CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
         ref_kernel.allocateGPUState(n_heads * d_k * d_v);
         ASSERT_TRUE(ref_kernel.chunk_forward(
-            d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
             d_ref_out.ptr, nullptr,
             real_len, n_heads, d_k, d_v,
             /*chunk_size=*/64, /*use_qk_l2norm=*/true));
         checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(reference recurrence prefill)");
         ASSERT_TRUE(ref_kernel.recurrent_step(
-            d_Q.ptr + static_cast<size_t>(decode_row) * qk_stride,
-            d_K.ptr + static_cast<size_t>(decode_row) * qk_stride,
-            d_V.ptr + static_cast<size_t>(decode_row) * v_stride,
-            d_alpha.ptr + static_cast<size_t>(decode_row) * n_heads,
-            d_beta.ptr + static_cast<size_t>(decode_row) * n_heads,
+            d_Q_ref.ptr + static_cast<size_t>(decode_row) * qk_stride,
+            d_K_ref.ptr + static_cast<size_t>(decode_row) * qk_stride,
+            d_V_ref.ptr + static_cast<size_t>(decode_row) * v_stride,
+            d_alpha_ref.ptr + static_cast<size_t>(decode_row) * n_heads,
+            d_beta_ref.ptr + static_cast<size_t>(decode_row) * n_heads,
             d_A_log.ptr,
             d_dt_bias.ptr,
             d_ref_out.ptr + static_cast<size_t>(decode_row) * v_stride,
@@ -334,6 +395,111 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedD
         EXPECT_LT(decode.second, 1e-4) << "real_len=" << real_len;
         EXPECT_EQ(tail_abs, 0.0f) << "CUDA recurrence padding rows must be inert for real_len=" << real_len;
     }
+}
+
+TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillCapturesAndLaunchesCudaGraph)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int n_heads = 2;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int real_len = 7;
+    constexpr int bucket_len = 13;
+    constexpr int decode_row = bucket_len;
+    constexpr int total_len = bucket_len + 1;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(total_len) * static_cast<size_t>(v_stride);
+
+    const auto Q = makeSequenceRows(total_len, qk_stride, real_len, bucket_len, 0.0021f, 0.19f, 0.0035f);
+    const auto K = makeSequenceRows(total_len, qk_stride, real_len, bucket_len, -0.0019f, 0.17f, -0.0027f);
+    const auto V = makeSequenceRows(total_len, v_stride, real_len, bucket_len, 0.0025f, 0.23f, 0.0041f);
+    const auto alpha = makeSequenceRows(total_len, n_heads, real_len, bucket_len, 0.025f, 0.8f, 0.031f);
+    const auto beta = makeSequenceRows(total_len, n_heads, real_len, bucket_len, -0.021f, 0.7f, -0.029f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    CudaFloatBuffer d_Q_captured(Q);
+    CudaFloatBuffer d_K_captured(K);
+    CudaFloatBuffer d_V_captured(V);
+    CudaFloatBuffer d_alpha_captured(alpha);
+    CudaFloatBuffer d_beta_captured(beta);
+    CudaFloatBuffer d_Q_ref(Q);
+    CudaFloatBuffer d_K_ref(K);
+    CudaFloatBuffer d_V_ref(V);
+    CudaFloatBuffer d_alpha_ref(alpha);
+    CudaFloatBuffer d_beta_ref(beta);
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_captured_out(output_elems, 123.0f);
+    CudaFloatBuffer d_ref_out(output_elems, -57.0f);
+    CudaIntBuffer d_effective_len(real_len);
+    CudaStreamHandle capture_stream;
+
+    CUDAGatedDeltaNet captured_kernel(cuda_ordinal_);
+    captured_kernel.allocateGPUState(n_heads * d_k * d_v);
+    captured_kernel.setGPUStream(capture_stream.stream);
+    captureAndLaunchOnce(capture_stream.stream, [&] {
+        return captured_kernel.chunkForwardWithEffectiveSeqLen(
+            d_Q_captured.ptr, d_K_captured.ptr, d_V_captured.ptr, d_alpha_captured.ptr, d_beta_captured.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_captured_out.ptr, nullptr,
+            bucket_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true,
+            d_effective_len.ptr);
+    });
+
+    ASSERT_TRUE(captured_kernel.recurrent_step(
+        d_Q_captured.ptr + static_cast<size_t>(decode_row) * qk_stride,
+        d_K_captured.ptr + static_cast<size_t>(decode_row) * qk_stride,
+        d_V_captured.ptr + static_cast<size_t>(decode_row) * v_stride,
+        d_alpha_captured.ptr + static_cast<size_t>(decode_row) * n_heads,
+        d_beta_captured.ptr + static_cast<size_t>(decode_row) * n_heads,
+        d_A_log.ptr,
+        d_dt_bias.ptr,
+        d_captured_out.ptr + static_cast<size_t>(decode_row) * v_stride,
+        nullptr,
+        n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(captured recurrence decode)");
+
+    CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
+    ref_kernel.allocateGPUState(n_heads * d_k * d_v);
+    ASSERT_TRUE(ref_kernel.chunk_forward(
+        d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_ref_out.ptr, nullptr,
+        real_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(reference recurrence prefill)");
+    ASSERT_TRUE(ref_kernel.recurrent_step(
+        d_Q_ref.ptr + static_cast<size_t>(decode_row) * qk_stride,
+        d_K_ref.ptr + static_cast<size_t>(decode_row) * qk_stride,
+        d_V_ref.ptr + static_cast<size_t>(decode_row) * v_stride,
+        d_alpha_ref.ptr + static_cast<size_t>(decode_row) * n_heads,
+        d_beta_ref.ptr + static_cast<size_t>(decode_row) * n_heads,
+        d_A_log.ptr,
+        d_dt_bias.ptr,
+        d_ref_out.ptr + static_cast<size_t>(decode_row) * v_stride,
+        nullptr,
+        n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(reference recurrence decode)");
+
+    const auto captured = d_captured_out.toHost();
+    const auto ref = d_ref_out.toHost();
+    const auto prefix = diffStats(captured, ref, 0, static_cast<size_t>(real_len) * v_stride);
+    const auto decode = diffStats(captured, ref, static_cast<size_t>(decode_row) * v_stride, v_stride);
+    const float tail_abs = maxAbsSpan(
+        captured,
+        static_cast<size_t>(real_len) * v_stride,
+        static_cast<size_t>(bucket_len - real_len) * v_stride);
+
+    EXPECT_LT(prefix.first, 2e-4f);
+    EXPECT_LT(prefix.second, 1e-4);
+    EXPECT_LT(decode.first, 2e-4f);
+    EXPECT_LT(decode.second, 1e-4);
+    EXPECT_EQ(tail_abs, 0.0f) << "Captured CUDA recurrence padding rows must be inert";
 }
 
 TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeState)
@@ -414,6 +580,87 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvEffectivePrefillPreservesDecodeSt
         EXPECT_LT(decode.second, 1e-5) << "real_len=" << real_len;
         EXPECT_EQ(tail_abs, 0.0f) << "CUDA short-conv padding rows must be inert for real_len=" << real_len;
     }
+}
+
+TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvEffectivePrefillCapturesAndLaunchesCudaGraph)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int channels = 32;
+    constexpr int kernel_size = 4;
+    constexpr int real_len = 7;
+    constexpr int bucket_len = 13;
+    constexpr int decode_row = bucket_len;
+    constexpr int total_len = bucket_len + 1;
+    constexpr size_t output_elems = static_cast<size_t>(total_len) * static_cast<size_t>(channels);
+
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto input = makeSequenceRows(total_len, channels, real_len, bucket_len, 0.015f, 3.0f, 0.027f);
+
+    CudaFloatBuffer d_input(input);
+    CudaFloatBuffer d_weight(weight);
+    CudaFloatBuffer d_bias(bias);
+    CudaFloatBuffer d_captured_out(output_elems, 91.0f);
+    CudaFloatBuffer d_ref_out(output_elems, -37.0f);
+    CudaIntBuffer d_effective_len(real_len);
+    CudaStreamHandle capture_stream;
+
+    CUDAShortConvolution captured_kernel(cuda_ordinal_);
+    captured_kernel.allocateGPUState(channels * (kernel_size - 1));
+    captured_kernel.setGPUStream(capture_stream.stream);
+    captureAndLaunchOnce(capture_stream.stream, [&] {
+        return captured_kernel.forwardWithEffectiveSeqLen(
+            d_input.ptr, d_weight.ptr, d_bias.ptr,
+            d_captured_out.ptr, nullptr,
+            bucket_len, channels, kernel_size,
+            d_effective_len.ptr,
+            /*apply_silu=*/true);
+    });
+
+    ASSERT_TRUE(captured_kernel.forward(
+        d_input.ptr + static_cast<size_t>(decode_row) * channels,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_captured_out.ptr + static_cast<size_t>(decode_row) * channels,
+        nullptr,
+        1, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(captured short-conv decode)");
+
+    CUDAShortConvolution ref_kernel(cuda_ordinal_);
+    ref_kernel.allocateGPUState(channels * (kernel_size - 1));
+    ASSERT_TRUE(ref_kernel.forward(
+        d_input.ptr, d_weight.ptr, d_bias.ptr,
+        d_ref_out.ptr, nullptr,
+        real_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(reference short-conv prefill)");
+    ASSERT_TRUE(ref_kernel.forward(
+        d_input.ptr + static_cast<size_t>(decode_row) * channels,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_ref_out.ptr + static_cast<size_t>(decode_row) * channels,
+        nullptr,
+        1, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(reference short-conv decode)");
+
+    const auto captured = d_captured_out.toHost();
+    const auto ref = d_ref_out.toHost();
+    const auto prefix = diffStats(captured, ref, 0, static_cast<size_t>(real_len) * channels);
+    const auto decode = diffStats(captured, ref, static_cast<size_t>(decode_row) * channels, channels);
+    const float tail_abs = maxAbsSpan(
+        captured,
+        static_cast<size_t>(real_len) * channels,
+        static_cast<size_t>(bucket_len - real_len) * channels);
+
+    EXPECT_LT(prefix.first, 1e-5f);
+    EXPECT_LT(prefix.second, 1e-5);
+    EXPECT_LT(decode.first, 1e-5f);
+    EXPECT_LT(decode.second, 1e-5);
+    EXPECT_EQ(tail_abs, 0.0f) << "Captured CUDA short-conv padding rows must be inert";
 }
 
 #endif

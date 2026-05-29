@@ -15,6 +15,7 @@
 
 #include "../../../tensors/TensorKernels.h"
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 
 // Forward declaration of extern "C" kernel wrapper
@@ -71,6 +72,13 @@ namespace llaminar2
         {
             if (gpu_state_ && state_size_ == state_size)
                 return;
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[CUDAShortConvolution] GPU state allocation during graph capture "
+                          "(need "
+                          << state_size << " floats, have " << state_size_ << ")");
+                return;
+            }
             if (gpu_state_)
             {
                 cudaGDN_gpu_set_device(device_ordinal_);
@@ -108,7 +116,24 @@ namespace llaminar2
             bool apply_silu = true) override
         {
             cudaGDN_gpu_set_device(device_ordinal_);
-            float *effective_state = gpu_state_ ? gpu_state_ : conv_state;
+            const int required_state_size = channels * (kernel_size - 1);
+            if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDAShortConvolution::forward] GPU state allocation during graph capture "
+                              "(need "
+                              << required_state_size << " floats, have " << state_size_ << ")");
+                    return false;
+                }
+                allocateState(required_state_size);
+            }
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[CUDAShortConvolution] Missing GPU convolution state");
+                return false;
+            }
+            float *effective_state = gpu_state_;
             float *effective_output = output;
 
             // Prefill runs one thread per timestep/channel. In-place output can
@@ -152,7 +177,24 @@ namespace llaminar2
             bool apply_silu = true) override
         {
             cudaGDN_gpu_set_device(device_ordinal_);
-            float *effective_state = gpu_state_ ? gpu_state_ : conv_state;
+            const int required_state_size = channels * (kernel_size - 1);
+            if (!gpu_state_ || state_size_ != required_state_size)
+            {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDAShortConvolution::forwardWithEffectiveSeqLen] GPU state allocation during graph capture "
+                              "(need "
+                              << required_state_size << " floats, have " << state_size_ << ")");
+                    return false;
+                }
+                allocateState(required_state_size);
+            }
+            if (!gpu_state_)
+            {
+                LOG_ERROR("[CUDAShortConvolution] Missing GPU convolution state");
+                return false;
+            }
+            float *effective_state = gpu_state_;
             float *effective_output = output;
 
             const bool needs_scratch = (seq_len > 1 && input == output);
@@ -221,9 +263,24 @@ namespace llaminar2
                 return true;
             if (scratch_)
             {
+                if (isGraphCaptureActive())
+                {
+                    LOG_ERROR("[CUDAShortConvolution] in-place prefill scratch realloc during graph capture "
+                              "(need "
+                              << scratch_size << " floats, have " << scratch_size_ << ")");
+                    return false;
+                }
                 cudaGDN_gpu_set_device(device_ordinal_);
                 cudaGDN_gpu_free(scratch_);
                 scratch_ = nullptr;
+            }
+
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[CUDAShortConvolution] in-place prefill scratch allocation during graph capture "
+                          "(need "
+                          << scratch_size << " floats)");
+                return false;
             }
 
             scratch_size_ = scratch_size;

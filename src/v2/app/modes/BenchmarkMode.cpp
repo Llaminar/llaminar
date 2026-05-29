@@ -39,16 +39,67 @@ namespace llaminar2
             return oss.str();
         }
 
+        /// @brief Detect whether this benchmark run executes a multi-device
+        ///        (tensor- or pipeline-parallel) configuration whose per-device
+        ///        graphs contain collective stages.
+        ///
+        /// Padded bucketed prefill is intentionally unsupported when collective
+        /// nodes are present (Phase 6 fail-loud guard in ForwardExecutionEngine):
+        /// padding the sequence to a bucket length would desynchronize collective
+        /// sizes across participants. For these runs we must execute the exact
+        /// prefill length instead of a padded bucket.
+        ///
+        /// @param config  Parsed orchestration configuration for this run.
+        /// @param mpi_ctx MPI context (used to detect global/multi-rank TP).
+        /// @return true if the run uses TP/PP collectives and must not bucket prefill.
+        bool benchmarkUsesCollectives(const OrchestrationConfig &config,
+                                      const std::shared_ptr<IMPIContext> &mpi_ctx)
+        {
+            // Simple tensor parallelism (degree or explicit device list).
+            if (config.tp_degree > 1 || config.tp_devices.size() > 1)
+                return true;
+            // Hybrid local/global TP degrees.
+            if (config.tp_local_degree > 1 || config.tp_global_degree > 1)
+                return true;
+            // Pipeline parallelism (simple degree or named domains / pp-stages).
+            if (config.pp_degree > 1 || config.usesNamedDomains())
+                return true;
+            // Global TP/PP distributed across multiple MPI ranks.
+            if (mpi_ctx && mpi_ctx->world_size() > 1)
+                return true;
+            return false;
+        }
+
         /// @brief Opt benchmark mode into production bucketed prefill defaults.
-        void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx)
+        void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx,
+                                               const OrchestrationConfig &config)
         {
             const auto &env = debugEnv();
             const bool user_selected_bucket_mode = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKETS");
             const bool user_selected_bucket_sizes = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
             const bool user_selected_gpu_graphs = env.presence.has("LLAMINAR_GPU_GRAPHS");
+
+            // Multi-device TP/PP runs cannot use padded bucketed prefill (collective
+            // stages would desynchronize). Only auto-enable bucketing for
+            // single-device runs; an explicit user opt-in is still honored (and will
+            // hit the fail-loud guard if it is incompatible with collectives).
+            const bool uses_collectives = benchmarkUsesCollectives(config, mpi_ctx);
+
             if (!user_selected_bucket_mode)
             {
-                setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1", 1);
+                if (uses_collectives)
+                {
+                    if (mpi_ctx && mpi_ctx->rank() == 0)
+                    {
+                        LOG_INFO("[Benchmark] Multi-device (TP/PP) run detected; leaving prefill "
+                                 "graph bucketing disabled (padded buckets are incompatible with "
+                                 "collective stages — running exact prefill length)");
+                    }
+                }
+                else
+                {
+                    setenv("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1", 1);
+                }
             }
             else if (!env.execution.prefill_graph_buckets && !user_selected_gpu_graphs)
             {
@@ -123,7 +174,7 @@ namespace llaminar2
             LOG_DEBUG("Running benchmark mode...");
         }
 
-        configureBenchmarkPrefillBuckets(mpi_ctx);
+        configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config);
 
         auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
 

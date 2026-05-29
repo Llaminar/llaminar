@@ -32,6 +32,7 @@
 #include "tensors/KernelSnapshotInfo.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h" // isGraphCaptureActive()
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
 #include "utils/DebugEnv.h"
@@ -1333,13 +1334,48 @@ namespace llaminar2
                                                debugEnv().gemm.deterministic;
             const bool small_m_stage_stream = (gpu_stream_ != nullptr) && (m <= 16);
 
-            const bool concurrent_eligible = use_blockwise && m > 16 &&
-                                             projections.size() >= 2 &&
-                                             debugEnv().gemm.cuda_concurrent_prefill &&
-                                             !deterministic_prefill &&
-                                             !small_m_stage_stream;
+            // Prefill concurrency: larger prompt M, multi-stream fused projections.
+            // The small-M regime (m <= 16) is intentionally excluded here because the
+            // multi-stream fused path proved unstable in local-PP parity runs.
+            const bool prefill_concurrent_eligible = use_blockwise && m > 16 &&
+                                                     projections.size() >= 2 &&
+                                                     debugEnv().gemm.cuda_concurrent_prefill &&
+                                                     !deterministic_prefill &&
+                                                     !small_m_stage_stream;
 
-            if (concurrent_eligible)
+            // Decode concurrency: m == 1 GEMV projections (e.g. the GDN q/k/v/z and the
+            // tiny alpha/beta gates) dispatched on separate streams so the small,
+            // latency-bound gate GEMVs overlap the larger qkv read instead of running
+            // strictly serially. Gated separately from prefill (LLAMINAR_CUDA_CONCURRENT_DECODE)
+            // because this is single-device decode only; the GEMV path ignores the INT32
+            // accumulator scratch, so no per-stream scratch buffers are required.
+            const bool decode_concurrent_eligible = use_blockwise && m == 1 &&
+                                                    projections.size() >= 2 &&
+                                                    debugEnv().gemm.cuda_concurrent_decode &&
+                                                    !deterministic_prefill;
+
+            const bool concurrent_eligible = prefill_concurrent_eligible || decode_concurrent_eligible;
+            const bool concurrent_decode = decode_concurrent_eligible;
+
+            // CUDA stream/event creation (pool.init) is illegal while a graph capture is
+            // active. The pool is initialized during the eager warmup step (step 0) that
+            // precedes capture, so by the time the captured decode runs it is already
+            // initialized. Guard defensively: if capture is active and the pool has not
+            // yet been initialized, fall back to the sequential path rather than issue an
+            // illegal allocation inside the capture.
+            bool concurrent_safe = concurrent_eligible;
+            if (concurrent_eligible && isGraphCaptureActive())
+            {
+                auto &pool_check = getSharedCUDAPrefillPool(cuda_device_id_);
+                if (!pool_check.initialized)
+                {
+                    LOG_DEBUG("[ConcurrentGemm] Graph capture active but stream pool not "
+                              "initialized; using sequential fallback");
+                    concurrent_safe = false;
+                }
+            }
+
+            if (concurrent_safe)
             {
                 const int num_proj = static_cast<int>(projections.size());
                 auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
@@ -1364,16 +1400,24 @@ namespace llaminar2
 
                     // Use per-stream scratch buffer instead of shared workspace ACC_INT32
                     // to avoid write-after-write races between concurrent projections.
+                    // The decode (m == 1) GEMV path ignores the INT32 accumulator entirely
+                    // (it reduces directly into FP32 via the per-kernel GEMV context), so we
+                    // skip the scratch allocation there — this also keeps the captured-decode
+                    // path free of any cudaMalloc.
                     int stream_idx = pi % pool.count;
-                    size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
-                    if (!pool.ensureScratch(stream_idx, acc_elements))
+                    int32_t *proj_d_C_int32 = nullptr;
+                    if (!concurrent_decode)
                     {
-                        throw std::runtime_error(
-                            "[ConcurrentPrefill] Failed to allocate scratch for projection " +
-                            std::to_string(pi) + " (" + std::to_string(acc_elements * sizeof(int32_t)) +
-                            " bytes) — GPU OOM");
+                        size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
+                        if (!pool.ensureScratch(stream_idx, acc_elements))
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Failed to allocate scratch for projection " +
+                                std::to_string(pi) + " (" + std::to_string(acc_elements * sizeof(int32_t)) +
+                                " bytes) — GPU OOM");
+                        }
+                        proj_d_C_int32 = pool.scratch[stream_idx];
                     }
-                    int32_t *proj_d_C_int32 = pool.scratch[stream_idx];
 
                     auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
                     if (!fp32_output)

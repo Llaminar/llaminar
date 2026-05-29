@@ -732,6 +732,7 @@ namespace llaminar2
     // Forward declarations for CUDA sampling kernels (CUDASamplingKernels.cu)
     extern "C" bool cudaOps_argmax_f32(
         const float *data, int n, float *out_value, int *out_index,
+        float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream);
 
     extern "C" bool cudaOps_topk_f32(
@@ -739,12 +740,15 @@ namespace llaminar2
         int device_idx, void *stream);
 
     bool CUDABackend::argmaxF32(const void *data_device, int n, int device_id,
-                                float *out_value, int *out_index, void *stream)
+                                float *out_value, int *out_index, void *stream,
+                                void *partial_vals, void *partial_idxs, int partial_capacity)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0)
             return false;
 
-        // Lazily allocate per-device result buffers
+        // Lazily allocate the tiny per-device D2H result staging buffers (8 bytes
+        // total). The larger partial-reduction scratch is NOT allocated here — it
+        // is owned by the orchestrator's BufferArena and supplied by the caller.
         if (argmax_buffers_.empty())
             argmax_buffers_.resize(device_count_);
 
@@ -768,16 +772,26 @@ namespace llaminar2
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
         cudaStream_t s = resolveStream(device_id, stream);
+        // Pass the caller-supplied partial scratch through to the kernel wrapper.
+        // When partial_vals/partial_idxs are null (or capacity < 1), the wrapper
+        // transparently falls back to a single-block reduction.
         if (!cudaOps_argmax_f32(
                 static_cast<const float *>(data_device), n,
                 static_cast<float *>(bufs.value_ptr),
                 static_cast<int *>(bufs.index_ptr),
+                static_cast<float *>(partial_vals),
+                static_cast<int *>(partial_idxs),
+                partial_capacity,
                 device_id, s))
         {
             return false;
         }
 
-        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
+        // The argmax kernel and the two D2H copies are all enqueued on stream `s`,
+        // so stream ordering already guarantees the copies observe the kernel's
+        // results. A single synchronize after the copies is sufficient — an
+        // intermediate sync between the kernel and the copies would add a
+        // redundant host<->GPU round-trip on the per-decode-step hot path.
         CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), cudaMemcpyDeviceToHost, s));
         CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), cudaMemcpyDeviceToHost, s));
         CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));

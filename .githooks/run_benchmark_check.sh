@@ -101,6 +101,8 @@ FAILED_CHECKS=""
 # ---------------------------------------------------------------------------
 # Run benchmarks for all models × devices
 # ---------------------------------------------------------------------------
+BENCHMARK_DEFAULT_ENV="LLAMINAR_GPU_STAGE_TIMING=0"
+
 for (( mi=0; mi<NUM_MODELS; mi++ )); do
     MODEL_NAME=$(jq -r ".models[$mi].name" "$BASELINE_FILE")
     MODEL=$(jq -r ".models[$mi].model" "$BASELINE_FILE")
@@ -108,9 +110,9 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
     DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
 
     # Optional per-model environment variables (e.g. LLAMINAR_MOE_REBALANCE=off)
-    ENV_PREFIX=""
+    ENV_PREFIX="$BENCHMARK_DEFAULT_ENV"
     if jq -e ".models[$mi].env" "$BASELINE_FILE" > /dev/null 2>&1; then
-        ENV_PREFIX=$(jq -r ".models[$mi].env | to_entries[] | \"\(.key)=\(.value)\"" "$BASELINE_FILE" | tr '\n' ' ')
+        ENV_PREFIX="$ENV_PREFIX $(jq -r ".models[$mi].env | to_entries[] | \"\(.key)=\(.value)\"" "$BASELINE_FILE" | tr '\n' ' ')"
     fi
 
     MODEL_PATH="$ROOT_DIR/$MODEL"

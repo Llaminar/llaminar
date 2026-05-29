@@ -80,10 +80,16 @@ namespace llaminar2
             float max_val = -std::numeric_limits<float>::infinity();
             int max_idx = 0;
 
+            // Drive the multi-block argmax with the runner's arena-owned scratch
+            // (null/zero capacity -> argmaxF32 fails, and we degrade to host-side
+            // sampling below). No allocation happens on this hot path.
             if (!backend->argmaxF32(info.gpu_ptr,
                                     static_cast<int>(info.vocab_local),
                                     info.device->gpu_ordinal(),
-                                    &max_val, &max_idx, info.stream))
+                                    &max_val, &max_idx, info.stream,
+                                    info.argmax_partial_vals,
+                                    info.argmax_partial_idxs,
+                                    info.argmax_partial_capacity))
             {
                 LOG_TRACE("[DeviceSampler::sampleGreedy] argmaxF32 failed for device "
                           << info.device->toString());

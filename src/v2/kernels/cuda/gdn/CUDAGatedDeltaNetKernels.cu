@@ -208,7 +208,7 @@ namespace
     //      independent, so no __syncthreads() in the column processing body.
     // =========================================================================
 
-    __global__ void cuda_gdn_chunk_forward_kernel(
+    __global__ __launch_bounds__(256, 2) void cuda_gdn_chunk_forward_kernel(
         const float *__restrict__ Q,        // [seq_len, n_heads * d_k]
         const float *__restrict__ K,        // [seq_len, n_heads * d_k]
         const float *__restrict__ V,        // [seq_len, n_heads * d_v]
@@ -220,7 +220,8 @@ namespace
         float *__restrict__ state,          // [n_heads, d_k, d_v]
         const int *__restrict__ effective_seq_len_ptr,
         int seq_len, int n_heads, int d_k, int d_v,
-        bool use_qk_l2norm)
+        bool use_qk_l2norm,
+        bool inputs_preprocessed)
     {
         const int h = blockIdx.x;
         if (h >= n_heads)
@@ -232,7 +233,8 @@ namespace
         // Row-split parallelism: ROW_SPLIT threads collaborate on each
         // column, splitting the d_k rows between them. With ROW_SPLIT=4 and
         // 256 threads/block: 8 warps/block — optimal for Ampere L1 latency.
-        constexpr int ROW_SPLIT = 4;
+        constexpr int ROW_SPLIT = 8;
+        constexpr int ROWS_PER_SPLIT = 16;
         const int cols_per_block = block_size / ROW_SPLIT;
         const int split_id = tid / cols_per_block; // 0..ROW_SPLIT-1
         const int col_in_block = tid % cols_per_block;
@@ -253,21 +255,46 @@ namespace
         float *reduce_kv = smem + 2 * d_k + 16;               // [block_size]
         float *reduce_out = smem + 2 * d_k + 16 + block_size; // [block_size]
 
-        // Pre-load A_log and dt_bias (constant across timesteps)
+        // Pre-load A_log and dt_bias only for the legacy in-kernel preprocessing
+        // path. Captured prefill uses the separate preprocess kernel and skips
+        // this uniform barrier on the hot recurrence path.
         __shared__ float A_log_h;
         __shared__ float dt_bias_h;
-        if (tid == 0)
+        if (!inputs_preprocessed)
         {
-            A_log_h = A_log[h];
-            dt_bias_h = dt_bias[h];
+            if (tid == 0)
+            {
+                A_log_h = A_log[h];
+                dt_bias_h = dt_bias[h];
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
         int effective_seq_len = seq_len;
         if (effective_seq_len_ptr)
         {
             const int raw_effective = *effective_seq_len_ptr;
             effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+        }
+
+        // Keep this thread's recurrence-state slice resident across the entire
+        // prefill. The recurrence is sequential in time, but each (head, column,
+        // row-split) lane owns the same 32 state rows for every token; loading
+        // them once removes hundreds of global-memory passes at bucket sizes.
+        const int j_start = split_id * ROWS_PER_SPLIT;
+        float sc[ROWS_PER_SPLIT];
+
+        if (vi < d_v)
+        {
+#pragma unroll
+            for (int j = 0; j < ROWS_PER_SPLIT; ++j)
+                sc[j] = S[(j_start + j) * d_v + vi];
+        }
+        else
+        {
+#pragma unroll
+            for (int j = 0; j < ROWS_PER_SPLIT; ++j)
+                sc[j] = 0.0f;
         }
 
         // Process each timestep sequentially (inherent to recurrence)
@@ -293,8 +320,11 @@ namespace
             }
             __syncthreads();
 
-            // L2 normalize Q and K
-            if (use_qk_l2norm)
+            // Q/K and gate preprocessing can be shared by all column tiles. The
+            // CUDA wrapper runs that separate graph-capturable kernel for
+            // prefill so this recurrence kernel only handles the sequential
+            // delta-rule state update.
+            if (!inputs_preprocessed && use_qk_l2norm)
             {
                 int warp_id = tid / 32;
                 int lane_id = tid % 32;
@@ -344,7 +374,7 @@ namespace
                     k_local[i] *= k_inv;
                 __syncthreads();
             }
-            else
+            else if (!inputs_preprocessed)
             {
                 for (int i = tid; i < d_k; i += block_size)
                     q_local[i] *= scale;
@@ -353,74 +383,168 @@ namespace
 
             // Gate and beta (thread 0 computes, broadcast via shared mem)
             float decay, beta_h;
+            if (inputs_preprocessed)
+            {
+                const int gate_idx = t * n_heads + h;
+                decay = alpha[gate_idx];
+                beta_h = beta_raw[gate_idx];
+            }
+            else
+            {
+                if (tid == 0)
+                {
+                    float x = alpha[t * n_heads + h] + dt_bias_h;
+                    float sp = (x > 20.0f) ? x : log1pf(expf(x));
+                    warp_sums[0] = expf(A_log_h * sp);
+                    warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[t * n_heads + h]));
+                }
+                __syncthreads();
+                decay = warp_sums[0];
+                beta_h = warp_sums[1];
+            }
+
+            float partial_kv = 0.0f;
+            if (vi < d_v)
+            {
+#pragma unroll
+                for (int j = 0; j < ROWS_PER_SPLIT; ++j)
+                {
+                    sc[j] *= decay;
+                    partial_kv += sc[j] * k_local[j_start + j];
+                }
+            }
+            reduce_kv[tid] = partial_kv;
+            __syncthreads();
+
+            float delta = 0.0f;
+            if (vi < d_v)
+            {
+                float kv = 0.0f;
+                for (int s = 0; s < ROW_SPLIT; s++)
+                    kv += reduce_kv[col_in_block + s * cols_per_block];
+                delta = (v_src[vi] - kv) * beta_h;
+            }
+
+            float partial_out = 0.0f;
+            if (vi < d_v)
+            {
+#pragma unroll
+                for (int j = 0; j < ROWS_PER_SPLIT; ++j)
+                {
+                    sc[j] += k_local[j_start + j] * delta;
+                    partial_out += sc[j] * q_local[j_start + j];
+                }
+            }
+            reduce_out[tid] = partial_out;
+            __syncthreads();
+
+            if (vi < d_v && split_id == 0)
+            {
+                float out_vi = 0.0f;
+                for (int s = 0; s < ROW_SPLIT; s++)
+                    out_vi += reduce_out[col_in_block + s * cols_per_block];
+                o_dst[vi] = out_vi;
+            }
+        }
+
+        if (vi < d_v)
+        {
+#pragma unroll
+            for (int j = 0; j < ROWS_PER_SPLIT; ++j)
+                S[(j_start + j) * d_v + vi] = sc[j];
+        }
+    }
+
+    __global__ void cuda_gdn_prefill_preprocess_kernel(
+        float *__restrict__ Q,
+        float *__restrict__ K,
+        float *__restrict__ alpha,
+        float *__restrict__ beta_raw,
+        const float *__restrict__ A_log,
+        const float *__restrict__ dt_bias,
+        int seq_len, int n_heads, int d_k,
+        bool use_qk_l2norm)
+    {
+        const int h = blockIdx.x;
+        const int t = blockIdx.y;
+        if (h >= n_heads || t >= seq_len)
+            return;
+
+        const int tid = threadIdx.x;
+        const int block_size = blockDim.x;
+        const int qk_stride = n_heads * d_k;
+        const float scale = rsqrtf(static_cast<float>(d_k));
+
+        float *q_head = Q + t * qk_stride + h * d_k;
+        float *k_head = K + t * qk_stride + h * d_k;
+
+        __shared__ float warp_sums[8];
+        const int warp_id = tid / 32;
+        const int lane_id = tid % 32;
+        const int num_warps = (block_size + 31) / 32;
+
+        if (use_qk_l2norm)
+        {
+            float q_sum = 0.0f;
+            for (int i = tid; i < d_k; i += block_size)
+            {
+                const float qv = q_head[i];
+                q_sum += qv * qv;
+            }
+            for (int offset = 16; offset > 0; offset >>= 1)
+                q_sum += __shfl_xor_sync(0xFFFFFFFF, q_sum, offset);
+            if (lane_id == 0)
+                warp_sums[warp_id] = q_sum;
+            __syncthreads();
             if (tid == 0)
             {
-                float x = alpha[t * n_heads + h] + dt_bias_h;
-                float sp = (x > 20.0f) ? x : log1pf(expf(x));
-                warp_sums[0] = expf(A_log_h * sp);
-                warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[t * n_heads + h]));
+                float total = 0.0f;
+                for (int w = 0; w < num_warps; ++w)
+                    total += warp_sums[w];
+                warp_sums[0] = total;
             }
             __syncthreads();
-            decay = warp_sums[0];
-            beta_h = warp_sums[1];
+            const float q_inv = scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+            for (int i = tid; i < d_k; i += block_size)
+                q_head[i] *= q_inv;
+            __syncthreads();
 
-            // Row-split column processing with register caching:
-            // Each thread caches its d_k/ROW_SPLIT rows (32 floats for ROW_SPLIT=4)
-            // in an array that nvcc keeps in registers. This eliminates the
-            // second read of S per pass (1R+1W vs 2R+1W = 33% memory savings).
-            // 32 floats + ~20 other regs ≈ 52 regs/thread — well within budget.
+            float k_sum = 0.0f;
+            for (int i = tid; i < d_k; i += block_size)
             {
-                constexpr int ROWS_PER_SPLIT = 32; // d_k(128) / ROW_SPLIT(4)
-                const int j_start = split_id * ROWS_PER_SPLIT;
-
-                // Pass 1: Load S into register cache + partial kv dot product
-                float s_cache[ROWS_PER_SPLIT];
-                float partial_kv = 0.0f;
-                if (vi < d_v)
-                {
-                    for (int j = 0; j < ROWS_PER_SPLIT; j++)
-                    {
-                        float s = S[(j_start + j) * d_v + vi] * decay;
-                        s_cache[j] = s;
-                        partial_kv += s * k_local[j_start + j];
-                    }
-                }
-                reduce_kv[tid] = partial_kv;
-                __syncthreads();
-
-                // Reduce kv across all splits and compute delta
-                float delta = 0.0f;
-                if (vi < d_v)
-                {
-                    float kv = 0.0f;
-                    for (int s = 0; s < ROW_SPLIT; s++)
-                        kv += reduce_kv[col_in_block + s * cols_per_block];
-                    delta = (v_src[vi] - kv) * beta_h;
-                }
-
-                // Pass 2: Update from register cache + partial output (no re-read)
-                float partial_out = 0.0f;
-                if (vi < d_v)
-                {
-                    for (int j = 0; j < ROWS_PER_SPLIT; j++)
-                    {
-                        float s_new = s_cache[j] + k_local[j_start + j] * delta;
-                        S[(j_start + j) * d_v + vi] = s_new;
-                        partial_out += s_new * q_local[j_start + j];
-                    }
-                }
-                reduce_out[tid] = partial_out;
-                __syncthreads();
-
-                // Reduce output and write (only split_id=0 writes)
-                if (vi < d_v && split_id == 0)
-                {
-                    float out_vi = 0.0f;
-                    for (int s = 0; s < ROW_SPLIT; s++)
-                        out_vi += reduce_out[col_in_block + s * cols_per_block];
-                    o_dst[vi] = out_vi;
-                }
+                const float kv = k_head[i];
+                k_sum += kv * kv;
             }
+            for (int offset = 16; offset > 0; offset >>= 1)
+                k_sum += __shfl_xor_sync(0xFFFFFFFF, k_sum, offset);
+            if (lane_id == 0)
+                warp_sums[warp_id] = k_sum;
+            __syncthreads();
+            if (tid == 0)
+            {
+                float total = 0.0f;
+                for (int w = 0; w < num_warps; ++w)
+                    total += warp_sums[w];
+                warp_sums[0] = total;
+            }
+            __syncthreads();
+            const float k_inv = 1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
+            for (int i = tid; i < d_k; i += block_size)
+                k_head[i] *= k_inv;
+        }
+        else
+        {
+            for (int i = tid; i < d_k; i += block_size)
+                q_head[i] *= scale;
+        }
+
+        if (tid == 0)
+        {
+            const int gate_idx = t * n_heads + h;
+            const float x = alpha[gate_idx] + dt_bias[h];
+            const float sp = (x > 20.0f) ? x : log1pf(expf(x));
+            alpha[gate_idx] = expf(A_log[h] * sp);
+            beta_raw[gate_idx] = 1.0f / (1.0f + expf(-beta_raw[gate_idx]));
         }
     }
 
@@ -882,27 +1006,40 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
-        // 8 warps/block — optimal for Ampere L1 latency hiding.
+        // Row-split: 256 threads per block, 8 threads per column = 32 cols/block.
+        // More column blocks keep Ampere GPUs occupied during the sequential recurrence.
         int col_threads = 256;
-        int cols_per_block = col_threads / 4; // 64 columns per block
+        int cols_per_block = col_threads / 8; // 32 columns per block
         if (d_v <= 64)
         {
             col_threads = 128;
-            cols_per_block = col_threads / 4; // 32 columns per block
+            cols_per_block = col_threads / 8; // 16 columns per block
         }
         int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
         // smem: q_local[d_k] + k_local[d_k] + warp_sums[16] + reduce_kv[col_threads] + reduce_out[col_threads]
         int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
+
+        cuda_gdn_prefill_preprocess_kernel<<<dim3(n_heads, seq_len), 64, 0, (cudaStream_t)stream>>>(
+            const_cast<float *>(Q), const_cast<float *>(K),
+            const_cast<float *>(alpha), const_cast<float *>(beta_raw),
+            A_log, dt_bias,
+            seq_len, n_heads, d_k, use_qk_l2norm);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[cudaGDN_prefill_preprocess] %s\n", cudaGetErrorString(err));
+            return false;
+        }
 
         dim3 grid(n_heads, num_col_blocks);
         cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
             nullptr,
-            seq_len, n_heads, d_k, d_v, use_qk_l2norm);
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            true);
 
-        cudaError_t err = cudaGetLastError();
+        err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[cudaGDN_chunk_forward] %s\n", cudaGetErrorString(err));
@@ -924,23 +1061,36 @@ extern "C"
         cudaSetDevice(device_idx);
 
         int col_threads = 256;
-        int cols_per_block = col_threads / 4;
+        int cols_per_block = col_threads / 8;
         if (d_v <= 64)
         {
             col_threads = 128;
-            cols_per_block = col_threads / 4;
+            cols_per_block = col_threads / 8;
         }
         int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
         int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
+
+        cuda_gdn_prefill_preprocess_kernel<<<dim3(n_heads, seq_len), 64, 0, (cudaStream_t)stream>>>(
+            const_cast<float *>(Q), const_cast<float *>(K),
+            const_cast<float *>(alpha), const_cast<float *>(beta_raw),
+            A_log, dt_bias,
+            seq_len, n_heads, d_k, use_qk_l2norm);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[cudaGDN_prefill_preprocess_effective] %s\n", cudaGetErrorString(err));
+            return false;
+        }
 
         dim3 grid(n_heads, num_col_blocks);
         cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
             device_effective_seq_len,
-            seq_len, n_heads, d_k, d_v, use_qk_l2norm);
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            true);
 
-        cudaError_t err = cudaGetLastError();
+        err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             fprintf(stderr, "[cudaGDN_chunk_forward_effective] %s\n", cudaGetErrorString(err));

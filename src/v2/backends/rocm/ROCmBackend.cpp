@@ -319,10 +319,12 @@ namespace llaminar2
     // Forward declaration for HIP argmax kernel (implemented in ROCmArgmaxKernels.hip)
     extern "C" bool rocmOps_argmax_f32(
         const float *data, int n, float *out_value, int *out_index,
+        float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream);
 
     bool ROCmBackend::argmaxF32(const void *data_device, int n, int device_id,
-                                float *out_value, int *out_index, void *stream)
+                                float *out_value, int *out_index, void *stream,
+                                void *partial_vals, void *partial_idxs, int partial_capacity)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0)
             return false;
@@ -352,10 +354,16 @@ namespace llaminar2
         // Launch kernel on device's managed stream
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
         hipStream_t s = resolveStream(device_id, stream);
+        // Pass the caller-supplied partial scratch through to the kernel wrapper.
+        // The scratch is mandatory (arena-owned); the wrapper fails loud if it is
+        // missing or undersized — there is no single-block fallback.
         if (!rocmOps_argmax_f32(
                 static_cast<const float *>(data_device), n,
                 static_cast<float *>(bufs.value_ptr),
                 static_cast<int *>(bufs.index_ptr),
+                static_cast<float *>(partial_vals),
+                static_cast<int *>(partial_idxs),
+                partial_capacity,
                 device_id, s))
         {
             return false;
