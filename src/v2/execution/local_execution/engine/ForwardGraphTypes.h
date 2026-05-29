@@ -254,14 +254,15 @@ namespace llaminar2
         bool prefill_replay_param_stages_cached = false;
 
         // Tracks whether setGPUStream has been applied to all stages.
-        // The capture_stream never changes once set, so we skip the
-        // 339-stage loop on subsequent decode steps.
+        // Decode graph replay reapplies the capture stream before dynamic
+        // params because manual/collective segments may temporarily bind a
+        // different stream during execution.
         bool gpu_stream_applied = false;
 
-        // The stream pointer that was last applied to all stages. If
-        // segment_cache.reset() destroys the capture_stream and a new one is
-        // created, we must re-apply it to avoid stages holding a dangling
-        // stream pointer.
+        // The stream pointer that was last applied to all stages. Replay-state
+        // resets preserve the capture stream, but workspace rebinds and full
+        // invalidation can still force a new stream binding epoch. Track the
+        // pointer so cached stages are rebound whenever that epoch changes.
         void *applied_stream = nullptr;
 
         // Tracks whether Phase 3 graph replay is active (no markCompleted calls),
@@ -321,11 +322,7 @@ namespace llaminar2
                 gpu_graph->reset();
                 gpu_graph.reset();
             }
-            segment_cache.segments.clear();
-            segment_cache.initialized = false;
-            segment_cache.needs_capture = false;
-            segment_cache.consecutive_failures = 0;
-            segment_cache.decode_step = 0;
+            segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
             gpu_graph_update_failures = 0;
             phase3_active = false;
         }
@@ -379,6 +376,7 @@ namespace llaminar2
         void invalidate()
         {
             resetReplayState();
+            segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
             if (prefill_graph_cache)
                 prefill_graph_cache->invalidateAll();
             prefill_capture_stream.reset();

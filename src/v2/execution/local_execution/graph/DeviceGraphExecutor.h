@@ -380,6 +380,19 @@ namespace llaminar2
          */
         struct GraphSegmentCache
         {
+            /**
+             * @brief Controls whether reset() keeps the explicit capture stream alive.
+             *
+             * Preserve is used for recapture/retry state resets where cached stages
+             * may still hold the stream pointer. Destroy is reserved for teardown or
+             * cache invalidation where no stage will execute again before rebinding.
+             */
+            enum class StreamResetPolicy
+            {
+                Preserve,
+                Destroy
+            };
+
             std::vector<GraphSegment> segments;       ///< Ordered segments
             bool initialized = false;                 ///< Whether segments have been built
             bool needs_capture = false;               ///< True after warmup, before capture
@@ -435,7 +448,7 @@ namespace llaminar2
             GraphSegmentCache(const GraphSegmentCache &) = delete;
             GraphSegmentCache &operator=(const GraphSegmentCache &) = delete;
 
-            void reset()
+            void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
             {
                 segments.clear();
                 initialized = false;
@@ -443,7 +456,8 @@ namespace llaminar2
                 consecutive_failures = 0;
                 decode_step = 0;
                 destroySyncEvent();
-                destroyCaptureStream();
+                if (stream_policy == StreamResetPolicy::Destroy)
+                    destroyCaptureStream();
             }
 
             /// Create a local blocking stream for graph capture via the GPU context.

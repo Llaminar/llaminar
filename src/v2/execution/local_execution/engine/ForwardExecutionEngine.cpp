@@ -746,59 +746,69 @@ namespace llaminar2
             setup_stream_t0 = setup_token_copy_t1;
         }
 
-        // For GPU graph replay: set the capture stream on all stages.
-        // Normally the capture_stream never changes between decode steps,
-        // but segment_cache.reset() (on capture retry or repeated replay
-        // failures) destroys the stream and the next call creates a NEW one.
-        // We track the last applied stream pointer and re-apply whenever it
-        // changes so stages never hold a dangling/stale stream.
-        //
-        // Critical: if capture_stream was destroyed but not yet recreated
-        // (e.g. between segment_cache.reset() and the next warmup phase),
-        // applied_stream points at freed memory. Fall back to the device's
-        // default stream for this forward pass so updateDynamicParams and
-        // any stage kernels issue work on a live stream. The warmup phase
-        // will re-apply the fresh capture_stream to all stages before
-        // capture is attempted again.
-        void *replay_stream = forward_cache.segment_cache.capture_stream;
-        if (!replay_stream && forward_cache.applied_stream != nullptr)
-        {
-            // capture_stream was destroyed — previously applied stream is
-            // now invalid. Fall back to the context's default stream.
-            IDeviceContext *fallback_ctx = host.getDeviceContext(input.device);
-            void *fallback_stream = nullptr;
-            if (fallback_ctx && fallback_ctx->deviceId().is_gpu())
-            {
-                auto &pool = GPUDeviceContextPool::instance();
-                IWorkerGPUContext &gpu_ctx = pool.getContext(fallback_ctx->deviceId());
-                fallback_stream = gpu_ctx.defaultStream();
-            }
-            if (fallback_stream && fallback_stream != forward_cache.applied_stream)
-            {
-                const auto &order = forward_cache.graph->getExecutionOrder();
-                for (const auto &node_name : order)
-                {
-                    ComputeNode *node = forward_cache.graph->getNode(node_name);
-                    if (node && node->stage)
-                        node->stage->setGPUStream(fallback_stream);
-                }
-                forward_cache.applied_stream = fallback_stream;
-                // Leave gpu_stream_applied=true so warmup will still detect
-                // the pointer change when it installs the new capture_stream.
-            }
-        }
-        else if (replay_stream && (!forward_cache.gpu_stream_applied ||
-                                   forward_cache.applied_stream != replay_stream))
+        // For GPU graph replay: set an explicit capture stream on all stages
+        // before dynamic params are updated. The stream is owned by the segment
+        // cache and survives ordinary replay-state resets, so stages never need
+        // to fall back to the device context's default stream between a failed
+        // replay/capture and the next warmup attempt.
+        auto apply_cached_graph_stream = [&](void *stream)
         {
             const auto &order = forward_cache.graph->getExecutionOrder();
             for (const auto &node_name : order)
             {
                 ComputeNode *node = forward_cache.graph->getNode(node_name);
                 if (node && node->stage)
-                    node->stage->setGPUStream(replay_stream);
+                    node->stage->setGPUStream(stream);
             }
             forward_cache.gpu_stream_applied = true;
-            forward_cache.applied_stream = replay_stream;
+            forward_cache.applied_stream = stream;
+        };
+
+        void *replay_stream = forward_cache.segment_cache.capture_stream;
+
+        if (is_decode && input.device.is_gpu())
+        {
+            IDeviceContext *stream_ctx = host.getDeviceContext(input.device);
+            if (stream_ctx && stream_ctx->deviceId().is_gpu())
+            {
+                const auto early_capture_policy = host.buildDecodeCapturePolicy(
+                    !forward_cache.collective_nodes.empty(),
+                    stream_ctx,
+                    forward_cache.segment_cache.consecutive_failures);
+
+                if (early_capture_policy.allow_segmented_capture &&
+                    forward_cache.segment_cache.consecutive_failures < early_capture_policy.max_segment_failures)
+                {
+                    auto &pool = GPUDeviceContextPool::instance();
+                    IWorkerGPUContext &gpu_ctx = pool.getContext(stream_ctx->deviceId());
+
+                    // Keep the context/default stream handles for the executor's
+                    // existing policy interface, but bind stages to capture_stream.
+                    forward_cache.gpu_ctx = &gpu_ctx;
+                    if (!forward_cache.gpu_stream)
+                        forward_cache.gpu_stream = gpu_ctx.defaultStream();
+
+                    if (forward_cache.segment_cache.ensureCaptureStream(&gpu_ctx))
+                    {
+                        replay_stream = forward_cache.segment_cache.capture_stream;
+                    }
+                    else
+                    {
+                        LOG_WARN("[ForwardExecutionEngine] Failed to create explicit decode graph stream for "
+                                 << stream_ctx->deviceId().toString()
+                                 << "; segmented graph replay will fall back without rebinding stages to defaultStream");
+                    }
+                }
+            }
+        }
+
+        if (replay_stream)
+        {
+            // Segmented replay can temporarily bind collective/manual stages to
+            // a separate compute stream. Re-apply the capture stream on every
+            // cached decode hit so updateDynamicParams() always launches any
+            // device work on the graph stream before the phase controller runs.
+            apply_cached_graph_stream(replay_stream);
         }
 
         if (!is_decode && input.device.is_gpu())
@@ -813,15 +823,7 @@ namespace llaminar2
                     void *prefill_stream = forward_cache.prefill_capture_stream.stream;
                     if (prefill_stream && forward_cache.applied_stream != prefill_stream)
                     {
-                        const auto &order = forward_cache.graph->getExecutionOrder();
-                        for (const auto &node_name : order)
-                        {
-                            ComputeNode *node = forward_cache.graph->getNode(node_name);
-                            if (node && node->stage)
-                                node->stage->setGPUStream(prefill_stream);
-                        }
-                        forward_cache.gpu_stream_applied = true;
-                        forward_cache.applied_stream = prefill_stream;
+                        apply_cached_graph_stream(prefill_stream);
                     }
                 }
             }

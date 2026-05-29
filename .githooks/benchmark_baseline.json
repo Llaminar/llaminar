@@ -8,10 +8,10 @@
       "decode_tokens": 128,
       "devices": {
         "cuda:0": {
-          "prefill_tok_s": 4830.25,
+          "prefill_tok_s": 4915.22,
           "decode_tok_s": 93.97,
           "regression_threshold_pct": 5,
-          "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "rocm:0": {
           "prefill_tok_s": 1183.62,
@@ -39,10 +39,10 @@
           "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cuda:0": {
-          "prefill_tok_s": 5884.77,
+          "prefill_tok_s": 5910.97,
           "decode_tok_s": 144.96,
           "regression_threshold_pct": 10,
-          "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "rocm:0": {
           "prefill_tok_s": 1668.46,
@@ -92,10 +92,10 @@
           "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "rocm:0": {
-          "prefill_tok_s": 228.92,
-          "decode_tok_s": 28.06,
+          "prefill_tok_s": 229.32,
+          "decode_tok_s": 28.08,
           "regression_threshold_pct": 10,
-          "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     },
@@ -105,11 +105,11 @@
       "decode_tokens": 128,
       "devices": {
         "tp": {
-          "prefill_tok_s": 352.12,
-          "decode_tok_s": 27.91,
+          "prefill_tok_s": 352.35,
+          "decode_tok_s": 29.43,
           "regression_threshold_pct": 10,
           "extra_flags": "--tp-devices rocm:0,rocm:1",
-          "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     },
@@ -120,10 +120,10 @@
       "devices": {
         "pp": {
           "prefill_tok_s": 274.37,
-          "decode_tok_s": 17.45,
+          "decode_tok_s": 17.51,
           "regression_threshold_pct": 10,
           "extra_flags": "--define-domain cuda_pp=cuda:0 --define-domain rocm_pp=rocm:0 --pp-stage 0=cuda_pp:0-15 --pp-stage 1=rocm_pp:16-63",
-          "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "_comment": "High-water mark set at commit 3fbb4879 on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         }
       }
     }

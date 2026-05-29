@@ -348,7 +348,7 @@ namespace llaminar2
                     if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
                     {
                         LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
-                        segment_cache.reset();
+                        segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
                     }
                     graph.reset();
                     return executeFastDecode(graph, ctx, collective_nodes);
@@ -554,7 +554,7 @@ namespace llaminar2
 
             if (capture_result.reset_cache)
             {
-                segment_cache.reset();
+                segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
             }
 
             if (!capture_result.success)

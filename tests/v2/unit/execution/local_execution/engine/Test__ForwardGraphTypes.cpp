@@ -240,3 +240,61 @@ TEST(Test__ForwardGraphCache, InvalidateIdempotent)
     EXPECT_FALSE(cache.valid);
     EXPECT_TRUE(cache.token_ids.empty());
 }
+
+TEST(Test__GraphSegmentCache, ResetCanPreserveCaptureStream)
+{
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    void *stream = reinterpret_cast<void *>(0x1234);
+
+    cache.initialized = true;
+    cache.needs_capture = true;
+    cache.consecutive_failures = 2;
+    cache.decode_step = 17;
+    cache.capture_stream = stream;
+
+    cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+
+    EXPECT_FALSE(cache.initialized);
+    EXPECT_FALSE(cache.needs_capture);
+    EXPECT_EQ(cache.consecutive_failures, 0);
+    EXPECT_EQ(cache.decode_step, 0u);
+    EXPECT_EQ(cache.capture_stream, stream);
+}
+
+TEST(Test__GraphSegmentCache, ResetCanDestroyCaptureStream)
+{
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.capture_stream = reinterpret_cast<void *>(0x1234);
+
+    cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+
+    EXPECT_EQ(cache.capture_stream, nullptr);
+}
+
+TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
+{
+    ForwardGraphCache cache;
+    void *stream = reinterpret_cast<void *>(0x1234);
+
+    cache.segment_cache.capture_stream = stream;
+    cache.segment_cache.initialized = true;
+    cache.gpu_graph_update_failures = 3;
+    cache.phase3_active = true;
+
+    cache.resetReplayState();
+
+    EXPECT_EQ(cache.segment_cache.capture_stream, stream);
+    EXPECT_FALSE(cache.segment_cache.initialized);
+    EXPECT_EQ(cache.gpu_graph_update_failures, 0);
+    EXPECT_FALSE(cache.phase3_active);
+}
+
+TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)
+{
+    ForwardGraphCache cache;
+    cache.segment_cache.capture_stream = reinterpret_cast<void *>(0x1234);
+
+    cache.invalidate();
+
+    EXPECT_EQ(cache.segment_cache.capture_stream, nullptr);
+}
