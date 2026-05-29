@@ -1936,6 +1936,19 @@ add_v2_test(V2_Integration_TensorBase_TransferTo
     MPI_PROCS 1
 )
 
+# Test: TransferEngine copyActivation - tensor→tensor copy transport selection (requires GPU)
+add_executable(v2_integration_transfer_engine_copy_activation integration/transfer/Test__TransferEngine_CopyActivation.cpp)
+target_link_libraries(v2_integration_transfer_engine_copy_activation 
+    llaminar2_core 
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Integration_TransferEngine_CopyActivation 
+    COMMAND $<TARGET_FILE:v2_integration_transfer_engine_copy_activation>
+    LABELS "V2;Integration;Transfer;TransferEngine;Coherence;CopyActivation;GPU"
+    MPI_PROCS 1
+)
+
 # Test: FusedQKVGEMMStage compute stage (regression test for QKV bias bug)
 add_executable(v2_test_fused_qkv_gemm_stage unit/execution/compute_stages/stages/Test__FusedQKVGEMMStage.cpp)
 target_link_libraries(v2_test_fused_qkv_gemm_stage

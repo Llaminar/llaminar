@@ -16,6 +16,7 @@
 #include "PrefillBucketUtils.h"
 #include "../graph/GraphCaptureGuard.h"
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../transfer/TransferEngine.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
@@ -700,18 +701,42 @@ namespace llaminar2
             forward_cache.pp_external_hidden_state &&
             forward_cache.pp_working_buffer)
         {
-            // Unified PP copy: data() handles all device coherence sync
-            // automatically (including D2H via staging buffer).
-            const void *src = forward_cache.pp_external_hidden_state->data();
-            void *dst = forward_cache.pp_working_buffer->mutable_data();
-            std::memcpy(dst, src, forward_cache.pp_copy_bytes);
+            // PP hidden-state handoff. copyActivation picks the cheapest transport
+            // for the (source authoritative device -> pp_device) pair:
+            //   - same physical GPU   -> intra-VRAM device-to-device memcpy
+            //   - same-vendor diff GPU -> peer copy (NCCL/RCCL or peer DMA)
+            //   - cross-vendor / host  -> single host-staged bounce
+            // and leaves the destination DEVICE_AUTHORITATIVE on pp_device.
+            //
+            // In the steady-state heterogeneous CUDA->ROCm case the producing
+            // stage's transferActivation() has already moved the external hidden
+            // state onto pp_device (rocm:0), so this resolves to an intra-GPU D2D
+            // copy. This replaces the old data()/memcpy/ensureOnDevice host
+            // round-trip that cost ~30ms/token.
+            const bool pp_time = is_decode && debugEnv().tp_timing;
+            auto pp_t0 = pp_time ? Clock::now() : Clock::time_point{};
 
-            const auto &dev = forward_cache.pp_device;
-            if (dev.is_gpu())
+            auto pp_result = TransferEngine::instance().copyActivation(
+                forward_cache.pp_external_hidden_state, forward_cache.pp_working_buffer,
+                forward_cache.pp_device, forward_cache.pp_copy_bytes);
+
+            // Fail loud: a failed hidden-state handoff corrupts the entire
+            // downstream pipeline stage, so there is no safe fallback.
+            if (!pp_result.success)
             {
-                forward_cache.pp_working_buffer->ensureOnDevice(dev);
-                forward_cache.pp_working_buffer->transitionTo(
-                    TensorCoherenceState::DEVICE_AUTHORITATIVE, dev);
+                LOG_ERROR("[PP_COPY] copyActivation failed on "
+                          << forward_cache.pp_device << ": " << pp_result.error);
+                throw std::runtime_error("PP hidden-state copy failed: " + pp_result.error);
+            }
+
+            if (pp_time)
+            {
+                auto pp_t1 = Clock::now();
+                double total_us =
+                    std::chrono::duration<double, std::micro>(pp_t1 - pp_t0).count();
+                LOG_DEBUG("[PP_COPY] dev=" << forward_cache.pp_device << " method="
+                          << to_string(pp_result.method_used) << " total=" << total_us
+                          << "us bytes=" << forward_cache.pp_copy_bytes);
             }
         }
 
@@ -996,12 +1021,22 @@ namespace llaminar2
             double setup_us = std::chrono::duration<double, std::micro>(exec_t0 - start).count();
             double exec_us = std::chrono::duration<double, std::micro>(exec_t1 - exec_t0).count();
             double sync_us = std::chrono::duration<double, std::micro>(end - exec_t1).count();
+            std::ostringstream subphase;
+            if (profiling_setup)
+            {
+                subphase << " [ws=" << std::chrono::duration<double, std::micro>(setup_workspace_t1 - setup_workspace_t0).count()
+                         << "us tok=" << std::chrono::duration<double, std::micro>(setup_token_copy_t1 - setup_token_copy_t0).count()
+                         << "us strm=" << std::chrono::duration<double, std::micro>(setup_stream_t1 - setup_stream_t0).count()
+                         << "us dyn=" << std::chrono::duration<double, std::micro>(setup_dynamic_params_t1 - setup_dynamic_params_t0).count()
+                         << "us rst=" << std::chrono::duration<double, std::micro>(setup_graph_reset_t1 - setup_graph_reset_t0).count() << "us]";
+            }
             LOG_DEBUG("[DEVICE_DECODE] dev=" << input.device
                                              << " setup=" << std::fixed << std::setprecision(1) << setup_us << "us"
                                              << " exec=" << exec_us << "us"
                                              << " sync=" << sync_us << "us"
                                              << " total=" << (ms * 1000.0) << "us"
-                                             << " phase3=" << forward_cache.phase3_active);
+                                             << " phase3=" << forward_cache.phase3_active
+                                             << subphase.str());
         }
 
         // Forward pass wall-clock profiler (enabled via LLAMINAR_PROFILING=1)

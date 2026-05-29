@@ -44,9 +44,9 @@
 #                       to WARN so this harness can catch warnings)
 #   LLAMINAR_E2E_LOG_DIR Override per-case server log directory
 #   LLAMINAR_E2E_LONG_CONTEXT Enable optional long-context checks (default: 0)
-#   LLAMINAR_E2E_LONG_CONTEXT_TIER lite|full long-context tier (default: lite)
+#   LLAMINAR_E2E_LONG_CONTEXT_TIER lite|full long-context tier (default: full)
 #   LLAMINAR_E2E_CONTEXT_LENGTH Context length passed with -c for eligible models (default: 4096)
-#   LLAMINAR_E2E_LONG_MAX_TOKENS Long-generation max_tokens (default: 512)
+#   LLAMINAR_E2E_LONG_MAX_TOKENS Long-generation max_tokens (default: 1024)
 #   LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS Minimum helper prompt tokens (default: 900)
 #   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: REQUEST_TIMEOUT)
 #   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
@@ -160,9 +160,9 @@ REQUEST_TIMEOUT=180   # seconds per curl request
 # Optional long-context helper controls. The helper is intentionally gated to
 # 4B+ models by default so small smoke-test suites keep their fast behavior.
 LONG_CONTEXT_ENABLED="${LLAMINAR_E2E_LONG_CONTEXT:-0}"
-LONG_CONTEXT_TIER="${LLAMINAR_E2E_LONG_CONTEXT_TIER:-lite}"
+LONG_CONTEXT_TIER="${LLAMINAR_E2E_LONG_CONTEXT_TIER:-full}"
 CONTEXT_LENGTH="${LLAMINAR_E2E_CONTEXT_LENGTH:-4096}"
-LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-512}"
+LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-1024}"
 LONG_MIN_PROMPT_TOKENS="${LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS:-900}"
 LONG_REQUEST_TIMEOUT="${LLAMINAR_E2E_LONG_REQUEST_TIMEOUT:-$REQUEST_TIMEOUT}"
 LONG_MIN_MODEL_SIZE_B="${LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B:-4}"

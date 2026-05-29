@@ -163,6 +163,32 @@ namespace llaminar2
         return (err == cudaSuccess);
     }
 
+    bool CUDABackend::deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        // Use setDevice() which handles both runtime and driver API context
+        if (!setDevice(device_id))
+        {
+            return false;
+        }
+
+        // Same-GPU VRAM copy: both src and dst are device pointers on device_id.
+        cudaStream_t s = resolveStream(device_id, stream);
+        cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, s);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::deviceToDevice] cudaMemcpyAsync failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        err = cudaStreamSynchronize(s);
+        return (err == cudaSuccess);
+    }
+
     bool CUDABackend::synchronize(int device_id)
     {
         if (device_id >= device_count_ || device_id < 0)

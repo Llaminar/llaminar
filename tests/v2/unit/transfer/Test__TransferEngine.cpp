@@ -532,6 +532,95 @@ TEST_F(Test__TransferEngine_Execute, DeviceToHost_NullDevicePtr_Fails)
 }
 
 // ============================================================================
+// copyActivation() tests — tensor→tensor copy with transport auto-selection.
+//
+// GPU-buffer paths (same-device D2D, same-vendor peer copy, cross-vendor
+// host-staging) require real device backends and are exercised in the
+// integration suite (integration/transfer/Test__TransferEngine_CopyActivation).
+// Here we cover the host/CPU-destination path and the argument guards, which
+// are fully deterministic without a GPU.
+// ============================================================================
+
+TEST_F(Test__TransferEngine_Execute, CopyActivation_NullSrc_Fails)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto dst = TestTensorFactory::createFP32({4, 4});
+    auto result = engine.copyActivation(nullptr, dst.get(), DeviceId::cpu(), 64);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.error.empty());
+}
+
+TEST_F(Test__TransferEngine_Execute, CopyActivation_NullDst_Fails)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto src = TestTensorFactory::createFP32({4, 4});
+    auto result = engine.copyActivation(src.get(), nullptr, DeviceId::cpu(), 64);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.error.empty());
+}
+
+TEST_F(Test__TransferEngine_Execute, CopyActivation_ZeroBytes_Noop)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    auto src = TestTensorFactory::createFP32({4, 4});
+    auto dst = TestTensorFactory::createFP32({4, 4});
+
+    auto result = engine.copyActivation(src.get(), dst.get(), DeviceId::cpu(), 0);
+
+    EXPECT_TRUE(result.success);
+    EXPECT_EQ(result.method_used, TransferMethod::NOOP);
+
+    // No backend interaction for a zero-byte copy
+    auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+    EXPECT_EQ(stats.d2d_count, 0u);
+}
+
+TEST_F(Test__TransferEngine_Execute, CopyActivation_CpuDestination_HostMemcpy)
+{
+    s_mock_ = mock_backend_.get();
+    TransferEngine engine(resolver_);
+
+    // Source filled with a known pattern; destination starts zeroed.
+    auto src = TestTensorFactory::createFP32({4, 4});
+    auto dst = TestTensorFactory::createFP32({4, 4});
+    float *src_data = src->mutable_data();
+    float *dst_data = dst->mutable_data();
+    for (size_t i = 0; i < src->numel(); ++i)
+    {
+        src_data[i] = static_cast<float>(i) + 0.5f;
+        dst_data[i] = 0.0f;
+    }
+
+    const size_t bytes = src->numel() * sizeof(float);
+    auto result = engine.copyActivation(src.get(), dst.get(), DeviceId::cpu(), bytes);
+
+    EXPECT_TRUE(result.success);
+
+    // CPU destination is a pure host-side copy: no device transfers occur.
+    auto stats = mock_backend_->getTransferStats();
+    EXPECT_EQ(stats.h2d_count, 0u);
+    EXPECT_EQ(stats.d2h_count, 0u);
+    EXPECT_EQ(stats.d2d_count, 0u);
+
+    // Data must have landed in the destination host buffer.
+    const float *out = dst->data();
+    for (size_t i = 0; i < dst->numel(); ++i)
+    {
+        EXPECT_FLOAT_EQ(out[i], static_cast<float>(i) + 0.5f);
+    }
+}
+
+// ============================================================================
 // to_string tests
 // ============================================================================
 

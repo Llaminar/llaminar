@@ -34,6 +34,7 @@ namespace llaminar2
         // Memory transfer operations (see IBackend documentation)
         bool deviceToHost(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
         bool hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
+        bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override;
         bool synchronize(int device_id) override;
         bool streamSynchronize(int device_id) override;
         bool setDevice(int device_id) override;

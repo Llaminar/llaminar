@@ -6,6 +6,8 @@
 
 #include "backends/BackendManager.h"
 #include "backends/IBackend.h"
+#include "collective/BackendRouter.h"
+#include "collective/ICollectiveBackend.h"
 #include "tensors/TensorClasses.h"
 #include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
@@ -271,6 +273,157 @@ namespace llaminar2
                 tensor->applyCoherenceOp_(CoherenceOp::DOWNLOAD);
             }
         }
+
+        return result;
+    }
+
+    TransferResult TransferEngine::copyActivation(TensorBase *src, TensorBase *dst,
+                                                  DeviceId dst_device, size_t bytes)
+    {
+        if (!src || !dst)
+            return TransferResult::fail(TransferMethod::NOOP, "null tensor in copyActivation");
+        if (bytes == 0)
+            return TransferResult::ok(TransferMethod::NOOP);
+
+        // ----------------------------------------------------------------------
+        // Host or mapped destination: a plain host-side copy is correct and
+        // cheapest. Mapped memory shares host/device storage, so writing the
+        // host side is immediately visible to the device — no transfer needed.
+        // ----------------------------------------------------------------------
+        if (dst_device.is_cpu() || dst->is_mapped_ || src->is_mapped_)
+        {
+            const void *host_src = src->data();   // ensures src is host-valid
+            void *host_dst = dst->mutable_data(); // host (or mapped) storage
+            if (!host_src || !host_dst)
+                return TransferResult::fail(TransferMethod::DEVICE_TO_HOST,
+                                            "null host pointer in copyActivation host path");
+            std::memcpy(host_dst, host_src, bytes);
+            if (dst_device.is_gpu()) // mapped GPU dst: data is already device-visible
+                dst->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
+            return TransferResult::ok(dst->is_mapped_ ? TransferMethod::MAPPED_NOOP
+                                                      : TransferMethod::DEVICE_TO_HOST);
+        }
+
+        // ----------------------------------------------------------------------
+        // GPU destination: ensure a device buffer exists. We deliberately do NOT
+        // upload host data here (the buffer is about to be overwritten by the
+        // copy below).
+        // ----------------------------------------------------------------------
+        void *dst_ptr = dst->getOrAllocateDeviceBuffer(dst_device);
+        if (!dst_ptr)
+            return TransferResult::fail(TransferMethod::HOST_TO_DEVICE,
+                                        "failed to allocate dst device buffer on " + dst_device.toString());
+
+        // Locate the authoritative source data. NOTE: we use getAuthoritativeDevice()
+        // rather than gpu_device_: after a cross-vendor transferActivation(), the
+        // tensor's primary gpu_device_/gpu_data_ptr_ still point at the producing
+        // GPU (e.g. CUDA), while the authoritative copy lives in a secondary buffer
+        // on the consumer GPU (e.g. ROCm).
+        const auto auth = src->getAuthoritativeDevice();
+        const bool src_on_gpu = auth.has_value() && auth->is_gpu();
+        const DeviceId src_device = src_on_gpu ? *auth : DeviceId::cpu();
+
+        TransferResult result;
+
+        // Decide whether a direct device-to-device path exists for this pair.
+        // Same physical GPU is always direct (intra-VRAM memcpy). Different GPUs
+        // of the SAME vendor go through the collective backend (NCCL/RCCL/peer
+        // DMA). Only cross-vendor pairs (CUDA↔ROCm) have no direct path and must
+        // bounce through the host.
+        const bool same_physical_gpu = src_on_gpu && src_device == dst_device;
+        const bool same_vendor_diff_gpu =
+            src_on_gpu && !same_physical_gpu && src_device.type == dst_device.type;
+
+        if (same_physical_gpu)
+        {
+            // Same physical GPU: pure device-to-device copy — no host bounce.
+            void *src_ptr = src->getOrAllocateDeviceBuffer(src_device);
+            IBackend *backend = resolveBackend(dst_device);
+            if (!backend)
+                return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
+                                            "no backend for " + dst_device.toString());
+            if (!src_ptr)
+                return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
+                                            "source has no device buffer on " + dst_device.toString());
+            if (!backend->deviceToDevice(dst_ptr, src_ptr, bytes, dst_device.gpu_ordinal()))
+                return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
+                                            "deviceToDevice failed on " + dst_device.toString());
+            result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
+        }
+        else if (same_vendor_diff_gpu)
+        {
+            // Same-vendor, different GPU (e.g. cuda:0 → cuda:1): use the
+            // collective backend's peer copy (NCCL/RCCL or peer DMA). No host
+            // bounce — the data moves directly across the PCIe/NVLink fabric.
+            void *src_ptr = src->getOrAllocateDeviceBuffer(src_device);
+            auto *router = GlobalBackendRouter::get();
+            ICollectiveBackend *backend =
+                router ? router->getBackendForCopy(src_device, dst_device) : nullptr;
+            if (!src_ptr)
+                return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
+                                            "source has no device buffer on " + src_device.toString());
+            if (!backend || !backend->supportsCopy(src_device, dst_device))
+                return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
+                                            "no collective backend supports peer copy " +
+                                                src_device.toString() + " -> " + dst_device.toString());
+            if (!backend->copy(dst_ptr, dst_device, src_ptr, src_device, bytes))
+                return TransferResult::fail(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND,
+                                            "peer copy failed " + src_device.toString() +
+                                                " -> " + dst_device.toString());
+            result = TransferResult::ok(TransferMethod::DEVICE_TO_DEVICE_SAME_BACKEND);
+        }
+        else
+        {
+            // Cross-vendor GPU pair (CUDA↔ROCm) or host-resident source: there
+            // is no direct device path across vendors, so stage through the
+            // source tensor's own host buffer and upload into the dst device
+            // buffer. This is what makes heterogeneous CUDA↔ROCm PP work.
+            const void *host_src = nullptr;
+            if (src_on_gpu)
+            {
+                void *src_host = src->raw_host_data_ptr();
+                void *src_dev = src->getOrAllocateDeviceBuffer(src_device);
+                IBackend *src_backend = resolveBackend(src_device);
+                if (!src_host || !src_dev || !src_backend)
+                    return TransferResult::fail(TransferMethod::HOST_STAGED,
+                                                "missing src host/device buffer or backend for staged copy");
+                if (!src_backend->deviceToHost(src_host, src_dev, bytes, src_device.gpu_ordinal()))
+                    return TransferResult::fail(TransferMethod::HOST_STAGED,
+                                                "D2H step failed in copyActivation");
+                host_src = src_host;
+            }
+            else
+            {
+                host_src = src->data(); // host-resident source
+            }
+
+            IBackend *dst_backend = resolveBackend(dst_device);
+            if (!dst_backend || !host_src)
+                return TransferResult::fail(TransferMethod::HOST_TO_DEVICE,
+                                            "missing dst backend or host src in copyActivation");
+            if (!dst_backend->hostToDevice(dst_ptr, host_src, bytes, dst_device.gpu_ordinal()))
+                return TransferResult::fail(TransferMethod::HOST_TO_DEVICE,
+                                            "H2D step failed in copyActivation");
+            result = TransferResult::ok(src_on_gpu ? TransferMethod::HOST_STAGED
+                                                   : TransferMethod::HOST_TO_DEVICE);
+        }
+
+        // ----------------------------------------------------------------------
+        // Promote dst_ptr to the primary device buffer if it currently lives in
+        // the secondary map (so later gpu_data_ptr() returns the buffer we just
+        // wrote), then mark the destination authoritative on dst_device.
+        // ----------------------------------------------------------------------
+        if (!dst->gpu_device_.has_value() || *dst->gpu_device_ != dst_device)
+        {
+            // Preserve any existing primary buffer as a secondary so it is not leaked.
+            if (dst->gpu_device_.has_value() && dst->gpu_data_ptr_)
+                dst->secondary_device_buffers_[TensorBase::packDeviceId(*dst->gpu_device_)] =
+                    dst->gpu_data_ptr_;
+            dst->gpu_device_ = dst_device;
+            dst->gpu_data_ptr_ = dst_ptr;
+            dst->secondary_device_buffers_.erase(TensorBase::packDeviceId(dst_device));
+        }
+        dst->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, dst_device);
 
         return result;
     }
