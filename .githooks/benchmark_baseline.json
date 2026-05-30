@@ -81,6 +81,19 @@
       }
     },
     {
+      "name": "Qwen 3.5 35B MoE Q3_K_S",
+      "model": "models/Qwen3.5-35B-A3B-Q3_K_S.gguf",
+      "decode_tokens": 128,
+      "devices": {
+        "cuda:0": {
+          "prefill_tok_s": 2015.0,
+          "decode_tok_s": 116.4,
+          "regression_threshold_pct": 10,
+          "_comment": "Realistic baseline recorded at commit ec078498. Human-approved (IQ3_S/IQ3_XXS expert decode is compute-bound; prefill gap to llama.cpp is structural). Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+        }
+      }
+    },
+    {
       "name": "Qwen 3.5 27B Dense Q4_K_M",
       "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
       "decode_tokens": 128,
