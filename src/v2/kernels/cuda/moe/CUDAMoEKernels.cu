@@ -1694,7 +1694,11 @@ extern "C"
         constexpr int kRouteTiledMinTokens = 16;
         if (seq_len >= kRouteTiledMinTokens)
         {
-            // Tile geometry must match the template instantiation below.
+            // Tile geometry must match the template instantiation below. BM=BN=64
+            // (256-thread block) empirically beats smaller tiles here: although it
+            // yields only 44 blocks (occupancy-bound on this M=679,N=256 GEMM), the
+            // 256-thread block's load efficiency and ILP outperform 32×32 (1918) and
+            // 64×32 (1931) configs that produce more blocks but fewer threads each.
             constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
             constexpr int kTiledThreads = (BM / TM) * (BN / TN); // 16×16 = 256
             dim3 grid((num_experts + BN - 1) / BN, (seq_len + BM - 1) / BM);
