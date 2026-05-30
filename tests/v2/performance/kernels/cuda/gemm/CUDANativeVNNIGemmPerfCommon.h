@@ -93,6 +93,13 @@ namespace llaminar2::test::native_vnni_gemm_perf
     };
 
     inline const std::vector<Shape> kQwenShapes = {
+        // Qwen3.5-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
+        // These are the production hot-path GEMMs for the grouped MoE prefill/decode
+        // kernels (gate/up: N=512,K=2048; down: N=2048,K=512). The dense NativeVNNI
+        // kernel exercised here shares the same per-codebook decode_groups helpers as
+        // the grouped MoE kernel, so this is a valid A/B harness for decode tuning.
+        {"35BMoE_Expert_GateUp", 512, 2048},
+        {"35BMoE_Expert_Down", 2048, 512},
         {"0.5B_Attn", 896, 896},
         {"0.5B_FFN_Up", 4864, 896},
         {"0.5B_FFN_Down", 896, 4864},
