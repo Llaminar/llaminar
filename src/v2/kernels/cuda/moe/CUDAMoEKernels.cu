@@ -1,0 +1,2260 @@
+/**
+ * @file CUDAMoEKernels.cu
+ * @brief CUDA launch bridges for MoE routing, grouping, and scatter/gather primitives.
+ *
+ * These kernels intentionally cover the non-GEMM MoE glue. Expert gate/up/down
+ * projections continue to use the dedicated CUDA GEMM kernels. The launch
+ * wrappers are C ABI functions consumed by `CUDAMoEKernel.cpp`, matching the
+ * split used by the rest of the CUDA backend.
+ */
+
+#include <cuda_runtime.h>
+
+#include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "utils/DebugEnv.h"
+
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+
+namespace
+{
+    constexpr int kThreads = 256;
+    constexpr int kMaxExperts = 1024;
+    constexpr int kDeviceMoEMaxExperts = 256;
+    constexpr int kMaxTopK = 16;
+
+    struct DeviceNativeVNNIMatrixDesc
+    {
+        const uint8_t *payload = nullptr;
+        const void *scales = nullptr;
+        const void *mins = nullptr;
+        const void *emins = nullptr;
+        int n = 0;
+        int k = 0;
+        uint32_t blocks_per_row = 0;
+        uint8_t codebook_id = 0;
+        uint8_t reserved[3] = {0, 0, 0};
+    };
+
+    __device__ __forceinline__ float silu(float x)
+    {
+        return x / (1.0f + expf(-x));
+    }
+
+    bool finishLaunch(const char *name)
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::fprintf(stderr, "%s launch failed: %s\n", name, cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // Router GEMV: one block per (expert, token) computes logit = dot(hidden_token, gate_expert).
+    //
+    // Optimized memory-bound dot product. The previous implementation used scalar
+    // loads (one element/thread/iter) followed by a full log2(blockDim)-step shared
+    // memory tree reduction, leaving it ~15x off the memory-bound limit. This version:
+    //   1. Loads gate/hidden as coalesced float4 vectors (4x fewer load instructions).
+    //   2. Reduces within each warp via __shfl_down_sync (no __syncthreads, no shared
+    //      traffic for the intra-warp reduction).
+    //   3. Combines the (few) per-warp partials with a single short shared-memory step.
+    // The block-per-expert grid is preserved so decode (num_experts blocks) keeps full
+    // SM coverage.
+    __global__ void route_logits_kernel(
+        const float *__restrict__ hidden,
+        const float *__restrict__ gate_weights,
+        float *__restrict__ logits,
+        int seq_len, int d_model, int num_experts)
+    {
+        const int expert = blockIdx.x;
+        const int token = blockIdx.y;
+        if (expert >= num_experts || token >= seq_len)
+            return;
+
+        const float *h = hidden + static_cast<size_t>(token) * d_model;
+        const float *g = gate_weights + static_cast<size_t>(expert) * d_model;
+
+        // Vectorized main loop: consecutive threads read consecutive float4 chunks
+        // (fully coalesced). gate rows are 16B-aligned (d_model is a multiple of 4
+        // for all supported models), so the float4 reinterpret is safe.
+        const int vec4 = d_model >> 2;
+        float sum = 0.0f;
+        for (int v = threadIdx.x; v < vec4; v += blockDim.x)
+        {
+            const float4 hv = reinterpret_cast<const float4 *>(h)[v];
+            const float4 gv = reinterpret_cast<const float4 *>(g)[v];
+            sum += hv.x * gv.x + hv.y * gv.y + hv.z * gv.z + hv.w * gv.w;
+        }
+        // Scalar tail for any d_model not divisible by 4.
+        for (int j = (vec4 << 2) + threadIdx.x; j < d_model; j += blockDim.x)
+            sum += h[j] * g[j];
+
+        // Intra-warp reduction via shuffle (no shared memory, no barriers).
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+
+        // Combine per-warp partials. blockDim is a multiple of 32 and <= 1024, so at
+        // most 32 warps; warp 0 reduces the per-warp sums in a single shuffle pass.
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int num_warps = blockDim.x >> 5;
+        __shared__ float warp_sums[32];
+        if (lane == 0)
+            warp_sums[warp] = sum;
+        __syncthreads();
+        if (warp == 0)
+        {
+            float v = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1)
+                v += __shfl_down_sync(0xffffffffu, v, offset);
+            if (lane == 0)
+                logits[static_cast<size_t>(token) * num_experts + expert] = v;
+        }
+    }
+
+    __global__ void softmax_topk_kernel(
+        float *__restrict__ logits,
+        int *__restrict__ expert_indices,
+        float *__restrict__ expert_weights,
+        int seq_len, int num_experts, int top_k,
+        bool normalize_weights)
+    {
+        const int token = blockIdx.x;
+        if (token >= seq_len)
+            return;
+
+        __shared__ float values[kMaxExperts];
+        __shared__ float reductions[kThreads];
+        __shared__ int selected[kMaxTopK];
+        __shared__ float selected_weights[kMaxTopK];
+
+        const size_t row_offset = static_cast<size_t>(token) * num_experts;
+        float local_max = -INFINITY;
+        for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+            local_max = fmaxf(local_max, logits[row_offset + expert]);
+        reductions[threadIdx.x] = local_max;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+                reductions[threadIdx.x] = fmaxf(reductions[threadIdx.x], reductions[threadIdx.x + stride]);
+            __syncthreads();
+        }
+        const float max_value = reductions[0];
+
+        float local_sum = 0.0f;
+        for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+        {
+            const float prob = expf(logits[row_offset + expert] - max_value);
+            values[expert] = prob;
+            local_sum += prob;
+        }
+        reductions[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+                reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float denom = reductions[0];
+        for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+        {
+            const float prob = denom > 0.0f ? values[expert] / denom : 0.0f;
+            values[expert] = prob;
+            logits[row_offset + expert] = prob;
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0)
+        {
+            float topk_sum = 0.0f;
+            for (int k = 0; k < top_k; ++k)
+            {
+                int best = 0;
+                float best_value = -1.0f;
+                for (int expert = 0; expert < num_experts; ++expert)
+                {
+                    const float value = values[expert];
+                    if (value > best_value)
+                    {
+                        best_value = value;
+                        best = expert;
+                    }
+                }
+                selected[k] = best;
+                selected_weights[k] = best_value;
+                topk_sum += best_value;
+                values[best] = -1.0f;
+            }
+
+            for (int k = 0; k < top_k; ++k)
+            {
+                const size_t out = static_cast<size_t>(token) * top_k + k;
+                expert_indices[out] = selected[k];
+                expert_weights[out] = normalize_weights && topk_sum > 0.0f
+                                          ? selected_weights[k] / topk_sum
+                                          : selected_weights[k];
+            }
+        }
+    }
+
+    __global__ void softmax_topk_decode_runtime_kernel(
+        float *__restrict__ logits,
+        int *__restrict__ runtime_expert_ids,
+        float *__restrict__ runtime_weights,
+        uint64_t *__restrict__ runtime_histogram,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts, int top_k,
+        bool normalize_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram)
+    {
+        __shared__ float values[kMaxExperts];
+        __shared__ float reductions[kThreads];
+        __shared__ int selected[kMaxTopK];
+        __shared__ float selected_weights[kMaxTopK];
+
+        float local_max = -INFINITY;
+        for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+            local_max = fmaxf(local_max, logits[expert]);
+        reductions[threadIdx.x] = local_max;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+                reductions[threadIdx.x] = fmaxf(reductions[threadIdx.x], reductions[threadIdx.x + stride]);
+            __syncthreads();
+        }
+        const float max_value = reductions[0];
+
+        float local_sum = 0.0f;
+        for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+        {
+            const float prob = expf(logits[expert] - max_value);
+            values[expert] = prob;
+            local_sum += prob;
+        }
+        reductions[threadIdx.x] = local_sum;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+                reductions[threadIdx.x] += reductions[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float denom = reductions[0];
+        for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+        {
+            const float prob = denom > 0.0f ? values[expert] / denom : 0.0f;
+            values[expert] = prob;
+            logits[expert] = prob;
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0)
+        {
+            float topk_sum = 0.0f;
+            for (int k = 0; k < top_k; ++k)
+            {
+                int best = 0;
+                float best_value = -1.0f;
+                for (int expert = 0; expert < num_experts; ++expert)
+                {
+                    if (values[expert] > best_value)
+                    {
+                        best_value = values[expert];
+                        best = expert;
+                    }
+                }
+                selected[k] = best;
+                selected_weights[k] = best_value;
+                topk_sum += best_value;
+                values[best] = -1.0f;
+            }
+
+            for (int k = 0; k < top_k; ++k)
+            {
+                const float weight = normalize_weights && topk_sum > 0.0f
+                                         ? selected_weights[k] / topk_sum
+                                         : selected_weights[k];
+                runtime_expert_ids[k] = selected[k];
+                runtime_weights[k] = weight;
+                if (write_legacy_outputs)
+                {
+                    legacy_indices[k] = static_cast<float>(selected[k]);
+                    legacy_weights[k] = weight;
+                }
+                if (update_runtime_histogram)
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime_histogram[selected[k]]),
+                              static_cast<unsigned long long>(1));
+            }
+        }
+    }
+
+    __global__ void decode_route_select_runtime_kernel(
+        const int *__restrict__ expert_indices,
+        const float *__restrict__ expert_weights,
+        int *__restrict__ runtime_expert_ids,
+        float *__restrict__ runtime_weights,
+        uint64_t *__restrict__ runtime_histogram,
+        float *legacy_indices,
+        float *legacy_weights,
+        int top_k,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram)
+    {
+        const int k = threadIdx.x;
+        if (k >= top_k)
+            return;
+        const int expert = expert_indices[k];
+        const float weight = expert_weights[k];
+        runtime_expert_ids[k] = expert;
+        runtime_weights[k] = weight;
+        if (write_legacy_outputs)
+        {
+            legacy_indices[k] = static_cast<float>(expert);
+            legacy_weights[k] = weight;
+        }
+        if (update_runtime_histogram && expert >= 0 && expert < kDeviceMoEMaxExperts)
+            atomicAdd(reinterpret_cast<unsigned long long *>(&runtime_histogram[expert]),
+                      static_cast<unsigned long long>(1));
+    }
+
+    __global__ void int_to_float_kernel(const int *__restrict__ input, float *__restrict__ output, int count)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < count)
+            output[idx] = static_cast<float>(input[idx]);
+    }
+
+    __global__ void float_to_int_kernel(const float *__restrict__ input, int *__restrict__ output, int count)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < count)
+            output[idx] = static_cast<int>(input[idx]);
+    }
+
+    __global__ void gather_tokens_kernel(
+        const float *__restrict__ hidden,
+        float *__restrict__ batch_buffer,
+        const int *__restrict__ token_indices,
+        int num_tokens, int d_model)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = num_tokens * d_model;
+        if (idx >= total)
+            return;
+        const int token_slot = idx / d_model;
+        const int col = idx % d_model;
+        const int token = token_indices[token_slot];
+        batch_buffer[idx] = hidden[static_cast<size_t>(token) * d_model + col];
+    }
+
+    __global__ void scatter_add_kernel(
+        float *__restrict__ output,
+        const float *__restrict__ expert_output,
+        const int *__restrict__ token_indices,
+        const float *__restrict__ weights,
+        int num_tokens, int d_model)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = num_tokens * d_model;
+        if (idx >= total)
+            return;
+        const int token_slot = idx / d_model;
+        const int col = idx % d_model;
+        const int token = token_indices[token_slot];
+        output[static_cast<size_t>(token) * d_model + col] += weights[token_slot] * expert_output[idx];
+    }
+
+    __global__ void shared_expert_gate_kernel(
+        const float *__restrict__ input,
+        const float *__restrict__ gate_inp,
+        float *__restrict__ shared_output,
+        int seq_len, int d_model)
+    {
+        const int token = blockIdx.x;
+        if (token >= seq_len)
+            return;
+
+        __shared__ float partial[kThreads];
+        const float *x = input + static_cast<size_t>(token) * d_model;
+        float dot = 0.0f;
+        for (int col = threadIdx.x; col < d_model; col += blockDim.x)
+            dot += x[col] * gate_inp[col];
+        partial[threadIdx.x] = dot;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+        {
+            if (threadIdx.x < stride)
+                partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+
+        const float gate = 1.0f / (1.0f + expf(-partial[0]));
+        float *out = shared_output + static_cast<size_t>(token) * d_model;
+        for (int col = threadIdx.x; col < d_model; col += blockDim.x)
+            out[col] *= gate;
+    }
+
+    __global__ void swiglu_kernel(float *__restrict__ gate, const float *__restrict__ up, int count)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < count)
+            gate[idx] = silu(gate[idx]) * up[idx];
+    }
+
+    __global__ void weighted_add_kernel(float *__restrict__ output, const float *__restrict__ input, float weight, int count)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < count)
+            output[idx] += weight * input[idx];
+    }
+
+    __global__ void count_per_expert_kernel(
+        const int *__restrict__ routing_indices,
+        int *__restrict__ expert_counts,
+        int total_slots, int num_experts)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total_slots)
+            return;
+        const int expert = routing_indices[idx];
+        if (expert >= 0 && expert < num_experts)
+            atomicAdd(expert_counts + expert, 1);
+    }
+
+    __global__ void exclusive_scan_kernel(const int *__restrict__ expert_counts, int *__restrict__ expert_offsets, int num_experts)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+        int running = 0;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            expert_offsets[expert] = running;
+            running += expert_counts[expert];
+        }
+    }
+
+    __global__ void scatter_tokens_kernel(
+        const int *__restrict__ routing_indices,
+        const float *__restrict__ routing_weights,
+        int *__restrict__ write_heads,
+        const int *__restrict__ expert_offsets,
+        int *__restrict__ grouped_token_indices,
+        float *__restrict__ grouped_weights,
+        int total_slots, int top_k, int num_experts)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total_slots)
+            return;
+        const int expert = routing_indices[idx];
+        if (expert < 0 || expert >= num_experts)
+            return;
+        const int local = atomicAdd(write_heads + expert, 1);
+        const int dest = expert_offsets[expert] + local;
+        grouped_token_indices[dest] = idx / top_k;
+        grouped_weights[dest] = routing_weights[idx];
+    }
+
+    __global__ void gather_expert_fixed_kernel(
+        const float *__restrict__ hidden,
+        float *__restrict__ batch_buffer,
+        const int *__restrict__ expert_offsets,
+        const int *__restrict__ expert_counts,
+        const int *__restrict__ grouped_token_indices,
+        int expert_id,
+        int max_tokens,
+        int d_model)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = max_tokens * d_model;
+        if (idx >= total)
+            return;
+
+        const int token_slot = idx / d_model;
+        const int col = idx % d_model;
+        const int count = expert_counts[expert_id];
+        float value = 0.0f;
+        if (token_slot < count)
+        {
+            const int grouped = expert_offsets[expert_id] + token_slot;
+            const int token = grouped_token_indices[grouped];
+            value = hidden[static_cast<size_t>(token) * d_model + col];
+        }
+        batch_buffer[idx] = value;
+    }
+
+    __global__ void scatter_expert_fixed_kernel(
+        float *__restrict__ output,
+        const float *__restrict__ expert_output,
+        const int *__restrict__ expert_offsets,
+        const int *__restrict__ expert_counts,
+        const int *__restrict__ grouped_token_indices,
+        const float *__restrict__ grouped_weights,
+        int expert_id,
+        int max_tokens,
+        int d_model)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        const int total = max_tokens * d_model;
+        if (idx >= total)
+            return;
+
+        const int token_slot = idx / d_model;
+        const int col = idx % d_model;
+        const int count = expert_counts[expert_id];
+        if (token_slot >= count)
+            return;
+
+        const int grouped = expert_offsets[expert_id] + token_slot;
+        const int token = grouped_token_indices[grouped];
+        const float weight = grouped_weights[grouped];
+        atomicAdd(output + static_cast<size_t>(token) * d_model + col,
+                  weight * expert_output[idx]);
+    }
+
+    __global__ void grouped_hidden_quantize_blockwise_kernel(
+        const float *__restrict__ hidden,
+        int8_t *__restrict__ A_int8,
+        float *__restrict__ scales_A_blockwise,
+        int K)
+    {
+        constexpr int kBlockSize = 32;
+        const int block_idx = blockIdx.x;
+        const int lane = threadIdx.x;
+        const int col = block_idx * kBlockSize + lane;
+        if (lane >= kBlockSize || col >= K)
+            return;
+
+        float abs_value = fabsf(hidden[col]);
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+
+        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        if (lane == 0)
+            scales_A_blockwise[block_idx] = scale;
+
+        const float q = hidden[col] / scale;
+        A_int8[col] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+    }
+
+    __global__ void grouped_swiglu_quantize_blockwise_kernel(
+        const float *const *__restrict__ gate_ptrs,
+        const float *const *__restrict__ up_ptrs,
+        int8_t *__restrict__ A_int8,
+        float *__restrict__ scales_A_blockwise,
+        int num_active,
+        int K)
+    {
+        const int slot = blockIdx.x;
+        if (slot >= num_active)
+            return;
+
+        constexpr int kBlockSize = 32;
+        constexpr int kWarps = 8;
+        const int lane = threadIdx.x & 31;
+        const int warp_id = threadIdx.x >> 5;
+        const int blocks_per_row = K / kBlockSize;
+        const float *gate = gate_ptrs[slot];
+        const float *up = up_ptrs[slot];
+        int8_t *row_int8 = A_int8 + static_cast<size_t>(slot) * K;
+        float *row_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
+
+        for (int block_idx = warp_id; block_idx < blocks_per_row; block_idx += kWarps)
+        {
+            const int col = block_idx * kBlockSize + lane;
+            const float g = gate[col];
+            const float value = (g / (1.0f + expf(-g))) * up[col];
+
+            float abs_value = fabsf(value);
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1)
+                abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+
+            const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+            if (lane == 0)
+                row_scales[block_idx] = scale;
+
+            const float q = value / scale;
+            row_int8[col] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+        }
+    }
+
+    __global__ void grouped_prefill_gather_quantize_blockwise_kernel(
+        const float *__restrict__ hidden,
+        int8_t *__restrict__ A_int8,
+        float *__restrict__ scales_A_blockwise,
+        const int *__restrict__ grouped_token_indices,
+        int total_slots,
+        int K)
+    {
+        const int block_idx = blockIdx.x;
+        const int slot = blockIdx.y;
+        const int lane = threadIdx.x;
+        const int col = block_idx * 32 + lane;
+        if (slot >= total_slots || lane >= 32 || col >= K)
+            return;
+
+        const int source_token = grouped_token_indices[slot];
+        const float value = hidden[static_cast<size_t>(source_token) * K + col];
+
+        float abs_value = fabsf(value);
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+
+        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const int blocks_per_row = (K + 31) / 32;
+        if (lane == 0)
+            scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx] = scale;
+
+        const float q = value / scale;
+        A_int8[static_cast<size_t>(slot) * K + col] =
+            static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+    }
+
+    template <uint8_t CodebookId, int TileM>
+    __device__ __forceinline__ void accumulate_prefill_dot_block(
+        const int32_t (&packed_groups)[8],
+        const uint16_t *__restrict__ scale_base,
+        const uint16_t *__restrict__ min_base,
+        const uint32_t *__restrict__ emin_base,
+        const uint8_t *__restrict__ payload,
+        size_t linear,
+        const int32_t *__restrict__ a4_base,
+        int a4_stride_i32,
+        const float *__restrict__ scale_a_base,
+        int scale_a_stride,
+        int tokens_in_group,
+        float (&acc)[TileM])
+    {
+#pragma unroll
+        for (int m = 0; m < TileM; ++m)
+        {
+            if (m >= tokens_in_group)
+                break;
+
+            // Per-token activation row: a4_base/scale_a_base point at a staged shared-memory
+            // tile (contiguous, stride = 8 int32 / 1 scale). The 8 int32 are read as 2×128-bit
+            // vector loads to cut the LDS instruction count 4× (relieves the MIO pipe).
+            // Requires a4_base + m*stride to be 16-byte aligned (s_a is __align__(16), stride=8).
+            const int4 *a4v = reinterpret_cast<const int4 *>(a4_base + static_cast<size_t>(m) * a4_stride_i32);
+            const int4 av0 = a4v[0];
+            const int4 av1 = a4v[1];
+            const int32_t a4[8] = {av0.x, av0.y, av0.z, av0.w, av1.x, av1.y, av1.z, av1.w};
+            const float scale_a = scale_a_base[static_cast<size_t>(m) * scale_a_stride];
+
+            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale)
+            {
+                int dot_lo = 0;
+                int dot_hi = 0;
+                int sum_lo = 0;
+                int sum_hi = 0;
+#pragma unroll
+                for (int group = 0; group < 4; ++group)
+                {
+                    dot_lo = __dp4a(a4[group], packed_groups[group], dot_lo);
+                    sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a4[group]);
+                }
+#pragma unroll
+                for (int group = 4; group < 8; ++group)
+                {
+                    dot_hi = __dp4a(a4[group], packed_groups[group], dot_hi);
+                    sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a4[group]);
+                }
+
+                const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
+                const float scale_hi = min_base ? llaminar2::cuda_native_vnni::fp16_bits_to_float(min_base[linear]) : 0.0f;
+                acc[m] += scale_a * (scale_lo * static_cast<float>(dot_lo) +
+                                     scale_hi * static_cast<float>(dot_hi));
+
+                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale_asym)
+                {
+                    const uint32_t emin = emin_base ? emin_base[linear] : 0u;
+                    const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
+                    const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
+                    acc[m] += scale_a * (min_lo * static_cast<float>(sum_lo) +
+                                         min_hi * static_cast<float>(sum_hi));
+                }
+
+                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq1_m)
+                {
+                    constexpr float kIQ1SDelta = 0.125f;
+                    const uint8_t qh0 = payload[4];
+                    const uint8_t qh1 = payload[5];
+                    const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(a4[0]) +
+                                    llaminar2::cuda_native_vnni::sum_packed_i8(a4[1]);
+                    const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(a4[2]) +
+                                    llaminar2::cuda_native_vnni::sum_packed_i8(a4[3]);
+                    const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(a4[4]) +
+                                    llaminar2::cuda_native_vnni::sum_packed_i8(a4[5]);
+                    const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(a4[6]) +
+                                    llaminar2::cuda_native_vnni::sum_packed_i8(a4[7]);
+                    const float delta0 = (qh0 & 0x08) ? -kIQ1SDelta : kIQ1SDelta;
+                    const float delta1 = (qh0 & 0x80) ? -kIQ1SDelta : kIQ1SDelta;
+                    const float delta2 = (qh1 & 0x08) ? -kIQ1SDelta : kIQ1SDelta;
+                    const float delta3 = (qh1 & 0x80) ? -kIQ1SDelta : kIQ1SDelta;
+                    acc[m] += scale_a * ((delta0 * static_cast<float>(sg0) + delta1 * static_cast<float>(sg1)) * scale_lo +
+                                         (delta2 * static_cast<float>(sg2) + delta3 * static_cast<float>(sg3)) * scale_hi);
+                }
+            }
+            else
+            {
+                int dot = 0;
+                int sum_a = 0;
+#pragma unroll
+                for (int group = 0; group < 8; ++group)
+                {
+                    dot = __dp4a(a4[group], packed_groups[group], dot);
+                    sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a4[group]);
+                }
+
+                const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
+                acc[m] += scale_a * scale_b * static_cast<float>(dot);
+
+                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_asymmetric)
+                {
+                    const float min_b = min_base ? llaminar2::cuda_native_vnni::fp16_bits_to_float(min_base[linear]) : 0.0f;
+                    acc[m] += scale_a * min_b * static_cast<float>(sum_a);
+                }
+            }
+        }
+    }
+
+    template <uint8_t CodebookId, int kTileM>
+    __global__ void grouped_native_vnni_gate_up_prefill_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        const int *__restrict__ expert_counts,
+        const int *__restrict__ expert_offsets,
+        float *__restrict__ gate_output,
+        float *__restrict__ up_output,
+        int N,
+        int K)
+    {
+        // kTileN columns per block (one per thread); kTileM tokens processed per block.
+        // Larger kTileM amortizes the expensive IQ-codebook weight decode (done once per
+        // (block_idx, n)) over more tokens and reduces redundant cross-group re-decode.
+        constexpr int kTileN = 128;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int token_group = blockIdx.y;
+        const int expert_id = blockIdx.z;
+
+        const int count = expert_counts[expert_id];
+        const int first_token = token_group * kTileM;
+        if (first_token >= count)
+            return; // Whole-block uniform exit (token_group/expert from blockIdx) — barrier-safe.
+
+        const int tokens_in_group = min(kTileM, count - first_token);
+        const int first_slot = expert_offsets[expert_id] + first_token;
+        const int blocks_per_row = K / 32;
+
+        // Per-thread output column may be out of range when N is not a multiple of kTileN.
+        // We must NOT early-return such threads: they still participate in the cooperative
+        // shared-memory staging + __syncthreads below. Guard only the weight work / writes.
+        const bool active = (n < N);
+
+        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
+        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+
+        const uint8_t *gate_payload_base = gate_desc.payload;
+        const uint16_t *gate_scale_base = static_cast<const uint16_t *>(gate_desc.scales);
+        const uint16_t *gate_min_base = static_cast<const uint16_t *>(gate_desc.mins);
+        const uint32_t *gate_emin_base = static_cast<const uint32_t *>(gate_desc.emins);
+        const uint8_t *up_payload_base = up_desc.payload;
+        const uint16_t *up_scale_base = static_cast<const uint16_t *>(up_desc.scales);
+        const uint16_t *up_min_base = static_cast<const uint16_t *>(up_desc.mins);
+        const uint32_t *up_emin_base = static_cast<const uint32_t *>(up_desc.emins);
+
+        // Staged activation tile for the current K-block: kTileM tokens × 32 int8 (= 8 int32)
+        // plus one blockwise scale per token. Staging once per block (cooperatively) removes
+        // the ~kTileN-way redundant L1 loads that all N-threads previously issued.
+        // 16-byte aligned so the per-token 8×int32 row can be read as 2× int4 (128-bit) loads.
+        __shared__ __align__(16) int32_t s_a[kTileM * 8];
+        __shared__ float s_scale[kTileM];
+
+        float gate_acc[kTileM] = {};
+        float up_acc[kTileM] = {};
+
+        // Weight decode is hoisted above the activation-staging barrier: for IQ3 codebooks
+        // the decode is a data-dependent payload-byte load followed by a grid-table lookup
+        // (a long-scoreboard latency chain). Issuing it before the cooperative smem staging
+        // + __syncthreads lets the load latency overlap the staging loads and barrier wait,
+        // with no extra register double-buffer (which would cost occupancy).
+        constexpr int kPayloadBytes =
+            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::payload_bytes;
+
+#pragma unroll 1
+        for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx)
+        {
+            const size_t linear = static_cast<size_t>(block_idx) * N + static_cast<size_t>(n);
+
+            // Decode this block's weights first so the global-load + grid-lookup latency
+            // overlaps the activation staging + barrier below.
+            int32_t gate_groups[8];
+            int32_t up_groups[8];
+            const uint8_t *gate_payload = gate_payload_base + linear * kPayloadBytes;
+            const uint8_t *up_payload = up_payload_base + linear * kPayloadBytes;
+            if (active)
+            {
+                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(gate_payload, gate_groups);
+                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(up_payload, up_groups);
+            }
+
+            // Cooperatively load the activation tile for this K-block into shared memory.
+            const int a_count = tokens_in_group * 8;
+            for (int idx = threadIdx.x; idx < a_count; idx += kTileN)
+            {
+                const int m = idx >> 3;
+                const int g = idx & 7;
+                const int slot = first_slot + m;
+                s_a[idx] = reinterpret_cast<const int32_t *>(
+                    A_int8 + static_cast<size_t>(slot) * K + block_idx * 32)[g];
+            }
+            for (int m = threadIdx.x; m < tokens_in_group; m += kTileN)
+            {
+                const int slot = first_slot + m;
+                s_scale[m] = scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx];
+            }
+            __syncthreads();
+
+            if (active)
+            {
+                accumulate_prefill_dot_block<CodebookId, kTileM>(
+                    gate_groups, gate_scale_base, gate_min_base, gate_emin_base, gate_payload,
+                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    tokens_in_group, gate_acc);
+                accumulate_prefill_dot_block<CodebookId, kTileM>(
+                    up_groups, up_scale_base, up_min_base, up_emin_base, up_payload,
+                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    tokens_in_group, up_acc);
+            }
+
+            // Barrier before the next iteration overwrites the staged tile.
+            __syncthreads();
+        }
+
+        if (active)
+        {
+#pragma unroll
+            for (int m = 0; m < kTileM; ++m)
+            {
+                if (m >= tokens_in_group)
+                    break;
+                const int slot = first_slot + m;
+                gate_output[static_cast<size_t>(slot) * N + n] = gate_acc[m];
+                up_output[static_cast<size_t>(slot) * N + n] = up_acc[m];
+            }
+        }
+    }
+
+    // Fused gate/up GEMM + SwiGLU + blockwise int8 quantization.
+    //
+    // This is the fused-epilogue variant of grouped_native_vnni_gate_up_prefill_kernel: after
+    // computing gate_acc/up_acc for each token in the tile, it directly evaluates
+    // silu(gate)*up and blockwise-quantizes the result to int8, writing the down-projection
+    // input (swiglu_int8 + swiglu_scales) in place. This eliminates the FP32 gate/up global
+    // round-trip and the separate grouped_prefill_swiglu_quantize_blockwise_kernel launch.
+    //
+    // Quantization layout: each warp (32 lanes) spans exactly one aligned 32-wide block of the
+    // intermediate (N) dimension (kTileN=128 is a multiple of 32, and N % 32 == 0), so the
+    // per-block absmax is a warp-shuffle reduction with no cross-warp synchronization.
+    template <uint8_t CodebookId, int kTileM>
+    __global__ void grouped_native_vnni_gate_up_swiglu_prefill_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        const int *__restrict__ expert_counts,
+        const int *__restrict__ expert_offsets,
+        int8_t *__restrict__ swiglu_int8,
+        float *__restrict__ swiglu_scales,
+        int N,
+        int K)
+    {
+        constexpr int kTileN = 128;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int token_group = blockIdx.y;
+        const int expert_id = blockIdx.z;
+
+        const int count = expert_counts[expert_id];
+        const int first_token = token_group * kTileM;
+        if (first_token >= count)
+            return; // Whole-block uniform exit — barrier-safe.
+
+        const int tokens_in_group = min(kTileM, count - first_token);
+        const int first_slot = expert_offsets[expert_id] + first_token;
+        const int blocks_per_row = K / 32;
+
+        // Threads with n >= N still participate in cooperative staging + __syncthreads.
+        const bool active = (n < N);
+
+        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
+        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+
+        const uint8_t *gate_payload_base = gate_desc.payload;
+        const uint16_t *gate_scale_base = static_cast<const uint16_t *>(gate_desc.scales);
+        const uint16_t *gate_min_base = static_cast<const uint16_t *>(gate_desc.mins);
+        const uint32_t *gate_emin_base = static_cast<const uint32_t *>(gate_desc.emins);
+        const uint8_t *up_payload_base = up_desc.payload;
+        const uint16_t *up_scale_base = static_cast<const uint16_t *>(up_desc.scales);
+        const uint16_t *up_min_base = static_cast<const uint16_t *>(up_desc.mins);
+        const uint32_t *up_emin_base = static_cast<const uint32_t *>(up_desc.emins);
+
+        __shared__ __align__(16) int32_t s_a[kTileM * 8];
+        __shared__ float s_scale[kTileM];
+
+        float gate_acc[kTileM] = {};
+        float up_acc[kTileM] = {};
+
+        constexpr int kPayloadBytes =
+            llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::payload_bytes;
+
+#pragma unroll 1
+        for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx)
+        {
+            const size_t linear = static_cast<size_t>(block_idx) * N + static_cast<size_t>(n);
+
+            // Hoisted weight decode (overlaps activation staging + barrier latency).
+            int32_t gate_groups[8];
+            int32_t up_groups[8];
+            const uint8_t *gate_payload = gate_payload_base + linear * kPayloadBytes;
+            const uint8_t *up_payload = up_payload_base + linear * kPayloadBytes;
+            if (active)
+            {
+                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(gate_payload, gate_groups);
+                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(up_payload, up_groups);
+            }
+
+            // Cooperatively stage the activation tile for this K-block into shared memory.
+            const int a_count = tokens_in_group * 8;
+            for (int idx = threadIdx.x; idx < a_count; idx += kTileN)
+            {
+                const int m = idx >> 3;
+                const int g = idx & 7;
+                const int slot = first_slot + m;
+                s_a[idx] = reinterpret_cast<const int32_t *>(
+                    A_int8 + static_cast<size_t>(slot) * K + block_idx * 32)[g];
+            }
+            for (int m = threadIdx.x; m < tokens_in_group; m += kTileN)
+            {
+                const int slot = first_slot + m;
+                s_scale[m] = scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx];
+            }
+            __syncthreads();
+
+            if (active)
+            {
+                accumulate_prefill_dot_block<CodebookId, kTileM>(
+                    gate_groups, gate_scale_base, gate_min_base, gate_emin_base, gate_payload,
+                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    tokens_in_group, gate_acc);
+                accumulate_prefill_dot_block<CodebookId, kTileM>(
+                    up_groups, up_scale_base, up_min_base, up_emin_base, up_payload,
+                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    tokens_in_group, up_acc);
+            }
+
+            __syncthreads();
+        }
+
+        // Fused SwiGLU + blockwise int8 quant epilogue. N == intermediate here.
+        const int lane = threadIdx.x & 31;
+        const int blocks_per_row_out = N / 32;
+        const int quant_block = n >> 5; // aligned 32-wide block index along intermediate
+#pragma unroll
+        for (int m = 0; m < kTileM; ++m)
+        {
+            if (m >= tokens_in_group)
+                break; // tokens_in_group is block-uniform → all lanes break together (shfl-safe).
+
+            const int slot = first_slot + m;
+            // Inactive lanes (n >= N) contribute 0 to the warp absmax and skip the write.
+            const float value = active ? (silu(gate_acc[m]) * up_acc[m]) : 0.0f;
+
+            float abs_value = fabsf(value);
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1)
+                abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+
+            const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+            if (active)
+            {
+                if (lane == 0)
+                    swiglu_scales[static_cast<size_t>(slot) * blocks_per_row_out + quant_block] = scale;
+                const float q = value / scale;
+                swiglu_int8[static_cast<size_t>(slot) * N + n] =
+                    static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+            }
+        }
+    }
+
+    __global__ void grouped_prefill_swiglu_quantize_blockwise_kernel(
+        const float *__restrict__ gate,
+        const float *__restrict__ up,
+        int8_t *__restrict__ A_int8,
+        float *__restrict__ scales_A_blockwise,
+        int total_slots,
+        int K)
+    {
+        const int block_idx = blockIdx.x;
+        const int slot = blockIdx.y;
+        const int lane = threadIdx.x;
+        const int col = block_idx * 32 + lane;
+        if (slot >= total_slots || lane >= 32 || col >= K)
+            return;
+
+        const size_t idx = static_cast<size_t>(slot) * K + col;
+        const float g = gate[idx];
+        const float value = silu(g) * up[idx];
+
+        float abs_value = fabsf(value);
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+
+        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        const int blocks_per_row = (K + 31) / 32;
+        if (lane == 0)
+            scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx] = scale;
+
+        const float q = value / scale;
+        A_int8[idx] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+    }
+
+    template <uint8_t CodebookId, int kTileM>
+    __global__ void grouped_native_vnni_down_prefill_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const int *__restrict__ expert_counts,
+        const int *__restrict__ expert_offsets,
+        float *__restrict__ output,
+        int N,
+        int K)
+    {
+        // kTileM tokens processed per block; larger values amortize weight decode (see gate_up).
+        constexpr int kTileN = 128;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int token_group = blockIdx.y;
+        const int expert_id = blockIdx.z;
+
+        const int count = expert_counts[expert_id];
+        const int first_token = token_group * kTileM;
+        if (first_token >= count)
+            return; // Whole-block uniform exit — barrier-safe.
+
+        const int tokens_in_group = min(kTileM, count - first_token);
+        const int first_slot = expert_offsets[expert_id] + first_token;
+        const int blocks_per_row = K / 32;
+
+        // Per-thread output column may exceed N; such threads must still participate in the
+        // cooperative staging + __syncthreads. Guard only weight decode / output writes.
+        const bool active = (n < N);
+
+        const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+
+        const uint8_t *payload_base = desc.payload;
+        const uint16_t *scale_base = static_cast<const uint16_t *>(desc.scales);
+        const uint16_t *min_base = static_cast<const uint16_t *>(desc.mins);
+        const uint32_t *emin_base = static_cast<const uint32_t *>(desc.emins);
+
+        // Staged activation tile (see gate_up kernel) to remove redundant L1 loads.
+        // 16-byte aligned for vectorized 2× int4 (128-bit) per-token reads.
+        __shared__ __align__(16) int32_t s_a[kTileM * 8];
+        __shared__ float s_scale[kTileM];
+
+        float acc[kTileM] = {};
+
+#pragma unroll 1
+        for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx)
+        {
+            // Cooperatively stage the activation tile for this K-block into shared memory.
+            const int a_count = tokens_in_group * 8;
+            for (int idx = threadIdx.x; idx < a_count; idx += kTileN)
+            {
+                const int m = idx >> 3;
+                const int g = idx & 7;
+                const int slot = first_slot + m;
+                s_a[idx] = reinterpret_cast<const int32_t *>(
+                    A_int8 + static_cast<size_t>(slot) * K + block_idx * 32)[g];
+            }
+            for (int m = threadIdx.x; m < tokens_in_group; m += kTileN)
+            {
+                const int slot = first_slot + m;
+                s_scale[m] = scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx];
+            }
+            __syncthreads();
+
+            if (active)
+            {
+                const size_t linear = static_cast<size_t>(block_idx) * N + static_cast<size_t>(n);
+                int32_t packed_groups[8];
+                const uint8_t *payload = payload_base +
+                    linear * llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CodebookId>();
+                llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(payload, packed_groups);
+                accumulate_prefill_dot_block<CodebookId, kTileM>(
+                    packed_groups, scale_base, min_base, emin_base, payload,
+                    linear, s_a, /*a4_stride_i32=*/8, s_scale, /*scale_a_stride=*/1,
+                    tokens_in_group, acc);
+            }
+
+            __syncthreads();
+        }
+
+        if (active)
+        {
+#pragma unroll
+            for (int m = 0; m < kTileM; ++m)
+            {
+                if (m >= tokens_in_group)
+                    break;
+                const int slot = first_slot + m;
+                output[static_cast<size_t>(slot) * N + n] = acc[m];
+            }
+        }
+    }
+
+    __global__ void grouped_prefill_scatter_weighted_kernel(
+        float *__restrict__ output,
+        const float *__restrict__ expert_output,
+        const int *__restrict__ grouped_token_indices,
+        const float *__restrict__ grouped_weights,
+        int total_slots,
+        int d_model)
+    {
+        constexpr int kTileN = 64;
+        const int col = blockIdx.x * kTileN + threadIdx.x;
+        const int slot = blockIdx.y;
+        if (slot >= total_slots || col >= d_model)
+            return;
+
+        const int token = grouped_token_indices[slot];
+        const float weight = grouped_weights[slot];
+        const float value = expert_output[static_cast<size_t>(slot) * d_model + col];
+        atomicAdd(output + static_cast<size_t>(token) * d_model + col, weight * value);
+    }
+
+    /**
+     * @brief Compute a partial dot product over a K-block subrange [b_start, b_end).
+     *
+     * This is the split-K building block: each caller reduces only a slice of the
+     * K dimension so that multiple thread blocks can cooperate on a single output
+     * column. Passing [0, K/32) reproduces the full reduction.
+     *
+     * @param desc                 Native-VNNI weight descriptor (column n of B).
+     * @param n                    Output column index into the weight matrix.
+     * @param A_int8               Quantized activation row (int8, K elements).
+     * @param scales_A_blockwise   Per-K-block activation scales.
+     * @param N                    Weight matrix column count (stride for payload).
+     * @param K                    Reduction dimension length.
+     * @param b_start              First K-block (inclusive) this call reduces.
+     * @param b_end                Last K-block (exclusive) this call reduces.
+     * @return Partial accumulated dot product over the requested K-block range.
+     */
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ float native_vnni_dot_desc_range(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        int n,
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        int N,
+        int K,
+        int b_start,
+        int b_end)
+    {
+        const int blocks_per_row = K / 32;
+        const uint8_t *payload_base = desc.payload;
+        const uint16_t *scale_base = static_cast<const uint16_t *>(desc.scales);
+        const uint16_t *min_base = static_cast<const uint16_t *>(desc.mins);
+        const uint32_t *emin_base = static_cast<const uint32_t *>(desc.emins);
+        float acc = 0.0f;
+
+        // Clamp the requested range to the valid K-block span.
+        if (b_start < 0)
+            b_start = 0;
+        if (b_end > blocks_per_row)
+            b_end = blocks_per_row;
+
+#pragma unroll 1
+        for (int block_idx = b_start; block_idx < b_end; ++block_idx)
+        {
+            const int32_t *a4 = reinterpret_cast<const int32_t *>(A_int8 + block_idx * 32);
+            const size_t linear = static_cast<size_t>(block_idx) * N + static_cast<size_t>(n);
+            const uint8_t *payload = payload_base +
+                                     linear * llaminar2::cuda_native_vnni::payload_bytes_for_codebook<CodebookId>();
+
+            int32_t packed_groups[8];
+            llaminar2::cuda_native_vnni::decode_groups_vec<CodebookId>(payload, packed_groups);
+
+            const float scale_a = scales_A_blockwise[block_idx];
+            if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale)
+            {
+                int dot_lo = 0;
+                int dot_hi = 0;
+                int sum_lo = 0;
+                int sum_hi = 0;
+#pragma unroll
+                for (int group = 0; group < 4; ++group)
+                {
+                    dot_lo = __dp4a(a4[group], packed_groups[group], dot_lo);
+                    dot_hi = __dp4a(a4[group + 4], packed_groups[group + 4], dot_hi);
+                    sum_lo += llaminar2::cuda_native_vnni::sum_packed_i8(a4[group]);
+                    sum_hi += llaminar2::cuda_native_vnni::sum_packed_i8(a4[group + 4]);
+                }
+
+                const float scale_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
+                const float scale_hi = min_base ? llaminar2::cuda_native_vnni::fp16_bits_to_float(min_base[linear]) : 0.0f;
+                acc += scale_a * (scale_lo * static_cast<float>(dot_lo) +
+                                  scale_hi * static_cast<float>(dot_hi));
+
+                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale_asym)
+                {
+                    const uint32_t emin = emin_base ? emin_base[linear] : 0u;
+                    const float min_lo = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin));
+                    const float min_hi = llaminar2::cuda_native_vnni::fp16_bits_to_float(static_cast<uint16_t>(emin >> 16));
+                    acc += scale_a * (min_lo * static_cast<float>(sum_lo) +
+                                      min_hi * static_cast<float>(sum_hi));
+                }
+
+                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_iq1_m)
+                {
+                    constexpr float kIQ1SDelta = 0.125f;
+                    const uint8_t qh0 = payload[4];
+                    const uint8_t qh1 = payload[5];
+                    const int sg0 = llaminar2::cuda_native_vnni::sum_packed_i8(a4[0]) +
+                                    llaminar2::cuda_native_vnni::sum_packed_i8(a4[1]);
+                    const int sg1 = llaminar2::cuda_native_vnni::sum_packed_i8(a4[2]) +
+                                    llaminar2::cuda_native_vnni::sum_packed_i8(a4[3]);
+                    const int sg2 = llaminar2::cuda_native_vnni::sum_packed_i8(a4[4]) +
+                                    llaminar2::cuda_native_vnni::sum_packed_i8(a4[5]);
+                    const int sg3 = llaminar2::cuda_native_vnni::sum_packed_i8(a4[6]) +
+                                    llaminar2::cuda_native_vnni::sum_packed_i8(a4[7]);
+                    const float delta0 = (qh0 & 0x08) ? -kIQ1SDelta : kIQ1SDelta;
+                    const float delta1 = (qh0 & 0x80) ? -kIQ1SDelta : kIQ1SDelta;
+                    const float delta2 = (qh1 & 0x08) ? -kIQ1SDelta : kIQ1SDelta;
+                    const float delta3 = (qh1 & 0x80) ? -kIQ1SDelta : kIQ1SDelta;
+                    acc += scale_a * ((delta0 * static_cast<float>(sg0) + delta1 * static_cast<float>(sg1)) * scale_lo +
+                                      (delta2 * static_cast<float>(sg2) + delta3 * static_cast<float>(sg3)) * scale_hi);
+                }
+            }
+            else
+            {
+                int dot = 0;
+                int sum_a = 0;
+#pragma unroll
+                for (int group = 0; group < 8; ++group)
+                {
+                    dot = __dp4a(a4[group], packed_groups[group], dot);
+                    sum_a += llaminar2::cuda_native_vnni::sum_packed_i8(a4[group]);
+                }
+
+                const float scale_b = llaminar2::cuda_native_vnni::fp16_bits_to_float(scale_base[linear]);
+                acc += scale_a * scale_b * static_cast<float>(dot);
+
+                if constexpr (llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_asymmetric)
+                {
+                    const float min_b = min_base ? llaminar2::cuda_native_vnni::fp16_bits_to_float(min_base[linear]) : 0.0f;
+                    acc += scale_a * min_b * static_cast<float>(sum_a);
+                }
+            }
+        }
+
+        return acc;
+    }
+
+    /**
+     * @brief Full-K dot product wrapper (reduces all K-blocks). Preserves the
+     *        original single-shot reduction semantics for non-split-K callers.
+     */
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ float native_vnni_dot_desc(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        int n,
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        int N,
+        int K)
+    {
+        return native_vnni_dot_desc_range<CodebookId>(
+            desc, n, A_int8, scales_A_blockwise, N, K, 0, K / 32);
+    }
+
+    /**
+     * @brief Split-K scatter kernel for grouped gate/up decode projection.
+     *
+     * Each block reduces one K-partition of one output column for one expert
+     * slot, writing its partial to a [slot][k_part][N] scratch buffer. A separate
+     * reduce kernel sums the partials. This raises occupancy versus the single
+     * full-K kernel (which launches only num_active * ceil(N/64) blocks) by
+     * multiplying the block count by k_partitions, exposing far more warps to
+     * hide global-memory latency on the weight payload loads.
+     *
+     * Grid:  ((N + 63)/64, k_partitions, num_active)   Block: (64)
+     */
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_gate_up_kpart_decode_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        const int *__restrict__ expert_ids,
+        float *__restrict__ gate_partials,
+        float *__restrict__ up_partials,
+        int num_active,
+        int N,
+        int K,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int k_part = blockIdx.y;
+        const int slot = blockIdx.z;
+        if (slot >= num_active || k_part >= k_partitions || n >= N)
+            return;
+
+        // Linear index into the [num_active][k_partitions][N] partials buffer.
+        const size_t partial_index =
+            (static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) +
+             static_cast<size_t>(k_part)) *
+                static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+
+        const int expert_id = expert_ids[slot];
+        if (expert_id < 0)
+        {
+            gate_partials[partial_index] = 0.0f;
+            up_partials[partial_index] = 0.0f;
+            return;
+        }
+
+        // Evenly split the K-blocks across the k_partitions; this block owns
+        // [b_start, b_end).
+        const int blocks_per_row = K / 32;
+        const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
+        const int b_start = k_part * blocks_per_part;
+        int b_end = b_start + blocks_per_part;
+        if (b_end > blocks_per_row)
+            b_end = blocks_per_row;
+
+        if (b_start >= b_end)
+        {
+            gate_partials[partial_index] = 0.0f;
+            up_partials[partial_index] = 0.0f;
+            return;
+        }
+
+        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
+        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+        gate_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
+            gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        up_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
+            up_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    }
+
+    /**
+     * @brief Reduce K-partition partials into the final grouped gate/up outputs.
+     *
+     * Sums the k_partitions partial contributions for each (slot, n) produced by
+     * grouped_native_vnni_gate_up_kpart_decode_kernel and writes the result to
+     * the per-slot gate/up output buffers.
+     *
+     * Grid: ((N + 63)/64, num_active)   Block: (64)
+     */
+    __global__ void grouped_native_vnni_gate_up_kpart_reduce_kernel(
+        const float *__restrict__ gate_partials,
+        const float *__restrict__ up_partials,
+        float *const *__restrict__ gate_outputs,
+        float *const *__restrict__ up_outputs,
+        int num_active,
+        int N,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int slot = blockIdx.y;
+        if (slot >= num_active || n >= N)
+            return;
+
+        float gate_sum = 0.0f;
+        float up_sum = 0.0f;
+        const size_t slot_base =
+            static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+        for (int k_part = 0; k_part < k_partitions; ++k_part)
+        {
+            const size_t idx =
+                slot_base + static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
+            gate_sum += gate_partials[idx];
+            up_sum += up_partials[idx];
+        }
+
+        gate_outputs[slot][n] = gate_sum;
+        up_outputs[slot][n] = up_sum;
+    }
+
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_gate_up_decode_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ gate_descs,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
+        const int *__restrict__ expert_ids,
+        float *const *__restrict__ gate_outputs,
+        float *const *__restrict__ up_outputs,
+        int num_active,
+        int N,
+        int K)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int slot = blockIdx.y;
+        if (slot >= num_active || n >= N)
+            return;
+
+        const int expert_id = expert_ids[slot];
+        if (expert_id < 0)
+            return;
+
+        const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
+        const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+        gate_outputs[slot][n] = native_vnni_dot_desc<CodebookId>(gate_desc, n, A_int8, scales_A_blockwise, N, K);
+        up_outputs[slot][n] = native_vnni_dot_desc<CodebookId>(up_desc, n, A_int8, scales_A_blockwise, N, K);
+    }
+
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_down_decode_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const int *__restrict__ expert_ids,
+        const float *__restrict__ route_weights,
+        float *__restrict__ output,
+        int num_active,
+        int N,
+        int K)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        if (n >= N)
+            return;
+
+        const int blocks_per_row = K / 32;
+        float total = 0.0f;
+#pragma unroll 1
+        for (int slot = 0; slot < num_active; ++slot)
+        {
+            const int expert_id = expert_ids[slot];
+            if (expert_id < 0)
+                continue;
+
+            const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
+            const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
+            const float expert_value = native_vnni_dot_desc<CodebookId>(desc, n, slot_A, slot_scales, N, K);
+            total += route_weights[slot] * expert_value;
+        }
+        output[n] = total;
+    }
+
+    /**
+     * @brief Split-K scatter kernel for the grouped SwiGLU down projection.
+     *
+     * Each block reduces one K-partition of one output column, summing the
+     * route-weighted partial contributions of all active experts for that
+     * K-range, and writes the partial to a [k_partitions][N] scratch buffer.
+     * A separate reduce kernel sums the partials. The down projection launches
+     * only ceil(N/64) blocks in the serial path (N = d_model), leaving the GPU
+     * heavily under-occupied; multiplying the block count by k_partitions
+     * exposes enough warps to hide the weight-payload global-memory latency.
+     *
+     * The expert sum and the K-partition sum commute because each is a linear
+     * accumulation, so summing experts within a K-range and then summing the
+     * K-ranges yields the same result as the serial full-K expert sum.
+     *
+     * Grid: ((N + 63)/64, k_partitions)   Block: (64)
+     */
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_down_kpart_decode_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const int *__restrict__ expert_ids,
+        const float *__restrict__ route_weights,
+        float *__restrict__ partials,
+        int num_active,
+        int N,
+        int K,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int k_part = blockIdx.y;
+        if (k_part >= k_partitions || n >= N)
+            return;
+
+        // Linear index into the [k_partitions][N] partials buffer.
+        const size_t partial_index =
+            static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
+
+        // Evenly split the K-blocks across the partitions; this block owns
+        // [b_start, b_end).
+        const int blocks_per_row = K / 32;
+        const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
+        const int b_start = k_part * blocks_per_part;
+        int b_end = b_start + blocks_per_part;
+        if (b_end > blocks_per_row)
+            b_end = blocks_per_row;
+        if (b_start >= b_end)
+        {
+            partials[partial_index] = 0.0f;
+            return;
+        }
+
+        // Accumulate the route-weighted expert contributions for this K-range.
+        float total = 0.0f;
+#pragma unroll 1
+        for (int slot = 0; slot < num_active; ++slot)
+        {
+            const int expert_id = expert_ids[slot];
+            if (expert_id < 0)
+                continue;
+
+            const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
+            const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
+            const float expert_value = native_vnni_dot_desc_range<CodebookId>(
+                desc, n, slot_A, slot_scales, N, K, b_start, b_end);
+            total += route_weights[slot] * expert_value;
+        }
+        partials[partial_index] = total;
+    }
+
+    /**
+     * @brief Reduce K-partition partials into the final grouped down output.
+     *
+     * Sums the k_partitions partial contributions for each output column n
+     * produced by grouped_native_vnni_down_kpart_decode_kernel.
+     *
+     * Grid: ((N + 63)/64)   Block: (64)
+     */
+    __global__ void grouped_native_vnni_down_kpart_reduce_kernel(
+        const float *__restrict__ partials,
+        float *__restrict__ output,
+        int N,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        if (n >= N)
+            return;
+
+        float sum = 0.0f;
+        for (int k_part = 0; k_part < k_partitions; ++k_part)
+            sum += partials[static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n)];
+        output[n] = sum;
+    }
+
+    int blocksFor(int count)
+    {
+        return (count + kThreads - 1) / kThreads;
+    }
+}
+
+extern "C"
+{
+    bool cudaMoE_route_logits(const float *hidden, const float *gate_weights, float *logits,
+                              int seq_len, int d_model, int num_experts,
+                              int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        dim3 grid(num_experts, seq_len);
+        route_logits_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            hidden, gate_weights, logits, seq_len, d_model, num_experts);
+        return finishLaunch("cudaMoE_route_logits");
+    }
+
+    bool cudaMoE_softmax_topk(float *logits, int *expert_indices, float *expert_weights,
+                              int seq_len, int num_experts, int top_k, bool normalize_weights,
+                              int device_idx, void *stream)
+    {
+        if (num_experts > kMaxExperts || top_k > kMaxTopK)
+            return false;
+        cudaSetDevice(device_idx);
+        softmax_topk_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, expert_indices, expert_weights, seq_len, num_experts, top_k, normalize_weights);
+        return finishLaunch("cudaMoE_softmax_topk");
+    }
+
+    bool cudaMoE_softmax_topk_decode_runtime(float *logits,
+                                             int *runtime_expert_ids,
+                                             float *runtime_weights,
+                                             uint64_t *runtime_histogram,
+                                             float *legacy_indices, float *legacy_weights,
+                                             int num_experts, int top_k, bool normalize_weights,
+                                             bool write_legacy_outputs, bool update_runtime_histogram,
+                                             int device_idx, void *stream)
+    {
+        if (num_experts > kMaxExperts || top_k > kMaxTopK)
+            return false;
+        cudaSetDevice(device_idx);
+        softmax_topk_decode_runtime_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            logits, runtime_expert_ids, runtime_weights, runtime_histogram,
+            legacy_indices, legacy_weights, num_experts, top_k, normalize_weights,
+            write_legacy_outputs, update_runtime_histogram);
+        return finishLaunch("cudaMoE_softmax_topk_decode_runtime");
+    }
+
+    bool cudaMoE_decode_route_select_runtime(const int *expert_indices, const float *expert_weights,
+                                             int *runtime_expert_ids,
+                                             float *runtime_weights,
+                                             uint64_t *runtime_histogram,
+                                             float *legacy_indices, float *legacy_weights,
+                                             int, int top_k, bool write_legacy_outputs,
+                                             bool update_runtime_histogram, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        decode_route_select_runtime_kernel<<<1, kMaxTopK, 0, static_cast<cudaStream_t>(stream)>>>(
+            expert_indices, expert_weights, runtime_expert_ids, runtime_weights, runtime_histogram,
+            legacy_indices, legacy_weights, top_k, write_legacy_outputs, update_runtime_histogram);
+        return finishLaunch("cudaMoE_decode_route_select_runtime");
+    }
+
+    bool cudaMoE_int_to_float(const int *input, float *output, int count, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        int_to_float_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(input, output, count);
+        return finishLaunch("cudaMoE_int_to_float");
+    }
+
+    bool cudaMoE_float_to_int(const float *input, int *output, int count, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        float_to_int_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(input, output, count);
+        return finishLaunch("cudaMoE_float_to_int");
+    }
+
+    bool cudaMoE_gather_tokens(const float *hidden, float *batch_buffer, const int *token_indices,
+                               int num_tokens, int d_model, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        const int total = num_tokens * d_model;
+        gather_tokens_kernel<<<blocksFor(total), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            hidden, batch_buffer, token_indices, num_tokens, d_model);
+        return finishLaunch("cudaMoE_gather_tokens");
+    }
+
+    bool cudaMoE_scatter_add(float *output, const float *expert_output, const int *token_indices,
+                             const float *weights, int num_tokens, int d_model, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        const int total = num_tokens * d_model;
+        scatter_add_kernel<<<blocksFor(total), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            output, expert_output, token_indices, weights, num_tokens, d_model);
+        return finishLaunch("cudaMoE_scatter_add");
+    }
+
+    bool cudaMoE_shared_expert_gate(const float *input, const float *gate_inp, float *shared_output,
+                                    int seq_len, int d_model, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        shared_expert_gate_kernel<<<seq_len, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            input, gate_inp, shared_output, seq_len, d_model);
+        return finishLaunch("cudaMoE_shared_expert_gate");
+    }
+
+    bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        swiglu_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, count);
+        return finishLaunch("cudaMoE_swiglu");
+    }
+
+    bool cudaMoE_weighted_add(float *output, const float *input, float weight, int count, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        weighted_add_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(output, input, weight, count);
+        return finishLaunch("cudaMoE_weighted_add");
+    }
+
+    bool cudaMoE_count_per_expert(const int *routing_indices, int *expert_counts, int total_slots,
+                                  int num_experts, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        count_per_expert_kernel<<<blocksFor(total_slots), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            routing_indices, expert_counts, total_slots, num_experts);
+        return finishLaunch("cudaMoE_count_per_expert");
+    }
+
+    bool cudaMoE_exclusive_scan(const int *expert_counts, int *expert_offsets,
+                                int num_experts, int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        exclusive_scan_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(expert_counts, expert_offsets, num_experts);
+        return finishLaunch("cudaMoE_exclusive_scan");
+    }
+
+    bool cudaMoE_scatter_tokens(const int *routing_indices, const float *routing_weights,
+                                int *write_heads, const int *expert_offsets,
+                                int *grouped_token_indices, float *grouped_weights,
+                                int total_slots, int top_k, int num_experts,
+                                int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        scatter_tokens_kernel<<<blocksFor(total_slots), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            routing_indices, routing_weights, write_heads, expert_offsets,
+            grouped_token_indices, grouped_weights, total_slots, top_k, num_experts);
+        return finishLaunch("cudaMoE_scatter_tokens");
+    }
+
+    bool cudaMoE_gather_expert_fixed(const float *hidden, float *batch_buffer,
+                                     const int *expert_offsets, const int *expert_counts,
+                                     const int *grouped_token_indices,
+                                     int expert_id, int max_tokens, int d_model,
+                                     int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        const int total = max_tokens * d_model;
+        gather_expert_fixed_kernel<<<blocksFor(total), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            hidden, batch_buffer, expert_offsets, expert_counts, grouped_token_indices,
+            expert_id, max_tokens, d_model);
+        return finishLaunch("cudaMoE_gather_expert_fixed");
+    }
+
+    bool cudaMoE_scatter_expert_fixed(float *output, const float *expert_output,
+                                      const int *expert_offsets, const int *expert_counts,
+                                      const int *grouped_token_indices,
+                                      const float *grouped_weights,
+                                      int expert_id, int max_tokens, int d_model,
+                                      int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        const int total = max_tokens * d_model;
+        scatter_expert_fixed_kernel<<<blocksFor(total), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            output, expert_output, expert_offsets, expert_counts, grouped_token_indices,
+            grouped_weights, expert_id, max_tokens, d_model);
+        return finishLaunch("cudaMoE_scatter_expert_fixed");
+    }
+
+    bool cudaMoE_grouped_gate_up_native_vnni_decode_table(
+        const float *d_hidden,
+        const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
+        const DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        int num_active,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
+            !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
+            num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        const int blocks_per_row = K / 32;
+        grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+            d_hidden, d_hidden_int8, d_hidden_scales, K);
+        if (!finishLaunch("cudaMoE_grouped_gate_up_hidden_quantize"))
+            return false;
+
+        constexpr int kTileN = 64;
+        dim3 grid((N + kTileN - 1) / kTileN, num_active);
+        dim3 block(kTileN);
+
+#define LAUNCH_GROUPED_GATE_UP(CB)                                                                  \
+    grouped_native_vnni_gate_up_decode_kernel<CB><<<grid, block, 0, cuda_stream>>>(                 \
+        d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,           \
+        d_gate_outputs, d_up_outputs, num_active, N, K)
+
+        switch (codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_GATE_UP(0); break;
+        case 4:  LAUNCH_GROUPED_GATE_UP(4); break;
+        case 5:  LAUNCH_GROUPED_GATE_UP(5); break;
+        case 6:  LAUNCH_GROUPED_GATE_UP(6); break;
+        case 7:  LAUNCH_GROUPED_GATE_UP(7); break;
+        case 8:  LAUNCH_GROUPED_GATE_UP(8); break;
+        case 9:  LAUNCH_GROUPED_GATE_UP(9); break;
+        case 10: LAUNCH_GROUPED_GATE_UP(10); break;
+        case 11: LAUNCH_GROUPED_GATE_UP(11); break;
+        case 12: LAUNCH_GROUPED_GATE_UP(12); break;
+        case 13: LAUNCH_GROUPED_GATE_UP(13); break;
+        case 14: LAUNCH_GROUPED_GATE_UP(14); break;
+        case 15: LAUNCH_GROUPED_GATE_UP(15); break;
+        case 16: LAUNCH_GROUPED_GATE_UP(16); break;
+        case 17: LAUNCH_GROUPED_GATE_UP(17); break;
+        case 19: LAUNCH_GROUPED_GATE_UP(19); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table] unsupported codebook_id=%u\n",
+                         static_cast<unsigned>(codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_GATE_UP
+
+        return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_table");
+    }
+
+    bool cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+        const float *d_hidden,
+        const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
+        const DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int num_active,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream)
+    {
+        const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
+                                         k_partitions == 16 || k_partitions == 32);
+        if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
+            !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
+            !d_gate_partials || !d_up_partials ||
+            num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0 || !valid_k_partitions)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        // Step 1: blockwise-quantize the shared hidden activation row once.
+        const int blocks_per_row = K / 32;
+        grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+            d_hidden, d_hidden_int8, d_hidden_scales, K);
+        if (!finishLaunch("cudaMoE_grouped_gate_up_kpart_hidden_quantize"))
+            return false;
+
+        // Step 2: split-K scatter — each (n-tile, k-partition, expert-slot) block
+        // reduces its K-slice into the partials buffer.
+        constexpr int kTileN = 64;
+        dim3 partial_grid((N + kTileN - 1) / kTileN, k_partitions, num_active);
+        dim3 block(kTileN);
+
+#define LAUNCH_GROUPED_GATE_UP_KPART(CB)                                                            \
+    grouped_native_vnni_gate_up_kpart_decode_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>(   \
+        d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,           \
+        d_gate_partials, d_up_partials, num_active, N, K, k_partitions)
+
+        switch (codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_GATE_UP_KPART(0); break;
+        case 4:  LAUNCH_GROUPED_GATE_UP_KPART(4); break;
+        case 5:  LAUNCH_GROUPED_GATE_UP_KPART(5); break;
+        case 6:  LAUNCH_GROUPED_GATE_UP_KPART(6); break;
+        case 7:  LAUNCH_GROUPED_GATE_UP_KPART(7); break;
+        case 8:  LAUNCH_GROUPED_GATE_UP_KPART(8); break;
+        case 9:  LAUNCH_GROUPED_GATE_UP_KPART(9); break;
+        case 10: LAUNCH_GROUPED_GATE_UP_KPART(10); break;
+        case 11: LAUNCH_GROUPED_GATE_UP_KPART(11); break;
+        case 12: LAUNCH_GROUPED_GATE_UP_KPART(12); break;
+        case 13: LAUNCH_GROUPED_GATE_UP_KPART(13); break;
+        case 14: LAUNCH_GROUPED_GATE_UP_KPART(14); break;
+        case 15: LAUNCH_GROUPED_GATE_UP_KPART(15); break;
+        case 16: LAUNCH_GROUPED_GATE_UP_KPART(16); break;
+        case 17: LAUNCH_GROUPED_GATE_UP_KPART(17); break;
+        case 19: LAUNCH_GROUPED_GATE_UP_KPART(19); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
+                         static_cast<unsigned>(codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_GATE_UP_KPART
+
+        if (!finishLaunch("cudaMoE_grouped_gate_up_kpart_partial"))
+            return false;
+
+        // Step 3: reduce the k_partitions partials into the final gate/up outputs.
+        dim3 reduce_grid((N + kTileN - 1) / kTileN, num_active);
+        grouped_native_vnni_gate_up_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
+            d_gate_partials, d_up_partials, d_gate_outputs, d_up_outputs,
+            num_active, N, k_partitions);
+
+        return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart");
+    }
+
+    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_output,
+        int num_active,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
+            !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
+            num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
+            d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales, num_active, K);
+        if (!finishLaunch("cudaMoE_grouped_swiglu_quantize"))
+            return false;
+
+        constexpr int kTileN = 64;
+        dim3 grid((N + kTileN - 1) / kTileN);
+        dim3 block(kTileN);
+
+#define LAUNCH_GROUPED_DOWN(CB)                                                                  \
+    grouped_native_vnni_down_decode_kernel<CB><<<grid, block, 0, cuda_stream>>>(                 \
+        d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,                   \
+        d_output, num_active, N, K)
+
+        switch (codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_DOWN(0); break;
+        case 4:  LAUNCH_GROUPED_DOWN(4); break;
+        case 5:  LAUNCH_GROUPED_DOWN(5); break;
+        case 6:  LAUNCH_GROUPED_DOWN(6); break;
+        case 7:  LAUNCH_GROUPED_DOWN(7); break;
+        case 8:  LAUNCH_GROUPED_DOWN(8); break;
+        case 9:  LAUNCH_GROUPED_DOWN(9); break;
+        case 10: LAUNCH_GROUPED_DOWN(10); break;
+        case 11: LAUNCH_GROUPED_DOWN(11); break;
+        case 12: LAUNCH_GROUPED_DOWN(12); break;
+        case 13: LAUNCH_GROUPED_DOWN(13); break;
+        case 14: LAUNCH_GROUPED_DOWN(14); break;
+        case 15: LAUNCH_GROUPED_DOWN(15); break;
+        case 16: LAUNCH_GROUPED_DOWN(16); break;
+        case 17: LAUNCH_GROUPED_DOWN(17); break;
+        case 19: LAUNCH_GROUPED_DOWN(19); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table] unsupported codebook_id=%u\n",
+                         static_cast<unsigned>(codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_DOWN
+
+        return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table");
+    }
+
+    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_down_partials,
+        float *d_output,
+        int num_active,
+        int d_model,
+        int intermediate,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream)
+    {
+        const bool valid_k_partitions =
+            (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
+             k_partitions == 16);
+        if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
+            !d_swiglu_int8 || !d_swiglu_scales || !d_down_partials || !d_output ||
+            num_active <= 0 || d_model <= 0 || intermediate <= 0 || (intermediate % 32) != 0 ||
+            !valid_k_partitions)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        // Step 1: quantize the per-slot SwiGLU activations (shared with serial path).
+        grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
+            d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales, num_active, intermediate);
+        if (!finishLaunch("cudaMoE_grouped_swiglu_quantize"))
+            return false;
+
+        constexpr int kTileN = 64;
+        const int N = d_model;
+        const int K = intermediate;
+        dim3 scatter_grid((N + kTileN - 1) / kTileN, k_partitions);
+        dim3 reduce_grid((N + kTileN - 1) / kTileN);
+        dim3 block(kTileN);
+
+        // Step 2: scatter — each (n, k_part) block writes a route-weighted partial.
+#define LAUNCH_GROUPED_DOWN_KPART(CB)                                                            \
+    grouped_native_vnni_down_kpart_decode_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>(   \
+        d_swiglu_int8, d_swiglu_scales, d_desc_table, d_expert_ids, d_weights,                   \
+        d_down_partials, num_active, N, K, k_partitions)
+
+        switch (codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_DOWN_KPART(0); break;
+        case 4:  LAUNCH_GROUPED_DOWN_KPART(4); break;
+        case 5:  LAUNCH_GROUPED_DOWN_KPART(5); break;
+        case 6:  LAUNCH_GROUPED_DOWN_KPART(6); break;
+        case 7:  LAUNCH_GROUPED_DOWN_KPART(7); break;
+        case 8:  LAUNCH_GROUPED_DOWN_KPART(8); break;
+        case 9:  LAUNCH_GROUPED_DOWN_KPART(9); break;
+        case 10: LAUNCH_GROUPED_DOWN_KPART(10); break;
+        case 11: LAUNCH_GROUPED_DOWN_KPART(11); break;
+        case 12: LAUNCH_GROUPED_DOWN_KPART(12); break;
+        case 13: LAUNCH_GROUPED_DOWN_KPART(13); break;
+        case 14: LAUNCH_GROUPED_DOWN_KPART(14); break;
+        case 15: LAUNCH_GROUPED_DOWN_KPART(15); break;
+        case 16: LAUNCH_GROUPED_DOWN_KPART(16); break;
+        case 17: LAUNCH_GROUPED_DOWN_KPART(17); break;
+        case 19: LAUNCH_GROUPED_DOWN_KPART(19); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
+                         static_cast<unsigned>(codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_DOWN_KPART
+
+        if (!finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart scatter"))
+            return false;
+
+        // Step 3: reduce — sum the k_partitions partials into the final output.
+        grouped_native_vnni_down_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
+            d_down_partials, d_output, N, k_partitions);
+
+        return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart reduce");
+    }
+
+    bool cudaMoE_grouped_prefill_pipeline(
+        const float *d_hidden,
+        const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
+        const DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const DeviceNativeVNNIMatrixDesc *d_down_desc_table,
+        const int *d_group_counts,
+        const int *d_group_offsets,
+        const int *d_group_token_indices,
+        const float *d_group_weights,
+        int8_t *d_scratch_A_int8,
+        float *d_scratch_scales,
+        float *d_scratch_gate,
+        float *d_scratch_up,
+        int8_t *d_scratch_swiglu_int8,
+        float *d_scratch_swiglu_scales,
+        float *d_scratch_down_out,
+        float *d_output,
+        int num_experts,
+        int d_model,
+        int intermediate,
+        int max_tokens_per_expert,
+        int total_slots,
+        uint8_t gateup_codebook_id,
+        uint8_t down_codebook_id,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_down_desc_table ||
+            !d_group_counts || !d_group_offsets || !d_group_token_indices || !d_group_weights ||
+            !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate || !d_scratch_up ||
+            !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out || !d_output ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
+            max_tokens_per_expert <= 0 || total_slots <= 0 ||
+            (d_model % 32) != 0 || (intermediate % 32) != 0)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        {
+            dim3 grid(d_model / 32, total_slots);
+            dim3 block(32);
+            grouped_prefill_gather_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
+                d_hidden, d_scratch_A_int8, d_scratch_scales,
+                d_group_token_indices, total_slots, d_model);
+            if (!finishLaunch("cudaMoE_grouped_prefill_gather_quantize"))
+                return false;
+        }
+
+        {
+            constexpr int kTileN = 128;
+            // kTileM is tunable (debugEnv) to amortize IQ-codebook weight decode across more
+            // tokens. Valid values 8 or 16; larger reduces redundant decode but uses more regs.
+            const int tile_m = llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
+            const int kTileM = (tile_m == 16) ? 16 : 8;
+            // When fusion is enabled the gate/up kernel computes SwiGLU + blockwise int8 quant
+            // in its epilogue, writing the down-projection input directly (no FP32 gate/up
+            // round-trip, no separate swiglu_quantize launch).
+            const bool fuse_swiglu = llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu;
+            dim3 grid((intermediate + kTileN - 1) / kTileN,
+                      (max_tokens_per_expert + kTileM - 1) / kTileM,
+                      num_experts);
+            dim3 block(kTileN);
+
+#define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                   \
+    grouped_native_vnni_gate_up_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(            \
+        d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
+        d_group_counts, d_group_offsets, d_scratch_gate, d_scratch_up, intermediate, d_model)
+#define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                            \
+    grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(     \
+        d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
+        d_group_counts, d_group_offsets, d_scratch_swiglu_int8, d_scratch_swiglu_scales,            \
+        intermediate, d_model)
+#define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                          \
+    do {                                                                                           \
+        if (fuse_swiglu) {                                                                          \
+            if (kTileM == 16) LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);                      \
+            else              LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                        \
+        } else {                                                                                    \
+            if (kTileM == 16) LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                             \
+            else              LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                              \
+        }                                                                                           \
+    } while (0)
+
+            switch (gateup_codebook_id)
+            {
+            case 0:  LAUNCH_GROUPED_GATEUP_PREFILL(0); break;
+            case 4:  LAUNCH_GROUPED_GATEUP_PREFILL(4); break;
+            case 5:  LAUNCH_GROUPED_GATEUP_PREFILL(5); break;
+            case 6:  LAUNCH_GROUPED_GATEUP_PREFILL(6); break;
+            case 7:  LAUNCH_GROUPED_GATEUP_PREFILL(7); break;
+            case 8:  LAUNCH_GROUPED_GATEUP_PREFILL(8); break;
+            case 9:  LAUNCH_GROUPED_GATEUP_PREFILL(9); break;
+            case 10: LAUNCH_GROUPED_GATEUP_PREFILL(10); break;
+            case 11: LAUNCH_GROUPED_GATEUP_PREFILL(11); break;
+            case 12: LAUNCH_GROUPED_GATEUP_PREFILL(12); break;
+            case 13: LAUNCH_GROUPED_GATEUP_PREFILL(13); break;
+            case 14: LAUNCH_GROUPED_GATEUP_PREFILL(14); break;
+            case 15: LAUNCH_GROUPED_GATEUP_PREFILL(15); break;
+            case 16: LAUNCH_GROUPED_GATEUP_PREFILL(16); break;
+            case 17: LAUNCH_GROUPED_GATEUP_PREFILL(17); break;
+            case 19: LAUNCH_GROUPED_GATEUP_PREFILL(19); break;
+            default:
+                std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] unsupported gate/up codebook_id=%u\n",
+                             static_cast<unsigned>(gateup_codebook_id));
+                return false;
+            }
+
+#undef LAUNCH_GROUPED_GATEUP_PREFILL
+#undef LAUNCH_GROUPED_GATEUP_PREFILL_TM
+
+            if (!finishLaunch("cudaMoE_grouped_gate_up_prefill"))
+                return false;
+        }
+
+        // Separate SwiGLU + blockwise-quant pass. Skipped when fusion is enabled — the fused
+        // gate/up kernel already produced d_scratch_swiglu_int8 / d_scratch_swiglu_scales.
+        if (!llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
+        {
+            dim3 grid(intermediate / 32, total_slots);
+            dim3 block(32);
+            grouped_prefill_swiglu_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
+                d_scratch_gate, d_scratch_up,
+                d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+                total_slots, intermediate);
+            if (!finishLaunch("cudaMoE_grouped_swiglu_quantize_prefill"))
+                return false;
+        }
+
+        {
+            constexpr int kTileN = 128;
+            const int tile_m = llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
+            const int kTileM = (tile_m == 16) ? 16 : 8;
+            dim3 grid((d_model + kTileN - 1) / kTileN,
+                      (max_tokens_per_expert + kTileM - 1) / kTileM,
+                      num_experts);
+            dim3 block(kTileN);
+
+#define LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, TM)                                                     \
+    grouped_native_vnni_down_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(               \
+        d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                          \
+        d_group_counts, d_group_offsets, d_scratch_down_out, d_model, intermediate)
+#define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
+    do {                                                                                           \
+        if (kTileM == 16) LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 16);                                   \
+        else              LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 8);                                    \
+    } while (0)
+
+            switch (down_codebook_id)
+            {
+            case 0:  LAUNCH_GROUPED_DOWN_PREFILL(0); break;
+            case 4:  LAUNCH_GROUPED_DOWN_PREFILL(4); break;
+            case 5:  LAUNCH_GROUPED_DOWN_PREFILL(5); break;
+            case 6:  LAUNCH_GROUPED_DOWN_PREFILL(6); break;
+            case 7:  LAUNCH_GROUPED_DOWN_PREFILL(7); break;
+            case 8:  LAUNCH_GROUPED_DOWN_PREFILL(8); break;
+            case 9:  LAUNCH_GROUPED_DOWN_PREFILL(9); break;
+            case 10: LAUNCH_GROUPED_DOWN_PREFILL(10); break;
+            case 11: LAUNCH_GROUPED_DOWN_PREFILL(11); break;
+            case 12: LAUNCH_GROUPED_DOWN_PREFILL(12); break;
+            case 13: LAUNCH_GROUPED_DOWN_PREFILL(13); break;
+            case 14: LAUNCH_GROUPED_DOWN_PREFILL(14); break;
+            case 15: LAUNCH_GROUPED_DOWN_PREFILL(15); break;
+            case 16: LAUNCH_GROUPED_DOWN_PREFILL(16); break;
+            case 17: LAUNCH_GROUPED_DOWN_PREFILL(17); break;
+            case 19: LAUNCH_GROUPED_DOWN_PREFILL(19); break;
+            default:
+                std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] unsupported down codebook_id=%u\n",
+                             static_cast<unsigned>(down_codebook_id));
+                return false;
+            }
+
+#undef LAUNCH_GROUPED_DOWN_PREFILL
+#undef LAUNCH_GROUPED_DOWN_PREFILL_TM
+
+            if (!finishLaunch("cudaMoE_grouped_down_prefill"))
+                return false;
+        }
+
+        {
+            constexpr int kTileN = 64;
+            dim3 grid((d_model + kTileN - 1) / kTileN, total_slots);
+            dim3 block(kTileN);
+            grouped_prefill_scatter_weighted_kernel<<<grid, block, 0, cuda_stream>>>(
+                d_output, d_scratch_down_out,
+                d_group_token_indices, d_group_weights,
+                total_slots, d_model);
+            if (!finishLaunch("cudaMoE_grouped_scatter_prefill"))
+                return false;
+        }
+
+        return true;
+    }
+}

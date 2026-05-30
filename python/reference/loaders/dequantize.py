@@ -23,9 +23,15 @@ Author: David Sanftenberg
 """
 
 import struct
+import re
+from functools import lru_cache
+from pathlib import Path
 import numpy as np
 from typing import Tuple
 from .gguf_parser import GGUFTensorType
+
+
+_IQ_SIGN_MASKS = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=np.uint8)
 
 
 def fp16_to_fp32(fp16_bytes: bytes) -> float:
@@ -85,10 +91,7 @@ def dequantize_q4_0(data: bytes, n_elements: int) -> np.ndarray:
     Returns:
         NumPy array of FP32 values
     """
-    BLOCK_SIZE = 32
     BLOCK_BYTES = 18  # 2 (scale) + 16 (data)
-    
-    num_blocks = (n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE
     
     # Convert entire data to numpy array for vectorized operations
     data_array = np.frombuffer(data, dtype=np.uint8)
@@ -175,7 +178,6 @@ def dequantize_q8_0(data: bytes, n_elements: int) -> np.ndarray:
     Returns:
         NumPy array of FP32 values
     """
-    BLOCK_SIZE = 32
     BLOCK_BYTES = 34  # 2 (scale) + 32 (data)
     
     # Convert to numpy array
@@ -269,9 +271,9 @@ def dequantize_q6_k(data: bytes, n_elements: int) -> np.ndarray:
 
     # 3D reshape: 16 groups of 16 elements, each group has one scale value.
     # Broadcasting (N,16,1) scale × (N,16,16) quants avoids materializing (N,256) scale array.
-    q_3d = quants.reshape(full_blocks, 16, 16).astype(np.float32)
+    q_3d = quants.reshape((full_blocks, 16, 16)).astype(np.float32)
     q_3d -= 32
-    sc_3d = sc.astype(np.float32).reshape(full_blocks, 16, 1)
+    sc_3d = sc.astype(np.float32).reshape((full_blocks, 16, 1))
     q_3d *= d[:, np.newaxis, np.newaxis] * sc_3d
 
     result[:full_blocks * QK_K] = q_3d.reshape(-1)
@@ -681,6 +683,270 @@ def dequantize_q5_k(data: bytes, n_elements: int) -> np.ndarray:
     return result
 
 
+@lru_cache(maxsize=1)
+def _load_iq3s_grid() -> np.ndarray:
+    """
+    Load the IQ3_S grid table from the C++ source of truth.
+
+    IQ3_S uses ``iq3s_grid[512]`` from ``IQQuantTables.h``. The C++ decoder
+    casts each uint32_t entry to ``uint8_t*`` and reads four little-endian grid
+    values, so this loader returns a ``(512, 4)`` FP32 array in that byte order.
+    """
+    header_path = Path(__file__).resolve().parents[3] / "src" / "v2" / "tensors" / "IQQuantTables.h"
+    try:
+        table_source = header_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Unable to load IQ3_S grid table from {header_path}") from exc
+
+    match = re.search(
+        r"static\s+constexpr\s+uint32_t\s+iq3s_grid\s*\[\s*512\s*\]\s*=\s*\{(?P<body>.*?)\};",
+        table_source,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise RuntimeError(f"Unable to find iq3s_grid[512] in {header_path}")
+
+    body = re.sub(r"/\*.*?\*/|//[^\n]*", "", match.group("body"), flags=re.DOTALL)
+    values = [int(value, 16) for value in re.findall(r"0x[0-9a-fA-F]+", body)]
+    if len(values) != 512:
+        raise RuntimeError(f"Expected 512 IQ3_S grid entries, found {len(values)} in {header_path}")
+
+    return np.array(values, dtype="<u4").view(np.uint8).reshape(512, 4).astype(np.float32)
+
+
+@lru_cache(maxsize=1)
+def _load_iq3xxs_grid() -> np.ndarray:
+    """
+    Load the IQ3_XXS grid table from the C++ source of truth.
+
+    IQ3_XXS uses ``iq3xxs_grid[256]`` from ``IQQuantTables.h``. Each uint32_t
+    stores four little-endian grid values, matching the C++ decoder's
+    ``reinterpret_cast<const uint8_t*>`` access pattern.
+    """
+    header_path = Path(__file__).resolve().parents[3] / "src" / "v2" / "tensors" / "IQQuantTables.h"
+    try:
+        table_source = header_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Unable to load IQ3_XXS grid table from {header_path}") from exc
+
+    match = re.search(
+        r"static\s+constexpr\s+uint32_t\s+iq3xxs_grid\s*\[\s*256\s*\]\s*=\s*\{(?P<body>.*?)\};",
+        table_source,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise RuntimeError(f"Unable to find iq3xxs_grid[256] in {header_path}")
+
+    body = re.sub(r"/\*.*?\*/|//[^\n]*", "", match.group("body"), flags=re.DOTALL)
+    values = [int(value, 16) for value in re.findall(r"0x[0-9a-fA-F]+", body)]
+    if len(values) != 256:
+        raise RuntimeError(f"Expected 256 IQ3_XXS grid entries, found {len(values)} in {header_path}")
+
+    return np.array(values, dtype="<u4").view(np.uint8).reshape(256, 4).astype(np.float32)
+
+
+@lru_cache(maxsize=1)
+def _load_ksigns_iq2xs() -> np.ndarray:
+    """Load the packed IQ sign-pattern table used by IQ3_XXS."""
+    header_path = Path(__file__).resolve().parents[3] / "src" / "v2" / "tensors" / "IQQuantTables.h"
+    try:
+        table_source = header_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Unable to load IQ sign table from {header_path}") from exc
+
+    match = re.search(
+        r"static\s+constexpr\s+uint8_t\s+ksigns_iq2xs\s*\[\s*128\s*\]\s*=\s*\{(?P<body>.*?)\};",
+        table_source,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise RuntimeError(f"Unable to find ksigns_iq2xs[128] in {header_path}")
+
+    body = re.sub(r"/\*.*?\*/|//[^\n]*", "", match.group("body"), flags=re.DOTALL)
+    values = [int(value, 0) for value in re.findall(r"0x[0-9a-fA-F]+|\d+", body)]
+    if len(values) != 128:
+        raise RuntimeError(f"Expected 128 IQ sign entries, found {len(values)} in {header_path}")
+
+    return np.array(values, dtype=np.uint8)
+
+
+def dequantize_iq3_s(data: bytes, shape: Tuple[int, ...]) -> np.ndarray:
+    """
+    Dequantize IQ3_S (3-bit small IQ) to FP32.
+
+    IQ3_S format matches ``IQ3_SBlock`` in ``BlockStructures.h``:
+      - d (FP16, 2 bytes): super-block scale
+      - qs[64]: 8-bit portions of 9-bit grid indices
+      - qh[8]: high bits for grid indices, one byte per 32-element sub-block
+      - signs[32]: direct sign bits, four bytes per sub-block
+      - scales[4]: two 4-bit scale nibbles per byte, eight sub-blocks total
+
+    Each 110-byte super-block produces 256 values. The final dimension is
+    treated as the row stride so tensors with row padding decode correctly.
+    """
+    QK_K = 256
+    BLOCK_BYTES = 110
+
+    n_elements = 1
+    for dim in shape:
+        n_elements *= dim
+
+    if n_elements == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    cols = shape[-1] if len(shape) > 0 else n_elements
+    if cols == 0:
+        return np.zeros(n_elements, dtype=np.float32)
+    rows = n_elements // cols
+    blocks_per_row = (cols + QK_K - 1) // QK_K
+    expected_blocks = rows * blocks_per_row
+    full_blocks = min(expected_blocks, len(data) // BLOCK_BYTES)
+
+    if full_blocks == 0:
+        return np.zeros(n_elements, dtype=np.float32)
+
+    data_array = np.frombuffer(data, dtype=np.uint8, count=full_blocks * BLOCK_BYTES)
+    blocks = data_array.reshape(full_blocks, BLOCK_BYTES)
+
+    d = np.ascontiguousarray(blocks[:, 0:2]).view(np.float16).reshape(full_blocks).astype(np.float32)
+    qs = blocks[:, 2:66]
+    qh = blocks[:, 66:74].astype(np.uint16)
+    signs = blocks[:, 74:106]
+    scales = blocks[:, 106:110]
+    grid = _load_iq3s_grid()
+
+    decoded_blocks = np.empty((full_blocks, QK_K), dtype=np.float32)
+
+    for sub_block in range(8):
+        scale_byte = scales[:, sub_block // 2]
+        if sub_block & 1:
+            scale_nibble = scale_byte >> 4
+        else:
+            scale_nibble = scale_byte & 0x0F
+        block_scale = d * (1.0 + 2.0 * scale_nibble.astype(np.float32))
+
+        qh_byte = qh[:, sub_block]
+        qs_offset = sub_block * 8
+        signs_offset = sub_block * 4
+        out_offset = sub_block * 32
+
+        for group in range(4):
+            grid_idx1 = qs[:, qs_offset + 2 * group].astype(np.uint16) | ((qh_byte << (8 - 2 * group)) & 0x100)
+            grid_idx2 = qs[:, qs_offset + 2 * group + 1].astype(np.uint16) | ((qh_byte << (7 - 2 * group)) & 0x100)
+
+            sign_byte = signs[:, signs_offset + group]
+            sign1 = np.where((sign_byte[:, np.newaxis] & _IQ_SIGN_MASKS[:4]) != 0, -1.0, 1.0).astype(np.float32)
+            sign2 = np.where((sign_byte[:, np.newaxis] & _IQ_SIGN_MASKS[4:]) != 0, -1.0, 1.0).astype(np.float32)
+
+            dst = out_offset + group * 8
+            decoded_blocks[:, dst:dst + 4] = block_scale[:, np.newaxis] * grid[grid_idx1] * sign1
+            decoded_blocks[:, dst + 4:dst + 8] = block_scale[:, np.newaxis] * grid[grid_idx2] * sign2
+
+    if full_blocks == expected_blocks and cols % QK_K == 0:
+        return decoded_blocks.reshape(-1)[:n_elements]
+
+    result = np.zeros(n_elements, dtype=np.float32)
+    for row in range(rows):
+        for block_in_row in range(blocks_per_row):
+            block_idx = row * blocks_per_row + block_in_row
+            if block_idx >= full_blocks:
+                break
+
+            col_offset = block_in_row * QK_K
+            valid_count = min(QK_K, cols - col_offset)
+            if valid_count <= 0:
+                continue
+
+            dst_offset = row * cols + col_offset
+            result[dst_offset:dst_offset + valid_count] = decoded_blocks[block_idx, :valid_count]
+
+    return result
+
+
+def dequantize_iq3_xxs(data: bytes, shape: Tuple[int, ...]) -> np.ndarray:
+    """
+    Dequantize IQ3_XXS (3-bit extra-extra-small IQ) to FP32.
+
+    IQ3_XXS format matches ``IQ3_XXSBlock`` in ``BlockStructures.h``:
+      - d (FP16, 2 bytes): super-block scale
+      - qs[0:64]: eight 8-bit grid indices per 32-element sub-block
+      - qs[64:96]: eight little-endian aux words containing sign codes and scale nibbles
+
+    Each 98-byte super-block produces 256 values. The final dimension is
+    treated as the row stride so tensors with row padding decode correctly.
+    """
+    QK_K = 256
+    BLOCK_BYTES = 98
+
+    n_elements = 1
+    for dim in shape:
+        n_elements *= dim
+
+    if n_elements == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    cols = shape[-1] if len(shape) > 0 else n_elements
+    if cols == 0:
+        return np.zeros(n_elements, dtype=np.float32)
+    rows = n_elements // cols
+    blocks_per_row = (cols + QK_K - 1) // QK_K
+    expected_blocks = rows * blocks_per_row
+    full_blocks = min(expected_blocks, len(data) // BLOCK_BYTES)
+
+    if full_blocks == 0:
+        return np.zeros(n_elements, dtype=np.float32)
+
+    data_array = np.frombuffer(data, dtype=np.uint8, count=full_blocks * BLOCK_BYTES)
+    blocks = data_array.reshape(full_blocks, BLOCK_BYTES)
+
+    d = np.ascontiguousarray(blocks[:, 0:2]).view(np.float16).reshape(full_blocks).astype(np.float32)
+    qs = blocks[:, 2:66]
+    aux = blocks[:, 66:98]
+    grid = _load_iq3xxs_grid()
+    signs_table = _load_ksigns_iq2xs()
+
+    decoded_blocks = np.empty((full_blocks, QK_K), dtype=np.float32)
+
+    for sub_block in range(8):
+        aux32 = np.ascontiguousarray(aux[:, 4 * sub_block:4 * sub_block + 4]).view("<u4").reshape(full_blocks)
+        block_scale = d * (0.5 + (aux32 >> 28).astype(np.float32)) * 0.5
+
+        qs_offset = sub_block * 8
+        out_offset = sub_block * 32
+        for group in range(4):
+            grid_idx1 = qs[:, qs_offset + 2 * group]
+            grid_idx2 = qs[:, qs_offset + 2 * group + 1]
+            sign_code = ((aux32 >> (7 * group)) & 0x7F).astype(np.uint8)
+            sign_byte = signs_table[sign_code]
+
+            sign1 = np.where((sign_byte[:, np.newaxis] & _IQ_SIGN_MASKS[:4]) != 0, -1.0, 1.0).astype(np.float32)
+            sign2 = np.where((sign_byte[:, np.newaxis] & _IQ_SIGN_MASKS[4:]) != 0, -1.0, 1.0).astype(np.float32)
+
+            dst = out_offset + group * 8
+            decoded_blocks[:, dst:dst + 4] = block_scale[:, np.newaxis] * grid[grid_idx1] * sign1
+            decoded_blocks[:, dst + 4:dst + 8] = block_scale[:, np.newaxis] * grid[grid_idx2] * sign2
+
+    if full_blocks == expected_blocks and cols % QK_K == 0:
+        return decoded_blocks.reshape(-1)[:n_elements]
+
+    result = np.zeros(n_elements, dtype=np.float32)
+    for row in range(rows):
+        for block_in_row in range(blocks_per_row):
+            block_idx = row * blocks_per_row + block_in_row
+            if block_idx >= full_blocks:
+                break
+
+            col_offset = block_in_row * QK_K
+            valid_count = min(QK_K, cols - col_offset)
+            if valid_count <= 0:
+                continue
+
+            dst_offset = row * cols + col_offset
+            result[dst_offset:dst_offset + valid_count] = decoded_blocks[block_idx, :valid_count]
+
+    return result
+
+
 def dequantize_f16(data: bytes, n_elements: int) -> np.ndarray:
     """
     Convert FP16 (half precision) to FP32.
@@ -753,6 +1019,10 @@ def dequantize(data: bytes, tensor_type: GGUFTensorType, shape: Tuple[int, ...])
         result = dequantize_q5_k(data, n_elements)
     elif tensor_type == GGUFTensorType.Q4_K:
         result = dequantize_q4_k(data, n_elements)
+    elif tensor_type == GGUFTensorType.IQ3_S:
+        result = dequantize_iq3_s(data, shape)
+    elif tensor_type == GGUFTensorType.IQ3_XXS:
+        result = dequantize_iq3_xxs(data, shape)
     else:
         raise ValueError(f"Unsupported tensor type for dequantization: {tensor_type.name}")
     
@@ -805,6 +1075,18 @@ def get_quantization_info(tensor_type: GGUFTensorType) -> dict:
             'block_bytes': 210,
             'bits_per_weight': 6.5625,  # (210*8)/256
             'name': 'Q6_K (6-bit K-quantization)',
+        },
+        GGUFTensorType.IQ3_S: {
+            'block_size': 256,
+            'block_bytes': 110,
+            'bits_per_weight': 3.4375,  # (110*8)/256
+            'name': 'IQ3_S (3-bit small importance quantization)',
+        },
+        GGUFTensorType.IQ3_XXS: {
+            'block_size': 256,
+            'block_bytes': 98,
+            'bits_per_weight': 3.0625,  # (98*8)/256
+            'name': 'IQ3_XXS (3-bit extra-extra-small importance quantization)',
         },
     }
     

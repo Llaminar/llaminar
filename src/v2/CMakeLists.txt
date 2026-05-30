@@ -241,6 +241,8 @@ if(HAVE_CUDA)
         kernels/cuda/kvcache/CUDARingKVCacheTQ.cu     # TurboQuant KV cache (TQ8-K/TQ4-V split)
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu  # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
+        # MoE (Mixture of Experts) kernels
+        kernels/cuda/moe/CUDAMoEKernels.cu            # MoE routing, gather, scatter, gate, swiglu
         # GPU repack kernels (GGUF → VNNI layout on device)
         kernels/cuda/repack/CUDAVnniRepackKernels.cu   # VNNI repack for all 18 quantization formats
         kernels/cuda/repack/CUDAVnniUnpackKernels.cu   # VNNI reverse repack (GPU separated → raw GGUF)
@@ -1663,6 +1665,7 @@ if(HAVE_CUDA)
         kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp
         kernels/cuda/ops/CUDAOpsKernels.cpp           # RMSNorm, SwiGLU, RoPE, Embedding ITensor implementations
         kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp  # Flash Attention ITensor implementation
+        kernels/cuda/moe/CUDAMoEKernel.cpp            # MoE kernel adapter (routing, gather, scatter, gate, swiglu)
     )
     
     message(STATUS "V2: Linked CUDA backend library")

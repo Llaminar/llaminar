@@ -1,40 +1,133 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/ModelMemoryProfile.h"
+#include "tensors/BlockStructures.h"
+
+/**
+ * @file WeightMemoryEstimator.cpp
+ * @brief Estimates native and prepared weight memory across CPU and GPU devices.
+ *
+ * Native estimates mirror GGUF block layouts from BlockStructures.h. GPU estimates
+ * mirror the separated native-VNNI layout used by WeightVRAMPool/CUDA/ROCm packers:
+ * per-32-value payload bytes plus FP16 scales and optional FP16 mins/Q2_K emins.
+ * CPU estimates intentionally preserve the existing VNNI-expanded planning model.
+ */
 
 namespace llaminar2
 {
+    namespace
+    {
+        struct NativeBlockLayout
+        {
+            const char *quant_type;
+            size_t block_bytes;
+            size_t block_elements;
+        };
+
+        struct GPUNativeVNNILayout
+        {
+            const char *quant_type;
+            int payload_bytes_per_32;
+            bool is_asymmetric;
+            bool has_emins;
+        };
+
+        constexpr NativeBlockLayout kNativeBlockLayouts[] = {
+            {"Q4_0", sizeof(Q4_0Block), Q4_0Block::BLOCK_SIZE},
+            {"Q4_1", sizeof(Q4_1Block), Q4_1Block::BLOCK_SIZE},
+            {"Q5_0", sizeof(Q5_0Block), Q5_0Block::BLOCK_SIZE},
+            {"Q5_1", sizeof(Q5_1Block), Q5_1Block::BLOCK_SIZE},
+            {"Q8_0", sizeof(Q8_0Block), Q8_0Block::BLOCK_SIZE},
+            {"Q8_1", sizeof(Q8_1Block), Q8_1Block::BLOCK_SIZE},
+            {"Q2_K", sizeof(Q2_KBlock), Q2_KBlock::BLOCK_SIZE},
+            {"Q3_K", sizeof(Q3_KBlock), Q3_KBlock::BLOCK_SIZE},
+            {"Q3_K_S", sizeof(Q3_KBlock), Q3_KBlock::BLOCK_SIZE},
+            {"Q3_K_M", sizeof(Q3_KBlock), Q3_KBlock::BLOCK_SIZE},
+            {"Q3_K_L", sizeof(Q3_KBlock), Q3_KBlock::BLOCK_SIZE},
+            {"Q4_K", sizeof(Q4_KBlock), Q4_KBlock::BLOCK_SIZE},
+            {"Q4_K_S", sizeof(Q4_KBlock), Q4_KBlock::BLOCK_SIZE},
+            {"Q4_K_M", sizeof(Q4_KBlock), Q4_KBlock::BLOCK_SIZE},
+            {"Q5_K", sizeof(Q5_KBlock), Q5_KBlock::BLOCK_SIZE},
+            {"Q5_K_S", sizeof(Q5_KBlock), Q5_KBlock::BLOCK_SIZE},
+            {"Q5_K_M", sizeof(Q5_KBlock), Q5_KBlock::BLOCK_SIZE},
+            {"Q6_K", sizeof(Q6_KBlock), Q6_KBlock::BLOCK_SIZE},
+            {"Q8_K", sizeof(Q8_KBlock), Q8_KBlock::BLOCK_SIZE},
+            {"IQ4_NL", sizeof(IQ4_NLBlock), IQ4_NLBlock::BLOCK_SIZE},
+            {"IQ4_XS", sizeof(IQ4_XSBlock), IQ4_XSBlock::BLOCK_SIZE},
+            {"IQ2_XXS", sizeof(IQ2_XXSBlock), IQ2_XXSBlock::BLOCK_SIZE},
+            {"IQ2_XS", sizeof(IQ2_XSBlock), IQ2_XSBlock::BLOCK_SIZE},
+            {"IQ3_XXS", sizeof(IQ3_XXSBlock), IQ3_XXSBlock::BLOCK_SIZE},
+            {"IQ2_S", sizeof(IQ2_SBlock), IQ2_SBlock::BLOCK_SIZE},
+            {"IQ3_S", sizeof(IQ3_SBlock), IQ3_SBlock::BLOCK_SIZE},
+            {"IQ1_S", sizeof(IQ1_SBlock), IQ1_SBlock::BLOCK_SIZE},
+            {"IQ1_M", sizeof(IQ1_MBlock), IQ1_MBlock::BLOCK_SIZE},
+        };
+
+        constexpr GPUNativeVNNILayout kGPUNativeVNNILayouts[] = {
+            {"Q4_0", 16, false, false},
+            {"IQ4_NL", 16, false, false},
+            {"Q4_1", 16, true, false},
+            {"Q5_0", 20, false, false},
+            {"Q5_1", 20, true, false},
+            {"Q8_0", 32, false, false},
+            {"Q8_1", 32, false, false},
+            {"Q2_K", 8, true, true},
+            {"Q3_K", 12, true, false},
+            {"Q3_K_S", 12, true, false},
+            {"Q3_K_M", 12, true, false},
+            {"Q3_K_L", 12, true, false},
+            {"Q4_K", 16, true, false},
+            {"Q4_K_S", 16, true, false},
+            {"Q4_K_M", 16, true, false},
+            {"Q5_K", 20, true, false},
+            {"Q5_K_S", 20, true, false},
+            {"Q5_K_M", 20, true, false},
+            {"Q6_K", 24, true, false},
+            {"IQ4_XS", 16, false, false},
+            {"IQ2_XXS", 8, false, false},
+            {"IQ2_XS", 9, true, false},
+            {"IQ3_XXS", 12, false, false},
+            {"IQ2_S", 9, true, false},
+            {"IQ3_S", 13, false, false},
+            {"IQ1_S", 6, true, false},
+            {"IQ1_M", 6, true, false},
+        };
+
+        const NativeBlockLayout *findNativeBlockLayout(const std::string &quant_type)
+        {
+            for (const auto &layout : kNativeBlockLayouts)
+            {
+                if (quant_type == layout.quant_type)
+                    return &layout;
+            }
+            return nullptr;
+        }
+
+        const GPUNativeVNNILayout *findGPUNativeVNNILayout(const std::string &quant_type)
+        {
+            for (const auto &layout : kGPUNativeVNNILayouts)
+            {
+                if (quant_type == layout.quant_type)
+                    return &layout;
+            }
+            return nullptr;
+        }
+
+        float blockBytesPerWeight(size_t block_bytes, size_t block_elements)
+        {
+            return static_cast<float>(block_bytes) / static_cast<float>(block_elements);
+        }
+    } // anonymous namespace
 
     float WeightMemoryEstimator::getNativeBytesPerWeight(const std::string &quant_type)
     {
-        // Block quantization formats: bytes_per_block / elements_per_block
-        if (quant_type == "Q4_0")
-            return 18.0f / 32; // 0.5625
-        if (quant_type == "Q4_1")
-            return 20.0f / 32; // 0.625
-        if (quant_type == "Q5_0")
-            return 22.0f / 32; // 0.6875
-        if (quant_type == "Q5_1")
-            return 24.0f / 32; // 0.75
-        if (quant_type == "Q8_0")
-            return 34.0f / 32; // 1.0625
-        if (quant_type == "Q8_1")
-            return 36.0f / 32; // 1.125
-        if (quant_type == "Q2_K")
-            return 0.3125f; // ~10 bits/weight
-        if (quant_type == "Q3_K")
-            return 0.4375f;
-        if (quant_type == "Q4_K" || quant_type == "Q4_K_M" || quant_type == "Q4_K_S")
-            return 0.5625f;
-        if (quant_type == "Q5_K" || quant_type == "Q5_K_M" || quant_type == "Q5_K_S")
-            return 0.6875f;
-        if (quant_type == "Q6_K")
-            return 0.8125f;
-        if (quant_type == "IQ4_NL")
-            return 18.0f / 32; // Same block size as Q4_0
-        if (quant_type == "F16" || quant_type == "BF16")
+        if (quant_type == "F16" || quant_type == "FP16" || quant_type == "BF16")
             return 2.0f;
         if (quant_type == "F32")
             return 4.0f;
+
+        if (const auto *layout = findNativeBlockLayout(quant_type))
+            return blockBytesPerWeight(layout->block_bytes, layout->block_elements);
+
         // Unknown format — assume worst case FP32
         return 4.0f;
     }
@@ -53,31 +146,21 @@ namespace llaminar2
 
     float WeightMemoryEstimator::getGPUPackedBytesPerWeight(const std::string &quant_type, size_t K)
     {
-        // Match WeightVRAMPool native-VNNI layout: payload + FP16 scales + optional mins/emins per 32 values.
-        if (quant_type == "Q4_0" || quant_type == "IQ4_NL")
-            return 18.0f / 32.0f;
-        if (quant_type == "Q4_1")
-            return 20.0f / 32.0f;
-        if (quant_type == "Q5_0")
-            return 22.0f / 32.0f;
-        if (quant_type == "Q5_1")
-            return 24.0f / 32.0f;
-        if (quant_type == "Q8_0" || quant_type == "Q8_1")
-            return 34.0f / 32.0f;
-        if (quant_type == "Q2_K")
-            return 16.0f / 32.0f;
-        if (quant_type == "Q3_K")
-            return 16.0f / 32.0f;
-        if (quant_type == "Q4_K" || quant_type == "Q4_K_M" || quant_type == "Q4_K_S")
-            return 20.0f / 32.0f;
-        if (quant_type == "Q5_K" || quant_type == "Q5_K_M" || quant_type == "Q5_K_S")
-            return 24.0f / 32.0f;
-        if (quant_type == "Q6_K")
-            return 28.0f / 32.0f;
-        if (quant_type == "F16" || quant_type == "BF16")
+        if (quant_type == "F16" || quant_type == "FP16" || quant_type == "BF16")
             return 2.0f;
         if (quant_type == "F32")
             return 4.0f;
+
+        if (const auto *layout = findGPUNativeVNNILayout(quant_type))
+        {
+            const int scale_bytes = sizeof(uint16_t);
+            const int min_bytes = layout->is_asymmetric ? static_cast<int>(sizeof(uint16_t)) : 0;
+            const int emin_bytes = layout->has_emins ? static_cast<int>(sizeof(uint32_t)) : 0;
+            return static_cast<float>(layout->payload_bytes_per_32 + scale_bytes + min_bytes + emin_bytes) / 32.0f;
+        }
+
+        if (quant_type == "Q8_K")
+            return blockBytesPerWeight(sizeof(Q8_KBlock), Q8_KBlock::BLOCK_SIZE);
 
         return getCUDAPackedBytesPerWeight(K);
     }
@@ -88,14 +171,11 @@ namespace llaminar2
         // Q8_0 → int8 with block scales, ~1.125 bytes/weight
         // Q4_0 → dequant to int8 for VNNI, ~1.125 bytes/weight (after expansion)
         // IQ4_NL → dequant to int8, ~1.125 bytes/weight
-        if (quant_type == "Q8_0" || quant_type == "Q4_0" || quant_type == "IQ4_NL" ||
-            quant_type == "Q4_K" || quant_type == "Q4_K_M" || quant_type == "Q4_K_S" ||
-            quant_type == "Q5_K" || quant_type == "Q5_K_M" || quant_type == "Q5_K_S" ||
-            quant_type == "Q6_K")
+        if (findNativeBlockLayout(quant_type) != nullptr)
         {
             return 1.125f; // int8 packed with scale overhead
         }
-        if (quant_type == "F16" || quant_type == "BF16")
+        if (quant_type == "F16" || quant_type == "FP16" || quant_type == "BF16")
             return 2.0f;
         if (quant_type == "F32")
             return 4.0f;

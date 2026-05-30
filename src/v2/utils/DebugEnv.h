@@ -303,13 +303,19 @@ namespace llaminar2
         bool gemm_dynamic_schedule = false; ///< Use dynamic OMP scheduling (static is better)
         int gemm_n_tile = 0;                ///< N-dimension tile size (0=no tiling is optimal for large batches)
 
-        bool deterministic = false;    ///< Enable deterministic CUDA GEMM dispatch when LLAMINAR_DETERMINISTIC is non-zero.
-        bool cuda_cublas_gemm = false; ///< Use cuBLAS FP16 GEMM path only when LLAMINAR_CUBLAS_GEMM=1.
-        bool cuda_gemv_rowpar = true;  ///< Enable CUDA GEMV row-parallel layout unless LLAMINAR_CUDA_GEMV_ROWPAR starts with '0'.
-        int cuda_bk256_mode = 0;       ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
-        int cuda_stream_k_mode = 0;    ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
-        int cuda_force_prefill_tile = -1; ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
-        int cuda_force_prefill_split_k = 0; ///< CUDA native-VNNI prefill split-K override (LLAMINAR_FORCE_PREFILL_SPLIT_K, 0=auto, 1..8=forced).
+        bool deterministic = false;               ///< Enable deterministic CUDA GEMM dispatch when LLAMINAR_DETERMINISTIC is non-zero.
+        bool cuda_cublas_gemm = false;            ///< Use cuBLAS FP16 GEMM path only when LLAMINAR_CUBLAS_GEMM=1.
+        bool cuda_gemv_rowpar = true;             ///< Enable CUDA GEMV row-parallel layout unless LLAMINAR_CUDA_GEMV_ROWPAR starts with '0'.
+        int cuda_bk256_mode = 0;                  ///< CUDA native-VNNI BK256 mode override (LLAMINAR_BK256_MODE, default 0=auto).
+        int cuda_stream_k_mode = 0;               ///< CUDA native-VNNI stream-K force mode (LLAMINAR_STREAM_K, default 0=auto).
+        int cuda_force_prefill_tile = -1;         ///< CUDA native-VNNI prefill tile override (LLAMINAR_FORCE_PREFILL_TILE, -1=auto, 0..5=TileId).
+        int cuda_force_prefill_split_k = 0;       ///< CUDA native-VNNI prefill split-K override (LLAMINAR_FORCE_PREFILL_SPLIT_K, 0=auto, 1..8=forced).
+        bool cuda_moe_gateup_kpart_decode = true; ///< Enable K-partitioned grouped MoE gate/up decode projection on CUDA (LLAMINAR_CUDA_MOE_GATEUP_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
+        int cuda_moe_gateup_kparts = 16;          ///< K partitions for grouped MoE gate/up decode projection on CUDA (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, default 16)
+        bool cuda_moe_down_kpart_decode = true;   ///< Enable K-partitioned grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
+        int cuda_moe_down_kparts = 16;            ///< K partitions for grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, default 16)
+        int cuda_moe_prefill_tile_m = 16;         ///< Tokens-per-block (kTileM) for grouped MoE prefill gate/up + down GEMM on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 8|16, default 16)
+        bool cuda_moe_prefill_fuse_swiglu = true; ///< Fuse SwiGLU + blockwise int8 quant into the grouped MoE prefill gate/up GEMM epilogue, eliminating the FP32 gate/up global round-trip + separate swiglu_quantize launch (LLAMINAR_CUDA_MOE_PREFILL_FUSE_SWIGLU, default ON)
 
         GemmConfig()
         {
@@ -440,8 +446,64 @@ namespace llaminar2
 
             const char *force_split_k_env = std::getenv("LLAMINAR_FORCE_PREFILL_SPLIT_K");
             cuda_force_prefill_split_k = force_split_k_env ? std::atoi(force_split_k_env) : 0;
-        }
 
+            // CUDA grouped MoE gate/up split-K (kpart) decode toggle + partition count.
+            cuda_moe_gateup_kpart_decode = true;
+            cuda_moe_gateup_kparts = 16;
+            const char *moe_gateup_kpart_env = std::getenv("LLAMINAR_CUDA_MOE_GATEUP_KPART_DECODE");
+            if (moe_gateup_kpart_env)
+                cuda_moe_gateup_kpart_decode = (std::atoi(moe_gateup_kpart_env) != 0);
+            const char *moe_gateup_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_GATEUP_KPARTS");
+            if (moe_gateup_kparts_env)
+            {
+                const int requested = std::atoi(moe_gateup_kparts_env);
+                // gate/up GEMV has K=2048 (64 K-blocks); allow up to 32 partitions
+                // to raise block/wave occupancy on the under-utilized decode grid.
+                if (requested == 2 || requested == 4 || requested == 8 ||
+                    requested == 16 || requested == 32)
+                    cuda_moe_gateup_kparts = requested;
+            }
+            // Split-K reduction reorders the accumulation; disable for determinism.
+            if (deterministic)
+                cuda_moe_gateup_kpart_decode = false;
+
+            // CUDA grouped MoE SwiGLU down split-K (kpart) decode toggle + partition count.
+            cuda_moe_down_kpart_decode = true;
+            cuda_moe_down_kparts = 16;
+            const char *moe_down_kpart_env = std::getenv("LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE");
+            if (moe_down_kpart_env)
+                cuda_moe_down_kpart_decode = (std::atoi(moe_down_kpart_env) != 0);
+            const char *moe_down_kparts_env = std::getenv("LLAMINAR_CUDA_MOE_DOWN_KPARTS");
+            if (moe_down_kparts_env)
+            {
+                const int requested = std::atoi(moe_down_kparts_env);
+                // down GEMV has K=512 (16 K-blocks); allow up to 16 partitions.
+                if (requested == 2 || requested == 4 || requested == 8 ||
+                    requested == 16)
+                    cuda_moe_down_kparts = requested;
+            }
+            // Split-K reduction reorders the accumulation; disable for determinism.
+            if (deterministic)
+                cuda_moe_down_kpart_decode = false;
+
+            // CUDA grouped MoE prefill tokens-per-block (kTileM). Larger tiles amortize the
+            // IQ-codebook weight decode over more tokens; valid values are 8 or 16.
+            cuda_moe_prefill_tile_m = 16;
+            const char *moe_prefill_tile_m_env = std::getenv("LLAMINAR_CUDA_MOE_PREFILL_TILE_M");
+            if (moe_prefill_tile_m_env)
+            {
+                const int requested = std::atoi(moe_prefill_tile_m_env);
+                if (requested == 8 || requested == 16)
+                    cuda_moe_prefill_tile_m = requested;
+            }
+
+            // CUDA grouped MoE prefill SwiGLU+quant fusion toggle (default ON). When set to
+            // "0" the legacy split path (FP32 gate/up scratch + separate swiglu_quantize) runs.
+            cuda_moe_prefill_fuse_swiglu = true;
+            const char *moe_fuse_swiglu_env = std::getenv("LLAMINAR_CUDA_MOE_PREFILL_FUSE_SWIGLU");
+            if (moe_fuse_swiglu_env && std::atoi(moe_fuse_swiglu_env) == 0)
+                cuda_moe_prefill_fuse_swiglu = false;
+        }
         bool trace_q8_1_direct = false;      ///< Enable detailed Q8_1 JIT kernel tracing
         bool cuda_concurrent_prefill = true; ///< Multi-stream concurrent fused GEMM projections during CUDA prefill (LLAMINAR_CUDA_CONCURRENT_PREFILL, default ON)
         bool cuda_concurrent_decode = true;  ///< Multi-stream concurrent fused GEMV projections during CUDA decode (m==1), e.g. GDN q/k/v/z/alpha/beta (LLAMINAR_CUDA_CONCURRENT_DECODE, default ON)
@@ -858,12 +920,12 @@ namespace llaminar2
         // =================================================================
         // Prefill Graph Capture Configuration
         // =================================================================
-        int prefill_graph_min_seq = 256;                                                                                                                          ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
-        bool prefill_graph_trace = false;                                                                                                                         ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
-        bool prefill_graph_buckets = false;                                                                                                                       ///< Enable bucketed capture for server (env: LLAMINAR_PREFILL_GRAPH_BUCKETS)
+        int prefill_graph_min_seq = 256;                                                                                                                               ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
+        bool prefill_graph_trace = false;                                                                                                                              ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
+        bool prefill_graph_buckets = false;                                                                                                                            ///< Enable bucketed capture for server (env: LLAMINAR_PREFILL_GRAPH_BUCKETS)
         std::vector<int> prefill_graph_bucket_sizes = {64, 128, 256, 384, 512, 544, 576, 600, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096}; ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
-        int prefill_graph_max_cached_buckets = 10;                                                                                                                ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
-        int prefill_graph_pad_token_id = 0;                                                                                                                       ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
+        int prefill_graph_max_cached_buckets = 10;                                                                                                                     ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
+        int prefill_graph_pad_token_id = 0;                                                                                                                            ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
 
         // =================================================================
         // Device Placement / Heterogeneous Execution

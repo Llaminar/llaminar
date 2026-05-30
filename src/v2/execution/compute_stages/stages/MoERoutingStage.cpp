@@ -42,6 +42,47 @@ namespace llaminar2
 
             return true;
         }
+
+        bool supportsGroupedPrefillGraphCaptureBackend(DeviceId device)
+        {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+            (void)device;
+            return false;
+#else
+            if (!debugEnv().rocm.moe_grouped_prefill)
+                return false;
+#if defined(HAVE_ROCM)
+            if (device.is_rocm())
+                return true;
+#endif
+#if defined(HAVE_CUDA)
+            if (device.is_cuda())
+                return true;
+#endif
+            return false;
+#endif
+        }
+
+        bool supportsDeviceRoutedDecodeGraphCaptureBackend(DeviceId device)
+        {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+            (void)device;
+            return false;
+#else
+            const auto &rocm = debugEnv().rocm;
+            if (!rocm.moe_grouped_decode || !rocm.moe_device_routed_decode)
+                return false;
+#if defined(HAVE_ROCM)
+            if (device.is_rocm())
+                return true;
+#endif
+#if defined(HAVE_CUDA)
+            if (device.is_cuda())
+                return true;
+#endif
+            return false;
+#endif
+        }
     } // namespace
 
     MoERoutingStage::MoERoutingStage(Params params)
@@ -223,15 +264,14 @@ namespace llaminar2
 
     bool MoERoutingStage::isDeviceRoutedDecodeGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
 #else
-        // Runtime-table decode routing is capture-safe when ROCm keeps top-k
-        // routing tensors device-resident. Snapshot builds still require host
-        // top-k/logit materialization, but decode histograms are merged lazily
-        // from DeviceMoELayerRuntime::decode_histogram.
-        const auto &rocm = debugEnv().rocm;
-        return params_.device_id.is_rocm() &&
+        // Runtime-table decode routing is capture-safe when the GPU backend
+        // keeps top-k routing tensors device-resident. Snapshot builds still
+        // require host top-k/logit materialization, but decode histograms are
+        // merged lazily from DeviceMoELayerRuntime::decode_histogram.
+        return supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
                params_.seq_len == 1 &&
                params_.d_model > 0 &&
                params_.num_experts > 0 &&
@@ -242,8 +282,6 @@ namespace llaminar2
                params_.gate_weights &&
                params_.output_indices &&
                params_.output_weights &&
-               rocm.moe_grouped_decode &&
-               rocm.moe_device_routed_decode &&
                params_.moe_runtime_table &&
                hasInitializedRuntimeTableIfProvided();
 #endif
@@ -251,14 +289,10 @@ namespace llaminar2
 
     bool MoERoutingStage::isDeviceRoutedPrefillGraphCaptureSupported() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
-        return false;
-#else
         // Cold padded-bucket preflight can run before ensureMoEKernel() has
         // been called. Validate the backend, shape, and tensor contract here;
         // isDeviceRoutedPrefillGraphCapturable() adds warmed-kernel readiness.
-        const auto &rocm = debugEnv().rocm;
-        return params_.device_id.is_rocm() &&
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 1 &&
                params_.d_model > 0 &&
                params_.num_experts > 0 &&
@@ -267,17 +301,15 @@ namespace llaminar2
                params_.input &&
                params_.gate_weights &&
                params_.output_indices &&
-               params_.output_weights &&
-               rocm.moe_grouped_prefill;
-#endif
+               params_.output_weights;
     }
 
     bool MoERoutingStage::isDeviceRoutedPrefillGraphCapturable() const
     {
-        // Prefill routing is graph-capturable on ROCm when the full path is
+        // Prefill routing is graph-capturable on supported GPU backends when the full path is
         // device-only and the lazy MoE kernel has already been resolved during
         // normal warmup. routeWithTensors() in non-snapshot Release builds does
-        // no D2H and no hipStreamSynchronize, so data stays device-resident.
+        // no D2H and no backend stream synchronization, so data stays device-resident.
         return isDeviceRoutedPrefillGraphCaptureSupported() && moe_kernel_ != nullptr;
     }
 

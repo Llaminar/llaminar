@@ -1,3 +1,12 @@
+/**
+ * @file Test__MoEGraphNative_ForbiddenDependencyScan.cpp
+ * @brief Source hygiene tests for graph-native MoE and backend-neutral MoE stages.
+ *
+ * These tests scan source files that are supposed to remain orchestration glue.
+ * They catch accidental dependencies on legacy overlay runtime code and direct
+ * CUDA/HIP runtime APIs before those dependencies can leak into compute stages.
+ */
+
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -88,6 +97,24 @@ namespace llaminar2::test
         bool isStageFile(const fs::path &path)
         {
             return path.generic_string().find("src/v2/execution/compute_stages/stages/") != std::string::npos;
+        }
+
+        std::vector<fs::path> moeStageGlueFiles()
+        {
+            return {
+                "src/v2/execution/compute_stages/stages/MoERoutingStage.h",
+                "src/v2/execution/compute_stages/stages/MoERoutingStage.cpp",
+                "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.h",
+                "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp",
+                "src/v2/execution/compute_stages/stages/MoEExpertDispatchStage.h",
+                "src/v2/execution/compute_stages/stages/MoEExpertDispatchStage.cpp",
+                "src/v2/execution/compute_stages/stages/MoELocalExpertStage.h",
+                "src/v2/execution/compute_stages/stages/MoELocalExpertStage.cpp",
+                "src/v2/execution/compute_stages/stages/MoESparseDispatchStage.h",
+                "src/v2/execution/compute_stages/stages/MoESparseDispatchStage.cpp",
+                "src/v2/execution/compute_stages/stages/MoESparseReturnReduceStage.h",
+                "src/v2/execution/compute_stages/stages/MoESparseReturnReduceStage.cpp",
+            };
         }
 
     } // namespace
@@ -211,6 +238,54 @@ namespace llaminar2::test
             {
                 if (contents.find(token) != std::string::npos)
                     failures.push_back(relative_path.generic_string() + " contains removed token " + token);
+            }
+        }
+
+        EXPECT_TRUE(failures.empty()) << [&]
+        {
+            std::ostringstream out;
+            for (const auto &failure : failures)
+                out << failure << '\n';
+            return out.str();
+        }();
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MoEStageGlueDoesNotUseBackendRuntimeAPIs)
+    {
+        const fs::path root = findRepoRoot();
+        const std::vector<std::string> forbidden_literals = {
+            "#include <cuda",
+            "#include \"cuda",
+            "#include <hip/",
+            "#include \"hip/",
+            "cudaMalloc",
+            "cudaFree",
+            "cudaMemcpy",
+            "cudaMemset",
+            "cudaStream",
+            "cudaEvent",
+            "cudaLaunch",
+            "hipMalloc",
+            "hipFree",
+            "hipMemcpy",
+            "hipMemset",
+            "hipStream",
+            "hipEvent",
+            "hipLaunch",
+        };
+
+        std::vector<std::string> failures;
+        for (const auto &relative_path : moeStageGlueFiles())
+        {
+            const fs::path path = root / relative_path;
+            ASSERT_TRUE(fs::exists(path)) << path;
+            const std::string contents = readFile(path);
+            ASSERT_FALSE(contents.empty()) << path;
+
+            for (const auto &token : forbidden_literals)
+            {
+                if (contents.find(token) != std::string::npos)
+                    failures.push_back(relative_path.generic_string() + " contains backend runtime token " + token);
             }
         }
 

@@ -763,6 +763,37 @@ namespace llaminar2
             return impl_ && (impl_->gemv_ctx || impl_->prefill_ctx || impl_->cublas_ctx || gpu_stream_ != nullptr);
         }
 
+        bool CUDAQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)
+        {
+            out = {};
+            try
+            {
+                ensureWeightsConverted();
+            }
+            catch (const std::exception &ex)
+            {
+                LOG_DEBUG("[CUDAQuantisedGemmKernel] Cannot export native-VNNI descriptor: " << ex.what());
+                return false;
+            }
+
+            if (!impl_ || !impl_->d_weights_native_vnni || !impl_->d_weights_native_scales ||
+                N_ == 0 || K_ == 0 || impl_->native_blocks_per_row == 0 ||
+                !nativeVNNIPrefillSupportsCodebook(impl_->native_codebook_id))
+            {
+                return false;
+            }
+
+            out.payload = impl_->d_weights_native_vnni;
+            out.scales = impl_->d_weights_native_scales;
+            out.mins = impl_->d_weights_native_mins;
+            out.emins = impl_->d_weights_native_emins;
+            out.n = static_cast<int>(N_);
+            out.k = static_cast<int>(K_);
+            out.blocks_per_row = impl_->native_blocks_per_row;
+            out.codebook_id = impl_->native_codebook_id;
+            return out.valid();
+        }
+
         CUDAQuantisedGemmKernel::CUDAQuantisedGemmKernel(CUDAQuantisedGemmKernel &&other) noexcept
             : weights_(other.weights_),
               packed_(other.packed_),
@@ -1400,22 +1431,22 @@ namespace llaminar2
 
                     // Use per-stream scratch buffer instead of shared workspace ACC_INT32
                     // to avoid write-after-write races between concurrent projections.
+                    int stream_idx = pi % pool.count;
+                    size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
+                    if (!pool.ensureScratch(stream_idx, acc_elements))
+                    {
+                        throw std::runtime_error(
+                            "[ConcurrentPrefill] Failed to allocate scratch for projection " +
+                            std::to_string(pi) + " (" + std::to_string(acc_elements * sizeof(int32_t)) +
+                            " bytes) — GPU OOM");
+                    }
                     // The decode (m == 1) GEMV path ignores the INT32 accumulator entirely
                     // (it reduces directly into FP32 via the per-kernel GEMV context), so we
                     // skip the scratch allocation there — this also keeps the captured-decode
                     // path free of any cudaMalloc.
-                    int stream_idx = pi % pool.count;
                     int32_t *proj_d_C_int32 = nullptr;
                     if (!concurrent_decode)
                     {
-                        size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
-                        if (!pool.ensureScratch(stream_idx, acc_elements))
-                        {
-                            throw std::runtime_error(
-                                "[ConcurrentPrefill] Failed to allocate scratch for projection " +
-                                std::to_string(pi) + " (" + std::to_string(acc_elements * sizeof(int32_t)) +
-                                " bytes) — GPU OOM");
-                        }
                         proj_d_C_int32 = pool.scratch[stream_idx];
                     }
 

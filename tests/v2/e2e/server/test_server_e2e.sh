@@ -125,6 +125,14 @@ if [ ${#SUITES[@]} -eq 0 ]; then
         SUITES+=("${S4_MODEL}|rocm:0|200")
     fi
 
+    # Suite 4b: Qwen3.5 35B MoE Q3_K_S on CUDA (single-device CUDA MoE path)
+    # This is the proving model for CUDA MoE enablement and mirrors the parity
+    # configuration that regenerates its own Q3_K_S PyTorch snapshots.
+    S4B_MODEL="/opt/llaminar-models/Qwen3.5-35B-A3B-Q3_K_S.gguf"
+    if [ -f "$S4B_MODEL" ] && [ -z "$OVERRIDE_MODEL" ]; then
+        SUITES+=("${S4B_MODEL}|cuda:0|200")
+    fi
+
     # Suite 5: Qwen3.5 27B dense (hybrid GDN/FA architecture — all backends)
     # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
     # <think>...</think> tags before the actual answer.

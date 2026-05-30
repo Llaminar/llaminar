@@ -58,7 +58,7 @@ fi
 
 # Always rebuild Release to benchmark against the current source
 echo -e "${YELLOW}Building Release binary...${NC}"
-cmake -B "$ROOT_DIR/build_v2_release" -S "$ROOT_DIR/src/v2" -G Ninja -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1
+cmake -B "$ROOT_DIR/build_v2_release" -S "$ROOT_DIR/src/v2" -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=ON -DHAVE_ROCM=ON > /dev/null 2>&1
 if ! cmake --build "$ROOT_DIR/build_v2_release" --parallel > /dev/null 2>&1; then
     echo -e "${RED}Error: Release build failed${NC}" >&2
     echo -e "${YELLOW}Run manually to see errors: cmake --build build_v2_release --parallel${NC}" >&2
@@ -115,7 +115,11 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
         ENV_PREFIX="$ENV_PREFIX $(jq -r ".models[$mi].env | to_entries[] | \"\(.key)=\(.value)\"" "$BASELINE_FILE" | tr '\n' ' ')"
     fi
 
-    MODEL_PATH="$ROOT_DIR/$MODEL"
+    if [[ "$MODEL" == /* ]]; then
+        MODEL_PATH="$MODEL"
+    else
+        MODEL_PATH="$ROOT_DIR/$MODEL"
+    fi
     if [[ ! -f "$MODEL_PATH" ]]; then
         echo -e "${RED}✗ FAILED: ${MODEL_NAME}: model not found (${MODEL})${NC}" >&2
         OVERALL_PASS=false
@@ -352,90 +356,7 @@ done
 
 if $OVERALL_PASS; then
     echo -e "${GREEN}✓ No performance regressions detected${NC}"
-
-    # ---------------------------------------------------------------------------
-    # Ratchet: auto-raise baselines when a new high-water mark is reached
-    # ---------------------------------------------------------------------------
-    RATCHETED=false
-    for (( mi=0; mi<NUM_MODELS; mi++ )); do
-        MODEL_NAME=$(jq -r ".models[$mi].name" "$BASELINE_FILE")
-        DEVICES=$(jq -r ".models[$mi].devices | keys[]" "$BASELINE_FILE")
-
-        for DEVICE in $DEVICES; do
-            KEY="${mi}:${DEVICE}"
-            if [[ -z "${RESULTS_PREFILL[$KEY]:-}" ]]; then
-                continue
-            fi
-
-            BASELINE_PREFILL=$(jq -r ".models[$mi].devices[\"$DEVICE\"].prefill_tok_s" "$BASELINE_FILE")
-            BASELINE_DECODE=$(jq -r ".models[$mi].devices[\"$DEVICE\"].decode_tok_s" "$BASELINE_FILE")
-            CUR_PREFILL="${RESULTS_PREFILL[$KEY]}"
-            CUR_DECODE="${RESULTS_DECODE[$KEY]}"
-
-            RAISE_PREFILL=false
-            RAISE_DECODE=false
-            if (( $(echo "$CUR_PREFILL > $BASELINE_PREFILL" | bc -l) )); then
-                RAISE_PREFILL=true
-            fi
-            if (( $(echo "$CUR_DECODE > $BASELINE_DECODE" | bc -l) )); then
-                RAISE_DECODE=true
-            fi
-
-            if $RAISE_PREFILL || $RAISE_DECODE; then
-                NEW_PREFILL=$( $RAISE_PREFILL && echo "$CUR_PREFILL" || echo "$BASELINE_PREFILL" )
-                NEW_DECODE=$( $RAISE_DECODE && echo "$CUR_DECODE" || echo "$BASELINE_DECODE" )
-                COMMIT_HASH=$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
-                COMMENT="High-water mark set at commit ${COMMIT_HASH} on $(date +%Y-%m-%d). Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
-
-                DEVICE_THRESHOLD=$(jq -r ".models[$mi].devices[\"$DEVICE\"].regression_threshold_pct // empty" "$BASELINE_FILE")
-
-                if [[ -n "$DEVICE_THRESHOLD" ]]; then
-                    jq --argjson mi "$mi" \
-                       --arg dev "$DEVICE" \
-                       --argjson pf "$NEW_PREFILL" \
-                       --argjson dc "$NEW_DECODE" \
-                       --argjson thr "$DEVICE_THRESHOLD" \
-                       --arg cmt "$COMMENT" \
-                       '.models[$mi].devices[$dev].prefill_tok_s = $pf |
-                        .models[$mi].devices[$dev].decode_tok_s = $dc |
-                        .models[$mi].devices[$dev].regression_threshold_pct = $thr |
-                        .models[$mi].devices[$dev]._comment = $cmt' \
-                       "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
-                else
-                    jq --argjson mi "$mi" \
-                       --arg dev "$DEVICE" \
-                       --argjson pf "$NEW_PREFILL" \
-                       --argjson dc "$NEW_DECODE" \
-                       --arg cmt "$COMMENT" \
-                       '.models[$mi].devices[$dev].prefill_tok_s = $pf |
-                        .models[$mi].devices[$dev].decode_tok_s = $dc |
-                        .models[$mi].devices[$dev]._comment = $cmt' \
-                       "$BASELINE_FILE" > "${BASELINE_FILE}.tmp" && mv "${BASELINE_FILE}.tmp" "$BASELINE_FILE"
-                fi
-
-                RATCHETED=true
-                DETAILS=""
-                $RAISE_PREFILL && DETAILS+="prefill ${BASELINE_PREFILL}→${CUR_PREFILL}"
-                $RAISE_PREFILL && $RAISE_DECODE && DETAILS+=", "
-                $RAISE_DECODE && DETAILS+="decode ${BASELINE_DECODE}→${CUR_DECODE}"
-                echo -e "  ${GREEN}▲ [${MODEL_NAME}] ${DEVICE}: ratcheted baseline (${DETAILS})${NC}"
-            fi
-        done
-    done
-
-    if $RATCHETED; then
-        # `git add` is only meaningful in a working git checkout (e.g. the
-        # pre-commit hook context). In CI we run inside a docker container
-        # that doesn't have .git mounted, so skip silently.
-        if git -C "$ROOT_DIR" rev-parse --git-dir &>/dev/null; then
-            git -C "$ROOT_DIR" add "$BASELINE_FILE"
-            echo ""
-            echo -e "${GREEN}✓ Baseline ratcheted and staged for commit${NC}"
-        else
-            echo ""
-            echo -e "${GREEN}✓ Baseline ratcheted (not in a git repo; skipping git add)${NC}"
-        fi
-    fi
+    echo -e "${BLUE}Baseline file unchanged. Use --update-baseline after explicit approval to rewrite baseline values.${NC}"
 
     exit 0
 else

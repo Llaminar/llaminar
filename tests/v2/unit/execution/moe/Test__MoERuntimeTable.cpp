@@ -225,7 +225,7 @@ namespace llaminar2::test
         EXPECT_EQ(hist.activationCount(1, 1), 2u);
     }
 
-    TEST(Test__MoERuntimeTable, ConstructorRejectsInvalidBoundsAndUnsupportedMirroring)
+    TEST(Test__MoERuntimeTable, ConstructorRejectsInvalidBoundsAndCpuMirroring)
     {
         EXPECT_THROW(MoERuntimeTable(DeviceId::invalid(), 1, 4, 2), std::invalid_argument);
         EXPECT_THROW(MoERuntimeTable(DeviceId::cpu(), 0, 4, 2), std::invalid_argument);
@@ -235,7 +235,6 @@ namespace llaminar2::test
         EXPECT_THROW(MoERuntimeTable(DeviceId::cpu(), 1, 4, static_cast<int>(kDeviceMoEMaxTopK) + 1),
                      std::invalid_argument);
         EXPECT_THROW(MoERuntimeTable(DeviceId::cpu(), 1, 4, 2, true), std::runtime_error);
-        EXPECT_THROW(MoERuntimeTable(DeviceId::cuda(0), 1, 4, 2, true), std::runtime_error);
         DeviceMoERuntimeTable::Config prefill_without_mirror;
         prefill_without_mirror.device_id = DeviceId::cpu();
         prefill_without_mirror.num_layers = 1;

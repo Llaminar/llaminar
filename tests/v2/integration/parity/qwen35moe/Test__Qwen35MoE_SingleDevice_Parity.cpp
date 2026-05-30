@@ -14,7 +14,7 @@
  *
  * Configurations:
  *   - CPU: Full-precision baseline with FP16 KV cache
- *   - CUDA: Single NVIDIA GPU (SKIP for now — model too large for single 3090)
+ *   - CUDA: Single NVIDIA GPU with the smaller Q3_K_S proving model
  *   - ROCm: Single AMD GPU
  *
  * Model: Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf at /opt/llaminar-models/
@@ -51,8 +51,8 @@ using namespace llaminar2::test::parity::qwen35moe;
 // - GDN layers use recurrent delta-rule (accumulates numerical differences)
 // - 35B model with 256 experts — large model increases error accumulation
 // - FP16 KV cache truncation causes 0.04-0.12 attention cosine drops in decode
-// CPU and ROCm intentionally share thresholds so GPU decode drift cannot be
-// hidden behind backend-specific liberal gates while this parity bug is active.
+// CPU, CUDA, and ROCm intentionally share thresholds so GPU decode drift cannot
+// be hidden behind backend-specific liberal gates while this parity bug is active.
 
 static const auto kQwen35MoE35BStrictSingleDeviceThresholds = BackendThresholds{
     .cosine_threshold = 0.96f,        // Worst CPU observed: 0.9725 layer avg
@@ -60,8 +60,8 @@ static const auto kQwen35MoE35BStrictSingleDeviceThresholds = BackendThresholds{
     .early_layers_count = 6,
     .min_early_layers_passed = 5, // 6/6 observed; require 5
     .kl_threshold = 0.03f,        // LM_HEAD observed: 0.005-0.014 (run-to-run variance with dynamic rebalance)
-    .min_top1_accuracy = 0.80f,   // Observed: 100%
-    .min_top5_accuracy = 0.60f,   // Observed: 80% (0.8 on 2 steps)
+    .min_top1_accuracy = 80.0f,   // Observed: 100%
+    .min_top5_accuracy = 60.0f,   // Observed: 80% (0.8 on 2 steps)
     .pytorch_top1_in_topk = 3,    // Observed: 5/5 RefInTop3
 };
 
@@ -95,6 +95,17 @@ static const std::vector<TestConfig> kQwen35MoESingleDeviceConfigs = {
         .thresholds = kQwen35MoE35BStrictSingleDeviceThresholds,
         .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
         .snapshot_dir = "pytorch_qwen35_moe_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    {
+        .name = "Qwen35MoE_35B_CUDA_Q3_K_S_KV_FP16",
+        .devices = {ParityDeviceType::CUDA},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = kQwen35MoE35BStrictSingleDeviceThresholds,
+        .model_path = "/opt/llaminar-models/Qwen3.5-35B-A3B-Q3_K_S.gguf",
+        .snapshot_dir = "pytorch_qwen35_moe_q3ks_snapshots",
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::FP16,
     },

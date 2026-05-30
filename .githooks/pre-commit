@@ -6,13 +6,14 @@
 #   chmod +x .git/hooks/pre-commit
 #
 # This hook builds and runs tests before allowing a commit.
-# All branches run a 5-step suite; develop/master add a 6th step:
+# Feature branches run a 6-step suite:
 #   1. Integration build
 #   2. Unit tests (parallel)
-#   3. Integration tests — develop/master only (excl. Parity & RCCL)
-#   4. Focused parity baseline (38 tests, all model families, sequential)
+#   3. Focused parity baseline (40 tests, all model families, sequential)
+#   4. E2E release build
 #   5. E2E server integration tests
 #   6. Performance regression benchmarks
+# develop/master add full integration as step 3 and shift the later steps to 4-7.
 # Override with: git commit --no-verify
 
 set -e
@@ -55,7 +56,7 @@ fi
 
 # Step 1: Build Integration (Release optimizations + debug symbols + assertions)
 echo -e "${YELLOW}[1/${TOTAL_STEPS}] Building V2 Integration...${NC}"
-if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration > /dev/null 2>&1; then
+if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration -DHAVE_CUDA=ON -DHAVE_ROCM=ON > /dev/null 2>&1; then
     echo -e "${RED}❌ CMake configuration failed (Integration)${NC}"
     exit 1
 fi
@@ -117,14 +118,14 @@ if $FULL_SUITE; then
     echo ""
 fi
 
-# Step 3/4: Run Focused Parity Baseline (38 tests, all model families, sequential)
+# Step 3/4: Run Focused Parity Baseline (40 tests, all model families, sequential)
 # Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
 # Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
 # HybridPPTP (pipeline+tensor parallel),
 # and ExpertOverlay (tiered same-layer expert residency).
 # Runs on ALL branches to catch accuracy regressions early.
 if $FULL_SUITE; then PARITY_STEP=4; else PARITY_STEP=3; fi
-echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (38 tests, all model families)...${NC}"
+echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (40 tests, all model families)...${NC}"
 echo ""
 
 set +e
@@ -150,7 +151,7 @@ echo ""
 # Step 4: Build Release (for E2E — no assertions/debug overhead = faster inference)
 if $FULL_SUITE; then E2E_BUILD_STEP=5; else E2E_BUILD_STEP=4; fi
 echo -e "${YELLOW}[${E2E_BUILD_STEP}/${TOTAL_STEPS}] Building V2 Release for E2E tests...${NC}"
-if ! cmake -B "$BUILD_V2_RELEASE" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1; then
+if ! cmake -B "$BUILD_V2_RELEASE" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=ON -DHAVE_ROCM=ON > /dev/null 2>&1; then
     echo -e "${RED}❌ CMake configuration failed (Release)${NC}"
     exit 1
 fi
@@ -235,7 +236,7 @@ echo -e "${GREEN}  • Unit tests: OK${NC}"
 if $FULL_SUITE; then
 echo -e "${GREEN}  • Integration tests: OK${NC}"
 fi
-echo -e "${GREEN}  • Parity baseline (32 tests): OK${NC}"
+echo -e "${GREEN}  • Parity baseline (40 tests): OK${NC}"
 echo -e "${GREEN}  • E2E server tests: OK${NC}"
 echo -e "${GREEN}  • Performance benchmarks: OK${NC}"
 echo ""

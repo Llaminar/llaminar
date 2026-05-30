@@ -22,7 +22,6 @@ import mmap
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional, Union
 from enum import IntEnum
-import numpy as np
 
 
 class GGUFValueType(IntEnum):
@@ -407,6 +406,22 @@ class GGUFParser:
             block_size = 32
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 22
+        elif tensor_type == GGUFTensorType.IQ3_S:
+            # IQ3_S: 256 elements per row super-block, 110 bytes per block.
+            # Use the fastest-varying dimension so row padding is accounted for.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 110
+        elif tensor_type == GGUFTensorType.IQ3_XXS:
+            # IQ3_XXS: 256 elements per row super-block, 98 bytes per block.
+            # Use the fastest-varying dimension so row padding is accounted for.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 98
         else:
             # For other types, estimate conservatively
             # Most quantized types use 2-8 bits per value

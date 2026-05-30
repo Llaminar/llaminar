@@ -24,13 +24,15 @@ from python.reference.loaders.dequantize import (
     dequantize_q4_1,
     dequantize_q5_0,
     dequantize_q6_k,
+    dequantize_iq3_s,
+    dequantize_iq3_xxs,
     dequantize_q8_0,
     dequantize_f16,
     dequantize_f32,
     dequantize,
     get_quantization_info,
 )
-from python.reference.loaders.gguf_parser import GGUFTensorType
+from python.reference.loaders.gguf_parser import GGUFParser, GGUFTensorInfo, GGUFTensorType
 
 
 class TestQ40Dequantization(unittest.TestCase):
@@ -247,6 +249,87 @@ class TestQ80Dequantization(unittest.TestCase):
         self.assertTrue(np.allclose(result, -128.0))
 
 
+class TestIQ3SDequantization(unittest.TestCase):
+    """Test IQ3_S dequantization (3-bit small importance quantization)."""
+
+    def _block(self, scale=1.0, qs=None, qh=None, signs=None, scales=None):
+        qs = bytes(qs if qs is not None else [0] * 64)
+        qh = bytes(qh if qh is not None else [0] * 8)
+        signs = bytes(signs if signs is not None else [0] * 32)
+        scales = bytes(scales if scales is not None else [0] * 4)
+        return struct.pack('<e', scale) + qs + qh + signs + scales
+
+    def test_single_block_grid_zero(self):
+        """Test a simple IQ3_S block using grid index zero and positive signs."""
+        result = dequantize_iq3_s(self._block(scale=1.0), (256,))
+
+        self.assertEqual(result.shape, (256,))
+        self.assertTrue(np.allclose(result, 1.0))
+
+    def test_scales_and_direct_sign_bits(self):
+        """Test scale nibbles and the direct sign mask for the first sub-block."""
+        signs = [0] * 32
+        signs[0] = 0x01
+        result = dequantize_iq3_s(
+            self._block(scale=2.0, signs=signs, scales=[0x21, 0, 0, 0]),
+            (256,),
+        )
+
+        self.assertAlmostEqual(result[0], -6.0)
+        self.assertTrue(np.allclose(result[1:32], 6.0))
+        self.assertTrue(np.allclose(result[32:64], 10.0))
+
+    def test_row_padding(self):
+        """Test row-aware decoding when the final dimension is not a 256 multiple."""
+        data = b''.join(self._block(scale=scale) for scale in [1.0, 2.0, 3.0, 4.0])
+        result = dequantize_iq3_s(data, (2, 300))
+
+        self.assertEqual(result.shape, (600,))
+        self.assertTrue(np.allclose(result[:256], 1.0))
+        self.assertTrue(np.allclose(result[256:300], 2.0))
+        self.assertTrue(np.allclose(result[300:556], 3.0))
+        self.assertTrue(np.allclose(result[556:600], 4.0))
+
+
+class TestIQ3XXSDequantization(unittest.TestCase):
+    """Test IQ3_XXS dequantization (3-bit extra-extra-small importance quantization)."""
+
+    def _block(self, scale=1.0, qs=None, aux_words=None):
+        qs = bytes(qs if qs is not None else [0] * 64)
+        aux_words = aux_words if aux_words is not None else [0] * 8
+        aux = b''.join(struct.pack('<I', word) for word in aux_words)
+        return struct.pack('<e', scale) + qs + aux
+
+    def test_single_block_grid_zero(self):
+        """Test a simple IQ3_XXS block using grid index zero and positive signs."""
+        result = dequantize_iq3_xxs(self._block(scale=1.0), (256,))
+
+        self.assertEqual(result.shape, (256,))
+        self.assertTrue(np.allclose(result, 1.0))
+
+    def test_scale_nibble_and_packed_sign_code(self):
+        """Test aux-word scale nibbles and ksigns_iq2xs sign decoding."""
+        aux_words = [0] * 8
+        aux_words[0] = (2 << 28) | 1
+        result = dequantize_iq3_xxs(self._block(scale=2.0, aux_words=aux_words), (256,))
+
+        self.assertAlmostEqual(result[0], -10.0)
+        self.assertTrue(np.allclose(result[1:7], 10.0))
+        self.assertAlmostEqual(result[7], -10.0)
+        self.assertTrue(np.allclose(result[32:64], 2.0))
+
+    def test_row_padding(self):
+        """Test row-aware decoding when the final dimension is not a 256 multiple."""
+        data = b''.join(self._block(scale=scale) for scale in [1.0, 2.0, 3.0, 4.0])
+        result = dequantize_iq3_xxs(data, (2, 300))
+
+        self.assertEqual(result.shape, (600,))
+        self.assertTrue(np.allclose(result[:256], 1.0))
+        self.assertTrue(np.allclose(result[256:300], 2.0))
+        self.assertTrue(np.allclose(result[300:556], 3.0))
+        self.assertTrue(np.allclose(result[556:600], 4.0))
+
+
 class TestF16Dequantization(unittest.TestCase):
     """Test F16 (FP16) dequantization."""
     
@@ -347,6 +430,26 @@ class TestDequantizeDispatch(unittest.TestCase):
         result = dequantize(data, GGUFTensorType.Q4_0, shape)
         
         self.assertEqual(result.shape, shape)
+
+    def test_iq3_s_dispatch(self):
+        """Test dispatch to IQ3_S dequantization."""
+        data = struct.pack('<e', 1.0) + bytes([0] * 108)
+        shape = (256,)
+
+        result = dequantize(data, GGUFTensorType.IQ3_S, shape)
+
+        self.assertEqual(result.shape, shape)
+        self.assertTrue(np.allclose(result, 1.0))
+
+    def test_iq3_xxs_dispatch(self):
+        """Test dispatch to IQ3_XXS dequantization."""
+        data = struct.pack('<e', 1.0) + bytes([0] * 96)
+        shape = (256,)
+
+        result = dequantize(data, GGUFTensorType.IQ3_XXS, shape)
+
+        self.assertEqual(result.shape, shape)
+        self.assertTrue(np.allclose(result, 1.0))
     
     def test_shape_reshape(self):
         """Test that result is properly reshaped."""
@@ -421,6 +524,32 @@ class TestQuantizationInfo(unittest.TestCase):
         self.assertEqual(info['block_size'], 256)
         self.assertEqual(info['block_bytes'], 210)
         self.assertAlmostEqual(info['bits_per_weight'], 6.5625)
+
+    def test_iq3_s_info(self):
+        """Test IQ3_S quantization info."""
+        info = get_quantization_info(GGUFTensorType.IQ3_S)
+
+        self.assertEqual(info['block_size'], 256)
+        self.assertEqual(info['block_bytes'], 110)
+        self.assertAlmostEqual(info['bits_per_weight'], 3.4375)
+        self.assertIn('IQ3_S', info['name'])
+
+    def test_iq3_xxs_info(self):
+        """Test IQ3_XXS quantization info."""
+        info = get_quantization_info(GGUFTensorType.IQ3_XXS)
+
+        self.assertEqual(info['block_size'], 256)
+        self.assertEqual(info['block_bytes'], 98)
+        self.assertAlmostEqual(info['bits_per_weight'], 3.0625)
+        self.assertIn('IQ3_XXS', info['name'])
+
+    def test_iq3_xxs_parser_size_uses_row_padding(self):
+        """Test IQ3_XXS raw tensor sizing accounts for row block padding."""
+        parser = GGUFParser("unused.gguf")
+        tensor_info = GGUFTensorInfo("test.weight", [2, 300], GGUFTensorType.IQ3_XXS, 0)
+        calculate_tensor_size = getattr(parser, "_calculate_tensor_size")
+
+        self.assertEqual(calculate_tensor_size(tensor_info), 4 * 98)
 
 
 class TestNumericalProperties(unittest.TestCase):

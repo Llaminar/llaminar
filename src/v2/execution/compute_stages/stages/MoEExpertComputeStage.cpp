@@ -8,6 +8,7 @@
 #include "../../../execution/moe/ExpertWeightTransfer.h"
 #include "../../../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../../../execution/moe/MoEExpertWeightService.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/Tensors.h"
@@ -98,6 +99,47 @@ namespace llaminar2
         {
             markGpuTensorWritten(output, device, stream);
         }
+
+        bool supportsGroupedPrefillGraphCaptureBackend(DeviceId device)
+        {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+            (void)device;
+            return false;
+#else
+            if (!debugEnv().rocm.moe_grouped_prefill)
+                return false;
+#if defined(HAVE_ROCM)
+            if (device.is_rocm())
+                return true;
+#endif
+#if defined(HAVE_CUDA)
+            if (device.is_cuda())
+                return true;
+#endif
+            return false;
+#endif
+        }
+
+        bool supportsDeviceRoutedDecodeGraphCaptureBackend(DeviceId device)
+        {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+            (void)device;
+            return false;
+#else
+            const auto &rocm = debugEnv().rocm;
+            if (!rocm.moe_grouped_decode || !rocm.moe_device_routed_decode)
+                return false;
+#if defined(HAVE_ROCM)
+            if (device.is_rocm())
+                return true;
+#endif
+#if defined(HAVE_CUDA)
+            if (device.is_cuda())
+                return true;
+#endif
+            return false;
+#endif
+        }
     } // anonymous namespace
 
     // =========================================================================
@@ -110,8 +152,7 @@ namespace llaminar2
         if (params_.moe_runtime_table && params_.layer_idx >= 0)
         {
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
-            if (params_.device_id.is_rocm() && params_.seq_len == 1 &&
-                debugEnv().rocm.moe_grouped_decode && debugEnv().rocm.moe_device_routed_decode)
+            if (supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) && params_.seq_len == 1)
             {
                 moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank() ||
                                                  initializeMoERuntimeTableForGroupedDecode();
@@ -795,10 +836,10 @@ namespace llaminar2
         // Use input tensor directly (no gather needed for 1 token)
         const TensorBase *input_tensor = params_.input;
 
-        if (params_.device_id.is_rocm() && params_.moe_runtime_table && params_.layer_idx >= 0 && !moe_runtime_layer_)
+        if (supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+            params_.moe_runtime_table && params_.layer_idx >= 0 && !moe_runtime_layer_)
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
-        if (params_.device_id.is_rocm() && !moe_runtime_table_initialized_ &&
-            debugEnv().rocm.moe_grouped_decode && debugEnv().rocm.moe_device_routed_decode)
+        if (supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) && !moe_runtime_table_initialized_)
         {
             moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank() ||
                                              initializeMoERuntimeTableForGroupedDecode();
@@ -811,9 +852,7 @@ namespace llaminar2
         const bool can_try_device_routed_decode = false;
 #else
         const bool can_try_device_routed_decode =
-            params_.device_id.is_rocm() &&
-            debugEnv().rocm.moe_grouped_decode &&
-            debugEnv().rocm.moe_device_routed_decode &&
+            supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.moe_runtime_table &&
             moe_runtime_layer_ &&
             moe_runtime_table_initialized_ &&
@@ -883,12 +922,20 @@ namespace llaminar2
                         d_model,
                         intermediate);
                 }
+            }
 
-                if (!device_routed_done)
-                {
-                    LOG_DEBUG("[MoEExpertComputeStage] Device-routed ROCm decode path unavailable for layer "
-                              << params_.layer_idx << "; using host-routed fallback");
-                }
+            if (!device_routed_done && isGraphCaptureActive())
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Device-routed grouped decode path unavailable during graph capture "
+                          "for layer "
+                          << params_.layer_idx);
+                return false;
+            }
+
+            if (grouped_tables_ready && !device_routed_done)
+            {
+                LOG_DEBUG("[MoEExpertComputeStage] Device-routed grouped decode path unavailable for layer "
+                          << params_.layer_idx << "; using host-routed fallback");
             }
 
             if (device_routed_done)
@@ -1542,7 +1589,7 @@ namespace llaminar2
     {
         if (!params_.moe_runtime_table || params_.layer_idx < 0 ||
             params_.num_experts <= 0 || params_.top_k <= 0 ||
-            !params_.device_id.is_rocm())
+            !supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id))
         {
             return false;
         }
@@ -1665,8 +1712,7 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::canUseFixedTopologyGroupedPrefill() const
     {
-        return params_.device_id.is_rocm() &&
-               debugEnv().rocm.moe_grouped_prefill &&
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 1 &&
                hasFullLocalExpertOwnership() &&
                expertMaskAllEnabled() &&
@@ -1713,23 +1759,36 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::isDeviceRoutedDecodeGraphCapturable() const
     {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
+#else
+        return supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+               params_.seq_len == 1 &&
+               params_.d_model > 0 &&
+               params_.expert_intermediate > 0 &&
+               params_.num_experts > 0 &&
+               params_.top_k > 0 &&
+               params_.top_k <= 16 &&
+               params_.top_k <= params_.num_experts &&
+               params_.input &&
+               params_.output &&
+               params_.moe_runtime_table &&
+               moe_runtime_layer_ &&
+               moe_runtime_table_initialized_ &&
+               runtimeTableHasActiveGroupedDecodeBank() &&
+               params_.replica_set.num_replicated == 0 &&
+               hasFullLocalExpertOwnership() &&
+               expertMaskAllEnabled();
+#endif
     }
 
     bool MoEExpertComputeStage::supportsFixedTopologyPrefillGraphCapturePreflight() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
-        return false;
-#else
         // Cold preflight validates the fixed-topology grouped prefill contract
         // without requiring lazy warmup resources such as the MoE kernel or its
         // grouping scratch. Those are checked by isGraphCapturable() before the
         // actual capture pass begins.
-        if (!params_.device_id.is_rocm() || params_.seq_len <= 1)
-            return false;
-
-        const auto &rocm = debugEnv().rocm;
-        if (!rocm.moe_grouped_prefill)
+        if (!supportsGroupedPrefillGraphCaptureBackend(params_.device_id) || params_.seq_len <= 1)
             return false;
 
         // Require full local expert ownership, no masks, no replicas
@@ -1751,14 +1810,10 @@ namespace llaminar2
 
         // Must have all prepared GEMM engines ready
         return hasAllPreparedExpertGemmEngines();
-#endif
     }
 
     bool MoEExpertComputeStage::isFixedTopologyPrefillGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
-        return false;
-#else
         if (!supportsFixedTopologyPrefillGraphCapturePreflight())
             return false;
 
@@ -1767,7 +1822,6 @@ namespace llaminar2
             return false;
 
         return true;
-#endif
     }
 
     bool MoEExpertComputeStage::hasFullLocalExpertOwnership() const
@@ -1957,22 +2011,13 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::isGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
 #else
         // Device-routed grouped decode path: after warmup, all descriptor tables
         // are built and execution is pure kernel launches reading routing info
         // from the device-resident MoE runtime table.
-        const auto &rocm = debugEnv().rocm;
-        if (params_.device_id.is_rocm() &&
-            params_.seq_len == 1 &&
-            rocm.moe_grouped_decode &&
-            rocm.moe_device_routed_decode &&
-            params_.moe_runtime_table != nullptr &&
-            params_.top_k > 0 && params_.top_k <= 16 &&
-            params_.replica_set.num_replicated == 0 &&
-            hasFullLocalExpertOwnership() &&
-            expertMaskAllEnabled())
+        if (isDeviceRoutedDecodeGraphCapturable())
             return true;
 
         // Fixed-topology grouped prefill path
@@ -2427,13 +2472,13 @@ namespace llaminar2
 
     bool SharedExpertFFNStage::isGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
 #else
         // After warmup: GEMM engines cached, scratch buffers allocated,
         // all operations are pure kernel launches (fused gate+up, swiglu, down).
         // Capturable for both decode and prefill once scratch is pre-sized.
-        if (!params_.device_id.is_rocm())
+        if (!supportsGroupedPrefillGraphCaptureBackend(params_.device_id))
             return false;
         // Decode: always ready after warmup (scratch not used for seq_len==1 grouped path)
         if (params_.seq_len == 1)
@@ -2445,11 +2490,7 @@ namespace llaminar2
 
     bool SharedExpertFFNStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
-        return false;
-#else
-        const auto &rocm = debugEnv().rocm;
-        return params_.device_id.is_rocm() &&
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 1 &&
                params_.d_model > 0 &&
                params_.intermediate > 0 &&
@@ -2457,9 +2498,7 @@ namespace llaminar2
                params_.gate_w &&
                params_.up_w &&
                params_.down_w &&
-               params_.output &&
-               rocm.moe_grouped_prefill;
-#endif
+               params_.output;
     }
 
     StageBufferRequirements SharedExpertFFNStage::getBufferRequirements() const
@@ -2646,31 +2685,25 @@ namespace llaminar2
 
     bool SharedExpertGateStage::isGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
 #else
         // Single kernel call (sigmoid gating) — pure kernel launch after warmup.
-        // Capturable for both decode (seq_len==1) and prefill (seq_len>1) on ROCm
+        // Capturable for both decode (seq_len==1) and prefill (seq_len>1) on supported GPU backends
         // because the stage is just a kernel launch with stable device pointers.
         // MoE kernel must already be cached (from warmup execution).
-        return params_.device_id.is_rocm() && moe_kernel_ != nullptr;
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) && moe_kernel_ != nullptr;
 #endif
     }
 
     bool SharedExpertGateStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || !defined(HAVE_ROCM)
-        return false;
-#else
-        const auto &rocm = debugEnv().rocm;
-        return params_.device_id.is_rocm() &&
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 1 &&
                params_.d_model > 0 &&
                params_.input &&
                params_.gate_inp &&
-               params_.shared_output &&
-               rocm.moe_grouped_prefill;
-#endif
+               params_.shared_output;
     }
 
     StageBufferRequirements SharedExpertGateStage::getBufferRequirements() const

@@ -57,6 +57,7 @@
 #include "cuda/attention/CUDAFlashAttentionKernelT.h" // Flash Attention
 #include "cuda/gdn/CUDAGatedDeltaNet.h"               // GDN recurrence
 #include "cuda/gdn/CUDAShortConvolution.h"            // GDN short conv1d
+#include "cuda/moe/CUDAMoEKernel.h"                   // MoE routing/gather/scatter/gate/swiglu
 
 extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 #endif
@@ -2535,17 +2536,43 @@ namespace llaminar
                     return raw_ptr;
                 }
 
-                // Create device-appropriate MoE kernel
+                // Create device-appropriate MoE kernel. CUDA/ROCm devices must
+                // never silently fall through to CPU: that would pull routing
+                // tensors back to host and break graph-capture assumptions.
                 std::unique_ptr<llaminar2::IMoEKernel> kernel;
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    kernel = std::make_unique<llaminar2::CUDAMoEKernel>(target_device.cuda_ordinal());
+                }
+                else
+#else
+                if (target_device.is_cuda())
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: CUDA device requested but HAVE_CUDA is OFF");
+                }
+                else
+#endif
 #ifdef HAVE_ROCM
                 if (target_device.is_rocm())
                 {
                     kernel = std::make_unique<llaminar2::ROCmMoEKernel>(target_device.rocm_ordinal());
                 }
                 else
+#else
+                if (target_device.is_rocm())
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: ROCm device requested but HAVE_ROCM is OFF");
+                }
+                else
 #endif
+                if (target_device.is_cpu())
                 {
                     kernel = std::make_unique<llaminar2::CPUMoEKernel>();
+                }
+                else
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: invalid target device " + target_device.to_string());
                 }
 
                 auto *raw_ptr = kernel.get();

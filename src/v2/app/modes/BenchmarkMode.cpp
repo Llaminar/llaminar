@@ -72,7 +72,7 @@ namespace llaminar2
 
         /// @brief Opt benchmark mode into production bucketed prefill defaults.
         void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx,
-                                               const OrchestrationConfig &config)
+                                              const OrchestrationConfig &config)
         {
             const auto &env = debugEnv();
             const bool user_selected_bucket_mode = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKETS");
@@ -85,15 +85,30 @@ namespace llaminar2
             // hit the fail-loud guard if it is incompatible with collectives).
             const bool uses_collectives = benchmarkUsesCollectives(config, mpi_ctx);
 
+            // MoE dynamic rebalancing rejects padded bucketed prefill graphs during
+            // preflight (PrefillGraphRejectReason::ActiveMoERebalancing): a captured
+            // padded-bucket graph would embed expert-placement pointers that a
+            // rebalance could invalidate. Auto-enabling padded buckets in that case
+            // makes warmup prefill fail hard, so leave bucketing disabled and run the
+            // exact prefill length (the fixed benchmark prompt is still graph-captured
+            // at its exact shape, so no replay benefit is lost).
+            const bool moe_rebalancing_active =
+                config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
+
             if (!user_selected_bucket_mode)
             {
-                if (uses_collectives)
+                if (uses_collectives || moe_rebalancing_active)
                 {
                     if (mpi_ctx && mpi_ctx->rank() == 0)
                     {
-                        LOG_INFO("[Benchmark] Multi-device (TP/PP) run detected; leaving prefill "
-                                 "graph bucketing disabled (padded buckets are incompatible with "
-                                 "collective stages — running exact prefill length)");
+                        const char *reason = uses_collectives
+                                                 ? "Multi-device (TP/PP) run detected; padded buckets "
+                                                   "are incompatible with collective stages"
+                                                 : "MoE dynamic rebalancing active; padded buckets are "
+                                                   "rejected by prefill graph preflight";
+                        LOG_INFO("[Benchmark] " << reason
+                                                << " — leaving prefill graph bucketing disabled "
+                                                   "(running exact prefill length)");
                     }
                 }
                 else

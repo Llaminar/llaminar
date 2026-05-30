@@ -351,6 +351,9 @@ namespace llaminar2
             size_t weight_cols() const { return K_; }
             bool weights_converted() const { return weights_converted_; }
 
+            /// @brief Export native-VNNI device pointers for grouped MoE CUDA prefill.
+            bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
+
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)
              *
@@ -501,8 +504,8 @@ namespace llaminar2
             // Member data
             // =========================================================================
 
-            const TensorBase *weights_ = nullptr; // Original weight tensor (null if using packed_)
-            CUDAPackedWeights *packed_ = nullptr; // Pre-packed weights (owned by tensor cache)
+            const TensorBase *weights_ = nullptr;  // Original weight tensor (null if using packed_)
+            CUDAPackedWeights *packed_ = nullptr;  // Pre-packed weights (owned by tensor cache)
             std::shared_ptr<void> lifetime_owner_; // Keeps shared MoE batch allocation alive
             int cuda_device_id_;
             size_t N_; // Output features (weight rows)

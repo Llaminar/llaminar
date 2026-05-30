@@ -646,6 +646,19 @@ add_v2_test(V2_Unit_MoEExpertParallelPlanner
     MPI_PROCS 1
 )
 
+# Test: MoE graph-native/stage source hygiene guardrails
+add_executable(v2_unit_moe_forbidden_dependency_scan unit/execution/moe/Test__MoEGraphNative_ForbiddenDependencyScan.cpp)
+target_link_libraries(v2_unit_moe_forbidden_dependency_scan
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEForbiddenDependencyScan
+    COMMAND $<TARGET_FILE:v2_unit_moe_forbidden_dependency_scan>
+    LABELS "V2;Unit;Execution;MoE;SourceHygiene;GraphNative"
+    MPI_PROCS 1
+)
+
 # Test: Tensor Host Release Lifecycle (CPU-only tensor release guard regression)
 # Regression tests for the bug where releaseAllHostWeightData() released CPU-only
 # tensors that were never uploaded to GPU, causing null data access in graph stages.
@@ -4240,6 +4253,17 @@ add_v2_test(V2_Integration_CUDAGemmNonDeterminism
     LABELS "V2;Integration;CUDA;GEMM;NonDeterminism;Quantized;SplitK"
     MPI_PROCS 1
 )
+
+if(HAVE_CUDA)
+add_executable(v2_integration_cuda_moe_kernel integration/kernels/cuda/Test__CUDAMoEKernel.cpp)
+target_link_libraries(v2_integration_cuda_moe_kernel llaminar2_core GTest::gtest GTest::gtest_main CUDA::cudart)
+add_v2_test(V2_Integration_CUDAMoEKernel
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+    LABELS "V2;Integration;CUDA;MoE;Routing;Gather;Scatter;SwiGLU;KernelFactory"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added CUDA MoE kernel integration tests")
+endif()
 
 # Test: CUDA Ops Parity (RMSNorm, SwiGLU, RoPE)
 # Tests CUDA kernel implementations of normalization and activation functions

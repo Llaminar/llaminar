@@ -6,12 +6,8 @@
 #include "MoERuntimeTable.h"
 
 #include "DecodeExpertHistogram.h"
+#include "../../backends/BackendManager.h"
 #include "../../utils/Logger.h"
-
-#ifdef HAVE_ROCM
-#include "../../backends/rocm/HipDeviceGuard.h"
-#include <hip/hip_runtime.h>
-#endif
 
 #include <algorithm>
 #include <limits>
@@ -42,22 +38,121 @@ namespace llaminar2
             return "[MoERuntimeTable] layer " + std::to_string(layer_idx) + ": ";
         }
 
-#ifdef HAVE_ROCM
-        void throwOnHipError(hipError_t err, const std::string &what)
+        IBackend *mirrorBackend(DeviceId device, const std::string &what)
         {
-            if (err == hipSuccess)
-                return;
-            const std::string message = what + ": " + hipGetErrorString(err);
-            LOG_ERROR(message);
-            throw std::runtime_error(message);
+            if (!device.is_gpu())
+                throw std::runtime_error(what + ": mirrored MoE runtime tables require a GPU device, got " + device.to_string());
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+                throw std::runtime_error(what + ": no backend available for " + device.to_string());
+            return backend;
         }
 
-        void synchronizeHipStream(void *stream, const std::string &what)
+        void *allocateMirror(DeviceId device, size_t bytes, const std::string &what)
         {
-            auto hip_stream = static_cast<hipStream_t>(stream);
-            throwOnHipError(hipStreamSynchronize(hip_stream), what);
+            IBackend *backend = mirrorBackend(device, what);
+            void *ptr = backend->allocate(bytes, device.toKernelDeviceIndex());
+            if (!ptr)
+                throw std::runtime_error(what + ": backend allocation failed for " + std::to_string(bytes) + " bytes on " + device.to_string());
+            return ptr;
         }
-#endif
+
+        void freeMirror(DeviceId device, void *ptr, const std::string &what) noexcept
+        {
+            if (!ptr)
+                return;
+            try
+            {
+                IBackend *backend = getBackendFor(device);
+                if (!backend)
+                {
+                    LOG_ERROR(what << ": no backend available for " << device.to_string());
+                    return;
+                }
+                backend->free(ptr, device.toKernelDeviceIndex());
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR(what << ": backend free failed for " << device.to_string() << ": " << e.what());
+            }
+            catch (...)
+            {
+                LOG_ERROR(what << ": backend free failed for " << device.to_string() << ": unknown exception");
+            }
+        }
+
+        void copyHostToMirror(DeviceId device, void *dst, const void *src,
+                              size_t bytes, void *stream, const std::string &what)
+        {
+            IBackend *backend = mirrorBackend(device, what);
+            const int ordinal = device.toKernelDeviceIndex();
+            const bool ok = stream
+                                ? backend->hostToDeviceOnStream(dst, src, bytes, ordinal, stream)
+                                : backend->hostToDevice(dst, src, bytes, ordinal, nullptr);
+            if (!ok)
+                throw std::runtime_error(what + ": backend H2D copy failed on " + device.to_string());
+        }
+
+        void copyMirrorToHost(DeviceId device, void *dst, const void *src,
+                              size_t bytes, void *stream, const std::string &what)
+        {
+            IBackend *backend = mirrorBackend(device, what);
+            const bool ok = backend->deviceToHostFast(dst, src, bytes, device.toKernelDeviceIndex(), stream);
+            if (!ok)
+                throw std::runtime_error(what + ": backend D2H copy failed on " + device.to_string());
+        }
+
+        void memsetMirror(DeviceId device, void *dst, int value,
+                          size_t bytes, void *stream, const std::string &what)
+        {
+            IBackend *backend = mirrorBackend(device, what);
+            if (!backend->memset(dst, value, bytes, device.toKernelDeviceIndex(), stream))
+                throw std::runtime_error(what + ": backend memset failed on " + device.to_string());
+        }
+
+        void synchronizeMirror(DeviceId device, void *stream, const std::string &what)
+        {
+            IBackend *backend = mirrorBackend(device, what);
+            const int ordinal = device.toKernelDeviceIndex();
+            const bool ok = stream
+                                ? backend->synchronizeStream(stream, ordinal)
+                                : backend->streamSynchronize(ordinal);
+            if (!ok)
+                throw std::runtime_error(what + ": backend stream synchronization failed on " + device.to_string());
+        }
+
+        void *createMirrorStream(DeviceId device, const std::string &what)
+        {
+            IBackend *backend = mirrorBackend(device, what);
+            void *stream = backend->createStream(device.toKernelDeviceIndex());
+            if (!stream)
+                throw std::runtime_error(what + ": backend stream creation failed on " + device.to_string());
+            return stream;
+        }
+
+        void destroyMirrorStream(DeviceId device, void *stream, const std::string &what) noexcept
+        {
+            if (!stream)
+                return;
+            try
+            {
+                IBackend *backend = getBackendFor(device);
+                if (!backend)
+                {
+                    LOG_ERROR(what << ": no backend available for " << device.to_string());
+                    return;
+                }
+                backend->destroyStream(stream, device.toKernelDeviceIndex());
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR(what << ": backend stream destroy failed for " << device.to_string() << ": " << e.what());
+            }
+            catch (...)
+            {
+                LOG_ERROR(what << ": backend stream destroy failed for " << device.to_string() << ": unknown exception");
+            }
+        }
 
         uint32_t checkedRouteCapacity(int token_capacity, int top_k)
         {
@@ -89,12 +184,12 @@ namespace llaminar2
         if (top_k_ <= 0 || top_k_ > static_cast<int>(kDeviceMoEMaxTopK))
             throw std::invalid_argument("[MoERuntimeTable] top_k must be in [1, " +
                                         std::to_string(kDeviceMoEMaxTopK) + "]");
-        if (mirror_to_device_ && !device_id_.is_rocm())
-            throw std::runtime_error("[MoERuntimeTable] device mirroring is currently implemented only for ROCm devices");
+        if (mirror_to_device_ && !device_id_.is_gpu())
+            throw std::runtime_error("[MoERuntimeTable] device mirroring requires a GPU device");
         if (prefill_token_capacity_ < 0)
             throw std::invalid_argument("[MoERuntimeTable] prefill_token_capacity must be non-negative");
         if (prefill_token_capacity_ > 0 && !mirror_to_device_)
-            throw std::runtime_error("[MoERuntimeTable] prefill route scratch requires a mirrored ROCm runtime table");
+            throw std::runtime_error("[MoERuntimeTable] prefill route scratch requires a mirrored GPU runtime table");
         (void)checkedRouteCapacity(prefill_token_capacity_, top_k_);
 
         host_layers_.resize(static_cast<size_t>(num_layers_));
@@ -203,29 +298,15 @@ namespace llaminar2
         }
         else
         {
-#ifdef HAVE_ROCM
-            const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
-            throwOnHipError(set_err, "[MoERuntimeTable] hipSetDevice failed for decode histogram sync");
-            auto hip_stream = static_cast<hipStream_t>(stream);
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             {
                 const auto *src = device_layers_[layer_idx].decode_histogram;
                 auto *dst = counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
-                throwOnHipError(hipMemcpyAsync(dst,
-                                               src,
-                                               static_cast<size_t>(num_experts_) * sizeof(uint64_t),
-                                               hipMemcpyDeviceToHost,
-                                               hip_stream),
-                                layerPrefix(layer_idx) + "hipMemcpyAsync failed for decode histogram D2H");
+                copyMirrorToHost(device_id_, dst, src,
+                                 static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                                 stream,
+                                 layerPrefix(layer_idx) + "decode histogram D2H");
             }
-            throwOnHipError(hipStreamSynchronize(hip_stream),
-                            "[MoERuntimeTable] hipStreamSynchronize failed for decode histogram D2H");
-#else
-            (void)stream;
-            (void)reset_runtime_counts;
-            LOG_ERROR("[MoERuntimeTable] ROCm decode histogram sync requested but HAVE_ROCM is not enabled");
-            return false;
-#endif
         }
 
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
@@ -242,20 +323,15 @@ namespace llaminar2
 
         if (mirror_to_device_)
         {
-#ifdef HAVE_ROCM
-            auto hip_stream = static_cast<hipStream_t>(stream);
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             {
                 auto *dst = device_layers_[layer_idx].decode_histogram;
-                throwOnHipError(hipMemsetAsync(dst,
-                                               0,
-                                               static_cast<size_t>(num_experts_) * sizeof(uint64_t),
-                                               hip_stream),
-                                layerPrefix(layer_idx) + "hipMemsetAsync failed for decode histogram reset");
+                memsetMirror(device_id_, dst, 0,
+                             static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                             stream,
+                             layerPrefix(layer_idx) + "decode histogram reset");
             }
-            throwOnHipError(hipStreamSynchronize(hip_stream),
-                            "[MoERuntimeTable] hipStreamSynchronize failed for decode histogram reset");
-#endif
+            synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode histogram reset sync");
         }
 
         return true;
@@ -269,25 +345,15 @@ namespace llaminar2
         if (!mirror_to_device_)
             return;
 
-#ifdef HAVE_ROCM
-        const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
-        throwOnHipError(set_err, "[MoERuntimeTable] hipSetDevice failed for decode histogram reset");
-        auto hip_stream = static_cast<hipStream_t>(stream);
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             auto *dst = device_layers_[layer_idx].decode_histogram;
-            throwOnHipError(hipMemsetAsync(dst,
-                                           0,
-                                           static_cast<size_t>(num_experts_) * sizeof(uint64_t),
-                                           hip_stream),
-                            layerPrefix(layer_idx) + "hipMemsetAsync failed for decode histogram reset");
+            memsetMirror(device_id_, dst, 0,
+                         static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                         stream,
+                         layerPrefix(layer_idx) + "decode histogram reset");
         }
-        throwOnHipError(hipStreamSynchronize(hip_stream),
-                        "[MoERuntimeTable] hipStreamSynchronize failed for decode histogram reset");
-#else
-        (void)stream;
-        throw std::runtime_error("[MoERuntimeTable] ROCm decode histogram reset requested but HAVE_ROCM is not enabled");
-#endif
+        synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode histogram reset sync");
     }
 
     void DeviceMoERuntimeTable::resetDecodeRuntimeState(void *stream)
@@ -313,22 +379,17 @@ namespace llaminar2
         if (!mirror_to_device_)
             return;
 
-#ifdef HAVE_ROCM
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             uploadLayerState(layer_idx, stream);
-        synchronizeHipStream(stream, "[MoERuntimeTable] hipStreamSynchronize failed for decode runtime reset");
-#else
-        (void)stream;
-        throw std::runtime_error("[MoERuntimeTable] ROCm decode runtime reset requested but HAVE_ROCM is not enabled");
-#endif
+        synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode runtime reset sync");
     }
 
     void DeviceMoERuntimeTable::ensurePrefillRouteScratchCapacity(int token_capacity, void *stream)
     {
         if (token_capacity <= 0)
             throw std::invalid_argument("[MoERuntimeTable] prefill route scratch token_capacity must be positive");
-        if (!mirror_to_device_ || !device_id_.is_rocm())
-            throw std::runtime_error("[MoERuntimeTable] prefill route scratch requires a mirrored ROCm runtime table");
+        if (!mirror_to_device_ || !device_id_.is_gpu())
+            throw std::runtime_error("[MoERuntimeTable] prefill route scratch requires a mirrored GPU runtime table");
         (void)checkedRouteCapacity(token_capacity, top_k_);
 
         if (static_cast<int>(prefill_route_scratch_.size()) != num_layers_)
@@ -350,9 +411,7 @@ namespace llaminar2
             prefill_token_capacity_ = std::max(prefill_token_capacity_, token_capacity);
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
                 uploadLayerState(layer_idx, stream);
-#ifdef HAVE_ROCM
-            synchronizeHipStream(stream, "[MoERuntimeTable] hipStreamSynchronize failed for prefill route scratch upload");
-#endif
+            synchronizeMirror(device_id_, stream, "[MoERuntimeTable] prefill route scratch upload sync");
         }
     }
 
@@ -473,14 +532,10 @@ namespace llaminar2
     void DeviceMoERuntimeTable::allocatePrefillRouteScratchForLayer(int layer_idx, int token_capacity)
     {
         validateLayerIndex(layer_idx);
-        if (!mirror_to_device_ || !device_id_.is_rocm())
-            throw std::runtime_error(layerPrefix(layer_idx) + "prefill route scratch requires a mirrored ROCm runtime table");
+        if (!mirror_to_device_ || !device_id_.is_gpu())
+            throw std::runtime_error(layerPrefix(layer_idx) + "prefill route scratch requires a mirrored GPU runtime table");
         if (token_capacity <= 0)
             throw std::invalid_argument(layerPrefix(layer_idx) + "prefill route scratch token capacity must be positive");
-
-#ifdef HAVE_ROCM
-        const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
-        throwOnHipError(set_err, layerPrefix(layer_idx) + "hipSetDevice failed for prefill route scratch allocation");
 
         if (static_cast<int>(prefill_route_scratch_.size()) != num_layers_)
             prefill_route_scratch_.resize(static_cast<size_t>(num_layers_));
@@ -489,20 +544,20 @@ namespace llaminar2
         if (prefillRouteScratchAllocationHasCapacity(allocation, token_capacity))
             return;
 
-        auto free_allocation = [](PrefillRouteScratchAllocation &scratch) noexcept
+        auto free_allocation = [&](PrefillRouteScratchAllocation &scratch) noexcept
         {
             if (scratch.route_expert_ids)
-                (void)hipFree(scratch.route_expert_ids);
+                freeMirror(device_id_, scratch.route_expert_ids, layerPrefix(layer_idx) + "free prefill route_expert_ids");
             if (scratch.route_weights)
-                (void)hipFree(scratch.route_weights);
+                freeMirror(device_id_, scratch.route_weights, layerPrefix(layer_idx) + "free prefill route_weights");
             if (scratch.expert_counts)
-                (void)hipFree(scratch.expert_counts);
+                freeMirror(device_id_, scratch.expert_counts, layerPrefix(layer_idx) + "free prefill expert_counts");
             if (scratch.expert_offsets)
-                (void)hipFree(scratch.expert_offsets);
+                freeMirror(device_id_, scratch.expert_offsets, layerPrefix(layer_idx) + "free prefill expert_offsets");
             if (scratch.grouped_token_ids)
-                (void)hipFree(scratch.grouped_token_ids);
+                freeMirror(device_id_, scratch.grouped_token_ids, layerPrefix(layer_idx) + "free prefill grouped_token_ids");
             if (scratch.grouped_route_weights)
-                (void)hipFree(scratch.grouped_route_weights);
+                freeMirror(device_id_, scratch.grouped_route_weights, layerPrefix(layer_idx) + "free prefill grouped_route_weights");
             scratch = {};
         };
 
@@ -512,8 +567,8 @@ namespace llaminar2
         auto allocate = [&](auto **ptr, size_t count, const char *name)
         {
             using Pointer = std::remove_pointer_t<std::remove_pointer_t<decltype(ptr)>>;
-            throwOnHipError(hipMalloc(reinterpret_cast<void **>(ptr), count * sizeof(Pointer)),
-                            layerPrefix(layer_idx) + "hipMalloc failed for " + name);
+            *ptr = static_cast<Pointer *>(allocateMirror(device_id_, count * sizeof(Pointer),
+                                                         layerPrefix(layer_idx) + "allocation failed for " + name));
         };
 
         try
@@ -544,104 +599,73 @@ namespace llaminar2
         state.grouped_route_weights = allocation.grouped_route_weights;
         state.prefill_token_capacity = allocation.token_capacity;
         state.prefill_route_capacity = allocation.route_capacity;
-#else
-        (void)token_capacity;
-        throw std::runtime_error(layerPrefix(layer_idx) + "ROCm prefill route scratch requested but HAVE_ROCM is not enabled");
-#endif
     }
 
     void DeviceMoERuntimeTable::releasePrefillRouteScratch() noexcept
     {
         if (prefill_route_scratch_.empty())
             return;
-#ifdef HAVE_ROCM
-        (void)HipDeviceGuard::setDevice(device_id_.rocm_ordinal());
         for (auto &allocation : prefill_route_scratch_)
         {
             if (allocation.route_expert_ids)
-                (void)hipFree(allocation.route_expert_ids);
+                freeMirror(device_id_, allocation.route_expert_ids, "[MoERuntimeTable] free prefill route_expert_ids");
             if (allocation.route_weights)
-                (void)hipFree(allocation.route_weights);
+                freeMirror(device_id_, allocation.route_weights, "[MoERuntimeTable] free prefill route_weights");
             if (allocation.expert_counts)
-                (void)hipFree(allocation.expert_counts);
+                freeMirror(device_id_, allocation.expert_counts, "[MoERuntimeTable] free prefill expert_counts");
             if (allocation.expert_offsets)
-                (void)hipFree(allocation.expert_offsets);
+                freeMirror(device_id_, allocation.expert_offsets, "[MoERuntimeTable] free prefill expert_offsets");
             if (allocation.grouped_token_ids)
-                (void)hipFree(allocation.grouped_token_ids);
+                freeMirror(device_id_, allocation.grouped_token_ids, "[MoERuntimeTable] free prefill grouped_token_ids");
             if (allocation.grouped_route_weights)
-                (void)hipFree(allocation.grouped_route_weights);
+                freeMirror(device_id_, allocation.grouped_route_weights, "[MoERuntimeTable] free prefill grouped_route_weights");
             allocation = {};
         }
-#endif
         prefill_route_scratch_.clear();
     }
 
     void DeviceMoERuntimeTable::allocateDeviceMirror()
     {
-#ifdef HAVE_ROCM
-        const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
-        throwOnHipError(set_err, "[MoERuntimeTable] hipSetDevice failed for ROCm mirror allocation");
         const size_t bytes = host_layers_.size() * sizeof(DeviceMoELayerRuntime);
-        throwOnHipError(hipMalloc(reinterpret_cast<void **>(&device_layers_), bytes),
-                        "[MoERuntimeTable] hipMalloc failed for ROCm runtime table mirror");
-#else
-        throw std::runtime_error("[MoERuntimeTable] ROCm device mirroring requested but HAVE_ROCM is not enabled");
-#endif
+        device_layers_ = static_cast<DeviceMoELayerRuntime *>(
+            allocateMirror(device_id_, bytes, "[MoERuntimeTable] runtime table mirror allocation"));
     }
 
     void DeviceMoERuntimeTable::releaseDeviceMirror() noexcept
     {
         if (!device_layers_)
             return;
-#ifdef HAVE_ROCM
-        (void)HipDeviceGuard::setDevice(device_id_.rocm_ordinal());
-        const hipError_t err = hipFree(device_layers_);
-        if (err != hipSuccess)
-            LOG_ERROR("[MoERuntimeTable] hipFree failed for ROCm runtime table mirror: " << hipGetErrorString(err));
-#endif
+        freeMirror(device_id_, device_layers_, "[MoERuntimeTable] free runtime table mirror");
         device_layers_ = nullptr;
     }
 
     void DeviceMoERuntimeTable::uploadLayerState(int layer_idx, void *stream)
     {
-#ifdef HAVE_ROCM
-        const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
-        throwOnHipError(set_err, "[MoERuntimeTable] hipSetDevice failed for ROCm runtime table upload");
         auto *dst = device_layers_ + layer_idx;
         auto *src = host_layers_.data() + layer_idx;
-        auto hip_stream = static_cast<hipStream_t>(stream);
-        throwOnHipError(hipMemcpyAsync(dst, src, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice, hip_stream),
-                        "[MoERuntimeTable] hipMemcpyAsync failed for ROCm runtime table upload");
-#else
-        (void)layer_idx;
-        (void)stream;
-        throw std::runtime_error("[MoERuntimeTable] ROCm device mirroring requested but HAVE_ROCM is not enabled");
-#endif
+        copyHostToMirror(device_id_, dst, src, sizeof(DeviceMoELayerRuntime), stream,
+                         layerPrefix(layer_idx) + "runtime table upload");
     }
 
     void DeviceMoERuntimeTable::uploadAllLayerStates()
     {
-#ifdef HAVE_ROCM
-        const hipError_t set_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.rocm_ordinal()));
-        throwOnHipError(set_err, "[MoERuntimeTable] hipSetDevice failed for ROCm runtime table initial upload");
-
         // Create a dedicated one-shot stream for the bulk initialization upload.
-        // We avoid the default stream (nullptr/0) to maintain stream hygiene —
+        // We avoid the default stream (nullptr/0) to maintain stream hygiene --
         // all async GPU work must use an explicit stream for correctness and overlap.
-        hipStream_t init_stream;
-        throwOnHipError(hipStreamCreate(&init_stream),
-                        "[MoERuntimeTable] hipStreamCreate failed for ROCm runtime table initial upload");
-
+        void *init_stream = createMirrorStream(device_id_, "[MoERuntimeTable] runtime table initial upload stream");
         const size_t bytes = host_layers_.size() * sizeof(DeviceMoELayerRuntime);
-        throwOnHipError(hipMemcpyAsync(device_layers_, host_layers_.data(), bytes, hipMemcpyHostToDevice, init_stream),
-                        "[MoERuntimeTable] hipMemcpyAsync failed for ROCm runtime table initial upload");
-        throwOnHipError(hipStreamSynchronize(init_stream),
-                        "[MoERuntimeTable] hipStreamSynchronize failed for ROCm runtime table initial upload");
-        throwOnHipError(hipStreamDestroy(init_stream),
-                        "[MoERuntimeTable] hipStreamDestroy failed for ROCm runtime table initial upload");
-#else
-        throw std::runtime_error("[MoERuntimeTable] ROCm device mirroring requested but HAVE_ROCM is not enabled");
-#endif
+        try
+        {
+            copyHostToMirror(device_id_, device_layers_, host_layers_.data(), bytes, init_stream,
+                             "[MoERuntimeTable] runtime table initial upload");
+            synchronizeMirror(device_id_, init_stream, "[MoERuntimeTable] runtime table initial upload sync");
+            destroyMirrorStream(device_id_, init_stream, "[MoERuntimeTable] runtime table initial upload stream destroy");
+        }
+        catch (...)
+        {
+            destroyMirrorStream(device_id_, init_stream, "[MoERuntimeTable] runtime table initial upload stream destroy");
+            throw;
+        }
     }
 
 } // namespace llaminar2

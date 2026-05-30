@@ -209,13 +209,19 @@ namespace llaminar2
                                                                int prefill_token_capacity,
                                                                const std::string &key_suffix)
     {
-#if !defined(HAVE_ROCM)
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         (void)device;
         (void)prefill_token_capacity;
         (void)key_suffix;
         return nullptr;
 #else
-        if (!device.is_rocm() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || config_.n_layers <= 0)
+        // Device-routed grouped MoE (decode + grouped prefill) is supported on any
+        // GPU backend: MoERuntimeTable mirrors its placement banks through the
+        // generic IBackend abstraction (see MoERuntimeTable.cpp mirrorBackend),
+        // so CUDA and ROCm are both valid here. Gating on is_rocm() previously
+        // left CUDA without a runtime table, which forced every MoE routing/expert
+        // decode stage into a non-capturable manual graph segment.
+        if (!device.is_gpu() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || config_.n_layers <= 0)
             return nullptr;
 
         const std::string key = key_suffix.empty()
