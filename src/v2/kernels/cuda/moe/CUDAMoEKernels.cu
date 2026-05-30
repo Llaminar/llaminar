@@ -491,14 +491,21 @@ namespace
         const int *__restrict__ token_indices,
         int num_tokens, int d_model)
     {
-        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const int total = num_tokens * d_model;
-        if (idx >= total)
+        // 2D grid: blockIdx.y selects the token row, threads cover the d_model columns
+        // as float4. The original flat 1D layout paid an integer div+mod (idx/d_model,
+        // idx%d_model) per element and used scalar copies; this version removes both.
+        // d_model is a multiple of 32 (enforced) → safe to treat the row as float4.
+        const int token_slot = blockIdx.y;
+        if (token_slot >= num_tokens)
             return;
-        const int token_slot = idx / d_model;
-        const int col = idx % d_model;
+        const int n4 = d_model >> 2;
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= n4)
+            return;
         const int token = token_indices[token_slot];
-        batch_buffer[idx] = hidden[static_cast<size_t>(token) * d_model + col];
+        const float4 *src = reinterpret_cast<const float4 *>(hidden + static_cast<size_t>(token) * d_model);
+        float4 *dst = reinterpret_cast<float4 *>(batch_buffer + static_cast<size_t>(token_slot) * d_model);
+        dst[i] = src[i];
     }
 
     __global__ void scatter_add_kernel(
@@ -508,14 +515,28 @@ namespace
         const float *__restrict__ weights,
         int num_tokens, int d_model)
     {
-        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        const int total = num_tokens * d_model;
-        if (idx >= total)
+        // 2D grid + float4, mirroring gather_tokens_kernel. Each token_slot maps to a
+        // distinct output token (caller guarantees uniqueness — original used a plain
+        // non-atomic +=, preserved here), so the read-modify-write per float4 is race
+        // free. Removes the per-element div/mod and vectorizes the accumulate.
+        const int token_slot = blockIdx.y;
+        if (token_slot >= num_tokens)
             return;
-        const int token_slot = idx / d_model;
-        const int col = idx % d_model;
+        const int n4 = d_model >> 2;
+        const int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= n4)
+            return;
         const int token = token_indices[token_slot];
-        output[static_cast<size_t>(token) * d_model + col] += weights[token_slot] * expert_output[idx];
+        const float w = weights[token_slot];
+        const float4 *ev = reinterpret_cast<const float4 *>(expert_output + static_cast<size_t>(token_slot) * d_model);
+        float4 *ov = reinterpret_cast<float4 *>(output + static_cast<size_t>(token) * d_model);
+        const float4 e = ev[i];
+        float4 o = ov[i];
+        o.x += w * e.x;
+        o.y += w * e.y;
+        o.z += w * e.z;
+        o.w += w * e.w;
+        ov[i] = o;
     }
 
     __global__ void shared_expert_gate_kernel(
@@ -1868,8 +1889,10 @@ extern "C"
                                int num_tokens, int d_model, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        const int total = num_tokens * d_model;
-        gather_tokens_kernel<<<blocksFor(total), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        // 2D grid: x covers d_model/4 float4 columns, y selects the token row.
+        const int n4 = d_model >> 2;
+        dim3 grid((n4 + kThreads - 1) / kThreads, num_tokens);
+        gather_tokens_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             hidden, batch_buffer, token_indices, num_tokens, d_model);
         return finishLaunch("cudaMoE_gather_tokens");
     }
@@ -1878,8 +1901,10 @@ extern "C"
                              const float *weights, int num_tokens, int d_model, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        const int total = num_tokens * d_model;
-        scatter_add_kernel<<<blocksFor(total), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+        // 2D grid: x covers d_model/4 float4 columns, y selects the token row.
+        const int n4 = d_model >> 2;
+        dim3 grid((n4 + kThreads - 1) / kThreads, num_tokens);
+        scatter_add_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             output, expert_output, token_indices, weights, num_tokens, d_model);
         return finishLaunch("cudaMoE_scatter_add");
     }
