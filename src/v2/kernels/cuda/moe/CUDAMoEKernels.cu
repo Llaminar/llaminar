@@ -697,6 +697,15 @@ namespace
         }
     }
 
+    // Gather + blockwise-int8 quantize for the prefill expert pipeline.
+    //
+    // Each 32-lane warp owns exactly one 32-element quant block: it loads the block,
+    // computes the absmax via warp shuffle, derives the per-block scale, and writes the
+    // quantized int8 + scale. The original launch used block=32 (a single warp), which
+    // caps occupancy at one warp per block (profiled ~21% occupancy). Packing
+    // kWarpsPerQuantBlock warps into each CUDA block lets the scheduler run many warps
+    // per SM with the same per-warp work, lifting occupancy ~8× with no extra arithmetic.
+    static constexpr int kWarpsPerQuantBlock = 8; // 8 warps = 256-thread block
     __global__ void grouped_prefill_gather_quantize_blockwise_kernel(
         const float *__restrict__ hidden,
         int8_t *__restrict__ A_int8,
@@ -705,23 +714,29 @@ namespace
         int total_slots,
         int K)
     {
-        const int block_idx = blockIdx.x;
         const int slot = blockIdx.y;
-        const int lane = threadIdx.x;
+        if (slot >= total_slots)
+            return;
+
+        // Map this thread to (warp, lane); each warp handles a distinct 32-col block.
+        const int warp = threadIdx.x >> 5;  // 0..kWarpsPerQuantBlock-1
+        const int lane = threadIdx.x & 31;  // 0..31
+        const int block_idx = blockIdx.x * kWarpsPerQuantBlock + warp;
         const int col = block_idx * 32 + lane;
-        if (slot >= total_slots || lane >= 32 || col >= K)
+        const int blocks_per_row = (K + 31) / 32;
+        if (block_idx >= blocks_per_row || col >= K)
             return;
 
         const int source_token = grouped_token_indices[slot];
         const float value = hidden[static_cast<size_t>(source_token) * K + col];
 
+        // Warp-local absmax reduction (each warp owns its own 32-element block).
         float abs_value = fabsf(value);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
             abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
 
         const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
-        const int blocks_per_row = (K + 31) / 32;
         if (lane == 0)
             scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx] = scale;
 
@@ -2235,8 +2250,11 @@ extern "C"
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         {
-            dim3 grid(d_model / 32, total_slots);
-            dim3 block(32);
+            // One warp per 32-col quant block; pack kWarpsPerQuantBlock warps per CUDA
+            // block so each block covers kWarpsPerQuantBlock*32 columns. grid.x rounds up.
+            const int blocks_per_row = d_model / 32;
+            dim3 grid((blocks_per_row + kWarpsPerQuantBlock - 1) / kWarpsPerQuantBlock, total_slots);
+            dim3 block(kWarpsPerQuantBlock * 32);
             grouped_prefill_gather_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
                 d_hidden, d_scratch_A_int8, d_scratch_scales,
                 d_group_token_indices, total_slots, d_model);
