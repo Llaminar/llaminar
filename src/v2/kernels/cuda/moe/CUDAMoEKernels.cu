@@ -238,6 +238,7 @@ namespace
 
         __shared__ float values[kMaxExperts];
         __shared__ float reductions[kThreads];
+        __shared__ int red_idx[kThreads];
         __shared__ int selected[kMaxTopK];
         __shared__ float selected_weights[kMaxTopK];
 
@@ -279,28 +280,63 @@ namespace
         }
         __syncthreads();
 
-        if (threadIdx.x == 0)
+        // Parallel top-k selection. The original implementation ran the entire
+        // top_k * num_experts argmax scan on thread 0 with the other 255 lanes idle.
+        // Here each selection round does a block-wide parallel argmax reduction over
+        // the (still-unselected) experts, masks the winner, and repeats. Ties break
+        // toward the lower expert index to match the original serial scan exactly.
+        float topk_sum = 0.0f;
+        for (int k = 0; k < top_k; ++k)
         {
-            float topk_sum = 0.0f;
-            for (int k = 0; k < top_k; ++k)
+            // Each thread finds the best (value,index) over its strided expert subset.
+            float best_value = -1.0f;
+            int best = 0;
+            for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
             {
-                int best = 0;
-                float best_value = -1.0f;
-                for (int expert = 0; expert < num_experts; ++expert)
+                const float value = values[expert];
+                if (value > best_value)
                 {
-                    const float value = values[expert];
-                    if (value > best_value)
+                    best_value = value;
+                    best = expert;
+                }
+            }
+            reductions[threadIdx.x] = best_value;
+            red_idx[threadIdx.x] = best;
+            __syncthreads();
+
+            // Tree reduction to the global argmax for this round.
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+            {
+                if (threadIdx.x < stride)
+                {
+                    const float other = reductions[threadIdx.x + stride];
+                    const int other_idx = red_idx[threadIdx.x + stride];
+                    const float cur = reductions[threadIdx.x];
+                    const int cur_idx = red_idx[threadIdx.x];
+                    if (other > cur || (other == cur && other_idx < cur_idx))
                     {
-                        best_value = value;
-                        best = expert;
+                        reductions[threadIdx.x] = other;
+                        red_idx[threadIdx.x] = other_idx;
                     }
                 }
-                selected[k] = best;
-                selected_weights[k] = best_value;
-                topk_sum += best_value;
-                values[best] = -1.0f;
+                __syncthreads();
             }
 
+            const int winner = red_idx[0];
+            const float winner_value = reductions[0];
+            topk_sum += winner_value;
+            if (threadIdx.x == 0)
+            {
+                selected[k] = winner;
+                selected_weights[k] = winner_value;
+                values[winner] = -1.0f; // mask out for the next round
+            }
+            __syncthreads(); // ensure the mask is visible before the next round
+        }
+
+        // Thread 0 writes the final indices + (optionally normalized) weights.
+        if (threadIdx.x == 0)
+        {
             for (int k = 0; k < top_k; ++k)
             {
                 const size_t out = static_cast<size_t>(token) * top_k + k;
