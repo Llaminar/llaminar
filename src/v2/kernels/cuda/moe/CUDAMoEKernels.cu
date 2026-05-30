@@ -592,16 +592,49 @@ namespace
 
     __global__ void swiglu_kernel(float *__restrict__ gate, const float *__restrict__ up, int count)
     {
+        // Process four contiguous elements per thread via float4 to cut the load/store
+        // instruction count 4×. count (= m*intermediate) is not guaranteed to be a
+        // multiple of 4, so vectorize the bulk and handle the ragged tail with scalars.
+        const int n4 = count >> 2;
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < count)
-            gate[idx] = silu(gate[idx]) * up[idx];
+        if (idx < n4)
+        {
+            float4 g = reinterpret_cast<float4 *>(gate)[idx];
+            const float4 u = reinterpret_cast<const float4 *>(up)[idx];
+            g.x = silu(g.x) * u.x;
+            g.y = silu(g.y) * u.y;
+            g.z = silu(g.z) * u.z;
+            g.w = silu(g.w) * u.w;
+            reinterpret_cast<float4 *>(gate)[idx] = g;
+        }
+        // Tail: the last (count & 3) elements. Only the first few threads do work.
+        const int tail_base = n4 << 2;
+        const int tail_idx = tail_base + idx;
+        if (idx < (count & 3) && tail_idx < count)
+            gate[tail_idx] = silu(gate[tail_idx]) * up[tail_idx];
     }
 
     __global__ void weighted_add_kernel(float *__restrict__ output, const float *__restrict__ input, float weight, int count)
     {
+        // float4-vectorized fused multiply-add (output += weight*input). count is
+        // typically d_model (a multiple of 32), but we still handle a scalar tail so
+        // the kernel is safe for any count.
+        const int n4 = count >> 2;
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx < count)
-            output[idx] += weight * input[idx];
+        if (idx < n4)
+        {
+            float4 o = reinterpret_cast<float4 *>(output)[idx];
+            const float4 in = reinterpret_cast<const float4 *>(input)[idx];
+            o.x += weight * in.x;
+            o.y += weight * in.y;
+            o.z += weight * in.z;
+            o.w += weight * in.w;
+            reinterpret_cast<float4 *>(output)[idx] = o;
+        }
+        const int tail_base = n4 << 2;
+        const int tail_idx = tail_base + idx;
+        if (idx < (count & 3) && tail_idx < count)
+            output[tail_idx] += weight * input[tail_idx];
     }
 
     __global__ void count_per_expert_kernel(
@@ -1921,14 +1954,16 @@ extern "C"
     bool cudaMoE_swiglu(float *gate, const float *up, int count, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        swiglu_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, count);
+        // One thread per float4 lane; ceil(count/4) threads cover both the vectorized
+        // bulk and the (<4) scalar tail.
+        swiglu_kernel<<<blocksFor((count + 3) >> 2), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(gate, up, count);
         return finishLaunch("cudaMoE_swiglu");
     }
 
     bool cudaMoE_weighted_add(float *output, const float *input, float weight, int count, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        weighted_add_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(output, input, weight, count);
+        weighted_add_kernel<<<blocksFor((count + 3) >> 2), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(output, input, weight, count);
         return finishLaunch("cudaMoE_weighted_add");
     }
 
