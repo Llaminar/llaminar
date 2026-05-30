@@ -116,6 +116,115 @@ namespace
         }
     }
 
+    // Tiled SGEMM for the PREFILL router logits: logits[S, E] = hidden[S, D] · gateᵀ[D, E].
+    //
+    // The block-per-(expert,token) route_logits_kernel above has zero data reuse: it
+    // re-reads hidden[token] once per expert (E× redundant) and gate[expert] once per
+    // token (S× redundant), saturating L2 (~85% L2 throughput, ~1% DRAM, ~0.7 TFLOP/s).
+    // This classic shared-memory tiled GEMM stages BM×BK hidden and BN×BK gate tiles
+    // into smem and reuses each loaded element across the BN (resp. BM) tile dimension,
+    // cutting L2 traffic by ~min(BM,BN)× and converting the kernel from L2-bound to
+    // compute-bound.
+    //
+    // Tile geometry: BM=64 tokens × BN=64 experts per block, BK=16 along d_model.
+    // Block = 16×16 = 256 threads, each thread computes a TM×TN = 4×4 output micro-tile.
+    // Decode (seq_len == 1) still uses the warp-reduction kernel above for SM coverage.
+    template <int BM, int BN, int BK, int TM, int TN>
+    __global__ void route_logits_tiled_kernel(
+        const float *__restrict__ hidden,       // A: [seq_len, d_model] row-major
+        const float *__restrict__ gate_weights, // B: [num_experts, d_model] row-major
+        float *__restrict__ logits,             // C: [seq_len, num_experts] row-major
+        int seq_len, int d_model, int num_experts)
+    {
+        // Shared tiles, stored K-major so the compute loop reads a full column of
+        // BM (resp. BN) values contiguously for each k step.
+        __shared__ float As[BK * BM]; // As[k * BM + m] = hidden[blockM + m, kk + k]
+        __shared__ float Bs[BK * BN]; // Bs[k * BN + n] = gate  [blockN + n, kk + k]
+
+        // Origin of this block's output tile in (token, expert) space.
+        const int blockM = blockIdx.y * BM;
+        const int blockN = blockIdx.x * BN;
+
+        // 16×16 thread grid; each thread owns a TM×TN micro-tile of the output.
+        const int threadRow = threadIdx.x / (BN / TN); // 0..15
+        const int threadCol = threadIdx.x % (BN / TN); // 0..15
+
+        // Per-thread accumulators for the TM×TN micro-tile (lives in registers).
+        float acc[TM][TN];
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+#pragma unroll
+            for (int j = 0; j < TN; ++j)
+                acc[i][j] = 0.0f;
+
+        // March across the K (d_model) dimension one BK-wide strip at a time.
+        for (int kk = 0; kk < d_model; kk += BK)
+        {
+            // Cooperative load of the hidden tile into smem (K-major). Consecutive
+            // threads read consecutive k → fully coalesced within each hidden row.
+            for (int idx = threadIdx.x; idx < BM * BK; idx += blockDim.x)
+            {
+                const int m = idx / BK;
+                const int k = idx % BK;
+                const int gm = blockM + m;
+                const int gk = kk + k;
+                As[k * BM + m] = (gm < seq_len && gk < d_model)
+                                     ? hidden[static_cast<size_t>(gm) * d_model + gk]
+                                     : 0.0f;
+            }
+            // Cooperative load of the gate tile into smem (K-major), same coalescing.
+            for (int idx = threadIdx.x; idx < BN * BK; idx += blockDim.x)
+            {
+                const int n = idx / BK;
+                const int k = idx % BK;
+                const int gn = blockN + n;
+                const int gk = kk + k;
+                Bs[k * BN + n] = (gn < num_experts && gk < d_model)
+                                     ? gate_weights[static_cast<size_t>(gn) * d_model + gk]
+                                     : 0.0f;
+            }
+            __syncthreads();
+
+            // Multiply the staged strip: for each k, broadcast TM hidden values and
+            // TN gate values from smem into registers and accumulate the outer product.
+#pragma unroll
+            for (int k = 0; k < BK; ++k)
+            {
+                float regM[TM];
+                float regN[TN];
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+                    regM[i] = As[k * BM + threadRow * TM + i];
+#pragma unroll
+                for (int j = 0; j < TN; ++j)
+                    regN[j] = Bs[k * BN + threadCol * TN + j];
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j)
+                        acc[i][j] += regM[i] * regN[j];
+            }
+            __syncthreads();
+        }
+
+        // Write the micro-tile back to global memory, guarding the ragged token edge
+        // (num_experts is a multiple of BN for all supported models, but guard anyway).
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+        {
+            const int m = blockM + threadRow * TM + i;
+            if (m >= seq_len)
+                continue;
+#pragma unroll
+            for (int j = 0; j < TN; ++j)
+            {
+                const int n = blockN + threadCol * TN + j;
+                if (n < num_experts)
+                    logits[static_cast<size_t>(m) * num_experts + n] = acc[i][j];
+            }
+        }
+    }
+
     __global__ void softmax_topk_kernel(
         float *__restrict__ logits,
         int *__restrict__ expert_indices,
@@ -1577,6 +1686,24 @@ extern "C"
                               int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
+
+        // PREFILL: with many tokens this is a genuine GEMM. The naive block-per-
+        // (expert,token) kernel is L2-bandwidth-bound (re-reads hidden E× and gate S×).
+        // Above this token threshold the tiled SGEMM (smem reuse) is a large win; below
+        // it (decode, seq_len==1) the warp-reduction kernel keeps full SM coverage.
+        constexpr int kRouteTiledMinTokens = 16;
+        if (seq_len >= kRouteTiledMinTokens)
+        {
+            // Tile geometry must match the template instantiation below.
+            constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+            constexpr int kTiledThreads = (BM / TM) * (BN / TN); // 16×16 = 256
+            dim3 grid((num_experts + BN - 1) / BN, (seq_len + BM - 1) / BM);
+            route_logits_tiled_kernel<BM, BN, BK, TM, TN>
+                <<<grid, kTiledThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                    hidden, gate_weights, logits, seq_len, d_model, num_experts);
+            return finishLaunch("cudaMoE_route_logits_tiled");
+        }
+
         dim3 grid(num_experts, seq_len);
         route_logits_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             hidden, gate_weights, logits, seq_len, d_model, num_experts);
