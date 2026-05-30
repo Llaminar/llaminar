@@ -530,9 +530,23 @@ namespace
 
         __shared__ float partial[kThreads];
         const float *x = input + static_cast<size_t>(token) * d_model;
+
+        // d_model is always a multiple of 32 (enforced upstream), so it is also a
+        // multiple of 4 → we can process the row as float4 to cut the load/store
+        // instruction count 4× (the original scalar stride loop was MIO-bound at 65%
+        // memory throughput). Both rows start at token*d_model*4 bytes, which is
+        // 16-byte aligned for d_model multiple of 4.
+        const int n4 = d_model >> 2;
+        const float4 *x4 = reinterpret_cast<const float4 *>(x);
+        const float4 *g4 = reinterpret_cast<const float4 *>(gate_inp);
+
         float dot = 0.0f;
-        for (int col = threadIdx.x; col < d_model; col += blockDim.x)
-            dot += x[col] * gate_inp[col];
+        for (int i = threadIdx.x; i < n4; i += blockDim.x)
+        {
+            const float4 a = x4[i];
+            const float4 b = g4[i];
+            dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
         partial[threadIdx.x] = dot;
         __syncthreads();
         for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
@@ -543,9 +557,16 @@ namespace
         }
 
         const float gate = 1.0f / (1.0f + expf(-partial[0]));
-        float *out = shared_output + static_cast<size_t>(token) * d_model;
-        for (int col = threadIdx.x; col < d_model; col += blockDim.x)
-            out[col] *= gate;
+        float4 *out4 = reinterpret_cast<float4 *>(shared_output + static_cast<size_t>(token) * d_model);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x)
+        {
+            float4 v = out4[i];
+            v.x *= gate;
+            v.y *= gate;
+            v.z *= gate;
+            v.w *= gate;
+            out4[i] = v;
+        }
     }
 
     __global__ void swiglu_kernel(float *__restrict__ gate, const float *__restrict__ up, int count)
@@ -577,14 +598,32 @@ namespace
 
     __global__ void exclusive_scan_kernel(const int *__restrict__ expert_counts, int *__restrict__ expert_offsets, int num_experts)
     {
-        if (threadIdx.x != 0 || blockIdx.x != 0)
-            return;
-        int running = 0;
-        for (int expert = 0; expert < num_experts; ++expert)
+        // The prefix sum is inherently serial, but the original implementation ran it
+        // on thread 0 reading/writing global memory — num_experts (256) dependent
+        // global loads at ~400-cycle latency dominated the ~9µs runtime. Stage the
+        // counts into shared memory with a coalesced strided load, run the serial scan
+        // in smem (~20-cycle latency), then write the offsets back coalesced. Arithmetic
+        // order is identical to the original, so results are bit-exact.
+        __shared__ int s_counts[kMaxExperts];
+
+        for (int i = threadIdx.x; i < num_experts; i += blockDim.x)
+            s_counts[i] = expert_counts[i];
+        __syncthreads();
+
+        if (threadIdx.x == 0)
         {
-            expert_offsets[expert] = running;
-            running += expert_counts[expert];
+            int running = 0;
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                const int c = s_counts[expert];
+                s_counts[expert] = running; // in-place exclusive prefix
+                running += c;
+            }
         }
+        __syncthreads();
+
+        for (int i = threadIdx.x; i < num_experts; i += blockDim.x)
+            expert_offsets[i] = s_counts[i];
     }
 
     __global__ void scatter_tokens_kernel(
@@ -1881,7 +1920,7 @@ extern "C"
                                 int num_experts, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        exclusive_scan_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(expert_counts, expert_offsets, num_experts);
+        exclusive_scan_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(expert_counts, expert_offsets, num_experts);
         return finishLaunch("cudaMoE_exclusive_scan");
     }
 
