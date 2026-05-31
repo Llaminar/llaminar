@@ -27,10 +27,15 @@
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
+#include "tensors/Tensors.h"
 #include "../../../mocks/MockModelContext.h"
 
+#include <algorithm>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 using namespace llaminar2;
 using namespace testing;
@@ -95,6 +100,8 @@ namespace
 
         const float *logits() const override
         {
+            if (column_parallel_logits_)
+                return nullptr;
             return logits_.data();
         }
 
@@ -106,12 +113,29 @@ namespace
             last_mtp_condition_token_ = draft_condition_token;
             mtp_logits_.assign(VOCAB_SIZE, -10.0f);
             mtp_logits_[MTP_ARGMAX_TOKEN] = 10.0f;
+            if (column_parallel_logits_)
+            {
+                resetLocalTensor(mtp_logits_local_, 1);
+                setLocalToken(mtp_logits_local_, 0, MTP_ARGMAX_TOKEN, 10.0f);
+            }
             return true;
         }
 
         const float *mtpLogits() const override
         {
+            if (column_parallel_logits_)
+                return nullptr;
             return mtp_logits_.empty() ? nullptr : mtp_logits_.data();
+        }
+
+        bool hasMTPLogitsLocal() const override
+        {
+            return column_parallel_logits_ && mtp_logits_local_ != nullptr;
+        }
+
+        LogitsLocalInfo getMTPLogitsLocalInfo() const override
+        {
+            return makeLocalInfo(mtp_logits_local_.get());
         }
 
         bool setComputeAllPositionLogits(bool enabled) override
@@ -125,7 +149,19 @@ namespace
 
         const float *getAllPositionLogits() const override
         {
+            if (column_parallel_logits_)
+                return nullptr;
             return all_position_logits_.empty() ? nullptr : all_position_logits_.data();
+        }
+
+        bool hasAllPositionLogitsLocal() const override
+        {
+            return column_parallel_logits_ && all_position_logits_local_ != nullptr;
+        }
+
+        LogitsLocalInfo getAllPositionLogitsLocalInfo() const override
+        {
+            return makeLocalInfo(all_position_logits_local_.get());
         }
 
         std::string mtpDecodeUnsupportedReason() const override
@@ -147,6 +183,16 @@ namespace
 
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock"; }
+
+        bool hasLogitsLocal() const override
+        {
+            return column_parallel_logits_ && logits_local_ != nullptr;
+        }
+
+        LogitsLocalInfo getLogitsLocalInfo() const override
+        {
+            return makeLocalInfo(logits_local_.get());
+        }
 
         // GPU sampling returns -1 to force CPU fallback (for test coverage)
         int sampleGreedyOnDevice() override { return -1; }
@@ -171,6 +217,13 @@ namespace
         void setMTPUnsupportedReason(std::string reason)
         {
             mtp_unsupported_reason_ = std::move(reason);
+        }
+        void enableColumnParallelShard(int vocab_start, int vocab_local)
+        {
+            column_parallel_logits_ = true;
+            vocab_start_ = vocab_start;
+            vocab_local_ = vocab_local;
+            setupPrefillLogits();
         }
 
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
@@ -198,12 +251,22 @@ namespace
         {
             logits_.assign(VOCAB_SIZE, -10.0f);
             logits_[PREFILL_ARGMAX_TOKEN] = 10.0f; // Token 7 is argmax
+            if (column_parallel_logits_)
+            {
+                resetLocalTensor(logits_local_, 1);
+                setLocalToken(logits_local_, 0, PREFILL_ARGMAX_TOKEN, 10.0f);
+            }
         }
 
         void setupDecodeLogits()
         {
             logits_.assign(VOCAB_SIZE, -10.0f);
             logits_[DECODE_ARGMAX_TOKEN] = 10.0f; // Token 3 is argmax
+            if (column_parallel_logits_)
+            {
+                resetLocalTensor(logits_local_, 1);
+                setLocalToken(logits_local_, 0, DECODE_ARGMAX_TOKEN, 10.0f);
+            }
         }
 
         void setupAllPositionLogits(int seq_len)
@@ -215,11 +278,54 @@ namespace
             {
                 all_position_logits_[VOCAB_SIZE + DECODE_ARGMAX_TOKEN] = 10.0f;
             }
+            if (column_parallel_logits_)
+            {
+                resetLocalTensor(all_position_logits_local_, seq_len);
+                setLocalToken(all_position_logits_local_, 0, row0_token, 10.0f);
+                if (seq_len > 1)
+                {
+                    setLocalToken(all_position_logits_local_, 1, DECODE_ARGMAX_TOKEN, 10.0f);
+                }
+            }
+        }
+
+        void resetLocalTensor(std::shared_ptr<FP32Tensor> &tensor, int rows)
+        {
+            tensor = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(vocab_local_)},
+                DeviceId::cpu());
+            std::fill(tensor->mutable_data(), tensor->mutable_data() + tensor->numel(), -10.0f);
+        }
+
+        void setLocalToken(const std::shared_ptr<FP32Tensor> &tensor, int row, int global_token, float value)
+        {
+            if (!tensor)
+                return;
+            if (global_token < vocab_start_ || global_token >= vocab_start_ + vocab_local_)
+                return;
+            tensor->mutable_data()[static_cast<size_t>(row) * static_cast<size_t>(vocab_local_) +
+                                   static_cast<size_t>(global_token - vocab_start_)] = value;
+        }
+
+        LogitsLocalInfo makeLocalInfo(FP32Tensor *tensor) const
+        {
+            if (!tensor)
+                return {};
+            LogitsLocalInfo info;
+            info.gpu_ptr = nullptr;
+            info.device = std::nullopt;
+            info.vocab_local = static_cast<size_t>(vocab_local_);
+            info.tensor = tensor;
+            info.stream = nullptr;
+            return info;
         }
 
         std::vector<float> logits_;
         std::vector<float> mtp_logits_;
         std::vector<float> all_position_logits_;
+        std::shared_ptr<FP32Tensor> logits_local_;
+        std::shared_ptr<FP32Tensor> mtp_logits_local_;
+        std::shared_ptr<FP32Tensor> all_position_logits_local_;
         int forward_call_count_{0};
         int forward_mtp_count_{0};
         int clear_cache_count_{0};
@@ -230,6 +336,9 @@ namespace
         bool mtp_enabled_{false};
         bool accept_mtp_token_{true};
         bool all_position_logits_enabled_{false};
+        bool column_parallel_logits_{false};
+        int vocab_start_{0};
+        int vocab_local_{VOCAB_SIZE};
         std::string mtp_unsupported_reason_;
         std::vector<int> last_forward_tokens_;
         int last_forward_seq_len_{0};
@@ -298,12 +407,19 @@ namespace
             return {runners_.back().get(), mock_ptr};
         }
 
-        LocalTPRunnerHarness createLocalTPRunner(bool mtp_accept = true)
+        LocalTPRunnerHarness createLocalTPRunner(bool mtp_accept = true,
+                                                 bool column_parallel_logits = false)
         {
             auto child0 = std::make_unique<MockInferenceRunner>();
             auto child1 = std::make_unique<MockInferenceRunner>();
             child0->enableMTP(mtp_accept);
             child1->enableMTP(mtp_accept);
+            if (column_parallel_logits)
+            {
+                child0->enableColumnParallelShard(0, MockInferenceRunner::VOCAB_SIZE / 2);
+                child1->enableColumnParallelShard(MockInferenceRunner::VOCAB_SIZE / 2,
+                                                  MockInferenceRunner::VOCAB_SIZE / 2);
+            }
 
             auto *child0_ptr = child0.get();
             auto *child1_ptr = child1.get();
@@ -636,6 +752,70 @@ namespace
         EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
         EXPECT_EQ(harness.child0->restoreCount(), 1);
         EXPECT_EQ(harness.child1->restoreCount(), 1);
+        EXPECT_THAT(harness.child0->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+        EXPECT_THAT(harness.child1->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+        const auto probe = harness.runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, LocalTPMTPColumnParallelAcceptsGatheredDraftAndVerifierLogits)
+    {
+        auto harness = createLocalTPRunner(/*mtp_accept=*/true, /*column_parallel_logits=*/true);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(harness.runner->prefill(prompt));
+
+        GenerationResult step1 = harness.runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child0->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(harness.child1->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_THAT(harness.child0->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(harness.child1->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        const auto probe = harness.runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, LocalTPMTPColumnParallelRejectsUsingGatheredVerifierLogits)
+    {
+        auto harness = createLocalTPRunner(/*mtp_accept=*/false, /*column_parallel_logits=*/true);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(harness.runner->prefill(prompt));
+
+        GenerationResult step1 = harness.runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+        EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
         EXPECT_THAT(harness.child0->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));

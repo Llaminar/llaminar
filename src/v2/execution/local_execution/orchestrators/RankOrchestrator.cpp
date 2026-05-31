@@ -460,6 +460,26 @@ namespace llaminar2
 
         LOG_DEBUG("RankOrchestrator: Created via createForTest with "
                   << device_runners_.size() << " injected device runners");
+
+        if (model_ctx_ && !device_runners_.empty())
+        {
+            int vocab = vocab_size();
+            if (vocab > 0)
+            {
+                size_t max_tokens = static_cast<size_t>(config_.batch_size) *
+                                    static_cast<size_t>(config_.max_seq_len);
+                logits_gatherer_ = std::make_unique<LogitsGatherer>(vocab, max_tokens);
+
+                if (device_runners_.size() > 1)
+                {
+                    DeviceId primary_dev = device_runners_[0]->primaryDeviceId();
+                    if (primary_dev.is_gpu())
+                    {
+                        logits_gatherer_->pinForDevice(primary_dev);
+                    }
+                }
+            }
+        }
     }
 
     RankOrchestrator::~RankOrchestrator() = default;
