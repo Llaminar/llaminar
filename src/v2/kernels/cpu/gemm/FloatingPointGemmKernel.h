@@ -63,6 +63,61 @@ namespace llaminar2
 
         // ========== OneDNN GEMM Primitives ==========
 
+        inline bool run_fp32_skinny_matmul(const float *A,
+                                           const float *B,
+                                           float *C,
+                                           int M,
+                                           int N,
+                                           int K,
+                                           bool transpose_B,
+                                           float alpha = 1.0f,
+                                           float beta = 0.0f,
+                                           const float *bias = nullptr)
+        {
+            if (!A || !B || !C || M < 0 || N < 0 || K < 0)
+            {
+                LOG_ERROR("[FloatingPointGemmKernel] Invalid skinny FP32 matmul pointers/dims: "
+                          << "A=" << static_cast<const void *>(A)
+                          << " B=" << static_cast<const void *>(B)
+                          << " C=" << static_cast<void *>(C)
+                          << " M=" << M << " N=" << N << " K=" << K);
+                return false;
+            }
+
+            auto work = [&]()
+            {
+#pragma omp for collapse(2) schedule(static)
+                for (int row = 0; row < M; ++row)
+                {
+                    for (int col = 0; col < N; ++col)
+                    {
+                        float acc = 0.0f;
+                        const float *a_row = A + static_cast<size_t>(row) * K;
+                        if (transpose_B)
+                        {
+                            const float *b_row = B + static_cast<size_t>(col) * K;
+                            for (int kk = 0; kk < K; ++kk)
+                                acc += a_row[kk] * b_row[kk];
+                        }
+                        else
+                        {
+                            for (int kk = 0; kk < K; ++kk)
+                                acc += a_row[kk] * B[static_cast<size_t>(kk) * N + col];
+                        }
+
+                        float value = alpha * acc;
+                        if (bias)
+                            value += bias[col];
+                        if (beta != 0.0f)
+                            value += beta * C[static_cast<size_t>(row) * N + col];
+                        C[static_cast<size_t>(row) * N + col] = value;
+                    }
+                }
+            };
+            OMP_WORKSHARE_REGION(work);
+            return true;
+        }
+
         /**
          * @brief Execute FP32 matrix multiplication using OneDNN with optional fused bias
          *
@@ -91,6 +146,21 @@ namespace llaminar2
         {
             const KernelType profile_type = (M == 1) ? KernelType::GEMV_FP32 : KernelType::GEMM_FP32;
             KERNEL_PROFILE_SCOPE(profile_type);
+
+            if (!A || !B || !C)
+            {
+                LOG_ERROR("OneDNN FP32 matmul received null pointer: "
+                          << "A=" << static_cast<const void *>(A)
+                          << " B=" << static_cast<const void *>(B)
+                          << " C=" << static_cast<void *>(C)
+                          << " M=" << M << " N=" << N << " K=" << K);
+                return false;
+            }
+
+            if (B && M <= 64 && N <= 64)
+            {
+                return run_fp32_skinny_matmul(A, B, C, M, N, K, transpose_B, alpha, beta, bias);
+            }
 
             using dt = dnnl::memory::data_type;
             using tag = dnnl::memory::format_tag;

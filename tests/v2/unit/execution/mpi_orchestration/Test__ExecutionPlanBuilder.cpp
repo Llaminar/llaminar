@@ -254,6 +254,44 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_TwoRanksUsesCrossRankDo
     }
 }
 
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_ExplicitCPUDeviceMapKeepsRanksOnCPU)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {{DeviceType::CUDA, 0}})
+                       .addRank(1, "localhost", 1, {{DeviceType::ROCm, 0}})
+                       .build();
+
+    config.device_mode = DeviceAssignmentMode::EXPLICIT;
+    config.device_map = {
+        {0, GlobalDeviceAddress::cpu(0)},
+        {1, GlobalDeviceAddress::cpu(1)},
+    };
+    config.device_map_numa_explicit = {{0, true}, {1, true}};
+    config.tp_degree = 2;
+    config.tp_scope = TPScope::NODE_LOCAL;
+    config.default_backend = CollectiveBackendType::MPI;
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 2);
+    for (int r = 0; r < 2; ++r)
+    {
+        const auto &plan = plans[r];
+        EXPECT_TRUE(plan.usesGlobalTP());
+        EXPECT_EQ(plan.tp_scope, TPScope::NODE_LOCAL);
+        EXPECT_TRUE(plan.primary_device.isCPU());
+        EXPECT_EQ(plan.primary_device.numa_node, r);
+        EXPECT_TRUE(plan.primary_device_numa_explicit);
+        EXPECT_TRUE(plan.local_tp_devices.empty());
+        EXPECT_EQ(plan.global_tp_domain_size, 2);
+        EXPECT_EQ(plan.weight_shard.total_shards, 2);
+        EXPECT_EQ(plan.weight_shard.shard_index, r);
+
+        auto errors = plan.validate();
+        EXPECT_TRUE(errors.empty()) << "Rank " << r << " errors: " << (errors.empty() ? "" : errors[0]);
+    }
+}
+
 // ============================================================================
 // Pipeline Parallelism Tests
 // ============================================================================

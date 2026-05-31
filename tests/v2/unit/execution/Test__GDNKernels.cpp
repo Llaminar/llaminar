@@ -47,6 +47,7 @@
 #include "tensors/TensorKernels.h"
 #include "utils/DebugEnv.h"
 #include "../../utils/TestTensorFactory.h"
+#include "../../utils/PreparedWeightTestHarness.h"
 
 using namespace llaminar2;
 using ::testing::_;
@@ -585,6 +586,103 @@ TEST(Test__GDNKernels, Projection_MixedKernelTypesUsePerProjectionFallback)
     EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
     EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
     EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+}
+
+TEST(Test__GDNKernels, Projection_Qwen36NodeLocalTPPrefillShapeResolvesPreparedMixedFallback)
+{
+    auto ctx = makeCPUContext();
+
+    const int M = 9;
+    const int K = 5120;
+    const int N_QKV = 7168;
+    const int N_Z = 3072;
+    const int N_ALPHA = 24;
+    const int N_BETA = 24;
+
+    auto input = test::TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f, 42);
+    auto w_qkv = test::TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)});
+    auto w_z = test::TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)});
+    auto w_a = test::TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_ALPHA), static_cast<size_t>(K)}, -0.1f, 0.1f, 43);
+    auto w_b = test::TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_BETA), static_cast<size_t>(K)}, -0.1f, 0.1f, 44);
+
+    auto out_qkv = test::TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+    auto out_z = test::TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+    auto out_a = test::TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(M), static_cast<size_t>(N_ALPHA)});
+    auto out_b = test::TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(M), static_cast<size_t>(N_BETA)});
+
+    constexpr ModelContextId model_id{3600};
+    PreparedWeightStore store(model_id);
+    auto qkv_binding = test::makePreparedWeightTestBinding(
+        w_qkv.get(), DeviceId::cpu(), "blk.0.gdn_qkv_proj.weight", model_id);
+    auto z_binding = test::makePreparedWeightTestBinding(
+        w_z.get(), DeviceId::cpu(), "blk.0.gdn_z_proj.weight", model_id);
+    auto a_binding = test::makePreparedWeightTestBinding(
+        w_a.get(), DeviceId::cpu(), "blk.0.gdn_alpha_proj.weight", model_id);
+    auto b_binding = test::makePreparedWeightTestBinding(
+        w_b.get(), DeviceId::cpu(), "blk.0.gdn_beta_proj.weight", model_id);
+
+    auto qkv_ref = store.prepareGemm(qkv_binding);
+    auto z_ref = store.prepareGemm(z_binding);
+    auto a_ref = store.prepareGemm(a_binding);
+    auto b_ref = store.prepareGemm(b_binding);
+    ASSERT_NE(store.gemmKernel(qkv_ref), nullptr);
+    ASSERT_NE(store.gemmKernel(z_ref), nullptr);
+    ASSERT_NE(store.gemmKernel(a_ref), nullptr);
+    ASSERT_NE(store.gemmKernel(b_ref), nullptr);
+
+    w_qkv->release_raw_data();
+    w_z->release_raw_data();
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = M;
+    p.k = K;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = N_QKV;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = N_Z;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = N_ALPHA;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = N_BETA;
+    p.prepared_ref_qkv = qkv_ref;
+    p.prepared_ref_z = z_ref;
+    p.prepared_ref_a = a_ref;
+    p.prepared_ref_b = b_ref;
+    p.prepared_store = &store;
+
+    GDNProjectionStage stage(p);
+    ASSERT_TRUE(stage.execute(ctx.get()));
+
+    auto assertFiniteNonzero = [](const TensorBase *tensor, int rows, int cols, const char *name)
+    {
+        const float *data = tensor->data();
+        bool any_nonzero = false;
+        for (size_t i = 0; i < static_cast<size_t>(rows) * cols; ++i)
+        {
+            ASSERT_TRUE(std::isfinite(data[i])) << name << " non-finite at " << i;
+            any_nonzero = any_nonzero || data[i] != 0.0f;
+        }
+        EXPECT_TRUE(any_nonzero) << name << " is all zero";
+    };
+
+    assertFiniteNonzero(out_qkv.get(), M, N_QKV, "qkv");
+    assertFiniteNonzero(out_z.get(), M, N_Z, "z");
+    assertFiniteNonzero(out_a.get(), M, N_ALPHA, "alpha");
+    assertFiniteNonzero(out_b.get(), M, N_BETA, "beta");
 }
 
 // ============================================================================

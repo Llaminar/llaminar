@@ -176,6 +176,37 @@ TEST_F(Test__WeightManagerCpuHostRelease, RetainsFP32TensorAfterCpuPreparation)
     EXPECT_FALSE(fp32_tensor->is_raw_data_released());
 }
 
+TEST_F(Test__WeightManagerCpuHostRelease, RetainsFP32TensorSliceAfterCpuPreparation)
+{
+    // TensorSlice forwards IINT8Unpackable, so FP32 slices must be identified
+    // by missing VNNI format metadata rather than by dynamic_cast alone.
+    TestableCpuReleaseWeightManager wm(*mock_loader_);
+    DeviceId cpu = DeviceId::cpu();
+
+    mock_loader_->addFP32RandomTensor("blk.0.gdn_alpha_proj.weight", {24, 64});
+    auto fp32_inner = mock_loader_->loadTensor("blk.0.gdn_alpha_proj.weight");
+    ASSERT_NE(fp32_inner, nullptr);
+    auto fp32_sliced = wrapInSlice(fp32_inner, 48, 64);
+
+    auto *unpackable = dynamic_cast<IINT8Unpackable *>(fp32_sliced.get());
+    ASSERT_NE(unpackable, nullptr);
+    ASSERT_EQ(unpackable->vnniFormatInfo(), nullptr);
+
+    auto binding = makeBinding(1, fp32_sliced.get(), "blk.0.gdn_alpha_proj.weight",
+                               WeightRole::Other, 0, cpu, /*mark_prepared=*/true);
+    wm.preRegisterPrepared(binding, cpu);
+
+    InferenceStrategy strategy;
+    std::vector<WeightBinding> bindings_vec = {binding};
+    FrozenModelWeightSet frozen(strategy, std::move(bindings_vec));
+
+    bool ok = wm.prepareWeightsForDevice(frozen, cpu);
+    ASSERT_TRUE(ok);
+
+    EXPECT_FALSE(fp32_sliced->is_raw_data_released());
+    EXPECT_NE(fp32_sliced->data(), nullptr);
+}
+
 TEST_F(Test__WeightManagerCpuHostRelease, RetainsEmbeddingWeightAfterCpuPreparation)
 {
     // Embedding role weights should be skipped regardless of tensor type

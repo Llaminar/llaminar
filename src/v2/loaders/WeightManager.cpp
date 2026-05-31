@@ -111,6 +111,12 @@ namespace llaminar2
             return hash == 0 ? 1 : hash;
         }
 
+        bool hasVnniPackedQuantizedPayload(const TensorBase *tensor)
+        {
+            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
+            return unpackable && unpackable->vnniFormatInfo() != nullptr;
+        }
+
     }
 
     const char *WeightManager::weightPrepStateName(WeightPrepState state)
@@ -2727,8 +2733,8 @@ namespace llaminar2
             // Release raw host data for quantized weights now that VNNI packing
             // is complete. The kernel owns its own packed buffer (native_interleaved
             // + payload); the original Q4_K/Q5_K/Q6_K/etc TensorSlice heap data is
-            // no longer needed. FP32/oneDNN weights are not IINT8Unpackable so
-            // the dynamic_cast fails and they are retained.
+            // no longer needed. TensorSlice implements IINT8Unpackable for forwarding,
+            // so require actual VNNI format metadata before releasing.
             size_t released_count = 0;
             for (const auto &binding : frozen_weights.bindings())
             {
@@ -2742,7 +2748,7 @@ namespace llaminar2
                 {
                     continue;
                 }
-                if (dynamic_cast<IINT8Unpackable *>(binding.tensor))
+                if (hasVnniPackedQuantizedPayload(binding.tensor))
                 {
                     binding.tensor->release_host_weight_data();
                     ++released_count;
@@ -3360,8 +3366,7 @@ namespace llaminar2
                     // so the original host data is no longer needed.
                     // Floating-point GEMM (oneDNN) reads weight_tensor_->data() live
                     // at every inference call — releasing would cause a null dereference.
-                    if (release_raw_data && job.tensor &&
-                        dynamic_cast<IINT8Unpackable *>(job.tensor.get()))
+                    if (release_raw_data && hasVnniPackedQuantizedPayload(job.tensor.get()))
                     {
                         job.tensor->release_host_weight_data();
                     }
@@ -4486,7 +4491,7 @@ namespace llaminar2
             if (!tensor || !kernel)
                 return false;
 
-            const bool quantized = dynamic_cast<IINT8Unpackable *>(tensor) != nullptr;
+            const bool quantized = hasVnniPackedQuantizedPayload(tensor);
             KernelFactory::GemmPreparationKind resolved_kind = quantized
                                                                    ? (target_device.is_cuda()   ? KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
                                                                       : target_device.is_rocm() ? KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED

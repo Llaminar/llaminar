@@ -440,7 +440,17 @@ namespace
             config.tp_scope = TPScope::NODE_LOCAL;
             config.pp_degree = 1;
             config.default_backend = CollectiveBackendType::MPI;
-            config.device_for_this_rank = GlobalDeviceAddress::cpu();
+            config.device_mode = DeviceAssignmentMode::EXPLICIT;
+            config.device_map.clear();
+            config.device_map_numa_explicit.clear();
+            for (int rank = 0;
+                 rank < test_case.mpi_ranks &&
+                 rank < static_cast<int>(test_case.devices.size());
+                 ++rank)
+            {
+                config.device_map.emplace_back(rank, test_case.devices[rank]);
+                config.device_map_numa_explicit.emplace_back(rank, test_case.devices[rank].hasValidNuma());
+            }
             break;
         }
 

@@ -4773,40 +4773,35 @@ namespace llaminar2
 
     int DeviceGraphOrchestrator::sampleGreedyOnDevice()
     {
-        if (!state_.device_id.is_gpu() || !state_.logits)
-            return -1;
-        if (!state_.logits->deviceValid())
-            return -1;
+        // LmHeadStage always writes the last-token logits to row 0 for both
+        // prefill and decode.  In GlobalTP/NodeLocalTP, the terminal restore path
+        // repopulates logits_local, so greedy sampling must use the shard-local
+        // tensor and coordinate the winning candidate across ranks.
+        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel &&
+            state_.logits_local)
+        {
+            const int token_offset = vocabOffsetForTPConfig(graph_builder_->config());
+            return coordinateGreedyCandidate(
+                sampleGreedyCandidateFromTensor(state_.logits_local.get(),
+                                                0,
+                                                token_offset,
+                                                argmax_partial_vals_dev_,
+                                                argmax_partial_idxs_dev_,
+                                                argmax_partial_capacity_),
+                globalTPContextForMTPCoordination());
+        }
 
-        IBackend *backend = getBackendFor(state_.device_id);
-        if (!backend)
-            return -1;
-
-        const void *gpu_ptr = state_.logits->gpu_data_ptr();
-        if (!gpu_ptr)
-            return -1;
-
-        const auto &shape = state_.logits->shape();
-        const size_t vocab = (shape.size() >= 2) ? shape[1] : shape[0];
-
-        // LmHeadStage always writes the last token's logits to row 0
-        // (both prefill and decode), so we always argmax row 0.
-        const void *target_row = gpu_ptr;
-
-        float max_val = 0.0f;
-        int max_idx = 0;
-
-        // Supply the arena-owned partial-reduction scratch so the backend can use
-        // its fast two-pass multi-block argmax. If the scratch is unavailable the
-        // pointers are null and the backend falls back to a single-block reduction.
-        if (!backend->argmaxF32(target_row, static_cast<int>(vocab),
-                                state_.device_id.gpu_ordinal(),
-                                &max_val, &max_idx, nullptr,
-                                argmax_partial_vals_dev_, argmax_partial_idxs_dev_,
-                                argmax_partial_capacity_))
+        if (!state_.logits)
             return -1;
 
-        return max_idx;
+        return coordinateGreedyCandidate(
+            sampleGreedyCandidateFromTensor(state_.logits.get(),
+                                            0,
+                                            0,
+                                            argmax_partial_vals_dev_,
+                                            argmax_partial_idxs_dev_,
+                                            argmax_partial_capacity_),
+            globalTPContextForMTPCoordination());
     }
 
     bool DeviceGraphOrchestrator::applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,

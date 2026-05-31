@@ -317,6 +317,36 @@ TEST(Test__ConfigValidator, MutualExclusion_Device_SimpleTP)
     EXPECT_TRUE(ruleFiresFor(v, "device-simple-tp-conflict", cfg));
 }
 
+TEST(Test__ConfigValidator, NodeLocalTPAutoPickWithoutDeviceIsValid)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.tp_degree = 2;
+    cfg.tp_scope = TPScope::NODE_LOCAL;
+    cfg.pp_degree = 1;
+    cfg.default_backend = CollectiveBackendType::MPI;
+
+    EXPECT_TRUE(noErrors(v, cfg));
+}
+
+TEST(Test__ConfigValidator, NodeLocalTPWithExplicitCPUDeviceMapIsValid)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.device_mode = DeviceAssignmentMode::EXPLICIT;
+    cfg.device_map = {
+        {0, GlobalDeviceAddress::cpu(0)},
+        {1, GlobalDeviceAddress::cpu(1)},
+    };
+    cfg.device_map_numa_explicit = {{0, true}, {1, true}};
+    cfg.tp_degree = 2;
+    cfg.tp_scope = TPScope::NODE_LOCAL;
+    cfg.pp_degree = 1;
+    cfg.default_backend = CollectiveBackendType::MPI;
+
+    EXPECT_TRUE(noErrors(v, cfg));
+}
+
 TEST(Test__ConfigValidator, MutualExclusion_Device_DeviceMap)
 {
     auto v = ConfigValidator::createStandard();

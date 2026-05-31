@@ -551,6 +551,58 @@ namespace
         std::cout << "[" << fmt << "/patterned] " << total_checks << " checks PASSED" << std::endl;
     }
 
+    TEST(CPUQuantizedGemmParityRegression, Q5KQwen36NodeLocalTPGDNPrefillShape)
+    {
+        const int M = 9;
+        const int N = 7168;
+        const int K = 5120;
+
+        auto weights = TestTensorFactory::createQ5_KRandom(
+            {static_cast<size_t>(N), static_cast<size_t>(K)});
+        ASSERT_NE(weights, nullptr);
+
+        auto gemm = weights->createGemm();
+        ASSERT_NE(gemm, nullptr);
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f, 42);
+        auto output = TestTensorFactory::createFP32Zeros(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        const int saved_threads = omp_get_max_threads();
+        for (int threads : {1, std::max(1, saved_threads)})
+        {
+            SCOPED_TRACE(::testing::Message() << "threads=" << threads);
+            omp_set_num_threads(threads);
+            std::memset(output->mutable_data(), 0,
+                        static_cast<size_t>(M) * N * sizeof(float));
+
+            ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), M, N, K));
+
+            const float *out = output->data();
+            for (size_t i = 0; i < static_cast<size_t>(M) * N; ++i)
+            {
+                ASSERT_TRUE(std::isfinite(out[i]))
+                    << "non-finite output at flat index " << i;
+            }
+
+            for (int row = 0; row < M; ++row)
+            {
+                bool all_zero = true;
+                for (int col = 0; col < N; ++col)
+                {
+                    if (out[static_cast<size_t>(row) * N + col] != 0.0f)
+                    {
+                        all_zero = false;
+                        break;
+                    }
+                }
+                EXPECT_FALSE(all_zero) << "row " << row << " is all zero";
+            }
+        }
+        omp_set_num_threads(saved_threads);
+    }
+
     // =========================================================================
     // Instantiate for all 20 quantized formats
     // =========================================================================
