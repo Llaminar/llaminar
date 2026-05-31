@@ -380,7 +380,8 @@ namespace
         const DensePrefixRestoreParityCase &test_case,
         const std::string &model_path,
         bool enable_prefix_cache,
-        int block_size)
+        int block_size,
+        bool enable_mtp = false)
     {
         OrchestrationConfig config = OrchestrationConfig::defaults();
         config.model_path = model_path;
@@ -395,7 +396,8 @@ namespace
         config.prefix_cache.block_size = block_size;
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
-        config.mtp.enabled = false;
+        config.mtp.enabled = enable_mtp;
+        config.mtp.draft_tokens = 1;
 
         switch (test_case.topology)
         {
@@ -455,6 +457,108 @@ namespace
         }
 
         return config;
+    }
+
+    void runDenseMTPParity(
+        const DensePrefixRestoreParityCase &test_case,
+        bool enable_prefix_cache)
+    {
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        const std::string model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        const std::filesystem::path metadata_path = firstEnvOrDefault(
+            test_case.metadata_envs,
+            test_case.default_metadata_path);
+        if (!std::filesystem::exists(metadata_path))
+        {
+            GTEST_SKIP() << test_case.name
+                         << " PyTorch metadata not found: " << metadata_path;
+        }
+
+        const auto prompt_tokens = readTokenListFromMetadata(metadata_path, "token_ids");
+        const auto pytorch_decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
+        ASSERT_FALSE(prompt_tokens.empty());
+        ASSERT_GE(pytorch_decode_tokens.size(), static_cast<size_t>(test_case.decode_steps));
+
+        const std::vector<int32_t> expected_tokens(
+            pytorch_decode_tokens.begin(),
+            pytorch_decode_tokens.begin() + test_case.decode_steps);
+
+        const int block_size = enable_prefix_cache
+                                   ? static_cast<int>(prompt_tokens.size())
+                                   : 2;
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        auto baseline = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(test_case, model_path, false, block_size, false));
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto baseline_result = baseline->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto baseline_snapshot = baseline->prefixStateProbe();
+        baseline->shutdown();
+
+        ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+        ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(baseline_result.tokens, expected_tokens);
+        EXPECT_EQ(baseline_snapshot.prefix_cache_hits, 0u);
+        EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+
+        auto mtp = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(test_case, model_path, enable_prefix_cache, block_size, true));
+        ASSERT_NE(mtp, nullptr);
+        ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+
+        auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto after_first = mtp->prefixStateProbe();
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        ASSERT_EQ(first.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(first.tokens, expected_tokens);
+        EXPECT_EQ(first.tokens, baseline_result.tokens);
+        EXPECT_FALSE(after_first.mtp_bypassed) << after_first.mtp_bypass_reason;
+        EXPECT_GE(after_first.mtp_draft_steps, 1u);
+        EXPECT_GE(after_first.mtp_verifier_runs, 1u);
+
+        if (!enable_prefix_cache)
+        {
+            mtp->shutdown();
+            return;
+        }
+
+        EXPECT_TRUE(after_first.prefix_cache_ready);
+        EXPECT_GE(after_first.prefix_cache_inserts, 1u);
+        EXPECT_GT(after_first.prefix_cache_mtp_state_bytes, 0u);
+
+        auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto after_second = mtp->prefixStateProbe();
+        mtp->shutdown();
+
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_EQ(second.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(second.tokens, expected_tokens);
+        EXPECT_EQ(second.tokens, baseline_result.tokens);
+        EXPECT_TRUE(after_second.prefix_cache_ready);
+        EXPECT_GE(after_second.prefix_cache_hits, 1u);
+        EXPECT_TRUE(after_second.prefix_request.hit);
+        EXPECT_EQ(after_second.prefix_request.matched_tokens,
+                  static_cast<int>(prompt_tokens.size()));
+        EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
+        EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
+        EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
+        EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
+        EXPECT_GT(after_second.mtp_draft_steps, after_first.mtp_draft_steps);
+        EXPECT_GT(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs);
     }
 
     void runDensePrefixRestoreParity(
@@ -1472,6 +1576,42 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseNodeLocalTPPrefixRestoreParity)
             "Qwen3.6 dense NodeLocalTP prefix restore parity",
             DensePrefixParityTopology::NodeLocalTP),
         PrefixRestoreParityMode::FullHit);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseSingleDeviceMTPParity)
+{
+    runDenseMTPParity(
+        qwen36DensePrefixParityCase(
+            "Qwen3.6 dense SingleDevice MTP parity",
+            DensePrefixParityTopology::SingleDevice),
+        false);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseLocalTPMTPParity)
+{
+    runDenseMTPParity(
+        qwen36DensePrefixParityCase(
+            "Qwen3.6 dense LocalTP MTP parity",
+            DensePrefixParityTopology::LocalTP),
+        false);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseSingleDevicePrefixCacheMTPRestoreParity)
+{
+    runDenseMTPParity(
+        qwen36DensePrefixParityCase(
+            "Qwen3.6 dense SingleDevice prefix+MTP restore parity",
+            DensePrefixParityTopology::SingleDevice),
+        true);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseLocalTPPrefixCacheMTPRestoreParity)
+{
+    runDenseMTPParity(
+        qwen36DensePrefixParityCase(
+            "Qwen3.6 dense LocalTP prefix+MTP restore parity",
+            DensePrefixParityTopology::LocalTP),
+        true);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)

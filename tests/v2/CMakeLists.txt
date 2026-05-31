@@ -5763,6 +5763,30 @@ add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36NodeLocalTPPrefixRestore
     MPI_PROCS 2
     TIMEOUT 1800
 )
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36SingleDeviceMTP
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36DenseSingleDeviceMTPParity
+    LABELS "V2;Integration;Parity;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;SingleDevice"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36LocalTPMTP
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36DenseLocalTPMTPParity
+    LABELS "V2;Integration;Parity;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36SingleDevicePrefixMTPRestore
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36DenseSingleDevicePrefixCacheMTPRestoreParity
+    LABELS "V2;Integration;Parity;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;SingleDevice"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36LocalTPPrefixMTPRestore
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36DenseLocalTPPrefixCacheMTPRestoreParity
+    LABELS "V2;Integration;Parity;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
 
 # Test: ConfigValidator (declarative device selection validation rules)
 # Tests mutual exclusion, co-requirements, intra-mode consistency, mode detection.
