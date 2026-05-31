@@ -73,6 +73,27 @@ namespace llaminar2
         explicit operator bool() const { return ok; }
     };
 
+    struct PrefillChunkMaintenanceState
+    {
+        int chunk_index = 0;
+        bool rebalance_requested = false;
+        bool histograms_merged = false;
+        bool manual_boundaries_complete = true;
+        bool graph_capture_active = false;
+        bool graph_replay_active = false;
+        bool participants_at_same_boundary = true;
+    };
+
+    struct PrefillChunkMaintenanceDecision
+    {
+        bool ok = false;
+        bool can_run = false;
+        bool required = false;
+        std::string reason;
+
+        explicit operator bool() const { return ok; }
+    };
+
     /**
      * @brief Host-owned inputs for one future `runPrefillChunk()` execution.
      *
@@ -144,6 +165,13 @@ namespace llaminar2
      */
     PrefillChunkSchedule planPrefillChunkSchedule(
         const PrefillChunkSchedulerPolicy &policy);
+
+    /**
+     * @brief Decide whether chunk-boundary maintenance may run after a chunk.
+     */
+    PrefillChunkMaintenanceDecision evaluatePrefillChunkMaintenance(
+        const PrefillChunkPlan &chunk,
+        const PrefillChunkMaintenanceState &state);
 
     /**
      * @brief Build absolute position IDs for one fixed-bucket prefill chunk.

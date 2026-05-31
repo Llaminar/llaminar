@@ -426,6 +426,78 @@ TEST(Test__PrefillGraphCache, ChunkSchedule_RejectsInvalidPolicy)
     EXPECT_NE(schedule.error.find("min"), std::string::npos);
 }
 
+TEST(Test__PrefillGraphCache, ChunkMaintenanceGate_RequiresMergedHistogramsAndCompletedBoundaries)
+{
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 3;
+    chunk.rebalance_allowed_after = true;
+
+    PrefillChunkMaintenanceState state;
+    state.chunk_index = 3;
+    state.rebalance_requested = true;
+
+    auto decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_FALSE(decision);
+    EXPECT_FALSE(decision.can_run);
+    EXPECT_EQ(decision.reason, "histograms_not_merged");
+
+    state.histograms_merged = true;
+    state.manual_boundaries_complete = false;
+    decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_FALSE(decision);
+    EXPECT_EQ(decision.reason, "manual_boundary_incomplete");
+
+    state.manual_boundaries_complete = true;
+    state.graph_capture_active = true;
+    decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_FALSE(decision);
+    EXPECT_EQ(decision.reason, "graph_capture_active");
+
+    state.graph_capture_active = false;
+    state.graph_replay_active = true;
+    decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_FALSE(decision);
+    EXPECT_EQ(decision.reason, "graph_replay_active");
+}
+
+TEST(Test__PrefillGraphCache, ChunkMaintenanceGate_ReadyRequestedRequiredAndParticipantAlignment)
+{
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 1;
+    chunk.rebalance_allowed_after = true;
+
+    PrefillChunkMaintenanceState state;
+    state.chunk_index = 1;
+    state.histograms_merged = true;
+
+    auto decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_TRUE(decision);
+    EXPECT_FALSE(decision.can_run);
+    EXPECT_FALSE(decision.required);
+    EXPECT_EQ(decision.reason, "rebalance_not_requested");
+
+    state.rebalance_requested = true;
+    decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_TRUE(decision);
+    EXPECT_TRUE(decision.can_run);
+    EXPECT_FALSE(decision.required);
+    EXPECT_EQ(decision.reason, "ready");
+
+    state.participants_at_same_boundary = false;
+    decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_FALSE(decision);
+    EXPECT_EQ(decision.reason, "participants_not_at_same_boundary");
+
+    state.participants_at_same_boundary = true;
+    state.rebalance_requested = false;
+    chunk.rebalance_required_after = true;
+    decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_TRUE(decision);
+    EXPECT_TRUE(decision.can_run);
+    EXPECT_TRUE(decision.required);
+    EXPECT_EQ(decision.reason, "required");
+}
+
 TEST(Test__PrefillGraphCache, ChunkPositionIds_ExactChunk)
 {
     auto position_ids = buildPrefillChunkPositionIds(

@@ -192,6 +192,61 @@ namespace llaminar2
         return schedule;
     }
 
+    PrefillChunkMaintenanceDecision evaluatePrefillChunkMaintenance(
+        const PrefillChunkPlan &chunk,
+        const PrefillChunkMaintenanceState &state)
+    {
+        PrefillChunkMaintenanceDecision decision;
+        decision.required = chunk.rebalance_required_after;
+
+        if (chunk.chunk_index != state.chunk_index)
+        {
+            decision.reason = "chunk_index_mismatch";
+            return decision;
+        }
+        if (!state.histograms_merged)
+        {
+            decision.reason = "histograms_not_merged";
+            return decision;
+        }
+        if (!state.manual_boundaries_complete)
+        {
+            decision.reason = "manual_boundary_incomplete";
+            return decision;
+        }
+        if (state.graph_capture_active)
+        {
+            decision.reason = "graph_capture_active";
+            return decision;
+        }
+        if (state.graph_replay_active)
+        {
+            decision.reason = "graph_replay_active";
+            return decision;
+        }
+        if (!state.participants_at_same_boundary)
+        {
+            decision.reason = "participants_not_at_same_boundary";
+            return decision;
+        }
+        if (!chunk.rebalance_allowed_after && !chunk.rebalance_required_after)
+        {
+            decision.reason = "rebalance_interval_not_ready";
+            return decision;
+        }
+        if (!state.rebalance_requested && !chunk.rebalance_required_after)
+        {
+            decision.ok = true;
+            decision.reason = "rebalance_not_requested";
+            return decision;
+        }
+
+        decision.ok = true;
+        decision.can_run = true;
+        decision.reason = chunk.rebalance_required_after ? "required" : "ready";
+        return decision;
+    }
+
     std::vector<int> buildPrefillChunkPositionIds(
         int real_count,
         int bucket_seq_len,
