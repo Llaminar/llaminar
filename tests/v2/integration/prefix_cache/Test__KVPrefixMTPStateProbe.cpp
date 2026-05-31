@@ -1350,12 +1350,12 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmokeO
     ASSERT_FALSE(encoded.empty());
     const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
 
-    auto baseline_result = baseline->generate(prompt, 2, greedy);
+    auto baseline_result = baseline->generate(prompt, 4, greedy);
     const auto baseline_snapshot = baseline->prefixStateProbe();
     baseline->shutdown();
 
     ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
-    ASSERT_EQ(baseline_result.tokens.size(), 2u);
+    ASSERT_EQ(baseline_result.tokens.size(), 4u);
     EXPECT_EQ(baseline_snapshot.prefix_cache_hits, 0u);
     EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
 
@@ -1363,10 +1363,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmokeO
     ASSERT_NE(cached, nullptr);
     ASSERT_TRUE(cached->initialize()) << cached->lastError();
 
-    auto first = cached->generate(prompt, 2, greedy);
+    auto first = cached->generate(prompt, 4, greedy);
     const auto after_first = cached->prefixStateProbe();
     ASSERT_TRUE(first.error.empty()) << first.error;
-    ASSERT_EQ(first.tokens.size(), 2u);
+    ASSERT_EQ(first.tokens.size(), 4u);
     EXPECT_EQ(first.tokens, baseline_result.tokens);
     EXPECT_TRUE(after_first.prefix_cache_ready);
     EXPECT_GE(after_first.prefix_cache_inserts, 2u);
@@ -1374,12 +1374,12 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmokeO
     EXPECT_FALSE(after_first.mtp_bypassed) << after_first.mtp_bypass_reason;
     EXPECT_GE(after_first.mtp_draft_steps, 1u);
 
-    auto second = cached->generate(prompt, 2, greedy);
+    auto second = cached->generate(prompt, 4, greedy);
     const auto after_second = cached->prefixStateProbe();
     cached->shutdown();
 
     ASSERT_TRUE(second.error.empty()) << second.error;
-    ASSERT_EQ(second.tokens.size(), 2u);
+    ASSERT_EQ(second.tokens.size(), 4u);
     EXPECT_EQ(second.tokens, baseline_result.tokens);
     EXPECT_TRUE(after_second.prefix_cache_ready);
     EXPECT_GE(after_second.prefix_cache_hits, 2u);
@@ -1390,8 +1390,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmokeO
     EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
     EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
     EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
-    EXPECT_GE(after_second.mtp_draft_steps, after_first.mtp_draft_steps + 1u);
-    EXPECT_GE(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs + 1u);
+    EXPECT_GE(after_second.mtp_draft_steps, after_first.mtp_draft_steps + 2u);
+    EXPECT_GE(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs + 2u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)
