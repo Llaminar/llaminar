@@ -432,6 +432,10 @@ namespace llaminar2
         std::string mtpDecodeBypassReason() const;
         void recordMTPBypass(const std::string &reason);
         GenerationResult decodeStepMTP();
+        bool forwardPrefillTokens(
+            const int *tokens,
+            int token_count,
+            const std::string &failure_message);
 
         // =====================================================================
         // Error Handling

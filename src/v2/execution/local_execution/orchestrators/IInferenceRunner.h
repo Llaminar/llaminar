@@ -27,6 +27,7 @@ namespace llaminar2
     struct GraphExecutorStats;
     struct SamplingParams;
     struct LogitPenalty;
+    struct PrefillChunkSchedulerPolicy;
 
     /**
      * @brief Lightweight view of a device runner's local logits state
@@ -105,6 +106,37 @@ namespace llaminar2
          * @return true if forward succeeded
          */
         virtual bool forward(const int *tokens, int seq_len) = 0;
+
+        /**
+         * @brief Whether this runner can execute a prepared bucketed prefill
+         *        chunk schedule for the current request state.
+         */
+        virtual bool supportsPrefillChunkSchedule(int seq_len) const
+        {
+            (void)seq_len;
+            return false;
+        }
+
+        /**
+         * @brief Execute a prompt/suffix through prepared bucketed prefill chunks.
+         *
+         * Default false keeps the path opt-in for runners that can preserve KV,
+         * logits, and maintenance state across chunk boundaries.
+         */
+        virtual bool forwardPrefillChunkSchedule(
+            const int *tokens,
+            int seq_len,
+            const PrefillChunkSchedulerPolicy &policy,
+            int pad_token_id,
+            bool allow_padded_execution)
+        {
+            (void)tokens;
+            (void)seq_len;
+            (void)policy;
+            (void)pad_token_id;
+            (void)allow_padded_execution;
+            return false;
+        }
 
         /**
          * @brief Get logits from last forward pass

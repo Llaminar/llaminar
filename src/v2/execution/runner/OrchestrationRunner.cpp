@@ -13,6 +13,7 @@
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
 #include "../factory/InferenceRunnerFactory.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
+#include "../local_execution/engine/PrefillBucketUtils.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../parallelism_tree/ParallelismTree.h"
 #include "../parallelism_tree/TreeToRunnerCompiler.h"
@@ -433,6 +434,51 @@ namespace llaminar2
     // Inference
     // =========================================================================
 
+    bool OrchestrationRunner::forwardPrefillTokens(
+        const int *tokens,
+        int token_count,
+        const std::string &failure_message)
+    {
+        if (!runner_ || !tokens || token_count <= 0)
+            return setError(failure_message);
+
+        const auto &exec = debugEnv().execution;
+        const auto buckets = normalizePrefillGraphBuckets(exec.prefill_graph_bucket_sizes);
+        const bool long_bucketed_prefill =
+            exec.gpu_graphs &&
+            exec.prefill_graph_buckets &&
+            token_count >= exec.prefill_graph_min_seq &&
+            !buckets.empty() &&
+            token_count > buckets.back();
+
+        if (long_bucketed_prefill && runner_->supportsPrefillChunkSchedule(token_count))
+        {
+            PrefillChunkSchedulerPolicy policy;
+            policy.bucket_sizes = buckets;
+            policy.fixed_chunk_real_tokens = buckets.back();
+            policy.min_rebalance_interval_tokens = buckets.back();
+            policy.max_rebalance_interval_tokens = 0;
+            policy.real_token_start = runner_->get_position();
+            policy.real_token_count = token_count;
+
+            if (runner_->forwardPrefillChunkSchedule(
+                    tokens,
+                    token_count,
+                    policy,
+                    exec.prefill_graph_pad_token_id,
+                    /*allow_padded_execution=*/true))
+            {
+                return true;
+            }
+
+            return setError(failure_message + " (chunked prefill failed)");
+        }
+
+        if (!runner_->forward(tokens, token_count))
+            return setError(failure_message);
+        return true;
+    }
+
     bool OrchestrationRunner::prefill(const std::vector<int32_t> &prompt_tokens)
     {
         if (!initialized_)
@@ -527,10 +573,10 @@ namespace llaminar2
 
                 if (suffix_len > 0)
                 {
-                    if (!runner_->forward(prompt_tokens.data() + suffix_start, suffix_len))
-                    {
-                        return setError("Forward pass failed during prefix-cache suffix prefill");
-                    }
+                    if (!forwardPrefillTokens(prompt_tokens.data() + suffix_start,
+                                              suffix_len,
+                                              "Forward pass failed during prefix-cache suffix prefill"))
+                        return false;
                     prefill_logits_ready_ = true;
                 }
                 else if (common_hit.has_terminal_logits &&
@@ -554,10 +600,10 @@ namespace llaminar2
                     }
                     suffix_start = matched_tokens;
                     suffix_len = static_cast<int>(prompt_tokens.size()) - suffix_start;
-                    if (!runner_->forward(prompt_tokens.data() + suffix_start, suffix_len))
-                    {
-                        return setError("Forward pass failed during prefix-cache terminal recompute");
-                    }
+                    if (!forwardPrefillTokens(prompt_tokens.data() + suffix_start,
+                                              suffix_len,
+                                              "Forward pass failed during prefix-cache terminal recompute"))
+                        return false;
                     prefill_logits_ready_ = true;
                 }
 
@@ -581,11 +627,10 @@ namespace llaminar2
         // Run forward pass
         try
         {
-            if (!runner_->forward(prompt_tokens.data(),
-                                  static_cast<int>(prompt_tokens.size())))
-            {
-                return setError("Forward pass failed during prefill");
-            }
+            if (!forwardPrefillTokens(prompt_tokens.data(),
+                                      static_cast<int>(prompt_tokens.size()),
+                                      "Forward pass failed during prefill"))
+                return false;
         }
         catch (const std::exception &e)
         {

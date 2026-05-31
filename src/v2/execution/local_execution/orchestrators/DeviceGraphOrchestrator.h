@@ -1755,6 +1755,15 @@ namespace llaminar2
             return forward(tokens, seq_len, 1) != nullptr;
         }
 
+        bool supportsPrefillChunkSchedule(int seq_len) const override;
+
+        bool forwardPrefillChunkSchedule(
+            const int *tokens,
+            int seq_len,
+            const PrefillChunkSchedulerPolicy &policy,
+            int pad_token_id,
+            bool allow_padded_execution) override;
+
         /**
          * @brief GPU-side greedy argmax for single-device inference
          *

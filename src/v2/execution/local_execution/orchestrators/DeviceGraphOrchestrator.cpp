@@ -2866,6 +2866,132 @@ namespace llaminar2
         return logits_output ? logits_output->fp32_data() : nullptr;
     }
 
+    bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule(int seq_len) const
+    {
+        const auto &env = debugEnv().execution;
+        if (seq_len <= 1 ||
+            !state_.isInitialized() ||
+            !state_.device_id.is_gpu() ||
+            !cache_config_.enabled ||
+            !env.gpu_graphs ||
+            !env.prefill_graph_buckets ||
+            seq_len < env.prefill_graph_min_seq ||
+            pp_stage_config_.has_value() ||
+            (pipeline_config_ && pipeline_config_->hasPP()) ||
+            compute_all_position_logits_)
+        {
+            return false;
+        }
+
+        const auto buckets = normalizePrefillGraphBuckets(env.prefill_graph_bucket_sizes);
+        return !buckets.empty();
+    }
+
+    bool DeviceGraphOrchestrator::forwardPrefillChunkSchedule(
+        const int *tokens,
+        int seq_len,
+        const PrefillChunkSchedulerPolicy &policy,
+        int pad_token_id,
+        bool allow_padded_execution)
+    {
+        ScopedDeviceLog device_log(state_.device_id);
+
+        if (!tokens || seq_len <= 1)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid prefill chunk schedule input");
+            return false;
+        }
+        if (!supportsPrefillChunkSchedule(seq_len))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk schedule is not supported for current runner state");
+            return false;
+        }
+        if (!hasGlobalWeights())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] prefill chunk schedule called without global weights set");
+            return false;
+        }
+        if (seq_len > state_.max_seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk schedule length " << seq_len
+                                                                                 << " exceeds buffer capacity "
+                                                                                 << state_.max_seq_len);
+            return false;
+        }
+
+        transitionToPhase(InferencePhase::PREFILL);
+
+        TensorBase *logits_output = state_.logits.get();
+        TensorBase *logits_local_output = state_.logits_local.get();
+        ModelBuffers model_buffers = state_.toModelBuffers();
+        model_buffers.logits = logits_output;
+        model_buffers.logits_local = logits_local_output;
+        setBuffers(model_buffers);
+
+        ForwardInput input;
+        input.token_ids = tokens;
+        input.batch_size = 1;
+        input.seq_len = seq_len;
+        input.real_seq_len = seq_len;
+        input.position_offset = state_.positions[0];
+        input.token_offset = state_.positions[0];
+        input.device = state_.device_id;
+        input.kv_cache = state_.kv_cache.get();
+
+        ensureForwardEngine();
+        auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+            input,
+            policy,
+            pad_token_id,
+            allow_padded_execution);
+        if (!schedule)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to prepare prefill chunk schedule: "
+                      << schedule.error);
+            return false;
+        }
+
+        ForwardOutput output;
+        output.logits = logits_output;
+        output.hidden = state_.hidden.get();
+
+        if (!forward_engine_->runPrefillChunkSchedule(input, schedule, output, *this))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk schedule execution failed");
+            return false;
+        }
+
+        if (release_host_resident_after_forward_ && !host_resident_released_ && weight_manager_)
+        {
+            host_resident_released_ = true;
+            weight_manager_->releaseHostResidentWeightData();
+        }
+
+        state_.positions[0] += seq_len;
+        state_.sequence_lengths[0] += seq_len;
+
+        if (!populateMTPShiftedCacheFromPrefill(tokens, seq_len, 1, input.position_offset))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to populate MTP shifted prefill cache after chunk schedule");
+            return false;
+        }
+
+        const int terminal_seq_len = schedule.chunks.empty()
+                                         ? seq_len
+                                         : schedule.chunks.back().chunk.real_count;
+        if (!refreshMTPTerminalHiddenState(terminal_seq_len, 1))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to refresh MTP terminal hidden state after chunk schedule");
+            return false;
+        }
+
+        LOG_TRACE("[FORWARD_TRACE] chunk_schedule seq_len=" << seq_len
+                                                            << " pos_offset=" << input.position_offset
+                                                            << " chunks=" << schedule.chunks.size()
+                                                            << " positions_after=" << state_.positions[0]);
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::ensureMTPTerminalHiddenBuffer()
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)

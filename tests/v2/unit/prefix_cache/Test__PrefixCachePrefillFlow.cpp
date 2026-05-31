@@ -3,9 +3,11 @@
 
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
+#include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/runner/OrchestrationRunner.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar2;
 using namespace testing;
@@ -26,6 +28,32 @@ namespace
                 all_position_logits[verify_argmax_token] = 10.0f;
                 return true;
             }
+            logits_buffer.assign(vocab_size(), -1.0f);
+            logits_buffer[prefill_argmax_token] = 10.0f;
+            return true;
+        }
+
+        bool supportsPrefillChunkSchedule(int seq_len) const override
+        {
+            return supports_chunk_schedule && seq_len > 0;
+        }
+
+        bool forwardPrefillChunkSchedule(
+            const int *tokens,
+            int seq_len,
+            const PrefillChunkSchedulerPolicy &policy,
+            int pad_token_id,
+            bool allow_padded_execution) override
+        {
+            ++chunk_schedule_calls;
+            last_chunk_schedule_tokens.assign(tokens, tokens + seq_len);
+            last_chunk_schedule_policy = policy;
+            last_chunk_schedule_pad_token_id = pad_token_id;
+            last_chunk_schedule_allow_padded = allow_padded_execution;
+            if (!chunk_schedule_ok)
+                return false;
+
+            position += seq_len;
             logits_buffer.assign(vocab_size(), -1.0f);
             logits_buffer[prefill_argmax_token] = 10.0f;
             return true;
@@ -130,6 +158,8 @@ namespace
         bool restore_terminal_ok = true;
         bool mtp_enabled = false;
         bool all_position_logits_enabled = false;
+        bool supports_chunk_schedule = false;
+        bool chunk_schedule_ok = true;
         std::vector<float> logits_buffer = std::vector<float>(16, -1.0f);
         std::vector<float> mtp_logits;
         std::vector<float> all_position_logits;
@@ -137,6 +167,7 @@ namespace
         int mtp_argmax_token = 11;
         int verify_argmax_token = 11;
         int forward_calls = 0;
+        int chunk_schedule_calls = 0;
         int forward_mtp_calls = 0;
         int clear_calls = 0;
         int lookup_calls = 0;
@@ -149,9 +180,47 @@ namespace
         int harvested_prompt_token_count = 0;
         int position = 0;
         std::vector<int> last_forward_tokens;
+        std::vector<int> last_chunk_schedule_tokens;
+        PrefillChunkSchedulerPolicy last_chunk_schedule_policy;
+        int last_chunk_schedule_pad_token_id = -1;
+        bool last_chunk_schedule_allow_padded = false;
         std::vector<int32_t> lookup_tokens;
         std::vector<int32_t> harvested_tokens;
         std::vector<int> populated_tokens;
+    };
+
+    class ScopedPrefillChunkScheduleEnv
+    {
+    public:
+        ScopedPrefillChunkScheduleEnv()
+            : old_gpu_graphs_(mutableDebugEnv().execution.gpu_graphs),
+              old_buckets_(mutableDebugEnv().execution.prefill_graph_buckets),
+              old_min_seq_(mutableDebugEnv().execution.prefill_graph_min_seq),
+              old_bucket_sizes_(mutableDebugEnv().execution.prefill_graph_bucket_sizes),
+              old_pad_token_(mutableDebugEnv().execution.prefill_graph_pad_token_id)
+        {
+            mutableDebugEnv().execution.gpu_graphs = true;
+            mutableDebugEnv().execution.prefill_graph_buckets = true;
+            mutableDebugEnv().execution.prefill_graph_min_seq = 1;
+            mutableDebugEnv().execution.prefill_graph_bucket_sizes = {2};
+            mutableDebugEnv().execution.prefill_graph_pad_token_id = 99;
+        }
+
+        ~ScopedPrefillChunkScheduleEnv()
+        {
+            mutableDebugEnv().execution.gpu_graphs = old_gpu_graphs_;
+            mutableDebugEnv().execution.prefill_graph_buckets = old_buckets_;
+            mutableDebugEnv().execution.prefill_graph_min_seq = old_min_seq_;
+            mutableDebugEnv().execution.prefill_graph_bucket_sizes = old_bucket_sizes_;
+            mutableDebugEnv().execution.prefill_graph_pad_token_id = old_pad_token_;
+        }
+
+    private:
+        bool old_gpu_graphs_;
+        bool old_buckets_;
+        int old_min_seq_;
+        std::vector<int> old_bucket_sizes_;
+        int old_pad_token_;
     };
 
     RankExecutionPlan makePlan(bool mtp_enabled = false)
@@ -225,6 +294,54 @@ TEST(Test__PrefixCachePrefillFlow, SharedPrefixRunsOnlySuffixAndHarvestsPrompt)
     EXPECT_EQ(mock_ptr->harvest_calls, 1);
     EXPECT_EQ(mock_ptr->harvested_prompt_token_count, 5);
     EXPECT_THAT(mock_ptr->harvested_tokens, ElementsAre(1, 2, 3, 4, 5));
+}
+
+TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSupportsIt)
+{
+    ScopedPrefillChunkScheduleEnv env;
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->supports_chunk_schedule = true;
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 2;
+
+    auto runner = makeRunner(std::move(mock));
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->chunk_schedule_calls, 1);
+    EXPECT_THAT(mock_ptr->last_chunk_schedule_tokens, ElementsAre(3, 4, 5));
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_start, 2);
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.real_token_count, 3);
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.fixed_chunk_real_tokens, 2);
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.min_rebalance_interval_tokens, 2);
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_policy.max_rebalance_interval_tokens, 0);
+    EXPECT_THAT(mock_ptr->last_chunk_schedule_policy.bucket_sizes, ElementsAre(2));
+    EXPECT_EQ(mock_ptr->last_chunk_schedule_pad_token_id, 99);
+    EXPECT_TRUE(mock_ptr->last_chunk_schedule_allow_padded);
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixFallsBackWhenChunkScheduleUnsupported)
+{
+    ScopedPrefillChunkScheduleEnv env;
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 2;
+
+    auto runner = makeRunner(std::move(mock));
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->chunk_schedule_calls, 0);
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4, 5));
 }
 
 TEST(Test__PrefixCachePrefillFlow, MTPPartialHitWithoutTerminalHiddenRecomputesBoundaryBlock)
