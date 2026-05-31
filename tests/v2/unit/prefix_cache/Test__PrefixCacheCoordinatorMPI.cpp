@@ -12,13 +12,14 @@ namespace
         int tokens,
         bool terminal_logits,
         bool terminal_hidden,
-        uint64_t fingerprint)
+        uint64_t fingerprint,
+        uint64_t placement_epoch = 11)
     {
         PrefixParticipantLookup lookup;
         lookup.domain_id = "mpi-prefix-domain";
         lookup.participant_id = rank;
         lookup.device = DeviceId::cpu();
-        lookup.placement_epoch = 11;
+        lookup.placement_epoch = placement_epoch;
         lookup.fingerprint_key = fingerprint;
         lookup.supported = true;
         lookup.cache_enabled = true;
@@ -67,6 +68,27 @@ TEST(Test__PrefixCacheCoordinatorMPI, ReducesCommonPrefixAndTerminalStateAcrossR
     EXPECT_TRUE(result.common_terminal_logits);
     EXPECT_FALSE(result.common_terminal_hidden);
     EXPECT_EQ(result.fingerprint_key, 0xabcdu);
+    EXPECT_EQ(result.placement_epoch, 11u);
+}
+
+TEST(Test__PrefixCacheCoordinatorMPI, ReducesPlacementEpochAcrossRanks)
+{
+    if (mpiWorldSize() < 2)
+        GTEST_SKIP() << "requires at least two MPI ranks";
+
+    const int rank = mpiWorldRank();
+    const uint64_t placement_epoch = rank == 0 ? 11u : 19u;
+
+    MPIPrefixCollectiveCoordinator coordinator(MPI_COMM_WORLD);
+    auto result = coordinatePrefixLookups(
+        {rankParticipant(rank, /*tokens=*/8, /*terminal_logits=*/true,
+                         /*terminal_hidden=*/true, 0xabcdu, placement_epoch)},
+        &coordinator);
+
+    EXPECT_TRUE(result.supported);
+    EXPECT_EQ(result.common_matched_tokens, 8);
+    EXPECT_EQ(result.fingerprint_key, 0xabcdu);
+    EXPECT_EQ(result.placement_epoch, 19u);
 }
 
 TEST(Test__PrefixCacheCoordinatorMPI, FingerprintMismatchAcrossRanksBypassesCommonHit)

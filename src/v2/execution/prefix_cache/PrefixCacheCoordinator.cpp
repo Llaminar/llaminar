@@ -182,6 +182,7 @@ namespace llaminar2
         int global_min_blocks = local_min_blocks;
         uint64_t global_min_fingerprint = local_min_fingerprint;
         uint64_t global_max_fingerprint = local_max_fingerprint;
+        uint64_t global_placement_epoch = local_placement_epoch;
         bool global_any_cache_enabled = local_any_cache_enabled;
         bool global_all_supported = local_all_supported;
         bool global_all_terminal_logits = local_all_terminal_logits;
@@ -193,6 +194,7 @@ namespace llaminar2
                 !domain_coordinator->allMinInt(local_min_blocks, &global_min_blocks) ||
                 !domain_coordinator->allMinUInt64(local_min_fingerprint, &global_min_fingerprint) ||
                 !domain_coordinator->allMaxUInt64(local_max_fingerprint, &global_max_fingerprint) ||
+                !domain_coordinator->allMaxUInt64(local_placement_epoch, &global_placement_epoch) ||
                 !domain_coordinator->allOrBool(local_any_cache_enabled, &global_any_cache_enabled) ||
                 !domain_coordinator->allAndBool(local_all_supported, &global_all_supported) ||
                 !domain_coordinator->allAndBool(local_all_terminal_logits, &global_all_terminal_logits) ||
@@ -207,7 +209,7 @@ namespace llaminar2
 
         result.cache_enabled = global_any_cache_enabled;
         result.supported = global_all_supported;
-        result.placement_epoch = local_placement_epoch;
+        result.placement_epoch = global_placement_epoch;
         const bool fingerprint_mismatch =
             global_min_tokens > 0 &&
             global_min_fingerprint != 0 &&

@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 #include <mpi.h>
+#include <vector>
 
 using namespace llaminar2;
 
@@ -40,6 +41,8 @@ namespace
         bool and_bool = true;
         bool or_bool = true;
         bool fail = false;
+        std::vector<uint64_t> max_uint64_results;
+        size_t max_uint64_call_count = 0;
 
         bool allMinInt(int, int *global_value) override
         {
@@ -57,11 +60,17 @@ namespace
             return true;
         }
 
-        bool allMaxUInt64(uint64_t, uint64_t *global_value) override
+        bool allMaxUInt64(uint64_t local_value, uint64_t *global_value) override
         {
             if (fail)
                 return false;
-            *global_value = 0x1000;
+            if (max_uint64_call_count < max_uint64_results.size())
+            {
+                *global_value = max_uint64_results[max_uint64_call_count++];
+                return true;
+            }
+            ++max_uint64_call_count;
+            *global_value = local_value;
             return true;
         }
 
@@ -149,6 +158,22 @@ TEST(Test__PrefixCacheCoordinator, DomainCoordinatorAppliesScalarReductions)
     EXPECT_TRUE(result.cache_enabled);
     EXPECT_EQ(result.common_matched_tokens, 0);
     EXPECT_EQ(result.clamp_reason, "at least one prefix participant is unsupported");
+}
+
+TEST(Test__PrefixCacheCoordinator, DomainCoordinatorReducesPlacementEpoch)
+{
+    FakeDomainCoordinator coordinator;
+    coordinator.min_int = 8;
+    coordinator.max_uint64_results = {0x1000u, 19u};
+
+    auto result = coordinatePrefixLookups({
+        participant(/*id=*/0, /*tokens=*/8, /*terminal_logits=*/true, /*terminal_hidden=*/true),
+    },
+                                           &coordinator);
+
+    EXPECT_TRUE(result.supported);
+    EXPECT_EQ(result.fingerprint_key, 0x1000u);
+    EXPECT_EQ(result.placement_epoch, 19u);
 }
 
 TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
