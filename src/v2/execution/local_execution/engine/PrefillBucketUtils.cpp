@@ -89,32 +89,107 @@ namespace llaminar2
         int total_real_tokens,
         const std::vector<int> &bucket_sizes)
     {
-        std::vector<PrefillChunkPlan> chunks;
-        if (total_real_tokens <= 0)
-            return chunks;
+        PrefillChunkSchedulerPolicy policy;
+        policy.bucket_sizes = bucket_sizes;
+        policy.real_token_start = 0;
+        policy.real_token_count = total_real_tokens;
 
-        const std::vector<int> buckets = normalizePrefillGraphBuckets(bucket_sizes);
-        if (buckets.empty())
-            return chunks;
+        auto schedule = planPrefillChunkSchedule(policy);
+        if (!schedule)
+            return {};
+        return schedule.chunks;
+    }
 
-        const int max_bucket = buckets.back();
-        int offset = 0;
-        while (offset < total_real_tokens)
+    PrefillChunkSchedule planPrefillChunkSchedule(
+        const PrefillChunkSchedulerPolicy &policy)
+    {
+        PrefillChunkSchedule schedule;
+
+        if (policy.real_token_start < 0)
         {
-            const int remaining = total_real_tokens - offset;
-            const int real_count = std::min(remaining, max_bucket);
-            auto selected = selectPrefillGraphBucket(real_count, buckets);
-            if (!selected)
-                return {};
-
-            chunks.push_back(PrefillChunkPlan{
-                offset,
-                real_count,
-                selected.bucket_seq_len});
-            offset += real_count;
+            schedule.error = "real_token_start must be non-negative";
+            return schedule;
+        }
+        if (policy.real_token_count <= 0)
+        {
+            schedule.error = "real_token_count must be positive";
+            return schedule;
+        }
+        if (policy.fixed_chunk_real_tokens < 0)
+        {
+            schedule.error = "fixed_chunk_real_tokens must be non-negative";
+            return schedule;
+        }
+        if (policy.min_rebalance_interval_tokens < 0 ||
+            policy.max_rebalance_interval_tokens < 0)
+        {
+            schedule.error = "rebalance intervals must be non-negative";
+            return schedule;
+        }
+        if (policy.min_rebalance_interval_tokens > 0 &&
+            policy.max_rebalance_interval_tokens > 0 &&
+            policy.min_rebalance_interval_tokens > policy.max_rebalance_interval_tokens)
+        {
+            schedule.error = "min rebalance interval exceeds max rebalance interval";
+            return schedule;
         }
 
-        return chunks;
+        const std::vector<int> buckets = normalizePrefillGraphBuckets(policy.bucket_sizes);
+        if (buckets.empty())
+        {
+            schedule.error = "no positive prefill graph buckets configured";
+            return schedule;
+        }
+
+        const int max_bucket = buckets.back();
+        const int chunk_target =
+            policy.fixed_chunk_real_tokens > 0 ? policy.fixed_chunk_real_tokens : max_bucket;
+        if (chunk_target <= 0 || chunk_target > max_bucket)
+        {
+            schedule.error = "fixed chunk interval exceeds largest prefill graph bucket";
+            return schedule;
+        }
+
+        int local_offset = 0;
+        int chunk_index = 0;
+        int real_tokens_since_required_boundary = 0;
+        while (local_offset < policy.real_token_count)
+        {
+            const int remaining = policy.real_token_count - local_offset;
+            const int real_count = std::min(remaining, chunk_target);
+            auto selected = selectPrefillGraphBucket(real_count, buckets);
+            if (!selected)
+            {
+                schedule.error = selected.error;
+                schedule.chunks.clear();
+                return schedule;
+            }
+
+            real_tokens_since_required_boundary += real_count;
+            const bool rebalance_allowed =
+                policy.min_rebalance_interval_tokens > 0 &&
+                real_tokens_since_required_boundary >= policy.min_rebalance_interval_tokens;
+            const bool rebalance_required =
+                policy.max_rebalance_interval_tokens > 0 &&
+                real_tokens_since_required_boundary >= policy.max_rebalance_interval_tokens;
+
+            schedule.chunks.push_back(PrefillChunkPlan{
+                policy.real_token_start + local_offset,
+                real_count,
+                selected.bucket_seq_len,
+                chunk_index,
+                rebalance_allowed || rebalance_required,
+                rebalance_required});
+
+            if (rebalance_required)
+                real_tokens_since_required_boundary = 0;
+
+            local_offset += real_count;
+            ++chunk_index;
+        }
+
+        schedule.ok = true;
+        return schedule;
     }
 
     std::vector<int> buildPrefillChunkPositionIds(

@@ -349,6 +349,83 @@ TEST(Test__PrefillGraphCache, ChunkPlanning_UsesLargestBucketsThenRemainder)
     EXPECT_EQ(chunks[2].bucket_seq_len, 128);
 }
 
+TEST(Test__PrefillGraphCache, ChunkSchedule_UsesFixedIntervalAndRealTokenRange)
+{
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {64, 128};
+    policy.fixed_chunk_real_tokens = 96;
+    policy.real_token_start = 32;
+    policy.real_token_count = 250;
+
+    auto schedule = planPrefillChunkSchedule(policy);
+
+    ASSERT_TRUE(schedule) << schedule.error;
+    ASSERT_EQ(schedule.chunks.size(), 3u);
+    EXPECT_EQ(schedule.chunks[0].chunk_index, 0);
+    EXPECT_EQ(schedule.chunks[0].token_offset, 32);
+    EXPECT_EQ(schedule.chunks[0].real_count, 96);
+    EXPECT_EQ(schedule.chunks[0].bucket_seq_len, 128);
+    EXPECT_EQ(schedule.chunks[1].chunk_index, 1);
+    EXPECT_EQ(schedule.chunks[1].token_offset, 128);
+    EXPECT_EQ(schedule.chunks[1].real_count, 96);
+    EXPECT_EQ(schedule.chunks[1].bucket_seq_len, 128);
+    EXPECT_EQ(schedule.chunks[2].chunk_index, 2);
+    EXPECT_EQ(schedule.chunks[2].token_offset, 224);
+    EXPECT_EQ(schedule.chunks[2].real_count, 58);
+    EXPECT_EQ(schedule.chunks[2].bucket_seq_len, 64);
+}
+
+TEST(Test__PrefillGraphCache, ChunkSchedule_RebalanceIntervalsCountRealTokensOnly)
+{
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {64};
+    policy.fixed_chunk_real_tokens = 32;
+    policy.min_rebalance_interval_tokens = 64;
+    policy.max_rebalance_interval_tokens = 64;
+    policy.real_token_start = 0;
+    policy.real_token_count = 96;
+
+    auto schedule = planPrefillChunkSchedule(policy);
+
+    ASSERT_TRUE(schedule) << schedule.error;
+    ASSERT_EQ(schedule.chunks.size(), 3u);
+    EXPECT_EQ(schedule.chunks[0].bucket_seq_len, 64);
+    EXPECT_EQ(schedule.chunks[0].real_count, 32);
+    EXPECT_FALSE(schedule.chunks[0].rebalance_allowed_after);
+    EXPECT_FALSE(schedule.chunks[0].rebalance_required_after);
+
+    EXPECT_EQ(schedule.chunks[1].bucket_seq_len, 64);
+    EXPECT_EQ(schedule.chunks[1].real_count, 32);
+    EXPECT_TRUE(schedule.chunks[1].rebalance_allowed_after);
+    EXPECT_TRUE(schedule.chunks[1].rebalance_required_after);
+
+    EXPECT_EQ(schedule.chunks[2].bucket_seq_len, 64);
+    EXPECT_EQ(schedule.chunks[2].real_count, 32);
+    EXPECT_FALSE(schedule.chunks[2].rebalance_allowed_after);
+    EXPECT_FALSE(schedule.chunks[2].rebalance_required_after);
+}
+
+TEST(Test__PrefillGraphCache, ChunkSchedule_RejectsInvalidPolicy)
+{
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {64};
+    policy.fixed_chunk_real_tokens = 128;
+    policy.real_token_count = 256;
+
+    auto schedule = planPrefillChunkSchedule(policy);
+
+    EXPECT_FALSE(schedule);
+    EXPECT_NE(schedule.error.find("largest"), std::string::npos);
+
+    policy.fixed_chunk_real_tokens = 32;
+    policy.min_rebalance_interval_tokens = 128;
+    policy.max_rebalance_interval_tokens = 64;
+
+    schedule = planPrefillChunkSchedule(policy);
+    EXPECT_FALSE(schedule);
+    EXPECT_NE(schedule.error.find("min"), std::string::npos);
+}
+
 TEST(Test__PrefillGraphCache, ChunkPositionIds_ExactChunk)
 {
     auto position_ids = buildPrefillChunkPositionIds(

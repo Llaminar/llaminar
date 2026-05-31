@@ -37,9 +37,40 @@ namespace llaminar2
      */
     struct PrefillChunkPlan
     {
-        int token_offset = 0;     ///< Offset of the first real token in the original prompt.
-        int real_count = 0;       ///< Real token count processed by this chunk.
-        int bucket_seq_len = 0;   ///< Fixed execution length selected for this chunk.
+        int token_offset = 0;                 ///< Offset of the first real token in the original prompt.
+        int real_count = 0;                   ///< Real token count processed by this chunk.
+        int bucket_seq_len = 0;               ///< Fixed execution length selected for this chunk.
+        int chunk_index = 0;                  ///< Stable chunk ordinal within the scheduled real-token range.
+        bool rebalance_allowed_after = false; ///< True when min real-token interval is satisfied at this boundary.
+        bool rebalance_required_after = false; ///< True when max real-token interval forces maintenance here.
+    };
+
+    /**
+     * @brief Explicit scheduler policy for graph-captured prefill chunks.
+     *
+     * The policy is phrased in real-token counts. Bucket padding is shape
+     * material only and must not advance rebalance windows or histogram counts.
+     */
+    struct PrefillChunkSchedulerPolicy
+    {
+        std::vector<int> bucket_sizes;        ///< Candidate graph bucket lengths.
+        int fixed_chunk_real_tokens = 0;      ///< Real-token interval per chunk; 0 uses the largest bucket.
+        int min_rebalance_interval_tokens = 0; ///< Real tokens before rebalance may run; 0 disables optional flag.
+        int max_rebalance_interval_tokens = 0; ///< Real tokens before rebalance is required; 0 disables force flag.
+        int real_token_start = 0;             ///< First real token offset covered by this schedule.
+        int real_token_count = 0;             ///< Number of real tokens covered by this schedule.
+    };
+
+    /**
+     * @brief Result of applying PrefillChunkSchedulerPolicy.
+     */
+    struct PrefillChunkSchedule
+    {
+        bool ok = false;
+        std::vector<PrefillChunkPlan> chunks;
+        std::string error;
+
+        explicit operator bool() const { return ok; }
     };
 
     /**
@@ -107,6 +138,12 @@ namespace llaminar2
     std::vector<PrefillChunkPlan> planPrefillChunks(
         int total_real_tokens,
         const std::vector<int> &bucket_sizes);
+
+    /**
+     * @brief Plan a real-token range using an explicit chunk scheduling policy.
+     */
+    PrefillChunkSchedule planPrefillChunkSchedule(
+        const PrefillChunkSchedulerPolicy &policy);
 
     /**
      * @brief Build absolute position IDs for one fixed-bucket prefill chunk.
