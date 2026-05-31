@@ -23,9 +23,11 @@
 
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
+#include "../../../mocks/MockModelContext.h"
 
 #include <string>
 #include <utility>
@@ -241,6 +243,13 @@ namespace
     class Test__PrefillDecodeTransition : public ::testing::Test
     {
     protected:
+        struct LocalTPRunnerHarness
+        {
+            OrchestrationRunner *runner = nullptr;
+            MockInferenceRunner *child0 = nullptr;
+            MockInferenceRunner *child1 = nullptr;
+        };
+
         void SetUp() override
         {
             // Create a minimal execution plan (single device, full pipeline)
@@ -287,6 +296,53 @@ namespace
 
             runners_.push_back(std::move(runner));
             return {runners_.back().get(), mock_ptr};
+        }
+
+        LocalTPRunnerHarness createLocalTPRunner(bool mtp_accept = true)
+        {
+            auto child0 = std::make_unique<MockInferenceRunner>();
+            auto child1 = std::make_unique<MockInferenceRunner>();
+            child0->enableMTP(mtp_accept);
+            child1->enableMTP(mtp_accept);
+
+            auto *child0_ptr = child0.get();
+            auto *child1_ptr = child1.get();
+
+            std::vector<std::unique_ptr<IInferenceRunner>> device_runners;
+            device_runners.push_back(std::move(child0));
+            device_runners.push_back(std::move(child1));
+
+            RankOrchestrator::Config rank_config;
+            rank_config.mode = RankOrchestrator::ParallelismMode::TP;
+            rank_config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
+            rank_config.mtp.enabled = true;
+            rank_config.mtp.draft_tokens = 1;
+            rank_config.mtp.verify_mode = MTPVerifyMode::Greedy;
+
+            auto model_ctx = test::MockModelContext::createMinimal();
+            model_ctx->setVocabSize(MockInferenceRunner::VOCAB_SIZE);
+
+            auto rank_runner = RankOrchestrator::createForTest(
+                std::move(model_ctx),
+                std::move(device_runners),
+                nullptr,
+                rank_config);
+
+            OrchestrationConfig config;
+            config.device_for_this_rank = GlobalDeviceAddress::cpu();
+            config.mtp.enabled = true;
+            config.mtp.draft_tokens = 1;
+            config.mtp.verify_mode = MTPVerifyMode::Greedy;
+
+            auto runner = std::make_unique<OrchestrationRunner>(
+                std::move(config), plan_, std::move(rank_runner));
+
+            SamplingParams greedy;
+            greedy.temperature = 0.0f;
+            runner->setSamplingParams(greedy);
+
+            runners_.push_back(std::move(runner));
+            return {runners_.back().get(), child0_ptr, child1_ptr};
         }
 
         RankExecutionPlan plan_;
@@ -524,6 +580,76 @@ namespace
         EXPECT_NE(probe.mtp_bypass_reason.find("TP logits"), std::string::npos);
         EXPECT_EQ(probe.mtp_bypasses, 1u);
         EXPECT_EQ(probe.mtp_draft_steps, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, LocalTPMTPDecodeRunsEveryParticipantAndRecordsOneRollback)
+    {
+        auto harness = createLocalTPRunner(/*mtp_accept=*/true);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(harness.runner->prefill(prompt));
+
+        GenerationResult step1 = harness.runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child0->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(harness.child1->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(harness.child0->restoreCount(), 1);
+        EXPECT_EQ(harness.child1->restoreCount(), 1);
+        EXPECT_GE(harness.child0->setAllPositionCount(), 2);
+        EXPECT_GE(harness.child1->setAllPositionCount(), 2);
+        EXPECT_THAT(harness.child0->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(harness.child1->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        const auto probe = harness.runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, LocalTPMTPForcedRejectCountsOnceAcrossParticipants)
+    {
+        auto harness = createLocalTPRunner(/*mtp_accept=*/false);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(harness.runner->prefill(prompt));
+
+        GenerationResult step1 = harness.runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+        EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child0->restoreCount(), 1);
+        EXPECT_EQ(harness.child1->restoreCount(), 1);
+        EXPECT_THAT(harness.child0->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+        EXPECT_THAT(harness.child1->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+        const auto probe = harness.runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
 
     /**
