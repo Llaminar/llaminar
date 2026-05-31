@@ -22,6 +22,8 @@
 #include <gmock/gmock.h>
 
 #include "execution/runner/OrchestrationRunner.h"
+#include "execution/global/GlobalOrchestrator.h"
+#include "execution/global_pp/GlobalPPTopology.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "config/OrchestrationConfig.h"
@@ -544,6 +546,23 @@ namespace
             return {runners_.back().get(), child0_ptr, child1_ptr};
         }
 
+        static GlobalPPTopology buildSingleStageGlobalTPTopo(int world_size)
+        {
+            GlobalPPStageSpec stage;
+            stage.stage_id = 0;
+            stage.first_layer = 0;
+            stage.last_layer = 23;
+            stage.has_embedding = true;
+            stage.has_lm_head = true;
+            stage.is_global_tp = true;
+            for (int rank = 0; rank < world_size; ++rank)
+            {
+                stage.participating_ranks.push_back(rank);
+            }
+            stage.per_rank_device = GlobalDeviceAddress::cpu();
+            return GlobalPPTopology::build({stage}, 24, world_size);
+        }
+
         RankExecutionPlan plan_;
         std::vector<std::unique_ptr<OrchestrationRunner>> runners_; // Prevent dangling
     };
@@ -831,6 +850,56 @@ namespace
         EXPECT_GE(mock->sampleMainLogitsCount(), 1);
         EXPECT_EQ(mock->sampleMTPLogitsCount(), 1);
         EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 1);
+
+        auto probe = runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, GlobalTPMTPDecodeRunsThroughGlobalOrchestratorCoordination)
+    {
+        auto mpi = std::make_shared<llaminar2::test::MockMPIContext>(0, 2);
+        auto child = std::make_unique<MockInferenceRunner>();
+        auto *child_ptr = child.get();
+        child_ptr->enableMTP(/*accept_mtp_token=*/true);
+
+        GlobalOrchestrator::Config global_config;
+        global_config.topology = buildSingleStageGlobalTPTopo(2);
+        global_config.rank = 0;
+        global_config.world_size = 2;
+        global_config.mpi_ctx = mpi.get();
+        global_config.rank_runner = std::move(child);
+        global_config.vocab_size = MockInferenceRunner::VOCAB_SIZE;
+        global_config.d_model = 16;
+        global_config.architecture_name = "mock";
+
+        auto global_runner = std::make_unique<GlobalOrchestrator>(std::move(global_config));
+
+        OrchestrationConfig config;
+        config.device_for_this_rank = GlobalDeviceAddress::cpu();
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+        config.mtp.verify_mode = MTPVerifyMode::Greedy;
+
+        auto runner = std::make_unique<OrchestrationRunner>(
+            std::move(config), plan_, std::move(global_runner), mpi);
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        runner->setSamplingParams(greedy);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(child_ptr->forwardMTPCount(), 1);
+        EXPECT_EQ(child_ptr->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(child_ptr->restoreCount(), 1);
 
         auto probe = runner->prefixStateProbe();
         EXPECT_FALSE(probe.mtp_bypassed);
