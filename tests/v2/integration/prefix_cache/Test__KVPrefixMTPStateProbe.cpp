@@ -28,9 +28,11 @@
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -41,6 +43,51 @@ using namespace llaminar2::test;
 namespace
 {
     constexpr const char *kDenseModelPath = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+    std::vector<int32_t> readTokenListFromMetadata(
+        const std::filesystem::path &metadata_path,
+        const std::string &key)
+    {
+        std::ifstream file(metadata_path);
+        if (!file.is_open())
+        {
+            return {};
+        }
+
+        std::string line;
+        const std::string prefix = key + ":";
+        while (std::getline(file, line))
+        {
+            if (line.rfind(prefix, 0) != 0)
+            {
+                continue;
+            }
+
+            std::string tokens = line.substr(prefix.size());
+            const size_t start = tokens.find_first_not_of(" \t");
+            if (start != std::string::npos)
+            {
+                tokens = tokens.substr(start);
+            }
+
+            std::vector<int32_t> result;
+            std::stringstream ss(tokens);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                const size_t token_start = token.find_first_not_of(" \t");
+                const size_t token_end = token.find_last_not_of(" \t");
+                if (token_start == std::string::npos || token_end == std::string::npos)
+                {
+                    continue;
+                }
+                result.push_back(std::stoi(token.substr(token_start, token_end - token_start + 1)));
+            }
+            return result;
+        }
+
+        return {};
+    }
 
     std::optional<std::string> firstGpuDeviceSpec()
     {
@@ -914,6 +961,77 @@ TEST(Test__KVPrefixMTPStateProbe, MTP_ModelInventoryWhenAvailable)
     {
         GTEST_SKIP() << "Qwen3.6 MTP probe models are not available";
     }
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen35CPUPrefixCacheMatchesPyTorchDecodeTokensOptIn)
+{
+    const char *enabled = std::getenv("LLAMINAR_ENABLE_PREFIX_MTP_PARITY");
+    if (!enabled || std::string(enabled) != "1")
+    {
+        GTEST_SKIP() << "Set LLAMINAR_ENABLE_PREFIX_MTP_PARITY=1 to run prefix-cache PyTorch token parity";
+    }
+
+    const char *env_model = std::getenv("LLAMINAR_PREFIX_MTP_PARITY_MODEL");
+    const std::string model_path = env_model ? env_model : "models/Qwen3.5-0.8B-Q4_0.gguf";
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.5 parity model not found: " << model_path;
+    }
+
+    const char *env_metadata = std::getenv("LLAMINAR_PREFIX_MTP_PARITY_METADATA");
+    const std::filesystem::path metadata_path =
+        env_metadata ? env_metadata : "pytorch_qwen35_snapshots/metadata.txt";
+    if (!std::filesystem::exists(metadata_path))
+    {
+        GTEST_SKIP() << "PyTorch parity metadata not found: " << metadata_path;
+    }
+
+    const auto prompt_tokens = readTokenListFromMetadata(metadata_path, "token_ids");
+    const auto pytorch_decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
+    ASSERT_FALSE(prompt_tokens.empty());
+    ASSERT_GE(pytorch_decode_tokens.size(), 3u);
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = 64;
+    config.batch_size = 1;
+    config.device_for_this_rank = GlobalDeviceAddress::cpu();
+    config.kv_cache_precision = "fp16";
+    config.prefix_cache.enabled = true;
+    config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+    config.prefix_cache.block_size = static_cast<int>(prompt_tokens.size());
+    config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+    config.prefix_cache.ram_budget_bytes = 256ull * 1024ull * 1024ull;
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    const std::vector<int32_t> expected_tokens(
+        pytorch_decode_tokens.begin(),
+        pytorch_decode_tokens.begin() + 3);
+
+    auto first = runner->generate(prompt_tokens, 3, greedy);
+    const auto after_first = runner->prefixStateProbe();
+    ASSERT_TRUE(first.error.empty()) << first.error;
+    ASSERT_EQ(first.tokens.size(), expected_tokens.size());
+    EXPECT_EQ(first.tokens, expected_tokens);
+    EXPECT_TRUE(after_first.prefix_cache_ready);
+    EXPECT_GE(after_first.prefix_cache_inserts, 1u);
+
+    auto second = runner->generate(prompt_tokens, 3, greedy);
+    const auto after_second = runner->prefixStateProbe();
+    runner->shutdown();
+
+    ASSERT_TRUE(second.error.empty()) << second.error;
+    ASSERT_EQ(second.tokens.size(), expected_tokens.size());
+    EXPECT_EQ(second.tokens, expected_tokens);
+    EXPECT_TRUE(after_second.prefix_request.hit);
+    EXPECT_EQ(after_second.prefix_request.matched_tokens, static_cast<int>(prompt_tokens.size()));
+    EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
