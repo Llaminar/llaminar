@@ -3695,6 +3695,7 @@ namespace llaminar2
                 material.moe.push_back({"controller.num_layers", std::to_string(controller->numLayers())});
                 material.moe.push_back({"controller.num_experts", std::to_string(controller->numExperts())});
                 material.moe.push_back({"controller.top_k", std::to_string(controller->topK())});
+                material.moe.push_back({"controller.placement_epoch", std::to_string(controller->placementEpoch())});
                 material.moe.push_back({"controller.total_rebalances", std::to_string(controller->totalRebalances())});
 
                 const auto &placement = controller->currentPlacement();

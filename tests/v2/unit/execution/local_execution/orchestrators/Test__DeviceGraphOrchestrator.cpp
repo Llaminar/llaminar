@@ -21,6 +21,7 @@
 #include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "models/qwen/QwenStandardGraph.h"
+#include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "loaders/WeightPlan.h"
 #include "loaders/PreparedWeightStore.h"
 #include "backends/ComputeBackend.h"
@@ -128,6 +129,30 @@ namespace
         cfg.rebalance_config.min_improvement_ratio = 0.05f;
         cfg.rebalance_config.layer_cooldown_generations = 0;
         cfg.rebalance_config.min_window_activations = 1;
+        return cfg;
+    }
+
+    GraphConfig makeMaintenanceMoEGraphConfig()
+    {
+        GraphConfig cfg;
+        cfg.d_model = 8;
+        cfg.d_ff = 16;
+        cfg.n_heads = 2;
+        cfg.n_kv_heads = 2;
+        cfg.head_dim = 4;
+        cfg.n_layers = 2;
+        cfg.total_n_layers = 2;
+        cfg.vocab_size = 32;
+        cfg.rms_norm_eps = 1e-6f;
+        cfg.default_device = DeviceId::cpu();
+        cfg.moe.num_experts = 8;
+        cfg.moe.top_k = 2;
+        cfg.moe.intermediate_size = 8;
+        cfg.prefix_cache.enabled = true;
+        cfg.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+        cfg.prefix_cache.block_size = 2;
+        cfg.prefix_cache.ram_budget_bytes = 1 << 20;
+        cfg.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Off;
         return cfg;
     }
 
@@ -903,6 +928,53 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixCacheBudgetBypassIsReportedInProbe)
     PrefixLookupResult second_hit = orchestrator->lookupPrefix({1, 2});
     EXPECT_FALSE(second_hit.supported);
     EXPECT_EQ(orchestrator->prefixStateProbe().prefix_cache_bypasses, 1u);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochRefreshesPrefixFingerprint)
+{
+    auto moe_config = makeMaintenanceMoEGraphConfig();
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
+        nullptr);
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    for (int expert = 0; expert < 8; ++expert)
+        controller_config.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+
+    auto controller = std::make_unique<MoERebalanceController>(controller_config);
+    auto *controller_ptr = controller.get();
+    orchestrator->setMoERebalanceController(std::move(controller));
+
+    PrefixLookupResult before = orchestrator->lookupPrefix({1, 2});
+    ASSERT_TRUE(before.supported);
+    ASSERT_NE(before.fingerprint_key, 0u);
+    EXPECT_EQ(before.placement_epoch, 0u);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u);
+
+    fillMaintenanceWindowSkewed(*controller_ptr->histogram(),
+                                /*window_size=*/16,
+                                /*num_layers=*/2,
+                                /*top_k=*/2);
+    ASSERT_TRUE(controller_ptr->shouldRebalance());
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 8;
+    chunk.rebalance_allowed_after = true;
+
+    PrefillChunkMaintenanceDecision decision;
+    decision.ok = true;
+    decision.can_run = true;
+    IForwardExecutionHost &host = *orchestrator;
+    ASSERT_TRUE(host.onPrefillChunkMaintenance(chunk, decision));
+    ASSERT_EQ(controller_ptr->placementEpoch(), 1u);
+
+    PrefixLookupResult after = orchestrator->lookupPrefix({1, 2});
+    ASSERT_TRUE(after.supported);
+    EXPECT_EQ(after.placement_epoch, 1u);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 1u);
+    EXPECT_NE(after.fingerprint_key, before.fingerprint_key)
+        << "MoE placement epoch changes must invalidate prefix-cache key material";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateDefaultsSafeWithoutMoE)
