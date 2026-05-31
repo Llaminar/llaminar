@@ -48,6 +48,32 @@ namespace llaminar2::test
             return key;
         }
 
+        MoEOverlayCollectiveKey mtpDispatchKey() const
+        {
+            return makeMTPMoEOverlayCollectiveKey(
+                1,
+                7,
+                2,
+                3,
+                1,
+                9,
+                1,
+                MoEOverlayCollectiveDirection::Dispatch);
+        }
+
+        MoEOverlayCollectiveKey mtpReturnKey() const
+        {
+            return makeMTPMoEOverlayCollectiveKey(
+                1,
+                7,
+                2,
+                3,
+                1,
+                9,
+                0,
+                MoEOverlayCollectiveDirection::ReturnReduce);
+        }
+
         int rank_ = -1;
         int world_size_ = 0;
         std::shared_ptr<IMPIContext> mpi_ctx_;
@@ -159,6 +185,102 @@ namespace llaminar2::test
 
         auto stale_return = collective_->returnReduce(return_key, outbound_return, &inbound_return, nullptr);
         EXPECT_FALSE(stale_return.ok);
+    }
+
+    TEST_F(Test__MoEOverlaySparseTransport_MPI, MTPNamespacedDispatchAndReturnPreserveKeyAcrossRanks)
+    {
+        auto dispatch_key = mtpDispatchKey();
+        ASSERT_TRUE(dispatch_key.isValid());
+
+        auto outbound_dispatch = workspace_.localExpertInput(dispatch_key.layer_idx, dispatch_key.tier_idx);
+        outbound_dispatch.key = dispatch_key;
+        outbound_dispatch.source_participant = rank_;
+        outbound_dispatch.target_participant = (rank_ == 0) ? 1 : 0;
+
+        if (rank_ == 0)
+        {
+            outbound_dispatch.live_row_count = 1;
+            outbound_dispatch.live_entry_count = 2;
+            outbound_dispatch.row_ids_host[0] = 17;
+            outbound_dispatch.entry_offsets_host[0] = 0;
+            outbound_dispatch.entry_offsets_host[1] = 2;
+            outbound_dispatch.expert_ids_host[0] = 4;
+            outbound_dispatch.expert_ids_host[1] = 8;
+            outbound_dispatch.route_weights_host[0] = 0.25f;
+            outbound_dispatch.route_weights_host[1] = 0.75f;
+            for (int col = 0; col < outbound_dispatch.d_model; ++col)
+                outbound_dispatch.hidden_rows_fp32[col] = static_cast<float>(300 + col);
+        }
+        else
+        {
+            outbound_dispatch.live_row_count = 0;
+            outbound_dispatch.live_entry_count = 0;
+            outbound_dispatch.entry_offsets_host[0] = 0;
+        }
+
+        auto inbound_dispatch = workspace_.dispatchReceive(dispatch_key.layer_idx, dispatch_key.tier_idx);
+        const auto dispatch_result = collective_->dispatch(dispatch_key, outbound_dispatch, &inbound_dispatch, nullptr);
+        ASSERT_TRUE(dispatch_result.ok) << dispatch_result.error;
+        EXPECT_TRUE(dispatch_result.collective_complete);
+        EXPECT_EQ(inbound_dispatch.key, dispatch_key);
+        EXPECT_EQ(inbound_dispatch.key.key_namespace, MoEOverlayCollectiveNamespace::MTP);
+        EXPECT_EQ(inbound_dispatch.key.mtp_depth, 2);
+        EXPECT_EQ(inbound_dispatch.key.participant_id, 1);
+
+        if (rank_ == 1)
+        {
+            EXPECT_EQ(inbound_dispatch.live_row_count, 1u);
+            EXPECT_EQ(inbound_dispatch.live_entry_count, 2u);
+            EXPECT_EQ(inbound_dispatch.row_ids_host[0], 17);
+            EXPECT_EQ(inbound_dispatch.expert_ids_host[1], 8);
+            EXPECT_FLOAT_EQ(inbound_dispatch.route_weights_host[1], 0.75f);
+            EXPECT_FLOAT_EQ(inbound_dispatch.hidden_rows_fp32[3], 303.0f);
+        }
+        else
+        {
+            EXPECT_EQ(inbound_dispatch.live_row_count, 0u);
+            EXPECT_EQ(inbound_dispatch.live_entry_count, 0u);
+        }
+
+        auto return_key = mtpReturnKey();
+        ASSERT_TRUE(return_key.isValid());
+
+        auto outbound_return = workspace_.localExpertOutput(return_key.layer_idx, return_key.tier_idx);
+        outbound_return.key = return_key;
+        outbound_return.source_participant = rank_;
+        outbound_return.target_participant = (rank_ == 1) ? 0 : 1;
+
+        if (rank_ == 1)
+        {
+            outbound_return.live_row_count = 1;
+            outbound_return.row_ids_host[0] = 17;
+            for (int col = 0; col < outbound_return.d_model; ++col)
+                outbound_return.output_rows_fp32[col] = static_cast<float>(400 + col);
+        }
+        else
+        {
+            outbound_return.live_row_count = 0;
+        }
+
+        auto inbound_return = workspace_.returnReceive(return_key.layer_idx, return_key.tier_idx);
+        const auto return_result = collective_->returnReduce(return_key, outbound_return, &inbound_return, nullptr);
+        ASSERT_TRUE(return_result.ok) << return_result.error;
+        EXPECT_TRUE(return_result.collective_complete);
+        EXPECT_EQ(inbound_return.key, return_key);
+        EXPECT_EQ(inbound_return.key.key_namespace, MoEOverlayCollectiveNamespace::MTP);
+        EXPECT_EQ(inbound_return.key.mtp_depth, 2);
+        EXPECT_EQ(inbound_return.key.participant_id, 0);
+
+        if (rank_ == 0)
+        {
+            EXPECT_EQ(inbound_return.live_row_count, 1u);
+            EXPECT_EQ(inbound_return.row_ids_host[0], 17);
+            EXPECT_FLOAT_EQ(inbound_return.output_rows_fp32[3], 403.0f);
+        }
+        else
+        {
+            EXPECT_EQ(inbound_return.live_row_count, 0u);
+        }
     }
 
 } // namespace llaminar2::test
