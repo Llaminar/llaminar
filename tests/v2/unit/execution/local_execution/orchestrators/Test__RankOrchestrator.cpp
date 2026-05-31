@@ -103,6 +103,11 @@ public:
         return all_position_logits_.empty() ? logits_.data() : all_position_logits_.data();
     }
 
+    std::string mtpDecodeUnsupportedReason() const override
+    {
+        return mtp_unsupported_reason_;
+    }
+
     int vocab_size() const override
     {
         return config_.vocab_size;
@@ -237,6 +242,7 @@ public:
     void set_prefix_populate_ok(bool ok) { prefix_populate_ok_ = ok; }
     void set_forward_mtp_ok(bool ok) { forward_mtp_ok_ = ok; }
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
+    void set_mtp_unsupported_reason(std::string reason) { mtp_unsupported_reason_ = std::move(reason); }
     void set_prefix_live_capture_ok(bool ok) { prefix_live_capture_ok_ = ok; }
     void set_prefix_live_restore_ok(bool ok) { prefix_live_restore_ok_ = ok; }
     void set_prefix_live_truncate_ok(bool ok) { prefix_live_truncate_ok_ = ok; }
@@ -282,6 +288,7 @@ private:
     bool forward_mtp_ok_ = true;
     bool set_all_position_logits_ok_ = true;
     bool compute_all_position_logits_ = false;
+    std::string mtp_unsupported_reason_;
     bool prefix_live_capture_ok_ = true;
     bool prefix_live_restore_ok_ = true;
     bool prefix_live_truncate_ok_ = true;
@@ -1251,7 +1258,26 @@ TEST_F(Test__RankOrchestrator, AllPositionLogitToggleRunsOnEveryLocalTPChild)
     EXPECT_EQ(runner1_ptr->set_all_position_logits_call_count(), 2u);
 }
 
-TEST_F(Test__RankOrchestrator, MultiChildMTPDecodeReportsTopologyBypassUntilCoordinationExists)
+TEST_F(Test__RankOrchestrator, MultiChildMTPDecodePropagatesChildTopologyBypass)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_mtp_unsupported_reason("MTP decode all-position logits are not enabled for column-parallel LM head");
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const std::string reason = orchestrator->mtpDecodeUnsupportedReason();
+    EXPECT_NE(reason.find("column-parallel"), std::string::npos);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildMTPDecodeAllowsReplicatedLogitTopology)
 {
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
     runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
@@ -1263,8 +1289,65 @@ TEST_F(Test__RankOrchestrator, MultiChildMTPDecodeReportsTopologyBypassUntilCoor
         makeTPContextForRunnerCount(2),
         makeRankConfigForRunnerCount(2));
 
-    const std::string reason = orchestrator->mtpDecodeUnsupportedReason();
-    EXPECT_NE(reason.find("MTP/all-position logits"), std::string::npos);
+    EXPECT_TRUE(orchestrator->mtpDecodeUnsupportedReason().empty());
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsRequireMatchingReplicas)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_vocab_size(3);
+    runner0_ptr->set_mock_mtp_logits({0.0f, 5.0f, 1.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_vocab_size(3);
+    runner1_ptr->set_mock_mtp_logits({0.0f, 5.0f, 1.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    ASSERT_NE(orchestrator->mtpLogits(), nullptr);
+    EXPECT_FLOAT_EQ(orchestrator->mtpLogits()[1], 5.0f);
+
+    runner1_ptr->set_mock_mtp_logits({0.0f, 4.0f, 1.0f});
+    EXPECT_EQ(orchestrator->mtpLogits(), nullptr);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildAllPositionLogitsRequireMatchingReplicas)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_vocab_size(3);
+    runner0_ptr->set_mock_all_position_logits({1.0f, 2.0f, 3.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_vocab_size(3);
+    runner1_ptr->set_mock_all_position_logits({1.0f, 2.0f, 3.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    ASSERT_NE(orchestrator->getAllPositionLogits(), nullptr);
+    EXPECT_FLOAT_EQ(orchestrator->getAllPositionLogits()[2], 3.0f);
+
+    runner1_ptr->set_mock_all_position_logits({1.0f, 2.5f, 3.0f});
+    EXPECT_EQ(orchestrator->getAllPositionLogits(), nullptr);
 }
 
 TEST_F(Test__RankOrchestrator, SingleChildMTPDelegatesWithoutTopologyBypass)

@@ -2990,6 +2990,15 @@ namespace llaminar2
         return state_.all_position_logits->fp32_data();
     }
 
+    std::string DeviceGraphOrchestrator::mtpDecodeUnsupportedReason() const
+    {
+        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+        {
+            return "MTP decode all-position logits are not enabled for column-parallel LM head";
+        }
+        return {};
+    }
+
     PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const
     {
         PrefixRuntimeStateSnapshot snapshot;

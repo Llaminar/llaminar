@@ -1395,6 +1395,7 @@ namespace llaminar2
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;
+        std::string mtpDecodeUnsupportedReason() const override;
 
         /**
          * @brief Get current position offset for a sequence

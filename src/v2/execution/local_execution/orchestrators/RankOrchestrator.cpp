@@ -1957,15 +1957,42 @@ namespace llaminar2
 
     const float *RankOrchestrator::mtpLogits() const
     {
-        if (device_runners_.size() != 1)
+        if (device_runners_.empty())
         {
             return nullptr;
         }
-        if (device_runners_.empty() || !device_runners_[0])
+
+        const int compare_vocab = device_runners_[0] ? device_runners_[0]->vocab_size() : 0;
+        if (compare_vocab <= 0)
         {
             return nullptr;
         }
-        return device_runners_[0]->mtpLogits();
+
+        const float *primary_logits = nullptr;
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner)
+                return nullptr;
+            if (runner->vocab_size() != compare_vocab)
+                return nullptr;
+
+            const float *child_logits = runner->mtpLogits();
+            if (!child_logits)
+                return nullptr;
+
+            if (!primary_logits)
+            {
+                primary_logits = child_logits;
+                continue;
+            }
+
+            if (!std::equal(primary_logits, primary_logits + compare_vocab, child_logits))
+            {
+                LOG_WARN("RankOrchestrator::mtpLogits: child MTP logits diverged in replicated TP path");
+                return nullptr;
+            }
+        }
+        return primary_logits;
     }
 
     bool RankOrchestrator::setComputeAllPositionLogits(bool enabled)
@@ -1988,15 +2015,45 @@ namespace llaminar2
 
     const float *RankOrchestrator::getAllPositionLogits() const
     {
-        if (device_runners_.size() != 1)
+        if (device_runners_.empty())
         {
             return nullptr;
         }
-        if (device_runners_.empty() || !device_runners_[0])
+
+        const int compare_vocab = device_runners_[0] ? device_runners_[0]->vocab_size() : 0;
+        if (compare_vocab <= 0)
         {
             return nullptr;
         }
-        return device_runners_[0]->getAllPositionLogits();
+
+        const size_t rows = std::max<size_t>(1, static_cast<size_t>(std::max(0, current_padded_seq_len_)));
+        const size_t count = rows * static_cast<size_t>(compare_vocab);
+
+        const float *primary_logits = nullptr;
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner)
+                return nullptr;
+            if (runner->vocab_size() != compare_vocab)
+                return nullptr;
+
+            const float *child_logits = runner->getAllPositionLogits();
+            if (!child_logits)
+                return nullptr;
+
+            if (!primary_logits)
+            {
+                primary_logits = child_logits;
+                continue;
+            }
+
+            if (!std::equal(primary_logits, primary_logits + count, child_logits))
+            {
+                LOG_WARN("RankOrchestrator::getAllPositionLogits: child verifier logits diverged in replicated TP path");
+                return nullptr;
+            }
+        }
+        return primary_logits;
     }
 
     std::string RankOrchestrator::mtpDecodeUnsupportedReason() const
@@ -2007,7 +2064,15 @@ namespace llaminar2
         }
         if (device_runners_.size() > 1)
         {
-            return "MTP decode requires TP MTP/all-position logits coordination";
+            for (const auto &runner : device_runners_)
+            {
+                if (!runner)
+                    return "MTP decode requires every TP participant to be available";
+
+                const std::string child_reason = runner->mtpDecodeUnsupportedReason();
+                if (!child_reason.empty())
+                    return child_reason;
+            }
         }
         return {};
     }
