@@ -13,6 +13,7 @@
 #include "mocks/MockMPIContext.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "models/qwen35/Qwen35Graph.h"
+#include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "tensors/TensorSlice.h"
 #include "utils/TestTensorFactory.h"
 
@@ -134,6 +135,10 @@ namespace
         std::unique_ptr<FP32Tensor> gate_proj;
         std::unique_ptr<FP32Tensor> up_proj;
         std::unique_ptr<FP32Tensor> down_proj;
+        std::shared_ptr<FP32Tensor> moe_gate;
+        std::shared_ptr<FP32Tensor> moe_gate_exps;
+        std::shared_ptr<FP32Tensor> moe_up_exps;
+        std::shared_ptr<FP32Tensor> moe_down_exps;
 
         std::unique_ptr<FP32Tensor> terminal_hidden;
         std::unique_ptr<FP32Tensor> embedding;
@@ -152,6 +157,12 @@ namespace
         std::unique_ptr<FP32Tensor> gate;
         std::unique_ptr<FP32Tensor> up;
         std::unique_ptr<FP32Tensor> ffn_output;
+        std::unique_ptr<FP32Tensor> moe_expert_indices;
+        std::unique_ptr<FP32Tensor> moe_expert_weights;
+        std::unique_ptr<FP32Tensor> moe_combined_output;
+        std::unique_ptr<FP32Tensor> moe_shared_expert_output;
+        std::unique_ptr<FP32Tensor> moe_gate_scratch;
+        std::unique_ptr<FP32Tensor> moe_up_scratch;
         std::unique_ptr<FP32Tensor> logits;
 
         std::unique_ptr<ICPUKVCache> kv_cache;
@@ -179,6 +190,9 @@ namespace
             const size_t kv_dim = static_cast<size_t>(config.n_kv_heads * config.head_dim);
             const size_t ff = static_cast<size_t>(config.d_ff);
             const size_t vocab = static_cast<size_t>(config.vocab_size);
+            const size_t moe_experts = 4;
+            const size_t moe_top_k = 2;
+            const size_t moe_intermediate = 32;
 
             embedding_table = TestTensorFactory::createFP32Random({vocab, d});
             lm_head = TestTensorFactory::createFP32Random({vocab, d});
@@ -198,6 +212,10 @@ namespace
             gate_proj = TestTensorFactory::createFP32Random({ff, d});
             up_proj = TestTensorFactory::createFP32Random({ff, d});
             down_proj = TestTensorFactory::createFP32Random({d, ff});
+            moe_gate = std::make_shared<FP32Tensor>(std::vector<size_t>{moe_experts, d});
+            moe_gate_exps = std::make_shared<FP32Tensor>(std::vector<size_t>{d, moe_intermediate, moe_experts});
+            moe_up_exps = std::make_shared<FP32Tensor>(std::vector<size_t>{d, moe_intermediate, moe_experts});
+            moe_down_exps = std::make_shared<FP32Tensor>(std::vector<size_t>{moe_intermediate, d, moe_experts});
 
             terminal_hidden = TestTensorFactory::createFP32Random({1, d});
             embedding = TestTensorFactory::createFP32({1, d});
@@ -216,6 +234,12 @@ namespace
             gate = TestTensorFactory::createFP32({1, ff});
             up = TestTensorFactory::createFP32({1, ff});
             ffn_output = TestTensorFactory::createFP32({1, d});
+            moe_expert_indices = TestTensorFactory::createFP32({1, moe_top_k});
+            moe_expert_weights = TestTensorFactory::createFP32({1, moe_top_k});
+            moe_combined_output = TestTensorFactory::createFP32({1, d});
+            moe_shared_expert_output = TestTensorFactory::createFP32({1, d});
+            moe_gate_scratch = TestTensorFactory::createFP32({1, moe_experts});
+            moe_up_scratch = TestTensorFactory::createFP32({1, moe_experts});
             logits = TestTensorFactory::createFP32({1, vocab});
 
             kv_cache = createCPURingKVCache(
@@ -294,6 +318,12 @@ namespace
             out.gate = gate.get();
             out.up = up.get();
             out.ffn_output = ffn_output.get();
+            out.moe_expert_indices = moe_expert_indices.get();
+            out.moe_expert_weights = moe_expert_weights.get();
+            out.moe_combined_output = moe_combined_output.get();
+            out.moe_shared_expert_output = moe_shared_expert_output.get();
+            out.moe_gate_scratch = moe_gate_scratch.get();
+            out.moe_up_scratch = moe_up_scratch.get();
             return out;
         }
     };
@@ -780,7 +810,7 @@ TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWei
     EXPECT_TRUE(hasDependency(graph, "layer1_ffn_residual", "layer1_down_allreduce"));
 }
 
-TEST(Test__MTPGraphConstruction, RejectsMoESidecarForNow)
+TEST(Test__MTPGraphConstruction, RejectsIncompleteMoESidecarWeights)
 {
     DenseMTPGraphFixture fixture;
     Qwen35Graph graph_builder(fixture.config, fixture.mpi);
@@ -793,6 +823,47 @@ TEST(Test__MTPGraphConstruction, RejectsMoESidecarForNow)
     ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
 
     EXPECT_EQ(graph.size(), 0u);
+}
+
+TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
+{
+    DenseMTPGraphFixture fixture;
+    fixture.config.moe.num_experts = 4;
+    fixture.config.moe.top_k = 2;
+    fixture.config.moe.intermediate_size = 32;
+    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.has_shared_expert = false;
+
+    Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto weights = fixture.mtpWeights();
+    weights.fa_block.moe_gate = fixture.moe_gate.get();
+    weights.fa_block.moe_gate_exps = fixture.moe_gate_exps.get();
+    weights.fa_block.moe_up_exps = fixture.moe_up_exps.get();
+    weights.fa_block.moe_down_exps = fixture.moe_down_exps.get();
+    weights.fa_block.gate_proj = nullptr;
+    weights.fa_block.up_proj = nullptr;
+    weights.fa_block.down_proj = nullptr;
+
+    auto input = fixture.input();
+    auto output = fixture.output();
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head");
+    ASSERT_NE(graph.getNode("layer1_moe_routing"), nullptr);
+    ASSERT_NE(graph.getNode("layer1_moe_expert_ffn"), nullptr);
+    ASSERT_NE(graph.getNode("layer1_moe_combine"), nullptr);
+    ASSERT_NE(graph.getNode("layer1_ffn_residual"), nullptr);
+    ASSERT_NE(graph.getNode("mtp0_final_norm"), nullptr);
+
+    EXPECT_EQ(graph.getNode("layer1_moe_routing")->stage->type(), ComputeStageType::MOE_ROUTER);
+    EXPECT_EQ(graph.getNode("layer1_moe_expert_ffn")->stage->type(), ComputeStageType::MOE_EXPERT_FFN);
+    EXPECT_TRUE(hasDependency(graph, "layer1_moe_expert_ffn", "layer1_moe_routing"));
+    EXPECT_TRUE(hasDependency(graph, "layer1_moe_combine", "layer1_moe_expert_ffn"));
+    EXPECT_TRUE(hasDependency(graph, "layer1_ffn_residual", "layer1_moe_combine"));
+    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer1_ffn_residual"));
 }
 
 TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)

@@ -2907,6 +2907,12 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar requested without MTP weight bindings");
             return false;
         }
+        const auto &depth0_bindings = bindings.mtp.depths[0];
+        const bool mtp_moe_sidecar =
+            depth0_bindings.fa_block.moe_gate ||
+            depth0_bindings.fa_block.moe_gate_exps ||
+            depth0_bindings.fa_block.moe_up_exps ||
+            depth0_bindings.fa_block.moe_down_exps;
 
         auto get_extension = [&](BufferId id) -> TensorBase *
         {
@@ -2931,6 +2937,12 @@ namespace llaminar2
         TensorBase *mtp_gate = get_extension(BufferId::MTP_GATE_PROJ);
         TensorBase *mtp_up = get_extension(BufferId::MTP_UP_PROJ);
         TensorBase *mtp_ffn_output = get_extension(BufferId::MTP_FFN_OUTPUT);
+        TensorBase *mtp_moe_expert_indices = get_extension(BufferId::MOE_EXPERT_INDICES);
+        TensorBase *mtp_moe_expert_weights = get_extension(BufferId::MOE_EXPERT_WEIGHTS);
+        TensorBase *mtp_moe_combined_output = get_extension(BufferId::MOE_COMBINED_OUTPUT);
+        TensorBase *mtp_moe_shared_expert_output = get_extension(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+        TensorBase *mtp_moe_gate_scratch = get_extension(BufferId::MOE_GATE_SCRATCH);
+        TensorBase *mtp_moe_up_scratch = get_extension(BufferId::MOE_UP_SCRATCH);
 
         if (!terminal_hidden ||
             !mtp_logits || !mtp_hidden || !mtp_embedding || !mtp_norm_hidden ||
@@ -2940,6 +2952,14 @@ namespace llaminar2
             !mtp_ffn_output)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar missing required buffers");
+            return false;
+        }
+        if (mtp_moe_sidecar &&
+            (!mtp_moe_expert_indices || !mtp_moe_expert_weights ||
+             !mtp_moe_combined_output || !mtp_moe_shared_expert_output ||
+             !mtp_moe_gate_scratch || !mtp_moe_up_scratch))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MoE MTP sidecar missing required MoE scratch buffers");
             return false;
         }
 
@@ -2971,6 +2991,12 @@ namespace llaminar2
         output.gate = mtp_gate;
         output.up = mtp_up;
         output.ffn_output = mtp_ffn_output;
+        output.moe_expert_indices = mtp_moe_expert_indices;
+        output.moe_expert_weights = mtp_moe_expert_weights;
+        output.moe_combined_output = mtp_moe_combined_output;
+        output.moe_shared_expert_output = mtp_moe_shared_expert_output;
+        output.moe_gate_scratch = mtp_moe_gate_scratch;
+        output.moe_up_scratch = mtp_moe_up_scratch;
 
         ComputeGraph graph = graph_builder_->buildMTPGraph(
             0,

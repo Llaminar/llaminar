@@ -317,11 +317,11 @@ namespace llaminar2
             return graph;
         }
 
-        if (weights.fa_block.moe_gate || weights.fa_block.moe_gate_exps)
-        {
-            LOG_ERROR("[Qwen35Graph::buildMTPGraph] MoE MTP sidecar graph is not enabled in this phase");
-            return graph;
-        }
+        const bool mtp_moe =
+            weights.fa_block.moe_gate ||
+            weights.fa_block.moe_gate_exps ||
+            weights.fa_block.moe_up_exps ||
+            weights.fa_block.moe_down_exps;
 
         if (missing("embedding table", modelEmbeddingTable()) ||
             missing("lm head", modelLMHead()) ||
@@ -349,6 +349,23 @@ namespace llaminar2
             missing("output.up", output.up))
         {
             return graph;
+        }
+
+        if (mtp_moe)
+        {
+            if (missing("mtp.moe_gate", weights.fa_block.moe_gate) ||
+                missing("mtp.moe_gate_exps", weights.fa_block.moe_gate_exps) ||
+                missing("mtp.moe_up_exps", weights.fa_block.moe_up_exps) ||
+                missing("mtp.moe_down_exps", weights.fa_block.moe_down_exps) ||
+                missing("output.moe_expert_indices", output.moe_expert_indices) ||
+                missing("output.moe_expert_weights", output.moe_expert_weights) ||
+                missing("output.moe_combined_output", output.moe_combined_output) ||
+                missing("output.moe_shared_expert_output", output.moe_shared_expert_output) ||
+                missing("output.moe_gate_scratch", output.moe_gate_scratch) ||
+                missing("output.moe_up_scratch", output.moe_up_scratch))
+            {
+                return graph;
+            }
         }
 
         graph.addNode(prefix + "embedding",
@@ -447,6 +464,15 @@ namespace llaminar2
         mtp_buffers.ffn_output = output.ffn_output;
         mtp_buffers.extensions[BufferId::FA_Q_RAW] = output.q_raw;
         mtp_buffers.extensions[BufferId::FA_GATE] = output.q_gate;
+        if (mtp_moe)
+        {
+            mtp_buffers.extensions[BufferId::MOE_EXPERT_INDICES] = output.moe_expert_indices;
+            mtp_buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = output.moe_expert_weights;
+            mtp_buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = output.moe_combined_output;
+            mtp_buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = output.moe_shared_expert_output;
+            mtp_buffers.extensions[BufferId::MOE_GATE_SCRATCH] = output.moe_gate_scratch;
+            mtp_buffers.extensions[BufferId::MOE_UP_SCRATCH] = output.moe_up_scratch;
+        }
 
         ComputeGraph attention = buildFAAttentionGraph(
             weights.fa_block,

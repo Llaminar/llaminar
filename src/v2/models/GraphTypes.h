@@ -713,6 +713,13 @@ namespace llaminar2
         TensorBase *gate = nullptr;
         TensorBase *up = nullptr;
         TensorBase *ffn_output = nullptr;
+
+        TensorBase *moe_expert_indices = nullptr;
+        TensorBase *moe_expert_weights = nullptr;
+        TensorBase *moe_combined_output = nullptr;
+        TensorBase *moe_shared_expert_output = nullptr;
+        TensorBase *moe_gate_scratch = nullptr;
+        TensorBase *moe_up_scratch = nullptr;
     };
 
     struct MTPDepthWeightBindings
