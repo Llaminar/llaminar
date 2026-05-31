@@ -252,6 +252,95 @@ namespace llaminar2
         return plan;
     }
 
+    ForwardExecutionEngine::PrefillChunkRuntimeSchedule ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        const ForwardInput &input,
+        const PrefillChunkSchedulerPolicy &policy,
+        int pad_token_id,
+        bool allow_padded_execution)
+    {
+        PrefillChunkRuntimeSchedule runtime_schedule;
+
+        if (!input.token_ids)
+        {
+            runtime_schedule.error = "bucketed prefill schedule requires token_ids";
+            return runtime_schedule;
+        }
+        if (input.batch_size != 1)
+        {
+            runtime_schedule.error = "bucketed prefill schedule currently supports batch_size=1";
+            return runtime_schedule;
+        }
+
+        runtime_schedule.schedule = planPrefillChunkSchedule(policy);
+        if (!runtime_schedule.schedule)
+        {
+            runtime_schedule.error = runtime_schedule.schedule.error;
+            return runtime_schedule;
+        }
+
+        const int input_real_tokens = effectiveRealSeqLen(input);
+        const int input_start = effectiveTokenOffset(input);
+        if (input_real_tokens <= 0)
+        {
+            runtime_schedule.error = "input real token count must be positive";
+            return runtime_schedule;
+        }
+        if (input_start < 0)
+        {
+            runtime_schedule.error = "input token offset must be non-negative";
+            return runtime_schedule;
+        }
+        const int input_end = input_start + input_real_tokens;
+
+        runtime_schedule.chunks.reserve(runtime_schedule.schedule.chunks.size());
+        for (const auto &chunk : runtime_schedule.schedule.chunks)
+        {
+            if (chunk.token_offset < input_start ||
+                chunk.token_offset + chunk.real_count > input_end)
+            {
+                runtime_schedule.error = "scheduled chunk range is outside input token range";
+                runtime_schedule.chunks.clear();
+                return runtime_schedule;
+            }
+
+            ForwardInput chunk_input = input;
+            const int relative_offset = chunk.token_offset - input_start;
+            chunk_input.token_ids = input.token_ids + relative_offset;
+            chunk_input.seq_len = chunk.real_count;
+            chunk_input.real_seq_len = chunk.real_count;
+            chunk_input.bucket_seq_len = 0;
+            chunk_input.token_offset = chunk.token_offset;
+            chunk_input.position_offset = chunk.token_offset;
+
+            auto runtime_plan = prepareSinglePrefillChunkRuntimePlan(
+                chunk_input,
+                policy.bucket_sizes,
+                pad_token_id,
+                allow_padded_execution);
+            runtime_plan.chunk_index = chunk.chunk_index;
+            runtime_plan.rebalance_allowed_after = chunk.rebalance_allowed_after;
+            runtime_plan.rebalance_required_after = chunk.rebalance_required_after;
+
+            if (!runtime_plan)
+            {
+                runtime_schedule.error = runtime_plan.error;
+                runtime_schedule.chunks.push_back(std::move(runtime_plan));
+                return runtime_schedule;
+            }
+            if (runtime_plan.chunk.bucket_seq_len != chunk.bucket_seq_len)
+            {
+                runtime_schedule.error = "runtime chunk bucket does not match scheduler bucket";
+                runtime_schedule.chunks.clear();
+                return runtime_schedule;
+            }
+
+            runtime_schedule.chunks.push_back(std::move(runtime_plan));
+        }
+
+        runtime_schedule.ok = true;
+        return runtime_schedule;
+    }
+
     bool ForwardExecutionEngine::runPrefillChunk(
         const ForwardInput &base_input,
         const PrefillChunkRuntimePlan &plan,

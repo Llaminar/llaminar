@@ -422,6 +422,99 @@ TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_PaddedBucketCanBePr
     EXPECT_EQ(plan.chunk.position_ids, (std::vector<int>{100, 101, 102, 103, 104, 105, 106, 107}));
 }
 
+TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimeSchedule_PreparesExplicitRange)
+{
+    const std::vector<int> tokens = {100, 101, 102, 103, 104, 105, 106, 107, 108, 109};
+    auto input = makeTestInput(static_cast<int>(tokens.size()), 1, DeviceId::cpu(), tokens.data(), nullptr);
+    input.token_offset = 10;
+    input.real_seq_len = static_cast<int>(tokens.size());
+
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {4};
+    policy.fixed_chunk_real_tokens = 4;
+    policy.min_rebalance_interval_tokens = 4;
+    policy.max_rebalance_interval_tokens = 4;
+    policy.real_token_start = 12;
+    policy.real_token_count = 7;
+
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/true);
+
+    ASSERT_TRUE(schedule) << schedule.error;
+    ASSERT_EQ(schedule.chunks.size(), 2u);
+
+    const auto &first = schedule.chunks[0];
+    EXPECT_EQ(first.chunk_index, 0);
+    EXPECT_EQ(first.chunk.token_offset, 12);
+    EXPECT_EQ(first.chunk.real_count, 4);
+    EXPECT_EQ(first.chunk.bucket_seq_len, 4);
+    EXPECT_EQ(first.chunk.token_ids, (std::vector<int>{102, 103, 104, 105}));
+    EXPECT_EQ(first.chunk.position_ids, (std::vector<int>{12, 13, 14, 15}));
+    EXPECT_TRUE(first.rebalance_allowed_after);
+    EXPECT_TRUE(first.rebalance_required_after);
+
+    const auto &second = schedule.chunks[1];
+    EXPECT_EQ(second.chunk_index, 1);
+    EXPECT_EQ(second.chunk.token_offset, 16);
+    EXPECT_EQ(second.chunk.real_count, 3);
+    EXPECT_EQ(second.chunk.bucket_seq_len, 4);
+    EXPECT_EQ(second.chunk.token_ids, (std::vector<int>{106, 107, 108, 0}));
+    EXPECT_EQ(second.chunk.position_ids, (std::vector<int>{16, 17, 18, 19}));
+    EXPECT_TRUE(second.padding_required);
+    EXPECT_FALSE(second.rebalance_allowed_after);
+    EXPECT_FALSE(second.rebalance_required_after);
+}
+
+TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimeSchedule_RejectsRangeOutsideInput)
+{
+    const std::vector<int> tokens = {10, 11, 12, 13};
+    auto input = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), nullptr);
+    input.token_offset = 20;
+
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {4};
+    policy.fixed_chunk_real_tokens = 4;
+    policy.real_token_start = 22;
+    policy.real_token_count = 4;
+
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/true);
+
+    EXPECT_FALSE(schedule);
+    EXPECT_NE(schedule.error.find("outside input"), std::string::npos);
+    EXPECT_TRUE(schedule.chunks.empty());
+}
+
+TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimeSchedule_RejectsPaddedChunkWithoutOptIn)
+{
+    const std::vector<int> tokens = {10, 11, 12};
+    auto input = makeTestInput(3, 1, DeviceId::cpu(), tokens.data(), nullptr);
+
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {4};
+    policy.fixed_chunk_real_tokens = 3;
+    policy.real_token_start = 0;
+    policy.real_token_count = 3;
+
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/99,
+        /*allow_padded_execution=*/false);
+
+    EXPECT_FALSE(schedule);
+    EXPECT_NE(schedule.error.find("requires caller opt-in"), std::string::npos);
+    ASSERT_EQ(schedule.chunks.size(), 1u);
+    EXPECT_EQ(schedule.chunks[0].chunk.token_ids, (std::vector<int>{10, 11, 12, 99}));
+    EXPECT_FALSE(schedule.chunks[0].chunk.ok);
+}
+
 TEST_F(Test__ForwardExecutionEngine, PrefillChunkRuntimePlan_RejectsBatchSizeAboveOne)
 {
     const std::vector<int> tokens = {1, 2, 3, 4};

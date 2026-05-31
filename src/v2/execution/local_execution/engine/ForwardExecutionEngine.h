@@ -187,11 +187,27 @@ namespace llaminar2
         {
             bool ok = false;                  ///< True when this chunk may execute under current gates.
             bool padding_required = false;    ///< True when real_count < bucket_seq_len.
+            int chunk_index = 0;              ///< Stable chunk ordinal within a prepared schedule.
+            bool rebalance_allowed_after = false; ///< True when a maintenance hook may run after this chunk.
+            bool rebalance_required_after = false; ///< True when a maintenance hook must run after this chunk.
             PrefillBucketSelection selection; ///< Bucket selection result.
             PrefillChunkExecutionInput chunk; ///< Prepared host buffers and real/bucket metadata.
             std::string error;                ///< Failure reason when ok is false.
 
             /// @brief Convenience conversion for success checks.
+            explicit operator bool() const { return ok; }
+        };
+
+        /**
+         * @brief Prepared runtime plans for a multi-chunk prefill range.
+         */
+        struct PrefillChunkRuntimeSchedule
+        {
+            bool ok = false;
+            PrefillChunkSchedule schedule;
+            std::vector<PrefillChunkRuntimePlan> chunks;
+            std::string error;
+
             explicit operator bool() const { return ok; }
         };
 
@@ -210,6 +226,20 @@ namespace llaminar2
         static PrefillChunkRuntimePlan prepareSinglePrefillChunkRuntimePlan(
             const ForwardInput &input,
             const std::vector<int> &bucket_sizes,
+            int pad_token_id,
+            bool allow_padded_execution = false);
+
+        /**
+         * @brief Prepare all bucketed runtime chunks for an explicit schedule policy.
+         *
+         * `input.token_ids` must point to the first real token at
+         * `input.token_offset`. The policy's real-token range must be contained
+         * within `[input.token_offset, input.token_offset + input.real_seq_len)`;
+         * `input.seq_len` is used when `input.real_seq_len` is not set.
+         */
+        static PrefillChunkRuntimeSchedule preparePrefillChunkRuntimeSchedule(
+            const ForwardInput &input,
+            const PrefillChunkSchedulerPolicy &policy,
             int pad_token_id,
             bool allow_padded_execution = false);
 
