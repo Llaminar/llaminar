@@ -6300,6 +6300,14 @@ namespace llaminar2
         if (std::regex_search(name, match, layer_pattern))
         {
             int layer_idx = std::stoi(match[1].str());
+            const std::string sidecar_prefix = "blk." + std::to_string(layer_idx) + ".";
+            if (loader_.hasTensor(sidecar_prefix + "nextn.eh_proj.weight"))
+            {
+                // Qwen3.6 encodes MTP as a trailing blk.N sidecar. The main graph
+                // layer range intentionally excludes that block, but the MTP
+                // manifest may still request its attention/FFN tensors.
+                return true;
+            }
             // Layer range is [first, last) - first inclusive, last exclusive
             return layer_idx >= first_layer && layer_idx < last_layer;
         }

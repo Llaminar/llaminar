@@ -5698,25 +5698,25 @@ add_v2_test(V2_Integration_PrefixCacheStateProbe
     TIMEOUT 300
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmSmoke
-    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPRealModelSmokeOptIn
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU"
     MPI_PROCS 1
     TIMEOUT 1200
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmPrefixSmoke
-    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmPrefixCacheMTPRealModelSmokeOptIn
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmPrefixCacheMTPRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU"
     MPI_PROCS 1
     TIMEOUT 1200
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPSmoke
-    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPMTPRealModelSmokeOptIn
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPMTPRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP"
     MPI_PROCS 1
     TIMEOUT 1200
 )
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPPrefixSmoke
-    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmokeOptIn
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP"
     MPI_PROCS 1
     TIMEOUT 1200

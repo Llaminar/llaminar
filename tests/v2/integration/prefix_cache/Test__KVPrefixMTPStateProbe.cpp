@@ -1474,14 +1474,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseNodeLocalTPPrefixRestoreParity)
         PrefixRestoreParityMode::FullHit);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
 {
-    const char *enabled = std::getenv("LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE");
-    if (!enabled || std::string(enabled) != "1")
-    {
-        GTEST_SKIP() << "Set LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE=1 to run real Qwen3.6 ROCm MTP smoke";
-    }
-
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
         env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
@@ -1555,14 +1549,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
     EXPECT_GE(mtp_snapshot.mtp_rollbacks, 2u);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmokeOptIn)
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
 {
-    const char *enabled = std::getenv("LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE");
-    if (!enabled || std::string(enabled) != "1")
-    {
-        GTEST_SKIP() << "Set LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE=1 to run real Qwen3.6 ROCm prefix+MTP smoke";
-    }
-
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
         env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
@@ -1667,14 +1655,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmokeOptIn)
     EXPECT_GE(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs + 2u);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmokeOptIn)
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
 {
-    const char *enabled = std::getenv("LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE");
-    if (!enabled || std::string(enabled) != "1")
-    {
-        GTEST_SKIP() << "Set LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE=1 to run real Qwen3.6 ROCm LocalTP MTP smoke";
-    }
-
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
         env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
@@ -1729,14 +1711,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmokeOptIn)
     EXPECT_GE(snapshot.mtp_rollbacks, 1u);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmokeOptIn)
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
 {
-    const char *enabled = std::getenv("LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE");
-    if (!enabled || std::string(enabled) != "1")
-    {
-        GTEST_SKIP() << "Set LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE=1 to run real Qwen3.6 ROCm LocalTP prefix+MTP smoke";
-    }
-
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
         env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
