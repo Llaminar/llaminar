@@ -484,6 +484,7 @@ namespace llaminar2
         bool mpi_coordinated_mode_{false};                              // When true, rank 0 broadcasts commands for worker loop
         std::shared_ptr<ITokenizer> tokenizer_;
         MTPStats mtp_stats_;
+        PrefillChunkStats prefill_chunk_stats_;
         bool mtp_bypassed_{false};
         bool mtp_bypass_recorded_for_request_{false};
         std::string mtp_bypass_reason_;

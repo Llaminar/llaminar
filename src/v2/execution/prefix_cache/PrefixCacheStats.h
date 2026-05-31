@@ -45,4 +45,14 @@ namespace llaminar2
         uint64_t verifier_token_count = 0;
     };
 
+    struct PrefillChunkStats
+    {
+        uint64_t schedules = 0;
+        uint64_t successful_schedules = 0;
+        uint64_t chunks = 0;
+        uint64_t real_tokens = 0;
+        uint64_t padded_tokens = 0;
+        uint64_t failures = 0;
+    };
+
 } // namespace llaminar2

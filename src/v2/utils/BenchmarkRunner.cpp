@@ -96,7 +96,13 @@ namespace llaminar2
                snapshot.mtp_rollbacks != 0 ||
                snapshot.mtp_bypasses != 0 ||
                snapshot.mtp_verifier_runs != 0 ||
-               snapshot.mtp_verifier_token_count != 0;
+               snapshot.mtp_verifier_token_count != 0 ||
+               snapshot.prefill_chunk_schedules != 0 ||
+               snapshot.prefill_chunk_successful_schedules != 0 ||
+               snapshot.prefill_chunks != 0 ||
+               snapshot.prefill_chunk_real_tokens != 0 ||
+               snapshot.prefill_chunk_padded_tokens != 0 ||
+               snapshot.prefill_chunk_failures != 0;
     }
 
     static std::string formatByteCount(uint64_t bytes)
@@ -853,6 +859,23 @@ namespace llaminar2
                         << ", MTP " << formatByteCount(prefix_state.prefix_cache_mtp_state_bytes)
                         << ", terminal hits " << prefix_state.prefix_cache_terminal_state_hits;
                 state_table << "Payload state" << payload.str() << fort::endr;
+            }
+            if (prefix_state.prefill_chunk_schedules != 0 ||
+                prefix_state.prefill_chunk_successful_schedules != 0 ||
+                prefix_state.prefill_chunks != 0 ||
+                prefix_state.prefill_chunk_real_tokens != 0 ||
+                prefix_state.prefill_chunk_padded_tokens != 0 ||
+                prefix_state.prefill_chunk_failures != 0)
+            {
+                std::ostringstream chunked;
+                chunked << prefix_state.prefill_chunk_successful_schedules
+                        << "/" << prefix_state.prefill_chunk_schedules
+                        << " schedules, "
+                        << prefix_state.prefill_chunks << " chunks, "
+                        << prefix_state.prefill_chunk_real_tokens << " real tokens, "
+                        << prefix_state.prefill_chunk_padded_tokens << " padded tokens, "
+                        << prefix_state.prefill_chunk_failures << " failures";
+                state_table << "Prefill chunks" << chunked.str() << fort::endr;
             }
 
             if (prefix_state.mtp_draft_steps != 0 ||

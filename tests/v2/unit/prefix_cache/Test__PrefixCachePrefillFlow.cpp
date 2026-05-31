@@ -323,6 +323,14 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSu
     EXPECT_EQ(mock_ptr->last_chunk_schedule_pad_token_id, 99);
     EXPECT_TRUE(mock_ptr->last_chunk_schedule_allow_padded);
     EXPECT_EQ(mock_ptr->harvest_calls, 1);
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.prefill_chunk_schedules, 1u);
+    EXPECT_EQ(probe.prefill_chunk_successful_schedules, 1u);
+    EXPECT_EQ(probe.prefill_chunks, 2u);
+    EXPECT_EQ(probe.prefill_chunk_real_tokens, 3u);
+    EXPECT_EQ(probe.prefill_chunk_padded_tokens, 1u);
+    EXPECT_EQ(probe.prefill_chunk_failures, 0u);
 }
 
 TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixFallsBackWhenChunkScheduleUnsupported)
@@ -342,6 +350,41 @@ TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixFallsBackWhenChunkScheduleUns
     EXPECT_EQ(mock_ptr->chunk_schedule_calls, 0);
     EXPECT_EQ(mock_ptr->forward_calls, 1);
     EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4, 5));
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.prefill_chunk_schedules, 0u);
+    EXPECT_EQ(probe.prefill_chunks, 0u);
+    EXPECT_EQ(probe.prefill_chunk_failures, 0u);
+}
+
+TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixReportsChunkScheduleFailure)
+{
+    ScopedPrefillChunkScheduleEnv env;
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->supports_chunk_schedule = true;
+    mock_ptr->chunk_schedule_ok = false;
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 2;
+
+    auto runner = makeRunner(std::move(mock));
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_FALSE(runner->prefill(prompt));
+    EXPECT_THAT(runner->lastError(), HasSubstr("chunked prefill failed"));
+
+    EXPECT_EQ(mock_ptr->chunk_schedule_calls, 1);
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 0);
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.prefill_chunk_schedules, 1u);
+    EXPECT_EQ(probe.prefill_chunk_successful_schedules, 0u);
+    EXPECT_EQ(probe.prefill_chunks, 0u);
+    EXPECT_EQ(probe.prefill_chunk_real_tokens, 0u);
+    EXPECT_EQ(probe.prefill_chunk_padded_tokens, 0u);
+    EXPECT_EQ(probe.prefill_chunk_failures, 1u);
 }
 
 TEST(Test__PrefixCachePrefillFlow, MTPPartialHitWithoutTerminalHiddenRecomputesBoundaryBlock)

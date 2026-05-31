@@ -461,6 +461,23 @@ namespace llaminar2
             policy.real_token_start = runner_->get_position();
             policy.real_token_count = token_count;
 
+            PrefillChunkSchedule chunk_schedule = planPrefillChunkSchedule(policy);
+            if (!chunk_schedule)
+            {
+                ++prefill_chunk_stats_.schedules;
+                ++prefill_chunk_stats_.failures;
+                return setError(failure_message + " (chunk planning failed: " +
+                                chunk_schedule.error + ")");
+            }
+
+            uint64_t padded_tokens = 0;
+            for (const auto &chunk : chunk_schedule.chunks)
+            {
+                padded_tokens += static_cast<uint64_t>(
+                    std::max(0, chunk.bucket_seq_len - chunk.real_count));
+            }
+
+            ++prefill_chunk_stats_.schedules;
             if (runner_->forwardPrefillChunkSchedule(
                     tokens,
                     token_count,
@@ -468,9 +485,15 @@ namespace llaminar2
                     exec.prefill_graph_pad_token_id,
                     /*allow_padded_execution=*/true))
             {
+                ++prefill_chunk_stats_.successful_schedules;
+                prefill_chunk_stats_.chunks +=
+                    static_cast<uint64_t>(chunk_schedule.chunks.size());
+                prefill_chunk_stats_.real_tokens += static_cast<uint64_t>(token_count);
+                prefill_chunk_stats_.padded_tokens += padded_tokens;
                 return true;
             }
 
+            ++prefill_chunk_stats_.failures;
             return setError(failure_message + " (chunked prefill failed)");
         }
 
@@ -1190,6 +1213,12 @@ namespace llaminar2
         snapshot.mtp_bypasses = mtp_stats_.bypasses;
         snapshot.mtp_verifier_runs = mtp_stats_.verifier_runs;
         snapshot.mtp_verifier_token_count = mtp_stats_.verifier_token_count;
+        snapshot.prefill_chunk_schedules = prefill_chunk_stats_.schedules;
+        snapshot.prefill_chunk_successful_schedules = prefill_chunk_stats_.successful_schedules;
+        snapshot.prefill_chunks = prefill_chunk_stats_.chunks;
+        snapshot.prefill_chunk_real_tokens = prefill_chunk_stats_.real_tokens;
+        snapshot.prefill_chunk_padded_tokens = prefill_chunk_stats_.padded_tokens;
+        snapshot.prefill_chunk_failures = prefill_chunk_stats_.failures;
         if (snapshot.architecture.empty() && model_ctx_)
         {
             snapshot.architecture = model_ctx_->architecture();

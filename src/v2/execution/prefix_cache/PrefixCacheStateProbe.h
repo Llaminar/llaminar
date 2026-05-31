@@ -94,6 +94,12 @@ namespace llaminar2
         uint64_t mtp_bypasses = 0;
         uint64_t mtp_verifier_runs = 0;
         uint64_t mtp_verifier_token_count = 0;
+        uint64_t prefill_chunk_schedules = 0;
+        uint64_t prefill_chunk_successful_schedules = 0;
+        uint64_t prefill_chunks = 0;
+        uint64_t prefill_chunk_real_tokens = 0;
+        uint64_t prefill_chunk_padded_tokens = 0;
+        uint64_t prefill_chunk_failures = 0;
         std::vector<int> positions;
         std::vector<int> sequence_lengths;
         std::vector<PrefixKVCacheProbe> kv_caches;

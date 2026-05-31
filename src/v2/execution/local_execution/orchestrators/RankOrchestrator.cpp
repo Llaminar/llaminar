@@ -2753,6 +2753,13 @@ namespace llaminar2
             snapshot.mtp_bypasses += child.mtp_bypasses;
             snapshot.mtp_verifier_runs += child.mtp_verifier_runs;
             snapshot.mtp_verifier_token_count += child.mtp_verifier_token_count;
+            snapshot.prefill_chunk_schedules += child.prefill_chunk_schedules;
+            snapshot.prefill_chunk_successful_schedules +=
+                child.prefill_chunk_successful_schedules;
+            snapshot.prefill_chunks += child.prefill_chunks;
+            snapshot.prefill_chunk_real_tokens += child.prefill_chunk_real_tokens;
+            snapshot.prefill_chunk_padded_tokens += child.prefill_chunk_padded_tokens;
+            snapshot.prefill_chunk_failures += child.prefill_chunk_failures;
             if (snapshot.primary_device.is_cpu() && !child.primary_device.is_cpu())
             {
                 snapshot.primary_device = child.primary_device;

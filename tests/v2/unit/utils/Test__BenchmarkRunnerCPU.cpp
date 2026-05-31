@@ -328,6 +328,12 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     runner->snapshot.mtp_bypasses = 1;
     runner->snapshot.mtp_verifier_runs = 4;
     runner->snapshot.mtp_verifier_token_count = 8;
+    runner->snapshot.prefill_chunk_schedules = 2;
+    runner->snapshot.prefill_chunk_successful_schedules = 1;
+    runner->snapshot.prefill_chunks = 3;
+    runner->snapshot.prefill_chunk_real_tokens = 512;
+    runner->snapshot.prefill_chunk_padded_tokens = 32;
+    runner->snapshot.prefill_chunk_failures = 1;
 
     auto tokenizer = createMockTokenizer();
     auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
@@ -354,6 +360,12 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     EXPECT_EQ(result.prefix_state.mtp_bypasses, 1u);
     EXPECT_EQ(result.prefix_state.mtp_verifier_runs, 4u);
     EXPECT_EQ(result.prefix_state.mtp_verifier_token_count, 8u);
+    EXPECT_EQ(result.prefix_state.prefill_chunk_schedules, 2u);
+    EXPECT_EQ(result.prefix_state.prefill_chunk_successful_schedules, 1u);
+    EXPECT_EQ(result.prefix_state.prefill_chunks, 3u);
+    EXPECT_EQ(result.prefix_state.prefill_chunk_real_tokens, 512u);
+    EXPECT_EQ(result.prefix_state.prefill_chunk_padded_tokens, 32u);
+    EXPECT_EQ(result.prefix_state.prefill_chunk_failures, 1u);
 
     testing::internal::CaptureStdout();
     bench.printResults(result);
@@ -365,4 +377,6 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     EXPECT_NE(output.find("RAM budget cannot hold one complete prefix block"), std::string::npos);
     EXPECT_NE(output.find("sampling is not greedy"), std::string::npos);
     EXPECT_NE(output.find("MTP decode"), std::string::npos);
+    EXPECT_NE(output.find("Prefill chunks"), std::string::npos);
+    EXPECT_NE(output.find("1/2 schedules"), std::string::npos);
 }
