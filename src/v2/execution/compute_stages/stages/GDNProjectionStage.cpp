@@ -9,8 +9,53 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 
+#include <typeinfo>
+
 namespace llaminar2
 {
+    namespace
+    {
+        bool sameKernelType(const ITensorGemm *lhs, const ITensorGemm *rhs)
+        {
+            return lhs && rhs && typeid(*lhs) == typeid(*rhs);
+        }
+
+        bool multiplyProjectionFallback(
+            const TensorBase *input,
+            const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
+            int m,
+            int k,
+            DeviceWorkspaceManager *workspace)
+        {
+            for (const auto &projection : projections)
+            {
+                if (!projection.kernel || !projection.output)
+                    return false;
+
+                const bool ok = projection.kernel->multiply_tensor(
+                    input,
+                    projection.output,
+                    m,
+                    projection.n,
+                    k,
+                    true,
+                    1.0f,
+                    0.0f,
+                    projection.bias,
+                    nullptr,
+                    -1,
+                    workspace);
+                if (!ok)
+                {
+                    LOG_ERROR("[GDNProjectionStage] Projection fallback failed for "
+                              << (projection.name ? projection.name : "unnamed"));
+                    return false;
+                }
+            }
+            return true;
+        }
+    } // namespace
+
     GDNProjectionStage::GDNProjectionStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
@@ -155,9 +200,29 @@ namespace llaminar2
             {gemm_a, C_a, params_.n_a, nullptr, "alpha"},
             {gemm_b, C_b, params_.n_b, nullptr, "beta"}};
 
-        if (!gemm_qkv->multiply_fused_tensor(A_base, projections, M, K, nullptr, bound_workspace_))
+        const bool homogeneous_projection_kernels =
+            sameKernelType(gemm_qkv, gemm_z) &&
+            sameKernelType(gemm_qkv, gemm_a) &&
+            sameKernelType(gemm_qkv, gemm_b);
+
+        bool success = false;
+        if (homogeneous_projection_kernels)
         {
-            LOG_ERROR("[GDNProjectionStage] Fused 4-projection GEMM failed");
+            success = gemm_qkv->multiply_fused_tensor(A_base, projections, M, K, nullptr, bound_workspace_);
+            if (!success)
+                LOG_WARN("[GDNProjectionStage] Fused 4-projection GEMM failed; retrying per-projection fallback");
+        }
+        else
+        {
+            LOG_DEBUG("[GDNProjectionStage] Mixed projection GEMM kernels; using per-projection fallback");
+        }
+
+        if (!success)
+            success = multiplyProjectionFallback(A_base, projections, M, K, bound_workspace_);
+
+        if (!success)
+        {
+            LOG_ERROR("[GDNProjectionStage] 4-projection GEMM failed");
             return false;
         }
 

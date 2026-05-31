@@ -40,6 +40,7 @@
 #include "loaders/WeightPlan.h"
 #include "tensors/TensorKernels.h"
 #include "memory/BufferId.h"
+#include "../../../mocks/MockModelContext.h"
 #include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -656,6 +657,43 @@ TEST(Test__Qwen35Schema, LayerTypes_Interval4)
     EXPECT_EQ(config.layer_types[4], "gdn");
     EXPECT_EQ(config.layer_types[7], "full_attention");
     EXPECT_EQ(config.layer_types[31], "full_attention");
+}
+
+TEST(Test__Qwen35Schema, ConfigBuilder_LayerTypesPreferTensorInventory)
+{
+    auto ctx = MockModelContextBuilder()
+                   .setArchitecture("qwen35")
+                   .setBlockCount(5)
+                   .setEmbeddingLength(256)
+                   .setHeadCount(4)
+                   .setHeadCountKV(1)
+                   .setFeedForwardLength(512)
+                   .setVocabSize(1024)
+                   .build();
+
+    auto &loader = ctx->mockLoader();
+    loader.setIntParam("qwen35.ssm.conv_kernel", 4);
+    loader.setIntParam("qwen35.ssm.state_size", 64);
+    loader.setIntParam("qwen35.ssm.inner_size", 256);
+    loader.setIntParam("qwen35.ssm.group_count", 2);
+    loader.setIntParam("qwen35.ssm.time_step_rank", 4);
+    loader.setIntParam("qwen35.full_attention_interval", 4);
+
+    // The interval fallback would mark layer 3 full-attention and layer 4 GDN.
+    // Real Qwen3.6 nextn layouts prove the tensor directory is more specific.
+    loader.addFP32ZerosTensor("blk.3.attn_qkv.weight", {512, 256});
+    loader.addFP32ZerosTensor("blk.4.attn_q.weight", {256, 256});
+
+    GraphConfig config;
+    Qwen35GraphConfigBuilder builder;
+    ASSERT_TRUE(builder.populateFromModelContext(*ctx, config));
+
+    ASSERT_EQ(config.layer_types.size(), 5u);
+    EXPECT_EQ(config.layer_types[0], "gdn");
+    EXPECT_EQ(config.layer_types[1], "gdn");
+    EXPECT_EQ(config.layer_types[2], "gdn");
+    EXPECT_EQ(config.layer_types[3], "gdn");
+    EXPECT_EQ(config.layer_types[4], "full_attention");
 }
 
 TEST(Test__Qwen35Schema, IsFullAttentionLayer_Shortcut)

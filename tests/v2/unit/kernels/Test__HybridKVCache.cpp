@@ -416,6 +416,20 @@ namespace llaminar2::test
         EXPECT_EQ(restored_v, v_payload);
     }
 
+    TEST_F(Test__CPUHybridKVCache, PrefixCachedTokensProbeUsesFirstFullAttentionLayer)
+    {
+        auto cache = createCache();
+
+        const int kv_dim = N_KV_HEADS * HEAD_DIM;
+        auto k_tensor = TestTensorFactory::createFP32Zeros({2, static_cast<size_t>(kv_dim)});
+        auto v_tensor = TestTensorFactory::createFP32Zeros({2, static_cast<size_t>(kv_dim)});
+        ASSERT_TRUE(cache->append_kv(3, 0, k_tensor.get(), v_tensor.get(), 2));
+
+        EXPECT_EQ(cache->get_cached_tokens(cache->first_layer_index(), 0), 0);
+        EXPECT_EQ(firstRestorablePrefixLayer(*cache), 3);
+        EXPECT_EQ(restorablePrefixCachedTokens(*cache, 0), 2);
+    }
+
     TEST_F(Test__CPUHybridKVCache, HybridPrefixStateMetadataCountsHostBytes)
     {
         auto cache = createCache();

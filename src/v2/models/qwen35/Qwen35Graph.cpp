@@ -395,6 +395,7 @@ namespace llaminar2
                           .eps = config_.rms_norm_eps,
                           .subtract_one = config_.rms_norm_subtract_one,
                           .seq_len = total_tokens,
+                          .input_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
                           .output_buffer_id = BufferId::MTP_NORM_HIDDEN,
                       }),
                       device);
@@ -462,8 +463,22 @@ namespace llaminar2
         mtp_buffers.gate = output.gate;
         mtp_buffers.up = output.up;
         mtp_buffers.ffn_output = output.ffn_output;
-        mtp_buffers.extensions[BufferId::FA_Q_RAW] = output.q_raw;
-        mtp_buffers.extensions[BufferId::FA_GATE] = output.q_gate;
+        mtp_buffers.extensions[BufferId::MTP_FA_Q_RAW] = output.q_raw;
+        mtp_buffers.extensions[BufferId::MTP_FA_GATE] = output.q_gate;
+        mtp_buffers.binding_ids = {
+            {BufferId::HIDDEN_STATE, BufferId::MTP_PROJECTED},
+            {BufferId::NORMALIZED, BufferId::MTP_NORM_HIDDEN},
+            {BufferId::Q_PROJ, BufferId::MTP_Q_PROJ},
+            {BufferId::K_PROJ, BufferId::MTP_K_PROJ},
+            {BufferId::V_PROJ, BufferId::MTP_V_PROJ},
+            {BufferId::FA_Q_RAW, BufferId::MTP_FA_Q_RAW},
+            {BufferId::FA_GATE, BufferId::MTP_FA_GATE},
+            {BufferId::ATTN_OUTPUT, BufferId::MTP_ATTN_OUTPUT},
+            {BufferId::ATTN_PROJ, BufferId::MTP_ATTN_PROJ},
+            {BufferId::GATE_PROJ, BufferId::MTP_GATE_PROJ},
+            {BufferId::UP_PROJ, BufferId::MTP_UP_PROJ},
+            {BufferId::FFN_OUTPUT, BufferId::MTP_FFN_OUTPUT},
+        };
         if (mtp_moe)
         {
             mtp_buffers.extensions[BufferId::MOE_EXPERT_INDICES] = output.moe_expert_indices;
@@ -886,8 +901,8 @@ namespace llaminar2
         const bool has_qkv_proj = (layer.wq && layer.wk && layer.wv);
 
         // Retrieve extension buffers for FA gate path
-        TensorBase *fa_q_raw = buffers.get(BufferId::FA_Q_RAW);
-        TensorBase *fa_gate = buffers.get(BufferId::FA_GATE);
+        TensorBase *fa_q_raw = buffers.get(buffers.idFor(BufferId::FA_Q_RAW));
+        TensorBase *fa_gate = buffers.get(buffers.idFor(BufferId::FA_GATE));
 
         if (!fa_q_raw || !fa_gate)
         {
@@ -926,10 +941,10 @@ namespace llaminar2
                               .output_v = buffers.V,
                               .n_v = v_n,
                               .bias_v = layer.v_bias,
-                              .input_buffer_id = BufferId::NORMALIZED,
-                              .output_q_buffer_id = BufferId::FA_Q_RAW,
-                              .output_k_buffer_id = BufferId::K_PROJ,
-                              .output_v_buffer_id = BufferId::V_PROJ,
+                              .input_buffer_id = buffers.idFor(BufferId::NORMALIZED),
+                              .output_q_buffer_id = buffers.idFor(BufferId::FA_Q_RAW),
+                              .output_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                              .output_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
                               .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
                               .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
                               .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
@@ -953,9 +968,9 @@ namespace llaminar2
                               .seq_len = total_tokens,
                               .n_heads = local_n_heads,
                               .head_dim = config_.head_dim,
-                              .input_buffer_id = BufferId::FA_Q_RAW,
-                              .output_q_buffer_id = BufferId::Q_PROJ,
-                              .output_gate_buffer_id = BufferId::FA_GATE,
+                              .input_buffer_id = buffers.idFor(BufferId::FA_Q_RAW),
+                              .output_q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
+                              .output_gate_buffer_id = buffers.idFor(BufferId::FA_GATE),
                           }),
                           device);
 
@@ -1011,9 +1026,9 @@ namespace llaminar2
                               .gate = fa_gate,
                               .output = buffers.attn_output,
                               .seq_len = total_tokens,
-                              .input_buffer_id = BufferId::ATTN_OUTPUT,
-                              .gate_buffer_id = BufferId::FA_GATE,
-                              .output_buffer_id = BufferId::ATTN_OUTPUT,
+                              .input_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),
+                              .gate_buffer_id = buffers.idFor(BufferId::FA_GATE),
+                              .output_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),
                           }),
                           device);
             graph.addDependency(prefix + "attn_output_gate", attn_node);

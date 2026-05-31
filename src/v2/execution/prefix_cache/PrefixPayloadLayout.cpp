@@ -26,6 +26,18 @@ namespace llaminar2
         }
     } // namespace
 
+    int firstRestorablePrefixLayer(const IKVCache &kv_cache)
+    {
+        const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&kv_cache);
+        const int fa_layer = firstFullAttentionLayerForLayout(kv_cache, hybrid);
+        return fa_layer >= 0 ? fa_layer : kv_cache.first_layer_index();
+    }
+
+    int restorablePrefixCachedTokens(const IKVCache &kv_cache, int seq_idx)
+    {
+        return kv_cache.get_cached_tokens(firstRestorablePrefixLayer(kv_cache), seq_idx);
+    }
+
     size_t PrefixPayloadLayout::faKVBytes() const
     {
         return static_cast<size_t>(fa_layers) * (bytes_per_fa_layer_k + bytes_per_fa_layer_v);
@@ -119,7 +131,7 @@ namespace llaminar2
             layout.includes_hybrid_state = layout.hybrid_state_bytes > 0;
         }
 
-        const int layout_probe_layer = firstFullAttentionLayerForLayout(kv_cache, hybrid);
+        const int layout_probe_layer = firstRestorablePrefixLayer(kv_cache);
         const auto block = layout_probe_layer >= 0
                                ? kv_cache.logicalBlockLayout(layout_probe_layer, block_size)
                                : IKVCache::KVCacheLogicalBlockLayout{};

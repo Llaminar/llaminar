@@ -131,6 +131,29 @@ namespace llaminar2
         return true;
     }
 
+    bool BufferArena::bindExternalBuffer(BufferId id, ITensor *tensor)
+    {
+        auto idx = static_cast<size_t>(id);
+        if (idx >= kBufferCount || !tensor)
+            return false;
+
+        auto &b = buffers_[idx];
+        if (b.owned_tensor || (b.registered && !b.external_tensor))
+        {
+            LOG_WARN("BufferArena: cannot bind external tensor over arena-owned buffer "
+                     << bufferIdName(id));
+            return false;
+        }
+
+        b.registered = true;
+        b.external_tensor = tensor;
+        b.rows = tensor->rows();
+        b.cols = tensor->cols();
+        b.dtype = nullptr;
+        b.coherence = {};
+        return true;
+    }
+
     void BufferArena::registerAlias(BufferId a, BufferId b)
     {
         auto idx_a = static_cast<size_t>(a);
@@ -186,6 +209,10 @@ namespace llaminar2
             return "current_hidden";
         case BufferId::LOGITS:
             return "logits";
+        case BufferId::ALL_POSITION_LOGITS:
+            return "all_position_logits";
+        case BufferId::ALL_POSITION_LOGITS_LOCAL:
+            return "all_position_logits_local";
         default:
             return nullptr;
         }
@@ -230,6 +257,10 @@ namespace llaminar2
             return BufferId::K_ROPE;
         if (name == "V_dequant")
             return BufferId::V_DEQUANT;
+        if (name == "all_position_logits")
+            return BufferId::ALL_POSITION_LOGITS;
+        if (name == "all_position_logits_local")
+            return BufferId::ALL_POSITION_LOGITS_LOCAL;
 
         // GDN (Gated Delta Network) buffers
         if (name == "gdn_qkv")
@@ -290,6 +321,10 @@ namespace llaminar2
             return BufferId::MTP_K_PROJ;
         if (name == "mtp_v")
             return BufferId::MTP_V_PROJ;
+        if (name == "mtp_q_raw")
+            return BufferId::MTP_FA_Q_RAW;
+        if (name == "mtp_q_gate")
+            return BufferId::MTP_FA_GATE;
         if (name == "mtp_q_rope")
             return BufferId::MTP_Q_ROPE;
         if (name == "mtp_k_rope")

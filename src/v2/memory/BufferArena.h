@@ -137,6 +137,21 @@ namespace llaminar2
         bool registerExternalBuffer(BufferId id, ITensor *tensor);
 
         /**
+         * @brief Bind or replace an externally-owned scratch/output buffer.
+         *
+         * Unlike registerExternalBuffer(), this may be called at runtime for
+         * dynamic-shape activations such as all-position verifier logits. The
+         * buffer slot must not be arena-owned. Rebinding resets coherence to
+         * UNINITIALIZED so the next stage write establishes authority through
+         * the normal prepareForWrite/markWritten path.
+         *
+         * @param id      Unique buffer identifier
+         * @param tensor  Externally-owned tensor (lifetime must outlive use)
+         * @return true on success
+         */
+        bool bindExternalBuffer(BufferId id, ITensor *tensor);
+
+        /**
          * @brief Declare that two buffers may share storage (aliasing).
          *
          * The arena will validate at runtime (debug builds) that aliased

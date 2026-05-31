@@ -63,6 +63,21 @@ namespace llaminar2
             }
             return 0;
         }
+
+        BufferId logitsBufferId(bool column_parallel, bool all_positions)
+        {
+            if (all_positions)
+            {
+                return column_parallel ? BufferId::ALL_POSITION_LOGITS_LOCAL
+                                       : BufferId::ALL_POSITION_LOGITS;
+            }
+            return column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+        }
+
+        BufferId gatheredLogitsBufferId(bool all_positions)
+        {
+            return all_positions ? BufferId::ALL_POSITION_LOGITS : BufferId::LOGITS;
+        }
     }
 
     // Import graph_utils for cleaner code
@@ -644,7 +659,10 @@ namespace llaminar2
         lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
                                         ? BufferId::NORMALIZED
                                         : BufferId::LM_HEAD_INPUT_ROW;
-        lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+        lm_params.output_buffer_id = logitsBufferId(
+            use_column_parallel,
+            config_.compute_all_position_logits &&
+                lm_head_input == buffers_.layer_buffers.normalized);
         lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
         lm_params.compute_all_positions =
             config_.compute_all_position_logits &&
@@ -672,8 +690,11 @@ namespace llaminar2
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             // Multi-domain TP typically doesn't route LM head to a specific domain
             allgather_params.domain = nullptr;
-            allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
-            allgather_params.output_buffer_id = BufferId::LOGITS;
+            allgather_params.input_buffer_id = logitsBufferId(
+                /*column_parallel=*/true,
+                config_.compute_all_position_logits);
+            allgather_params.output_buffer_id = gatheredLogitsBufferId(
+                config_.compute_all_position_logits);
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -987,7 +1008,10 @@ namespace llaminar2
             lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
                                             ? BufferId::NORMALIZED
                                             : BufferId::LM_HEAD_INPUT_ROW;
-            lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+            lm_params.output_buffer_id = logitsBufferId(
+                use_column_parallel,
+                config_.compute_all_position_logits &&
+                    lm_head_input == buffers_.layer_buffers.normalized);
             lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
             lm_params.compute_all_positions =
                 config_.compute_all_position_logits &&
@@ -1012,8 +1036,11 @@ namespace llaminar2
                 // LM head always computes only the last token's logits (lm_m=1)
                 allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
                 allgather_params.domain = nullptr;
-                allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
-                allgather_params.output_buffer_id = BufferId::LOGITS;
+                allgather_params.input_buffer_id = logitsBufferId(
+                    /*column_parallel=*/true,
+                    config_.compute_all_position_logits);
+                allgather_params.output_buffer_id = gatheredLogitsBufferId(
+                    config_.compute_all_position_logits);
 
                 graph.addNode("lm_head_allgather",
                               ComputeStageFactory::createAllGather(allgather_params),
@@ -1346,7 +1373,10 @@ namespace llaminar2
                 lm_params.input_buffer_id = (lm_head_input == buffers_.layer_buffers.normalized)
                                                 ? BufferId::NORMALIZED
                                                 : BufferId::LM_HEAD_INPUT_ROW;
-                lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+                lm_params.output_buffer_id = logitsBufferId(
+                    use_column_parallel,
+                    config_.compute_all_position_logits &&
+                        lm_head_input == buffers_.layer_buffers.normalized);
                 lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
                 lm_params.compute_all_positions =
                     config_.compute_all_position_logits &&
@@ -1371,8 +1401,11 @@ namespace llaminar2
                     // LM head always computes only the last token's logits (lm_m=1)
                     allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
                     allgather_params.domain = nullptr;
-                    allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
-                    allgather_params.output_buffer_id = BufferId::LOGITS;
+                    allgather_params.input_buffer_id = logitsBufferId(
+                        /*column_parallel=*/true,
+                        config_.compute_all_position_logits);
+                    allgather_params.output_buffer_id = gatheredLogitsBufferId(
+                        config_.compute_all_position_logits);
 
                     graph.addNode("lm_head_allgather",
                                   ComputeStageFactory::createAllGather(allgather_params),
@@ -1588,6 +1621,10 @@ namespace llaminar2
         lm_params.bias_tensor = nullptr;
         lm_params.device_id = device;
         lm_params.prepared_store = prepared_weight_store_;
+        lm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+        lm_params.output_buffer_id = logitsBufferId(
+            use_column_parallel,
+            config_.compute_all_position_logits);
         lm_params.compute_all_positions = config_.compute_all_position_logits;
 
         graph.addNode("lm_head",
@@ -1611,8 +1648,11 @@ namespace llaminar2
             allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             allgather_params.domain = nullptr;
-            allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
-            allgather_params.output_buffer_id = BufferId::LOGITS;
+            allgather_params.input_buffer_id = logitsBufferId(
+                /*column_parallel=*/true,
+                config_.compute_all_position_logits);
+            allgather_params.output_buffer_id = gatheredLogitsBufferId(
+                config_.compute_all_position_logits);
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -1662,9 +1702,9 @@ namespace llaminar2
             fused_params.eps = config_.rms_norm_eps;
             fused_params.seq_len = total_tokens;
             fused_params.hidden_dim = config_.d_model;
-            fused_params.input_buffer_id = BufferId::ATTN_PROJ;
-            fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
+            fused_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            fused_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            fused_params.norm_output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
 
             graph.addNode(prefix + "ffn_norm",
                           ComputeStageFactory::createFusedResidualNorm(fused_params),
@@ -1697,9 +1737,9 @@ namespace llaminar2
             gate_up_params.mpi_ctx = mpi_ctx_.get();
             gate_up_params.device_id = device;
             gate_up_params.prepared_store = prepared_weight_store_;
-            gate_up_params.input_buffer_id = BufferId::NORMALIZED;
-            gate_up_params.output_gate_buffer_id = BufferId::GATE_PROJ;
-            gate_up_params.output_up_buffer_id = BufferId::UP_PROJ;
+            gate_up_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+            gate_up_params.output_gate_buffer_id = buffers.idFor(BufferId::GATE_PROJ);
+            gate_up_params.output_up_buffer_id = buffers.idFor(BufferId::UP_PROJ);
 
             graph.addNode(prefix + "gate_up_proj",
                           ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
@@ -1733,8 +1773,9 @@ namespace llaminar2
                 .beta = 0.0f,
                 .transpose_B = false,
                 .gemm_context = GemmContext::FFN,
-                .a_buffer_id = BufferId::UP_PROJ,
-                .c_buffer_id = BufferId::ATTN_PROJ,
+                .a_buffer_id = buffers.idFor(BufferId::UP_PROJ),
+                .gate_buffer_id = buffers.idFor(BufferId::GATE_PROJ),
+                .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
                 .prepared_ref = preparedRefForGraphWeight(down_proj_binding, device),
                 .prepared_store = prepared_weight_store_};
 
@@ -1769,7 +1810,7 @@ namespace llaminar2
                 std::string stage_name = prefix + "down_allreduce";
                 auto allreduce_stage = createTPAllreduceStage(
                     buffers.attn_proj, allreduce_count, device, layer_idx, /*is_attention=*/false, stage_name,
-                    BufferId::ATTN_PROJ);
+                    buffers.idFor(BufferId::ATTN_PROJ));
 
                 if (allreduce_stage)
                 {
@@ -1792,9 +1833,9 @@ namespace llaminar2
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
             res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-            res_params.input_buffer_id = BufferId::ATTN_PROJ;
-            res_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            res_params.output_buffer_id = BufferId::HIDDEN_STATE; // In-place with residual
+            res_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            res_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            res_params.output_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE); // In-place with residual
 
             graph.addNode(prefix + "ffn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
@@ -2242,9 +2283,9 @@ namespace llaminar2
             fused_params.eps = config_.rms_norm_eps;
             fused_params.seq_len = total_tokens;
             fused_params.hidden_dim = config_.d_model;
-            fused_params.input_buffer_id = BufferId::ATTN_PROJ;
-            fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
+            fused_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            fused_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            fused_params.norm_output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
 
             graph.addNode(node_name,
                           ComputeStageFactory::createFusedResidualNorm(fused_params),
@@ -2259,8 +2300,8 @@ namespace llaminar2
             norm_params.eps = config_.rms_norm_eps;
             norm_params.seq_len = total_tokens;
             norm_params.device_id = device;
-            norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
-            norm_params.output_buffer_id = BufferId::NORMALIZED;
+            norm_params.input_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            norm_params.output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
 
             graph.addNode(node_name,
                           ComputeStageFactory::createRMSNorm(norm_params),
@@ -2297,8 +2338,8 @@ namespace llaminar2
                           .head_dim = config_.head_dim,
                           .eps = config_.rms_norm_eps,
                           .seq_len = total_tokens,
-                          .input_buffer_id = BufferId::Q_PROJ,
-                          .output_buffer_id = BufferId::Q_PROJ,
+                          .input_buffer_id = buffers.idFor(BufferId::Q_PROJ),
+                          .output_buffer_id = buffers.idFor(BufferId::Q_PROJ),
                       }),
                       device);
         graph.addDependency(prefix + "q_norm", q_dependency);
@@ -2313,8 +2354,8 @@ namespace llaminar2
                           .head_dim = config_.head_dim,
                           .eps = config_.rms_norm_eps,
                           .seq_len = total_tokens,
-                          .input_buffer_id = BufferId::K_PROJ,
-                          .output_buffer_id = BufferId::K_PROJ,
+                          .input_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                          .output_buffer_id = buffers.idFor(BufferId::K_PROJ),
                       }),
                       device);
         graph.addDependency(prefix + "k_norm", k_dependency);
@@ -2349,8 +2390,8 @@ namespace llaminar2
                           .partial_rotary_factor = config_.partial_rotary_factor,
                           .position_ids = position_ids,
                           .skip_k = config_.rope_on_read,
-                          .q_buffer_id = BufferId::Q_PROJ,
-                          .k_buffer_id = BufferId::K_PROJ,
+                          .q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
+                          .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
                       }),
                       device);
 
@@ -2394,8 +2435,8 @@ namespace llaminar2
                               .head_dim = config_.head_dim,
                               .turboquant_ctx = config_.turboquant_ctx,
                               .kv_rotation = config_.kv_rotation,
-                              .k_buffer_id = BufferId::K_PROJ,
-                              .v_buffer_id = BufferId::V_PROJ,
+                              .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                              .v_buffer_id = buffers.idFor(BufferId::V_PROJ),
                           }),
                           device);
 
@@ -2492,8 +2533,8 @@ namespace llaminar2
                                                             kv_cache->precision() != ActivationPrecision::TQ4));
             attn_params.position_offset = position_ids ? position_ids[0] : 0;
             attn_params.mpi_ctx = mpi_ctx_.get();
-            attn_params.q_buffer_id = BufferId::Q_PROJ;
-            attn_params.output_buffer_id = BufferId::ATTN_OUTPUT;
+            attn_params.q_buffer_id = buffers.idFor(BufferId::Q_PROJ);
+            attn_params.output_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT);
             // NOTE: workspace_scores/workspace_context are no longer registered in
             // the arena (CPUFlashAttentionKernelT doesn't use them — O(S²) dead
             // buffers removed). Don't set buffer_ids for the contract.
@@ -2555,8 +2596,8 @@ namespace llaminar2
                           .beta = 0.0f,
                           .transpose_B = false,
                           .gemm_context = GemmContext::ATTN,
-                          .a_buffer_id = BufferId::ATTN_OUTPUT,
-                          .c_buffer_id = BufferId::ATTN_PROJ,
+                          .a_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),
+                          .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
                           .prepared_ref = preparedRefForGraphWeight(wo_binding, device),
                           .prepared_store = prepared_weight_store_,
                       }),
@@ -2573,7 +2614,7 @@ namespace llaminar2
 
             auto allreduce_stage = createTPAllreduceStage(
                 buffers.attn_proj, allreduce_count, device, layer_idx,
-                /*is_attention=*/true, ar_node, BufferId::ATTN_PROJ);
+                /*is_attention=*/true, ar_node, buffers.idFor(BufferId::ATTN_PROJ));
 
             if (allreduce_stage)
             {

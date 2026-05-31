@@ -66,17 +66,42 @@ namespace llaminar2
             int gdn_count = 0;
             for (int i = 0; i < total_layers; ++i)
             {
-                // Pattern: every Nth layer is full attention (1-indexed check)
-                // Layer indices 3, 7, 11, ... are FA when interval=4
-                if ((i + 1) % config.gdn.full_attention_interval == 0)
+                const std::string prefix = "blk." + std::to_string(i) + ".";
+                const bool has_gdn_qkv = loader->hasTensor(prefix + "attn_qkv.weight");
+                const bool has_fa_attention =
+                    loader->hasTensor(prefix + "attn_q.weight") ||
+                    loader->hasTensor(prefix + "attn_k.weight") ||
+                    loader->hasTensor(prefix + "attn_v.weight") ||
+                    loader->hasTensor(prefix + "attn_output.weight");
+
+                // Prefer the actual tensor inventory when present. Qwen3.6 GGUFs
+                // can include a final nextn/source block whose attention tensors
+                // are full-attention even when the simple interval rule says GDN.
+                if (has_gdn_qkv)
+                {
+                    config.layer_types[i] = "gdn";
+                    ++gdn_count;
+                }
+                else if (has_fa_attention)
                 {
                     config.layer_types[i] = "full_attention";
                     ++fa_count;
                 }
                 else
                 {
-                    config.layer_types[i] = "gdn";
-                    ++gdn_count;
+                    // Pattern fallback: every Nth layer is full attention
+                    // (1-indexed check). Layer indices 3, 7, 11, ... are FA
+                    // when interval=4.
+                    if ((i + 1) % config.gdn.full_attention_interval == 0)
+                    {
+                        config.layer_types[i] = "full_attention";
+                        ++fa_count;
+                    }
+                    else
+                    {
+                        config.layer_types[i] = "gdn";
+                        ++gdn_count;
+                    }
                 }
             }
 

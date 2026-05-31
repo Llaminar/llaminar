@@ -59,4 +59,8 @@ namespace llaminar2
         size_t terminal_hidden_bytes = 0,
         size_t terminal_logits_bytes = 0);
 
+    int firstRestorablePrefixLayer(const IKVCache &kv_cache);
+
+    int restorablePrefixCachedTokens(const IKVCache &kv_cache, int seq_idx = 0);
+
 } // namespace llaminar2

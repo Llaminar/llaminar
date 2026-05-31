@@ -27,6 +27,8 @@ namespace llaminar2
         HIDDEN_STATE, ///< Main hidden state [batch, d_model]
         LOGITS,       ///< Final logits [batch, vocab_size]
         LOGITS_LOCAL, ///< Column-parallel partial logits (TP)
+        ALL_POSITION_LOGITS,       ///< Verifier logits for every row [seq_len, vocab_size]
+        ALL_POSITION_LOGITS_LOCAL, ///< Column-parallel verifier logits [seq_len, local_vocab]
 
         // ── Per-layer activation buffers (recycled across layers) ───────────
         NORMALIZED,  ///< RMSNorm output
@@ -106,6 +108,8 @@ namespace llaminar2
         MTP_Q_PROJ,
         MTP_K_PROJ,
         MTP_V_PROJ,
+        MTP_FA_Q_RAW,
+        MTP_FA_GATE,
         MTP_Q_ROPE,
         MTP_K_ROPE,
         MTP_ATTN_OUTPUT,
@@ -131,6 +135,10 @@ namespace llaminar2
             return "LOGITS";
         case BufferId::LOGITS_LOCAL:
             return "LOGITS_LOCAL";
+        case BufferId::ALL_POSITION_LOGITS:
+            return "ALL_POSITION_LOGITS";
+        case BufferId::ALL_POSITION_LOGITS_LOCAL:
+            return "ALL_POSITION_LOGITS_LOCAL";
         case BufferId::NORMALIZED:
             return "NORMALIZED";
         case BufferId::RESIDUAL:
@@ -225,6 +233,10 @@ namespace llaminar2
             return "MTP_K_PROJ";
         case BufferId::MTP_V_PROJ:
             return "MTP_V_PROJ";
+        case BufferId::MTP_FA_Q_RAW:
+            return "MTP_FA_Q_RAW";
+        case BufferId::MTP_FA_GATE:
+            return "MTP_FA_GATE";
         case BufferId::MTP_Q_ROPE:
             return "MTP_Q_ROPE";
         case BufferId::MTP_K_ROPE:

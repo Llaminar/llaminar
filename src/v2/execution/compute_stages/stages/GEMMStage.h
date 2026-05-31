@@ -115,6 +115,7 @@ namespace llaminar2
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> a_buffer_id;
+            std::optional<BufferId> gate_buffer_id;
             std::optional<BufferId> c_buffer_id;
 
             // =================================================================

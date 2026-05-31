@@ -138,7 +138,10 @@ namespace llaminar2
         GreedyLogitCandidate sampleGreedyCandidateFromTensor(
             TensorBase *tensor,
             int row,
-            int token_offset)
+            int token_offset,
+            void *argmax_partial_vals = nullptr,
+            void *argmax_partial_idxs = nullptr,
+            int argmax_partial_capacity = 0)
         {
             GreedyLogitCandidate candidate;
             if (!tensor || row < 0)
@@ -175,9 +178,9 @@ namespace llaminar2
                                            &max_val,
                                            &max_idx,
                                            nullptr,
-                                           nullptr,
-                                           nullptr,
-                                           0))
+                                           argmax_partial_vals,
+                                           argmax_partial_idxs,
+                                           argmax_partial_capacity))
                     {
                         candidate.value = max_val;
                         candidate.token = token_offset + max_idx;
@@ -2747,6 +2750,34 @@ namespace llaminar2
                     state_.all_position_logits_local = std::shared_ptr<TensorBase>(tensor.release());
                 }
                 logits_local_output = state_.all_position_logits_local.get();
+                if (!arena_ ||
+                    !arena_->bindExternalBuffer(BufferId::ALL_POSITION_LOGITS_LOCAL,
+                                                logits_local_output))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind all-position local logits buffer");
+                    return nullptr;
+                }
+
+                const size_t vocab = static_cast<size_t>(state_.vocab_size);
+                needs_allocate = !state_.all_position_logits;
+                if (state_.all_position_logits)
+                {
+                    const auto &shape = state_.all_position_logits->shape();
+                    needs_allocate = shape.size() != 2 || shape[0] != rows || shape[1] != vocab;
+                }
+                if (needs_allocate)
+                {
+                    auto tensor = tensor_factory_->createFP32({rows, vocab}, state_.device_id);
+                    state_.all_position_logits = std::shared_ptr<TensorBase>(tensor.release());
+                }
+                logits_output = state_.all_position_logits.get();
+                if (!arena_ ||
+                    !arena_->bindExternalBuffer(BufferId::ALL_POSITION_LOGITS,
+                                                logits_output))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind all-position logits buffer");
+                    return nullptr;
+                }
             }
             else
             {
@@ -2770,6 +2801,13 @@ namespace llaminar2
                     state_.all_position_logits = std::shared_ptr<TensorBase>(tensor.release());
                 }
                 logits_output = state_.all_position_logits.get();
+                if (!arena_ ||
+                    !arena_->bindExternalBuffer(BufferId::ALL_POSITION_LOGITS,
+                                                logits_output))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind all-position logits buffer");
+                    return nullptr;
+                }
             }
         }
 
@@ -2997,6 +3035,28 @@ namespace llaminar2
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
 
+        auto register_with_arena = [&]() -> bool
+        {
+            if (!arena_)
+                return true;
+            if (arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
+            {
+                if (arena_->getTensor(BufferId::PREFIX_TERMINAL_HIDDEN) != state_.prefix_terminal_hidden.get())
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Arena PREFIX_TERMINAL_HIDDEN points at a stale tensor");
+                    return false;
+                }
+                return true;
+            }
+            if (!arena_->registerExternalBuffer(BufferId::PREFIX_TERMINAL_HIDDEN,
+                                                state_.prefix_terminal_hidden.get()))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register MTP terminal hidden with BufferArena");
+                return false;
+            }
+            return true;
+        };
+
         if (state_.prefix_terminal_hidden)
         {
             const auto &shape = state_.prefix_terminal_hidden->shape();
@@ -3004,7 +3064,12 @@ namespace llaminar2
                 shape[0] >= 1 &&
                 shape[1] >= static_cast<size_t>(state_.d_model))
             {
-                return true;
+                return register_with_arena();
+            }
+            if (arena_ && arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Registered MTP terminal hidden has incompatible shape");
+                return false;
             }
             state_.prefix_terminal_hidden.reset();
         }
@@ -3025,7 +3090,7 @@ namespace llaminar2
         }
 
         state_.prefix_terminal_hidden = std::shared_ptr<TensorBase>(tensor.release());
-        return true;
+        return register_with_arena();
     }
 
     bool DeviceGraphOrchestrator::refreshMTPTerminalHiddenState(int seq_len, int batch_size)
@@ -3054,6 +3119,8 @@ namespace llaminar2
         params.seq_len = seq_len;
         params.d_model = state_.d_model;
         params.selected_row_idx = seq_len - 1;
+        params.input_buffer_id = BufferId::HIDDEN_STATE;
+        params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
 
         ComputeGraph graph;
         graph.addNode("mtp_terminal_hidden_row_select",
@@ -3092,6 +3159,8 @@ namespace llaminar2
         params.seq_len = seq_len;
         params.d_model = state_.d_model;
         params.selected_row_idx = row_idx;
+        params.input_buffer_id = BufferId::HIDDEN_STATE;
+        params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
 
         ComputeGraph graph;
         graph.addNode("mtp_prefill_hidden_row_select",
@@ -3152,8 +3221,8 @@ namespace llaminar2
         TensorBase *mtp_q = get_extension(BufferId::MTP_Q_PROJ);
         TensorBase *mtp_k = get_extension(BufferId::MTP_K_PROJ);
         TensorBase *mtp_v = get_extension(BufferId::MTP_V_PROJ);
-        TensorBase *mtp_q_raw = get_extension(BufferId::FA_Q_RAW);
-        TensorBase *mtp_q_gate = get_extension(BufferId::FA_GATE);
+        TensorBase *mtp_q_raw = get_extension(BufferId::MTP_FA_Q_RAW);
+        TensorBase *mtp_q_gate = get_extension(BufferId::MTP_FA_GATE);
         TensorBase *mtp_attn_output = get_extension(BufferId::MTP_ATTN_OUTPUT);
         TensorBase *mtp_attn_proj = get_extension(BufferId::MTP_ATTN_PROJ);
         TensorBase *mtp_gate = get_extension(BufferId::MTP_GATE_PROJ);
@@ -3462,7 +3531,10 @@ namespace llaminar2
                                      ? vocabOffsetForTPConfig(graph_builder_->config())
                                      : 0;
         return coordinateGreedyCandidate(
-            sampleGreedyCandidateFromTensor(it->second.get(), 0, token_offset),
+            sampleGreedyCandidateFromTensor(it->second.get(), 0, token_offset,
+                                            argmax_partial_vals_dev_,
+                                            argmax_partial_idxs_dev_,
+                                            argmax_partial_capacity_),
             globalTPContextForMTPCoordination());
     }
 
@@ -3476,7 +3548,10 @@ namespace llaminar2
         if (state_.all_position_logits)
         {
             return coordinateGreedyCandidate(
-                sampleGreedyCandidateFromTensor(state_.all_position_logits.get(), row, 0),
+                sampleGreedyCandidateFromTensor(state_.all_position_logits.get(), row, 0,
+                                                argmax_partial_vals_dev_,
+                                                argmax_partial_idxs_dev_,
+                                                argmax_partial_capacity_),
                 globalTPContextForMTPCoordination());
         }
 
@@ -3486,7 +3561,10 @@ namespace llaminar2
                                          ? vocabOffsetForTPConfig(graph_builder_->config())
                                          : 0;
             return coordinateGreedyCandidate(
-                sampleGreedyCandidateFromTensor(state_.all_position_logits_local.get(), row, token_offset),
+                sampleGreedyCandidateFromTensor(state_.all_position_logits_local.get(), row, token_offset,
+                                                argmax_partial_vals_dev_,
+                                                argmax_partial_idxs_dev_,
+                                                argmax_partial_capacity_),
                 globalTPContextForMTPCoordination());
         }
 
@@ -4025,6 +4103,12 @@ namespace llaminar2
                     return false;
                 }
             }
+            if (arena_ && arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
+            {
+                arena_->markWrittenFlagsOnly(
+                    BufferId::PREFIX_TERMINAL_HIDDEN,
+                    state_.device_id.is_gpu() ? state_.device_id : DeviceId::cpu());
+            }
         }
 
         state_.positions[seq_idx] = hit.cached_tokens;
@@ -4088,6 +4172,12 @@ namespace llaminar2
                               << upload.error);
                     return false;
                 }
+            }
+            if (arena_ && arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
+            {
+                arena_->markWrittenFlagsOnly(
+                    BufferId::PREFIX_TERMINAL_HIDDEN,
+                    state_.device_id.is_gpu() ? state_.device_id : DeviceId::cpu());
             }
         }
         return true;
@@ -4238,8 +4328,7 @@ namespace llaminar2
             return snapshot;
         }
 
-        const int first_layer = state_.kv_cache->first_layer_index();
-        const int cached_tokens = state_.kv_cache->get_cached_tokens(first_layer, seq_idx);
+        const int cached_tokens = restorablePrefixCachedTokens(*state_.kv_cache, seq_idx);
         if (cached_tokens < 0 || cached_tokens > state_.kv_cache->max_seq_len())
         {
             return snapshot;
@@ -4318,8 +4407,7 @@ namespace llaminar2
                 continue;
             }
 
-            const int first_mtp_layer = cache->first_layer_index();
-            const int mtp_cached_tokens = cache->get_cached_tokens(first_mtp_layer, seq_idx);
+            const int mtp_cached_tokens = restorablePrefixCachedTokens(*cache, seq_idx);
             if (mtp_cached_tokens < 0 || mtp_cached_tokens > cache->max_seq_len())
             {
                 return {};
@@ -4381,13 +4469,21 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)
     {
+        auto fail = [](const std::string &reason) -> bool
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] restoreLivePrefixState failed: " << reason);
+            return false;
+        };
+
         if (!snapshot.valid || !state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
         {
-            return false;
+            return fail("invalid snapshot, missing KV cache, or sequence index out of range");
         }
         if (snapshot.cached_tokens < 0 || snapshot.cached_tokens > state_.kv_cache->max_seq_len())
         {
-            return false;
+            return fail("cached token count out of range: cached_tokens=" +
+                        std::to_string(snapshot.cached_tokens) +
+                        " max_seq_len=" + std::to_string(state_.kv_cache->max_seq_len()));
         }
 
         state_.kv_cache->clear_sequence(seq_idx);
@@ -4403,7 +4499,7 @@ namespace llaminar2
         {
             if (!snapshot.mtp_blocks.empty())
             {
-                return false;
+                return fail("zero-token snapshot unexpectedly contains MTP blocks");
             }
             resetHybridPrefixPayloadState(*state_.kv_cache);
             state_.positions[seq_idx] = 0;
@@ -4415,7 +4511,7 @@ namespace llaminar2
         {
             if (!handle.valid() || !handle.kvKData() || !handle.kvVData())
             {
-                return false;
+                return fail("main KV block handle is invalid");
             }
 
             PrefixPayloadLayout expected = buildDensePrefixPayloadLayout(
@@ -4424,7 +4520,7 @@ namespace llaminar2
                 handle.key.token_count);
             if (!handle.layout.compatiblePayloadShape(expected))
             {
-                return false;
+                return fail("main KV block layout is incompatible");
             }
 
             for (int local_layer = 0; local_layer < handle.layout.fa_layers; ++local_layer)
@@ -4432,7 +4528,7 @@ namespace llaminar2
                 const int global_layer = prefixFALayerForIndex(*state_.kv_cache, local_layer);
                 if (global_layer < 0)
                 {
-                    return false;
+                    return fail("main KV block layer index is invalid");
                 }
                 const uint8_t *k_src = handle.kvKData() +
                                        static_cast<size_t>(local_layer) * handle.layout.bytes_per_fa_layer_k;
@@ -4446,7 +4542,9 @@ namespace llaminar2
                 desc.token_count = handle.key.token_count;
                 if (!state_.kv_cache->importLogicalBlock(desc, k_src, v_src))
                 {
-                    return false;
+                    return fail("main KV logical block import failed for layer=" +
+                                std::to_string(global_layer) +
+                                " tokens=" + std::to_string(handle.key.token_count));
                 }
             }
         }
@@ -4454,25 +4552,28 @@ namespace llaminar2
         if (!snapshot.blocks.empty() &&
             !importHybridPrefixPayload(*state_.kv_cache, snapshot.blocks.back(), seq_idx))
         {
-            return false;
+            return fail("hybrid payload import failed");
         }
 
         for (const auto &handle : snapshot.mtp_blocks)
         {
             if (!handle.valid() || !handle.kvKData() || !handle.kvVData())
             {
-                return false;
+                return fail("MTP KV block handle is invalid");
             }
 
             const int depth = handle.key.block_index;
             if (depth < 0 || depth >= static_cast<int>(state_.mtp_kv_caches.size()))
             {
-                return false;
+                return fail("MTP KV block depth out of range: depth=" +
+                            std::to_string(depth) +
+                            " caches=" + std::to_string(state_.mtp_kv_caches.size()));
             }
             auto &cache = state_.mtp_kv_caches[static_cast<size_t>(depth)];
             if (!cache || handle.key.token_count < 0 || handle.key.token_count > cache->max_seq_len())
             {
-                return false;
+                return fail("MTP KV block token count out of range: tokens=" +
+                            std::to_string(handle.key.token_count));
             }
 
             PrefixPayloadLayout expected = buildDensePrefixPayloadLayout(
@@ -4481,7 +4582,7 @@ namespace llaminar2
                 handle.key.token_count);
             if (!handle.layout.compatiblePayloadShape(expected))
             {
-                return false;
+                return fail("MTP KV block layout is incompatible");
             }
 
             for (int local_layer = 0; local_layer < handle.layout.fa_layers; ++local_layer)
@@ -4489,7 +4590,7 @@ namespace llaminar2
                 const int global_layer = prefixFALayerForIndex(*cache, local_layer);
                 if (global_layer < 0)
                 {
-                    return false;
+                    return fail("MTP KV block layer index is invalid");
                 }
                 const uint8_t *k_src = handle.kvKData() +
                                        static_cast<size_t>(local_layer) * handle.layout.bytes_per_fa_layer_k;
@@ -4503,7 +4604,9 @@ namespace llaminar2
                 desc.token_count = handle.key.token_count;
                 if (!cache->importLogicalBlock(desc, k_src, v_src))
                 {
-                    return false;
+                    return fail("MTP KV logical block import failed for layer=" +
+                                std::to_string(global_layer) +
+                                " tokens=" + std::to_string(handle.key.token_count));
                 }
             }
         }

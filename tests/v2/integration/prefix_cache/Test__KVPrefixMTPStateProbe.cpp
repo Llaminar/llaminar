@@ -26,6 +26,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -912,6 +913,62 @@ TEST(Test__KVPrefixMTPStateProbe, MTP_ModelInventoryWhenAvailable)
     {
         GTEST_SKIP() << "Qwen3.6 MTP probe models are not available";
     }
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
+{
+    const char *enabled = std::getenv("LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE");
+    if (!enabled || std::string(enabled) != "1")
+    {
+        GTEST_SKIP() << "Set LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE=1 to run real Qwen3.6 ROCm MTP smoke";
+    }
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP smoke";
+    }
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = 16;
+    config.batch_size = 1;
+    config.tp_degree = 1;
+    config.pp_degree = 1;
+    config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+    config.kv_cache_precision = "auto";
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    const std::vector<int32_t> prompt = {1, 2};
+    auto result = runner->generate(prompt, 1, greedy);
+    const auto snapshot = runner->prefixStateProbe();
+    runner->shutdown();
+
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    ASSERT_FALSE(result.tokens.empty());
+    ASSERT_LE(result.tokens.size(), 2u);
+    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
+    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
+    EXPECT_GE(snapshot.mtp_rollbacks, 1u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)

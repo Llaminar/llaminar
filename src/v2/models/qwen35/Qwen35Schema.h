@@ -335,6 +335,8 @@ namespace llaminar2
                 {"mtp_concat", {"1", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized hidden and embedding"},
                 {"mtp_projected", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
                 {"mtp_hidden", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
+                {"mtp_q_raw", {"1", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output"},
+                {"mtp_q_gate", {"1", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate"},
                 {"mtp_q", {"1", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
                 {"mtp_k", {"1", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
                 {"mtp_v", {"1", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},

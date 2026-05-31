@@ -565,6 +565,22 @@ namespace
         return std::find(n->dependencies.begin(), n->dependencies.end(), dep) != n->dependencies.end();
     }
 
+    bool hasBufferBinding(const std::vector<BufferBinding> &bindings, BufferId id)
+    {
+        return std::any_of(bindings.begin(), bindings.end(), [id](const BufferBinding &binding)
+                           { return binding.id == id; });
+    }
+
+    bool contractReads(const StageBufferContract &contract, BufferId id)
+    {
+        return hasBufferBinding(contract.allArenaReads(), id);
+    }
+
+    bool contractWrites(const StageBufferContract &contract, BufferId id)
+    {
+        return hasBufferBinding(contract.allWrites(), id);
+    }
+
     template <typename StageType>
     const StageType *firstStageOfType(const ComputeGraph &graph)
     {
@@ -926,6 +942,36 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_EQ(graph.getNode("layer0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
     EXPECT_EQ(graph.getNode("mtp0_lm_head")->stage->type(), ComputeStageType::LM_HEAD);
 
+    const auto norm_hidden_contract = graph.getNode("mtp0_norm_hidden")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(norm_hidden_contract, BufferId::PREFIX_TERMINAL_HIDDEN));
+    EXPECT_TRUE(contractWrites(norm_hidden_contract, BufferId::MTP_NORM_HIDDEN));
+
+    const auto qkv_contract = graph.getNode("layer0_qkv_proj")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(qkv_contract, BufferId::MTP_NORM_HIDDEN));
+    EXPECT_TRUE(contractWrites(qkv_contract, BufferId::MTP_FA_Q_RAW));
+    EXPECT_TRUE(contractWrites(qkv_contract, BufferId::MTP_K_PROJ));
+    EXPECT_TRUE(contractWrites(qkv_contract, BufferId::MTP_V_PROJ));
+    EXPECT_FALSE(contractWrites(qkv_contract, BufferId::K_PROJ));
+    EXPECT_FALSE(contractWrites(qkv_contract, BufferId::V_PROJ));
+
+    const auto q_gate_contract = graph.getNode("layer0_q_gate_split")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(q_gate_contract, BufferId::MTP_FA_Q_RAW));
+    EXPECT_TRUE(contractWrites(q_gate_contract, BufferId::MTP_Q_PROJ));
+    EXPECT_TRUE(contractWrites(q_gate_contract, BufferId::MTP_FA_GATE));
+    EXPECT_FALSE(contractWrites(q_gate_contract, BufferId::Q_PROJ));
+    EXPECT_FALSE(contractWrites(q_gate_contract, BufferId::FA_GATE));
+
+    const auto attention_contract = graph.getNode("layer0_attention")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(attention_contract, BufferId::MTP_Q_PROJ));
+    EXPECT_TRUE(contractWrites(attention_contract, BufferId::MTP_ATTN_OUTPUT));
+    EXPECT_FALSE(contractWrites(attention_contract, BufferId::ATTN_OUTPUT));
+
+    const auto down_contract = graph.getNode("layer1_down_proj")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(down_contract, BufferId::MTP_UP_PROJ));
+    EXPECT_TRUE(contractReads(down_contract, BufferId::MTP_GATE_PROJ));
+    EXPECT_TRUE(contractWrites(down_contract, BufferId::MTP_ATTN_PROJ));
+    EXPECT_FALSE(contractWrites(down_contract, BufferId::ATTN_PROJ));
+
     EXPECT_TRUE(hasDependency(graph, "mtp0_concat", "mtp0_norm_hidden"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_concat", "mtp0_norm_embedding"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_fc", "mtp0_concat"));
@@ -968,6 +1014,65 @@ TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWei
     EXPECT_EQ(down_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
     EXPECT_TRUE(hasDependency(graph, "layer1_down_allreduce", "layer1_down_proj"));
     EXPECT_TRUE(hasDependency(graph, "layer1_ffn_residual", "layer1_down_allreduce"));
+}
+
+TEST(Test__MTPGraphConstruction, AllPositionLMHeadUsesVerifierLogitsContract)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.compute_all_position_logits = true;
+
+    QwenStandardGraph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto hidden = TestTensorFactory::createFP32({2, static_cast<size_t>(fixture.config.d_model)});
+    auto logits = TestTensorFactory::createFP32({2, static_cast<size_t>(fixture.config.vocab_size)});
+
+    ComputeGraph graph = graph_builder.buildLMHeadGraph(
+        hidden.get(),
+        logits.get(),
+        /*total_tokens=*/2,
+        DeviceId::cpu());
+
+    const auto *lm_head = graph.getNode("lm_head");
+    ASSERT_NE(lm_head, nullptr);
+    const auto contract = lm_head->stage->bufferContract();
+    EXPECT_TRUE(contractReads(contract, BufferId::HIDDEN_STATE));
+    EXPECT_TRUE(contractWrites(contract, BufferId::ALL_POSITION_LOGITS));
+    EXPECT_FALSE(contractWrites(contract, BufferId::LOGITS));
+}
+
+TEST(Test__MTPGraphConstruction, ColumnParallelAllPositionLMHeadUsesVerifierShardContracts)
+{
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.compute_all_position_logits = true;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / 2;
+
+    QwenStandardGraph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto hidden = TestTensorFactory::createFP32({2, static_cast<size_t>(fixture.config.d_model)});
+    auto logits = TestTensorFactory::createFP32({2, static_cast<size_t>(fixture.config.vocab_size)});
+    auto logits_local = TestTensorFactory::createFP32({2, static_cast<size_t>(fixture.config.vocab_local)});
+
+    ComputeGraph graph = graph_builder.buildLMHeadGraph(
+        hidden.get(),
+        logits.get(),
+        /*total_tokens=*/2,
+        DeviceId::cpu(),
+        logits_local.get());
+
+    const auto *lm_head = graph.getNode("lm_head");
+    ASSERT_NE(lm_head, nullptr);
+    const auto lm_contract = lm_head->stage->bufferContract();
+    EXPECT_TRUE(contractWrites(lm_contract, BufferId::ALL_POSITION_LOGITS_LOCAL));
+    EXPECT_FALSE(contractWrites(lm_contract, BufferId::LOGITS_LOCAL));
+
+    const auto *allgather = graph.getNode("lm_head_allgather");
+    ASSERT_NE(allgather, nullptr);
+    const auto gather_contract = allgather->stage->bufferContract();
+    EXPECT_TRUE(contractReads(gather_contract, BufferId::ALL_POSITION_LOGITS_LOCAL));
+    EXPECT_TRUE(contractWrites(gather_contract, BufferId::ALL_POSITION_LOGITS));
 }
 
 TEST(Test__MTPGraphConstruction, RejectsIncompleteMoESidecarWeights)

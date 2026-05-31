@@ -1127,12 +1127,25 @@ namespace llaminar2
         /// BufferId entries and schema buffer specs; no infrastructure changes.
         std::unordered_map<BufferId, TensorBase *> extensions;
 
+        /// Optional remap from the canonical transformer buffer id used by
+        /// shared graph builders to the concrete buffer id for this graph
+        /// fragment. MTP sidecars use this to keep attention/FFN contracts on
+        /// MTP scratch buffers instead of the main graph scratch buffers.
+        std::unordered_map<BufferId, BufferId> binding_ids;
+
         /// Look up a buffer by BufferId in the extensions map.
         /// Returns nullptr if the BufferId is not present.
         TensorBase *get(BufferId id) const
         {
             auto it = extensions.find(id);
             return it != extensions.end() ? it->second : nullptr;
+        }
+
+        /// Resolve the arena BufferId for a canonical activation role.
+        BufferId idFor(BufferId id) const
+        {
+            auto it = binding_ids.find(id);
+            return it != binding_ids.end() ? it->second : id;
         }
     };
 
