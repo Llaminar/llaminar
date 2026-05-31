@@ -211,6 +211,27 @@ namespace llaminar2
         return names;
     }
 
+    int mainLayerCountExcludingMTP(
+        const IModelLoader &loader,
+        const std::string &architecture,
+        int raw_layer_count)
+    {
+        if (raw_layer_count <= 0)
+            return raw_layer_count;
+
+        const int depth = metadataDepth(loader, architecture);
+        if (depth <= 0 || raw_layer_count < depth)
+            return raw_layer_count;
+
+        const int sidecar_source_layer = raw_layer_count - depth;
+        if (loader.hasTensor(makeNextNDepth(0, sidecar_source_layer).fc))
+        {
+            return sidecar_source_layer;
+        }
+
+        return raw_layer_count;
+    }
+
     MTPWeightManifest discoverMTPWeightManifest(
         const IModelLoader &loader,
         const std::string &architecture,

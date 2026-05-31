@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <vector>
 #include <cmath>
 #include <memory>
@@ -393,6 +394,81 @@ namespace
         {
             EXPECT_TRUE(std::isfinite(out_data[i])) << "GQA output[" << i << "] should be finite";
         }
+    }
+
+    TEST_F(Test__AttentionComputeStage, ContinuationCausalMaskMatchesFullPrefillForQwen35GQA)
+    {
+        TensorFactory factory(mpi_ctx_);
+
+        constexpr int total_len = 9;
+        constexpr int prefix_len = 4;
+        constexpr int suffix_len = total_len - prefix_len;
+        constexpr int n_heads = 8;
+        constexpr int n_kv_heads = 2;
+        constexpr int head_dim = 256;
+        constexpr size_t q_cols = static_cast<size_t>(n_heads * head_dim);
+        constexpr size_t kv_cols = static_cast<size_t>(n_kv_heads * head_dim);
+
+        auto Q_full = factory.createFP32({total_len, q_cols}, device_id_);
+        auto K_full = factory.createFP32({total_len, kv_cols}, device_id_);
+        auto V_full = factory.createFP32({total_len, kv_cols}, device_id_);
+        auto O_full = factory.createFP32({total_len, q_cols}, device_id_);
+        auto Q_suffix = factory.createFP32({suffix_len, q_cols}, device_id_);
+        auto O_suffix = factory.createFP32({suffix_len, q_cols}, device_id_);
+
+        float *q_full = Q_full->mutable_data();
+        float *k_full = K_full->mutable_data();
+        float *v_full = V_full->mutable_data();
+        for (size_t i = 0; i < Q_full->numel(); ++i)
+            q_full[i] = std::sin(static_cast<float>(i % 251) * 0.013f) * 0.05f;
+        for (size_t i = 0; i < K_full->numel(); ++i)
+            k_full[i] = std::cos(static_cast<float>(i % 257) * 0.011f) * 0.05f;
+        for (size_t i = 0; i < V_full->numel(); ++i)
+            v_full[i] = std::sin(static_cast<float>(i % 263) * 0.017f) * 0.05f;
+
+        std::copy(q_full + static_cast<size_t>(prefix_len) * q_cols,
+                  q_full + static_cast<size_t>(total_len) * q_cols,
+                  Q_suffix->mutable_data());
+
+        AttentionComputeStage::Params full_params;
+        full_params.Q = Q_full.get();
+        full_params.K = K_full.get();
+        full_params.V = V_full.get();
+        full_params.output = O_full.get();
+        full_params.batch_size = 1;
+        full_params.seq_len = total_len;
+        full_params.kv_len = total_len;
+        full_params.n_heads = n_heads;
+        full_params.n_kv_heads = n_kv_heads;
+        full_params.head_dim = head_dim;
+        full_params.causal = true;
+        full_params.device_id = device_id_;
+        full_params.mpi_ctx = &mpi_ctx_;
+
+        AttentionComputeStage full_stage(full_params);
+        ASSERT_TRUE(full_stage.execute(nullptr));
+
+        AttentionComputeStage::Params suffix_params = full_params;
+        suffix_params.Q = Q_suffix.get();
+        suffix_params.output = O_suffix.get();
+        suffix_params.seq_len = suffix_len;
+        suffix_params.kv_len = total_len;
+        suffix_params.position_offset = prefix_len;
+
+        AttentionComputeStage suffix_stage(suffix_params);
+        ASSERT_TRUE(suffix_stage.execute(nullptr));
+
+        const float *full_out = O_full->data() + static_cast<size_t>(prefix_len) * q_cols;
+        const float *suffix_out = O_suffix->data();
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < static_cast<size_t>(suffix_len) * q_cols; ++i)
+        {
+            max_diff = std::max(max_diff, std::abs(full_out[i] - suffix_out[i]));
+        }
+
+        EXPECT_LT(max_diff, 2e-5f)
+            << "Explicit continuation mask must match one-shot causal attention "
+               "for suffix rows";
     }
 
     /**

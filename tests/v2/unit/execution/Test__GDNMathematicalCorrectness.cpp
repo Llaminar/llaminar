@@ -20,8 +20,10 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -79,6 +81,17 @@ namespace
         for (size_t i = 0; i < t->numel(); ++i)
             d[i] = dist(gen);
         return t;
+    }
+
+    float maxAbsDiff(const std::vector<float> &a, const std::vector<float> &b)
+    {
+        if (a.size() != b.size())
+            return std::numeric_limits<float>::infinity();
+
+        float max_diff = 0.0f;
+        for (size_t i = 0; i < a.size(); ++i)
+            max_diff = std::max(max_diff, std::abs(a[i] - b[i]));
+        return max_diff;
     }
 
     // Reference scalar functions (match kernel formulas exactly)
@@ -1514,6 +1527,238 @@ TEST(Test__GDNMathematicalCorrectness, Recurrence_NonZeroInitialState)
     {
         EXPECT_NEAR(kernel_state[i], ref_state[i], 1e-5f) << "State[" << i << "]";
     }
+}
+
+TEST(Test__GDNMathematicalCorrectness, Recurrence_Qwen35ChunkContinuationMatchesSequentialDecode)
+{
+    // Qwen3.5 dense uses head_dim=128 and q/k L2 normalization. The optimized
+    // chunk path must match token-by-token recurrent decode when a prior prefix
+    // has already populated recurrence state.
+    const int n_heads = 16;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int suffix_len = 5;
+
+    std::mt19937 rng(55555);
+    std::normal_distribution<float> activation_dist(0.0f, 0.08f);
+    std::normal_distribution<float> gate_dist(0.0f, 0.15f);
+    std::uniform_real_distribution<float> state_dist(-0.02f, 0.02f);
+
+    std::vector<float> q_data(suffix_len * n_heads * d_k);
+    std::vector<float> k_data(suffix_len * n_heads * d_k);
+    std::vector<float> v_data(suffix_len * n_heads * d_v);
+    std::vector<float> alpha_data(suffix_len * n_heads);
+    std::vector<float> beta_data(suffix_len * n_heads);
+    std::vector<float> A_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+
+    for (auto &x : q_data)
+        x = activation_dist(rng);
+    for (auto &x : k_data)
+        x = activation_dist(rng);
+    for (auto &x : v_data)
+        x = activation_dist(rng);
+    for (auto &x : alpha_data)
+        x = gate_dist(rng);
+    for (auto &x : beta_data)
+        x = gate_dist(rng);
+    for (int h = 0; h < n_heads; ++h)
+    {
+        A_log[h] = -std::exp(gate_dist(rng));
+        dt_bias[h] = gate_dist(rng);
+    }
+
+    std::vector<float> initial_state(n_heads * d_k * d_v);
+    for (auto &x : initial_state)
+        x = state_dist(rng);
+
+    CPUGatedDeltaNet recurrent_kernel;
+    std::vector<float> recurrent_state = initial_state;
+    std::vector<float> recurrent_output(suffix_len * n_heads * d_v);
+    std::vector<float> step_output(n_heads * d_v);
+    for (int t = 0; t < suffix_len; ++t)
+    {
+        ASSERT_TRUE(recurrent_kernel.recurrent_step(
+            q_data.data() + t * n_heads * d_k,
+            k_data.data() + t * n_heads * d_k,
+            v_data.data() + t * n_heads * d_v,
+            alpha_data.data() + t * n_heads,
+            beta_data.data() + t * n_heads,
+            A_log.data(),
+            dt_bias.data(),
+            step_output.data(),
+            recurrent_state.data(),
+            n_heads,
+            d_k,
+            d_v,
+            /*use_qk_l2norm=*/true));
+        std::copy(step_output.begin(), step_output.end(),
+                  recurrent_output.begin() + t * n_heads * d_v);
+    }
+
+    CPUGatedDeltaNet chunk_kernel;
+    std::vector<float> chunk_state = initial_state;
+    std::vector<float> chunk_output(suffix_len * n_heads * d_v);
+    ASSERT_TRUE(chunk_kernel.chunk_forward(
+        q_data.data(),
+        k_data.data(),
+        v_data.data(),
+        alpha_data.data(),
+        beta_data.data(),
+        A_log.data(),
+        dt_bias.data(),
+        chunk_output.data(),
+        chunk_state.data(),
+        suffix_len,
+        n_heads,
+        d_k,
+        d_v,
+        /*chunk_size=*/64,
+        /*use_qk_l2norm=*/true));
+
+    EXPECT_LT(maxAbsDiff(chunk_output, recurrent_output), 2e-4f);
+    EXPECT_LT(maxAbsDiff(chunk_state, recurrent_state), 2e-4f);
+}
+
+TEST(Test__GDNMathematicalCorrectness, ShortConv_Qwen35ChunkContinuationMatchesSequentialDecode)
+{
+    // The real Qwen3.5 dense GDN short-conv projection has three 2048-wide
+    // streams packed into 6144 channels. This locks the full-width prefill path
+    // to the same continuation semantics as token-by-token decode.
+    const int channels = 6144;
+    const int kernel_size = 4;
+    const int state_len = kernel_size - 1;
+    const int suffix_len = 5;
+
+    std::mt19937 rng(66666);
+    std::normal_distribution<float> activation_dist(0.0f, 0.08f);
+    std::normal_distribution<float> weight_dist(0.0f, 0.03f);
+    std::uniform_real_distribution<float> state_dist(-0.05f, 0.05f);
+
+    std::vector<float> input(suffix_len * channels);
+    std::vector<float> weight(channels * kernel_size);
+    std::vector<float> bias(channels);
+    std::vector<float> initial_state(channels * state_len);
+
+    for (auto &x : input)
+        x = activation_dist(rng);
+    for (auto &x : weight)
+        x = weight_dist(rng);
+    for (auto &x : bias)
+        x = weight_dist(rng);
+    for (auto &x : initial_state)
+        x = state_dist(rng);
+
+    CPUShortConvolution chunk_kernel;
+    std::vector<float> chunk_state = initial_state;
+    std::vector<float> chunk_output(suffix_len * channels);
+    ASSERT_TRUE(chunk_kernel.forward(
+        input.data(),
+        weight.data(),
+        bias.data(),
+        chunk_output.data(),
+        chunk_state.data(),
+        suffix_len,
+        channels,
+        kernel_size,
+        /*apply_silu=*/true));
+
+    CPUShortConvolution decode_kernel;
+    std::vector<float> decode_state = initial_state;
+    std::vector<float> decode_output(suffix_len * channels);
+    for (int t = 0; t < suffix_len; ++t)
+    {
+        ASSERT_TRUE(decode_kernel.forward(
+            input.data() + t * channels,
+            weight.data(),
+            bias.data(),
+            decode_output.data() + t * channels,
+            decode_state.data(),
+            /*seq_len=*/1,
+            channels,
+            kernel_size,
+            /*apply_silu=*/true));
+    }
+
+    EXPECT_LT(maxAbsDiff(chunk_output, decode_output), 1e-4f);
+    EXPECT_EQ(maxAbsDiff(chunk_state, decode_state), 0.0f);
+}
+
+TEST(Test__GDNMathematicalCorrectness, ShortConv_Qwen35InPlaceSplitPrefillMatchesFullPrefill)
+{
+    // The production Qwen3.5 graph runs short-conv in-place on the merged QKV
+    // buffer. Continuation prefill depends on conv_state retaining the raw QKV
+    // tail, not the overwritten convolved output.
+    const int channels = 6144;
+    const int kernel_size = 4;
+    const int state_len = kernel_size - 1;
+    const int prefix_len = 4;
+    const int suffix_len = 5;
+    const int total_len = prefix_len + suffix_len;
+
+    std::mt19937 rng(77777);
+    std::normal_distribution<float> activation_dist(0.0f, 0.08f);
+    std::normal_distribution<float> weight_dist(0.0f, 0.03f);
+
+    std::vector<float> input(total_len * channels);
+    std::vector<float> weight(channels * kernel_size);
+    std::vector<float> bias(channels);
+
+    for (auto &x : input)
+        x = activation_dist(rng);
+    for (auto &x : weight)
+        x = weight_dist(rng);
+    for (auto &x : bias)
+        x = weight_dist(rng);
+
+    CPUShortConvolution full_kernel;
+    std::vector<float> full_buffer = input;
+    std::vector<float> full_state(channels * state_len, 0.0f);
+    ASSERT_TRUE(full_kernel.forward(
+        full_buffer.data(),
+        weight.data(),
+        bias.data(),
+        full_buffer.data(),
+        full_state.data(),
+        total_len,
+        channels,
+        kernel_size,
+        /*apply_silu=*/true));
+
+    CPUShortConvolution split_kernel;
+    std::vector<float> prefix_buffer(input.begin(),
+                                     input.begin() + static_cast<size_t>(prefix_len) * channels);
+    std::vector<float> suffix_buffer(input.begin() + static_cast<size_t>(prefix_len) * channels,
+                                     input.end());
+    std::vector<float> split_state(channels * state_len, 0.0f);
+
+    ASSERT_TRUE(split_kernel.forward(
+        prefix_buffer.data(),
+        weight.data(),
+        bias.data(),
+        prefix_buffer.data(),
+        split_state.data(),
+        prefix_len,
+        channels,
+        kernel_size,
+        /*apply_silu=*/true));
+
+    ASSERT_TRUE(split_kernel.forward(
+        suffix_buffer.data(),
+        weight.data(),
+        bias.data(),
+        suffix_buffer.data(),
+        split_state.data(),
+        suffix_len,
+        channels,
+        kernel_size,
+        /*apply_silu=*/true));
+
+    std::vector<float> full_suffix(
+        full_buffer.begin() + static_cast<size_t>(prefix_len) * channels,
+        full_buffer.end());
+    EXPECT_LT(maxAbsDiff(suffix_buffer, full_suffix), 1e-4f);
+    EXPECT_EQ(maxAbsDiff(split_state, full_state), 0.0f);
 }
 
 // ============================================================================

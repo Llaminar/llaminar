@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -258,6 +259,451 @@ namespace
         std::transform(value.begin(), value.end(), value.begin(),
                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
         return value;
+    }
+
+    std::string firstEnvOrDefault(
+        const std::vector<std::string> &names,
+        const std::string &fallback)
+    {
+        for (const auto &name : names)
+        {
+            const char *value = std::getenv(name.c_str());
+            if (value && *value)
+            {
+                return value;
+            }
+        }
+        return fallback;
+    }
+
+    int mpiWorldSize()
+    {
+        int world_size = 1;
+        MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+        return world_size;
+    }
+
+    enum class DensePrefixParityTopology
+    {
+        SingleDevice,
+        LocalTP,
+        LocalPP,
+        NodeLocalTP,
+    };
+
+    enum class PrefixRestoreParityMode
+    {
+        FullHit,
+        PartialHit,
+    };
+
+    struct DensePrefixRestoreParityCase
+    {
+        std::string name;
+        DensePrefixParityTopology topology = DensePrefixParityTopology::SingleDevice;
+        std::vector<GlobalDeviceAddress> devices;
+        std::vector<std::string> model_envs;
+        std::string default_model_path;
+        std::vector<std::string> metadata_envs;
+        std::string default_metadata_path;
+        std::string kv_cache_precision = "auto";
+        int decode_steps = 3;
+        int max_seq_len = 96;
+        int main_layers = 0;
+        int mpi_ranks = 1;
+        int required_rocm_devices = 0;
+    };
+
+    std::optional<std::string> densePrefixParitySkipReason(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        const int world_size = mpiWorldSize();
+        if (test_case.topology == DensePrefixParityTopology::NodeLocalTP)
+        {
+            if (world_size != test_case.mpi_ranks)
+            {
+                std::ostringstream oss;
+                oss << test_case.name << " requires exactly "
+                    << test_case.mpi_ranks << " MPI ranks (got "
+                    << world_size << ")";
+                return oss.str();
+            }
+        }
+        else if (world_size != 1)
+        {
+            return test_case.name + " is a local topology test and must run with one MPI rank";
+        }
+
+        if (test_case.required_rocm_devices > 0)
+        {
+            auto &dm = DeviceManager::instance();
+            dm.initialize(-1, false);
+            if (dm.rocm_device_count() < test_case.required_rocm_devices)
+            {
+                std::ostringstream oss;
+                oss << test_case.name << " requires "
+                    << test_case.required_rocm_devices
+                    << " ROCm device(s)";
+                return oss.str();
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    std::vector<PPStageDefinition> splitStages(
+        int total_layers,
+        const std::vector<GlobalDeviceAddress> &devices)
+    {
+        std::vector<PPStageDefinition> stages;
+        const int stage_count = static_cast<int>(devices.size());
+        if (stage_count <= 0 || total_layers <= 0)
+            return stages;
+
+        int first = 0;
+        for (int stage = 0; stage < stage_count; ++stage)
+        {
+            const int next = ((stage + 1) * total_layers) / stage_count;
+            const int last = std::max(first, next) - 1;
+            stages.push_back(PPStageDefinition{
+                stage,
+                "stage" + std::to_string(stage),
+                first,
+                last,
+            });
+            first = last + 1;
+        }
+        return stages;
+    }
+
+    OrchestrationConfig makeDensePrefixRestoreConfig(
+        const DensePrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        bool enable_prefix_cache,
+        int block_size)
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.activation_precision = "fp32";
+        config.kv_cache_precision = test_case.kv_cache_precision;
+        config.prefix_cache.enabled = enable_prefix_cache;
+        config.prefix_cache.storage_mode = enable_prefix_cache
+                                               ? PrefixCacheStorageMode::Ram
+                                               : PrefixCacheStorageMode::Disabled;
+        config.prefix_cache.block_size = block_size;
+        config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+        config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
+        config.mtp.enabled = false;
+
+        switch (test_case.topology)
+        {
+        case DensePrefixParityTopology::SingleDevice:
+            config.tp_degree = 1;
+            config.pp_degree = 1;
+            config.device_for_this_rank = test_case.devices.empty()
+                                              ? GlobalDeviceAddress::cpu()
+                                              : test_case.devices.front();
+            break;
+
+        case DensePrefixParityTopology::LocalTP:
+            config.tp_degree = static_cast<int>(test_case.devices.size());
+            config.tp_scope = TPScope::LOCAL;
+            config.tp_devices = test_case.devices;
+            config.pp_degree = 1;
+            config.default_backend = CollectiveBackendType::RCCL;
+            break;
+
+        case DensePrefixParityTopology::LocalPP:
+        {
+            config.tp_degree = 1;
+            config.pp_degree = static_cast<int>(test_case.devices.size());
+            config.pp_split = PPSplitMode::MANUAL;
+            config.domain_definitions.clear();
+            config.pp_stage_definitions = splitStages(test_case.main_layers, test_case.devices);
+            for (size_t i = 0; i < test_case.devices.size(); ++i)
+            {
+                DomainDefinition domain;
+                domain.name = "stage" + std::to_string(i);
+                domain.devices = {test_case.devices[i]};
+                domain.scope = TPScope::LOCAL;
+                domain.owner_rank = 0;
+                domain.backend = CollectiveBackendType::AUTO;
+                config.domain_definitions.push_back(std::move(domain));
+            }
+            break;
+        }
+
+        case DensePrefixParityTopology::NodeLocalTP:
+            config.tp_degree = test_case.mpi_ranks;
+            config.tp_scope = TPScope::NODE_LOCAL;
+            config.pp_degree = 1;
+            config.default_backend = CollectiveBackendType::MPI;
+            config.device_for_this_rank = GlobalDeviceAddress::cpu();
+            break;
+        }
+
+        return config;
+    }
+
+    void runDensePrefixRestoreParity(
+        const DensePrefixRestoreParityCase &test_case,
+        PrefixRestoreParityMode mode)
+    {
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        const std::string model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        const std::filesystem::path metadata_path = firstEnvOrDefault(
+            test_case.metadata_envs,
+            test_case.default_metadata_path);
+        if (!std::filesystem::exists(metadata_path))
+        {
+            GTEST_SKIP() << test_case.name
+                         << " PyTorch metadata not found: " << metadata_path;
+        }
+
+        const auto prompt_tokens = readTokenListFromMetadata(metadata_path, "token_ids");
+        const auto pytorch_decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
+        ASSERT_FALSE(prompt_tokens.empty());
+        ASSERT_GE(pytorch_decode_tokens.size(), static_cast<size_t>(test_case.decode_steps));
+
+        const std::vector<int32_t> expected_tokens(
+            pytorch_decode_tokens.begin(),
+            pytorch_decode_tokens.begin() + test_case.decode_steps);
+
+        const int block_size = mode == PrefixRestoreParityMode::FullHit
+                                   ? static_cast<int>(prompt_tokens.size())
+                                   : 4;
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        auto baseline = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(test_case, model_path, false, block_size));
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto baseline_result = baseline->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto baseline_snapshot = baseline->prefixStateProbe();
+        baseline->shutdown();
+
+        ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+        ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(baseline_result.tokens, expected_tokens);
+        EXPECT_EQ(baseline_snapshot.prefix_cache_hits, 0u);
+
+        auto cached = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(test_case, model_path, true, block_size));
+        ASSERT_NE(cached, nullptr);
+        ASSERT_TRUE(cached->initialize()) << cached->lastError();
+
+        std::vector<int32_t> first_prompt = prompt_tokens;
+        if (mode == PrefixRestoreParityMode::PartialHit)
+        {
+            ASSERT_GT(prompt_tokens.size(), 4u);
+            first_prompt.assign(prompt_tokens.begin(), prompt_tokens.begin() + 4);
+        }
+
+        auto first = cached->generate(first_prompt, test_case.decode_steps, greedy);
+        const auto after_first = cached->prefixStateProbe();
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        EXPECT_TRUE(after_first.prefix_cache_ready);
+        EXPECT_GE(after_first.prefix_cache_inserts, 1u);
+        if (mode == PrefixRestoreParityMode::FullHit)
+        {
+            ASSERT_EQ(first.tokens.size(), expected_tokens.size());
+            EXPECT_EQ(first.tokens, expected_tokens);
+        }
+
+        auto second = cached->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto after_second = cached->prefixStateProbe();
+        cached->shutdown();
+
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_EQ(second.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(second.tokens, expected_tokens);
+        EXPECT_EQ(second.tokens, baseline_result.tokens);
+        EXPECT_TRUE(after_second.prefix_cache_ready);
+        EXPECT_GE(after_second.prefix_cache_hits, 1u);
+
+        if (mode == PrefixRestoreParityMode::FullHit)
+        {
+            EXPECT_TRUE(after_second.prefix_request.hit);
+            EXPECT_FALSE(after_second.prefix_request.partial_hit);
+            EXPECT_EQ(after_second.prefix_request.matched_tokens,
+                      static_cast<int>(prompt_tokens.size()));
+            EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
+        }
+        else
+        {
+            EXPECT_FALSE(after_second.prefix_request.hit);
+            EXPECT_TRUE(after_second.prefix_request.partial_hit);
+            EXPECT_EQ(after_second.prefix_request.matched_tokens, 4);
+            EXPECT_FALSE(after_second.prefix_request.terminal_logits_restored);
+        }
+    }
+
+    void runDenseSplitPrefillParity(
+        const DensePrefixRestoreParityCase &test_case,
+        int split_tokens)
+    {
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        const std::string model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        const std::filesystem::path metadata_path = firstEnvOrDefault(
+            test_case.metadata_envs,
+            test_case.default_metadata_path);
+        if (!std::filesystem::exists(metadata_path))
+        {
+            GTEST_SKIP() << test_case.name
+                         << " PyTorch metadata not found: " << metadata_path;
+        }
+
+        const auto prompt_tokens = readTokenListFromMetadata(metadata_path, "token_ids");
+        const auto pytorch_decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
+        ASSERT_GT(prompt_tokens.size(), static_cast<size_t>(split_tokens));
+        ASSERT_GE(pytorch_decode_tokens.size(), static_cast<size_t>(test_case.decode_steps));
+
+        const std::vector<int32_t> expected_tokens(
+            pytorch_decode_tokens.begin(),
+            pytorch_decode_tokens.begin() + test_case.decode_steps);
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        auto baseline = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(test_case, model_path, false, split_tokens));
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto baseline_result = baseline->generate(prompt_tokens, test_case.decode_steps, greedy);
+        baseline->shutdown();
+
+        ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+        ASSERT_EQ(baseline_result.tokens, expected_tokens);
+
+        auto split = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(test_case, model_path, false, split_tokens));
+        ASSERT_NE(split, nullptr);
+        ASSERT_TRUE(split->initialize()) << split->lastError();
+        split->setSamplingParams(greedy);
+
+        const std::vector<int32_t> first_prompt(
+            prompt_tokens.begin(),
+            prompt_tokens.begin() + split_tokens);
+        const std::vector<int32_t> suffix(
+            prompt_tokens.begin() + split_tokens,
+            prompt_tokens.end());
+
+        ASSERT_TRUE(split->prefill(first_prompt)) << split->lastError();
+        ASSERT_TRUE(split->prefill(suffix)) << split->lastError();
+        EXPECT_EQ(split->currentPosition(), static_cast<int>(prompt_tokens.size()));
+        EXPECT_TRUE(split->prefixStateProbe().prefill_logits_ready);
+
+        std::vector<int32_t> split_tokens_out;
+        for (int i = 0; i < test_case.decode_steps; ++i)
+        {
+            GenerationResult step = split->decodeStep();
+            ASSERT_TRUE(step.error.empty()) << step.error;
+            ASSERT_EQ(step.tokens.size(), 1u);
+            split_tokens_out.push_back(step.tokens.front());
+        }
+        split->shutdown();
+
+        EXPECT_EQ(split_tokens_out, expected_tokens);
+        EXPECT_EQ(split_tokens_out, baseline_result.tokens);
+    }
+
+    DensePrefixRestoreParityCase qwen35CpuPrefixParityCase()
+    {
+        return DensePrefixRestoreParityCase{
+            .name = "Qwen3.5 CPU prefix restore parity",
+            .topology = DensePrefixParityTopology::SingleDevice,
+            .devices = {GlobalDeviceAddress::cpu()},
+            .model_envs = {"LLAMINAR_PREFIX_MTP_PARITY_MODEL"},
+            .default_model_path = "models/Qwen3.5-0.8B-Q4_0.gguf",
+            .metadata_envs = {"LLAMINAR_PREFIX_MTP_PARITY_METADATA"},
+            .default_metadata_path = "pytorch_qwen35_snapshots/metadata.txt",
+            .kv_cache_precision = "fp32",
+            .decode_steps = 3,
+            .max_seq_len = 64,
+            .main_layers = 24,
+        };
+    }
+
+    DensePrefixRestoreParityCase qwen36DensePrefixParityCase(
+        const std::string &name,
+        DensePrefixParityTopology topology)
+    {
+        DensePrefixRestoreParityCase test_case{
+            .name = name,
+            .topology = topology,
+            .model_envs = {
+                "LLAMINAR_QWEN36_DENSE_MODEL",
+                "LLAMINAR_PARITY_DENSE_MODEL",
+            },
+            .default_model_path = "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf",
+            .metadata_envs = {
+                "LLAMINAR_QWEN36_PARITY_METADATA",
+                "LLAMINAR_PARITY_DENSE_METADATA",
+            },
+            .default_metadata_path = "pytorch_qwen36_dense_snapshots/metadata.txt",
+            .kv_cache_precision = "auto",
+            .decode_steps = 3,
+            .max_seq_len = 96,
+            .main_layers = 64,
+        };
+
+        switch (topology)
+        {
+        case DensePrefixParityTopology::SingleDevice:
+            test_case.devices = {GlobalDeviceAddress::rocm(0)};
+            test_case.required_rocm_devices = 1;
+            break;
+        case DensePrefixParityTopology::LocalTP:
+            test_case.devices = {
+                GlobalDeviceAddress::rocm(0),
+                GlobalDeviceAddress::rocm(1),
+            };
+            test_case.required_rocm_devices = 2;
+            break;
+        case DensePrefixParityTopology::LocalPP:
+            test_case.devices = {
+                GlobalDeviceAddress::rocm(0),
+                GlobalDeviceAddress::rocm(1),
+            };
+            test_case.required_rocm_devices = 2;
+            break;
+        case DensePrefixParityTopology::NodeLocalTP:
+            test_case.devices = {
+                GlobalDeviceAddress::cpu(0),
+                GlobalDeviceAddress::cpu(1),
+            };
+            test_case.mpi_ranks = 2;
+            break;
+        }
+
+        return test_case;
     }
 
     bool isMTPInventoryKey(const std::string &name)
@@ -963,75 +1409,59 @@ TEST(Test__KVPrefixMTPStateProbe, MTP_ModelInventoryWhenAvailable)
     }
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen35CPUPrefixCacheMatchesPyTorchDecodeTokensOptIn)
+TEST(Test__KVPrefixMTPStateProbe, Qwen35CPUPrefixCacheMatchesPyTorchDecodeTokens)
 {
-    const char *enabled = std::getenv("LLAMINAR_ENABLE_PREFIX_MTP_PARITY");
-    if (!enabled || std::string(enabled) != "1")
-    {
-        GTEST_SKIP() << "Set LLAMINAR_ENABLE_PREFIX_MTP_PARITY=1 to run prefix-cache PyTorch token parity";
-    }
+    runDensePrefixRestoreParity(
+        qwen35CpuPrefixParityCase(),
+        PrefixRestoreParityMode::FullHit);
+}
 
-    const char *env_model = std::getenv("LLAMINAR_PREFIX_MTP_PARITY_MODEL");
-    const std::string model_path = env_model ? env_model : "models/Qwen3.5-0.8B-Q4_0.gguf";
-    if (!std::filesystem::exists(model_path))
-    {
-        GTEST_SKIP() << "Qwen3.5 parity model not found: " << model_path;
-    }
+TEST(Test__KVPrefixMTPStateProbe, Qwen35CPUPartialPrefixCacheMatchesPyTorchDecodeTokens)
+{
+    runDensePrefixRestoreParity(
+        qwen35CpuPrefixParityCase(),
+        PrefixRestoreParityMode::PartialHit);
+}
 
-    const char *env_metadata = std::getenv("LLAMINAR_PREFIX_MTP_PARITY_METADATA");
-    const std::filesystem::path metadata_path =
-        env_metadata ? env_metadata : "pytorch_qwen35_snapshots/metadata.txt";
-    if (!std::filesystem::exists(metadata_path))
-    {
-        GTEST_SKIP() << "PyTorch parity metadata not found: " << metadata_path;
-    }
+TEST(Test__KVPrefixMTPStateProbe, Qwen35CPUSplitPrefillMatchesPyTorchDecodeTokens)
+{
+    runDenseSplitPrefillParity(qwen35CpuPrefixParityCase(), 4);
+}
 
-    const auto prompt_tokens = readTokenListFromMetadata(metadata_path, "token_ids");
-    const auto pytorch_decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
-    ASSERT_FALSE(prompt_tokens.empty());
-    ASSERT_GE(pytorch_decode_tokens.size(), 3u);
+TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseSingleDevicePrefixRestoreParity)
+{
+    runDensePrefixRestoreParity(
+        qwen36DensePrefixParityCase(
+            "Qwen3.6 dense SingleDevice prefix restore parity",
+            DensePrefixParityTopology::SingleDevice),
+        PrefixRestoreParityMode::FullHit);
+}
 
-    OrchestrationConfig config = OrchestrationConfig::defaults();
-    config.model_path = model_path;
-    config.max_seq_len = 64;
-    config.batch_size = 1;
-    config.device_for_this_rank = GlobalDeviceAddress::cpu();
-    config.kv_cache_precision = "fp16";
-    config.prefix_cache.enabled = true;
-    config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
-    config.prefix_cache.block_size = static_cast<int>(prompt_tokens.size());
-    config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
-    config.prefix_cache.ram_budget_bytes = 256ull * 1024ull * 1024ull;
+TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseLocalTPPrefixRestoreParity)
+{
+    runDensePrefixRestoreParity(
+        qwen36DensePrefixParityCase(
+            "Qwen3.6 dense LocalTP prefix restore parity",
+            DensePrefixParityTopology::LocalTP),
+        PrefixRestoreParityMode::FullHit);
+}
 
-    auto factory = createOrchestrationRunnerFactory();
-    auto runner = factory->createFromOrchestrationConfig(config);
-    ASSERT_NE(runner, nullptr);
-    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseLocalPPPrefixRestoreParity)
+{
+    runDensePrefixRestoreParity(
+        qwen36DensePrefixParityCase(
+            "Qwen3.6 dense LocalPP prefix restore parity",
+            DensePrefixParityTopology::LocalPP),
+        PrefixRestoreParityMode::FullHit);
+}
 
-    SamplingParams greedy;
-    greedy.temperature = 0.0f;
-    const std::vector<int32_t> expected_tokens(
-        pytorch_decode_tokens.begin(),
-        pytorch_decode_tokens.begin() + 3);
-
-    auto first = runner->generate(prompt_tokens, 3, greedy);
-    const auto after_first = runner->prefixStateProbe();
-    ASSERT_TRUE(first.error.empty()) << first.error;
-    ASSERT_EQ(first.tokens.size(), expected_tokens.size());
-    EXPECT_EQ(first.tokens, expected_tokens);
-    EXPECT_TRUE(after_first.prefix_cache_ready);
-    EXPECT_GE(after_first.prefix_cache_inserts, 1u);
-
-    auto second = runner->generate(prompt_tokens, 3, greedy);
-    const auto after_second = runner->prefixStateProbe();
-    runner->shutdown();
-
-    ASSERT_TRUE(second.error.empty()) << second.error;
-    ASSERT_EQ(second.tokens.size(), expected_tokens.size());
-    EXPECT_EQ(second.tokens, expected_tokens);
-    EXPECT_TRUE(after_second.prefix_request.hit);
-    EXPECT_EQ(after_second.prefix_request.matched_tokens, static_cast<int>(prompt_tokens.size()));
-    EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
+TEST(Test__KVPrefixMTPStateProbe, Qwen36DenseNodeLocalTPPrefixRestoreParity)
+{
+    runDensePrefixRestoreParity(
+        qwen36DensePrefixParityCase(
+            "Qwen3.6 dense NodeLocalTP prefix restore parity",
+            DensePrefixParityTopology::NodeLocalTP),
+        PrefixRestoreParityMode::FullHit);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)

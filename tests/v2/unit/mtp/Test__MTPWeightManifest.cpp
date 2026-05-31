@@ -162,6 +162,34 @@ TEST(Test__MTPWeightManifest, DiscoversNextNBlockLayoutFromQwen36Metadata)
     EXPECT_EQ(manifest.depths[0].wq, "blk.64.attn_q.weight");
 }
 
+TEST(Test__MTPWeightManifest, MainLayerCountExcludesTrailingNextNBlockForPlanning)
+{
+    MockModelLoaderBuilder builder;
+    builder.setArchitecture("qwen35")
+        .setBlockCount(65)
+        .setInt("qwen35.nextn_predict_layers", 1);
+    addNextNDepth(builder, 64);
+    auto loader = builder.build();
+
+    EXPECT_EQ(
+        mainLayerCountExcludingMTP(*loader, "qwen35", 65),
+        64);
+}
+
+TEST(Test__MTPWeightManifest, MainLayerCountKeepsRawBlocksWithoutNextNTensor)
+{
+    MockModelLoaderBuilder builder;
+    builder.setArchitecture("qwen35")
+        .setBlockCount(65)
+        .setInt("qwen35.nextn_predict_layers", 1);
+    addTensor(builder, "blk.64.attn_norm.weight");
+    auto loader = builder.build();
+
+    EXPECT_EQ(
+        mainLayerCountExcludingMTP(*loader, "qwen35", 65),
+        65);
+}
+
 TEST(Test__MTPWeightManifest, InfersNextNDepthWhenMetadataIsAbsent)
 {
     MockModelLoaderBuilder builder;

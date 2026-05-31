@@ -974,7 +974,9 @@ namespace llaminar2
         }
 
         // Global TP for multi-rank TP
-        if (config.tp_scope == TPScope::GLOBAL && cluster_inventory.world_size > 1)
+        if ((config.tp_scope == TPScope::GLOBAL ||
+             config.tp_scope == TPScope::NODE_LOCAL) &&
+            cluster_inventory.world_size > 1)
         {
             plan.global_tp_domain_id = 0;
             plan.global_tp_rank_in_domain = rank % config.tp_degree;

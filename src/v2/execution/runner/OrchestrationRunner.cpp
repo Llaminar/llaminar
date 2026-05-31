@@ -12,6 +12,7 @@
 #include "../../config/TPPPValidator.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
 #include "../factory/InferenceRunnerFactory.h"
+#include "../mtp/MTPWeightManifest.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
 #include "../local_execution/engine/PrefillBucketUtils.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
@@ -567,6 +568,7 @@ namespace llaminar2
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();
+        last_token_ = prompt_tokens.back();
 
         // Broadcast to worker ranks so they prefill with the same tokens
         if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
@@ -1370,6 +1372,7 @@ namespace llaminar2
         // Check if multi-rank MPI is needed
         bool needs_multi_rank_mpi = config_.pp_degree > 1 ||
                                     config_.tp_scope == TPScope::GLOBAL ||
+                                    config_.tp_scope == TPScope::NODE_LOCAL ||
                                     config_.tp_scope == TPScope::HYBRID ||
                                     requiresOverlayMPIWorld(config_.moe_expert_parallel_plan);
 
@@ -1450,7 +1453,11 @@ namespace llaminar2
                                 + " (file exists but GGUF parsing failed)");
             }
 
-            model_config.n_layers = static_cast<int>(metadata_loader.blockCount());
+            const int raw_layers = static_cast<int>(metadata_loader.blockCount());
+            model_config.n_layers = mainLayerCountExcludingMTP(
+                metadata_loader,
+                metadata_loader.architecture(),
+                raw_layers);
             model_config.n_heads = static_cast<int>(metadata_loader.headCount());
             model_config.n_kv_heads = static_cast<int>(metadata_loader.headCountKV());
             model_config.hidden_size = static_cast<int>(metadata_loader.embeddingLength());

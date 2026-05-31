@@ -43,8 +43,34 @@ namespace llaminar2
         }
         else
         {
-            return executePrefill(input, weight, bias, output, conv_state,
-                                  seq_len, channels, kernel_size, apply_silu);
+            const int state_len = kernel_size - 1;
+            const bool in_place_with_state =
+                input == output && conv_state && state_len > 0;
+            std::vector<float> raw_tail;
+            if (in_place_with_state)
+            {
+                raw_tail.resize(static_cast<size_t>(channels) * state_len);
+                for (int c = 0; c < channels; ++c)
+                {
+                    for (int s = 0; s < state_len; ++s)
+                    {
+                        const int src_t = seq_len - state_len + s;
+                        raw_tail[static_cast<size_t>(c) * state_len + s] =
+                            (src_t >= 0) ? input[static_cast<size_t>(src_t) * channels + c]
+                                         : conv_state[c * state_len + state_len + src_t];
+                    }
+                }
+            }
+
+            const bool ok = executePrefill(input, weight, bias, output, conv_state,
+                                           seq_len, channels, kernel_size, apply_silu);
+            if (ok && in_place_with_state)
+            {
+                std::memcpy(conv_state,
+                            raw_tail.data(),
+                            raw_tail.size() * sizeof(float));
+            }
+            return ok;
         }
     }
 

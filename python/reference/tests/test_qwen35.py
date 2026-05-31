@@ -254,6 +254,32 @@ class TestQwen35ConfigExtraction:
         assert config['linear_conv_kernel_dim'] == 4
         assert config['rope_dimension_sections'] == [11, 11, 10, 0]
 
+    def test_qwen36_nextn_sidecar_excluded_from_main_layers(self):
+        """Qwen3.6 nextn/MTP sidecar blocks are not main decoder layers."""
+        from python.reference.loaders.gguf_parser import GGUFParser
+
+        parser = GGUFParser.__new__(GGUFParser)
+        parser.metadata = {
+            'general.architecture': 'qwen35',
+            'qwen35.embedding_length': 5120,
+            'qwen35.attention.head_count': 40,
+            'qwen35.block_count': 65,
+            'qwen35.feed_forward_length': 27648,
+            'qwen35.context_length': 262144,
+            'qwen35.nextn_predict_layers': 1,
+            'qwen35.full_attention_interval': 4,
+            'tokenizer.ggml.tokens': ['a'] * 248320,
+        }
+        parser.tensors = [
+            'blk.63.attn_norm.weight',
+            'blk.64.attn_norm.weight',
+            'blk.64.nextn.eh_proj.weight',
+        ]
+
+        config = parser.get_config_dict()
+
+        assert config['num_hidden_layers'] == 64
+
 
 class TestQwen35ModelRegistry:
     """Test model registry for Qwen 3.5."""

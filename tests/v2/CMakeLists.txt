@@ -5722,10 +5722,46 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPPrefixSmoke
     TIMEOUT 1200
 )
 add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen35CPUPrefixSmoke
-    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen35CPUPrefixCacheMatchesPyTorchDecodeTokensOptIn
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen35CPUPrefixCacheMatchesPyTorchDecodeTokens
     LABELS "V2;Integration;Parity;PrefixCache;MTP;RealModel;Qwen35;CPU"
     MPI_PROCS 1
     TIMEOUT 900
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen35CPUPartialPrefixSmoke
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen35CPUPartialPrefixCacheMatchesPyTorchDecodeTokens
+    LABELS "V2;Integration;Parity;PrefixCache;MTP;RealModel;Qwen35;CPU"
+    MPI_PROCS 1
+    TIMEOUT 900
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen35CPUSplitPrefillSmoke
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen35CPUSplitPrefillMatchesPyTorchDecodeTokens
+    LABELS "V2;Integration;Parity;PrefixCache;MTP;RealModel;Qwen35;CPU"
+    MPI_PROCS 1
+    TIMEOUT 900
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36SingleDevicePrefixRestore
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36DenseSingleDevicePrefixRestoreParity
+    LABELS "V2;Integration;Parity;PrefixCache;RealModel;Qwen36;ROCm;GPU;SingleDevice"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36LocalTPPrefixRestore
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36DenseLocalTPPrefixRestoreParity
+    LABELS "V2;Integration;Parity;PrefixCache;RealModel;Qwen36;ROCm;GPU;LocalTP"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36LocalPPPrefixRestore
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36DenseLocalPPPrefixRestoreParity
+    LABELS "V2;Integration;Parity;PrefixCache;RealModel;Qwen36;ROCm;GPU;LocalPP"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
+add_v2_test(V2_Integration_Parity_PrefixCacheMTP_Qwen36NodeLocalTPPrefixRestore
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36DenseNodeLocalTPPrefixRestoreParity
+    LABELS "V2;Integration;Parity;PrefixCache;RealModel;Qwen36;CPU;NodeLocalTP;MPI"
+    MPI_PROCS 2
+    TIMEOUT 1800
 )
 
 # Test: ConfigValidator (declarative device selection validation rules)

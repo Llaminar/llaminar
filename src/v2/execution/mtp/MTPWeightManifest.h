@@ -61,4 +61,17 @@ namespace llaminar2
         int base_layer_count,
         bool explicit_mtp);
 
+    /**
+     * @brief Return the number of decoder layers that belong to the main graph.
+     *
+     * Some Qwen3.6 GGUFs are encoded as qwen35 and report block_count including
+     * trailing nextn/MTP sidecar block(s). The sidecar weights must remain in
+     * the tensor inventory, but orchestration planners and main graph builders
+     * should not assign those blocks as ordinary decoder layers.
+     */
+    int mainLayerCountExcludingMTP(
+        const IModelLoader &loader,
+        const std::string &architecture,
+        int raw_layer_count);
+
 } // namespace llaminar2

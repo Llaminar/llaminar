@@ -472,6 +472,20 @@ class GGUFParser:
             full_key = prefix + gguf_key
             if full_key in self.metadata:
                 config[hf_key] = self.metadata[full_key]
+
+        # Some Qwen3.6 GGUFs are encoded as qwen35 and include trailing
+        # next-token-prediction sidecar block(s) in block_count. Those blocks
+        # remain in the tensor inventory for MTP, but the main PyTorch
+        # reference graph must not instantiate them as ordinary decoder layers.
+        nextn_depth_key = prefix + 'nextn_predict_layers'
+        nextn_depth = int(self.metadata.get(nextn_depth_key, 0) or 0)
+        raw_layers = int(config.get('num_hidden_layers', 0) or 0)
+        if model_type in ('qwen35', 'qwen35moe') and nextn_depth > 0 and raw_layers >= nextn_depth:
+            source_layer = raw_layers - nextn_depth
+            nextn_tensor_name = f'blk.{source_layer}.nextn.eh_proj.weight'
+            tensor_names = {getattr(t, 'name', t) for t in getattr(self, 'tensors', [])}
+            if nextn_tensor_name in tensor_names:
+                config['num_hidden_layers'] = source_layer
         
         # Vocab size (may be in tokenizer metadata)
         vocab_size_keys = [

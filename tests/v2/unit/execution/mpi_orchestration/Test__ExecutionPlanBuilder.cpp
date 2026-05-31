@@ -226,6 +226,34 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_GlobalTP_TwoRanks)
     }
 }
 
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_TwoRanksUsesCrossRankDomain)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {})
+                       .addRank(1, "localhost", 1, {})
+                       .build();
+
+    config.tp_degree = 2;
+    config.tp_scope = TPScope::NODE_LOCAL;
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 2);
+    for (int r = 0; r < 2; ++r)
+    {
+        const auto &plan = plans[r];
+        EXPECT_TRUE(plan.usesGlobalTP());
+        EXPECT_EQ(plan.tp_scope, TPScope::NODE_LOCAL);
+        EXPECT_EQ(plan.global_tp_domain_size, 2);
+        EXPECT_EQ(plan.global_tp_rank_in_domain, r);
+        EXPECT_EQ(plan.weight_shard.total_shards, 2);
+        EXPECT_EQ(plan.weight_shard.shard_index, r);
+
+        auto errors = plan.validate();
+        EXPECT_TRUE(errors.empty()) << "Rank " << r << " errors: " << (errors.empty() ? "" : errors[0]);
+    }
+}
+
 // ============================================================================
 // Pipeline Parallelism Tests
 // ============================================================================

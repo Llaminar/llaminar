@@ -7,6 +7,7 @@
  */
 
 #include "NamedDomainGlobalRunner.h"
+#include "../mtp/MTPWeightManifest.h"
 #include "../../utils/Logger.h"
 #include "../../utils/MPIContext.h"
 #include "../../planning/ClusterInventoryGatherer.h"
@@ -142,7 +143,11 @@ namespace llaminar2
 
                 if (ok)
                 {
-                    model_config.n_layers = static_cast<int>(meta_loader.blockCount());
+                    const int raw_layers = static_cast<int>(meta_loader.blockCount());
+                    model_config.n_layers = mainLayerCountExcludingMTP(
+                        meta_loader,
+                        meta_loader.architecture(),
+                        raw_layers);
                     model_config.n_heads = static_cast<int>(meta_loader.headCount());
                     model_config.n_kv_heads = static_cast<int>(meta_loader.headCountKV());
                     model_config.hidden_size = static_cast<int>(meta_loader.embeddingLength());

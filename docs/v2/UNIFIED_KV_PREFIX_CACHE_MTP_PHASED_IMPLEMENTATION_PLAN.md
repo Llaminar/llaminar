@@ -1635,15 +1635,14 @@ Required matrix:
 | ExpertParallel ROCm+CPU | MoE Qwen3.6 | RAM | Greedy | Heterogeneous sparse sidecar parity |
 | ExpertParallel ROCm+CPU graph-captured chunks | MoE Qwen3.6 | RAM | Off/Greedy | Captured fixed/rebalanced schedule equals non-captured chunked reference |
 
-Large-model parity is opt-in:
+Large-model parity tests are normal parity-suite entries, not feature-gated opt-ins. They may skip only when a required model file, metadata fixture, MPI topology, or hardware backend is unavailable. Environment variables are path overrides, not enable switches:
 
 ```text
-LLAMINAR_ENABLE_LARGE_MODEL_PARITY=1
 LLAMINAR_PARITY_DENSE_MODEL=/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf
 LLAMINAR_PARITY_MOE_MODEL=/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf
 ```
 
-Small deterministic fixtures should remain in normal unit/focused integration coverage so CI can prove the contract without large model files.
+Small deterministic fixtures should remain in normal unit/focused integration coverage so CI can prove the contract without large model files. Large-model parity entries must still be present in the suite and report explicit prerequisite skips rather than requiring separate enable flags.
 
 ### Files
 
@@ -1673,16 +1672,15 @@ cmake --build build_v2_integration --parallel
 ctest --test-dir build_v2_integration -R "^V2_Unit_|^V2_Integration_PrefixCache|^V2_Integration_Parity_PrefixCacheMTP" --output-on-failure --parallel
 ```
 
-Large-model opt-in command shape:
+Large-model parity command shape:
 
 ```bash
-LLAMINAR_ENABLE_LARGE_MODEL_PARITY=1 \
 ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_.*Qwen36" --output-on-failure --parallel
 ```
 
 ### Exit Criteria
 
-- All non-gated unit and focused integration parity tests pass.
+- All unit and focused integration parity tests pass, or skip only for explicit missing prerequisites such as model files, metadata, MPI rank count, or hardware.
 - Large dense Qwen3.6 parity passes on each available SingleDevice backend requested for rollout.
 - NodeLocalTP CPU and LocalTP ROCm dense parity pass before enabling TP MTP.
 - ExpertParallel MoE parity passes before enabling MoE MTP.
