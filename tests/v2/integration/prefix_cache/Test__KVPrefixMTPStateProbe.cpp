@@ -19,6 +19,7 @@
 #include "utils/MPIContext.h"
 #include "utils/Sampler.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/Tokenizer.h"
 
 #include <mpi.h>
 
@@ -943,7 +944,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
     auto factory = createOrchestrationRunnerFactory();
     SamplingParams greedy;
     greedy.temperature = 0.0f;
-    const std::vector<int32_t> prompt = {1, 2};
+    const std::string prompt_text = "Paris is";
 
     auto make_config = [&](bool enable_mtp)
     {
@@ -967,6 +968,11 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
         auto runner = factory->createFromOrchestrationConfig(make_config(enable_mtp));
         ASSERT_NE(runner, nullptr);
         ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        auto tokenizer = runner->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        const auto encoded = tokenizer->encode(prompt_text, /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded.empty());
+        const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
         *result = runner->generate(prompt, 2, greedy);
         *snapshot = runner->prefixStateProbe();
         runner->shutdown();
