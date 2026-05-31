@@ -8226,6 +8226,7 @@ if(HAVE_ROCM)
     )
     target_link_libraries(v2_integration_rocm_native_vnni_gemm
         llaminar2_core
+        roc::hipblas
         GTest::gtest
         GTest::gtest_main
     )

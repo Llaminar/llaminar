@@ -1783,12 +1783,13 @@ endif()
 # Link ROCm backend if enabled
 # =============================================================================
 if(HAVE_ROCM)
-    target_compile_definitions(llaminar2_core PUBLIC HAVE_ROCM)
-    # NOTE: HIP runtime, hipBLAS, hipBLASLt, and ROCm include directories are
-    # linked to rocm_backend (not llaminar2_core) to consolidate all HIP
-    # dependencies in one place. They flow transitively via the PUBLIC link
-    # from rocm_backend → llaminar2_core → executables.
-    message(STATUS "V2: ROCm libraries available via rocm_backend (hip::host, hipBLAS, hipBLASLt)")
+    target_compile_definitions(llaminar2_core PUBLIC HAVE_ROCM __HIP_PLATFORM_AMD__=1)
+    # Expose the cheap HIP host-runtime contract for consumers that include HIP
+    # headers or call hipGetDeviceCount()/hipMemcpy() directly. The expensive
+    # ROCm backend archive and device-symbol link remain consolidated in
+    # rocm_backend and are folded into shared llaminar2_core once.
+    target_link_libraries(llaminar2_core PUBLIC hip::host)
+    message(STATUS "V2: ROCm host runtime exposed via llaminar2_core; backend archives remain folded once")
     
     # NOTE: RCCL is linked to rocm_backend (not llaminar2_core) to isolate symbols
     # from NCCL. Both libraries export the same symbols (ncclCommInitRank, etc.)
