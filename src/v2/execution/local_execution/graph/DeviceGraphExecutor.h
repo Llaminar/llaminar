@@ -512,7 +512,7 @@ namespace llaminar2
             bool allow_fast_decode = true;
             bool allow_segmented_capture = false;
             bool collective_segmented_enabled = false;
-            bool collectives_graph_capturable = false; ///< True when collective ops can be captured into GPU graph
+            bool collectives_graph_capturable = false; ///< True only for explicit future graph-captured collective paths
             int max_segment_failures = 4;
         };
 

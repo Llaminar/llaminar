@@ -696,6 +696,42 @@ TEST(Test__Qwen35Schema, ConfigBuilder_LayerTypesPreferTensorInventory)
     EXPECT_EQ(config.layer_types[4], "full_attention");
 }
 
+TEST(Test__Qwen35Schema, ConfigBuilder_ExcludesTrailingNextNBlocksFromMainGraph)
+{
+    auto ctx = MockModelContextBuilder()
+                   .setArchitecture("qwen35")
+                   .setBlockCount(5)
+                   .setEmbeddingLength(256)
+                   .setHeadCount(4)
+                   .setHeadCountKV(1)
+                   .setFeedForwardLength(512)
+                   .setVocabSize(1024)
+                   .build();
+
+    auto &loader = ctx->mockLoader();
+    loader.setIntParam("qwen35.ssm.conv_kernel", 4);
+    loader.setIntParam("qwen35.ssm.state_size", 64);
+    loader.setIntParam("qwen35.ssm.inner_size", 256);
+    loader.setIntParam("qwen35.ssm.group_count", 2);
+    loader.setIntParam("qwen35.ssm.time_step_rank", 4);
+    loader.setIntParam("qwen35.full_attention_interval", 4);
+    loader.setIntParam("qwen35.nextn_predict_layers", 1);
+
+    loader.addFP32ZerosTensor("blk.4.nextn.eh_proj.weight", {256, 512});
+    loader.addFP32ZerosTensor("blk.4.attn_q.weight", {512, 256});
+    loader.addFP32ZerosTensor("blk.3.attn_qkv.weight", {512, 256});
+
+    GraphConfig config;
+    Qwen35GraphConfigBuilder builder;
+    ASSERT_TRUE(builder.populateFromModelContext(*ctx, config));
+
+    EXPECT_EQ(config.n_layers, 4);
+    EXPECT_EQ(config.total_n_layers, 4);
+    ASSERT_EQ(config.layer_types.size(), 4u);
+    EXPECT_EQ(config.layer_types[3], "gdn")
+        << "The trailing nextn block owns layer 4 tensors but must not enter the main graph";
+}
+
 TEST(Test__Qwen35Schema, IsFullAttentionLayer_Shortcut)
 {
     GraphConfig config;

@@ -695,7 +695,7 @@ namespace
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPSecondDecodeReplaysConditionAndAcceptedTokens)
+    TEST_F(Test__PrefillDecodeTransition, MTPSecondDecodeUsesReplayTerminalLogitsWithoutRefeedingPreviousToken)
     {
         auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
 
@@ -717,8 +717,7 @@ namespace
         EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::DECODE_ARGMAX_TOKEN);
         EXPECT_EQ(mock->restoreCount(), 2);
         EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
-                                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
     }
 

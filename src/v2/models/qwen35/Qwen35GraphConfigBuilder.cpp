@@ -12,6 +12,41 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        int readNextNDepth(const std::shared_ptr<IModelLoader> &loader,
+                           const std::string &arch)
+        {
+            if (!loader)
+                return 0;
+
+            const std::vector<std::string> keys = {
+                arch + ".nextn_predict_layers",
+                arch + ".mtp_num_hidden_layers",
+                arch + ".mtp.num_hidden_layers",
+                "mtp.num_hidden_layers",
+                "mtp_num_hidden_layers",
+            };
+            for (const auto &key : keys)
+            {
+                const int value = loader->getInt(key, 0);
+                if (value > 0)
+                    return value;
+            }
+            return 0;
+        }
+
+        bool hasNextNBlockAt(const std::shared_ptr<IModelLoader> &loader,
+                             int source_layer)
+        {
+            if (!loader || source_layer < 0)
+                return false;
+
+            const std::string prefix = "blk." + std::to_string(source_layer) + ".nextn.";
+            return loader->hasTensor(prefix + "eh_proj.weight");
+        }
+    } // namespace
+
 
     bool Qwen35GraphConfigBuilder::populateFromModelContext(
         IModelContext &ctx,
@@ -31,6 +66,27 @@ namespace llaminar2
         }
 
         const std::string arch = ctx.architecture();
+
+        // Some Qwen3.6 GGUFs include the trailing next-token-prediction
+        // sidecar block(s) in block_count. Those blocks must remain visible to
+        // weight loading, but the main graph must not execute them as ordinary
+        // transformer layers.
+        const int raw_layer_count = config.n_layers;
+        const int nextn_depth = readNextNDepth(loader, arch);
+        if (nextn_depth > 0 &&
+            raw_layer_count >= nextn_depth &&
+            hasNextNBlockAt(loader, raw_layer_count - nextn_depth))
+        {
+            config.n_layers = raw_layer_count - nextn_depth;
+            if (config.total_n_layers == raw_layer_count)
+            {
+                config.total_n_layers = config.n_layers;
+            }
+            LOG_INFO("[Qwen35GraphConfigBuilder] Excluding "
+                     << nextn_depth
+                     << " trailing nextn/MTP block(s) from main graph layers: "
+                     << raw_layer_count << " -> " << config.n_layers);
+        }
 
         // =====================================================================
         // GDN / SSM metadata

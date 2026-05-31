@@ -833,7 +833,7 @@ namespace llaminar2
             return result;
         }
 
-        const bool use_prefill_logits = prefill_logits_ready_;
+        const bool use_ready_logits = prefill_logits_ready_;
         prefill_logits_ready_ = false;
 
         auto fail_after_checkpoint = [&](const std::string &message) -> GenerationResult
@@ -843,12 +843,13 @@ namespace llaminar2
             {
                 ++mtp_stats_.rollbacks;
             }
+            prefill_logits_ready_ = use_ready_logits;
             result.error = message;
             return result;
         };
 
         const int32_t condition_token = last_token_;
-        if (!use_prefill_logits && !runner_->forward(&condition_token, 1))
+        if (!use_ready_logits && !runner_->forward(&condition_token, 1))
         {
             return fail_after_checkpoint("Forward pass failed during MTP condition decode");
         }
@@ -954,8 +955,8 @@ namespace llaminar2
         }
 
         std::vector<int32_t> replay_tokens;
-        replay_tokens.reserve((use_prefill_logits ? 0 : 1) + accepted_tokens.size());
-        if (!use_prefill_logits)
+        replay_tokens.reserve((use_ready_logits ? 0 : 1) + accepted_tokens.size());
+        if (!use_ready_logits)
         {
             replay_tokens.push_back(condition_token);
         }
@@ -968,6 +969,7 @@ namespace llaminar2
             result.error = "Forward pass failed during MTP replay";
             return result;
         }
+        prefill_logits_ready_ = true;
 
         for (int32_t token : accepted_tokens)
         {

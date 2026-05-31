@@ -1647,30 +1647,15 @@ namespace llaminar2
             allow_collective_segmented &&
             collective_segmented_backend_supported;
 
-        // Check if collectives can be captured INTO the GPU graph
-        // (monolithic capture with on-stream allreduce).
-        //
-        // When enabled, TPAllreduceStage issues rcclAllReduce directly
-        // on the capture stream (via allreduceOnStream), making the collective
-        // part of the captured graph.  This eliminates segmentation overhead
-        // (many small graphs + manual segments) in favour of a single monolithic
-        // graph per decode step.
-        //
-        // Requirements:
-        //   - Local TP with RCCL/NCCL backend (on-stream allreduce path)
-        //   - Stages must call allreduceOnStream(gpuStream()) during capture
-        //   - No cross-stream event sync (pre/post compute_event dance) during capture
-        //
-        // The segmented path remains as fallback when this is disabled or for
-        // MPI-based collectives that cannot be graph-captured.
-        policy.collectives_graph_capturable =
-            has_collective_nodes &&
-            env.execution.gpu_graphs &&
-            ctx && ctx->isGPU();
+        // Capturing TP collectives directly into HIP/CUDA graphs is still an
+        // experimental Tier-2 collective-capture project. By default, graphs
+        // that contain collectives may use segmented replay only when the
+        // explicit segmented-collective switch is enabled; the collective
+        // stages themselves stay manual synchronization points.
+        policy.collectives_graph_capturable = false;
 
         const bool can_use_segmented_graph =
             !has_collective_nodes ||
-            policy.collectives_graph_capturable ||
             policy.collective_segmented_enabled;
 
         // When profiling is enabled (LLAMINAR_PROFILING=1), disable GPU graph
