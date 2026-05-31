@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "backends/DeviceId.h"
+#include "config/TensorParallelConfig.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -928,6 +929,64 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixCacheBudgetBypassIsReportedInProbe)
     PrefixLookupResult second_hit = orchestrator->lookupPrefix({1, 2});
     EXPECT_FALSE(second_hit.supported);
     EXPECT_EQ(orchestrator->prefixStateProbe().prefix_cache_bypasses, 1u);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintIsDomainLevelAcrossParticipants)
+{
+    const auto tp = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            config_.n_heads,
+            config_.n_kv_heads,
+            config_.d_ff,
+            config_.vocab_size,
+            std::vector<DeviceId>{DeviceId::cuda(0), DeviceId::cuda(1)}));
+
+    auto make_participant_config = [&](int rank)
+    {
+        GraphConfig cfg = config_;
+        cfg.prefix_cache.enabled = true;
+        cfg.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+        cfg.prefix_cache.block_size = 2;
+        cfg.prefix_cache.ram_budget_bytes = 1 << 20;
+        cfg.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Off;
+        cfg.tp_config = tp;
+        cfg.local_rank = rank;
+        cfg.qkv_column_parallel = true;
+        cfg.ffn_column_parallel = true;
+        cfg.lm_head_column_parallel = true;
+
+        const auto &assignment = tp->forRank(rank);
+        cfg.head_start = assignment.head_start;
+        cfg.local_n_heads = assignment.head_count;
+        cfg.local_n_kv_heads = assignment.kv_head_count;
+        cfg.d_ff_local = assignment.d_ff_count;
+        cfg.vocab_local = assignment.vocab_count;
+        return cfg;
+    };
+
+    auto rank0_config = make_participant_config(0);
+    auto rank1_config = make_participant_config(1);
+
+    auto rank0 = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<QwenStandardGraph>(rank0_config, nullptr),
+        nullptr);
+    auto rank1 = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<QwenStandardGraph>(rank1_config, nullptr),
+        nullptr);
+
+    ASSERT_TRUE(rank0->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+    ASSERT_TRUE(rank1->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    PrefixLookupResult hit0 = rank0->lookupPrefix({1, 2});
+    PrefixLookupResult hit1 = rank1->lookupPrefix({1, 2});
+
+    ASSERT_TRUE(hit0.supported) << hit0.bypass_reason;
+    ASSERT_TRUE(hit1.supported) << hit1.bypass_reason;
+    ASSERT_NE(hit0.fingerprint_key, 0u);
+    EXPECT_EQ(hit0.fingerprint_key, hit1.fingerprint_key)
+        << "TP prefix participants must use one domain-level logical key; "
+           "local payload layout still guards shard compatibility.";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochRefreshesPrefixFingerprint)

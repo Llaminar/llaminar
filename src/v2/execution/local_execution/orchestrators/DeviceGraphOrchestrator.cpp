@@ -90,6 +90,17 @@ namespace llaminar2
             return value;
         }
 
+        size_t fp32LogitsRowBytes(const TensorBase *tensor)
+        {
+            if (!tensor)
+                return 0;
+            const auto &shape = tensor->shape();
+            if (shape.empty())
+                return 0;
+            const size_t cols = shape.size() >= 2 ? shape.back() : shape.front();
+            return cols * sizeof(float);
+        }
+
         bool containsAny(const std::string &haystack, std::initializer_list<const char *> needles)
         {
             for (const char *needle : needles)
@@ -3735,13 +3746,29 @@ namespace llaminar2
             {"terminal_state", prefixCacheTerminalStateModeToString(prefix_config.terminal_state)},
         };
         material.topology = {
-            {"device", state_.device_id.toString()},
             {"first_layer_index", std::to_string(prefix_layout_.first_layer_index)},
             {"total_layers", std::to_string(prefix_layout_.total_layers)},
-            {"local_kv_heads", std::to_string(prefix_layout_.local_kv_heads)},
-            {"kv_head_start", std::to_string(prefix_layout_.kv_head_start)},
             {"head_dim", std::to_string(prefix_layout_.head_dim)},
         };
+        if (config.tp_config && config.tp_config->worldSize() > 1)
+        {
+            material.topology.push_back({"scope", "tp-domain"});
+            material.topology.push_back({"tp_world_size", std::to_string(config.tp_config->worldSize())});
+            material.topology.push_back({"tp_total_heads", std::to_string(config.tp_config->totalHeads())});
+            material.topology.push_back({"tp_total_kv_heads", std::to_string(config.tp_config->totalKVHeads())});
+            material.topology.push_back({"tp_total_d_ff", std::to_string(config.tp_config->totalDFF())});
+            material.topology.push_back({"tp_total_vocab", std::to_string(config.tp_config->totalVocab())});
+            material.topology.push_back({"tp_proportional", config.tp_config->isProportional() ? "true" : "false"});
+            material.topology.push_back({"qkv_column_parallel", config.qkv_column_parallel ? "true" : "false"});
+            material.topology.push_back({"lm_head_column_parallel", config.lm_head_column_parallel ? "true" : "false"});
+        }
+        else
+        {
+            material.topology.push_back({"scope", "single-participant"});
+            material.topology.push_back({"device", state_.device_id.toString()});
+            material.topology.push_back({"local_kv_heads", std::to_string(prefix_layout_.local_kv_heads)});
+            material.topology.push_back({"kv_head_start", std::to_string(prefix_layout_.kv_head_start)});
+        }
         material.hybrid = prefix_layout_.includes_hybrid_state
                               ? std::vector<PrefixFingerprintField>{
                                     {"enabled", "true"},
@@ -3863,6 +3890,10 @@ namespace llaminar2
         const int block_size = prefix_config.block_size > 0 ? prefix_config.block_size : 64;
         const bool terminal_state_enabled =
             prefix_config.terminal_state != PrefixCacheTerminalStateMode::Off;
+        const bool use_local_terminal_logits =
+            config.lm_head_column_parallel && static_cast<bool>(state_.logits_local);
+        const auto *terminal_logits_tensor =
+            use_local_terminal_logits ? state_.logits_local.get() : state_.logits.get();
         const size_t terminal_hidden_bytes =
             config.mtp.enabled && terminal_state_enabled && state_.d_model > 0
                 ? static_cast<size_t>(state_.d_model) * sizeof(float)
@@ -3870,7 +3901,7 @@ namespace llaminar2
         const size_t terminal_logits_bytes =
             !terminal_state_enabled
                 ? 0
-                : static_cast<size_t>(state_.vocab_size) * sizeof(float);
+                : fp32LogitsRowBytes(terminal_logits_tensor);
 
         prefix_layout_ = buildDensePrefixPayloadLayout(
             *state_.kv_cache,
@@ -4118,7 +4149,14 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::restorePrefixTerminalState(const PrefixLookupResult &hit)
     {
-        if (!hit.has_terminal_logits || hit.blocks.empty() || !state_.logits)
+        TensorBase *terminal_logits_tensor =
+            graph_builder_ && graph_builder_->config().lm_head_column_parallel && state_.logits_local
+                ? state_.logits_local.get()
+                : state_.logits.get();
+        const BufferId terminal_logits_buffer_id =
+            terminal_logits_tensor == state_.logits_local.get() ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+
+        if (!hit.has_terminal_logits || hit.blocks.empty() || !terminal_logits_tensor)
         {
             return false;
         }
@@ -4129,7 +4167,12 @@ namespace llaminar2
             return false;
         }
 
-        void *dst = state_.logits->raw_mutable_data();
+        if (fp32LogitsRowBytes(terminal_logits_tensor) < prefix_layout_.terminal_logits_bytes)
+        {
+            return false;
+        }
+
+        void *dst = terminal_logits_tensor->raw_mutable_data();
         if (!dst)
         {
             return false;
@@ -4137,13 +4180,19 @@ namespace llaminar2
         std::memcpy(dst, terminal.terminal_logits, prefix_layout_.terminal_logits_bytes);
         if (state_.device_id.is_gpu())
         {
-            auto upload = TransferEngine::instance().upload(state_.logits.get(), state_.device_id);
+            auto upload = TransferEngine::instance().upload(terminal_logits_tensor, state_.device_id);
             if (!upload.success)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal logits: "
                           << upload.error);
                 return false;
             }
+        }
+        if (arena_ && arena_->isRegistered(terminal_logits_buffer_id))
+        {
+            arena_->markWrittenFlagsOnly(
+                terminal_logits_buffer_id,
+                state_.device_id.is_gpu() ? state_.device_id : DeviceId::cpu());
         }
         if (prefix_cache_)
         {
@@ -4268,12 +4317,20 @@ namespace llaminar2
                     &handle);
             }
 
+            TensorBase *terminal_logits_tensor =
+                graph_builder_ && graph_builder_->config().lm_head_column_parallel && state_.logits_local
+                    ? state_.logits_local.get()
+                    : state_.logits.get();
             if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
-                state_.logits && handle.terminal_logits)
+                terminal_logits_tensor && handle.terminal_logits)
             {
+                if (fp32LogitsRowBytes(terminal_logits_tensor) < prefix_layout_.terminal_logits_bytes)
+                {
+                    ok = false;
+                }
                 if (state_.device_id.is_gpu())
                 {
-                    auto download = TransferEngine::instance().download(state_.logits.get());
+                    auto download = TransferEngine::instance().download(terminal_logits_tensor);
                     if (!download.success)
                     {
                         LOG_ERROR("[DeviceGraphOrchestrator] Failed to download prefix terminal logits: "
@@ -4281,7 +4338,7 @@ namespace llaminar2
                         ok = false;
                     }
                 }
-                const float *logits = ok ? state_.logits->fp32_data() : nullptr;
+                const float *logits = ok ? terminal_logits_tensor->fp32_data() : nullptr;
                 if (ok && logits)
                 {
                     std::memcpy(handle.terminal_logits, logits, prefix_layout_.terminal_logits_bytes);

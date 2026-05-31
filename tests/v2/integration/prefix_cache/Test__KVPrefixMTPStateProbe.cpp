@@ -1171,6 +1171,111 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmokeOptIn)
     EXPECT_GE(snapshot.mtp_rollbacks, 1u);
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmokeOptIn)
+{
+    const char *enabled = std::getenv("LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE");
+    if (!enabled || std::string(enabled) != "1")
+    {
+        GTEST_SKIP() << "Set LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE=1 to run real Qwen3.6 ROCm LocalTP prefix+MTP smoke";
+    }
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalTP prefix+MTP smoke";
+    }
+
+    auto make_config = [&](bool enable_prefix_cache, bool enable_mtp)
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = 32;
+        config.batch_size = 1;
+        config.tp_degree = 2;
+        config.tp_scope = TPScope::LOCAL;
+        config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+        config.pp_degree = 1;
+        config.kv_cache_precision = "auto";
+        config.prefix_cache.enabled = enable_prefix_cache;
+        config.prefix_cache.storage_mode = enable_prefix_cache
+                                               ? PrefixCacheStorageMode::Ram
+                                               : PrefixCacheStorageMode::Disabled;
+        config.prefix_cache.block_size = 2;
+        config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+        config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
+        config.mtp.enabled = enable_mtp;
+        config.mtp.draft_tokens = 1;
+        return config;
+    };
+
+    auto factory = createOrchestrationRunnerFactory();
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+
+    auto baseline = factory->createFromOrchestrationConfig(make_config(false, false));
+    ASSERT_NE(baseline, nullptr);
+    ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+    auto baseline_tokenizer = baseline->tokenizer();
+    ASSERT_NE(baseline_tokenizer, nullptr);
+    const auto encoded = baseline_tokenizer->encode("Paris is", /*add_bos=*/false, /*add_eos=*/false);
+    ASSERT_FALSE(encoded.empty());
+    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+
+    auto baseline_result = baseline->generate(prompt, 2, greedy);
+    const auto baseline_snapshot = baseline->prefixStateProbe();
+    baseline->shutdown();
+
+    ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+    ASSERT_EQ(baseline_result.tokens.size(), 2u);
+    EXPECT_EQ(baseline_snapshot.prefix_cache_hits, 0u);
+    EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+
+    auto cached = factory->createFromOrchestrationConfig(make_config(true, true));
+    ASSERT_NE(cached, nullptr);
+    ASSERT_TRUE(cached->initialize()) << cached->lastError();
+
+    auto first = cached->generate(prompt, 2, greedy);
+    const auto after_first = cached->prefixStateProbe();
+    ASSERT_TRUE(first.error.empty()) << first.error;
+    ASSERT_EQ(first.tokens.size(), 2u);
+    EXPECT_EQ(first.tokens, baseline_result.tokens);
+    EXPECT_TRUE(after_first.prefix_cache_ready);
+    EXPECT_GE(after_first.prefix_cache_inserts, 2u);
+    EXPECT_GT(after_first.prefix_cache_mtp_state_bytes, 0u);
+    EXPECT_FALSE(after_first.mtp_bypassed) << after_first.mtp_bypass_reason;
+    EXPECT_GE(after_first.mtp_draft_steps, 1u);
+
+    auto second = cached->generate(prompt, 2, greedy);
+    const auto after_second = cached->prefixStateProbe();
+    cached->shutdown();
+
+    ASSERT_TRUE(second.error.empty()) << second.error;
+    ASSERT_EQ(second.tokens.size(), 2u);
+    EXPECT_EQ(second.tokens, baseline_result.tokens);
+    EXPECT_TRUE(after_second.prefix_cache_ready);
+    EXPECT_GE(after_second.prefix_cache_hits, 2u);
+    EXPECT_GE(after_second.prefix_cache_matched_tokens, static_cast<uint64_t>(prompt.size() * 2));
+    EXPECT_TRUE(after_second.prefix_request.hit);
+    EXPECT_EQ(after_second.prefix_request.matched_tokens, static_cast<int>(prompt.size()));
+    EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
+    EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
+    EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
+    EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
+    EXPECT_GE(after_second.mtp_draft_steps, after_first.mtp_draft_steps + 1u);
+    EXPECT_GE(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs + 1u);
+}
+
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)
 {
     const auto device = firstGpuDeviceId();

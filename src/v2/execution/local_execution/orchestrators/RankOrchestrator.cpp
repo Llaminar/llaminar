@@ -2501,8 +2501,6 @@ namespace llaminar2
         LOG_DEBUG("RankOrchestrator::clear_cache: Clearing cache on all "
                   << device_runners_.size() << " TP devices and "
                   << pp_stage_runners_.size() << " PP stages");
-        last_device_prefix_hits_.clear();
-        last_pp_prefix_hits_.clear();
 
         // Clear TP device runners
         for (auto &runner : device_runners_)
@@ -2617,7 +2615,31 @@ namespace llaminar2
         if (participants.empty())
             return aggregate;
 
-        return makePrefixLookupResult(coordinatePrefixLookups(std::move(participants)), block_size);
+        aggregate = makePrefixLookupResult(coordinatePrefixLookups(std::move(participants)), block_size);
+        const int common_tokens = std::max(0, aggregate.cached_tokens);
+        if (common_tokens > 0)
+        {
+            const auto copy_representative_blocks =
+                [&](const std::vector<PrefixLookupResult> &hits)
+            {
+                for (const auto &hit : hits)
+                {
+                    if (hit.cached_tokens >= common_tokens && !hit.blocks.empty())
+                    {
+                        aggregate.blocks = hit.clampedTo(common_tokens).blocks;
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            if (!copy_representative_blocks(last_device_prefix_hits_))
+            {
+                copy_representative_blocks(last_pp_prefix_hits_);
+            }
+        }
+
+        return aggregate;
     }
 
     bool RankOrchestrator::populatePrefix(const PrefixLookupResult &hit, int seq_idx)

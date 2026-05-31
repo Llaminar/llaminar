@@ -5715,6 +5715,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPSmoke
     MPI_PROCS 1
     TIMEOUT 1200
 )
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPPrefixSmoke
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmokeOptIn
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;LocalTP"
+    MPI_PROCS 1
+    TIMEOUT 1200
+)
 
 # Test: ConfigValidator (declarative device selection validation rules)
 # Tests mutual exclusion, co-requirements, intra-mode consistency, mode detection.
