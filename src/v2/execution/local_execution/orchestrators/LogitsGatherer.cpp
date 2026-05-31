@@ -324,6 +324,7 @@ namespace llaminar2
                                    : (fallback_copy_elements > 0 ? fallback_copy_elements
                                                                  : static_cast<size_t>(vocab));
         std::memcpy(buffer_->mutable_data(), stage_logits, copy_elements * sizeof(float));
+        last_gathered_size_ = copy_elements;
 
         LOG_DEBUG("LogitsGatherer::copyFromStage: Copied " << copy_elements << " elements");
     }

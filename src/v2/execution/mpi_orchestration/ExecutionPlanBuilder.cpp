@@ -107,8 +107,11 @@ namespace llaminar2
             errors.push_back("ClusterInventory has no ranks");
         }
 
-        // Check PP degree doesn't exceed ranks
-        if (config.pp_degree > cluster_inventory.world_size)
+        // Check PP degree doesn't exceed ranks for implicit/simple PP.
+        // Explicit named-domain PP stages may be local to one MPI rank, so
+        // their stage count is validated through the stage definitions below.
+        if (config.pp_stage_definitions.empty() &&
+            config.pp_degree > cluster_inventory.world_size)
         {
             errors.push_back("PP degree (" + std::to_string(config.pp_degree) +
                              ") exceeds world_size (" +

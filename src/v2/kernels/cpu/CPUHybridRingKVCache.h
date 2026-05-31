@@ -98,6 +98,7 @@ namespace llaminar2
 
         int n_layers() const override { return total_layers_; }
         int num_layers() const override { return total_layers_; }
+        int first_layer_index() const override { return first_layer_index_; }
 
         // =====================================================================
         // IKVCache Overrides — Layer-Indexed Methods
@@ -105,7 +106,7 @@ namespace llaminar2
 
         int get_cached_tokens(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return 0; // GDN layer — no KV cache tokens
             return Base::get_cached_tokens(kv_idx, seq_idx);
@@ -115,7 +116,7 @@ namespace llaminar2
                     ITensor **out_k, ITensor **out_v,
                     int *out_kv_len = nullptr) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -133,7 +134,7 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -149,7 +150,7 @@ namespace llaminar2
 
         ITensor *get_k(int layer, int seq_idx = 0) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_k(kv_idx, seq_idx);
@@ -157,7 +158,7 @@ namespace llaminar2
 
         const ITensor *get_k(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_k(kv_idx, seq_idx);
@@ -165,7 +166,7 @@ namespace llaminar2
 
         ITensor *get_v(int layer, int seq_idx = 0) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_v(kv_idx, seq_idx);
@@ -173,7 +174,7 @@ namespace llaminar2
 
         const ITensor *get_v(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_v(kv_idx, seq_idx);
@@ -181,7 +182,7 @@ namespace llaminar2
 
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return true; // GDN layer — no-op
             return Base::append_kv(kv_idx, seq_idx, new_k, new_v);
@@ -189,7 +190,7 @@ namespace llaminar2
 
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return true; // GDN layer — no-op
             return Base::append_kv(kv_idx, seq_idx, new_k, new_v, num_tokens);
@@ -207,7 +208,7 @@ namespace llaminar2
 
         void clear_sequence(int layer, int seq_idx) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return; // GDN — no per-sequence clear needed (state is global)
             Base::clear_sequence(kv_idx, seq_idx);
@@ -215,7 +216,7 @@ namespace llaminar2
 
         void clear_layer(int layer) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx >= 0)
             {
                 Base::clear_layer(kv_idx);
@@ -223,7 +224,7 @@ namespace llaminar2
             else
             {
                 // Reset GDN state for this layer
-                int gdn_idx = layer_map_.toGDNIndex(layer);
+                int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
                 if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
                 {
                     gdn_states_[gdn_idx].reset();
@@ -234,29 +235,29 @@ namespace llaminar2
 
         typename IKVCache::KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override
         {
-            int kv_idx = layer_map_.toKVIndex(global_layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(global_layer));
             if (kv_idx < 0)
                 return {};
-            return Base::logicalBlockLayout(kv_idx, token_count);
+            return Base::logicalBlockLayout(baseLayerIndexForKVIndex(kv_idx), token_count);
         }
 
         typename IKVCache::KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override
         {
-            int kv_idx = layer_map_.toKVIndex(global_layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(global_layer));
             if (kv_idx < 0)
                 return {};
-            return Base::sequenceState(kv_idx, seq_idx);
+            return Base::sequenceState(baseLayerIndexForKVIndex(kv_idx), seq_idx);
         }
 
         bool exportLogicalBlock(const IKVCache::KVCacheLogicalBlockDescriptor &desc,
                                 void *dst_k,
                                 void *dst_v) const override
         {
-            int kv_idx = layer_map_.toKVIndex(desc.layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(desc.layer));
             if (kv_idx < 0)
                 return false;
             auto remapped = desc;
-            remapped.layer = kv_idx;
+            remapped.layer = baseLayerIndexForKVIndex(kv_idx);
             return Base::exportLogicalBlock(remapped, dst_k, dst_v);
         }
 
@@ -264,11 +265,11 @@ namespace llaminar2
                                 const void *src_k,
                                 const void *src_v) override
         {
-            int kv_idx = layer_map_.toKVIndex(desc.layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(desc.layer));
             if (kv_idx < 0)
                 return false;
             auto remapped = desc;
-            remapped.layer = kv_idx;
+            remapped.layer = baseLayerIndexForKVIndex(kv_idx);
             return Base::importLogicalBlock(remapped, src_k, src_v);
         }
 
@@ -281,7 +282,7 @@ namespace llaminar2
                               TensorBase *out_k, TensorBase *out_v,
                               std::vector<int> &out_kv_lens) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return -1; // GDN layer
             return Base::gather_kv_batched(kv_idx, num_sequences, out_k, out_v, out_kv_lens);
@@ -293,7 +294,7 @@ namespace llaminar2
                               int *out_kv_len = nullptr,
                               const typename Base::KVReadParams *rope = nullptr) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -309,7 +310,7 @@ namespace llaminar2
 
         DeviceId get_layer_device(int layer) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return DeviceId::cpu(); // GDN state is on CPU
             return Base::get_layer_device(kv_idx);
@@ -317,7 +318,7 @@ namespace llaminar2
 
         int ring_head(int layer, int seq_idx = 0) const
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return 0;
             return Base::ring_head(kv_idx, seq_idx);
@@ -325,7 +326,7 @@ namespace llaminar2
 
         int ring_size(int layer, int seq_idx = 0) const
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return 0;
             return Base::ring_size(kv_idx, seq_idx);
@@ -336,15 +337,23 @@ namespace llaminar2
         // =====================================================================
 
         /// Check if a layer is a GDN layer
-        bool isGDNLayer(int layer) const override { return !layer_map_.isFullAttention(layer); }
+        bool isGDNLayer(int layer) const override
+        {
+            const int local_layer = normalizeLayerIndex(layer);
+            return local_layer >= 0 && local_layer < total_layers_ &&
+                   !layer_map_.isFullAttention(local_layer);
+        }
 
         /// Check if a layer is a full-attention layer
-        bool isFullAttentionLayer(int layer) const override { return layer_map_.isFullAttention(layer); }
+        bool isFullAttentionLayer(int layer) const override
+        {
+            return layer_map_.isFullAttention(normalizeLayerIndex(layer));
+        }
 
         /// Get GDN state for a layer (nullptr if FA layer)
         HybridGDNLayerState *getGDNState(int layer) override
         {
-            int gdn_idx = layer_map_.toGDNIndex(layer);
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
             if (gdn_idx < 0)
                 return nullptr;
             return &gdn_states_[gdn_idx];
@@ -352,7 +361,7 @@ namespace llaminar2
 
         const HybridGDNLayerState *getGDNState(int layer) const override
         {
-            int gdn_idx = layer_map_.toGDNIndex(layer);
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
             if (gdn_idx < 0)
                 return nullptr;
             return &gdn_states_[gdn_idx];
@@ -465,8 +474,24 @@ namespace llaminar2
 
     private:
         int total_layers_;
+        int first_layer_index_ = 0;
         HybridLayerMap layer_map_;
         std::vector<HybridGDNLayerState> gdn_states_;
+
+        int normalizeLayerIndex(int layer) const
+        {
+            if (layer >= first_layer_index_ &&
+                layer < first_layer_index_ + total_layers_)
+            {
+                return layer - first_layer_index_;
+            }
+            return layer;
+        }
+
+        int baseLayerIndexForKVIndex(int kv_idx) const
+        {
+            return first_layer_index_ + kv_idx;
+        }
 
         HybridPrefixStateMetadata buildHybridPrefixStateMetadata() const
         {
@@ -587,6 +612,7 @@ namespace llaminar2
 
         void initHybrid(const HybridKVCacheConfig &config)
         {
+            first_layer_index_ = config.first_layer_index;
             layer_map_.build(config.layer_types);
 
             // Initialize GDN states

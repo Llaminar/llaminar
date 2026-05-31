@@ -22,6 +22,10 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+#include <hip/hip_runtime.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -642,6 +646,51 @@ TEST(Test__AMDDeviceContext, StreamCreationAndDestruction)
     ctx.submitAndWait([&]()
                       { ctx.destroyStream(stream); });
 }
+
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+TEST(Test__AMDDeviceContext, StreamCreationUsesContextDeviceWhenCallerDeviceDiffers)
+{
+    SKIP_IF_NO_ROCM();
+
+    auto &pool = GPUDeviceContextPool::instance();
+    if (pool.amdDeviceCount() < 2)
+    {
+        GTEST_SKIP() << "requires at least two ROCm devices";
+    }
+
+    int original_device = 0;
+    (void)hipGetDevice(&original_device);
+
+    auto &ctx = pool.getAMDContext(0);
+
+    ASSERT_EQ(hipSetDevice(1), hipSuccess);
+    void *stream = ctx.createStream();
+    ASSERT_NE(stream, nullptr) << "createStream() should return non-null";
+
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    int *device_word = nullptr;
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_word), sizeof(int)), hipSuccess);
+
+    hipError_t memset_err = hipMemsetAsync(
+        device_word,
+        0,
+        sizeof(int),
+        static_cast<hipStream_t>(stream));
+    EXPECT_EQ(memset_err, hipSuccess) << hipGetErrorString(memset_err);
+    if (memset_err == hipSuccess)
+    {
+        EXPECT_EQ(hipStreamSynchronize(static_cast<hipStream_t>(stream)), hipSuccess);
+    }
+
+    ASSERT_EQ(hipFree(device_word), hipSuccess);
+    ctx.destroyStream(stream);
+
+    if (original_device >= 0)
+    {
+        (void)hipSetDevice(original_device);
+    }
+}
+#endif
 
 TEST(Test__AMDDeviceContext, MultipleStreams)
 {

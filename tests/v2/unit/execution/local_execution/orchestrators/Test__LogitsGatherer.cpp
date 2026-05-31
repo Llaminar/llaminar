@@ -385,6 +385,7 @@ TEST_F(Test__LogitsGatherer, CopyFromStage_CopiesLogits)
     {
         EXPECT_FLOAT_EQ(result[i], expected[i]) << "Mismatch at index " << i;
     }
+    EXPECT_EQ(g->lastGatheredSize(), static_cast<size_t>(VOCAB));
 }
 
 TEST_F(Test__LogitsGatherer, CopyFromStage_AllocatesIfNull)

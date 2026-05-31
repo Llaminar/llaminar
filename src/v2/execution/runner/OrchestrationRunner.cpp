@@ -623,6 +623,16 @@ namespace llaminar2
                 PrefixLookupResult coordinated_hit =
                     makePrefixLookupResult(coordination, coordination_block_size);
                 int matched_tokens = coordinated_hit.cached_tokens;
+                LOG_DEBUG("[OrchestrationRunner] Prefix cache lookup summary: local_tokens="
+                          << local_hit.cached_tokens
+                          << " coordinated_tokens=" << coordinated_hit.cached_tokens
+                          << " supported=" << coordinated_hit.supported
+                          << " terminal_logits=" << coordinated_hit.has_terminal_logits
+                          << " terminal_hidden=" << coordinated_hit.has_terminal_hidden
+                          << " requires_terminal_logits=" << coordinated_hit.requires_terminal_logits
+                          << " requires_terminal_hidden=" << coordinated_hit.requires_terminal_hidden
+                          << " blocks=" << coordinated_hit.blocks.size()
+                          << " bypass_reason=" << coordinated_hit.bypass_reason);
 
                 runner_->clear_cache();
                 prefill_logits_ready_ = false;
@@ -660,6 +670,8 @@ namespace llaminar2
 
                 if (matched_tokens > 0 && !runner_->populatePrefix(common_hit))
                 {
+                    LOG_DEBUG("[OrchestrationRunner] Prefix cache populate failed at matched_tokens="
+                              << matched_tokens);
                     matched_tokens = 0;
                     common_hit = make_common_hit();
                     runner_->clear_cache();
@@ -687,6 +699,11 @@ namespace llaminar2
                 }
                 else
                 {
+                    LOG_DEBUG("[OrchestrationRunner] Prefix cache terminal restore unavailable; "
+                              << "matched_tokens=" << matched_tokens
+                              << " has_terminal_logits=" << common_hit.has_terminal_logits
+                              << " has_terminal_hidden=" << common_hit.has_terminal_hidden
+                              << " mtp_requires_hidden=" << mtp_full_hit_requires_terminal_hidden);
                     const int block_size =
                         common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
                     matched_tokens = std::max(0, matched_tokens - std::max(1, block_size));

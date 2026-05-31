@@ -903,6 +903,48 @@ TEST_F(Test__ExecutionPlanBuilder, ValidateConfig_PPDegreeExceedsRanks)
     EXPECT_FALSE(errors.empty());
 }
 
+TEST_F(Test__ExecutionPlanBuilder, ValidateConfig_NamedDomainLocalPPAllowsMoreStagesThanRanks)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .build();
+
+    DomainDefinition stage0_domain;
+    stage0_domain.name = "rocm0";
+    stage0_domain.devices = {GlobalDeviceAddress::rocm(0, 0)};
+
+    DomainDefinition stage1_domain;
+    stage1_domain.name = "rocm1";
+    stage1_domain.devices = {GlobalDeviceAddress::rocm(1, 0)};
+
+    PPStageDefinition stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "rocm0";
+    stage0.first_layer = 0;
+    stage0.last_layer = 13;
+
+    PPStageDefinition stage1;
+    stage1.stage_id = 1;
+    stage1.domain_name = "rocm1";
+    stage1.first_layer = 14;
+    stage1.last_layer = 27;
+
+    config.pp_degree = 2;
+    config.pp_split = PPSplitMode::MANUAL;
+    config.domain_definitions = {stage0_domain, stage1_domain};
+    config.pp_stage_definitions = {stage0, stage1};
+
+    auto errors = builder->validateConfig(config, model, cluster);
+    EXPECT_TRUE(errors.empty()) << "Unexpected validation error: "
+                                << (errors.empty() ? "" : errors.front());
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+    ASSERT_EQ(plans.size(), 1);
+    EXPECT_TRUE(plans[0].usesLocalPP());
+    EXPECT_EQ(plans[0].local_pp_devices.size(), 2);
+}
+
 TEST_F(Test__ExecutionPlanBuilder, ValidateConfig_PPDegreeExceedsLayers)
 {
     auto cluster = ClusterInventoryBuilder()

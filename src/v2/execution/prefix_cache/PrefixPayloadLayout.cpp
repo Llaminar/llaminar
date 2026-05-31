@@ -19,7 +19,7 @@ namespace llaminar2
             {
                 if (hybrid->isFullAttentionLayer(layer))
                 {
-                    return layer;
+                    return kv_cache.first_layer_index() + layer;
                 }
             }
             return -1;

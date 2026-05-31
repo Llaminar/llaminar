@@ -119,6 +119,8 @@ namespace llaminar2
         participant.matched_blocks = !hit.blocks.empty()
                                          ? static_cast<int>(hit.blocks.size())
                                          : (hit.block_size > 0 ? participant.matched_tokens / hit.block_size : 0);
+        participant.requires_terminal_logits = hit.requires_terminal_logits;
+        participant.requires_terminal_hidden = hit.requires_terminal_hidden;
         participant.has_terminal_logits = hit.has_terminal_logits;
         participant.has_terminal_hidden = hit.has_terminal_hidden;
         participant.bypass_reason = hit.bypass_reason;
@@ -141,6 +143,8 @@ namespace llaminar2
 
         bool local_any_cache_enabled = false;
         bool local_all_supported = true;
+        bool local_any_terminal_logits_required = false;
+        bool local_any_terminal_hidden_required = false;
         bool local_all_terminal_logits = true;
         bool local_all_terminal_hidden = true;
         int local_min_tokens = std::numeric_limits<int>::max();
@@ -161,14 +165,26 @@ namespace llaminar2
             local_min_blocks = std::min(local_min_blocks, participant_blocks);
             local_max_tokens = std::max(local_max_tokens, participant_tokens);
             local_placement_epoch = std::max(local_placement_epoch, participant.placement_epoch);
-            if (participant_tokens > 0 && participant.fingerprint_key != 0)
+            if (participant_tokens > 0 &&
+                participant.fingerprint_must_match &&
+                participant.fingerprint_key != 0)
             {
                 local_min_fingerprint = std::min(local_min_fingerprint, participant.fingerprint_key);
                 local_max_fingerprint = std::max(local_max_fingerprint, participant.fingerprint_key);
             }
 
-            local_all_terminal_logits = local_all_terminal_logits && participant.has_terminal_logits;
-            local_all_terminal_hidden = local_all_terminal_hidden && participant.has_terminal_hidden;
+            const bool needs_terminal_logits =
+                participant_tokens > 0 && participant.requires_terminal_logits;
+            const bool needs_terminal_hidden =
+                participant_tokens > 0 && participant.requires_terminal_hidden;
+            local_any_terminal_logits_required =
+                local_any_terminal_logits_required || needs_terminal_logits;
+            local_any_terminal_hidden_required =
+                local_any_terminal_hidden_required || needs_terminal_hidden;
+            local_all_terminal_logits =
+                local_all_terminal_logits && (!needs_terminal_logits || participant.has_terminal_logits);
+            local_all_terminal_hidden =
+                local_all_terminal_hidden && (!needs_terminal_hidden || participant.has_terminal_hidden);
         }
 
         if (local_min_tokens == std::numeric_limits<int>::max())
@@ -185,6 +201,8 @@ namespace llaminar2
         uint64_t global_placement_epoch = local_placement_epoch;
         bool global_any_cache_enabled = local_any_cache_enabled;
         bool global_all_supported = local_all_supported;
+        bool global_any_terminal_logits_required = local_any_terminal_logits_required;
+        bool global_any_terminal_hidden_required = local_any_terminal_hidden_required;
         bool global_all_terminal_logits = local_all_terminal_logits;
         bool global_all_terminal_hidden = local_all_terminal_hidden;
 
@@ -196,6 +214,10 @@ namespace llaminar2
                 !domain_coordinator->allMaxUInt64(local_max_fingerprint, &global_max_fingerprint) ||
                 !domain_coordinator->allMaxUInt64(local_placement_epoch, &global_placement_epoch) ||
                 !domain_coordinator->allOrBool(local_any_cache_enabled, &global_any_cache_enabled) ||
+                !domain_coordinator->allOrBool(local_any_terminal_logits_required,
+                                               &global_any_terminal_logits_required) ||
+                !domain_coordinator->allOrBool(local_any_terminal_hidden_required,
+                                               &global_any_terminal_hidden_required) ||
                 !domain_coordinator->allAndBool(local_all_supported, &global_all_supported) ||
                 !domain_coordinator->allAndBool(local_all_terminal_logits, &global_all_terminal_logits) ||
                 !domain_coordinator->allAndBool(local_all_terminal_hidden, &global_all_terminal_hidden))
@@ -210,6 +232,8 @@ namespace llaminar2
         result.cache_enabled = global_any_cache_enabled;
         result.supported = global_all_supported;
         result.placement_epoch = global_placement_epoch;
+        result.common_terminal_logits_required = global_any_terminal_logits_required;
+        result.common_terminal_hidden_required = global_any_terminal_hidden_required;
         const bool fingerprint_mismatch =
             global_min_tokens > 0 &&
             global_min_fingerprint != 0 &&
@@ -224,9 +248,13 @@ namespace llaminar2
                 ? global_min_fingerprint
                 : 0;
         result.common_terminal_logits =
-            result.common_matched_tokens > 0 && global_all_terminal_logits;
+            result.common_matched_tokens > 0 &&
+            global_any_terminal_logits_required &&
+            global_all_terminal_logits;
         result.common_terminal_hidden =
-            result.common_matched_tokens > 0 && global_all_terminal_hidden;
+            result.common_matched_tokens > 0 &&
+            global_any_terminal_hidden_required &&
+            global_all_terminal_hidden;
 
         if (fingerprint_mismatch)
         {
@@ -243,7 +271,8 @@ namespace llaminar2
             result.clamp_reason = "clamped to common prefix across participants";
         }
         else if (result.common_matched_tokens > 0 &&
-                 (!result.common_terminal_logits || !result.common_terminal_hidden))
+                 ((global_any_terminal_logits_required && !global_all_terminal_logits) ||
+                  (global_any_terminal_hidden_required && !global_all_terminal_hidden)))
         {
             result.clamp_reason = "terminal state missing on at least one participant";
         }
@@ -261,6 +290,8 @@ namespace llaminar2
         result.block_size = block_size;
         result.fingerprint_key = coordination.fingerprint_key;
         result.placement_epoch = coordination.placement_epoch;
+        result.requires_terminal_logits = coordination.common_terminal_logits_required;
+        result.requires_terminal_hidden = coordination.common_terminal_hidden_required;
 
         int restorable_tokens = nonNegative(coordination.common_matched_tokens);
         if (block_size > 0)

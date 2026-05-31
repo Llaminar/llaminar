@@ -281,7 +281,7 @@ namespace llaminar2
                 }
                 if (seen == fa_index)
                 {
-                    return layer;
+                    return cache.first_layer_index() + layer;
                 }
                 ++seen;
             }
@@ -2562,7 +2562,22 @@ namespace llaminar2
             if (config.hasGDN() && !config.layer_types.empty())
             {
                 hybrid_config_storage = std::make_unique<HybridKVCacheConfig>();
-                hybrid_config_storage->layer_types = config.layer_types;
+                hybrid_config_storage->first_layer_index = kv_config.first_layer_index;
+                const int first_layer = std::max(0, kv_config.first_layer_index);
+                const int layer_count = std::max(0, kv_config.num_layers);
+                if (first_layer < static_cast<int>(config.layer_types.size()) &&
+                    layer_count > 0 &&
+                    first_layer + layer_count <= static_cast<int>(config.layer_types.size()))
+                {
+                    hybrid_config_storage->layer_types.assign(
+                        config.layer_types.begin() + first_layer,
+                        config.layer_types.begin() + first_layer + layer_count);
+                }
+                else
+                {
+                    hybrid_config_storage->first_layer_index = 0;
+                    hybrid_config_storage->layer_types = config.layer_types;
+                }
                 hybrid_config_storage->gdn_conv_kernel_size = config.gdn.conv_kernel_size;
                 hybrid_config_storage->gdn_state_size = config.gdn.state_size;
                 hybrid_config_storage->gdn_inner_size = config.gdn.inner_size;
@@ -2573,8 +2588,14 @@ namespace llaminar2
                 kv_config.hybrid_config = hybrid_config_storage.get();
 
                 LOG_DEBUG("[DeviceGraphOrchestrator] Hybrid KV cache config: "
+                          << "layers [" << hybrid_config_storage->first_layer_index
+                          << ", " << (hybrid_config_storage->first_layer_index +
+                                      static_cast<int>(hybrid_config_storage->layer_types.size()))
+                          << "), "
                           << hybrid_config_storage->countKVLayers() << " KV layers, "
-                          << (n_layers - hybrid_config_storage->countKVLayers()) << " GDN layers");
+                          << (static_cast<int>(hybrid_config_storage->layer_types.size()) -
+                              hybrid_config_storage->countKVLayers())
+                          << " GDN layers");
             }
             kv_config.max_seq_len = max_seq_len;
             kv_config.n_kv_heads = n_kv_heads;
@@ -3875,16 +3896,18 @@ namespace llaminar2
         const int block_size = prefix_config.block_size > 0 ? prefix_config.block_size : 64;
         const bool terminal_state_enabled =
             prefix_config.terminal_state != PrefixCacheTerminalStateMode::Off;
+        const bool owns_terminal_state =
+            !pp_stage_config_.has_value() || pp_stage_config_->has_lm_head;
         const bool use_local_terminal_logits =
             config.lm_head_column_parallel && static_cast<bool>(state_.logits_local);
         const auto *terminal_logits_tensor =
             use_local_terminal_logits ? state_.logits_local.get() : state_.logits.get();
         const size_t terminal_hidden_bytes =
-            config.mtp.enabled && terminal_state_enabled && state_.d_model > 0
+            owns_terminal_state && config.mtp.enabled && terminal_state_enabled && state_.d_model > 0
                 ? static_cast<size_t>(state_.d_model) * sizeof(float)
                 : 0;
         const size_t terminal_logits_bytes =
-            !terminal_state_enabled
+            !terminal_state_enabled || !owns_terminal_state
                 ? 0
                 : fp32LogitsRowBytes(terminal_logits_tensor);
 
@@ -3993,6 +4016,8 @@ namespace llaminar2
         result.block_size = prefix_layout_.block_size;
         result.fingerprint_key = prefix_fingerprint_;
         result.placement_epoch = moePlacementEpoch();
+        result.requires_terminal_logits = prefix_layout_.includes_terminal_logits;
+        result.requires_terminal_hidden = prefix_layout_.includes_terminal_hidden;
         if (tokens.empty() || prefix_layout_.block_size <= 0)
         {
             return result;
@@ -4142,6 +4167,11 @@ namespace llaminar2
         const BufferId terminal_logits_buffer_id =
             terminal_logits_tensor == state_.logits_local.get() ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
 
+        if (!prefix_layout_.includes_terminal_logits ||
+            prefix_layout_.terminal_logits_bytes == 0)
+        {
+            return true;
+        }
         if (!hit.has_terminal_logits || hit.blocks.empty() || !terminal_logits_tensor)
         {
             return false;
@@ -4226,10 +4256,17 @@ namespace llaminar2
     {
         if (prompt_token_count <= 0 || prompt_token_count > static_cast<int>(tokens.size()))
         {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest skipped: invalid prompt_token_count="
+                      << prompt_token_count << " token_count=" << tokens.size());
             return false;
         }
         if (!ensurePrefixCacheReady() || !state_.kv_cache || !prefix_ram_backend_)
         {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest skipped: cache_ready="
+                      << (prefix_cache_ ? "yes" : "no")
+                      << " kv_cache=" << (state_.kv_cache ? "yes" : "no")
+                      << " ram_backend=" << (prefix_ram_backend_ ? "yes" : "no")
+                      << " bypass_reason=" << prefix_cache_bypass_reason_);
             return false;
         }
 
@@ -4252,12 +4289,17 @@ namespace llaminar2
 
             if (!prefix_cache_->reserveRam(prefix_layout_.totalBytes()))
             {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: RAM reserve rejected block_bytes="
+                          << prefix_layout_.totalBytes());
                 return false;
             }
 
             PrefixBlockHandle handle = prefix_ram_backend_->allocate(key, prefix_layout_);
             if (!handle.valid())
             {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: RAM allocate rejected key="
+                          << key.toHex()
+                          << " block_bytes=" << prefix_layout_.totalBytes());
                 return false;
             }
 
@@ -4267,6 +4309,8 @@ namespace llaminar2
                 const int global_layer = prefixFALayerForIndex(*state_.kv_cache, local_layer);
                 if (global_layer < 0)
                 {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: no FA layer for local index "
+                              << local_layer);
                     ok = false;
                     break;
                 }
@@ -4280,17 +4324,33 @@ namespace llaminar2
                 desc.logical_token_start = key.token_start;
                 desc.token_count = key.token_count;
                 ok = state_.kv_cache->exportLogicalBlock(desc, k_dst, v_dst);
+                if (!ok)
+                {
+                    const auto seq_state = state_.kv_cache->sequenceState(global_layer, desc.seq_idx);
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: exportLogicalBlock layer="
+                              << global_layer
+                              << " token_start=" << desc.logical_token_start
+                              << " token_count=" << desc.token_count
+                              << " cached_tokens=" << seq_state.cached_tokens
+                              << " first_layer_index=" << state_.kv_cache->first_layer_index()
+                              << " total_layers=" << state_.kv_cache->n_layers());
+                }
             }
 
             if (ok && prefix_layout_.includes_mtp_state)
             {
                 if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
                 {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: missing MTP KV cache");
                     ok = false;
                 }
                 else
                 {
                     ok = exportMTPPrefixPayload(*state_.mtp_kv_caches[0], 0, key, &handle);
+                    if (!ok)
+                    {
+                        LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: MTP payload export failed");
+                    }
                 }
             }
 
@@ -4303,6 +4363,10 @@ namespace llaminar2
                     0,
                     key.token_start + key.token_count,
                     &handle);
+                if (!ok)
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: hybrid payload export failed");
+                }
             }
 
             TensorBase *terminal_logits_tensor =
@@ -4332,6 +4396,11 @@ namespace llaminar2
                     std::memcpy(handle.terminal_logits, logits, prefix_layout_.terminal_logits_bytes);
                     handle.has_terminal_logits = true;
                 }
+                else if (ok)
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: terminal logits host pointer unavailable");
+                    ok = false;
+                }
             }
 
             if (ok && terminal_block && prefix_layout_.includes_terminal_hidden &&
@@ -4353,10 +4422,20 @@ namespace llaminar2
                     std::memcpy(handle.terminal_hidden, hidden, prefix_layout_.terminal_hidden_bytes);
                     handle.has_terminal_hidden = true;
                 }
+                else if (ok)
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: terminal hidden host pointer unavailable");
+                    ok = false;
+                }
             }
 
             if (!ok || !prefix_cache_->insert(handle))
             {
+                if (ok)
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: cache insert rejected key="
+                              << key.toHex());
+                }
                 prefix_ram_backend_->release(handle);
                 return false;
             }

@@ -14,7 +14,9 @@ namespace
         bool terminal_logits,
         bool terminal_hidden,
         bool supported = true,
-        uint64_t fingerprint_key = 0x1000)
+        uint64_t fingerprint_key = 0x1000,
+        bool requires_terminal_logits = true,
+        bool requires_terminal_hidden = true)
     {
         PrefixParticipantLookup lookup;
         lookup.domain_id = "test-domain";
@@ -27,6 +29,8 @@ namespace
         lookup.hit = tokens > 0;
         lookup.matched_tokens = tokens;
         lookup.matched_blocks = tokens / 2;
+        lookup.requires_terminal_logits = requires_terminal_logits;
+        lookup.requires_terminal_hidden = requires_terminal_hidden;
         lookup.has_terminal_logits = terminal_logits;
         lookup.has_terminal_hidden = terminal_hidden;
         if (!supported)
@@ -125,6 +129,22 @@ TEST(Test__PrefixCacheCoordinator, TerminalStateRequiresEveryParticipant)
     EXPECT_NE(result.clamp_reason.find("terminal state"), std::string::npos);
 }
 
+TEST(Test__PrefixCacheCoordinator, TerminalStateIgnoresParticipantsWithoutTerminalPayloadOwnership)
+{
+    auto result = coordinatePrefixLookups({
+        participant(/*id=*/0, /*tokens=*/6, /*terminal_logits=*/false, /*terminal_hidden=*/false,
+                    /*supported=*/true, /*fingerprint_key=*/0x1000,
+                    /*requires_terminal_logits=*/false, /*requires_terminal_hidden=*/false),
+        participant(/*id=*/1, /*tokens=*/6, /*terminal_logits=*/true, /*terminal_hidden=*/true),
+    });
+
+    EXPECT_TRUE(result.supported);
+    EXPECT_EQ(result.common_matched_tokens, 6);
+    EXPECT_TRUE(result.common_terminal_logits);
+    EXPECT_TRUE(result.common_terminal_hidden);
+    EXPECT_TRUE(result.clamp_reason.empty());
+}
+
 TEST(Test__PrefixCacheCoordinator, UnsupportedParticipantBypassesAndZerosCommonPrefix)
 {
     auto result = coordinatePrefixLookups({
@@ -185,6 +205,8 @@ TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
     hit.block_size = 2;
     hit.fingerprint_key = 0xfeed;
     hit.placement_epoch = 13;
+    hit.requires_terminal_logits = true;
+    hit.requires_terminal_hidden = true;
     hit.has_terminal_logits = true;
     hit.has_terminal_hidden = false;
 
@@ -200,6 +222,8 @@ TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
     EXPECT_TRUE(participant.hit);
     EXPECT_EQ(participant.matched_tokens, 6);
     EXPECT_EQ(participant.matched_blocks, 3);
+    EXPECT_TRUE(participant.requires_terminal_logits);
+    EXPECT_TRUE(participant.requires_terminal_hidden);
     EXPECT_TRUE(participant.has_terminal_logits);
     EXPECT_FALSE(participant.has_terminal_hidden);
 }
@@ -302,4 +326,31 @@ TEST(Test__PrefixCacheCoordinator, FingerprintMismatchDisablesCommonHit)
     EXPECT_EQ(result.common_matched_tokens, 0);
     EXPECT_EQ(result.fingerprint_key, 0u);
     EXPECT_NE(result.clamp_reason.find("fingerprint mismatch"), std::string::npos);
+}
+
+TEST(Test__PrefixCacheCoordinator, IgnoresFingerprintMismatchWhenParticipantsOwnDifferentPayloadSlices)
+{
+    auto stage0 = participant(/*id=*/0, /*tokens=*/8, /*terminal_logits=*/false,
+                              /*terminal_hidden=*/false, /*supported=*/true,
+                              /*fingerprint_key=*/0x1000,
+                              /*requires_terminal_logits=*/false,
+                              /*requires_terminal_hidden=*/false);
+    auto stage1 = participant(/*id=*/1, /*tokens=*/8, /*terminal_logits=*/true,
+                              /*terminal_hidden=*/true, /*supported=*/true,
+                              /*fingerprint_key=*/0x2000,
+                              /*requires_terminal_logits=*/true,
+                              /*requires_terminal_hidden=*/false);
+    stage0.fingerprint_must_match = false;
+    stage1.fingerprint_must_match = false;
+
+    auto result = coordinatePrefixLookups({stage0, stage1});
+
+    EXPECT_TRUE(result.supported);
+    EXPECT_TRUE(result.cache_enabled);
+    EXPECT_EQ(result.common_matched_tokens, 8);
+    EXPECT_EQ(result.common_matched_blocks, 4);
+    EXPECT_EQ(result.fingerprint_key, 0u);
+    EXPECT_TRUE(result.common_terminal_logits);
+    EXPECT_FALSE(result.common_terminal_hidden_required);
+    EXPECT_TRUE(result.clamp_reason.empty());
 }

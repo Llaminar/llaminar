@@ -16,11 +16,14 @@ namespace llaminar2
         DeviceId device = DeviceId::cpu();
         uint64_t placement_epoch = 0;
         uint64_t fingerprint_key = 0;
+        bool fingerprint_must_match = true;
         bool supported = false;
         bool cache_enabled = false;
         bool hit = false;
         int matched_tokens = 0;
         int matched_blocks = 0;
+        bool requires_terminal_logits = true;
+        bool requires_terminal_hidden = true;
         bool has_terminal_logits = false;
         bool has_terminal_hidden = false;
         std::string bypass_reason;
@@ -35,6 +38,8 @@ namespace llaminar2
         bool cache_enabled = false;
         int common_matched_tokens = 0;
         int common_matched_blocks = 0;
+        bool common_terminal_logits_required = false;
+        bool common_terminal_hidden_required = false;
         bool common_terminal_logits = false;
         bool common_terminal_hidden = false;
         std::string clamp_reason;

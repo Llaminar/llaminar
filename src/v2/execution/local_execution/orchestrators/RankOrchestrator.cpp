@@ -48,6 +48,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #ifdef __linux__
 #include <malloc.h> // malloc_trim for deferred host weight release
 #endif
@@ -2589,7 +2590,8 @@ namespace llaminar2
         int participant_id = 0;
 
         auto query_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners,
-                                 std::vector<PrefixLookupResult> &hits)
+                                 std::vector<PrefixLookupResult> &hits,
+                                 bool fingerprint_must_match)
         {
             for (auto &runner : runners)
             {
@@ -2597,25 +2599,43 @@ namespace llaminar2
                     continue;
 
                 PrefixLookupResult hit = runner->lookupPrefix(tokens);
-                participants.push_back(makePrefixParticipantLookup(
+                LOG_DEBUG("RankOrchestrator::lookupPrefix participant " << participant_id
+                          << " device=" << runner->primaryDeviceId().toString()
+                          << " supported=" << hit.supported
+                          << " cached_tokens=" << hit.cached_tokens
+                          << " blocks=" << hit.blocks.size()
+                          << " requires_terminal_logits=" << hit.requires_terminal_logits
+                          << " has_terminal_logits=" << hit.has_terminal_logits
+                          << " requires_terminal_hidden=" << hit.requires_terminal_hidden
+                          << " has_terminal_hidden=" << hit.has_terminal_hidden);
+                PrefixParticipantLookup participant = makePrefixParticipantLookup(
                     participant_id++,
                     runner->primaryDeviceId(),
                     hit,
                     {},
-                    runner->moePlacementEpoch()));
+                    runner->moePlacementEpoch());
+                participant.fingerprint_must_match = fingerprint_must_match;
+                participants.push_back(std::move(participant));
                 hits.push_back(hit);
                 if (block_size <= 0 && hit.block_size > 0)
                     block_size = hit.block_size;
             }
         };
 
-        query_runners(device_runners_, last_device_prefix_hits_);
-        query_runners(pp_stage_runners_, last_pp_prefix_hits_);
+        query_runners(device_runners_, last_device_prefix_hits_, /*fingerprint_must_match=*/true);
+        query_runners(pp_stage_runners_, last_pp_prefix_hits_, /*fingerprint_must_match=*/false);
 
         if (participants.empty())
             return aggregate;
 
         aggregate = makePrefixLookupResult(coordinatePrefixLookups(std::move(participants)), block_size);
+        LOG_DEBUG("RankOrchestrator::lookupPrefix aggregate supported=" << aggregate.supported
+                  << " cached_tokens=" << aggregate.cached_tokens
+                  << " block_size=" << aggregate.block_size
+                  << " requires_terminal_logits=" << aggregate.requires_terminal_logits
+                  << " has_terminal_logits=" << aggregate.has_terminal_logits
+                  << " requires_terminal_hidden=" << aggregate.requires_terminal_hidden
+                  << " has_terminal_hidden=" << aggregate.has_terminal_hidden);
         const int common_tokens = std::max(0, aggregate.cached_tokens);
         if (common_tokens > 0)
         {
@@ -2714,14 +2734,38 @@ namespace llaminar2
                 PrefixLookupResult child_hit =
                     hit_index < hits.size() ? hits[hit_index++].clampedTo(common_tokens)
                                             : hit.clampedTo(common_tokens);
+                LOG_DEBUG("RankOrchestrator::restorePrefixTerminalState child device="
+                          << runner->primaryDeviceId().toString()
+                          << " cached_tokens=" << child_hit.cached_tokens
+                          << " requires_terminal_logits=" << child_hit.requires_terminal_logits
+                          << " has_terminal_logits=" << child_hit.has_terminal_logits);
                 if (!runner->restorePrefixTerminalState(child_hit))
+                {
+                    LOG_DEBUG("RankOrchestrator::restorePrefixTerminalState child restore failed");
                     return false;
+                }
             }
             return true;
         };
 
-        return restore_runners(device_runners_, last_device_prefix_hits_) &&
-               restore_runners(pp_stage_runners_, last_pp_prefix_hits_);
+        const bool restored =
+            restore_runners(device_runners_, last_device_prefix_hits_) &&
+            restore_runners(pp_stage_runners_, last_pp_prefix_hits_);
+        if (!restored)
+            return false;
+
+        if (!pp_stage_runners_.empty() && pp_stage_runners_.back())
+        {
+            if (!logits_gatherer_)
+                logits_gatherer_ = std::make_unique<LogitsGatherer>(0, 0);
+            logits_gatherer_->copyFromStage(*pp_stage_runners_.back(),
+                                            static_cast<size_t>(vocab_size()),
+                                            config_.batch_size,
+                                            static_cast<int>(config_.max_seq_len));
+        }
+        current_position_ = common_tokens;
+        stats_dirty_ = true;
+        return true;
     }
 
     PrefixStateSnapshot RankOrchestrator::captureLivePrefixState(int seq_idx) const

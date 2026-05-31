@@ -21,6 +21,7 @@
 #include "../../utils/TestTensorFactory.h"
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 using namespace llaminar::v2::kernels;
@@ -55,6 +56,20 @@ namespace llaminar2::test
         config.gdn_time_step_rank = 16; // n_v_heads
         config.n_heads = 32;
         config.local_n_heads = 0;
+        return config;
+    }
+
+    static HybridKVCacheConfig makeQwen35_08B_StageConfig(int first_layer, int layer_count)
+    {
+        HybridKVCacheConfig config = makeQwen35_08B_Config();
+        std::vector<std::string> stage_layer_types;
+        stage_layer_types.reserve(static_cast<size_t>(layer_count));
+        for (int layer = first_layer; layer < first_layer + layer_count; ++layer)
+        {
+            stage_layer_types.push_back(config.layer_types.at(static_cast<size_t>(layer)));
+        }
+        config.layer_types = std::move(stage_layer_types);
+        config.first_layer_index = first_layer;
         return config;
     }
 
@@ -462,6 +477,74 @@ namespace llaminar2::test
         EXPECT_EQ(layout.hybrid_device_state_bytes, 0u);
         EXPECT_EQ(layout.hybrid_state_bytes, cache->gdnMemoryBytes());
         EXPECT_EQ(layout.totalBytes(), layout.faKVBytes() + cache->gdnMemoryBytes());
+    }
+
+    TEST_F(Test__CPUHybridKVCache, PrefixPayloadLayoutAndLogicalIOUsePPStageGlobalLayerIds)
+    {
+        constexpr int FIRST_LAYER = 8;
+        constexpr int STAGE_LAYERS = 8;
+        auto stage_config = makeQwen35_08B_StageConfig(FIRST_LAYER, STAGE_LAYERS);
+        auto cache = std::make_unique<CPUHybridRingKVCacheFP32>(
+            stage_config, getTestMPIContext(), STAGE_LAYERS, BATCH_SIZE,
+            MAX_SEQ_LEN, N_KV_HEADS, HEAD_DIM);
+
+        EXPECT_EQ(cache->first_layer_index(), FIRST_LAYER);
+        EXPECT_TRUE(cache->isFullAttentionLayer(3));
+        EXPECT_TRUE(cache->isFullAttentionLayer(11));
+        EXPECT_FALSE(cache->isFullAttentionLayer(8));
+        EXPECT_EQ(firstRestorablePrefixLayer(*cache), 11);
+
+        const PrefixPayloadLayout layout = buildDensePrefixPayloadLayout(
+            *cache,
+            DeviceId::cpu(),
+            2);
+        EXPECT_EQ(layout.first_layer_index, FIRST_LAYER);
+        EXPECT_EQ(layout.total_layers, STAGE_LAYERS);
+        EXPECT_EQ(layout.fa_layers, 2);
+        ASSERT_GT(layout.bytes_per_fa_layer_k, 0u);
+        ASSERT_GT(layout.bytes_per_fa_layer_v, 0u);
+
+        const int kv_dim = N_KV_HEADS * HEAD_DIM;
+        auto k_tensor = TestTensorFactory::createFP32Zeros({2, static_cast<size_t>(kv_dim)});
+        auto v_tensor = TestTensorFactory::createFP32Zeros({2, static_cast<size_t>(kv_dim)});
+        for (int i = 0; i < 2 * kv_dim; ++i)
+        {
+            k_tensor->mutable_data()[i] = static_cast<float>(3000 + i);
+            v_tensor->mutable_data()[i] = static_cast<float>(4000 + i);
+        }
+
+        ASSERT_TRUE(cache->append_kv(11, 0, k_tensor.get(), v_tensor.get(), 2));
+        EXPECT_EQ(cache->get_cached_tokens(11), 2);
+        EXPECT_EQ(cache->get_cached_tokens(3), 2);
+        EXPECT_EQ(restorablePrefixCachedTokens(*cache, 0), 2);
+
+        const auto local_layout = cache->logicalBlockLayout(3, 2);
+        const auto global_layout = cache->logicalBlockLayout(11, 2);
+        EXPECT_EQ(global_layout.k_bytes, local_layout.k_bytes);
+        EXPECT_EQ(global_layout.v_bytes, local_layout.v_bytes);
+        ASSERT_GT(global_layout.k_bytes, 0u);
+        ASSERT_GT(global_layout.v_bytes, 0u);
+
+        std::vector<uint8_t> k_payload(global_layout.k_bytes);
+        std::vector<uint8_t> v_payload(global_layout.v_bytes);
+        IKVCache::KVCacheLogicalBlockDescriptor desc;
+        desc.layer = 11;
+        desc.seq_idx = 0;
+        desc.logical_token_start = 0;
+        desc.token_count = 2;
+        ASSERT_TRUE(cache->exportLogicalBlock(desc, k_payload.data(), v_payload.data()));
+
+        auto restored = std::make_unique<CPUHybridRingKVCacheFP32>(
+            stage_config, getTestMPIContext(), STAGE_LAYERS, BATCH_SIZE,
+            MAX_SEQ_LEN, N_KV_HEADS, HEAD_DIM);
+        ASSERT_TRUE(restored->importLogicalBlock(desc, k_payload.data(), v_payload.data()));
+        EXPECT_EQ(restored->sequenceState(11, 0).cached_tokens, 2);
+
+        std::vector<uint8_t> restored_k(global_layout.k_bytes);
+        std::vector<uint8_t> restored_v(global_layout.v_bytes);
+        ASSERT_TRUE(restored->exportLogicalBlock(desc, restored_k.data(), restored_v.data()));
+        EXPECT_EQ(restored_k, k_payload);
+        EXPECT_EQ(restored_v, v_payload);
     }
 
     TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRoundTripRestoresGDNState)
