@@ -10790,6 +10790,26 @@ add_v2_test(V2_Unit_MoERoutingStage
     MPI_PROCS 1
 )
 
+add_executable(v2_test_moe_local_expert_stage_prepared_weights
+    unit/execution/compute_stages/Test__MoELocalExpertStage_PreparedWeights.cpp)
+target_include_directories(v2_test_moe_local_expert_stage_prepared_weights PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_local_expert_stage_prepared_weights llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MoELocalExpertStage_PreparedWeights
+    COMMAND $<TARGET_FILE:v2_test_moe_local_expert_stage_prepared_weights>
+    LABELS "V2;Unit;MoE;Stages;PreparedWeights;RuntimeTable;GraphCapture"
+    MPI_PROCS 1
+)
+
+add_executable(v2_test_moe_local_expert_stage_params
+    unit/execution/compute_stages/Test__MoELocalExpertStage_Params.cpp)
+target_include_directories(v2_test_moe_local_expert_stage_params PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_test_moe_local_expert_stage_params llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_MoELocalExpertStage_Params
+    COMMAND $<TARGET_FILE:v2_test_moe_local_expert_stage_params>
+    LABELS "V2;Unit;MoE;Stages;Params;RuntimeTable"
+    MPI_PROCS 1
+)
+
 add_executable(v2_test_prefill_graph_capturability unit/stages/Test__PrefillGraphCapturability.cpp)
 target_include_directories(v2_test_prefill_graph_capturability PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_test_prefill_graph_capturability llaminar2_core GTest::gtest GTest::gtest_main)
