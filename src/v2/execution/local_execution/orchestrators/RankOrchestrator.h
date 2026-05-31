@@ -541,6 +541,9 @@ namespace llaminar2
         bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
         bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
         bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
+        bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
 
         // =====================================================================
         // Hidden State API (for Pipeline Parallelism nesting)

@@ -27,6 +27,9 @@
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
 
+#include <string>
+#include <utility>
+
 using namespace llaminar2;
 using namespace testing;
 
@@ -123,6 +126,11 @@ namespace
             return all_position_logits_.empty() ? nullptr : all_position_logits_.data();
         }
 
+        std::string mtpDecodeUnsupportedReason() const override
+        {
+            return mtp_unsupported_reason_;
+        }
+
         int vocab_size() const override { return VOCAB_SIZE; }
 
         void clear_cache() override
@@ -157,6 +165,10 @@ namespace
         {
             mtp_enabled_ = true;
             accept_mtp_token_ = accept_mtp_token;
+        }
+        void setMTPUnsupportedReason(std::string reason)
+        {
+            mtp_unsupported_reason_ = std::move(reason);
         }
 
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
@@ -216,6 +228,7 @@ namespace
         bool mtp_enabled_{false};
         bool accept_mtp_token_{true};
         bool all_position_logits_enabled_{false};
+        std::string mtp_unsupported_reason_;
         std::vector<int> last_forward_tokens_;
         int last_forward_seq_len_{0};
         int position_{0};
@@ -247,7 +260,8 @@ namespace
          * @brief Create an OrchestrationRunner with the mock runner injected
          */
         std::pair<OrchestrationRunner *, MockInferenceRunner *> createRunner(bool mtp_enabled = false,
-                                                                             bool mtp_accept = true)
+                                                                             bool mtp_accept = true,
+                                                                             std::string mtp_unsupported_reason = {})
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -255,6 +269,7 @@ namespace
             {
                 mock_ptr->enableMTP(mtp_accept);
             }
+            mock_ptr->setMTPUnsupportedReason(std::move(mtp_unsupported_reason));
 
             OrchestrationConfig config;
             config.device_for_this_rank = GlobalDeviceAddress::cpu();
@@ -485,6 +500,30 @@ namespace
         ASSERT_TRUE(step2.success());
         EXPECT_EQ(mock->forwardMTPCount(), 0);
         EXPECT_EQ(runner->prefixStateProbe().mtp_bypasses, 1u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPBypassForRunnerTopologyReasonPreservesGreedyDecode)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            "MTP decode requires TP logits and checkpoint coordination");
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        ASSERT_EQ(step1.tokens.size(), 1u);
+        EXPECT_EQ(step1.tokens[0], MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+
+        auto probe = runner->prefixStateProbe();
+        EXPECT_TRUE(probe.mtp_config_enabled);
+        EXPECT_TRUE(probe.mtp_bypassed);
+        EXPECT_NE(probe.mtp_bypass_reason.find("TP logits"), std::string::npos);
+        EXPECT_EQ(probe.mtp_bypasses, 1u);
+        EXPECT_EQ(probe.mtp_draft_steps, 0u);
     }
 
     /**

@@ -31,6 +31,7 @@ namespace llaminar2
         int cached_tokens = 0;
         std::vector<PrefixBlockHandle> blocks;
         std::vector<PrefixBlockHandle> mtp_blocks;
+        std::vector<PrefixStateSnapshot> participant_snapshots;
     };
 
 } // namespace llaminar2

@@ -159,6 +159,38 @@ public:
         return prefix_terminal_restore_ok_;
     }
 
+    PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
+    {
+        (void)seq_idx;
+        prefix_live_capture_calls_.fetch_add(1, std::memory_order_relaxed);
+        PrefixStateSnapshot snapshot;
+        if (!prefix_live_capture_ok_)
+            return snapshot;
+        snapshot.valid = true;
+        snapshot.cached_tokens = position_;
+        return snapshot;
+    }
+
+    bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override
+    {
+        (void)seq_idx;
+        prefix_live_restore_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (!prefix_live_restore_ok_ || !snapshot.valid)
+            return false;
+        position_ = snapshot.cached_tokens;
+        return true;
+    }
+
+    bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override
+    {
+        (void)seq_idx;
+        prefix_live_truncate_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (!prefix_live_truncate_ok_ || cached_tokens < 0)
+            return false;
+        position_ = cached_tokens;
+        return true;
+    }
+
     // =====================================================================
     // Test Utilities
     // =====================================================================
@@ -205,6 +237,9 @@ public:
     void set_prefix_populate_ok(bool ok) { prefix_populate_ok_ = ok; }
     void set_forward_mtp_ok(bool ok) { forward_mtp_ok_ = ok; }
     void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
+    void set_prefix_live_capture_ok(bool ok) { prefix_live_capture_ok_ = ok; }
+    void set_prefix_live_restore_ok(bool ok) { prefix_live_restore_ok_ = ok; }
+    void set_prefix_live_truncate_ok(bool ok) { prefix_live_truncate_ok_ = ok; }
 
     size_t prefix_lookup_call_count() const { return prefix_lookup_calls_; }
     size_t prefix_populate_call_count() const { return prefix_populate_calls_; }
@@ -219,6 +254,9 @@ public:
     int32_t last_mtp_condition_token() const { return last_mtp_condition_token_; }
     size_t set_all_position_logits_call_count() const { return set_all_position_logits_calls_.load(std::memory_order_relaxed); }
     bool compute_all_position_logits() const { return compute_all_position_logits_; }
+    size_t prefix_live_capture_call_count() const { return prefix_live_capture_calls_.load(std::memory_order_relaxed); }
+    size_t prefix_live_restore_call_count() const { return prefix_live_restore_calls_.load(std::memory_order_relaxed); }
+    size_t prefix_live_truncate_call_count() const { return prefix_live_truncate_calls_.load(std::memory_order_relaxed); }
 
     void reset_call_counts()
     {
@@ -226,6 +264,9 @@ public:
         clear_cache_calls_.store(0, std::memory_order_relaxed);
         forward_mtp_calls_.store(0, std::memory_order_relaxed);
         set_all_position_logits_calls_.store(0, std::memory_order_relaxed);
+        prefix_live_capture_calls_.store(0, std::memory_order_relaxed);
+        prefix_live_restore_calls_.store(0, std::memory_order_relaxed);
+        prefix_live_truncate_calls_.store(0, std::memory_order_relaxed);
     }
 
 private:
@@ -241,6 +282,9 @@ private:
     bool forward_mtp_ok_ = true;
     bool set_all_position_logits_ok_ = true;
     bool compute_all_position_logits_ = false;
+    bool prefix_live_capture_ok_ = true;
+    bool prefix_live_restore_ok_ = true;
+    bool prefix_live_truncate_ok_ = true;
     int32_t last_mtp_condition_token_ = -1;
     size_t prefix_lookup_calls_ = 0;
     size_t prefix_populate_calls_ = 0;
@@ -255,6 +299,9 @@ private:
     mutable std::atomic<size_t> clear_cache_calls_{0};
     mutable std::atomic<size_t> forward_mtp_calls_{0};
     mutable std::atomic<size_t> set_all_position_logits_calls_{0};
+    mutable std::atomic<size_t> prefix_live_capture_calls_{0};
+    mutable std::atomic<size_t> prefix_live_restore_calls_{0};
+    mutable std::atomic<size_t> prefix_live_truncate_calls_{0};
 };
 
 // =============================================================================
@@ -1217,8 +1264,7 @@ TEST_F(Test__RankOrchestrator, MultiChildMTPDecodeReportsTopologyBypassUntilCoor
         makeRankConfigForRunnerCount(2));
 
     const std::string reason = orchestrator->mtpDecodeUnsupportedReason();
-    EXPECT_NE(reason.find("TP logits"), std::string::npos);
-    EXPECT_NE(reason.find("checkpoint"), std::string::npos);
+    EXPECT_NE(reason.find("MTP/all-position logits"), std::string::npos);
 }
 
 TEST_F(Test__RankOrchestrator, SingleChildMTPDelegatesWithoutTopologyBypass)
@@ -1245,6 +1291,106 @@ TEST_F(Test__RankOrchestrator, SingleChildMTPDelegatesWithoutTopologyBypass)
     EXPECT_TRUE(orchestrator->setComputeAllPositionLogits(true));
     ASSERT_NE(orchestrator->getAllPositionLogits(), nullptr);
     EXPECT_FLOAT_EQ(orchestrator->getAllPositionLogits()[0], 2.0f);
+}
+
+TEST_F(Test__RankOrchestrator, LivePrefixCheckpointCapturesTruncatesAndRestoresEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    int tokens[] = {1, 2, 3};
+    ASSERT_TRUE(runner0_ptr->forward(tokens, 3));
+    ASSERT_TRUE(runner1_ptr->forward(tokens, 3));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixStateSnapshot snapshot = orchestrator->captureLivePrefixState();
+    ASSERT_TRUE(snapshot.valid);
+    EXPECT_EQ(snapshot.cached_tokens, 3);
+    ASSERT_EQ(snapshot.participant_snapshots.size(), 2u);
+    EXPECT_EQ(runner0_ptr->prefix_live_capture_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->prefix_live_capture_call_count(), 1u);
+
+    ASSERT_TRUE(orchestrator->truncateLivePrefixState(1));
+    EXPECT_EQ(runner0_ptr->get_position(), 1);
+    EXPECT_EQ(runner1_ptr->get_position(), 1);
+    EXPECT_EQ(runner0_ptr->prefix_live_truncate_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->prefix_live_truncate_call_count(), 1u);
+
+    ASSERT_TRUE(orchestrator->restoreLivePrefixState(snapshot));
+    EXPECT_EQ(runner0_ptr->get_position(), 3);
+    EXPECT_EQ(runner1_ptr->get_position(), 3);
+    EXPECT_EQ(runner0_ptr->prefix_live_restore_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->prefix_live_restore_call_count(), 1u);
+}
+
+TEST_F(Test__RankOrchestrator, LivePrefixCheckpointRejectsDivergentChildPositions)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    int tokens0[] = {1, 2, 3};
+    int tokens1[] = {1, 2};
+    ASSERT_TRUE(runner0_ptr->forward(tokens0, 3));
+    ASSERT_TRUE(runner1_ptr->forward(tokens1, 2));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixStateSnapshot snapshot = orchestrator->captureLivePrefixState();
+    EXPECT_FALSE(snapshot.valid);
+    EXPECT_TRUE(snapshot.participant_snapshots.empty());
+    EXPECT_EQ(runner0_ptr->prefix_live_capture_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->prefix_live_capture_call_count(), 1u);
+}
+
+TEST_F(Test__RankOrchestrator, RestoreLivePrefixStateAttemptsEveryChildAndReportsFailure)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    int tokens[] = {1, 2, 3};
+    ASSERT_TRUE(runner0_ptr->forward(tokens, 3));
+    ASSERT_TRUE(runner1_ptr->forward(tokens, 3));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixStateSnapshot snapshot = orchestrator->captureLivePrefixState();
+    ASSERT_TRUE(snapshot.valid);
+    runner1_ptr->set_prefix_live_restore_ok(false);
+
+    EXPECT_FALSE(orchestrator->restoreLivePrefixState(snapshot));
+    EXPECT_EQ(runner0_ptr->prefix_live_restore_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->prefix_live_restore_call_count(), 1u);
 }
 
 // =============================================================================

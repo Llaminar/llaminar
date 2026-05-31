@@ -2007,7 +2007,7 @@ namespace llaminar2
         }
         if (device_runners_.size() > 1)
         {
-            return "MTP decode requires TP logits and checkpoint coordination";
+            return "MTP decode requires TP MTP/all-position logits coordination";
         }
         return {};
     }
@@ -2348,6 +2348,106 @@ namespace llaminar2
 
         return restore_runners(device_runners_, last_device_prefix_hits_) &&
                restore_runners(pp_stage_runners_, last_pp_prefix_hits_);
+    }
+
+    PrefixStateSnapshot RankOrchestrator::captureLivePrefixState(int seq_idx) const
+    {
+        PrefixStateSnapshot aggregate;
+        bool saw_runner = false;
+        bool have_common_tokens = false;
+        int common_tokens = 0;
+
+        auto capture_runners = [&](const std::vector<std::unique_ptr<IInferenceRunner>> &runners)
+        {
+            for (const auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+
+                saw_runner = true;
+                PrefixStateSnapshot child = runner->captureLivePrefixState(seq_idx);
+                if (!child.valid)
+                    return false;
+
+                if (!have_common_tokens)
+                {
+                    common_tokens = child.cached_tokens;
+                    have_common_tokens = true;
+                }
+                else if (child.cached_tokens != common_tokens)
+                {
+                    return false;
+                }
+
+                aggregate.participant_snapshots.push_back(std::move(child));
+            }
+            return true;
+        };
+
+        if (!capture_runners(device_runners_) ||
+            !capture_runners(pp_stage_runners_) ||
+            !saw_runner ||
+            !have_common_tokens)
+        {
+            return {};
+        }
+
+        aggregate.valid = true;
+        aggregate.cached_tokens = common_tokens;
+        return aggregate;
+    }
+
+    bool RankOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)
+    {
+        if (!snapshot.valid || snapshot.participant_snapshots.empty())
+            return false;
+
+        size_t participant_index = 0;
+        bool ok = true;
+        bool saw_runner = false;
+        auto restore_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners)
+        {
+            for (auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+
+                saw_runner = true;
+                if (participant_index >= snapshot.participant_snapshots.size())
+                {
+                    ok = false;
+                    continue;
+                }
+                ok = runner->restoreLivePrefixState(
+                         snapshot.participant_snapshots[participant_index++],
+                         seq_idx) &&
+                     ok;
+            }
+        };
+
+        restore_runners(device_runners_);
+        restore_runners(pp_stage_runners_);
+        return saw_runner && ok && participant_index == snapshot.participant_snapshots.size();
+    }
+
+    bool RankOrchestrator::truncateLivePrefixState(int cached_tokens, int seq_idx)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        auto truncate_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners)
+        {
+            for (auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+                saw_runner = true;
+                ok = runner->truncateLivePrefixState(cached_tokens, seq_idx) && ok;
+            }
+        };
+
+        truncate_runners(device_runners_);
+        truncate_runners(pp_stage_runners_);
+        return saw_runner && ok;
     }
 
     PrefixRuntimeStateSnapshot RankOrchestrator::prefixStateProbe() const

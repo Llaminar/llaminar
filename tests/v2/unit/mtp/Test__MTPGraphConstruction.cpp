@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "backends/ComputeBackend.h"
+#include "collective/ITPContext.h"
 #include "execution/compute_stages/stages/MTPConcatStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -10,6 +11,7 @@
 #include "mocks/MockMPIContext.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "models/qwen35/Qwen35Graph.h"
+#include "tensors/TensorSlice.h"
 #include "utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -22,6 +24,36 @@ using namespace llaminar2::test;
 
 namespace
 {
+    class GraphConstructionTPContext : public ITPContext
+    {
+    public:
+        TPScope scope() const override { return TPScope::LOCAL; }
+        int degree() const override { return 2; }
+        int myIndex() const override { return 0; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::HOST; }
+        bool allreduce(TensorBase * /*tensor*/) override { return true; }
+        bool broadcast(TensorBase * /*tensor*/, int /*source_index*/ = 0) override { return true; }
+        bool allgather(const TensorBase * /*local_shard*/, TensorBase * /*global_tensor*/) override { return true; }
+        void requestAbort() override { abort_requested_ = true; }
+        bool isAbortRequested() const override { return abort_requested_; }
+
+    private:
+        bool abort_requested_ = false;
+    };
+
+    std::unique_ptr<TensorSlice> makeRowParallelSlice(std::unique_ptr<TensorBase> tensor)
+    {
+        const size_t rows = tensor->shape()[0];
+        const size_t cols = tensor->shape()[1];
+        auto metadata = SliceMetadata::forRowParallel(
+            rows,
+            cols,
+            /*rank=*/0,
+            /*world_size=*/2,
+            /*inner_is_presliced=*/false);
+        return std::make_unique<TensorSlice>(std::move(tensor), std::move(metadata));
+    }
+
     struct DenseMTPGraphFixture
     {
         GraphConfig config;
@@ -652,6 +684,43 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_TRUE(hasDependency(graph, "mtp0_fc", "mtp0_concat"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer1_ffn_residual"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head", "mtp0_final_norm"));
+}
+
+TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWeights)
+{
+    DenseMTPGraphFixture fixture;
+    GraphConstructionTPContext tp_ctx;
+    fixture.config.tp_ctx = &tp_ctx;
+
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    const size_t d = static_cast<size_t>(fixture.config.d_model);
+    const size_t q_dim = static_cast<size_t>(fixture.config.n_heads * fixture.config.head_dim);
+    const size_t ff = static_cast<size_t>(fixture.config.d_ff);
+    auto wo_slice = makeRowParallelSlice(
+        TestTensorFactory::createFP32Random({d, q_dim}, -0.02f, 0.02f, 501));
+    auto down_slice = makeRowParallelSlice(
+        TestTensorFactory::createFP32Random({d, ff}, -0.02f, 0.02f, 502));
+
+    auto weights = fixture.mtpWeights();
+    weights.fa_block.wo = wo_slice.get();
+    weights.fa_block.down_proj = down_slice.get();
+    auto input = fixture.input();
+    auto output = fixture.output();
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    auto *wo_allreduce = graph.getNode("layer0_wo_allreduce");
+    ASSERT_NE(wo_allreduce, nullptr);
+    EXPECT_EQ(wo_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
+    EXPECT_TRUE(hasDependency(graph, "layer0_wo_allreduce", "layer0_wo_proj"));
+
+    auto *down_allreduce = graph.getNode("layer1_down_allreduce");
+    ASSERT_NE(down_allreduce, nullptr);
+    EXPECT_EQ(down_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
+    EXPECT_TRUE(hasDependency(graph, "layer1_down_allreduce", "layer1_down_proj"));
+    EXPECT_TRUE(hasDependency(graph, "layer1_ffn_residual", "layer1_down_allreduce"));
 }
 
 TEST(Test__MTPGraphConstruction, RejectsMoESidecarForNow)
