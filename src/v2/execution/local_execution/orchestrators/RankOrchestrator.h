@@ -533,6 +533,7 @@ namespace llaminar2
          * @brief Get architecture name
          */
         const char *architecture() const override;
+        uint64_t moePlacementEpoch() const override;
 
         /**
          * @brief Aggregate per-runner runtime state for prefix-cache/MTP probes.

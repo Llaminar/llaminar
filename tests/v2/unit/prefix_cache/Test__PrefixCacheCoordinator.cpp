@@ -184,6 +184,7 @@ TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
     hit.cached_tokens = 6;
     hit.block_size = 2;
     hit.fingerprint_key = 0xfeed;
+    hit.placement_epoch = 13;
     hit.has_terminal_logits = true;
     hit.has_terminal_hidden = false;
 
@@ -193,6 +194,7 @@ TEST(Test__PrefixCacheCoordinator, ConvertsLookupResultsIntoParticipants)
     EXPECT_EQ(participant.participant_id, 3);
     EXPECT_EQ(participant.device, DeviceId::rocm(1));
     EXPECT_EQ(participant.fingerprint_key, 0xfeedu);
+    EXPECT_EQ(participant.placement_epoch, 13u);
     EXPECT_TRUE(participant.supported);
     EXPECT_TRUE(participant.cache_enabled);
     EXPECT_TRUE(participant.hit);
@@ -215,6 +217,7 @@ TEST(Test__PrefixCacheCoordinator, BuildsAggregateLookupResultForRunnerCode)
     EXPECT_TRUE(aggregate.cache_enabled);
     EXPECT_EQ(aggregate.cached_tokens, 4);
     EXPECT_EQ(aggregate.fingerprint_key, 0x1000u);
+    EXPECT_EQ(aggregate.placement_epoch, 7u);
     EXPECT_EQ(aggregate.block_size, 2);
     EXPECT_TRUE(aggregate.has_terminal_logits);
     EXPECT_TRUE(aggregate.has_terminal_hidden);

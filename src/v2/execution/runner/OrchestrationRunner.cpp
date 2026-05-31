@@ -550,7 +550,9 @@ namespace llaminar2
                 PrefixParticipantLookup participant = makePrefixParticipantLookup(
                     mpi_ctx_ ? mpi_ctx_->rank() : 0,
                     runner_->primaryDeviceId(),
-                    local_hit);
+                    local_hit,
+                    {},
+                    runner_->moePlacementEpoch());
 
                 PrefixCoordinationResult coordination;
                 if (mpi_ctx_ && mpi_ctx_->world_size() > 1 &&

@@ -16,6 +16,7 @@ namespace llaminar2
         int cached_tokens = 0;
         int block_size = 0;
         uint64_t fingerprint_key = 0;
+        uint64_t placement_epoch = 0;
         bool has_terminal_hidden = false;
         bool has_terminal_logits = false;
         std::string bypass_reason;

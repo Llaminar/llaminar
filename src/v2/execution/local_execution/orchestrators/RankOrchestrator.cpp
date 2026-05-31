@@ -2470,6 +2470,22 @@ namespace llaminar2
         return "Unknown";
     }
 
+    uint64_t RankOrchestrator::moePlacementEpoch() const
+    {
+        uint64_t epoch = 0;
+        for (const auto &runner : device_runners_)
+        {
+            if (runner)
+                epoch = std::max(epoch, runner->moePlacementEpoch());
+        }
+        for (const auto &runner : pp_stage_runners_)
+        {
+            if (runner)
+                epoch = std::max(epoch, runner->moePlacementEpoch());
+        }
+        return epoch;
+    }
+
     PrefixLookupResult RankOrchestrator::lookupPrefix(const std::vector<int32_t> &tokens)
     {
         PrefixLookupResult aggregate;
@@ -2492,7 +2508,9 @@ namespace llaminar2
                 participants.push_back(makePrefixParticipantLookup(
                     participant_id++,
                     runner->primaryDeviceId(),
-                    hit));
+                    hit,
+                    {},
+                    runner->moePlacementEpoch()));
                 hits.push_back(hit);
                 if (block_size <= 0 && hit.block_size > 0)
                     block_size = hit.block_size;

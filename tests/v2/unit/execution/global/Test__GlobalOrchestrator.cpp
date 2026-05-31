@@ -100,6 +100,8 @@ namespace llaminar2::test
             return true;
         }
 
+        uint64_t moePlacementEpoch() const override { return moe_placement_epoch_; }
+
         int forward_mtp_calls() const { return forward_mtp_calls_; }
         int last_mtp_condition_token() const { return last_mtp_condition_token_; }
         int set_all_position_calls() const { return set_all_position_calls_; }
@@ -110,6 +112,11 @@ namespace llaminar2::test
         void set_mtp_unsupported_reason(std::string reason)
         {
             mtp_unsupported_reason_ = std::move(reason);
+        }
+
+        void set_moe_placement_epoch(uint64_t epoch)
+        {
+            moe_placement_epoch_ = epoch;
         }
 
     private:
@@ -126,6 +133,7 @@ namespace llaminar2::test
         bool capture_ok_ = true;
         bool restore_ok_ = true;
         bool truncate_ok_ = true;
+        uint64_t moe_placement_epoch_ = 0;
         std::string mtp_unsupported_reason_;
     };
 
@@ -896,11 +904,13 @@ namespace llaminar2::test
         auto runner = std::make_unique<MTPMockDeviceRunner>();
         auto *runner_raw = runner.get();
         runner_raw->set_position(11);
+        runner_raw->set_moe_placement_epoch(13);
 
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
 
         EXPECT_TRUE(orch.mtpDecodeUnsupportedReason().empty());
         EXPECT_TRUE(orch.supportsMTPTokenCoordination());
+        EXPECT_EQ(orch.moePlacementEpoch(), 13u);
         EXPECT_TRUE(orch.forwardMTP(42));
         EXPECT_EQ(runner_raw->forward_mtp_calls(), 1);
         EXPECT_EQ(runner_raw->last_mtp_condition_token(), 42);

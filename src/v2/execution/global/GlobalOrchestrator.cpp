@@ -485,6 +485,20 @@ namespace llaminar2
         return saw_runner && ok;
     }
 
+    uint64_t StageRunnerRegistry::moePlacementEpochAll() const
+    {
+        uint64_t epoch = 0;
+        for (const auto &entry : entries_)
+        {
+            epoch = std::max(epoch, entry.runner->moePlacementEpoch());
+        }
+        if (compatibility_runner_)
+        {
+            epoch = std::max(epoch, compatibility_runner_->moePlacementEpoch());
+        }
+        return epoch;
+    }
+
     PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixStateAll(int seq_idx) const
     {
         PrefixStateSnapshot aggregate;
@@ -1212,6 +1226,11 @@ namespace llaminar2
     bool GlobalOrchestrator::supportsMTPTokenCoordination() const
     {
         return mtpDecodeUnsupportedReason().empty();
+    }
+
+    uint64_t GlobalOrchestrator::moePlacementEpoch() const
+    {
+        return stage_runners_.moePlacementEpochAll();
     }
 
     int GlobalOrchestrator::sampleGreedyFromMTPLogitsOnDevice()

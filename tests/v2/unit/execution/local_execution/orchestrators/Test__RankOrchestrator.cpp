@@ -176,6 +176,11 @@ public:
         return config_.architecture.c_str();
     }
 
+    uint64_t moePlacementEpoch() const override
+    {
+        return moe_placement_epoch_;
+    }
+
     PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override
     {
         ++prefix_lookup_calls_;
@@ -306,6 +311,7 @@ public:
     void set_prefix_live_capture_ok(bool ok) { prefix_live_capture_ok_ = ok; }
     void set_prefix_live_restore_ok(bool ok) { prefix_live_restore_ok_ = ok; }
     void set_prefix_live_truncate_ok(bool ok) { prefix_live_truncate_ok_ = ok; }
+    void set_moe_placement_epoch(uint64_t epoch) { moe_placement_epoch_ = epoch; }
 
     size_t prefix_lookup_call_count() const { return prefix_lookup_calls_; }
     size_t prefix_populate_call_count() const { return prefix_populate_calls_; }
@@ -354,6 +360,7 @@ private:
     bool prefix_live_capture_ok_ = true;
     bool prefix_live_restore_ok_ = true;
     bool prefix_live_truncate_ok_ = true;
+    uint64_t moe_placement_epoch_ = 0;
     int32_t last_mtp_condition_token_ = -1;
     size_t prefix_lookup_calls_ = 0;
     size_t prefix_populate_calls_ = 0;
@@ -1088,10 +1095,12 @@ TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner0_ptr = runner0.get();
     runner0_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+    runner0_ptr->set_moe_placement_epoch(7);
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     auto *runner1_ptr = runner1.get();
     runner1_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/2, /*terminal_logits=*/false));
+    runner1_ptr->set_moe_placement_epoch(19);
 
     std::vector<std::unique_ptr<IInferenceRunner>> runners;
     runners.push_back(std::move(runner0));
@@ -1108,6 +1117,8 @@ TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
     EXPECT_TRUE(hit.cache_enabled);
     EXPECT_TRUE(hit.supported);
     EXPECT_EQ(hit.cached_tokens, 2);
+    EXPECT_EQ(hit.placement_epoch, 19u);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 19u);
     EXPECT_FALSE(hit.has_terminal_logits)
         << "Rank-level terminal state is usable only when all children have it";
     EXPECT_EQ(runner0_ptr->prefix_lookup_tokens(), prompt);

@@ -110,7 +110,7 @@ namespace llaminar2
         participant.domain_id = std::move(domain_id);
         participant.participant_id = participant_id;
         participant.device = device;
-        participant.placement_epoch = placement_epoch;
+        participant.placement_epoch = placement_epoch != 0 ? placement_epoch : hit.placement_epoch;
         participant.fingerprint_key = hit.fingerprint_key;
         participant.supported = hit.supported;
         participant.cache_enabled = hit.cache_enabled;
@@ -260,6 +260,7 @@ namespace llaminar2
         result.cache_enabled = coordination.cache_enabled;
         result.block_size = block_size;
         result.fingerprint_key = coordination.fingerprint_key;
+        result.placement_epoch = coordination.placement_epoch;
 
         int restorable_tokens = nonNegative(coordination.common_matched_tokens);
         if (block_size > 0)

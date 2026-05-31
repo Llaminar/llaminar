@@ -587,6 +587,14 @@ namespace llaminar2
         }
 
         /**
+         * @brief Domain-local MoE placement epoch used by prefix and graph caches.
+         *
+         * Non-MoE runners return 0. MoE runners increment this when expert
+         * ownership, masks, replicas, or runtime-table placement changes.
+         */
+        virtual uint64_t moePlacementEpoch() const { return 0; }
+
+        /**
          * @brief Find the longest reusable prefix for a token sequence.
          *
          * Default runners do not support persistent prefix state yet. Concrete

@@ -141,6 +141,7 @@ namespace llaminar2
         void flushStageTimelineAll();
         bool forwardMTPAll(int32_t draft_condition_token);
         bool setComputeAllPositionLogitsAll(bool enabled);
+        uint64_t moePlacementEpochAll() const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
         bool restoreLivePrefixStateAll(const PrefixStateSnapshot &snapshot, int seq_idx = 0);
         bool truncateLivePrefixStateAll(int cached_tokens, int seq_idx = 0);
@@ -268,6 +269,7 @@ namespace llaminar2
         LogitsLocalInfo getAllPositionLogitsLocalInfo() const override;
         std::string mtpDecodeUnsupportedReason() const override;
         bool supportsMTPTokenCoordination() const override;
+        uint64_t moePlacementEpoch() const override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;

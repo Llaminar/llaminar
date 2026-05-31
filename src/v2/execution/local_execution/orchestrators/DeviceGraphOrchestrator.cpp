@@ -3897,6 +3897,7 @@ namespace llaminar2
         result.supported = true;
         result.block_size = prefix_layout_.block_size;
         result.fingerprint_key = prefix_fingerprint_;
+        result.placement_epoch = moePlacementEpoch();
         if (tokens.empty() || prefix_layout_.block_size <= 0)
         {
             return result;
