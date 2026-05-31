@@ -442,6 +442,47 @@ namespace llaminar2
             }
         }
 
+        bool appendMTPWeightsIfRequested(
+            const InferenceRunnerConfig &config,
+            ModelContext &model_ctx,
+            const std::string &architecture,
+            WeightValidationResult &validation,
+            const std::string &log_prefix)
+        {
+            if (!config.mtp.enabled)
+                return true;
+
+            auto loader = model_ctx.loader();
+            if (!loader)
+            {
+                LOG_ERROR(log_prefix << " MTP was requested, but model loader is unavailable");
+                return false;
+            }
+
+            MTPWeightManifest mtp_manifest = discoverMTPWeightManifest(
+                *loader,
+                architecture,
+                model_ctx.totalBlockCount(),
+                /*explicit_mtp=*/true);
+
+            if (!mtp_manifest.available)
+            {
+                LOG_ERROR(log_prefix << " " << mtp_manifest.diagnostic);
+                if (!mtp_manifest.missing_required.empty())
+                {
+                    LOG_ERROR(log_prefix << " Missing MTP weight examples: "
+                                         << mtp_manifest.missing_required.front()
+                                         << (mtp_manifest.missing_required.size() > 1 ? " ..." : ""));
+                }
+                return false;
+            }
+
+            appendRequiredWeightsUnique(validation.weights_to_load, mtp_manifest.requiredNames());
+            LOG_DEBUG(log_prefix << " MTP weight manifest resolved: depth="
+                                 << mtp_manifest.depth << " " << mtp_manifest.diagnostic);
+            return true;
+        }
+
     } // namespace
 
     bool applyMoEExpertOverlayConfigToGraphForTesting(
@@ -1988,38 +2029,15 @@ namespace llaminar2
                                                     << " optional weights not present in model");
         }
 
-        if (config.mtp.enabled)
-        {
-            auto loader = model_ctx->loader();
-            if (!loader)
-            {
-                LOG_ERROR("[InferenceRunner] MTP was requested, but model loader is unavailable");
-                WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
-                return false;
-            }
-
-            MTPWeightManifest mtp_manifest = discoverMTPWeightManifest(
-                *loader,
+        if (!appendMTPWeightsIfRequested(
+                config,
+                *model_ctx,
                 arch,
-                model_ctx->totalBlockCount(),
-                /*explicit_mtp=*/true);
-
-            if (!mtp_manifest.available)
-            {
-                LOG_ERROR("[InferenceRunner] " << mtp_manifest.diagnostic);
-                if (!mtp_manifest.missing_required.empty())
-                {
-                    LOG_ERROR("[InferenceRunner] Missing MTP weight examples: "
-                              << mtp_manifest.missing_required.front()
-                              << (mtp_manifest.missing_required.size() > 1 ? " ..." : ""));
-                }
-                WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
-                return false;
-            }
-
-            appendRequiredWeightsUnique(validation.weights_to_load, mtp_manifest.requiredNames());
-            LOG_DEBUG("[InferenceRunner] MTP weight manifest resolved: depth="
-                      << mtp_manifest.depth << " " << mtp_manifest.diagnostic);
+                validation,
+                "[InferenceRunner]"))
+        {
+            WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
+            return false;
         }
 
         // Use validated weight list (only weights that exist in the model)
@@ -3196,6 +3214,16 @@ namespace llaminar2
                     if (!validation.success)
                     {
                         LOG_ERROR("[InferenceRunner] " << validation.error_message());
+                        return nullptr;
+                    }
+
+                    if (!appendMTPWeightsIfRequested(
+                            config,
+                            *concrete_model_ctx,
+                            architecture,
+                            validation,
+                            "[InferenceRunner] LocalTP"))
+                    {
                         return nullptr;
                     }
 

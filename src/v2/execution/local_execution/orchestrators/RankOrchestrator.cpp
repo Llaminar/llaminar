@@ -1964,14 +1964,108 @@ namespace llaminar2
             return false;
         }
 
-        bool all_success = true;
-        for (auto &runner : device_runners_)
+        if (device_runners_.size() == 1)
         {
-            if (!runner || !runner->forwardMTP(draft_condition_token))
+            return device_runners_[0] && device_runners_[0]->forwardMTP(draft_condition_token);
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
             {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] MTP worker failure detected — aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        tp_worker_pool_->dispatch(
+            [this, draft_condition_token, kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
+            {
+                KernelProfiler::setCurrentPhase(kernel_phase);
+                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                KVCacheProfiler::setCurrentPhase(kv_phase);
+                GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                auto device_id = device_runners_[i]->primaryDeviceId();
+                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                if (debugEnv().tp_collective_contract_trace)
+                {
+                    LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_mtp_enter"
+                              << " worker=" << i
+                              << " device=" << device_id.toString()
+                              << " token=" << draft_condition_token);
+                }
+
+                const bool ok = device_runners_[i] &&
+                                device_runners_[i]->forwardMTP(draft_condition_token);
+
+                if (debugEnv().tp_collective_contract_trace)
+                {
+                    LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_mtp_leave"
+                              << " worker=" << i
+                              << " device=" << device_id.toString()
+                              << " success=" << (ok ? 1 : 0));
+                }
+                return ok;
+            });
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        auto results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+        for (auto &r : results)
+        {
+            if (!r.completed)
+            {
+                LOG_ERROR("RankOrchestrator::forwardMTP: Device "
+                          << r.worker_index << " did not complete (stuck)");
+                if (tp_ctx_)
+                {
+                    LOG_WARN("RankOrchestrator::forwardMTP: requesting TP context abort after worker timeout");
+                    tp_ctx_->requestAbort();
+                }
+                all_success = false;
+                continue;
+            }
+
+            if (r.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = r.exception;
+                    first_exception_device = r.worker_index;
+                }
+                continue;
+            }
+
+            if (!r.success)
+            {
+                LOG_ERROR("RankOrchestrator::forwardMTP: Device "
+                          << r.worker_index << " MTP forward failed");
                 all_success = false;
             }
         }
+
+        if (first_exception)
+        {
+            LOG_ERROR("RankOrchestrator::forwardMTP: Re-throwing primary exception from device "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+
         return all_success;
     }
 

@@ -1016,6 +1016,35 @@ TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWei
     EXPECT_TRUE(hasDependency(graph, "layer1_ffn_residual", "layer1_down_allreduce"));
 }
 
+TEST(Test__MTPGraphConstruction, DenseSidecarAllreducesVocabParallelEmbedding)
+{
+    DenseMTPGraphFixture fixture;
+    GraphConstructionTPContext tp_ctx;
+    fixture.config.tp_ctx = &tp_ctx;
+    fixture.embedding_table = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(fixture.config.vocab_size / 2),
+         static_cast<size_t>(fixture.config.d_model)});
+
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto weights = fixture.mtpWeights();
+    auto input = fixture.input();
+    auto output = fixture.output();
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    auto *embedding_allreduce = graph.getNode("mtp0_embedding_allreduce");
+    ASSERT_NE(embedding_allreduce, nullptr);
+    EXPECT_EQ(embedding_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
+    EXPECT_TRUE(hasDependency(graph, "mtp0_embedding_allreduce", "mtp0_embedding"));
+    EXPECT_TRUE(hasDependency(graph, "mtp0_norm_embedding", "mtp0_embedding_allreduce"));
+
+    const auto contract = embedding_allreduce->stage->bufferContract();
+    EXPECT_TRUE(contractReads(contract, BufferId::MTP_EMBEDDING));
+    EXPECT_TRUE(contractWrites(contract, BufferId::MTP_EMBEDDING));
+}
+
 TEST(Test__MTPGraphConstruction, AllPositionLMHeadUsesVerifierLogitsContract)
 {
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);

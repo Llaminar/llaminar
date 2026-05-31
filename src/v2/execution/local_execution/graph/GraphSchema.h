@@ -518,8 +518,9 @@ namespace llaminar2
          */
         bool isNonGemmWeight(const std::string &name) const
         {
-            // Norms are 1D
-            if (name.find("_norm.weight") != std::string::npos)
+            // Norms are 1D.  Some sidecar layouts use compact names such as
+            // hnorm/enorm instead of *_norm; they still contain norm.weight.
+            if (name.find("norm.weight") != std::string::npos)
                 return true;
             // Biases are 1D
             if (name.find(".bias") != std::string::npos)

@@ -251,6 +251,10 @@ TEST_F(Test__WeightPreloadVirtualWeights, ShardingConfigClassifiesOutputWeightAs
         << "output_norm.weight should be classified as a non-GEMM weight";
     EXPECT_TRUE(config.isNonGemmWeight("blk.0.attn_norm.weight"))
         << "attn_norm.weight should be classified as a non-GEMM weight";
+    EXPECT_TRUE(config.isNonGemmWeight("blk.64.nextn.hnorm.weight"))
+        << "MTP hnorm.weight should be classified as a non-GEMM weight";
+    EXPECT_TRUE(config.isNonGemmWeight("blk.64.nextn.enorm.weight"))
+        << "MTP enorm.weight should be classified as a non-GEMM weight";
 }
 
 // ============================================================================

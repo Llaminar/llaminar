@@ -20,6 +20,28 @@ namespace llaminar2
 {
     using KernelFactory = llaminar::v2::kernels::KernelFactory;
 
+    namespace
+    {
+        int embeddingVocabOffsetForDevice(const GraphConfig &config, DeviceId device)
+        {
+            if (!config.tp_config)
+                return 0;
+
+            if (const auto *assignment = config.getAssignment())
+            {
+                if (assignment->device == device)
+                    return assignment->vocab_start;
+            }
+
+            for (const auto &assignment : config.tp_config->assignments())
+            {
+                if (assignment.device == device)
+                    return assignment.vocab_start;
+            }
+            return 0;
+        }
+    }
+
     // =========================================================================
     // Helper: populate allreduce precision with FA-layer awareness
     // =========================================================================
@@ -378,13 +400,34 @@ namespace llaminar2
                           .num_tokens = total_tokens,
                           .d_model = config_.d_model,
                           .vocab_size = config_.vocab_size,
-                          .vocab_offset = 0,
+                          .vocab_offset = embeddingVocabOffsetForDevice(config_, device),
                           .local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0,
                           .output_buffer_id = BufferId::MTP_EMBEDDING,
                           .prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), device),
                           .prepared_store = prepared_weight_store_,
                       }),
                       device);
+        const bool embedding_is_sharded =
+            modelEmbeddingTable() &&
+            static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
+        std::string embedding_terminal = prefix + "embedding";
+        if (embedding_is_sharded && needsTPAllreduce())
+        {
+            auto allreduce_stage = createTPAllreduceStage(
+                output.embedding,
+                static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model),
+                device,
+                -1,
+                /*is_attention=*/false,
+                prefix + "embedding_allreduce",
+                BufferId::MTP_EMBEDDING);
+            if (allreduce_stage)
+            {
+                graph.addNode(prefix + "embedding_allreduce", std::move(allreduce_stage), device);
+                graph.addDependency(prefix + "embedding_allreduce", prefix + "embedding");
+                embedding_terminal = prefix + "embedding_allreduce";
+            }
+        }
 
         graph.addNode(prefix + "norm_hidden",
                       ComputeStageFactory::createRMSNorm({
@@ -413,7 +456,7 @@ namespace llaminar2
                           .output_buffer_id = BufferId::MTP_NORM_EMBEDDING,
                       }),
                       device);
-        graph.addDependency(prefix + "norm_embedding", prefix + "embedding");
+        graph.addDependency(prefix + "norm_embedding", embedding_terminal);
 
         graph.addNode(prefix + "concat",
                       ComputeStageFactory::createMTPConcat({

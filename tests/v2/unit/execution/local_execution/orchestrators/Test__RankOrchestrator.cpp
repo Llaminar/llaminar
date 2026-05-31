@@ -22,13 +22,26 @@
 #include "tensors/Tensors.h"
 #include "mocks/MockModelContext.h"
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include <memory>
 #include <stdexcept>
 #include <utility>
 
 using namespace llaminar2;
+
+struct ForwardMTPRendezvous
+{
+    explicit ForwardMTPRendezvous(int expected_) : expected(expected_) {}
+
+    int expected = 0;
+    std::atomic<int> arrivals{0};
+    std::mutex mutex;
+    std::condition_variable cv;
+};
 
 // =============================================================================
 // MockDeviceGraphOrchestrator - Mock for per-device runners
@@ -83,6 +96,21 @@ public:
     {
         forward_mtp_calls_.fetch_add(1, std::memory_order_relaxed);
         last_mtp_condition_token_ = draft_condition_token;
+        if (forward_mtp_rendezvous_)
+        {
+            std::unique_lock<std::mutex> lock(forward_mtp_rendezvous_->mutex);
+            forward_mtp_rendezvous_->arrivals.fetch_add(1, std::memory_order_acq_rel);
+            forward_mtp_rendezvous_->cv.notify_all();
+            const bool all_arrived = forward_mtp_rendezvous_->cv.wait_for(
+                lock,
+                std::chrono::milliseconds(500),
+                [barrier = forward_mtp_rendezvous_]()
+                {
+                    return barrier->arrivals.load(std::memory_order_acquire) >= barrier->expected;
+                });
+            if (!all_arrived)
+                return false;
+        }
         return forward_mtp_ok_;
     }
 
@@ -312,6 +340,10 @@ public:
     void set_prefix_live_restore_ok(bool ok) { prefix_live_restore_ok_ = ok; }
     void set_prefix_live_truncate_ok(bool ok) { prefix_live_truncate_ok_ = ok; }
     void set_moe_placement_epoch(uint64_t epoch) { moe_placement_epoch_ = epoch; }
+    void set_forward_mtp_rendezvous(std::shared_ptr<ForwardMTPRendezvous> rendezvous)
+    {
+        forward_mtp_rendezvous_ = std::move(rendezvous);
+    }
 
     size_t prefix_lookup_call_count() const { return prefix_lookup_calls_; }
     size_t prefix_populate_call_count() const { return prefix_populate_calls_; }
@@ -349,6 +381,7 @@ private:
     std::vector<float> all_position_logits_;
     std::shared_ptr<FP32Tensor> mtp_logits_local_;
     std::shared_ptr<FP32Tensor> all_position_logits_local_;
+    std::shared_ptr<ForwardMTPRendezvous> forward_mtp_rendezvous_;
     PrefixLookupResult prefix_lookup_result_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
@@ -1299,6 +1332,36 @@ TEST_F(Test__RankOrchestrator, ForwardMTPRunsOnEveryLocalTPChild)
     EXPECT_EQ(runner1_ptr->forward_mtp_call_count(), 1u);
     EXPECT_EQ(runner0_ptr->last_mtp_condition_token(), 42);
     EXPECT_EQ(runner1_ptr->last_mtp_condition_token(), 42);
+}
+
+TEST_F(Test__RankOrchestrator, ForwardMTPEntersLocalTPChildrenConcurrently)
+{
+    auto rendezvous = std::make_shared<ForwardMTPRendezvous>(2);
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_forward_mtp_rendezvous(rendezvous);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_forward_mtp_rendezvous(rendezvous);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_TRUE(orchestrator->forwardMTP(99));
+    EXPECT_EQ(rendezvous->arrivals.load(std::memory_order_acquire), 2);
+    EXPECT_EQ(runner0_ptr->forward_mtp_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->forward_mtp_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_mtp_condition_token(), 99);
+    EXPECT_EQ(runner1_ptr->last_mtp_condition_token(), 99);
 }
 
 TEST_F(Test__RankOrchestrator, ForwardMTPFailureStillAttemptsEveryLocalTPChild)

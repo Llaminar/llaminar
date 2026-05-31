@@ -169,6 +169,47 @@ TEST(Test__PreparedWeightStore, RegistersOwnedPipelineHandleByBinding)
     EXPECT_TRUE(tensor->hasPreparedDeviceState());
 }
 
+TEST(Test__PreparedWeightStore, AdoptsPreparedGemmByCanonicalNameAfterHostPayloadRelease)
+{
+    PreparedWeightStore store(ModelContextId{99});
+    auto prepared_tensor = makeQ8_0Tensor(64, 64);
+    auto prepared_binding = makeStoreBinding(31, "output.weight", DeviceId::rocm(0));
+    prepared_binding.tensor = prepared_tensor.get();
+
+    auto handle = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+    handle->tensor = prepared_tensor.get();
+    handle->device_id = DeviceId::rocm(0);
+    handle->kind = llaminar::v2::kernels::KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
+    handle->prepared_weights = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
+
+    auto prepared_ref = store.registerPreparedGemmHandle(
+        prepared_binding,
+        PreparedWeightKind::RocmInt8PackedGemm,
+        DeviceId::rocm(0),
+        std::move(handle));
+    ASSERT_TRUE(store.contains(prepared_ref));
+
+    auto later_tensor = makeQ8_0Tensor(64, 64);
+    later_tensor->release_host_weight_data();
+    ASSERT_TRUE(later_tensor->is_raw_data_released());
+    ASSERT_EQ(later_tensor->size_bytes(), 0u);
+
+    auto later_binding = makeStoreBinding(32, "output.weight", DeviceId::rocm(0));
+    later_binding.tensor = later_tensor.get();
+    later_binding.prepared = PreparedWeightRef{
+        ModelContextId{99},
+        later_binding.binding_id,
+        PreparedWeightKind::RocmInt8PackedGemm,
+        DeviceId::rocm(0)};
+
+    ASSERT_TRUE(store.adoptPreparedGemmForBinding(later_binding, DeviceId::rocm(0)));
+    auto adopted_ref = store.preparedRefForBinding(later_binding.binding_id, DeviceId::rocm(0));
+    ASSERT_TRUE(adopted_ref.has_value());
+    EXPECT_EQ(adopted_ref->binding_id, later_binding.binding_id);
+    EXPECT_EQ(adopted_ref->kind, PreparedWeightKind::RocmInt8PackedGemm);
+    EXPECT_TRUE(later_tensor->hasPreparedDeviceState());
+}
+
 TEST(Test__PreparedWeightStore, SameTensorDifferentBindingDoesNotResolveAccidentally)
 {
     PreparedWeightStore store(ModelContextId{99});

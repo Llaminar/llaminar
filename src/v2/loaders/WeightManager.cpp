@@ -4044,6 +4044,43 @@ namespace llaminar2
             }
         }
 
+        if (frozen_weights)
+        {
+            std::vector<DenseGemmJob> pending_gemm_weights;
+            pending_gemm_weights.reserve(gemm_weights.size());
+            size_t adopted_dense = 0;
+
+            for (auto &dense_job : gemm_weights)
+            {
+                if (!dense_job.binding.has_value())
+                {
+                    pending_gemm_weights.push_back(std::move(dense_job));
+                    continue;
+                }
+
+                const auto &binding = *dense_job.binding;
+                if (preparedWeightStore()->preparedRefForBinding(binding.binding_id, target_device).has_value() ||
+                    preparedWeightStore()->adoptPreparedGemmForBinding(binding, target_device))
+                {
+                    markPrepState(dense_job.name, target_device, WeightPrepState::READY, true,
+                                  "GPU pipeline: adopted already-loaded prepared GEMM handle");
+                    ++adopted_dense;
+                    continue;
+                }
+
+                pending_gemm_weights.push_back(std::move(dense_job));
+            }
+
+            if (adopted_dense > 0)
+            {
+                LOG_DEBUG("[WeightManager] GPU pipeline: adopted " << adopted_dense
+                                                                    << " already-prepared GEMM bindings for "
+                                                                    << target_device.to_string());
+            }
+
+            gemm_weights = std::move(pending_gemm_weights);
+        }
+
         if (gemm_weights.empty() && moe_jobs.empty())
         {
             LOG_DEBUG("[WeightManager] GPU pipeline: no weights to load");

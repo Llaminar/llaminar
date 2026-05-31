@@ -1017,6 +1017,7 @@ namespace llaminar2
             last_error_ = std::string("rcclAllReduce failed: ") + rccl::ncclGetErrorString(r);
             return false;
         }
+        collective_performed_.store(true);
 
         // 4. Post-sync: record completion on RCCL stream, compute stream waits
         err = hipEventRecord(completion_event, rccl_stream);
@@ -1116,6 +1117,7 @@ namespace llaminar2
             last_error_ = std::string("rcclAllReduce(on-stream) failed: ") + rccl::ncclGetErrorString(r);
             return false;
         }
+        collective_performed_.store(true);
 
         if (debugEnv().tp_collective_contract_trace)
         {
@@ -1259,6 +1261,7 @@ namespace llaminar2
             last_error_ = std::string("rcclAllReduce failed: ") + rccl::ncclGetErrorString(r);
             return false;
         }
+        collective_performed_.store(true);
 
         // Record completion event
         err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[device_idx]), stream);

@@ -1109,6 +1109,68 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmokeOptIn)
     EXPECT_GE(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs + 2u);
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmokeOptIn)
+{
+    const char *enabled = std::getenv("LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE");
+    if (!enabled || std::string(enabled) != "1")
+    {
+        GTEST_SKIP() << "Set LLAMINAR_ENABLE_QWEN36_REAL_MODEL_SMOKE=1 to run real Qwen3.6 ROCm LocalTP MTP smoke";
+    }
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalTP MTP smoke";
+    }
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = 32;
+    config.batch_size = 1;
+    config.tp_degree = 2;
+    config.tp_scope = TPScope::LOCAL;
+    config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+    config.pp_degree = 1;
+    config.kv_cache_precision = "auto";
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    auto tokenizer = runner->tokenizer();
+    ASSERT_NE(tokenizer, nullptr);
+    const auto encoded = tokenizer->encode("Paris is", /*add_bos=*/false, /*add_eos=*/false);
+    ASSERT_FALSE(encoded.empty());
+    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    auto result = runner->generate(prompt, 2, greedy);
+    const auto snapshot = runner->prefixStateProbe();
+    runner->shutdown();
+
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    ASSERT_FALSE(result.tokens.empty());
+    EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
+    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
+    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
+    EXPECT_GE(snapshot.mtp_rollbacks, 1u);
+}
+
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)
 {
     const auto device = firstGpuDeviceId();
