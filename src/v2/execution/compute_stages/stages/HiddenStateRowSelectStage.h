@@ -63,6 +63,12 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
+        CoherencePolicy coherencePolicy() const override
+        {
+            return (params_.input_buffer_id && params_.output_buffer_id)
+                       ? CoherencePolicy::FULL
+                       : CoherencePolicy::NONE;
+        }
         bool hasPrefillReplayParams() const override { return true; }
 
         /**

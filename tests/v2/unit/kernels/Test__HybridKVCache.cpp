@@ -11,6 +11,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/prefix_cache/PrefixPayloadLayout.h"
 #include "kernels/HybridKVCacheConfig.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/KernelFactory.h"
@@ -18,6 +19,9 @@
 #include "utils/MPIContext.h"
 #include "backends/DeviceId.h"
 #include "../../utils/TestTensorFactory.h"
+
+#include <cstdint>
+#include <vector>
 
 using namespace llaminar::v2::kernels;
 using namespace llaminar2;
@@ -366,6 +370,156 @@ namespace llaminar2::test
         EXPECT_NE(v3, v7) << "Different FA layers should have different V tensors";
     }
 
+    TEST_F(Test__CPUHybridKVCache, LogicalBlockIOUsesGlobalFALayerIds)
+    {
+        auto cache = createCache();
+
+        const int kv_dim = N_KV_HEADS * HEAD_DIM;
+        auto k_tensor = TestTensorFactory::createFP32Zeros({2, static_cast<size_t>(kv_dim)});
+        auto v_tensor = TestTensorFactory::createFP32Zeros({2, static_cast<size_t>(kv_dim)});
+        for (int i = 0; i < 2 * kv_dim; ++i)
+        {
+            k_tensor->mutable_data()[i] = static_cast<float>(1000 + i);
+            v_tensor->mutable_data()[i] = static_cast<float>(2000 + i);
+        }
+
+        ASSERT_TRUE(cache->append_kv(3, 0, k_tensor.get(), v_tensor.get(), 2));
+        EXPECT_EQ(cache->get_cached_tokens(3), 2);
+        EXPECT_EQ(cache->get_cached_tokens(0), 0);
+
+        const auto gdn_layout = cache->logicalBlockLayout(0, 2);
+        EXPECT_EQ(gdn_layout.k_bytes, 0u);
+        EXPECT_EQ(gdn_layout.v_bytes, 0u);
+
+        const auto fa_layout = cache->logicalBlockLayout(3, 2);
+        ASSERT_GT(fa_layout.k_bytes, 0u);
+        ASSERT_GT(fa_layout.v_bytes, 0u);
+
+        std::vector<uint8_t> k_payload(fa_layout.k_bytes);
+        std::vector<uint8_t> v_payload(fa_layout.v_bytes);
+        IKVCache::KVCacheLogicalBlockDescriptor desc;
+        desc.layer = 3;
+        desc.seq_idx = 0;
+        desc.logical_token_start = 0;
+        desc.token_count = 2;
+        ASSERT_TRUE(cache->exportLogicalBlock(desc, k_payload.data(), v_payload.data()));
+
+        auto restored = createCache();
+        ASSERT_TRUE(restored->importLogicalBlock(desc, k_payload.data(), v_payload.data()));
+        EXPECT_EQ(restored->get_cached_tokens(3), 2);
+        EXPECT_EQ(restored->get_cached_tokens(0), 0);
+
+        std::vector<uint8_t> restored_k(fa_layout.k_bytes);
+        std::vector<uint8_t> restored_v(fa_layout.v_bytes);
+        ASSERT_TRUE(restored->exportLogicalBlock(desc, restored_k.data(), restored_v.data()));
+        EXPECT_EQ(restored_k, k_payload);
+        EXPECT_EQ(restored_v, v_payload);
+    }
+
+    TEST_F(Test__CPUHybridKVCache, HybridPrefixStateMetadataCountsHostBytes)
+    {
+        auto cache = createCache();
+
+        const HybridPrefixStateMetadata metadata = cache->hybridPrefixStateMetadata();
+        EXPECT_EQ(metadata.total_layers, N_LAYERS);
+        EXPECT_EQ(metadata.gdn_layers, 18);
+        EXPECT_EQ(metadata.host_bytes, cache->gdnMemoryBytes());
+        EXPECT_GT(metadata.host_bytes, 0u);
+        EXPECT_EQ(metadata.device_bytes, 0u);
+        EXPECT_FALSE(metadata.has_device_kernel_state);
+    }
+
+    TEST_F(Test__CPUHybridKVCache, PrefixPayloadLayoutCountsFALayersAndHybridState)
+    {
+        auto cache = createCache();
+
+        const PrefixPayloadLayout layout = buildDensePrefixPayloadLayout(
+            *cache,
+            DeviceId::cpu(),
+            2);
+
+        EXPECT_EQ(layout.total_layers, N_LAYERS);
+        EXPECT_EQ(layout.fa_layers, 6);
+        EXPECT_EQ(layout.gdn_layers, 18);
+        EXPECT_GT(layout.bytes_per_fa_layer_k, 0u);
+        EXPECT_GT(layout.bytes_per_fa_layer_v, 0u);
+        EXPECT_TRUE(layout.includes_hybrid_state);
+        EXPECT_EQ(layout.hybrid_host_state_bytes, cache->gdnMemoryBytes());
+        EXPECT_EQ(layout.hybrid_device_state_bytes, 0u);
+        EXPECT_EQ(layout.hybrid_state_bytes, cache->gdnMemoryBytes());
+        EXPECT_EQ(layout.totalBytes(), layout.faKVBytes() + cache->gdnMemoryBytes());
+    }
+
+    TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRoundTripRestoresGDNState)
+    {
+        auto cache = createCache();
+
+        auto *layer0 = cache->getGDNState(0);
+        auto *layer4 = cache->getGDNState(4);
+        ASSERT_NE(layer0, nullptr);
+        ASSERT_NE(layer4, nullptr);
+        ASSERT_FALSE(layer0->recurrence_state.empty());
+        ASSERT_FALSE(layer0->conv_state.empty());
+        ASSERT_FALSE(layer4->recurrence_state.empty());
+        ASSERT_FALSE(layer4->conv_state.empty());
+
+        layer0->recurrence_state[0] = 11.0f;
+        layer0->recurrence_state[1] = 12.0f;
+        layer0->conv_state[0] = 13.0f;
+        layer4->recurrence_state[0] = 41.0f;
+        layer4->conv_state[0] = 43.0f;
+
+        const HybridPrefixStateMetadata metadata = cache->hybridPrefixStateMetadata();
+        std::vector<uint8_t> payload(metadata.host_bytes);
+        HybridPrefixStateDescriptor desc;
+        desc.seq_idx = 0;
+        desc.logical_token_count = 7;
+        ASSERT_TRUE(cache->exportHybridPrefixState(desc, payload.data(), nullptr));
+
+        const float *payload_floats = reinterpret_cast<const float *>(payload.data());
+        EXPECT_FLOAT_EQ(payload_floats[0], 11.0f);
+        EXPECT_FLOAT_EQ(payload_floats[1], 12.0f);
+        const size_t layer0_conv_offset = layer0->recurrence_state.size();
+        EXPECT_FLOAT_EQ(payload_floats[layer0_conv_offset], 13.0f);
+        const size_t floats_per_gdn_layer = layer0->recurrence_state.size() + layer0->conv_state.size();
+        const size_t layer4_offset = 3 * floats_per_gdn_layer;
+        EXPECT_FLOAT_EQ(payload_floats[layer4_offset], 41.0f);
+        EXPECT_FLOAT_EQ(payload_floats[layer4_offset + layer4->recurrence_state.size()], 43.0f);
+
+        cache->clear();
+        EXPECT_FLOAT_EQ(layer0->recurrence_state[0], 0.0f);
+        EXPECT_FLOAT_EQ(layer0->conv_state[0], 0.0f);
+        EXPECT_FLOAT_EQ(layer4->recurrence_state[0], 0.0f);
+        EXPECT_FLOAT_EQ(layer4->conv_state[0], 0.0f);
+
+        ASSERT_TRUE(cache->importHybridPrefixState(desc, payload.data(), nullptr));
+        EXPECT_FLOAT_EQ(layer0->recurrence_state[0], 11.0f);
+        EXPECT_FLOAT_EQ(layer0->recurrence_state[1], 12.0f);
+        EXPECT_FLOAT_EQ(layer0->conv_state[0], 13.0f);
+        EXPECT_FLOAT_EQ(layer4->recurrence_state[0], 41.0f);
+        EXPECT_FLOAT_EQ(layer4->conv_state[0], 43.0f);
+    }
+
+    TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRejectsMissingHostBuffers)
+    {
+        auto cache = createCache();
+
+        const HybridPrefixStateMetadata metadata = cache->hybridPrefixStateMetadata();
+        ASSERT_GT(metadata.host_bytes, 0u);
+
+        HybridPrefixStateDescriptor desc;
+        desc.seq_idx = 0;
+        desc.logical_token_count = 7;
+
+        EXPECT_FALSE(cache->exportHybridPrefixState(desc, nullptr, nullptr));
+        EXPECT_FALSE(cache->importHybridPrefixState(desc, nullptr, nullptr));
+
+        std::vector<uint8_t> payload(metadata.host_bytes);
+        desc.seq_idx = -1;
+        EXPECT_FALSE(cache->exportHybridPrefixState(desc, payload.data(), nullptr));
+        EXPECT_FALSE(cache->importHybridPrefixState(desc, payload.data(), nullptr));
+    }
+
     // =============================================================================
     // REGRESSION TEST: createHybridKVCache must not throw for any supported precision
     //
@@ -454,6 +608,55 @@ namespace llaminar2::test
         EXPECT_FALSE(hybrid->isGDNLayer(3));
         EXPECT_NE(hybrid->getGDNState(0), nullptr);
         EXPECT_EQ(hybrid->getGDNState(3), nullptr);
+    }
+
+    TEST_F(Test__KernelFactory_HybridKVCache, HybridPrefixStateClearImportPreservesKernelObjects)
+    {
+        auto hybrid_config = makeQwen35_08B_Config();
+
+        KVCacheConfig config;
+        config.precision = ActivationPrecision::FP32;
+        config.device = DeviceId::cpu();
+        config.num_layers = 24;
+        config.batch_size = 1;
+        config.max_seq_len = 128;
+        config.n_kv_heads = 4;
+        config.head_dim = 64;
+        config.mpi_ctx = &getTestMPIContext();
+        config.hybrid_config = &hybrid_config;
+
+        auto cache = KernelFactory::createHybridKVCache(config);
+        auto *hybrid = dynamic_cast<IHybridKVCache *>(cache.get());
+        ASSERT_NE(hybrid, nullptr);
+
+        auto *layer0 = hybrid->getGDNState(0);
+        ASSERT_NE(layer0, nullptr);
+        layer0->recurrence_state[0] = 77.0f;
+        layer0->conv_state[0] = 88.0f;
+
+        auto *conv0 = hybrid->getConvKernel(0);
+        auto *rec0 = hybrid->getRecurrenceKernel(0);
+        ASSERT_NE(conv0, nullptr);
+        ASSERT_NE(rec0, nullptr);
+
+        const HybridPrefixStateMetadata metadata = hybrid->hybridPrefixStateMetadata();
+        std::vector<uint8_t> payload(metadata.host_bytes);
+        HybridPrefixStateDescriptor desc;
+        desc.seq_idx = 0;
+        desc.logical_token_count = 5;
+        ASSERT_TRUE(hybrid->exportHybridPrefixState(desc, payload.data(), nullptr));
+
+        cache->clear();
+        EXPECT_EQ(hybrid->getConvKernel(0), conv0);
+        EXPECT_EQ(hybrid->getRecurrenceKernel(0), rec0);
+        EXPECT_FLOAT_EQ(layer0->recurrence_state[0], 0.0f);
+        EXPECT_FLOAT_EQ(layer0->conv_state[0], 0.0f);
+
+        ASSERT_TRUE(hybrid->importHybridPrefixState(desc, payload.data(), nullptr));
+        EXPECT_EQ(hybrid->getConvKernel(0), conv0);
+        EXPECT_EQ(hybrid->getRecurrenceKernel(0), rec0);
+        EXPECT_FLOAT_EQ(layer0->recurrence_state[0], 77.0f);
+        EXPECT_FLOAT_EQ(layer0->conv_state[0], 88.0f);
     }
 
     TEST_F(Test__KernelFactory_HybridKVCache, CreateCPUHybrid_Sharded_AllPrecisions)

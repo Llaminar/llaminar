@@ -72,6 +72,14 @@ namespace llaminar2
             }
             return gemm;
         }
+
+        void markDeviceOutputWritten(TensorBase *tensor, DeviceId device, void *stream)
+        {
+            if (tensor && device.is_gpu())
+            {
+                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
+            }
+        }
     }
 
     // =============================================================================
@@ -308,13 +316,55 @@ namespace llaminar2
                     params_.m, effective_n, params_.k,
                     params_.alpha, params_.beta))
             {
+                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
                 LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
                 traceOutput("C", params_.C);
                 return true;
             }
-            LOG_ERROR("[GEMMStage] multiply_tensor_with_fused_swiglu() failed — "
-                      "kernel does not support fused SwiGLU+GEMM");
-            return false;
+
+            LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM unavailable; falling back to separate SwiGLU + GEMM");
+            auto *swiglu_output = const_cast<TensorBase *>(A_base_up);
+            auto *activation = dynamic_cast<IActivationTensor *>(swiglu_output);
+            if (!activation)
+            {
+                LOG_ERROR("[GEMMStage] Cannot run SwiGLU fallback: up tensor is not an activation tensor");
+                return false;
+            }
+
+            auto swiglu = activation->createSwiGLU();
+            if (!swiglu)
+            {
+                LOG_ERROR("[GEMMStage] Cannot run SwiGLU fallback: failed to create SwiGLU kernel");
+                return false;
+            }
+            swiglu->setGPUStream(gpuStream());
+
+            if (!swiglu->apply_tensor(
+                    gate_base, A_base_up, swiglu_output,
+                    params_.m, params_.k,
+                    /*add_residual=*/false,
+                    params_.mpi_ctx,
+                    params_.device_id.toKernelDeviceIndex()))
+            {
+                LOG_ERROR("[GEMMStage] SwiGLU fallback activation failed");
+                return false;
+            }
+            markDeviceOutputWritten(swiglu_output, params_.device_id, gpuStream());
+
+            bool success = gemm->multiply_tensor(
+                swiglu_output, C_base,
+                params_.m, effective_n, params_.k,
+                params_.transpose_B,
+                params_.alpha, params_.beta,
+                nullptr, // bias
+                params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
+                getWorkspace());
+            if (success)
+            {
+                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
+                traceOutput("C", params_.C);
+            }
+            return success;
         }
 
         // Primary path: use tensor-aware multiply_tensor for type-aware dispatch.
@@ -336,7 +386,10 @@ namespace llaminar2
                 getWorkspace());
 
             if (success)
+            {
+                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
                 traceOutput("C", params_.C);
+            }
             return success;
         }
     }

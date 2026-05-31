@@ -262,6 +262,12 @@ namespace llaminar2
         // Use apply_tensor() which handles GPU pointers correctly via active_data_ptr()
         bool ok = kernel->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
                                        params_.device_id.toKernelDeviceIndex());
+        if (ok && params_.device_id.is_gpu())
+        {
+            output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                               params_.device_id,
+                                               gpuStream());
+        }
 
         if (Logger::getInstance().shouldLog(LogLevel::TRACE) && !params_.device_id.is_gpu())
         {

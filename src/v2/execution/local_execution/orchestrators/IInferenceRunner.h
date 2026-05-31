@@ -10,11 +10,14 @@
 #pragma once
 
 #include <optional>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <stdexcept>
 
 #include "../../../backends/DeviceId.h"
+#include "../../prefix_cache/PrefixCacheStateProbe.h"
+#include "../../prefix_cache/PrefixStateSnapshot.h"
 
 namespace llaminar2
 {
@@ -109,6 +112,33 @@ namespace llaminar2
          * @return Pointer to logits [vocab_size], or nullptr if unavailable
          */
         virtual const float *logits() const = 0;
+
+        virtual bool forwardMTP(int32_t draft_condition_token)
+        {
+            (void)draft_condition_token;
+            return false;
+        }
+
+        virtual const float *mtpLogits() const
+        {
+            return nullptr;
+        }
+
+        virtual bool setComputeAllPositionLogits(bool enabled)
+        {
+            (void)enabled;
+            return false;
+        }
+
+        virtual const float *getAllPositionLogits() const
+        {
+            return nullptr;
+        }
+
+        virtual std::string mtpDecodeUnsupportedReason() const
+        {
+            return {};
+        }
 
         /**
          * @brief Batched forward pass
@@ -463,6 +493,67 @@ namespace llaminar2
         {
             throw std::runtime_error("No PlacementPlan configured for this runner");
         }
+
+        /**
+         * @brief Find the longest reusable prefix for a token sequence.
+         *
+         * Default runners do not support persistent prefix state yet. Concrete
+         * implementations return a populated result only when the feature is
+         * enabled and the active backend can import/export logical KV blocks.
+         */
+        virtual PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens)
+        {
+            (void)tokens;
+            return {};
+        }
+
+        virtual bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0)
+        {
+            (void)hit;
+            (void)seq_idx;
+            return false;
+        }
+
+        virtual bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count)
+        {
+            (void)tokens;
+            (void)prompt_token_count;
+            return false;
+        }
+
+        virtual bool restorePrefixTerminalState(const PrefixLookupResult &hit)
+        {
+            (void)hit;
+            return false;
+        }
+
+        virtual PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const
+        {
+            (void)seq_idx;
+            return {};
+        }
+
+        virtual bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0)
+        {
+            (void)snapshot;
+            (void)seq_idx;
+            return false;
+        }
+
+        virtual bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0)
+        {
+            (void)cached_tokens;
+            (void)seq_idx;
+            return false;
+        }
+
+        /**
+         * @brief Read-only runtime state probe for prefix-cache/MTP development.
+         *
+         * This is diagnostic state only: callers must not mutate runner-owned
+         * buffers through the returned value.
+         */
+        virtual PrefixRuntimeStateSnapshot prefixStateProbe() const { return {}; }
     };
 
 } // namespace llaminar2

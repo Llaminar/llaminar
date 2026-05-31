@@ -211,6 +211,12 @@ namespace llaminar2
             /// Explicit KV cache precision mode (AUTO preserves legacy behavior)
             KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+            /// Prefix-state cache feature gates and storage limits.
+            PrefixCacheRuntimeConfig prefix_cache;
+
+            /// Multi-token prediction feature gates and verification mode.
+            MTPRuntimeConfig mtp;
+
             /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
             MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
 
@@ -360,6 +366,11 @@ namespace llaminar2
             std::unique_ptr<ILocalTPContext> tp_ctx,
             const Config &config);
 
+        static std::unique_ptr<RankOrchestrator> createForTestWithPipelineStages(
+            std::shared_ptr<IModelContext> model_ctx,
+            std::vector<std::unique_ptr<IInferenceRunner>> pp_stage_runners,
+            const Config &config);
+
         // =====================================================================
         // Constructors
         // =====================================================================
@@ -412,6 +423,11 @@ namespace llaminar2
          * @return Pointer to combined logits [vocab_size], or nullptr if unavailable
          */
         const float *logits() const override;
+        bool forwardMTP(int32_t draft_condition_token) override;
+        const float *mtpLogits() const override;
+        bool setComputeAllPositionLogits(bool enabled) override;
+        const float *getAllPositionLogits() const override;
+        std::string mtpDecodeUnsupportedReason() const override;
 
         /**
          * @brief GPU-side greedy sampling for decode
@@ -515,6 +531,16 @@ namespace llaminar2
          * @brief Get architecture name
          */
         const char *architecture() const override;
+
+        /**
+         * @brief Aggregate per-runner runtime state for prefix-cache/MTP probes.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+
+        PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
+        bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
+        bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
+        bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
 
         // =====================================================================
         // Hidden State API (for Pipeline Parallelism nesting)
@@ -807,6 +833,10 @@ namespace llaminar2
         /// PP stage runners (when stages are TP domains, these are RankOrchestrator)
         /// Only used in TP+PP mode - in pure PP mode, device_runners_ holds stage runners
         std::vector<std::unique_ptr<IInferenceRunner>> pp_stage_runners_;
+
+        /// Per-child prefix hits captured during the last rank-level lookup.
+        std::vector<PrefixLookupResult> last_device_prefix_hits_;
+        std::vector<PrefixLookupResult> last_pp_prefix_hits_;
 
         /// Configuration
         Config config_;

@@ -283,6 +283,238 @@ namespace llaminar2
     // The base implementation calls buildAttentionGraph() (virtual dispatch)
     // and buildFFNGraph(), so GDN dispatch is automatic.
 
+    ComputeGraph Qwen35Graph::buildMTPGraph(
+        int depth_idx,
+        const MTPDepthWeightBindings &bindings,
+        const MTPForwardInput &input,
+        MTPForwardOutput &output)
+    {
+        return buildMTPGraph(depth_idx, toLegacyMTPDepthWeights(bindings), input, output);
+    }
+
+    ComputeGraph Qwen35Graph::buildMTPGraph(
+        int depth_idx,
+        const MTPDepthWeights &weights,
+        const MTPForwardInput &input,
+        MTPForwardOutput &output)
+    {
+        ComputeGraph graph;
+        const std::string prefix = "mtp" + std::to_string(depth_idx) + "_";
+        const int total_tokens = input.batch_size * input.seq_len;
+        const DeviceId device = input.device.is_valid() ? input.device : config_.default_device;
+
+        auto missing = [&](const char *name, const void *ptr)
+        {
+            if (ptr)
+                return false;
+            LOG_ERROR("[Qwen35Graph::buildMTPGraph] Missing " << name);
+            return true;
+        };
+
+        if (input.batch_size != 1 || input.seq_len != 1)
+        {
+            LOG_ERROR("[Qwen35Graph::buildMTPGraph] Phase 5 supports one-token MTP sidecar graphs only");
+            return graph;
+        }
+
+        if (weights.fa_block.moe_gate || weights.fa_block.moe_gate_exps)
+        {
+            LOG_ERROR("[Qwen35Graph::buildMTPGraph] MoE MTP sidecar graph is not enabled in this phase");
+            return graph;
+        }
+
+        if (missing("embedding table", modelEmbeddingTable()) ||
+            missing("lm head", modelLMHead()) ||
+            missing("draft_token_ids", input.draft_token_ids) ||
+            missing("terminal_hidden", input.terminal_hidden) ||
+            missing("mtp.fc", weights.fc) ||
+            missing("mtp.pre_fc_norm_hidden", weights.pre_fc_norm_hidden) ||
+            missing("mtp.pre_fc_norm_embedding", weights.pre_fc_norm_embedding) ||
+            missing("mtp.final_norm", weights.final_norm) ||
+            missing("output.embedding", output.embedding) ||
+            missing("output.norm_hidden", output.norm_hidden) ||
+            missing("output.norm_embedding", output.norm_embedding) ||
+            missing("output.concat", output.concat) ||
+            missing("output.projected", output.projected) ||
+            missing("output.hidden", output.hidden) ||
+            missing("output.logits", output.logits) ||
+            missing("output.q", output.q) ||
+            missing("output.k", output.k) ||
+            missing("output.v", output.v) ||
+            missing("output.q_raw", output.q_raw) ||
+            missing("output.q_gate", output.q_gate) ||
+            missing("output.attn_output", output.attn_output) ||
+            missing("output.attn_proj", output.attn_proj) ||
+            missing("output.gate", output.gate) ||
+            missing("output.up", output.up))
+        {
+            return graph;
+        }
+
+        graph.addNode(prefix + "embedding",
+                      ComputeStageFactory::createEmbedding({
+                          .device_id = device,
+                          .mpi_ctx = mpi_ctx_.get(),
+                          .embed_table = modelEmbeddingTable(),
+                          .token_ids = input.draft_token_ids,
+                          .output = output.embedding,
+                          .num_tokens = total_tokens,
+                          .d_model = config_.d_model,
+                          .vocab_size = config_.vocab_size,
+                          .vocab_offset = 0,
+                          .local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0,
+                          .output_buffer_id = BufferId::MTP_EMBEDDING,
+                          .prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), device),
+                          .prepared_store = prepared_weight_store_,
+                      }),
+                      device);
+
+        graph.addNode(prefix + "norm_hidden",
+                      ComputeStageFactory::createRMSNorm({
+                          .device_id = device,
+                          .input = input.terminal_hidden,
+                          .output = output.norm_hidden,
+                          .gamma = weights.pre_fc_norm_hidden,
+                          .eps = config_.rms_norm_eps,
+                          .subtract_one = config_.rms_norm_subtract_one,
+                          .seq_len = total_tokens,
+                          .output_buffer_id = BufferId::MTP_NORM_HIDDEN,
+                      }),
+                      device);
+
+        graph.addNode(prefix + "norm_embedding",
+                      ComputeStageFactory::createRMSNorm({
+                          .device_id = device,
+                          .input = output.embedding,
+                          .output = output.norm_embedding,
+                          .gamma = weights.pre_fc_norm_embedding,
+                          .eps = config_.rms_norm_eps,
+                          .subtract_one = config_.rms_norm_subtract_one,
+                          .seq_len = total_tokens,
+                          .input_buffer_id = BufferId::MTP_EMBEDDING,
+                          .output_buffer_id = BufferId::MTP_NORM_EMBEDDING,
+                      }),
+                      device);
+        graph.addDependency(prefix + "norm_embedding", prefix + "embedding");
+
+        graph.addNode(prefix + "concat",
+                      ComputeStageFactory::createMTPConcat({
+                          .device_id = device,
+                          .hidden = output.norm_hidden,
+                          .embedding = output.norm_embedding,
+                          .output = output.concat,
+                          .num_tokens = total_tokens,
+                          .hidden_dim = config_.d_model,
+                          .hidden_buffer_id = BufferId::MTP_NORM_HIDDEN,
+                          .embedding_buffer_id = BufferId::MTP_NORM_EMBEDDING,
+                          .output_buffer_id = BufferId::MTP_CONCAT,
+                      }),
+                      device);
+        graph.addDependency(prefix + "concat", prefix + "norm_hidden");
+        graph.addDependency(prefix + "concat", prefix + "norm_embedding");
+
+        graph.addNode(prefix + "fc",
+                      ComputeStageFactory::createGEMM({
+                          .device_id = device,
+                          .A = output.concat,
+                          .B = weights.fc,
+                          .C = output.projected,
+                          .m = total_tokens,
+                          .n = static_cast<int>(weights.fc->shape()[0]),
+                          .k = static_cast<int>(weights.fc->shape()[1]),
+                          .alpha = 1.0f,
+                          .beta = 0.0f,
+                          .transpose_B = false,
+                          .gemm_context = GemmContext::NONE,
+                          .a_buffer_id = BufferId::MTP_CONCAT,
+                          .c_buffer_id = BufferId::MTP_PROJECTED,
+                          .prepared_ref = preparedRefForGraphWeight(weights.fc_binding, device),
+                          .prepared_store = prepared_weight_store_,
+                      }),
+                      device);
+        graph.addDependency(prefix + "fc", prefix + "concat");
+
+        ActivationBuffers mtp_buffers;
+        mtp_buffers.current_hidden = output.projected;
+        mtp_buffers.normalized = output.norm_hidden;
+        mtp_buffers.Q = output.q;
+        mtp_buffers.K = output.k;
+        mtp_buffers.V = output.v;
+        mtp_buffers.attn_output = output.attn_output;
+        mtp_buffers.attn_proj = output.attn_proj;
+        mtp_buffers.gate = output.gate;
+        mtp_buffers.up = output.up;
+        mtp_buffers.ffn_output = output.ffn_output;
+        mtp_buffers.extensions[BufferId::FA_Q_RAW] = output.q_raw;
+        mtp_buffers.extensions[BufferId::FA_GATE] = output.q_gate;
+
+        ComputeGraph attention = buildFAAttentionGraph(
+            weights.fa_block,
+            mtp_buffers,
+            /*layer_idx=*/0,
+            input.seq_len,
+            input.batch_size,
+            input.kv_cache,
+            input.position_ids,
+            device,
+            input.sequence_lengths);
+        if (attention.size() == 0)
+            return ComputeGraph{};
+
+        const std::string attention_terminal = attention.terminalNode();
+        graph.merge(std::move(attention), prefix + "fc");
+
+        const int ffn_layer_idx = std::max(0, config_.n_layers - 1);
+        ComputeGraph ffn = buildFFNGraph(
+            weights.fa_block,
+            mtp_buffers,
+            ffn_layer_idx,
+            input.seq_len,
+            input.batch_size,
+            device);
+        if (ffn.size() == 0)
+            return ComputeGraph{};
+
+        const std::string ffn_terminal = ffn.terminalNode();
+        graph.merge(std::move(ffn), attention_terminal);
+
+        graph.addNode(prefix + "final_norm",
+                      ComputeStageFactory::createRMSNorm({
+                          .device_id = device,
+                          .input = output.projected,
+                          .output = output.hidden,
+                          .gamma = weights.final_norm,
+                          .eps = config_.rms_norm_eps,
+                          .subtract_one = config_.rms_norm_subtract_one,
+                          .seq_len = total_tokens,
+                          .input_buffer_id = BufferId::MTP_PROJECTED,
+                          .output_buffer_id = BufferId::MTP_HIDDEN,
+                      }),
+                      device);
+        graph.addDependency(prefix + "final_norm", ffn_terminal);
+
+        graph.addNode(prefix + "lm_head",
+                      ComputeStageFactory::createLMHead({
+                          .device_id = device,
+                          .hidden_states = output.hidden,
+                          .lm_head_weight = modelLMHead(),
+                          .logits = output.logits,
+                          .seq_len = total_tokens,
+                          .d_model = config_.d_model,
+                          .vocab_size = config_.vocab_size,
+                          .use_prefill_replay_row_offset = false,
+                          .input_buffer_id = BufferId::MTP_HIDDEN,
+                          .output_buffer_id = BufferId::MTP_LOGITS,
+                          .prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device),
+                          .prepared_store = prepared_weight_store_,
+                      }),
+                      device);
+        graph.addDependency(prefix + "lm_head", prefix + "final_norm");
+        graph.setTerminalNode(prefix + "lm_head");
+
+        return graph;
+    }
+
     // =========================================================================
     // Attention Graph Dispatch
     // =========================================================================
@@ -602,6 +834,10 @@ namespace llaminar2
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        const WeightBinding *wq_binding = layer.wq_binding ? layer.wq_binding : layer_bindings.wq;
+        const WeightBinding *wk_binding = layer.wk_binding ? layer.wk_binding : layer_bindings.wk;
+        const WeightBinding *wv_binding = layer.wv_binding ? layer.wv_binding : layer_bindings.wv;
+        const WeightBinding *wo_binding = layer.wo_binding ? layer.wo_binding : layer_bindings.wo;
 
         LOG_DEBUG("[Qwen35Graph::buildFAAttentionGraph] layer=" << layer_idx
                                                                 << " seq_len=" << seq_len << " batch_size=" << batch_size
@@ -663,9 +899,9 @@ namespace llaminar2
                               .output_q_buffer_id = BufferId::FA_Q_RAW,
                               .output_k_buffer_id = BufferId::K_PROJ,
                               .output_v_buffer_id = BufferId::V_PROJ,
-                              .prepared_ref_q = preparedRefForGraphWeight(layer_bindings.wq, device),
-                              .prepared_ref_k = preparedRefForGraphWeight(layer_bindings.wk, device),
-                              .prepared_ref_v = preparedRefForGraphWeight(layer_bindings.wv, device),
+                              .prepared_ref_q = preparedRefForGraphWeight(wq_binding, device),
+                              .prepared_ref_k = preparedRefForGraphWeight(wk_binding, device),
+                              .prepared_ref_v = preparedRefForGraphWeight(wv_binding, device),
                               .prepared_store = prepared_weight_store_,
                           }),
                           device);
@@ -757,7 +993,7 @@ namespace llaminar2
         // Stage 5: Wo projection + optional TP allreduce
         // =================================================================
         std::string terminal = addWoProjectionAndAllreduce(
-            graph, prefix, buffers, layer.wo, layer_bindings.wo,
+            graph, prefix, buffers, layer.wo, wo_binding,
             total_tokens, layer_idx, device,
             prefix + "attn_output_gate");
 

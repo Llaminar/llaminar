@@ -89,6 +89,18 @@ namespace llaminar2
             DeviceId device,
             const std::vector<int> *sequence_lengths = nullptr) override;
 
+        ComputeGraph buildMTPGraph(
+            int depth_idx,
+            const MTPDepthWeights &weights,
+            const MTPForwardInput &input,
+            MTPForwardOutput &output);
+
+        ComputeGraph buildMTPGraph(
+            int depth_idx,
+            const MTPDepthWeightBindings &bindings,
+            const MTPForwardInput &input,
+            MTPForwardOutput &output) override;
+
             /**
              * @brief Resolve the global GDN value-head offset for a local TP shard.
              *

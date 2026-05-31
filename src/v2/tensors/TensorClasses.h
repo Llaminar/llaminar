@@ -949,6 +949,29 @@ namespace llaminar2
         virtual void invalidateGpuData();
 
         /**
+         * @brief Mark host storage as containing the newest tensor contents.
+         *
+         * Use this after callers write host memory directly through
+         * raw_mutable_data() or an external receive path. Unlike mutable_data(),
+         * this does not try to download the previous device contents first.
+         */
+        void mark_host_dirty() override
+        {
+            std::lock_guard<std::mutex> lock(coherence_mutex_);
+            if (is_mapped_)
+            {
+                setCoherenceState_(TensorCoherenceState::MAPPED);
+                mapped_needs_sync_ = false;
+            }
+            else
+            {
+                setCoherenceState_(gpu_data_ptr_ ? TensorCoherenceState::HOST_AUTHORITATIVE
+                                                 : TensorCoherenceState::HOST_ONLY);
+            }
+            authoritative_device_.reset();
+        }
+
+        /**
          * @brief Ensure tensor data is available on host (CPU)
          *
          * Performs lazy download: if data is already on host and valid, returns immediately.

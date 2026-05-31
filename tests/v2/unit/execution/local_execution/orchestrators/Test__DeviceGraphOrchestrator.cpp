@@ -27,6 +27,7 @@
 #include "tensors/TensorFactory.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include <memory>
+#include <string>
 #include <utility>
 
 using namespace llaminar2;
@@ -786,6 +787,65 @@ TEST_F(Test__DeviceGraphOrchestrator, InferenceStateMultipleBatches)
     {
         EXPECT_EQ(orchestrator->getPosition(b), 0);
     }
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, DisabledPrefixCacheDoesNotRecordBypassStats)
+{
+    auto custom_config = config_;
+    custom_config.prefix_cache.enabled = false;
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<QwenStandardGraph>(custom_config, nullptr),
+        nullptr);
+
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2});
+    EXPECT_FALSE(hit.cache_enabled);
+    EXPECT_FALSE(hit.supported);
+
+    PrefixRuntimeStateSnapshot probe = orchestrator->prefixStateProbe();
+    EXPECT_FALSE(probe.prefix_cache_config_enabled);
+    EXPECT_FALSE(probe.prefix_cache_ready);
+    EXPECT_FALSE(probe.prefix_cache_bypassed);
+    EXPECT_TRUE(probe.prefix_cache_bypass_reason.empty());
+    EXPECT_EQ(probe.prefix_cache_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_unsupported_backend_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_fingerprint_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_terminal_state_bypasses, 0u);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefixCacheBudgetBypassIsReportedInProbe)
+{
+    auto custom_config = config_;
+    custom_config.prefix_cache.enabled = true;
+    custom_config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+    custom_config.prefix_cache.block_size = 2;
+    custom_config.prefix_cache.ram_budget_bytes = 1;
+    custom_config.mtp.enabled = false;
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<QwenStandardGraph>(custom_config, nullptr),
+        nullptr);
+
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2});
+    EXPECT_TRUE(hit.cache_enabled);
+    EXPECT_FALSE(hit.supported);
+    EXPECT_NE(hit.bypass_reason.find("RAM budget"), std::string::npos);
+
+    PrefixRuntimeStateSnapshot probe = orchestrator->prefixStateProbe();
+    EXPECT_TRUE(probe.prefix_cache_config_enabled);
+    EXPECT_FALSE(probe.prefix_cache_ready);
+    EXPECT_TRUE(probe.prefix_cache_bypassed);
+    EXPECT_NE(probe.prefix_cache_bypass_reason.find("RAM budget"), std::string::npos);
+    EXPECT_EQ(probe.prefix_cache_bypasses, 1u);
+    EXPECT_EQ(probe.prefix_cache_unsupported_backend_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_fingerprint_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_terminal_state_bypasses, 0u);
+
+    PrefixLookupResult second_hit = orchestrator->lookupPrefix({1, 2});
+    EXPECT_FALSE(second_hit.supported);
+    EXPECT_EQ(orchestrator->prefixStateProbe().prefix_cache_bypasses, 1u);
 }
 
 // =============================================================================

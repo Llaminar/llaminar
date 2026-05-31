@@ -18,6 +18,7 @@
 #include "DeviceSampler.h"
 #include "DeviceGraphOrchestrator.h"
 #include "../../factory/InferenceRunnerFactory.h"
+#include "../../prefix_cache/PrefixCacheCoordinator.h"
 #include "../../../collective/ILocalTPContext.h"
 #include "../../../collective/ILocalPPContext.h"
 #include "../../../config/TensorParallelConfig.h"
@@ -247,6 +248,8 @@ namespace llaminar2
         config.batch_size = plan.runtime.batch_size;
         config.activation_precision = plan.runtime.activation_precision;
         config.kv_cache_precision = plan.runtime.kv_cache_precision;
+        config.prefix_cache = plan.runtime.prefix_cache;
+        config.mtp = plan.runtime.mtp;
         config.moe_expert_mode = plan.runtime.moe_expert_mode;
         config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
         config.moe_rebalance = plan.runtime.moe_rebalance;
@@ -330,6 +333,21 @@ namespace llaminar2
                 std::move(device_runners),
                 std::move(tp_ctx),
                 config));
+    }
+
+    std::unique_ptr<RankOrchestrator> RankOrchestrator::createForTestWithPipelineStages(
+        std::shared_ptr<IModelContext> model_ctx,
+        std::vector<std::unique_ptr<IInferenceRunner>> pp_stage_runners,
+        const Config &config)
+    {
+        auto orchestrator = createForTest(
+            std::move(model_ctx),
+            {},
+            nullptr,
+            config);
+        orchestrator->mode_ = ParallelismMode::PP;
+        orchestrator->pp_stage_runners_ = std::move(pp_stage_runners);
+        return orchestrator;
     }
 
     // =========================================================================
@@ -713,6 +731,8 @@ namespace llaminar2
                                                  runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
                                                  runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                                                  runner_config.kv_cache_precision = config_.kv_cache_precision;
+                                                 runner_config.prefix_cache = config_.prefix_cache;
+                                                 runner_config.mtp = config_.mtp;
                                                  runner_config.moe_expert_mode = config_.moe_expert_mode;
                                                  runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
                                                  runner_config.moe_rebalance = config_.moe_rebalance;
@@ -986,6 +1006,8 @@ namespace llaminar2
             runner_config.kv_cache_scale_k = config_.kv_cache_scale_k;
             runner_config.kv_cache_scale_v = config_.kv_cache_scale_v;
             runner_config.kv_cache_precision = config_.kv_cache_precision;
+            runner_config.prefix_cache = config_.prefix_cache;
+            runner_config.mtp = config_.mtp;
             runner_config.moe_expert_mode = config_.moe_expert_mode;
             runner_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
             runner_config.moe_rebalance = config_.moe_rebalance;
@@ -1025,6 +1047,8 @@ namespace llaminar2
                 nested_config.kv_cache_scale_k = config_.kv_cache_scale_k;
                 nested_config.kv_cache_scale_v = config_.kv_cache_scale_v;
                 nested_config.kv_cache_precision = config_.kv_cache_precision;
+                nested_config.prefix_cache = config_.prefix_cache;
+                nested_config.mtp = config_.mtp;
                 nested_config.moe_expert_mode = config_.moe_expert_mode;
                 nested_config.moe_hot_expert_cache = config_.moe_hot_expert_cache;
                 nested_config.moe_rebalance = config_.moe_rebalance;
@@ -1913,6 +1937,81 @@ namespace llaminar2
         return nullptr;
     }
 
+    bool RankOrchestrator::forwardMTP(int32_t draft_condition_token)
+    {
+        if (device_runners_.empty())
+        {
+            return false;
+        }
+
+        bool all_success = true;
+        for (auto &runner : device_runners_)
+        {
+            if (!runner || !runner->forwardMTP(draft_condition_token))
+            {
+                all_success = false;
+            }
+        }
+        return all_success;
+    }
+
+    const float *RankOrchestrator::mtpLogits() const
+    {
+        if (device_runners_.size() != 1)
+        {
+            return nullptr;
+        }
+        if (device_runners_.empty() || !device_runners_[0])
+        {
+            return nullptr;
+        }
+        return device_runners_[0]->mtpLogits();
+    }
+
+    bool RankOrchestrator::setComputeAllPositionLogits(bool enabled)
+    {
+        if (device_runners_.empty())
+        {
+            return false;
+        }
+
+        bool all_success = true;
+        for (auto &runner : device_runners_)
+        {
+            if (!runner || !runner->setComputeAllPositionLogits(enabled))
+            {
+                all_success = false;
+            }
+        }
+        return all_success;
+    }
+
+    const float *RankOrchestrator::getAllPositionLogits() const
+    {
+        if (device_runners_.size() != 1)
+        {
+            return nullptr;
+        }
+        if (device_runners_.empty() || !device_runners_[0])
+        {
+            return nullptr;
+        }
+        return device_runners_[0]->getAllPositionLogits();
+    }
+
+    std::string RankOrchestrator::mtpDecodeUnsupportedReason() const
+    {
+        if (!pp_stage_runners_.empty())
+        {
+            return "MTP decode is not enabled for PP topologies";
+        }
+        if (device_runners_.size() > 1)
+        {
+            return "MTP decode requires TP logits and checkpoint coordination";
+        }
+        return {};
+    }
+
     void RankOrchestrator::setSkipLogitsGatherDecode(bool skip)
     {
         if (logits_gatherer_)
@@ -2068,6 +2167,8 @@ namespace llaminar2
         LOG_DEBUG("RankOrchestrator::clear_cache: Clearing cache on all "
                   << device_runners_.size() << " TP devices and "
                   << pp_stage_runners_.size() << " PP stages");
+        last_device_prefix_hits_.clear();
+        last_pp_prefix_hits_.clear();
 
         // Clear TP device runners
         for (auto &runner : device_runners_)
@@ -2127,6 +2228,238 @@ namespace llaminar2
             return device_runners_[0]->architecture();
         }
         return "Unknown";
+    }
+
+    PrefixLookupResult RankOrchestrator::lookupPrefix(const std::vector<int32_t> &tokens)
+    {
+        PrefixLookupResult aggregate;
+        last_device_prefix_hits_.clear();
+        last_pp_prefix_hits_.clear();
+
+        std::vector<PrefixParticipantLookup> participants;
+        int block_size = 0;
+        int participant_id = 0;
+
+        auto query_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners,
+                                 std::vector<PrefixLookupResult> &hits)
+        {
+            for (auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+
+                PrefixLookupResult hit = runner->lookupPrefix(tokens);
+                participants.push_back(makePrefixParticipantLookup(
+                    participant_id++,
+                    runner->primaryDeviceId(),
+                    hit));
+                hits.push_back(hit);
+                if (block_size <= 0 && hit.block_size > 0)
+                    block_size = hit.block_size;
+            }
+        };
+
+        query_runners(device_runners_, last_device_prefix_hits_);
+        query_runners(pp_stage_runners_, last_pp_prefix_hits_);
+
+        if (participants.empty())
+            return aggregate;
+
+        return makePrefixLookupResult(coordinatePrefixLookups(std::move(participants)), block_size);
+    }
+
+    bool RankOrchestrator::populatePrefix(const PrefixLookupResult &hit, int seq_idx)
+    {
+        const int common_tokens = std::max(0, hit.cached_tokens);
+        if (common_tokens <= 0)
+            return true;
+
+        auto populate_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners,
+                                    const std::vector<PrefixLookupResult> &hits)
+        {
+            size_t hit_index = 0;
+            for (auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+                if (hit_index >= hits.size())
+                    return false;
+
+                PrefixLookupResult child_hit = hits[hit_index++].clampedTo(common_tokens);
+                if (!runner->populatePrefix(child_hit, seq_idx))
+                    return false;
+            }
+            return hit_index == hits.size();
+        };
+
+        const bool populated =
+            populate_runners(device_runners_, last_device_prefix_hits_) &&
+            populate_runners(pp_stage_runners_, last_pp_prefix_hits_);
+        if (!populated)
+        {
+            clear_cache();
+        }
+        return populated;
+    }
+
+    bool RankOrchestrator::harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        auto harvest_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners)
+        {
+            for (auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+                saw_runner = true;
+                ok = runner->harvestPrefix(tokens, prompt_token_count) && ok;
+            }
+        };
+
+        harvest_runners(device_runners_);
+        harvest_runners(pp_stage_runners_);
+        return saw_runner && ok;
+    }
+
+    bool RankOrchestrator::restorePrefixTerminalState(const PrefixLookupResult &hit)
+    {
+        const int common_tokens = std::max(0, hit.cached_tokens);
+        if (common_tokens <= 0)
+            return false;
+
+        auto restore_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners,
+                                   const std::vector<PrefixLookupResult> &hits)
+        {
+            size_t hit_index = 0;
+            for (auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+
+                PrefixLookupResult child_hit =
+                    hit_index < hits.size() ? hits[hit_index++].clampedTo(common_tokens)
+                                            : hit.clampedTo(common_tokens);
+                if (!runner->restorePrefixTerminalState(child_hit))
+                    return false;
+            }
+            return true;
+        };
+
+        return restore_runners(device_runners_, last_device_prefix_hits_) &&
+               restore_runners(pp_stage_runners_, last_pp_prefix_hits_);
+    }
+
+    PrefixRuntimeStateSnapshot RankOrchestrator::prefixStateProbe() const
+    {
+        PrefixRuntimeStateSnapshot snapshot;
+        snapshot.initialized = true;
+        snapshot.architecture = architecture();
+        snapshot.execution_path = "rank-orchestrator";
+        snapshot.current_position = get_position();
+        snapshot.positions = {snapshot.current_position};
+        snapshot.sequence_lengths = current_sequence_lengths_;
+
+        auto merge_child = [&snapshot](const PrefixRuntimeStateSnapshot &child)
+        {
+            snapshot.initialized = snapshot.initialized && child.initialized;
+            snapshot.has_hidden = snapshot.has_hidden || child.has_hidden;
+            snapshot.has_logits = snapshot.has_logits || child.has_logits;
+            snapshot.session_epoch = std::max(snapshot.session_epoch, child.session_epoch);
+            snapshot.prefix_cache_config_enabled =
+                snapshot.prefix_cache_config_enabled || child.prefix_cache_config_enabled;
+            snapshot.prefix_cache_ready = snapshot.prefix_cache_ready || child.prefix_cache_ready;
+            snapshot.prefix_cache_bypassed =
+                snapshot.prefix_cache_bypassed || child.prefix_cache_bypassed;
+            if (snapshot.prefix_cache_bypass_reason.empty() &&
+                !child.prefix_cache_bypass_reason.empty())
+            {
+                snapshot.prefix_cache_bypass_reason = child.prefix_cache_bypass_reason;
+            }
+            snapshot.prefix_cache_lookups += child.prefix_cache_lookups;
+            snapshot.prefix_cache_hits += child.prefix_cache_hits;
+            snapshot.prefix_cache_partial_hits += child.prefix_cache_partial_hits;
+            snapshot.prefix_cache_misses += child.prefix_cache_misses;
+            snapshot.prefix_cache_matched_blocks += child.prefix_cache_matched_blocks;
+            snapshot.prefix_cache_matched_tokens += child.prefix_cache_matched_tokens;
+            snapshot.prefix_cache_stores += child.prefix_cache_stores;
+            snapshot.prefix_cache_inserts += child.prefix_cache_inserts;
+            snapshot.prefix_cache_evictions += child.prefix_cache_evictions;
+            snapshot.prefix_cache_promotions += child.prefix_cache_promotions;
+            snapshot.prefix_cache_disk_hydrations += child.prefix_cache_disk_hydrations;
+            snapshot.prefix_cache_terminal_state_hits += child.prefix_cache_terminal_state_hits;
+            snapshot.prefix_cache_ram_bytes += child.prefix_cache_ram_bytes;
+            snapshot.prefix_cache_device_bytes += child.prefix_cache_device_bytes;
+            snapshot.prefix_cache_disk_bytes += child.prefix_cache_disk_bytes;
+            snapshot.prefix_cache_hybrid_state_bytes += child.prefix_cache_hybrid_state_bytes;
+            snapshot.prefix_cache_mtp_state_bytes += child.prefix_cache_mtp_state_bytes;
+            snapshot.prefix_cache_bypasses += child.prefix_cache_bypasses;
+            snapshot.prefix_cache_unsupported_backend_bypasses +=
+                child.prefix_cache_unsupported_backend_bypasses;
+            snapshot.prefix_cache_fingerprint_bypasses +=
+                child.prefix_cache_fingerprint_bypasses;
+            snapshot.prefix_cache_terminal_state_bypasses +=
+                child.prefix_cache_terminal_state_bypasses;
+            snapshot.mtp_config_enabled = snapshot.mtp_config_enabled || child.mtp_config_enabled;
+            snapshot.mtp_bypassed = snapshot.mtp_bypassed || child.mtp_bypassed;
+            if (snapshot.mtp_bypass_reason.empty() && !child.mtp_bypass_reason.empty())
+            {
+                snapshot.mtp_bypass_reason = child.mtp_bypass_reason;
+            }
+            snapshot.mtp_draft_steps += child.mtp_draft_steps;
+            snapshot.mtp_accepted_tokens += child.mtp_accepted_tokens;
+            snapshot.mtp_rejected_tokens += child.mtp_rejected_tokens;
+            snapshot.mtp_rollbacks += child.mtp_rollbacks;
+            snapshot.mtp_bypasses += child.mtp_bypasses;
+            snapshot.mtp_verifier_runs += child.mtp_verifier_runs;
+            snapshot.mtp_verifier_token_count += child.mtp_verifier_token_count;
+            if (snapshot.primary_device.is_cpu() && !child.primary_device.is_cpu())
+            {
+                snapshot.primary_device = child.primary_device;
+            }
+            if (snapshot.positions.empty() && !child.positions.empty())
+            {
+                snapshot.positions = child.positions;
+            }
+            if (snapshot.sequence_lengths.empty() && !child.sequence_lengths.empty())
+            {
+                snapshot.sequence_lengths = child.sequence_lengths;
+            }
+            snapshot.kv_caches.insert(snapshot.kv_caches.end(), child.kv_caches.begin(), child.kv_caches.end());
+            snapshot.mtp_kv_caches.insert(snapshot.mtp_kv_caches.end(),
+                                          child.mtp_kv_caches.begin(),
+                                          child.mtp_kv_caches.end());
+            snapshot.gdn_layers.insert(snapshot.gdn_layers.end(), child.gdn_layers.begin(), child.gdn_layers.end());
+        };
+
+        bool saw_child = false;
+        for (const auto &runner : device_runners_)
+        {
+            if (runner)
+            {
+                merge_child(runner->prefixStateProbe());
+                saw_child = true;
+            }
+        }
+        for (const auto &runner : pp_stage_runners_)
+        {
+            if (runner)
+            {
+                merge_child(runner->prefixStateProbe());
+                saw_child = true;
+            }
+        }
+
+        if (!saw_child)
+        {
+            snapshot.initialized = false;
+        }
+        if (snapshot.prefix_cache_bypassed)
+        {
+            snapshot.prefix_cache_ready = false;
+        }
+
+        return snapshot;
     }
 
     // =========================================================================

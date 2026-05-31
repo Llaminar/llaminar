@@ -40,6 +40,7 @@ namespace llaminar2
     class ITPContext;
     class PreparedWeightStore;
     class IModelContext;
+    struct PrefixFingerprintMaterial;
 
     // =========================================================================
     // Generic Input/Output Structures
@@ -190,6 +191,19 @@ namespace llaminar2
          */
         virtual ComputeGraph buildLayerGraph(const LayerContext &ctx) = 0;
 
+        virtual ComputeGraph buildMTPGraph(
+            int depth_idx,
+            const MTPDepthWeightBindings &bindings,
+            const MTPForwardInput &input,
+            MTPForwardOutput &output)
+        {
+            (void)depth_idx;
+            (void)bindings;
+            (void)input;
+            (void)output;
+            return {};
+        }
+
         // =====================================================================
         // Optional Methods (with default implementations)
         // =====================================================================
@@ -225,6 +239,12 @@ namespace llaminar2
         /// Get the architecture name (e.g. "qwen2", "qwen3", "llama")
         virtual std::string architectureName() const { return "unknown"; }
 
+        /// Append model-owned prefix-cache fingerprint material, such as MoE placement.
+        virtual void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
+        {
+            (void)material;
+        }
+
         // =====================================================================
         // Weight / Buffer Management
         // =====================================================================
@@ -243,6 +263,13 @@ namespace llaminar2
 
         /// Set prepared weight store for kernel lifecycle management (Phase 10)
         virtual void setPreparedWeightStore(PreparedWeightStore *store) { (void)store; }
+
+        /// Enable or disable all-position LM-head logits for speculative verification.
+        virtual bool setComputeAllPositionLogits(bool enabled)
+        {
+            (void)enabled;
+            return false;
+        }
 
         /// Set model context for registry-created builders in tests/dependency injection.
         virtual void setModelContext(std::shared_ptr<IModelContext> model_ctx) { (void)model_ctx; }

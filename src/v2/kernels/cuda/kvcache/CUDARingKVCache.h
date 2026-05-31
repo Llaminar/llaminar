@@ -479,6 +479,13 @@ namespace llaminar2
         int local_n_kv_heads() const override { return local_n_kv_heads_; }
         int kv_head_start() const override { return kv_head_start_; }
         int local_kv_dim() const override { return kv_dim_; }
+        TensorLayout kv_layout() const override { return TensorLayout::KV_POS_HEAD_DIM; }
+
+        KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override;
+        KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const override;
+        bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v) override;
+        bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr) override;
 
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,

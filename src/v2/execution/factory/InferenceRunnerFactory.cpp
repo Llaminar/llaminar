@@ -39,6 +39,7 @@
 #include "../../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../execution/moe/MoEExpertParallelPlanner.h"
+#include "../../execution/mtp/MTPWeightManifest.h"
 #include "../../loaders/WeightLoadProgress.h"
 #include "../../loaders/WeightLoadProgressAggregator.h"
 #include <algorithm>
@@ -423,6 +424,22 @@ namespace llaminar2
                       << "    - Set LLAMINAR_WEIGHT_STREAMING=1 for GPU (streams weights on demand)\n"
                       << "    - Use tensor parallelism across machines (-tp with MPI sharding)");
             return false;
+        }
+
+        void appendRequiredWeightsUnique(
+            std::vector<std::pair<std::string, bool>> &weights_to_load,
+            const std::vector<std::string> &names)
+        {
+            std::unordered_set<std::string> seen;
+            seen.reserve(weights_to_load.size() + names.size());
+            for (const auto &[name, _] : weights_to_load)
+                seen.insert(name);
+
+            for (const auto &name : names)
+            {
+                if (seen.insert(name).second)
+                    weights_to_load.emplace_back(name, false);
+            }
         }
 
     } // namespace
@@ -1416,6 +1433,8 @@ namespace llaminar2
         // kv_cache_scale_k/v are set by the model config builder (e.g. QwenStandardGraphConfigBuilder)
         // which is the sole authority on K/V scale values for each model architecture.
         graph_config.kv_cache_precision = config.kv_cache_precision;
+        graph_config.prefix_cache = config.prefix_cache;
+        graph_config.mtp = config.mtp;
         LOG_DEBUG("[InferenceRunner] KV cache scale: K=" << graph_config.kv_cache_scale_k
                                                          << ", V=" << graph_config.kv_cache_scale_v);
         LOG_DEBUG("[InferenceRunner] KV cache precision mode: "
@@ -1967,6 +1986,40 @@ namespace llaminar2
         {
             LOG_DEBUG("[InferenceRunner] Skipping " << validation.missing_optional.size()
                                                     << " optional weights not present in model");
+        }
+
+        if (config.mtp.enabled)
+        {
+            auto loader = model_ctx->loader();
+            if (!loader)
+            {
+                LOG_ERROR("[InferenceRunner] MTP was requested, but model loader is unavailable");
+                WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
+                return false;
+            }
+
+            MTPWeightManifest mtp_manifest = discoverMTPWeightManifest(
+                *loader,
+                arch,
+                model_ctx->totalBlockCount(),
+                /*explicit_mtp=*/true);
+
+            if (!mtp_manifest.available)
+            {
+                LOG_ERROR("[InferenceRunner] " << mtp_manifest.diagnostic);
+                if (!mtp_manifest.missing_required.empty())
+                {
+                    LOG_ERROR("[InferenceRunner] Missing MTP weight examples: "
+                              << mtp_manifest.missing_required.front()
+                              << (mtp_manifest.missing_required.size() > 1 ? " ..." : ""));
+                }
+                WeightLoadingProfiler::end(WeightLoadPhase::TENSOR_LOAD);
+                return false;
+            }
+
+            appendRequiredWeightsUnique(validation.weights_to_load, mtp_manifest.requiredNames());
+            LOG_DEBUG("[InferenceRunner] MTP weight manifest resolved: depth="
+                      << mtp_manifest.depth << " " << mtp_manifest.diagnostic);
         }
 
         // Use validated weight list (only weights that exist in the model)
@@ -2595,6 +2648,8 @@ namespace llaminar2
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.activation_precision = config.activation_precision;
+        graph_config.prefix_cache = config.prefix_cache;
+        graph_config.mtp = config.mtp;
 
         // Non-TP: use full dimensions
         setFullDimensions(graph_config);
@@ -2720,6 +2775,8 @@ namespace llaminar2
 
         // kv_cache_scale_k/v set by config builder — don't overwrite
         graph_config.kv_cache_precision = config.kv_cache_precision;
+        graph_config.prefix_cache = config.prefix_cache;
+        graph_config.mtp = config.mtp;
 
         // TurboQuant context for TQ4/TQ KV cache
         std::shared_ptr<TurboQuantContext> turboquant_ctx;
@@ -2895,6 +2952,8 @@ namespace llaminar2
         graph_config.fused_attention_backend = config.fused_attention_backend;
         // kv_cache_scale_k/v set by config builder — don't overwrite
         graph_config.kv_cache_precision = config.kv_cache_precision;
+        graph_config.prefix_cache = config.prefix_cache;
+        graph_config.mtp = config.mtp;
 
         // TurboQuant context for TQ4/TQ KV cache
         std::shared_ptr<TurboQuantContext> turboquant_ctx;

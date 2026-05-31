@@ -934,10 +934,12 @@ if(HAVE_CUDA AND HAVE_ROCM)
     add_executable(v2_integration_collective_backend integration/collective/Test__CollectiveBackendIntegration.cpp)
     target_link_libraries(v2_integration_collective_backend 
         llaminar2_core 
-        device_benchmarks
         GTest::gtest
         GTest::gtest_main
     )
+    if(NOT LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_integration_collective_backend device_benchmarks)
+    endif()
     target_include_directories(v2_integration_collective_backend PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/utils
     )
@@ -1187,10 +1189,12 @@ endif()
 add_executable(v2_unit_heterogeneous_backend unit/collective/backends/Test__HeterogeneousBackend.cpp)
 target_link_libraries(v2_unit_heterogeneous_backend 
     llaminar2_core 
-    device_benchmarks
     GTest::gtest
     GTest::gtest_main
 )
+if(NOT LLAMINAR_SHARED_CORE)
+    target_link_libraries(v2_unit_heterogeneous_backend device_benchmarks)
+endif()
 add_v2_test(V2_Unit_HeterogeneousBackend 
     COMMAND $<TARGET_FILE:v2_unit_heterogeneous_backend>
     LABELS "V2;Unit;Collective;HeterogeneousBackend;CUDA;ROCm;CrossVendor"
@@ -2915,6 +2919,19 @@ add_v2_test(V2_Unit_CPURingKVCache_Q16_1
     MPI_PROCS 1
 )
 
+# Test: IKVCache logical block IO for prefix cache restore/rollback
+add_executable(v2_test_ikv_cache_logical_block_io unit/kernels/Test__IKVCacheLogicalBlockIO.cpp)
+target_link_libraries(v2_test_ikv_cache_logical_block_io
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_IKVCacheLogicalBlockIO
+    COMMAND $<TARGET_FILE:v2_test_ikv_cache_logical_block_io>
+    LABELS "V2;Unit;KVCache;PrefixCache;LogicalBlockIO;CPU;Q16_1;TQ"
+    MPI_PROCS 1
+)
+
 # Test: KernelFactory KVCache methods (unified factory interface for KV cache creation)
 add_executable(v2_test_kernelfactory_kvcache unit/kernels/Test__KernelFactory_KVCache.cpp)
 target_link_libraries(v2_test_kernelfactory_kvcache 
@@ -4421,6 +4438,17 @@ add_v2_test(V2_Integration_CUDARingKVCache_Comprehensive
 )
 message(STATUS "V2 Tests: Added CUDA Ring KV Cache comprehensive edge-case tests")
 
+# Integration Test: CUDA Ring Buffer KV Cache Logical Block IO
+# Proves host-backed prefix payload export/import/truncate over real CUDA storage.
+add_executable(v2_integration_cuda_ring_kv_cache_logical_block_io integration/kernels/cuda/Test__CUDARingKVCache_LogicalBlockIO.cpp)
+target_link_libraries(v2_integration_cuda_ring_kv_cache_logical_block_io llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDARingKVCache_LogicalBlockIO
+    COMMAND $<TARGET_FILE:v2_integration_cuda_ring_kv_cache_logical_block_io>
+    LABELS "V2;Integration;CUDA;KVCache;RingBuffer;PrefixCache;LogicalBlockIO;FP32;Q8_1"
+    MPI_PROCS 1
+)
+message(STATUS "V2 Tests: Added CUDA Ring KV Cache logical block IO integration tests")
+
 # Integration Test: CUDA Hybrid KV Cache Reset
 # Verifies GDN GPU kernel state and compressed FA metadata resets through
 # standard clear()/clear_layer() semantics without recreating cache kernels.
@@ -5472,6 +5500,184 @@ add_v2_test(V2_Unit_OrchestrationConfigParser
     MPI_PROCS 1
 )
 
+# Test: Prefix cache and MTP config feature gates
+add_executable(v2_test_prefix_mtp_config unit/config/Test__PrefixMTPConfig.cpp)
+target_link_libraries(v2_test_prefix_mtp_config llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixMTPConfig
+    COMMAND $<TARGET_FILE:v2_test_prefix_mtp_config>
+    LABELS "V2;Unit;Config;PrefixCache;MTP;CLI;YAML"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache fingerprint key material
+add_executable(v2_test_prefix_cache_fingerprint unit/prefix_cache/Test__PrefixCacheFingerprint.cpp)
+target_link_libraries(v2_test_prefix_cache_fingerprint llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixCacheFingerprint
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_fingerprint>
+    LABELS "V2;Unit;PrefixCache;Fingerprint;MoE;MTP"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache runtime state probe helpers
+add_executable(v2_test_prefix_cache_state_probe unit/prefix_cache/Test__PrefixCacheStateProbe.cpp)
+target_link_libraries(v2_test_prefix_cache_state_probe llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixCacheStateProbe
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_state_probe>
+    LABELS "V2;Unit;PrefixCache;StateProbe;KVCache"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache participant coordination
+add_executable(v2_test_prefix_cache_coordinator unit/prefix_cache/Test__PrefixCacheCoordinator.cpp)
+target_link_libraries(v2_test_prefix_cache_coordinator llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixCacheCoordinator
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_coordinator>
+    LABELS "V2;Unit;PrefixCache;Coordination;TP;PP;MoE"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache participant coordination across MPI ranks
+add_executable(v2_test_prefix_cache_coordinator_mpi
+    unit/prefix_cache/Test__PrefixCacheCoordinatorMPI.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_link_libraries(v2_test_prefix_cache_coordinator_mpi llaminar2_core GTest::gtest)
+add_v2_test(V2_Unit_PrefixCacheCoordinatorMPI
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_coordinator_mpi>
+    LABELS "V2;Unit;PrefixCache;Coordination;MPI;GlobalTP;NodeLocalTP"
+    MPI_PROCS 2
+)
+
+# Test: Prefix block hash helpers
+add_executable(v2_test_prefix_block_hash unit/prefix_cache/Test__PrefixBlockHash.cpp)
+target_link_libraries(v2_test_prefix_block_hash llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixBlockHash
+    COMMAND $<TARGET_FILE:v2_test_prefix_block_hash>
+    LABELS "V2;Unit;PrefixCache;Hash"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache keys
+add_executable(v2_test_prefix_cache_key unit/prefix_cache/Test__PrefixCacheKey.cpp)
+target_link_libraries(v2_test_prefix_cache_key llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixCacheKey
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_key>
+    LABELS "V2;Unit;PrefixCache;Key"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache RAM storage backend
+add_executable(v2_test_ram_prefix_storage_backend unit/prefix_cache/Test__RamPrefixStorageBackend.cpp)
+target_link_libraries(v2_test_ram_prefix_storage_backend llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_RamPrefixStorageBackend
+    COMMAND $<TARGET_FILE:v2_test_ram_prefix_storage_backend>
+    LABELS "V2;Unit;PrefixCache;Storage;RAM"
+    MPI_PROCS 1
+)
+
+# Test: Prefix state cache LRU accounting
+add_executable(v2_test_prefix_state_cache_lru unit/prefix_cache/Test__PrefixStateCacheLRU.cpp)
+target_link_libraries(v2_test_prefix_state_cache_lru llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixStateCacheLRU
+    COMMAND $<TARGET_FILE:v2_test_prefix_state_cache_lru>
+    LABELS "V2;Unit;PrefixCache;LRU;RAM"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache disk storage backend
+add_executable(v2_test_disk_prefix_storage_backend unit/prefix_cache/Test__DiskPrefixStorageBackend.cpp)
+target_link_libraries(v2_test_disk_prefix_storage_backend llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_DiskPrefixStorageBackend
+    COMMAND $<TARGET_FILE:v2_test_disk_prefix_storage_backend>
+    LABELS "V2;Unit;PrefixCache;Storage;Disk"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache BufferArena staging ids
+add_executable(v2_test_prefix_arena_staging unit/prefix_cache/Test__PrefixArenaStaging.cpp)
+target_link_libraries(v2_test_prefix_arena_staging llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixArenaStaging
+    COMMAND $<TARGET_FILE:v2_test_prefix_arena_staging>
+    LABELS "V2;Unit;PrefixCache;BufferArena"
+    MPI_PROCS 1
+)
+
+# Test: Prefix cache OrchestrationRunner prefill control flow
+add_executable(v2_test_prefix_cache_prefill_flow unit/prefix_cache/Test__PrefixCachePrefillFlow.cpp)
+target_link_libraries(v2_test_prefix_cache_prefill_flow
+    llaminar2_core
+    GTest::gtest
+    GTest::gmock
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PrefixCachePrefillFlow
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_prefill_flow>
+    LABELS "V2;Unit;PrefixCache;OrchestrationRunner;Prefill"
+    MPI_PROCS 1
+)
+
+# Test: MTP sidecar weight discovery and graph-facing bindings
+add_executable(v2_test_mtp_weight_manifest unit/mtp/Test__MTPWeightManifest.cpp)
+target_link_libraries(v2_test_mtp_weight_manifest llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_mtp_weight_manifest PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPWeightManifest
+    COMMAND $<TARGET_FILE:v2_test_mtp_weight_manifest>
+    LABELS "V2;Unit;MTP;Weights;PrefixCache"
+    MPI_PROCS 1
+)
+
+# Test: MTP sidecar graph construction
+add_executable(v2_test_mtp_graph_construction unit/mtp/Test__MTPGraphConstruction.cpp)
+target_link_libraries(v2_test_mtp_graph_construction llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_mtp_graph_construction PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPGraphConstruction
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+    LABELS "V2;Unit;MTP;Graph;PrefixCache"
+    MPI_PROCS 1
+)
+
+# Test: Phase 0 real-runner state probe for GPU prefix-cache/MTP work
+add_executable(v2_integration_prefix_cache_state_probe integration/prefix_cache/Test__KVPrefixMTPStateProbe.cpp)
+target_include_directories(v2_integration_prefix_cache_state_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+if(LLAMINAR_SHARED_CORE)
+    target_link_libraries(v2_integration_prefix_cache_state_probe PRIVATE
+        llaminar2_core
+        GTest::gtest
+    )
+elseif(UNIX AND NOT APPLE)
+    set(_prefix_probe_gpu_backends "")
+    if(HAVE_CUDA)
+        list(APPEND _prefix_probe_gpu_backends -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
+    endif()
+    if(HAVE_ROCM)
+        list(APPEND _prefix_probe_gpu_backends -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive)
+    endif()
+    target_link_libraries(v2_integration_prefix_cache_state_probe PRIVATE
+        -Wl,--start-group
+        llaminar2_core
+        ${_prefix_probe_gpu_backends}
+        -Wl,--end-group
+        GTest::gtest
+    )
+else()
+    target_link_libraries(v2_integration_prefix_cache_state_probe PRIVATE
+        llaminar2_core
+        GTest::gtest
+    )
+endif()
+add_v2_test(V2_Integration_PrefixCacheStateProbe
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe>
+    LABELS "V2;Integration;PrefixCache;StateProbe;MTP;GPU"
+    MPI_PROCS 1
+    TIMEOUT 300
+)
+
 # Test: ConfigValidator (declarative device selection validation rules)
 # Tests mutual exclusion, co-requirements, intra-mode consistency, mode detection.
 # Part of CLI Device Selection Cleanup
@@ -5658,6 +5864,9 @@ add_v2_test(V2_Unit_MultiDomainOrchestrator
 # forward/clear_cache delegation, logits retrieval, and synchronization.
 # Part of LOCAL TP implementation for multi-GPU inference within single MPI rank.
 add_executable(v2_test_multi_device_orchestrator unit/execution/local_execution/orchestrators/Test__RankOrchestrator.cpp)
+target_include_directories(v2_test_multi_device_orchestrator PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
 target_link_libraries(v2_test_multi_device_orchestrator llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_RankOrchestrator
     COMMAND $<TARGET_FILE:v2_test_multi_device_orchestrator>
@@ -8482,6 +8691,23 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm Ring KV Cache comprehensive edge-case tests")
 
+    # Integration Test: ROCm Ring Buffer KV Cache Logical Block IO
+    # Proves host-backed prefix payload export/import/truncate over real ROCm storage.
+    add_executable(v2_integration_rocm_ring_kv_cache_logical_block_io
+        integration/kernels/rocm/Test__ROCmRingKVCache_LogicalBlockIO.cpp
+    )
+    target_link_libraries(v2_integration_rocm_ring_kv_cache_logical_block_io
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmRingKVCache_LogicalBlockIO
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ring_kv_cache_logical_block_io>
+        LABELS "V2;Integration;ROCm;KVCache;RingBuffer;PrefixCache;LogicalBlockIO;FP32;Q8_1;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm Ring KV Cache logical block IO integration tests")
+
     # Integration Test: ROCm Hybrid KV Cache Reset
     # Verifies GDN GPU kernel state resets through standard clear()/clear_layer()
     # semantics without destroying/recreating the hybrid cache object.
@@ -8831,7 +9057,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_gpu_device_context
         integration/backends/Test__GPUDeviceContextIntegration.cpp
     )
-    if(UNIX AND NOT APPLE)
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_integration_gpu_device_context PRIVATE
+            llaminar2_core
+            GTest::gtest
+            GTest::gtest_main
+        )
+    elseif(UNIX AND NOT APPLE)
         # Must include cuda_backend/rocm_backend with --whole-archive to ensure static
         # initializers (factory registrars) are included even if not directly referenced.
         # Without --whole-archive, the linker won't include AMDContextFactory.cpp.o or
@@ -9734,7 +9966,13 @@ message(STATUS "V2 Tests: Added PrefillGraphCacheExecution integration tests")
 
 # Test: SegmentedGraphCaptureExecution - Integration test for segmented GPU graph capture/replay
 add_executable(v2_test_segmented_graph_capture_execution integration/execution/graph/Test__SegmentedGraphCaptureExecution.cpp)
-if(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
+if(LLAMINAR_SHARED_CORE)
+    target_link_libraries(v2_test_segmented_graph_capture_execution PRIVATE
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+elseif(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
     set(_gpu_backends_whole_sgce "")
     if(HAVE_CUDA)
         list(APPEND _gpu_backends_whole_sgce -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
@@ -9781,7 +10019,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_gpu_sampling_kernels
         integration/backends/Test__GPUSamplingKernels.cpp
     )
-    if(UNIX AND NOT APPLE)
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_integration_gpu_sampling_kernels PRIVATE
+            llaminar2_core
+            GTest::gtest
+            GTest::gtest_main
+        )
+    elseif(UNIX AND NOT APPLE)
         set(_gpu_backends_whole_sampling "")
         if(HAVE_CUDA)
             list(APPEND _gpu_backends_whole_sampling -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
@@ -10640,8 +10884,12 @@ target_link_libraries(v2_test_vnni_repack_kernels
     GTest::gtest
     GTest::gtest_main
 )
-if(HAVE_ROCM)
+if(HAVE_ROCM AND NOT LLAMINAR_SHARED_CORE)
     target_link_libraries(v2_test_vnni_repack_kernels rocm_backend)
+endif()
+if(HAVE_ROCM)
+    target_compile_definitions(v2_test_vnni_repack_kernels PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_test_vnni_repack_kernels hip::host)
 endif()
 add_v2_test(V2_Unit_VnniRepackKernels
     COMMAND $<TARGET_FILE:v2_test_vnni_repack_kernels>
@@ -10654,7 +10902,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_vnni_unpack_kernels
         integration/Test__VnniUnpackKernels.cpp
     )
-    if(UNIX AND NOT APPLE)
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(v2_integration_vnni_unpack_kernels PRIVATE
+            llaminar2_core
+            GTest::gtest
+            GTest::gtest_main
+        )
+    elseif(UNIX AND NOT APPLE)
         set(_gpu_backends_whole_unpack "")
         if(HAVE_CUDA)
             list(APPEND _gpu_backends_whole_unpack -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive)
@@ -10693,8 +10947,12 @@ target_link_libraries(v2_test_device_load_pipeline
     GTest::gtest
     GTest::gtest_main
 )
-if(HAVE_ROCM)
+if(HAVE_ROCM AND NOT LLAMINAR_SHARED_CORE)
     target_link_libraries(v2_test_device_load_pipeline rocm_backend)
+endif()
+if(HAVE_ROCM)
+    target_compile_definitions(v2_test_device_load_pipeline PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_test_device_load_pipeline hip::host)
 endif()
 add_v2_test(V2_Unit_DeviceLoadPipeline
     COMMAND $<TARGET_FILE:v2_test_device_load_pipeline>
@@ -10710,8 +10968,12 @@ target_link_libraries(v2_test_fp_weight_pipeline
     GTest::gtest
     GTest::gtest_main
 )
-if(HAVE_ROCM)
+if(HAVE_ROCM AND NOT LLAMINAR_SHARED_CORE)
     target_link_libraries(v2_test_fp_weight_pipeline rocm_backend)
+endif()
+if(HAVE_ROCM)
+    target_compile_definitions(v2_test_fp_weight_pipeline PRIVATE __HIP_PLATFORM_AMD__=1)
+    target_link_libraries(v2_test_fp_weight_pipeline hip::host)
 endif()
 add_v2_test(V2_Unit_FPWeightPipeline
     COMMAND $<TARGET_FILE:v2_test_fp_weight_pipeline>

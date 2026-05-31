@@ -488,6 +488,20 @@ namespace llaminar2
         return shadow;
     }
 
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    void CPURingKVCache<KPrecision, VPrecision>::invalidateFP32Shadow(int layer, int seq_idx) const
+    {
+        if (fp32_shadows_.empty() || layer < 0 || layer >= static_cast<int>(fp32_shadows_.size()) ||
+            seq_idx < 0 || seq_idx >= static_cast<int>(fp32_shadows_[layer].size()))
+        {
+            return;
+        }
+
+        auto &shadow = fp32_shadows_[layer][seq_idx];
+        shadow.converted_rows = 0;
+        shadow.last_head = -1;
+    }
+
     // -------------------------------------------------------------------------
     // Per-precision incremental conversion dispatch
     // -------------------------------------------------------------------------
@@ -834,11 +848,7 @@ namespace llaminar2
         }
         entries_[layer][seq_idx].head = 0;
         entries_[layer][seq_idx].size = 0;
-        if (!fp32_shadows_.empty())
-        {
-            fp32_shadows_[layer][seq_idx].converted_rows = 0;
-            fp32_shadows_[layer][seq_idx].last_head = -1;
-        }
+        invalidateFP32Shadow(layer, seq_idx);
     }
 
     template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
@@ -852,14 +862,7 @@ namespace llaminar2
         {
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].size = 0;
-        }
-        if (!fp32_shadows_.empty())
-        {
-            for (auto &shadow : fp32_shadows_[layer])
-            {
-                shadow.converted_rows = 0;
-                shadow.last_head = -1;
-            }
+            invalidateFP32Shadow(layer, seq_idx);
         }
     }
 
@@ -1364,6 +1367,7 @@ namespace llaminar2
             entry.head = (entry.head + evict) % max_seq_len_;
             entry.size -= evict;
             total_evicted_ += evict;
+            invalidateFP32Shadow(layer, seq_idx);
         }
     }
 
@@ -1402,6 +1406,302 @@ namespace llaminar2
             return 0;
         }
         return entries_[layer][seq_idx].size;
+    }
+
+    // =========================================================================
+    // Logical KV Block IO
+    // =========================================================================
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    typename IKVCache::KVCacheLogicalBlockLayout
+    CPURingKVCache<KPrecision, VPrecision>::logicalBlockLayout(int global_layer, int token_count) const
+    {
+        KVCacheLogicalBlockLayout layout;
+        layout.k_precision = KPrecision;
+        layout.v_precision = VPrecision;
+        layout.layout = kv_layout();
+        layout.local_kv_heads = local_n_kv_heads_;
+        layout.kv_head_start = kv_head_start_;
+        layout.head_dim = head_dim_;
+
+        const int local_layer = remapLayerIndex(global_layer);
+        if (local_layer < 0 || local_layer >= n_layers_ || batch_size_ <= 0 || token_count <= 0)
+        {
+            if (local_layer >= 0 && local_layer < n_layers_)
+            {
+                layout.device_resident = !layer_devices_[local_layer].is_cpu();
+            }
+            return layout;
+        }
+
+        layout.device_resident = !layer_devices_[local_layer].is_cpu();
+
+        const auto &entry = entries_[local_layer][0];
+        using KTrait = detail::CPUKVCacheTensor<KPrecision>;
+        using VTrait = detail::CPUKVCacheTensor<VPrecision>;
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            layout.k_bytes = static_cast<size_t>(local_n_kv_heads_) *
+                             static_cast<size_t>(token_count) *
+                             KTrait::head_bytes(entry.K.get(), kv_dim_, head_dim_);
+            layout.v_bytes = static_cast<size_t>(local_n_kv_heads_) *
+                             static_cast<size_t>(token_count) *
+                             VTrait::head_bytes(entry.V.get(), kv_dim_, head_dim_);
+        }
+        else
+        {
+            layout.k_bytes = static_cast<size_t>(token_count) *
+                             KTrait::row_bytes(entry.K.get(), kv_dim_, head_dim_);
+            layout.v_bytes = static_cast<size_t>(token_count) *
+                             VTrait::row_bytes(entry.V.get(), kv_dim_, head_dim_);
+        }
+
+        return layout;
+    }
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    typename IKVCache::KVCacheSequenceState
+    CPURingKVCache<KPrecision, VPrecision>::sequenceState(int global_layer, int seq_idx) const
+    {
+        const int local_layer = remapLayerIndex(global_layer);
+        if (local_layer < 0 || local_layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            return {};
+        }
+
+        const auto &entry = entries_[local_layer][seq_idx];
+        KVCacheSequenceState state;
+        state.cached_tokens = entry.size;
+        state.implementation_head = entry.head;
+        state.wrapped = entry.head != 0;
+        return state;
+    }
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    bool CPURingKVCache<KPrecision, VPrecision>::exportLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
+    {
+        const int local_layer = remapLayerIndex(desc.layer);
+        if (local_layer < 0 || local_layer >= n_layers_ ||
+            desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0)
+        {
+            return false;
+        }
+        if (!layer_devices_[local_layer].is_cpu())
+        {
+            return false;
+        }
+
+        const auto &entry = entries_[local_layer][desc.seq_idx];
+        if (desc.logical_token_start > entry.size ||
+            desc.token_count > entry.size - desc.logical_token_start)
+        {
+            return false;
+        }
+        if (desc.token_count == 0)
+        {
+            return true;
+        }
+        if (!dst_k || !dst_v || !entry.K || !entry.V)
+        {
+            return false;
+        }
+
+        const auto *src_k = reinterpret_cast<const uint8_t *>(entry.K->raw_data());
+        const auto *src_v = reinterpret_cast<const uint8_t *>(entry.V->raw_data());
+        auto *out_k = reinterpret_cast<uint8_t *>(dst_k);
+        auto *out_v = reinterpret_cast<uint8_t *>(dst_v);
+        if (!src_k || !src_v)
+        {
+            return false;
+        }
+
+        using KTrait = detail::CPUKVCacheTensor<KPrecision>;
+        using VTrait = detail::CPUKVCacheTensor<VPrecision>;
+        const size_t k_rb = KTrait::row_bytes(entry.K.get(), kv_dim_, head_dim_);
+        const size_t v_rb = VTrait::row_bytes(entry.V.get(), kv_dim_, head_dim_);
+        const size_t k_hb = KTrait::head_bytes(entry.K.get(), kv_dim_, head_dim_);
+        const size_t v_hb = VTrait::head_bytes(entry.V.get(), kv_dim_, head_dim_);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            for (int h = 0; h < local_n_kv_heads_; ++h)
+            {
+                for (int i = 0; i < desc.token_count; ++i)
+                {
+                    const int logical = desc.logical_token_start + i;
+                    const int phys = (entry.head + logical) % max_seq_len_;
+                    const size_t src_k_row = static_cast<size_t>(h) * static_cast<size_t>(max_seq_len_) + static_cast<size_t>(phys);
+                    const size_t src_v_row = static_cast<size_t>(h) * static_cast<size_t>(max_seq_len_) + static_cast<size_t>(phys);
+                    const size_t dst_row = static_cast<size_t>(h) * static_cast<size_t>(desc.token_count) + static_cast<size_t>(i);
+                    std::memcpy(out_k + dst_row * k_hb, src_k + src_k_row * k_hb, k_hb);
+                    std::memcpy(out_v + dst_row * v_hb, src_v + src_v_row * v_hb, v_hb);
+                }
+            }
+            return true;
+        }
+
+        for (int i = 0; i < desc.token_count; ++i)
+        {
+            const int logical = desc.logical_token_start + i;
+            const int phys = (entry.head + logical) % max_seq_len_;
+            std::memcpy(out_k + static_cast<size_t>(i) * k_rb,
+                        src_k + static_cast<size_t>(phys) * k_rb,
+                        k_rb);
+            std::memcpy(out_v + static_cast<size_t>(i) * v_rb,
+                        src_v + static_cast<size_t>(phys) * v_rb,
+                        v_rb);
+        }
+
+        return true;
+    }
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    bool CPURingKVCache<KPrecision, VPrecision>::importLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
+    {
+        const int local_layer = remapLayerIndex(desc.layer);
+        if (local_layer < 0 || local_layer >= n_layers_ ||
+            desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0 ||
+            desc.logical_token_start > max_seq_len_ ||
+            desc.token_count > max_seq_len_ - desc.logical_token_start)
+        {
+            return false;
+        }
+        if (!layer_devices_[local_layer].is_cpu())
+        {
+            return false;
+        }
+
+        auto &entry = entries_[local_layer][desc.seq_idx];
+        if (desc.token_count == 0)
+        {
+            if (desc.logical_token_start == 0)
+            {
+                entry.head = 0;
+                entry.size = 0;
+                invalidateFP32Shadow(local_layer, desc.seq_idx);
+            }
+            return true;
+        }
+        if (!src_k || !src_v || !entry.K || !entry.V)
+        {
+            return false;
+        }
+        if (desc.logical_token_start > entry.size || entry.head != 0)
+        {
+            return false;
+        }
+
+        const auto *in_k = reinterpret_cast<const uint8_t *>(src_k);
+        const auto *in_v = reinterpret_cast<const uint8_t *>(src_v);
+        auto *dst_k = reinterpret_cast<uint8_t *>(entry.K->raw_mutable_data());
+        auto *dst_v = reinterpret_cast<uint8_t *>(entry.V->raw_mutable_data());
+        if (!dst_k || !dst_v)
+        {
+            return false;
+        }
+
+        using KTrait = detail::CPUKVCacheTensor<KPrecision>;
+        using VTrait = detail::CPUKVCacheTensor<VPrecision>;
+        const size_t k_rb = KTrait::row_bytes(entry.K.get(), kv_dim_, head_dim_);
+        const size_t v_rb = VTrait::row_bytes(entry.V.get(), kv_dim_, head_dim_);
+        const size_t k_hb = KTrait::head_bytes(entry.K.get(), kv_dim_, head_dim_);
+        const size_t v_hb = VTrait::head_bytes(entry.V.get(), kv_dim_, head_dim_);
+
+        if (layout_mode_ == KVCacheLayoutMode::HEAD_MAJOR)
+        {
+            for (int h = 0; h < local_n_kv_heads_; ++h)
+            {
+                for (int i = 0; i < desc.token_count; ++i)
+                {
+                    const size_t src_row = static_cast<size_t>(h) * static_cast<size_t>(desc.token_count) + static_cast<size_t>(i);
+                    const size_t dst_row = static_cast<size_t>(h) * static_cast<size_t>(max_seq_len_) +
+                                           static_cast<size_t>(desc.logical_token_start + i);
+                    std::memcpy(dst_k + dst_row * k_hb, in_k + src_row * k_hb, k_hb);
+                    std::memcpy(dst_v + dst_row * v_hb, in_v + src_row * v_hb, v_hb);
+                }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < desc.token_count; ++i)
+            {
+                const size_t dst_row = static_cast<size_t>(desc.logical_token_start + i);
+                std::memcpy(dst_k + dst_row * k_rb,
+                            in_k + static_cast<size_t>(i) * k_rb,
+                            k_rb);
+                std::memcpy(dst_v + dst_row * v_rb,
+                            in_v + static_cast<size_t>(i) * v_rb,
+                            v_rb);
+            }
+        }
+
+        entry.head = 0;
+        entry.size = std::max(entry.size, desc.logical_token_start + desc.token_count);
+        invalidateFP32Shadow(local_layer, desc.seq_idx);
+        return true;
+    }
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    bool CPURingKVCache<KPrecision, VPrecision>::truncateSequence(int seq_idx, int cached_tokens, void *stream)
+    {
+        (void)stream;
+        if (seq_idx < 0 || seq_idx >= batch_size_ || cached_tokens < 0 || cached_tokens > max_seq_len_)
+        {
+            return false;
+        }
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            if (cached_tokens > entries_[layer][seq_idx].size)
+            {
+                return false;
+            }
+        }
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            auto &entry = entries_[layer][seq_idx];
+            if (entry.size == cached_tokens)
+            {
+                continue;
+            }
+            if (cached_tokens == 0)
+            {
+                entry.head = 0;
+            }
+            entry.size = cached_tokens;
+            invalidateFP32Shadow(layer, seq_idx);
+        }
+        return true;
+    }
+
+    template <ActivationPrecision KPrecision, ActivationPrecision VPrecision>
+    void CPURingKVCache<KPrecision, VPrecision>::advanceHead(int layer, int seq_idx, int num_tokens)
+    {
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            num_tokens <= 0)
+        {
+            return;
+        }
+
+        auto &entry = entries_[layer][seq_idx];
+        if (entry.size + num_tokens <= max_seq_len_)
+        {
+            entry.size += num_tokens;
+        }
+        else
+        {
+            const int to_evict = entry.size + num_tokens - max_seq_len_;
+            entry.head = (entry.head + to_evict) % max_seq_len_;
+            entry.size = max_seq_len_;
+        }
+        invalidateFP32Shadow(layer, seq_idx);
     }
 
     // =========================================================================

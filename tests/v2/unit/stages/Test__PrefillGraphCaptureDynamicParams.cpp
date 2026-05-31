@@ -298,6 +298,20 @@ namespace
         }
     }
 
+    void expectLogitsRowNearReference(
+        const FP32Tensor &logits,
+        int row,
+        const std::vector<float> &reference,
+        int vocab_size)
+    {
+        const float *logit_data = logits.data() + static_cast<size_t>(row) * vocab_size;
+        for (size_t vocab_idx = 0; vocab_idx < reference.size(); ++vocab_idx)
+        {
+            EXPECT_NEAR(logit_data[vocab_idx], reference[vocab_idx], 1e-5f)
+                << "row=" << row << " vocab_idx=" << vocab_idx;
+        }
+    }
+
     // =========================================================================
     // Test Fixture
     // =========================================================================
@@ -856,6 +870,52 @@ namespace
             d_model_);
         expectLogitsNearReference(*logits, second_reference);
         EXPECT_GT(maxLogitDifference(*logits, first_logits), 1e-3f);
+    }
+
+    TEST_F(Test__PrefillGraphCaptureDynamicParams, LMHead_ComputeAllPositionsIgnoresReplayOffset)
+    {
+        const int seq_len = 4;
+        auto hidden_states = createDeterministicHiddenStates(seq_len, d_model_, seq_len);
+        auto lm_head_weight = createDeterministicLmHeadWeights(vocab_size_, d_model_);
+        auto logits = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(seq_len), static_cast<size_t>(vocab_size_)},
+            DeviceId::cpu());
+        auto prepared_lm_head = makePreparedGemmFixture(
+            lm_head_weight.get(),
+            DeviceId::cpu(),
+            "output.weight");
+
+        LMHeadStage::Params params{};
+        params.device_id = DeviceId::cpu();
+        params.hidden_states = hidden_states.get();
+        params.lm_head_weight = lm_head_weight.get();
+        params.logits = logits.get();
+        params.seq_len = seq_len;
+        params.d_model = d_model_;
+        params.vocab_size = vocab_size_;
+        params.compute_all_positions = true;
+        params.prepared_ref = prepared_lm_head.ref;
+        params.prepared_store = prepared_lm_head.store.get();
+
+        LMHeadStage stage(params);
+        stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
+            /*real_seq_len=*/2,
+            /*bucket_seq_len=*/seq_len,
+            /*token_offset=*/0});
+        ASSERT_EQ(stage.activationRowOffsetForLogits(), 1)
+            << "Replay metadata still tracks the selected row for normal LM-head mode";
+        ASSERT_TRUE(stage.execute(nullptr));
+
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const auto reference = computeLmHeadReference(
+                *hidden_states,
+                *lm_head_weight,
+                row,
+                vocab_size_,
+                d_model_);
+            expectLogitsRowNearReference(*logits, row, reference, vocab_size_);
+        }
     }
 
     // =========================================================================

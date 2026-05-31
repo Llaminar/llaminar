@@ -32,6 +32,19 @@ using namespace llaminar2::testing;
 
 namespace
 {
+#ifdef HAVE_CUDA
+    struct ScopedCudaStream
+    {
+        cudaStream_t stream = nullptr;
+
+        ~ScopedCudaStream()
+        {
+            if (stream)
+                cudaStreamDestroy(stream);
+        }
+    };
+#endif
+
     class ScopedRocmMoEFlags
     {
     public:
@@ -492,6 +505,8 @@ TEST_F(MoERoutingStageTest, CUDAFallbackRoutingOutputsRemainDeviceCoherent)
 
     DeviceId cuda_device = DeviceId::cuda(0);
     MockDeviceContext cuda_ctx(cuda_device, ComputeBackendType::GPU_CUDA);
+    ScopedCudaStream stream;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream.stream, cudaStreamNonBlocking), cudaSuccess);
 
     auto input = TestTensorFactory::createFP32Random({SEQ_LEN, D_MODEL}, -0.5f, 0.5f, 400);
     auto gate_weights = TestTensorFactory::createFP32Random({NUM_EXPERTS, D_MODEL}, -0.1f, 0.1f, 401);
@@ -517,12 +532,13 @@ TEST_F(MoERoutingStageTest, CUDAFallbackRoutingOutputsRemainDeviceCoherent)
     params.layer_idx = 0;
 
     MoERoutingStage stage(params);
+    stage.setGPUStream(stream.stream);
     ASSERT_TRUE(stage.execute(&cuda_ctx));
     ASSERT_TRUE(output_indices->is_on_device(cuda_device));
     ASSERT_TRUE(output_weights->is_on_device(cuda_device));
 
-    output_indices->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, cuda_device);
-    output_weights->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, cuda_device);
+    ASSERT_TRUE(output_indices->ensureOnHost());
+    ASSERT_TRUE(output_weights->ensureOnHost());
 
     const float *idx = output_indices->data();
     const float *wt = output_weights->data();

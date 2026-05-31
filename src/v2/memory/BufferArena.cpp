@@ -255,6 +255,58 @@ namespace llaminar2
         if (name == "logits_local")
             return BufferId::LOGITS_LOCAL;
 
+        // Prefix cache staging buffers
+        if (name == "prefix_k_staging")
+            return BufferId::PREFIX_K_STAGING;
+        if (name == "prefix_v_staging")
+            return BufferId::PREFIX_V_STAGING;
+        if (name == "prefix_hybrid_state_staging")
+            return BufferId::PREFIX_HYBRID_STATE_STAGING;
+        if (name == "prefix_mtp_k_staging")
+            return BufferId::PREFIX_MTP_K_STAGING;
+        if (name == "prefix_mtp_v_staging")
+            return BufferId::PREFIX_MTP_V_STAGING;
+        if (name == "prefix_terminal_hidden")
+            return BufferId::PREFIX_TERMINAL_HIDDEN;
+        if (name == "prefix_terminal_logits")
+            return BufferId::PREFIX_TERMINAL_LOGITS;
+
+        // MTP sidecar graph buffers
+        if (name == "mtp_embedding")
+            return BufferId::MTP_EMBEDDING;
+        if (name == "mtp_norm_hidden")
+            return BufferId::MTP_NORM_HIDDEN;
+        if (name == "mtp_norm_embedding")
+            return BufferId::MTP_NORM_EMBEDDING;
+        if (name == "mtp_concat")
+            return BufferId::MTP_CONCAT;
+        if (name == "mtp_projected")
+            return BufferId::MTP_PROJECTED;
+        if (name == "mtp_hidden")
+            return BufferId::MTP_HIDDEN;
+        if (name == "mtp_q")
+            return BufferId::MTP_Q_PROJ;
+        if (name == "mtp_k")
+            return BufferId::MTP_K_PROJ;
+        if (name == "mtp_v")
+            return BufferId::MTP_V_PROJ;
+        if (name == "mtp_q_rope")
+            return BufferId::MTP_Q_ROPE;
+        if (name == "mtp_k_rope")
+            return BufferId::MTP_K_ROPE;
+        if (name == "mtp_attn_output")
+            return BufferId::MTP_ATTN_OUTPUT;
+        if (name == "mtp_attn_proj")
+            return BufferId::MTP_ATTN_PROJ;
+        if (name == "mtp_gate")
+            return BufferId::MTP_GATE_PROJ;
+        if (name == "mtp_up")
+            return BufferId::MTP_UP_PROJ;
+        if (name == "mtp_ffn_output")
+            return BufferId::MTP_FFN_OUTPUT;
+        if (name == "mtp_logits")
+            return BufferId::MTP_LOGITS;
+
         return BufferId::_COUNT; // sentinel: no mapping
     }
 

@@ -745,7 +745,9 @@ namespace llaminar2
             config.fused_attention_backend,
             config.moe_expert_mode,
             config.moe_hot_expert_cache,
-            config.moe_rebalance);
+            config.moe_rebalance,
+            config.prefix_cache,
+            config.mtp);
 
         return plan;
     }
@@ -1012,7 +1014,9 @@ namespace llaminar2
             config.fused_attention_backend,
             config.moe_expert_mode,
             config.moe_hot_expert_cache,
-            config.moe_rebalance);
+            config.moe_rebalance,
+            config.prefix_cache,
+            config.mtp);
 
         return plan;
     }

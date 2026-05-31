@@ -68,7 +68,7 @@ namespace llaminar2
         // =====================================================================
 
         int batch_size() const { return batch_size_; }
-        int n_kv_heads() const { return n_kv_heads_; }
+        int n_kv_heads() const override { return n_kv_heads_; }
         int head_dim() const { return head_dim_; }
         int kv_dim() const { return kv_dim_; }
         int device_id() const { return device_id_; }
@@ -77,6 +77,7 @@ namespace llaminar2
         int num_layers() const { return n_layers_; }
 
         int get_head_position(int layer, int seq_idx = 0) const;
+        int ring_head(int layer, int seq_idx = 0) const override { return get_head_position(layer, seq_idx); }
         bool is_wrapped(int layer, int seq_idx = 0) const;
 
     protected:

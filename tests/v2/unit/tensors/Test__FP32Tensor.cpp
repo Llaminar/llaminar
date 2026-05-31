@@ -105,6 +105,30 @@ TEST(Test__FP32Tensor, DataInitialization)
     EXPECT_FLOAT_EQ(data[2], 3.0f);
     EXPECT_FLOAT_EQ(data[3], 4.0f);
 }
+
+TEST(Test__FP32Tensor, MarkHostDirtyRestoresHostAuthorityAfterDirectWrite)
+{
+    FP32Tensor tensor({1, 2});
+    float *data = static_cast<float *>(tensor.raw_mutable_data());
+    data[0] = 1.0f;
+    data[1] = 2.0f;
+
+    tensor.transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::cuda(0));
+    EXPECT_FALSE(tensor.hostValid());
+    EXPECT_TRUE(tensor.needsDownload());
+    EXPECT_TRUE(tensor.getAuthoritativeDevice().has_value());
+
+    data = static_cast<float *>(tensor.raw_mutable_data());
+    data[0] = 3.0f;
+    data[1] = 4.0f;
+    tensor.mark_host_dirty();
+
+    EXPECT_TRUE(tensor.hostValid());
+    EXPECT_FALSE(tensor.needsDownload());
+    EXPECT_FALSE(tensor.getAuthoritativeDevice().has_value());
+    EXPECT_FLOAT_EQ(tensor.data()[0], 3.0f);
+    EXPECT_FLOAT_EQ(tensor.data()[1], 4.0f);
+}
 // NOTE: Legacy GEMM-related checks removed; FP32Tensor no longer owns GEMM tests.
 
 /**

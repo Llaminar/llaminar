@@ -162,6 +162,12 @@ namespace llaminar2
             prepared_weight_store_ = store;
         }
 
+        bool setComputeAllPositionLogits(bool enabled) override
+        {
+            config_.compute_all_position_logits = enabled;
+            return true;
+        }
+
         void setModelContext(std::shared_ptr<IModelContext> model_ctx) override;
 
         BufferArena *arena() const { return arena_; }

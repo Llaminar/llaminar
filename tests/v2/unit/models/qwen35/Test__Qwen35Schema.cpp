@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cstring>
 #include <string>
 
 #include "models/qwen35/Qwen35Schema.h"
@@ -174,6 +175,78 @@ namespace
             for (const auto &s : gdn_states_)
                 total += s.memoryBytes();
             return total;
+        }
+        HybridPrefixStateMetadata hybridPrefixStateMetadata() const override
+        {
+            HybridPrefixStateMetadata metadata;
+            metadata.total_layers = n_layers_;
+            metadata.gdn_layers = gdnLayerCount();
+            metadata.host_bytes = gdnMemoryBytes();
+            return metadata;
+        }
+        bool exportHybridPrefixState(const HybridPrefixStateDescriptor &desc,
+                                     void *dst_host,
+                                     void *dst_device) const override
+        {
+            (void)dst_device;
+            if (desc.seq_idx < 0)
+                return false;
+            if (gdnMemoryBytes() > 0 && !dst_host)
+                return false;
+
+            auto *cursor = static_cast<char *>(dst_host);
+            for (int layer = 0; layer < n_layers_; ++layer)
+            {
+                const auto *s = getGDNState(layer);
+                if (!s)
+                    continue;
+
+                const size_t recurrence_bytes = s->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = s->conv_state.size() * sizeof(float);
+                if (recurrence_bytes > 0)
+                {
+                    std::memcpy(cursor, s->recurrence_state.data(), recurrence_bytes);
+                    cursor += recurrence_bytes;
+                }
+                if (conv_bytes > 0)
+                {
+                    std::memcpy(cursor, s->conv_state.data(), conv_bytes);
+                    cursor += conv_bytes;
+                }
+            }
+            return true;
+        }
+        bool importHybridPrefixState(const HybridPrefixStateDescriptor &desc,
+                                     const void *src_host,
+                                     const void *src_device) override
+        {
+            (void)src_device;
+            if (desc.seq_idx < 0)
+                return false;
+            if (gdnMemoryBytes() > 0 && !src_host)
+                return false;
+
+            const auto *cursor = static_cast<const char *>(src_host);
+            for (int layer = 0; layer < n_layers_; ++layer)
+            {
+                auto *s = getGDNState(layer);
+                if (!s)
+                    continue;
+
+                const size_t recurrence_bytes = s->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = s->conv_state.size() * sizeof(float);
+                if (recurrence_bytes > 0)
+                {
+                    std::memcpy(s->recurrence_state.data(), cursor, recurrence_bytes);
+                    cursor += recurrence_bytes;
+                }
+                if (conv_bytes > 0)
+                {
+                    std::memcpy(s->conv_state.data(), cursor, conv_bytes);
+                    cursor += conv_bytes;
+                }
+            }
+            return true;
         }
 
         // --- IKVCache stubs (never called by graph builders) ---

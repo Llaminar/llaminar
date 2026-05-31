@@ -247,7 +247,9 @@ namespace llaminar2
                 config_.fused_attention_backend,
                 config_.moe_expert_mode,
                 config_.moe_hot_expert_cache,
-                config_.moe_rebalance);
+                config_.moe_rebalance,
+                config_.prefix_cache,
+                config_.mtp);
             InferenceRunnerConfig base_runner_cfg;
             base_runner_cfg.max_seq_len = runtime_cfg.max_seq_len;
             base_runner_cfg.batch_size = config_.batch_size;
@@ -257,6 +259,8 @@ namespace llaminar2
             base_runner_cfg.moe_expert_mode = runtime_cfg.moe_expert_mode;
             base_runner_cfg.moe_hot_expert_cache = runtime_cfg.moe_hot_expert_cache;
             base_runner_cfg.moe_rebalance = runtime_cfg.moe_rebalance;
+            base_runner_cfg.prefix_cache = runtime_cfg.prefix_cache;
+            base_runner_cfg.mtp = runtime_cfg.mtp;
 
             // Load model context once; each stage runner slices its own weight plan
             std::shared_ptr<ModelContext> model_ctx;
@@ -465,6 +469,11 @@ namespace llaminar2
     {
         if (inner_)
             inner_->clearCache();
+    }
+
+    PrefixRuntimeStateSnapshot NamedDomainGlobalRunner::prefixStateProbe() const
+    {
+        return inner_ ? inner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
     }
 
     const float *NamedDomainGlobalRunner::lastLogits() const

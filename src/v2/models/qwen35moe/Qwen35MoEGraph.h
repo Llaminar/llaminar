@@ -16,6 +16,7 @@
 
 namespace llaminar2
 {
+    struct PrefixFingerprintMaterial;
 
     /**
      * @brief Qwen 3.5 MoE graph builder
@@ -60,6 +61,9 @@ namespace llaminar2
 
         /// Reset MoE runtime state between independent inference sessions.
         void resetState() override;
+
+        /// Append active MoE runtime placement state to prefix-cache fingerprints.
+        void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const override;
 
     private:
         IMoERuntimeTable *moeRuntimeTableForDevice(DeviceId device,

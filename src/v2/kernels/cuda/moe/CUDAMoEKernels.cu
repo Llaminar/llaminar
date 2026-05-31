@@ -508,6 +508,22 @@ namespace
         dst[i] = src[i];
     }
 
+    __global__ void gather_tokens_scalar_kernel(
+        const float *__restrict__ hidden,
+        float *__restrict__ batch_buffer,
+        const int *__restrict__ token_indices,
+        int total_elements, int d_model)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total_elements)
+            return;
+
+        const int token_slot = idx / d_model;
+        const int col = idx - token_slot * d_model;
+        const int token = token_indices[token_slot];
+        batch_buffer[idx] = hidden[static_cast<size_t>(token) * d_model + col];
+    }
+
     __global__ void scatter_add_kernel(
         float *__restrict__ output,
         const float *__restrict__ expert_output,
@@ -537,6 +553,23 @@ namespace
         o.z += w * e.z;
         o.w += w * e.w;
         ov[i] = o;
+    }
+
+    __global__ void scatter_add_scalar_kernel(
+        float *__restrict__ output,
+        const float *__restrict__ expert_output,
+        const int *__restrict__ token_indices,
+        const float *__restrict__ weights,
+        int total_elements, int d_model)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total_elements)
+            return;
+
+        const int token_slot = idx / d_model;
+        const int col = idx - token_slot * d_model;
+        const int token = token_indices[token_slot];
+        output[static_cast<size_t>(token) * d_model + col] += weights[token_slot] * expert_output[idx];
     }
 
     __global__ void shared_expert_gate_kernel(
@@ -1922,11 +1955,23 @@ extern "C"
                                int num_tokens, int d_model, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        // 2D grid: x covers d_model/4 float4 columns, y selects the token row.
-        const int n4 = d_model >> 2;
-        dim3 grid((n4 + kThreads - 1) / kThreads, num_tokens);
-        gather_tokens_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            hidden, batch_buffer, token_indices, num_tokens, d_model);
+        if (num_tokens <= 0 || d_model <= 0)
+            return true;
+
+        if ((d_model & 3) == 0)
+        {
+            // 2D grid: x covers d_model/4 float4 columns, y selects the token row.
+            const int n4 = d_model >> 2;
+            dim3 grid((n4 + kThreads - 1) / kThreads, num_tokens);
+            gather_tokens_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                hidden, batch_buffer, token_indices, num_tokens, d_model);
+        }
+        else
+        {
+            const int total_elements = num_tokens * d_model;
+            gather_tokens_scalar_kernel<<<blocksFor(total_elements), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                hidden, batch_buffer, token_indices, total_elements, d_model);
+        }
         return finishLaunch("cudaMoE_gather_tokens");
     }
 
@@ -1934,11 +1979,23 @@ extern "C"
                              const float *weights, int num_tokens, int d_model, int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        // 2D grid: x covers d_model/4 float4 columns, y selects the token row.
-        const int n4 = d_model >> 2;
-        dim3 grid((n4 + kThreads - 1) / kThreads, num_tokens);
-        scatter_add_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            output, expert_output, token_indices, weights, num_tokens, d_model);
+        if (num_tokens <= 0 || d_model <= 0)
+            return true;
+
+        if ((d_model & 3) == 0)
+        {
+            // 2D grid: x covers d_model/4 float4 columns, y selects the token row.
+            const int n4 = d_model >> 2;
+            dim3 grid((n4 + kThreads - 1) / kThreads, num_tokens);
+            scatter_add_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                output, expert_output, token_indices, weights, num_tokens, d_model);
+        }
+        else
+        {
+            const int total_elements = num_tokens * d_model;
+            scatter_add_scalar_kernel<<<blocksFor(total_elements), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                output, expert_output, token_indices, weights, total_elements, d_model);
+        }
         return finishLaunch("cudaMoE_scatter_add");
     }
 

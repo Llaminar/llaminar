@@ -110,6 +110,7 @@ namespace llaminar2
         int vocabSize() const override;
         int currentPosition() const override;
         void clearCache() override;
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
         const float *lastLogits() const override;
         void setStopTokens(const std::vector<int32_t> &stop_tokens) override;
         std::shared_ptr<ITokenizer> tokenizer() const override;

@@ -1,0 +1,381 @@
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
+
+#include "backends/GlobalDeviceAddress.h"
+#include "config/OrchestrationConfig.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/mpi_orchestration/RankExecutionPlan.h"
+#include "execution/runner/OrchestrationRunner.h"
+
+using namespace llaminar2;
+using namespace testing;
+
+namespace
+{
+    class PrefixFlowMockRunner : public IInferenceRunner
+    {
+    public:
+        bool forward(const int *tokens, int seq_len) override
+        {
+            ++forward_calls;
+            last_forward_tokens.assign(tokens, tokens + seq_len);
+            position += seq_len;
+            if (all_position_logits_enabled)
+            {
+                all_position_logits.assign(static_cast<size_t>(seq_len) * vocab_size(), -1.0f);
+                all_position_logits[verify_argmax_token] = 10.0f;
+                return true;
+            }
+            logits_buffer.assign(vocab_size(), -1.0f);
+            logits_buffer[prefill_argmax_token] = 10.0f;
+            return true;
+        }
+
+        const float *logits() const override { return logits_buffer.data(); }
+        int vocab_size() const override { return 16; }
+        void clear_cache() override
+        {
+            ++clear_calls;
+            position = 0;
+        }
+        int get_position() const override { return position; }
+        ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
+        const char *architecture() const override { return "mock"; }
+        int sampleGreedyOnDevice() override { return -1; }
+
+        PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override
+        {
+            ++lookup_calls;
+            lookup_tokens = tokens;
+            return lookup_result;
+        }
+
+        bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            ++populate_calls;
+            populated_tokens.push_back(hit.cached_tokens);
+            position = hit.cached_tokens;
+            return populate_ok;
+        }
+
+        bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override
+        {
+            ++harvest_calls;
+            harvested_tokens = tokens;
+            harvested_prompt_token_count = prompt_token_count;
+            return true;
+        }
+
+        bool restorePrefixTerminalState(const PrefixLookupResult &hit) override
+        {
+            ++restore_terminal_calls;
+            restored_tokens = hit.cached_tokens;
+            logits_buffer.assign(vocab_size(), -1.0f);
+            logits_buffer[prefill_argmax_token] = 10.0f;
+            return restore_terminal_ok;
+        }
+
+        bool forwardMTP(int32_t draft_condition_token) override
+        {
+            if (!mtp_enabled)
+                return false;
+            ++forward_mtp_calls;
+            last_mtp_condition_token = draft_condition_token;
+            mtp_logits.assign(vocab_size(), -1.0f);
+            mtp_logits[mtp_argmax_token] = 10.0f;
+            return true;
+        }
+
+        const float *mtpLogits() const override
+        {
+            return mtp_logits.empty() ? nullptr : mtp_logits.data();
+        }
+
+        bool setComputeAllPositionLogits(bool enabled) override
+        {
+            if (!mtp_enabled)
+                return false;
+            all_position_logits_enabled = enabled;
+            return true;
+        }
+
+        const float *getAllPositionLogits() const override
+        {
+            return all_position_logits.empty() ? nullptr : all_position_logits.data();
+        }
+
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
+        {
+            (void)seq_idx;
+            PrefixStateSnapshot snapshot;
+            snapshot.valid = mtp_enabled;
+            snapshot.cached_tokens = position;
+            return snapshot;
+        }
+
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            if (!snapshot.valid)
+                return false;
+            ++restore_live_calls;
+            position = snapshot.cached_tokens;
+            all_position_logits_enabled = false;
+            return true;
+        }
+
+        PrefixLookupResult lookup_result;
+        bool populate_ok = true;
+        bool restore_terminal_ok = true;
+        bool mtp_enabled = false;
+        bool all_position_logits_enabled = false;
+        std::vector<float> logits_buffer = std::vector<float>(16, -1.0f);
+        std::vector<float> mtp_logits;
+        std::vector<float> all_position_logits;
+        int prefill_argmax_token = 9;
+        int mtp_argmax_token = 11;
+        int verify_argmax_token = 11;
+        int forward_calls = 0;
+        int forward_mtp_calls = 0;
+        int clear_calls = 0;
+        int lookup_calls = 0;
+        int populate_calls = 0;
+        int harvest_calls = 0;
+        int restore_terminal_calls = 0;
+        int restore_live_calls = 0;
+        int last_mtp_condition_token = -1;
+        int restored_tokens = 0;
+        int harvested_prompt_token_count = 0;
+        int position = 0;
+        std::vector<int> last_forward_tokens;
+        std::vector<int32_t> lookup_tokens;
+        std::vector<int32_t> harvested_tokens;
+        std::vector<int> populated_tokens;
+    };
+
+    RankExecutionPlan makePlan(bool mtp_enabled = false)
+    {
+        RankExecutionPlan plan;
+        plan.rank = 0;
+        plan.hostname = "localhost";
+        plan.numa_node = 0;
+        plan.pp_stage_id = 0;
+        plan.first_layer = 0;
+        plan.last_layer = 1;
+        plan.has_embedding = true;
+        plan.has_lm_head = true;
+        plan.primary_device = GlobalDeviceAddress::cpu();
+        plan.runtime.prefix_cache.enabled = true;
+        plan.runtime.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+        plan.runtime.prefix_cache.block_size = 2;
+        plan.runtime.mtp.enabled = mtp_enabled;
+        plan.runtime.mtp.draft_tokens = 1;
+        plan.runtime.mtp.verify_mode = MTPVerifyMode::Greedy;
+        return plan;
+    }
+
+    OrchestrationConfig makeConfig(bool mtp_enabled = false)
+    {
+        OrchestrationConfig config;
+        config.device_for_this_rank = GlobalDeviceAddress::cpu();
+        config.prefix_cache.enabled = true;
+        config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+        config.prefix_cache.block_size = 2;
+        config.mtp.enabled = mtp_enabled;
+        config.mtp.draft_tokens = 1;
+        config.mtp.verify_mode = MTPVerifyMode::Greedy;
+        return config;
+    }
+
+    std::unique_ptr<OrchestrationRunner> makeRunner(std::unique_ptr<PrefixFlowMockRunner> mock,
+                                                    bool mtp_enabled = false)
+    {
+        mock->mtp_enabled = mtp_enabled;
+        auto runner = std::make_unique<OrchestrationRunner>(
+            makeConfig(mtp_enabled),
+            makePlan(mtp_enabled),
+            std::move(mock));
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        runner->setSamplingParams(greedy);
+        return runner;
+    }
+} // namespace
+
+TEST(Test__PrefixCachePrefillFlow, SharedPrefixRunsOnlySuffixAndHarvestsPrompt)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 2;
+
+    auto runner = makeRunner(std::move(mock));
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->lookup_calls, 1);
+    EXPECT_EQ(mock_ptr->clear_calls, 1);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4, 5));
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+    EXPECT_EQ(mock_ptr->harvested_prompt_token_count, 5);
+    EXPECT_THAT(mock_ptr->harvested_tokens, ElementsAre(1, 2, 3, 4, 5));
+}
+
+TEST(Test__PrefixCachePrefillFlow, MTPPartialHitWithoutTerminalHiddenRecomputesBoundaryBlock)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_hidden = false;
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true);
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 1);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4, 5));
+}
+
+TEST(Test__PrefixCachePrefillFlow, FullHitWithTerminalLogitsSkipsForward)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 1);
+    EXPECT_EQ(mock_ptr->restored_tokens, 4);
+
+    auto step = runner->decodeStep();
+    ASSERT_TRUE(step.success()) << step.error;
+    ASSERT_EQ(step.tokens.size(), 1u);
+    EXPECT_EQ(step.tokens[0], mock_ptr->prefill_argmax_token);
+}
+
+TEST(Test__PrefixCachePrefillFlow, FullHitWithMTPReplaysAcceptedTokensWithoutPromptDuplication)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->lookup_result.has_terminal_hidden = true;
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true);
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 1);
+
+    auto step = runner->decodeStep();
+    ASSERT_TRUE(step.success()) << step.error;
+    EXPECT_THAT(step.tokens, ElementsAre(mock_ptr->prefill_argmax_token,
+                                         mock_ptr->mtp_argmax_token));
+    EXPECT_EQ(mock_ptr->forward_mtp_calls, 1);
+    EXPECT_EQ(mock_ptr->last_mtp_condition_token, mock_ptr->prefill_argmax_token);
+    EXPECT_EQ(mock_ptr->restore_live_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens,
+                ElementsAre(mock_ptr->prefill_argmax_token,
+                            mock_ptr->mtp_argmax_token));
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.mtp_draft_steps, 1u);
+    EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+    EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+    EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+    EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+}
+
+TEST(Test__PrefixCachePrefillFlow, FullMTPHitWithoutTerminalHiddenRecomputesFinalBlock)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->lookup_result.has_terminal_hidden = false;
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true);
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 0);
+    EXPECT_EQ(mock_ptr->clear_calls, 2);
+    EXPECT_EQ(mock_ptr->populate_calls, 2);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(4, 2));
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4));
+}
+
+TEST(Test__PrefixCachePrefillFlow, MTPStatsRecordRejectedDraftToken)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->lookup_result.has_terminal_hidden = true;
+    mock_ptr->verify_argmax_token = 12;
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true);
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    auto step = runner->decodeStep();
+    ASSERT_TRUE(step.success()) << step.error;
+    EXPECT_THAT(step.tokens, ElementsAre(mock_ptr->prefill_argmax_token,
+                                         mock_ptr->verify_argmax_token));
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.mtp_draft_steps, 1u);
+    EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+    EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+    EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+    EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+}
+
+TEST(Test__PrefixCachePrefillFlow, FullHitWithoutTerminalLogitsRecomputesFinalBlock)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = false;
+
+    auto runner = makeRunner(std::move(mock));
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->clear_calls, 2);
+    EXPECT_EQ(mock_ptr->populate_calls, 2);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(4, 2));
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4));
+}

@@ -25,6 +25,7 @@
 #include "../mpi_orchestration/IExecutionPlanBuilder.h"
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../mpi_orchestration/DeviceInventory.h"
+#include "../prefix_cache/PrefixCacheStats.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../../planning/MemoryPlanner.h"
 #include "../../collective/ILocalTPContext.h"
@@ -178,6 +179,7 @@ namespace llaminar2
         int vocabSize() const override;
         int currentPosition() const override;
         void clearCache() override;
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
 
         // =====================================================================
         // IOrchestrationRunner: Advanced
@@ -426,6 +428,11 @@ namespace llaminar2
          */
         void printStartupBanner();
 
+        bool shouldUseMTPDecode() const;
+        std::string mtpDecodeBypassReason() const;
+        void recordMTPBypass(const std::string &reason);
+        GenerationResult decodeStepMTP();
+
         // =====================================================================
         // Error Handling
         // =====================================================================
@@ -472,6 +479,10 @@ namespace llaminar2
         bool prefill_logits_ready_{false};                              // True after prefill(); first decodeStep() samples from existing logits
         bool mpi_coordinated_mode_{false};                              // When true, rank 0 broadcasts commands for worker loop
         std::shared_ptr<ITokenizer> tokenizer_;
+        MTPStats mtp_stats_;
+        bool mtp_bypassed_{false};
+        bool mtp_bypass_recorded_for_request_{false};
+        std::string mtp_bypass_reason_;
     };
 
 } // namespace llaminar2

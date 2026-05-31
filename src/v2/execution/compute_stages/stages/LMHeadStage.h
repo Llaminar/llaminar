@@ -52,6 +52,7 @@ namespace llaminar2
             int vocab_size = 0;
             int effective_last_row_idx = -1;           ///< Dynamic last real token row for padded prefill replay.
             bool use_prefill_replay_row_offset = true; ///< False when input is already a one-row scratch.
+            bool compute_all_positions = false;        ///< Compute logits for every input row instead of only the selected row.
 
             // Optional bias tensor [vocab_size] - passed to GEMM for fused addition
             const TensorBase *bias_tensor = nullptr;

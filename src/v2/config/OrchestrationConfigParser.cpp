@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <set>
+#include <limits>
 
 namespace llaminar2
 {
@@ -107,6 +108,47 @@ namespace llaminar2
             if (normalized == "false" || normalized == "0" || normalized == "no" || normalized == "off")
                 return false;
             throw std::invalid_argument("Invalid boolean value: '" + value + "'");
+        }
+
+        size_t parseNonNegativeSizeTValue(const std::string &value, const std::string &option_name)
+        {
+            const std::string trimmed_value = trim(value);
+            if (trimmed_value.empty() || trimmed_value.front() == '-')
+            {
+                throw std::invalid_argument(option_name + " must be a non-negative integer");
+            }
+
+            size_t parsed_chars = 0;
+            unsigned long long parsed = 0;
+            try
+            {
+                parsed = std::stoull(trimmed_value, &parsed_chars);
+            }
+            catch (const std::exception &)
+            {
+                throw std::invalid_argument("Invalid value for " + option_name + ": '" + value + "'");
+            }
+
+            if (parsed_chars != trimmed_value.size())
+            {
+                throw std::invalid_argument("Invalid value for " + option_name + ": '" + value + "'");
+            }
+            if (parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max()))
+            {
+                throw std::invalid_argument(option_name + " is too large");
+            }
+            return static_cast<size_t>(parsed);
+        }
+
+        size_t parseMegabytesToBytes(const std::string &value, const std::string &option_name)
+        {
+            constexpr size_t MiB = 1024ull * 1024ull;
+            const size_t megabytes = parseNonNegativeSizeTValue(value, option_name);
+            if (megabytes > std::numeric_limits<size_t>::max() / MiB)
+            {
+                throw std::invalid_argument(option_name + " is too large");
+            }
+            return megabytes * MiB;
         }
 
         MoEExpertMode parseMoEExpertModeValue(const std::string &value)
@@ -216,6 +258,86 @@ namespace llaminar2
             else if (normalized_key == "release_raw_expert_weights")
             {
                 config.moe_rebalance.release_raw_expert_weights = parseBoolValue(value);
+            }
+        }
+
+        void applyPrefixCacheYamlKey(OrchestrationConfig &config,
+                                     const std::string &key,
+                                     const std::string &value)
+        {
+            if (key == "enabled" || key == "prefix_cache")
+            {
+                config.prefix_cache.enabled = parseBoolValue(value);
+            }
+            else if (key == "storage" || key == "storage_mode")
+            {
+                auto parsed = parsePrefixCacheStorageMode(value);
+                if (!parsed)
+                    throw std::invalid_argument("Invalid prefix_cache storage: '" + value + "'");
+                config.prefix_cache.storage_mode = *parsed;
+            }
+            else if (key == "block_size")
+            {
+                config.prefix_cache.block_size = std::stoi(value);
+                if (config.prefix_cache.block_size <= 0)
+                    throw std::invalid_argument("prefix_cache block_size must be > 0");
+            }
+            else if (key == "ram_budget_mb")
+            {
+                config.prefix_cache.ram_budget_bytes = parseMegabytesToBytes(value, "prefix_cache.ram_budget_mb");
+            }
+            else if (key == "vram_budget_mb" || key == "device_budget_mb")
+            {
+                config.prefix_cache.device_budget_bytes = parseMegabytesToBytes(value, "prefix_cache.vram_budget_mb");
+            }
+            else if (key == "disk_budget_mb")
+            {
+                config.prefix_cache.disk_budget_bytes = parseMegabytesToBytes(value, "prefix_cache.disk_budget_mb");
+            }
+            else if (key == "disk_dir")
+            {
+                config.prefix_cache.disk_dir = value;
+            }
+            else if (key == "terminal_state")
+            {
+                auto parsed = parsePrefixCacheTerminalStateMode(value);
+                if (!parsed)
+                    throw std::invalid_argument("Invalid prefix_cache terminal_state: '" + value + "'");
+                config.prefix_cache.terminal_state = *parsed;
+            }
+            else if (key == "moe_policy")
+            {
+                auto parsed = parsePrefixCacheMoEPolicy(value);
+                if (!parsed)
+                    throw std::invalid_argument("Invalid prefix_cache moe_policy: '" + value + "'");
+                config.prefix_cache.moe_policy = *parsed;
+            }
+        }
+
+        void applyMTPYamlKey(OrchestrationConfig &config,
+                             const std::string &key,
+                             const std::string &value)
+        {
+            if (key == "enabled" || key == "mtp")
+            {
+                config.mtp.enabled = parseBoolValue(value);
+            }
+            else if (key == "draft_tokens")
+            {
+                config.mtp.draft_tokens = std::stoi(value);
+                if (config.mtp.draft_tokens <= 0)
+                    throw std::invalid_argument("mtp draft_tokens must be > 0");
+            }
+            else if (key == "verify_mode")
+            {
+                auto parsed = parseMTPVerifyMode(value);
+                if (!parsed)
+                    throw std::invalid_argument("Invalid mtp verify_mode: '" + value + "'");
+                config.mtp.verify_mode = *parsed;
+            }
+            else if (key == "require_terminal_hidden_for_full_hit")
+            {
+                config.mtp.require_terminal_hidden_for_full_hit = parseBoolValue(value);
             }
         }
 
@@ -693,6 +815,8 @@ namespace llaminar2
             .addCategory("Config File")
             .addCategory("MoE Configuration")
             .addCategory("Precision")
+            .addCategory("Prefix Cache")
+            .addCategory("MTP")
             .addCategory("Heterogeneous Mode")
             .addCategory("Verbosity");
 
@@ -1367,6 +1491,180 @@ namespace llaminar2
                 }),
         });
 
+        // --- Prefix Cache ----------------------------------------------------
+        spec.add({
+            .long_name = "--prefix-cache",
+            .category = "Prefix Cache",
+            .description = "Enable cross-request prefix-state caching",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.prefix_cache.enabled = true;
+                }),
+        });
+        spec.add({
+            .long_name = "--prefix-cache-storage",
+            .category = "Prefix Cache",
+            .value_label = "<mode>",
+            .description = "Prefix cache storage: ram, device, tiered",
+            .valid_values = {"disabled", "ram", "device", "tiered"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto parsed = parsePrefixCacheStorageMode(v);
+                    if (!parsed)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --prefix-cache-storage: '" + v +
+                            "' (valid: disabled, ram, device, tiered)");
+                    }
+                    c.prefix_cache.storage_mode = *parsed;
+                }),
+        });
+        spec.add({
+            .long_name = "--prefix-cache-block-size",
+            .category = "Prefix Cache",
+            .value_label = "<n>",
+            .description = "Prefix cache block size in tokens (default: 64)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.prefix_cache.block_size = std::stoi(v);
+                    if (c.prefix_cache.block_size <= 0)
+                    {
+                        throw std::invalid_argument("--prefix-cache-block-size must be > 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--prefix-cache-vram-budget-mb",
+            .category = "Prefix Cache",
+            .value_label = "<mb>",
+            .description = "Prefix cache device-hot budget in MiB (default: 256)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.prefix_cache.device_budget_bytes = parseMegabytesToBytes(v, "--prefix-cache-vram-budget-mb");
+                }),
+        });
+        spec.add({
+            .long_name = "--prefix-cache-ram-budget-mb",
+            .category = "Prefix Cache",
+            .value_label = "<mb>",
+            .description = "Prefix cache RAM budget in MiB (default: 4096)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.prefix_cache.ram_budget_bytes = parseMegabytesToBytes(v, "--prefix-cache-ram-budget-mb");
+                }),
+        });
+        spec.add({
+            .long_name = "--prefix-cache-disk-budget-mb",
+            .category = "Prefix Cache",
+            .value_label = "<mb>",
+            .description = "Prefix cache disk budget in MiB (default: 0)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.prefix_cache.disk_budget_bytes = parseMegabytesToBytes(v, "--prefix-cache-disk-budget-mb");
+                }),
+        });
+        spec.add({
+            .long_name = "--prefix-cache-disk-dir",
+            .category = "Prefix Cache",
+            .value_label = "<path>",
+            .description = "Prefix cache disk backing directory",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.prefix_cache.disk_dir = v;
+                }),
+        });
+        spec.add({
+            .long_name = "--prefix-cache-terminal-state",
+            .category = "Prefix Cache",
+            .value_label = "<mode>",
+            .description = "Terminal state storage: off, auto, always",
+            .valid_values = {"off", "auto", "always"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto parsed = parsePrefixCacheTerminalStateMode(v);
+                    if (!parsed)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --prefix-cache-terminal-state: '" + v +
+                            "' (valid: off, auto, always)");
+                    }
+                    c.prefix_cache.terminal_state = *parsed;
+                }),
+        });
+        spec.add({
+            .long_name = "--prefix-cache-moe-policy",
+            .category = "Prefix Cache",
+            .value_label = "<policy>",
+            .description = "MoE prefix policy: disabled, placement-fingerprint, invalidate-on-rebalance",
+            .valid_values = {"disabled", "placement-fingerprint", "invalidate-on-rebalance"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto parsed = parsePrefixCacheMoEPolicy(v);
+                    if (!parsed)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --prefix-cache-moe-policy: '" + v +
+                            "' (valid: disabled, placement-fingerprint, invalidate-on-rebalance)");
+                    }
+                    c.prefix_cache.moe_policy = *parsed;
+                }),
+        });
+
+        // --- MTP -------------------------------------------------------------
+        spec.add({
+            .long_name = "--mtp",
+            .category = "MTP",
+            .description = "Enable multi-token prediction speculative decoding",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &)
+                {
+                    c.mtp.enabled = true;
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-draft-tokens",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Number of MTP draft tokens to propose (default: 1)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.draft_tokens = std::stoi(v);
+                    if (c.mtp.draft_tokens <= 0)
+                    {
+                        throw std::invalid_argument("--mtp-draft-tokens must be > 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-verify-mode",
+            .category = "MTP",
+            .value_label = "<mode>",
+            .description = "MTP verification mode: greedy, speculative-sampling",
+            .valid_values = {"greedy", "speculative-sampling"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto parsed = parseMTPVerifyMode(v);
+                    if (!parsed)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --mtp-verify-mode: '" + v +
+                            "' (valid: greedy, speculative-sampling)");
+                    }
+                    c.mtp.verify_mode = *parsed;
+                }),
+        });
+
         // --- Heterogeneous Mode ----------------------------------------------
         spec.add({
             .long_name = "--cpu-fraction",
@@ -1753,6 +2051,16 @@ namespace llaminar2
                 applyMoEYamlKey(config, normalized_key, value);
                 continue;
             }
+            if (normalized_section == "prefix_cache")
+            {
+                applyPrefixCacheYamlKey(config, normalized_key, value);
+                continue;
+            }
+            if (normalized_section == "mtp")
+            {
+                applyMTPYamlKey(config, normalized_key, value);
+                continue;
+            }
 
             // Map YAML keys to config fields
             if (key == "dry_run")
@@ -1895,6 +2203,22 @@ namespace llaminar2
             else if (key == "kv_cache_precision")
             {
                 config.kv_cache_precision = value;
+            }
+            else if (normalized_key == "prefix_cache")
+            {
+                applyPrefixCacheYamlKey(config, normalized_key, value);
+            }
+            else if (normalized_key.rfind("prefix_cache_", 0) == 0)
+            {
+                applyPrefixCacheYamlKey(config, normalized_key.substr(std::string("prefix_cache_").size()), value);
+            }
+            else if (normalized_key == "mtp")
+            {
+                applyMTPYamlKey(config, normalized_key, value);
+            }
+            else if (normalized_key.rfind("mtp_", 0) == 0)
+            {
+                applyMTPYamlKey(config, normalized_key.substr(std::string("mtp_").size()), value);
             }
             else if (normalized_key == "moe_expert_mode")
             {

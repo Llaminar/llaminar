@@ -87,6 +87,34 @@ namespace llaminar2
         ARGMAX_PARTIAL_VALS, ///< Per-block partial max values for two-pass GPU argmax [1, kArgmaxPartials]
         ARGMAX_PARTIAL_IDXS, ///< Per-block partial max indices for two-pass GPU argmax [1, kArgmaxPartials]
 
+        // ── Prefix cache restore/harvest staging ───────────────────────────
+        PREFIX_K_STAGING,
+        PREFIX_V_STAGING,
+        PREFIX_HYBRID_STATE_STAGING,
+        PREFIX_MTP_K_STAGING,
+        PREFIX_MTP_V_STAGING,
+        PREFIX_TERMINAL_HIDDEN,
+        PREFIX_TERMINAL_LOGITS,
+
+        // ── MTP sidecar graph buffers ───────────────────────────────────────
+        MTP_EMBEDDING,
+        MTP_NORM_HIDDEN,
+        MTP_NORM_EMBEDDING,
+        MTP_CONCAT,
+        MTP_PROJECTED,
+        MTP_HIDDEN,
+        MTP_Q_PROJ,
+        MTP_K_PROJ,
+        MTP_V_PROJ,
+        MTP_Q_ROPE,
+        MTP_K_ROPE,
+        MTP_ATTN_OUTPUT,
+        MTP_ATTN_PROJ,
+        MTP_GATE_PROJ,
+        MTP_UP_PROJ,
+        MTP_FFN_OUTPUT,
+        MTP_LOGITS,
+
         _COUNT ///< Sentinel – must be last
     };
 
@@ -165,6 +193,54 @@ namespace llaminar2
             return "ARGMAX_PARTIAL_VALS";
         case BufferId::ARGMAX_PARTIAL_IDXS:
             return "ARGMAX_PARTIAL_IDXS";
+        case BufferId::PREFIX_K_STAGING:
+            return "PREFIX_K_STAGING";
+        case BufferId::PREFIX_V_STAGING:
+            return "PREFIX_V_STAGING";
+        case BufferId::PREFIX_HYBRID_STATE_STAGING:
+            return "PREFIX_HYBRID_STATE_STAGING";
+        case BufferId::PREFIX_MTP_K_STAGING:
+            return "PREFIX_MTP_K_STAGING";
+        case BufferId::PREFIX_MTP_V_STAGING:
+            return "PREFIX_MTP_V_STAGING";
+        case BufferId::PREFIX_TERMINAL_HIDDEN:
+            return "PREFIX_TERMINAL_HIDDEN";
+        case BufferId::PREFIX_TERMINAL_LOGITS:
+            return "PREFIX_TERMINAL_LOGITS";
+        case BufferId::MTP_EMBEDDING:
+            return "MTP_EMBEDDING";
+        case BufferId::MTP_NORM_HIDDEN:
+            return "MTP_NORM_HIDDEN";
+        case BufferId::MTP_NORM_EMBEDDING:
+            return "MTP_NORM_EMBEDDING";
+        case BufferId::MTP_CONCAT:
+            return "MTP_CONCAT";
+        case BufferId::MTP_PROJECTED:
+            return "MTP_PROJECTED";
+        case BufferId::MTP_HIDDEN:
+            return "MTP_HIDDEN";
+        case BufferId::MTP_Q_PROJ:
+            return "MTP_Q_PROJ";
+        case BufferId::MTP_K_PROJ:
+            return "MTP_K_PROJ";
+        case BufferId::MTP_V_PROJ:
+            return "MTP_V_PROJ";
+        case BufferId::MTP_Q_ROPE:
+            return "MTP_Q_ROPE";
+        case BufferId::MTP_K_ROPE:
+            return "MTP_K_ROPE";
+        case BufferId::MTP_ATTN_OUTPUT:
+            return "MTP_ATTN_OUTPUT";
+        case BufferId::MTP_ATTN_PROJ:
+            return "MTP_ATTN_PROJ";
+        case BufferId::MTP_GATE_PROJ:
+            return "MTP_GATE_PROJ";
+        case BufferId::MTP_UP_PROJ:
+            return "MTP_UP_PROJ";
+        case BufferId::MTP_FFN_OUTPUT:
+            return "MTP_FFN_OUTPUT";
+        case BufferId::MTP_LOGITS:
+            return "MTP_LOGITS";
         case BufferId::MOE_GATE_SCRATCH:
             return "MOE_GATE_SCRATCH";
         case BufferId::MOE_UP_SCRATCH:

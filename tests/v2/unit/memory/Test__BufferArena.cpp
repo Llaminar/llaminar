@@ -708,6 +708,8 @@ TEST(Test__BufferId, NameRoundTrips)
     EXPECT_STREQ(bufferIdName(BufferId::HIDDEN_STATE), "HIDDEN_STATE");
     EXPECT_STREQ(bufferIdName(BufferId::Q_PROJ), "Q_PROJ");
     EXPECT_STREQ(bufferIdName(BufferId::ALLREDUCE_STAGING), "ALLREDUCE_STAGING");
+    EXPECT_STREQ(bufferIdName(BufferId::MTP_PROJECTED), "MTP_PROJECTED");
+    EXPECT_STREQ(bufferIdName(BufferId::MTP_LOGITS), "MTP_LOGITS");
 }
 
 TEST(Test__BufferId, CountIsReasonable)

@@ -323,6 +323,9 @@ namespace llaminar2
         /** @brief Reset all sequences for a given layer. */
         void clear_layer(int layer) override;
 
+        /** @brief Advance ring metadata after an externally managed append/replay. */
+        void advanceHead(int layer, int seq_idx, int num_tokens) override;
+
         /// Bring in ICPUKVCache::clear_sequence(seq_idx) which clears across all layers.
         using ICPUKVCache::clear_sequence;
 
@@ -482,7 +485,7 @@ namespace llaminar2
          * This is the index of the oldest valid token in the pre-allocated tensor.
          * Useful for debugging and testing ring buffer behavior.
          */
-        int ring_head(int layer, int seq_idx = 0) const;
+        int ring_head(int layer, int seq_idx = 0) const override;
 
         /**
          * @brief Get the ring buffer occupancy for a (layer, sequence) entry.
@@ -490,6 +493,16 @@ namespace llaminar2
          * Equivalent to `get_cached_tokens()` but named to emphasize ring semantics.
          */
         int ring_size(int layer, int seq_idx = 0) const;
+
+        // =====================================================================
+        // Logical KV Block IO
+        // =====================================================================
+
+        KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override;
+        KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const override;
+        bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v) override;
+        bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr) override;
 
     private:
         // =====================================================================
@@ -539,6 +552,9 @@ namespace llaminar2
 
         /// @brief Lazily allocate and return the FP32Shadow for (layer, seq_idx).
         FP32Shadow &ensureFP32Shadow(int layer, int seq_idx) const;
+
+        /// @brief Invalidate any converted/RoPE shadow state for a cache entry.
+        void invalidateFP32Shadow(int layer, int seq_idx) const;
 
         /// @brief Convert newly appended rows from native precision to FP32 (+ optional RoPE).
         void convertNewRows(int layer, int seq_idx,

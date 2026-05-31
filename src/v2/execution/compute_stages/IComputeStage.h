@@ -339,6 +339,9 @@ namespace llaminar2
 
         // Qwen 3.5 FA-specific
         Q_GATE_SPLIT, ///< Split interleaved Q+gate GEMM output into separate buffers
+
+        // MTP sidecar
+        MTP_CONCAT, ///< Concatenate normalized terminal hidden and draft embedding rows
     };
 
     /**

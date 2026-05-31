@@ -654,6 +654,44 @@ TEST_F(StageDumpInfoTest, LMHeadStage_GetDumpInfo)
     EXPECT_TRUE(hasOutput(info, "logits"));
 }
 
+TEST_F(StageDumpInfoTest, LMHeadStage_ComputeAllPositionsDumpInfoUsesFullRows)
+{
+    int seq_len = 4;
+    int d_model = 32;
+    int vocab_size = 128;
+
+    auto hidden_states = TestTensorFactory::createFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    auto lm_head_weight = TestTensorFactory::createFP32Random({static_cast<size_t>(vocab_size), static_cast<size_t>(d_model)});
+    auto logits = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(vocab_size)});
+
+    LMHeadStage::Params params;
+    params.hidden_states = hidden_states.get();
+    params.lm_head_weight = lm_head_weight.get();
+    params.logits = logits.get();
+    params.seq_len = seq_len;
+    params.d_model = d_model;
+    params.vocab_size = vocab_size;
+    params.compute_all_positions = true;
+
+    LMHeadStage stage(params);
+    StageDumpInfo info = stage.getDumpInfo();
+
+    const StageDumpInfo::OutputBuffer *logits_output = nullptr;
+    for (const auto &output : info.outputs)
+    {
+        if (std::string(output.name) == "logits")
+        {
+            logits_output = &output;
+            break;
+        }
+    }
+
+    ASSERT_NE(logits_output, nullptr);
+    EXPECT_EQ(logits_output->rows, static_cast<size_t>(seq_len));
+    EXPECT_EQ(logits_output->cols, static_cast<size_t>(vocab_size));
+    EXPECT_TRUE(hasScalar(info, "compute_all_positions"));
+}
+
 // =============================================================================
 // Empty/Null Parameter Tests
 // =============================================================================

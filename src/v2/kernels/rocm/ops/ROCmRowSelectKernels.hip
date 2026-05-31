@@ -42,6 +42,30 @@ namespace llaminar2::rocm
             }
         }
 
+        /// @brief Concatenate two [rows, hidden_dim] matrices row-wise.
+        __global__ void mtpConcatFP32Kernel(
+            const float *__restrict__ hidden,
+            const float *__restrict__ embedding,
+            float *__restrict__ output,
+            int rows,
+            int hidden_dim)
+        {
+            const int total = rows * hidden_dim;
+            const int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+            const int stride = blockDim.x * gridDim.x;
+            for (int idx = thread_index; idx < total; idx += stride)
+            {
+                const int row = idx / hidden_dim;
+                const int col = idx - row * hidden_dim;
+                const size_t src_offset = static_cast<size_t>(idx);
+                const size_t dst_offset =
+                    (static_cast<size_t>(row) * static_cast<size_t>(hidden_dim) * 2) +
+                    static_cast<size_t>(col);
+                output[dst_offset] = hidden[src_offset];
+                output[dst_offset + static_cast<size_t>(hidden_dim)] = embedding[src_offset];
+            }
+        }
+
         /// @brief Return true if a HIP status is successful.
         bool ok(hipError_t status)
         {
@@ -128,6 +152,35 @@ namespace llaminar2::rocm
             device_selected_row,
             seq_len,
             d_model);
+        return ok(hipGetLastError());
+    }
+
+    bool launchMTPConcatFP32(
+        const float *hidden,
+        const float *embedding,
+        float *output,
+        int rows,
+        int hidden_dim,
+        void *stream)
+    {
+        if (!hidden || !embedding || !output || rows <= 0 || hidden_dim <= 0)
+            return false;
+
+        constexpr int threads_per_block = 256;
+        const int total = rows * hidden_dim;
+        const int blocks = std::max(1, std::min(1024, (total + threads_per_block - 1) / threads_per_block));
+        auto hip_stream = reinterpret_cast<hipStream_t>(stream);
+        hipLaunchKernelGGL(
+            mtpConcatFP32Kernel,
+            dim3(blocks),
+            dim3(threads_per_block),
+            0,
+            hip_stream,
+            hidden,
+            embedding,
+            output,
+            rows,
+            hidden_dim);
         return ok(hipGetLastError());
     }
 

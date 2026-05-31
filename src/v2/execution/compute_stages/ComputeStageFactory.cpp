@@ -257,6 +257,12 @@ namespace llaminar2
         return std::make_unique<QGateSplitStage>(params);
     }
 
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMTPConcat(
+        const MTPConcatStage::Params &params)
+    {
+        return std::make_unique<MTPConcatStage>(params);
+    }
+
     // =============================================================================
     // Model-Level Stage Factories
     // =============================================================================

@@ -22,6 +22,7 @@
 #pragma once
 
 #include "../../config/OrchestrationConfig.h"
+#include "../prefix_cache/PrefixCacheStateProbe.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../utils/Sampler.h"
 #include "../../utils/ToolCallTypes.h"
@@ -232,6 +233,11 @@ namespace llaminar2
          * Call before starting a new sequence.
          */
         virtual void clearCache() = 0;
+
+        /**
+         * @brief Read-only runtime state probe for prefix-cache/MTP development.
+         */
+        virtual PrefixRuntimeStateSnapshot prefixStateProbe() const { return {}; }
 
         // =====================================================================
         // Advanced

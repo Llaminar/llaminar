@@ -14,16 +14,19 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
 #include "tensors/Tensors.h"
+#include "mocks/MockModelContext.h"
 #include <atomic>
 #include <cstring>
 #include <vector>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 using namespace llaminar2;
 
@@ -76,6 +79,30 @@ public:
         return logits_.data();
     }
 
+    bool forwardMTP(int32_t draft_condition_token) override
+    {
+        forward_mtp_calls_.fetch_add(1, std::memory_order_relaxed);
+        last_mtp_condition_token_ = draft_condition_token;
+        return forward_mtp_ok_;
+    }
+
+    const float *mtpLogits() const override
+    {
+        return mtp_logits_.empty() ? logits_.data() : mtp_logits_.data();
+    }
+
+    bool setComputeAllPositionLogits(bool enabled) override
+    {
+        set_all_position_logits_calls_.fetch_add(1, std::memory_order_relaxed);
+        compute_all_position_logits_ = enabled;
+        return set_all_position_logits_ok_;
+    }
+
+    const float *getAllPositionLogits() const override
+    {
+        return all_position_logits_.empty() ? logits_.data() : all_position_logits_.data();
+    }
+
     int vocab_size() const override
     {
         return config_.vocab_size;
@@ -102,6 +129,36 @@ public:
         return config_.architecture.c_str();
     }
 
+    PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override
+    {
+        ++prefix_lookup_calls_;
+        prefix_lookup_tokens_ = tokens;
+        return prefix_lookup_result_;
+    }
+
+    bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override
+    {
+        (void)seq_idx;
+        ++prefix_populate_calls_;
+        populated_prefix_tokens_.push_back(hit.cached_tokens);
+        return prefix_populate_ok_;
+    }
+
+    bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override
+    {
+        ++prefix_harvest_calls_;
+        harvested_prefix_tokens_ = tokens;
+        harvested_prompt_token_count_ = prompt_token_count;
+        return prefix_harvest_ok_;
+    }
+
+    bool restorePrefixTerminalState(const PrefixLookupResult &hit) override
+    {
+        ++prefix_terminal_restore_calls_;
+        terminal_restored_tokens_.push_back(hit.cached_tokens);
+        return prefix_terminal_restore_ok_;
+    }
+
     // =====================================================================
     // Test Utilities
     // =====================================================================
@@ -124,24 +181,80 @@ public:
         config_.vocab_size = static_cast<int>(logits.size());
     }
 
+    void set_mock_mtp_logits(const std::vector<float> &logits)
+    {
+        mtp_logits_ = logits;
+    }
+
+    void set_mock_all_position_logits(const std::vector<float> &logits)
+    {
+        all_position_logits_ = logits;
+    }
+
     void set_vocab_size(int size)
     {
         config_.vocab_size = size;
         logits_.resize(static_cast<size_t>(size), 0.0f);
     }
 
+    void set_prefix_lookup_result(PrefixLookupResult result)
+    {
+        prefix_lookup_result_ = std::move(result);
+    }
+
+    void set_prefix_populate_ok(bool ok) { prefix_populate_ok_ = ok; }
+    void set_forward_mtp_ok(bool ok) { forward_mtp_ok_ = ok; }
+    void set_all_position_logits_ok(bool ok) { set_all_position_logits_ok_ = ok; }
+
+    size_t prefix_lookup_call_count() const { return prefix_lookup_calls_; }
+    size_t prefix_populate_call_count() const { return prefix_populate_calls_; }
+    size_t prefix_harvest_call_count() const { return prefix_harvest_calls_; }
+    size_t prefix_terminal_restore_call_count() const { return prefix_terminal_restore_calls_; }
+    const std::vector<int> &populated_prefix_tokens() const { return populated_prefix_tokens_; }
+    const std::vector<int> &terminal_restored_tokens() const { return terminal_restored_tokens_; }
+    const std::vector<int32_t> &prefix_lookup_tokens() const { return prefix_lookup_tokens_; }
+    const std::vector<int32_t> &harvested_prefix_tokens() const { return harvested_prefix_tokens_; }
+    int harvested_prompt_token_count() const { return harvested_prompt_token_count_; }
+    size_t forward_mtp_call_count() const { return forward_mtp_calls_.load(std::memory_order_relaxed); }
+    int32_t last_mtp_condition_token() const { return last_mtp_condition_token_; }
+    size_t set_all_position_logits_call_count() const { return set_all_position_logits_calls_.load(std::memory_order_relaxed); }
+    bool compute_all_position_logits() const { return compute_all_position_logits_; }
+
     void reset_call_counts()
     {
         forward_calls_.store(0, std::memory_order_relaxed);
         clear_cache_calls_.store(0, std::memory_order_relaxed);
+        forward_mtp_calls_.store(0, std::memory_order_relaxed);
+        set_all_position_logits_calls_.store(0, std::memory_order_relaxed);
     }
 
 private:
     Config config_;
     int position_;
     std::vector<float> logits_;
+    std::vector<float> mtp_logits_;
+    std::vector<float> all_position_logits_;
+    PrefixLookupResult prefix_lookup_result_;
+    bool prefix_populate_ok_ = true;
+    bool prefix_harvest_ok_ = true;
+    bool prefix_terminal_restore_ok_ = true;
+    bool forward_mtp_ok_ = true;
+    bool set_all_position_logits_ok_ = true;
+    bool compute_all_position_logits_ = false;
+    int32_t last_mtp_condition_token_ = -1;
+    size_t prefix_lookup_calls_ = 0;
+    size_t prefix_populate_calls_ = 0;
+    size_t prefix_harvest_calls_ = 0;
+    size_t prefix_terminal_restore_calls_ = 0;
+    int harvested_prompt_token_count_ = 0;
+    std::vector<int> populated_prefix_tokens_;
+    std::vector<int> terminal_restored_tokens_;
+    std::vector<int32_t> prefix_lookup_tokens_;
+    std::vector<int32_t> harvested_prefix_tokens_;
     mutable std::atomic<size_t> forward_calls_{0};
     mutable std::atomic<size_t> clear_cache_calls_{0};
+    mutable std::atomic<size_t> forward_mtp_calls_{0};
+    mutable std::atomic<size_t> set_all_position_logits_calls_{0};
 };
 
 // =============================================================================
@@ -463,6 +576,46 @@ protected:
     std::vector<std::unique_ptr<MockDeviceGraphOrchestrator>> mock_runners_;
     std::unique_ptr<MockLocalTPContext> mock_tp_ctx_;
 };
+
+static PrefixLookupResult makePrefixHit(int cached_tokens,
+                                        bool terminal_logits = false,
+                                        bool supported = true)
+{
+    PrefixLookupResult hit;
+    hit.cache_enabled = true;
+    hit.supported = supported;
+    hit.block_size = 2;
+    hit.cached_tokens = cached_tokens;
+    hit.has_terminal_hidden = terminal_logits;
+    hit.has_terminal_logits = terminal_logits;
+    return hit;
+}
+
+static std::unique_ptr<MockLocalTPContext> makeTPContextForRunnerCount(int count)
+{
+    MockLocalTPContext::Config tp_config;
+    for (int i = 0; i < count; ++i)
+    {
+        tp_config.devices.push_back(GlobalDeviceAddress::cpu());
+        tp_config.weights.push_back(1.0f / static_cast<float>(count));
+    }
+    return std::make_unique<MockLocalTPContext>(tp_config);
+}
+
+static RankOrchestrator::Config makeRankConfigForRunnerCount(int count)
+{
+    RankOrchestrator::Config config;
+    config.mode = RankOrchestrator::ParallelismMode::TP;
+    for (int i = 0; i < count; ++i)
+    {
+        config.devices.push_back(GlobalDeviceAddress::cpu());
+        config.weights.push_back(1.0f / static_cast<float>(count));
+    }
+    config.prefix_cache.enabled = true;
+    config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+    config.prefix_cache.block_size = 2;
+    return config;
+}
 
 // =============================================================================
 // Construction Tests
@@ -812,6 +965,286 @@ TEST_F(Test__RankOrchestrator, LocalTPContextReturnsContext)
     ASSERT_NE(mock_tp_ctx_, nullptr);
     EXPECT_EQ(mock_tp_ctx_->degree(), 2);
     EXPECT_EQ(mock_tp_ctx_->backend(), CollectiveBackendType::HOST);
+}
+
+TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/2, /*terminal_logits=*/false));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const std::vector<int32_t> prompt = {1, 2, 3, 4};
+    PrefixLookupResult hit = orchestrator->lookupPrefix(prompt);
+    EXPECT_TRUE(hit.cache_enabled);
+    EXPECT_TRUE(hit.supported);
+    EXPECT_EQ(hit.cached_tokens, 2);
+    EXPECT_FALSE(hit.has_terminal_logits)
+        << "Rank-level terminal state is usable only when all children have it";
+    EXPECT_EQ(runner0_ptr->prefix_lookup_tokens(), prompt);
+    EXPECT_EQ(runner1_ptr->prefix_lookup_tokens(), prompt);
+
+    ASSERT_TRUE(orchestrator->populatePrefix(hit));
+    EXPECT_EQ(runner0_ptr->populated_prefix_tokens(), std::vector<int>({2}));
+    EXPECT_EQ(runner1_ptr->populated_prefix_tokens(), std::vector<int>({2}));
+}
+
+TEST_F(Test__RankOrchestrator, PrefixLookupChildMissClampsAllChildrenToZero)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/0,
+                                                    /*terminal_logits=*/false,
+                                                    /*supported=*/false));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2, 3, 4});
+    EXPECT_FALSE(hit.supported);
+    EXPECT_EQ(hit.cached_tokens, 0);
+    EXPECT_EQ(runner1_ptr->prefix_lookup_call_count(), 1u);
+}
+
+TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreRunsOnAllChildrenAtCommonLength)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2, 3, 4});
+    ASSERT_TRUE(hit.has_terminal_logits);
+    ASSERT_TRUE(orchestrator->restorePrefixTerminalState(hit));
+
+    EXPECT_EQ(runner0_ptr->terminal_restored_tokens(), std::vector<int>({4}));
+    EXPECT_EQ(runner1_ptr->terminal_restored_tokens(), std::vector<int>({4}));
+}
+
+TEST_F(Test__RankOrchestrator, PrefixPopulateFailureClearsAllChildren)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+    runner1_ptr->set_prefix_populate_ok(false);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2, 3, 4});
+    ASSERT_FALSE(orchestrator->populatePrefix(hit));
+
+    EXPECT_EQ(runner0_ptr->populated_prefix_tokens(), std::vector<int>({4}));
+    EXPECT_EQ(runner1_ptr->populated_prefix_tokens(), std::vector<int>({4}));
+    EXPECT_EQ(runner0_ptr->clear_cache_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->clear_cache_call_count(), 1u);
+}
+
+TEST_F(Test__RankOrchestrator, PrefixLookupPipelineStageMissClampsWholePipeline)
+{
+    auto stage0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage0_ptr = stage0.get();
+    stage0_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/6, /*terminal_logits=*/true));
+
+    auto stage1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *stage1_ptr = stage1.get();
+    stage1_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/2, /*terminal_logits=*/false));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> stages;
+    stages.push_back(std::move(stage0));
+    stages.push_back(std::move(stage1));
+
+    auto orchestrator = RankOrchestrator::createForTestWithPipelineStages(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(stages),
+        makeRankConfigForRunnerCount(2));
+
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5, 6};
+    PrefixLookupResult hit = orchestrator->lookupPrefix(prompt);
+
+    EXPECT_TRUE(hit.cache_enabled);
+    EXPECT_TRUE(hit.supported);
+    EXPECT_EQ(hit.cached_tokens, 2);
+    EXPECT_FALSE(hit.has_terminal_logits)
+        << "Pipeline terminal state is usable only when every stage has it";
+    EXPECT_EQ(stage0_ptr->prefix_lookup_tokens(), prompt);
+    EXPECT_EQ(stage1_ptr->prefix_lookup_tokens(), prompt);
+
+    ASSERT_TRUE(orchestrator->populatePrefix(hit));
+    EXPECT_EQ(stage0_ptr->populated_prefix_tokens(), std::vector<int>({2}));
+    EXPECT_EQ(stage1_ptr->populated_prefix_tokens(), std::vector<int>({2}));
+}
+
+TEST_F(Test__RankOrchestrator, ForwardMTPRunsOnEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_TRUE(orchestrator->forwardMTP(42));
+    EXPECT_EQ(runner0_ptr->forward_mtp_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->forward_mtp_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_mtp_condition_token(), 42);
+    EXPECT_EQ(runner1_ptr->last_mtp_condition_token(), 42);
+}
+
+TEST_F(Test__RankOrchestrator, ForwardMTPFailureStillAttemptsEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_forward_mtp_ok(false);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_FALSE(orchestrator->forwardMTP(7));
+    EXPECT_EQ(runner0_ptr->forward_mtp_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->forward_mtp_call_count(), 1u);
+    EXPECT_EQ(runner0_ptr->last_mtp_condition_token(), 7);
+    EXPECT_EQ(runner1_ptr->last_mtp_condition_token(), 7);
+}
+
+TEST_F(Test__RankOrchestrator, AllPositionLogitToggleRunsOnEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_TRUE(orchestrator->setComputeAllPositionLogits(true));
+    EXPECT_TRUE(runner0_ptr->compute_all_position_logits());
+    EXPECT_TRUE(runner1_ptr->compute_all_position_logits());
+    EXPECT_EQ(runner0_ptr->set_all_position_logits_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->set_all_position_logits_call_count(), 1u);
+
+    EXPECT_TRUE(orchestrator->setComputeAllPositionLogits(false));
+    EXPECT_FALSE(runner0_ptr->compute_all_position_logits());
+    EXPECT_FALSE(runner1_ptr->compute_all_position_logits());
+    EXPECT_EQ(runner0_ptr->set_all_position_logits_call_count(), 2u);
+    EXPECT_EQ(runner1_ptr->set_all_position_logits_call_count(), 2u);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildMTPDecodeReportsTopologyBypassUntilCoordinationExists)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const std::string reason = orchestrator->mtpDecodeUnsupportedReason();
+    EXPECT_NE(reason.find("TP logits"), std::string::npos);
+    EXPECT_NE(reason.find("checkpoint"), std::string::npos);
+}
+
+TEST_F(Test__RankOrchestrator, SingleChildMTPDelegatesWithoutTopologyBypass)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_mock_mtp_logits({0.0f, 1.0f});
+    runner0_ptr->set_mock_all_position_logits({2.0f, 3.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(1),
+        makeRankConfigForRunnerCount(1));
+
+    EXPECT_TRUE(orchestrator->mtpDecodeUnsupportedReason().empty());
+    EXPECT_TRUE(orchestrator->forwardMTP(5));
+    EXPECT_EQ(runner0_ptr->forward_mtp_call_count(), 1u);
+    ASSERT_NE(orchestrator->mtpLogits(), nullptr);
+    EXPECT_FLOAT_EQ(orchestrator->mtpLogits()[1], 1.0f);
+    EXPECT_TRUE(orchestrator->setComputeAllPositionLogits(true));
+    ASSERT_NE(orchestrator->getAllPositionLogits(), nullptr);
+    EXPECT_FLOAT_EQ(orchestrator->getAllPositionLogits()[0], 2.0f);
 }
 
 // =============================================================================

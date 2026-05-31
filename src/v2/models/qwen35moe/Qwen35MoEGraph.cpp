@@ -17,6 +17,7 @@
 #include "../../execution/moe/MoEExpertOwnerMap.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../execution/moe/MoEOverlaySparseCollective.h"
+#include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "../../memory/BufferId.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
 #include "../../tensors/Tensors.h"
@@ -202,6 +203,24 @@ namespace llaminar2
             (void)key;
             if (table)
                 table->resetDecodeRuntimeState();
+        }
+    }
+
+    void Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
+    {
+        material.moe.push_back({"graph.num_experts", std::to_string(config_.moe.num_experts)});
+        material.moe.push_back({"graph.top_k", std::to_string(config_.moe.top_k)});
+        material.moe.push_back({"graph.runtime_table_count", std::to_string(moe_runtime_tables_.size())});
+
+        for (const auto &[key, table] : moe_runtime_tables_)
+        {
+            if (!table)
+                continue;
+            appendMoEPlacementFingerprintFields(
+                material.moe,
+                *table,
+                config_.n_layers,
+                "runtime_table." + key);
         }
     }
 

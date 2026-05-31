@@ -62,6 +62,69 @@ namespace llaminar2
         log_backend(getROCmBackend(), "ROCm");
     }
 
+    static bool hasPrefixOrMTPStats(const PrefixRuntimeStateSnapshot &snapshot)
+    {
+        return snapshot.prefix_cache_config_enabled ||
+               snapshot.prefix_cache_ready ||
+               snapshot.prefix_cache_bypassed ||
+               snapshot.prefix_cache_lookups != 0 ||
+               snapshot.prefix_cache_hits != 0 ||
+               snapshot.prefix_cache_partial_hits != 0 ||
+               snapshot.prefix_cache_misses != 0 ||
+               snapshot.prefix_cache_matched_blocks != 0 ||
+               snapshot.prefix_cache_matched_tokens != 0 ||
+               snapshot.prefix_cache_stores != 0 ||
+               snapshot.prefix_cache_inserts != 0 ||
+               snapshot.prefix_cache_evictions != 0 ||
+               snapshot.prefix_cache_promotions != 0 ||
+               snapshot.prefix_cache_disk_hydrations != 0 ||
+               snapshot.prefix_cache_terminal_state_hits != 0 ||
+               snapshot.prefix_cache_ram_bytes != 0 ||
+               snapshot.prefix_cache_device_bytes != 0 ||
+               snapshot.prefix_cache_disk_bytes != 0 ||
+               snapshot.prefix_cache_hybrid_state_bytes != 0 ||
+               snapshot.prefix_cache_mtp_state_bytes != 0 ||
+               snapshot.prefix_cache_bypasses != 0 ||
+               snapshot.prefix_cache_unsupported_backend_bypasses != 0 ||
+               snapshot.prefix_cache_fingerprint_bypasses != 0 ||
+               snapshot.prefix_cache_terminal_state_bypasses != 0 ||
+               snapshot.mtp_config_enabled ||
+               snapshot.mtp_bypassed ||
+               snapshot.mtp_draft_steps != 0 ||
+               snapshot.mtp_accepted_tokens != 0 ||
+               snapshot.mtp_rejected_tokens != 0 ||
+               snapshot.mtp_rollbacks != 0 ||
+               snapshot.mtp_bypasses != 0 ||
+               snapshot.mtp_verifier_runs != 0 ||
+               snapshot.mtp_verifier_token_count != 0;
+    }
+
+    static std::string formatByteCount(uint64_t bytes)
+    {
+        constexpr double kib = 1024.0;
+        constexpr double mib = 1024.0 * kib;
+        constexpr double gib = 1024.0 * mib;
+
+        std::ostringstream oss;
+        if (bytes >= static_cast<uint64_t>(gib))
+        {
+            oss << std::fixed << std::setprecision(2) << (bytes / gib) << " GiB";
+        }
+        else if (bytes >= static_cast<uint64_t>(mib))
+        {
+            oss << std::fixed << std::setprecision(2) << (bytes / mib) << " MiB";
+        }
+        else if (bytes >= static_cast<uint64_t>(kib))
+        {
+            oss << std::fixed << std::setprecision(2) << (bytes / kib) << " KiB";
+        }
+        else
+        {
+            oss << bytes << " B";
+        }
+        return oss.str();
+    }
+
     BenchmarkRunner::BenchmarkRunner(
         std::shared_ptr<IInferenceRunner> runner,
         std::shared_ptr<ITokenizer> tokenizer,
@@ -308,6 +371,11 @@ namespace llaminar2
     BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
     {
         BenchmarkResult result;
+        auto capture_and_return = [&]() -> BenchmarkResult
+        {
+            result.prefix_state = runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+            return result;
+        };
 
         // Determine prompt (use default if not provided or empty)
         std::string prompt = config.prompt;
@@ -342,7 +410,7 @@ namespace llaminar2
 
         if (token_count <= 0)
         {
-            return result; // Return empty result on error
+            return capture_and_return(); // Return empty result on error
         }
 
         // Broadcast tokens to all ranks
@@ -438,7 +506,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Warmup prefill failed");
             }
-            return result;
+            return capture_and_return();
         }
 
         // Warmup decode (if requested)
@@ -453,13 +521,13 @@ namespace llaminar2
                 {
                     LOG_ERROR("Warmup decode failed");
                 }
-                return result;
+                return capture_and_return();
             }
         }
 
         if (!warmPrefillGraphCapture())
         {
-            return result;
+            return capture_and_return();
         }
 
         if (mpi_ctx_->rank() == 0)
@@ -487,7 +555,7 @@ namespace llaminar2
             }
             if (rw_ok && !warmPrefillGraphCapture())
             {
-                return result;
+                return capture_and_return();
             }
         }
 
@@ -550,7 +618,7 @@ namespace llaminar2
                     LOG_ERROR("Prefill failed on iteration " << (iter + 1));
                 }
                 logGPUMemorySnapshot(("prefill-fail iter=" + std::to_string(iter + 1)).c_str());
-                return result;
+                return capture_and_return();
             }
             prefill_times.push_back(prefill_time);
             logGPUMemorySnapshot(("after-prefill iter=" + std::to_string(iter + 1)).c_str());
@@ -572,7 +640,7 @@ namespace llaminar2
                     {
                         LOG_ERROR("Decode failed on iteration " << (iter + 1));
                     }
-                    return result;
+                    return capture_and_return();
                 }
                 decode_times.push_back(decode_time);
                 decode_token_counts.push_back(tokens_generated);
@@ -626,7 +694,7 @@ namespace llaminar2
             LOG_INFO("Benchmark complete.");
         }
 
-        return result;
+        return capture_and_return();
     }
 
     void BenchmarkRunner::printResults(const BenchmarkResult &result)
@@ -714,6 +782,118 @@ namespace llaminar2
         }
 
         std::print("{}", table.to_string());
+
+        const auto &prefix_state = result.prefix_state;
+        if (hasPrefixOrMTPStats(prefix_state))
+        {
+            fort::utf8_table state_table;
+            state_table.set_border_style(FT_DOUBLE2_STYLE);
+            state_table << fort::header << "PREFIX / MTP STATE" << "Value" << fort::endr;
+            state_table.column(0).set_cell_text_align(fort::text_align::left);
+            state_table.column(1).set_cell_text_align(fort::text_align::right);
+
+            {
+                std::ostringstream status;
+                status << (prefix_state.prefix_cache_config_enabled ? "enabled" : "disabled")
+                       << ", " << (prefix_state.prefix_cache_ready ? "ready" : "not ready");
+                if (prefix_state.prefix_cache_bypassed)
+                {
+                    status << ", bypassed";
+                    if (!prefix_state.prefix_cache_bypass_reason.empty())
+                    {
+                        status << " (" << prefix_state.prefix_cache_bypass_reason << ")";
+                    }
+                }
+                state_table << "Prefix cache" << status.str() << fort::endr;
+            }
+            if (prefix_state.prefix_cache_bypasses != 0 ||
+                prefix_state.prefix_cache_unsupported_backend_bypasses != 0 ||
+                prefix_state.prefix_cache_fingerprint_bypasses != 0 ||
+                prefix_state.prefix_cache_terminal_state_bypasses != 0)
+            {
+                std::ostringstream bypasses;
+                bypasses << prefix_state.prefix_cache_bypasses << " total, "
+                         << prefix_state.prefix_cache_unsupported_backend_bypasses << " unsupported, "
+                         << prefix_state.prefix_cache_fingerprint_bypasses << " fingerprint, "
+                         << prefix_state.prefix_cache_terminal_state_bypasses << " terminal-state";
+                state_table << "Bypasses" << bypasses.str() << fort::endr;
+            }
+            {
+                std::ostringstream lookups;
+                lookups << prefix_state.prefix_cache_lookups << " lookups, "
+                        << prefix_state.prefix_cache_hits << " hits, "
+                        << prefix_state.prefix_cache_partial_hits << " partial, "
+                        << prefix_state.prefix_cache_misses << " misses";
+                state_table << "Lookup results" << lookups.str() << fort::endr;
+            }
+            {
+                std::ostringstream matched;
+                matched << prefix_state.prefix_cache_matched_blocks << " blocks, "
+                        << prefix_state.prefix_cache_matched_tokens << " tokens";
+                state_table << "Matched prefix" << matched.str() << fort::endr;
+            }
+            {
+                std::ostringstream storage;
+                storage << prefix_state.prefix_cache_stores << " stores, "
+                        << prefix_state.prefix_cache_evictions << " evictions, "
+                        << prefix_state.prefix_cache_promotions << " promotions, "
+                        << prefix_state.prefix_cache_disk_hydrations << " hydrations";
+                state_table << "Storage events" << storage.str() << fort::endr;
+            }
+            {
+                std::ostringstream bytes;
+                bytes << "RAM " << formatByteCount(prefix_state.prefix_cache_ram_bytes)
+                      << ", device " << formatByteCount(prefix_state.prefix_cache_device_bytes)
+                      << ", disk " << formatByteCount(prefix_state.prefix_cache_disk_bytes);
+                state_table << "Resident bytes" << bytes.str() << fort::endr;
+            }
+            {
+                std::ostringstream payload;
+                payload << "hybrid " << formatByteCount(prefix_state.prefix_cache_hybrid_state_bytes)
+                        << ", MTP " << formatByteCount(prefix_state.prefix_cache_mtp_state_bytes)
+                        << ", terminal hits " << prefix_state.prefix_cache_terminal_state_hits;
+                state_table << "Payload state" << payload.str() << fort::endr;
+            }
+
+            if (prefix_state.mtp_draft_steps != 0 ||
+                prefix_state.mtp_accepted_tokens != 0 ||
+                prefix_state.mtp_rejected_tokens != 0 ||
+                prefix_state.mtp_rollbacks != 0 ||
+                prefix_state.mtp_bypasses != 0 ||
+                prefix_state.mtp_verifier_runs != 0 ||
+                prefix_state.mtp_verifier_token_count != 0 ||
+                prefix_state.mtp_config_enabled ||
+                prefix_state.mtp_bypassed)
+            {
+                state_table << fort::separator;
+                {
+                    std::ostringstream status;
+                    status << (prefix_state.mtp_config_enabled ? "enabled" : "disabled");
+                    if (prefix_state.mtp_bypassed)
+                    {
+                        status << ", bypassed";
+                        if (!prefix_state.mtp_bypass_reason.empty())
+                        {
+                            status << " (" << prefix_state.mtp_bypass_reason << ")";
+                        }
+                    }
+                    state_table << "MTP" << status.str() << fort::endr;
+                }
+                {
+                    std::ostringstream mtp;
+                    mtp << prefix_state.mtp_draft_steps << " draft steps, "
+                        << prefix_state.mtp_accepted_tokens << " accepted, "
+                        << prefix_state.mtp_rejected_tokens << " rejected, "
+                        << prefix_state.mtp_rollbacks << " rollbacks, "
+                        << prefix_state.mtp_bypasses << " bypasses, "
+                        << prefix_state.mtp_verifier_runs << " verifier runs, "
+                        << prefix_state.mtp_verifier_token_count << " verifier tokens";
+                    state_table << "MTP decode" << mtp.str() << fort::endr;
+                }
+            }
+
+            std::print("{}", state_table.to_string());
+        }
 
         // Flush accumulated GPU stage timeline (prefill + decode + TP orchestrator)
         // This prints after BENCHMARK RESULTS for cleaner output ordering.

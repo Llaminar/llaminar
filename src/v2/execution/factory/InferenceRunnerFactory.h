@@ -121,6 +121,12 @@ namespace llaminar2
         // AUTO preserves legacy behavior (derived from activation precision mode).
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+        /// Prefix-state cache feature gates and storage limits.
+        PrefixCacheRuntimeConfig prefix_cache;
+
+        /// Multi-token prediction feature gates and verification mode.
+        MTPRuntimeConfig mtp;
+
         /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
         MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
 
@@ -212,6 +218,8 @@ namespace llaminar2
             config.moe_expert_mode = plan.runtime.moe_expert_mode;
             config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
             config.moe_rebalance = plan.runtime.moe_rebalance;
+            config.prefix_cache = plan.runtime.prefix_cache;
+            config.mtp = plan.runtime.mtp;
             return config;
         }
     };

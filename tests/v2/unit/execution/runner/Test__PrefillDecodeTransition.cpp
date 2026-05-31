@@ -49,6 +49,8 @@ namespace
         static constexpr int VOCAB_SIZE = 10;
         static constexpr int PREFILL_ARGMAX_TOKEN = 7; // Token with highest logit after prefill
         static constexpr int DECODE_ARGMAX_TOKEN = 3;  // Token with highest logit after decode forward
+        static constexpr int MTP_ARGMAX_TOKEN = 9;
+        static constexpr int VERIFY_REJECT_TOKEN = 4;
 
         MockInferenceRunner()
         {
@@ -62,6 +64,13 @@ namespace
             forward_call_count_++;
             last_forward_tokens_.assign(tokens, tokens + seq_len);
             last_forward_seq_len_ = seq_len;
+            position_ += seq_len;
+
+            if (all_position_logits_enabled_)
+            {
+                setupAllPositionLogits(seq_len);
+                return true;
+            }
 
             // After prefill (first forward in a cycle), set prefill logits.
             // After decode forwards, set decode logits.
@@ -84,6 +93,36 @@ namespace
             return logits_.data();
         }
 
+        bool forwardMTP(int32_t draft_condition_token) override
+        {
+            if (!mtp_enabled_)
+                return false;
+            forward_mtp_count_++;
+            last_mtp_condition_token_ = draft_condition_token;
+            mtp_logits_.assign(VOCAB_SIZE, -10.0f);
+            mtp_logits_[MTP_ARGMAX_TOKEN] = 10.0f;
+            return true;
+        }
+
+        const float *mtpLogits() const override
+        {
+            return mtp_logits_.empty() ? nullptr : mtp_logits_.data();
+        }
+
+        bool setComputeAllPositionLogits(bool enabled) override
+        {
+            if (!mtp_enabled_)
+                return false;
+            all_position_logits_enabled_ = enabled;
+            set_all_position_count_++;
+            return true;
+        }
+
+        const float *getAllPositionLogits() const override
+        {
+            return all_position_logits_.empty() ? nullptr : all_position_logits_.data();
+        }
+
         int vocab_size() const override { return VOCAB_SIZE; }
 
         void clear_cache() override
@@ -91,6 +130,7 @@ namespace
             clear_cache_count_++;
             is_first_forward_in_cycle_ = true; // Reset cycle
             setupPrefillLogits();              // Reset logits state
+            position_ = 0;
         }
 
         int get_position() const override { return position_; }
@@ -107,8 +147,37 @@ namespace
 
         int forwardCallCount() const { return forward_call_count_; }
         int clearCacheCount() const { return clear_cache_count_; }
+        int forwardMTPCount() const { return forward_mtp_count_; }
+        int restoreCount() const { return restore_count_; }
+        int setAllPositionCount() const { return set_all_position_count_; }
+        int lastMTPConditionToken() const { return last_mtp_condition_token_; }
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
         int lastForwardSeqLen() const { return last_forward_seq_len_; }
+        void enableMTP(bool accept_mtp_token)
+        {
+            mtp_enabled_ = true;
+            accept_mtp_token_ = accept_mtp_token;
+        }
+
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
+        {
+            (void)seq_idx;
+            PrefixStateSnapshot snapshot;
+            snapshot.valid = mtp_enabled_;
+            snapshot.cached_tokens = position_;
+            return snapshot;
+        }
+
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            if (!snapshot.valid)
+                return false;
+            restore_count_++;
+            position_ = snapshot.cached_tokens;
+            all_position_logits_enabled_ = false;
+            return true;
+        }
 
     private:
         void setupPrefillLogits()
@@ -123,10 +192,30 @@ namespace
             logits_[DECODE_ARGMAX_TOKEN] = 10.0f; // Token 3 is argmax
         }
 
+        void setupAllPositionLogits(int seq_len)
+        {
+            all_position_logits_.assign(static_cast<size_t>(seq_len) * VOCAB_SIZE, -10.0f);
+            const int row0_token = accept_mtp_token_ ? MTP_ARGMAX_TOKEN : VERIFY_REJECT_TOKEN;
+            all_position_logits_[row0_token] = 10.0f;
+            if (seq_len > 1)
+            {
+                all_position_logits_[VOCAB_SIZE + DECODE_ARGMAX_TOKEN] = 10.0f;
+            }
+        }
+
         std::vector<float> logits_;
+        std::vector<float> mtp_logits_;
+        std::vector<float> all_position_logits_;
         int forward_call_count_{0};
+        int forward_mtp_count_{0};
         int clear_cache_count_{0};
+        int restore_count_{0};
+        int set_all_position_count_{0};
+        int last_mtp_condition_token_{-1};
         bool is_first_forward_in_cycle_{true};
+        bool mtp_enabled_{false};
+        bool accept_mtp_token_{true};
+        bool all_position_logits_enabled_{false};
         std::vector<int> last_forward_tokens_;
         int last_forward_seq_len_{0};
         int position_{0};
@@ -157,13 +246,21 @@ namespace
         /**
          * @brief Create an OrchestrationRunner with the mock runner injected
          */
-        std::pair<OrchestrationRunner *, MockInferenceRunner *> createRunner()
+        std::pair<OrchestrationRunner *, MockInferenceRunner *> createRunner(bool mtp_enabled = false,
+                                                                             bool mtp_accept = true)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
+            if (mtp_enabled)
+            {
+                mock_ptr->enableMTP(mtp_accept);
+            }
 
             OrchestrationConfig config;
             config.device_for_this_rank = GlobalDeviceAddress::cpu();
+            config.mtp.enabled = mtp_enabled;
+            config.mtp.draft_tokens = 1;
+            config.mtp.verify_mode = MTPVerifyMode::Greedy;
 
             auto runner = std::make_unique<OrchestrationRunner>(
                 std::move(config), plan_, std::move(mock));
@@ -281,6 +378,113 @@ namespace
         ASSERT_TRUE(step2.success());
         ASSERT_EQ(step2.tokens.size(), 1u);
         EXPECT_EQ(step2.tokens[0], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeAcceptsGreedyDraftAndReplaysFromPrefillCheckpoint)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(mock->restoreCount(), 1);
+        EXPECT_GE(mock->setAllPositionCount(), 2);
+        EXPECT_THAT(mock->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPSecondDecodeReplaysConditionAndAcceptedTokens)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        ASSERT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        GenerationResult step2 = runner->decodeStep();
+        ASSERT_TRUE(step2.success());
+        EXPECT_THAT(step2.tokens,
+                    ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 2);
+        EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::DECODE_ARGMAX_TOKEN);
+        EXPECT_EQ(mock->restoreCount(), 2);
+        EXPECT_THAT(mock->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeForcedRejectReplaysVerifiedToken)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/false);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->restoreCount(), 1);
+        EXPECT_THAT(mock->lastForwardTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPBypassForNonGreedySamplingIsRecordedOncePerRequest)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        runner->setSamplingParams(sampling);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+
+        auto probe = runner->prefixStateProbe();
+        EXPECT_TRUE(probe.mtp_config_enabled);
+        EXPECT_TRUE(probe.mtp_bypassed);
+        EXPECT_NE(probe.mtp_bypass_reason.find("sampling is not greedy"), std::string::npos);
+        EXPECT_EQ(probe.mtp_bypasses, 1u);
+        EXPECT_EQ(probe.mtp_draft_steps, 0u);
+
+        GenerationResult step2 = runner->decodeStep();
+        ASSERT_TRUE(step2.success());
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+        EXPECT_EQ(runner->prefixStateProbe().mtp_bypasses, 1u);
     }
 
     /**

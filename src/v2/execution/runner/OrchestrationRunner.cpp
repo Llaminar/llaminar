@@ -12,6 +12,7 @@
 #include "../../config/TPPPValidator.h"
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
 #include "../factory/InferenceRunnerFactory.h"
+#include "../prefix_cache/PrefixCacheCoordinator.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../parallelism_tree/ParallelismTree.h"
 #include "../parallelism_tree/TreeToRunnerCompiler.h"
@@ -446,6 +447,10 @@ namespace llaminar2
             return false;
         }
 
+        mtp_bypassed_ = false;
+        mtp_bypass_recorded_for_request_ = false;
+        mtp_bypass_reason_.clear();
+
         // Broadcast to worker ranks so they prefill with the same tokens
         if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
         {
@@ -455,6 +460,122 @@ namespace llaminar2
             // const_cast is safe: rank 0 is the sender, buffer is not modified
             mpi_ctx_->broadcast_int32(const_cast<int32_t *>(prompt_tokens.data()),
                                       static_cast<size_t>(n_tokens), 0);
+        }
+
+        const auto &plan_prefix = plan_.runtime.prefix_cache;
+        const auto &config_prefix = config_.prefix_cache;
+        const MTPRuntimeConfig &active_mtp =
+            plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        const bool prefix_cache_enabled =
+            (plan_prefix.enabled || config_prefix.enabled) &&
+            plan_prefix.storage_mode != PrefixCacheStorageMode::Disabled &&
+            config_prefix.storage_mode != PrefixCacheStorageMode::Disabled;
+        const bool mtp_full_hit_requires_terminal_hidden =
+            active_mtp.enabled && active_mtp.require_terminal_hidden_for_full_hit;
+
+        if (prefix_cache_enabled)
+        {
+            try
+            {
+                PrefixLookupResult local_hit = runner_->lookupPrefix(prompt_tokens);
+                PrefixParticipantLookup participant = makePrefixParticipantLookup(
+                    mpi_ctx_ ? mpi_ctx_->rank() : 0,
+                    runner_->primaryDeviceId(),
+                    local_hit);
+
+                PrefixCoordinationResult coordination;
+                if (mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
+                    mpi_ctx_->communicator() != MPI_COMM_NULL)
+                {
+                    MPIPrefixCollectiveCoordinator domain_coordinator(mpi_ctx_->communicator());
+                    coordination = coordinatePrefixLookups({participant}, &domain_coordinator);
+                }
+                else
+                {
+                    coordination = coordinatePrefixLookups({participant});
+                }
+                int matched_tokens = coordination.common_matched_tokens;
+
+                runner_->clear_cache();
+                prefill_logits_ready_ = false;
+
+                PrefixLookupResult common_hit = local_hit.clampedTo(matched_tokens);
+                common_hit.has_terminal_logits =
+                    common_hit.has_terminal_logits && coordination.common_terminal_logits;
+                common_hit.has_terminal_hidden =
+                    common_hit.has_terminal_hidden && coordination.common_terminal_hidden;
+                if (active_mtp.enabled &&
+                    matched_tokens > 0 &&
+                    matched_tokens < static_cast<int>(prompt_tokens.size()) &&
+                    !common_hit.has_terminal_hidden)
+                {
+                    const int block_size =
+                        common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
+                    matched_tokens = std::max(0, matched_tokens - std::max(1, block_size));
+                    common_hit = local_hit.clampedTo(matched_tokens);
+                }
+
+                if (matched_tokens > 0 && !runner_->populatePrefix(common_hit))
+                {
+                    matched_tokens = 0;
+                    common_hit = local_hit.clampedTo(0);
+                    runner_->clear_cache();
+                }
+
+                int suffix_start = matched_tokens;
+                int suffix_len = static_cast<int>(prompt_tokens.size()) - suffix_start;
+
+                if (suffix_len > 0)
+                {
+                    if (!runner_->forward(prompt_tokens.data() + suffix_start, suffix_len))
+                    {
+                        return setError("Forward pass failed during prefix-cache suffix prefill");
+                    }
+                    prefill_logits_ready_ = true;
+                }
+                else if (common_hit.has_terminal_logits &&
+                         (!mtp_full_hit_requires_terminal_hidden ||
+                          common_hit.has_terminal_hidden) &&
+                         runner_->restorePrefixTerminalState(common_hit))
+                {
+                    prefill_logits_ready_ = true;
+                }
+                else
+                {
+                    const int block_size =
+                        common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
+                    matched_tokens = std::max(0, matched_tokens - std::max(1, block_size));
+                    common_hit = local_hit.clampedTo(matched_tokens);
+                    runner_->clear_cache();
+                    if (matched_tokens > 0 && !runner_->populatePrefix(common_hit))
+                    {
+                        matched_tokens = 0;
+                        runner_->clear_cache();
+                    }
+                    suffix_start = matched_tokens;
+                    suffix_len = static_cast<int>(prompt_tokens.size()) - suffix_start;
+                    if (!runner_->forward(prompt_tokens.data() + suffix_start, suffix_len))
+                    {
+                        return setError("Forward pass failed during prefix-cache terminal recompute");
+                    }
+                    prefill_logits_ready_ = true;
+                }
+
+                runner_->harvestPrefix(prompt_tokens, static_cast<int>(prompt_tokens.size()));
+
+                const bool full_hit = matched_tokens == static_cast<int>(prompt_tokens.size());
+                LOG_INFO("[OrchestrationRunner] Prefix cache request: "
+                         << (matched_tokens > 0 ? (full_hit ? "hit" : "partial-hit") : "miss")
+                         << " matched_tokens=" << matched_tokens
+                         << " prompt_tokens=" << prompt_tokens.size()
+                         << " terminal_logits="
+                         << (common_hit.has_terminal_logits ? "yes" : "no"));
+                return true;
+            }
+            catch (const std::exception &e)
+            {
+                return setError(std::string("Prefill with prefix cache failed: ") + e.what());
+            }
         }
 
         // Run forward pass
@@ -481,6 +602,211 @@ namespace llaminar2
         return true;
     }
 
+    bool OrchestrationRunner::shouldUseMTPDecode() const
+    {
+        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        return mtp.enabled && mtpDecodeBypassReason().empty();
+    }
+
+    std::string OrchestrationRunner::mtpDecodeBypassReason() const
+    {
+        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        if (!mtp.enabled)
+        {
+            return "feature disabled";
+        }
+        if (!runner_)
+        {
+            return "runner unavailable";
+        }
+        if (mtp.verify_mode != MTPVerifyMode::Greedy)
+        {
+            return "MTP verify mode is not greedy";
+        }
+        if (!active_sampling_params_.is_greedy())
+        {
+            return "sampling is not greedy";
+        }
+        if (active_sampling_params_.has_penalties())
+        {
+            return "sampling penalties are active";
+        }
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            return "MTP decode is not enabled for MPI world_size > 1";
+        }
+        const std::string runner_reason = runner_->mtpDecodeUnsupportedReason();
+        if (!runner_reason.empty())
+        {
+            return runner_reason;
+        }
+        return {};
+    }
+
+    void OrchestrationRunner::recordMTPBypass(const std::string &reason)
+    {
+        if (reason.empty() || reason == "feature disabled")
+        {
+            return;
+        }
+        mtp_bypassed_ = true;
+        mtp_bypass_reason_ = reason;
+        if (!mtp_bypass_recorded_for_request_)
+        {
+            ++mtp_stats_.bypasses;
+            mtp_bypass_recorded_for_request_ = true;
+            LOG_DEBUG("[OrchestrationRunner] MTP bypassed: " << reason);
+        }
+    }
+
+    GenerationResult OrchestrationRunner::decodeStepMTP()
+    {
+        GenerationResult result;
+        const int vocab = vocabSize();
+        if (vocab <= 0)
+        {
+            result.error = "Invalid vocabulary size for MTP decode";
+            return result;
+        }
+
+        PrefixStateSnapshot checkpoint = runner_->captureLivePrefixState();
+        if (!checkpoint.valid)
+        {
+            result.error = "MTP decode could not capture live prefix state";
+            return result;
+        }
+
+        const bool use_prefill_logits = prefill_logits_ready_;
+        prefill_logits_ready_ = false;
+
+        auto fail_after_checkpoint = [&](const std::string &message) -> GenerationResult
+        {
+            runner_->setComputeAllPositionLogits(false);
+            if (runner_->restoreLivePrefixState(checkpoint))
+            {
+                ++mtp_stats_.rollbacks;
+            }
+            result.error = message;
+            return result;
+        };
+
+        const int32_t condition_token = last_token_;
+        if (!use_prefill_logits && !runner_->forward(&condition_token, 1))
+        {
+            return fail_after_checkpoint("Forward pass failed during MTP condition decode");
+        }
+
+        const float *main_logits = runner_->logits();
+        if (!main_logits)
+        {
+            return fail_after_checkpoint("No logits available for MTP first draft token");
+        }
+        const int32_t first_token = sampler_.sample(
+            main_logits,
+            static_cast<size_t>(vocab),
+            active_sampling_params_);
+
+        if (!runner_->forwardMTP(first_token))
+        {
+            return fail_after_checkpoint("MTP sidecar forward failed");
+        }
+
+        const float *mtp_logits = runner_->mtpLogits();
+        if (!mtp_logits)
+        {
+            return fail_after_checkpoint("No MTP logits available");
+        }
+        const int32_t mtp_token = sampler_.sample(
+            mtp_logits,
+            static_cast<size_t>(vocab),
+            active_sampling_params_);
+        ++mtp_stats_.draft_steps;
+
+        if (!runner_->setComputeAllPositionLogits(true))
+        {
+            return fail_after_checkpoint("Runner does not support all-position logits for MTP verification");
+        }
+
+        const std::vector<int32_t> draft_tokens = {first_token, mtp_token};
+        if (!runner_->forward(draft_tokens.data(), static_cast<int>(draft_tokens.size())))
+        {
+            return fail_after_checkpoint("Forward pass failed during MTP verification");
+        }
+        ++mtp_stats_.verifier_runs;
+        mtp_stats_.verifier_token_count += static_cast<uint64_t>(draft_tokens.size());
+        if (!runner_->setComputeAllPositionLogits(false))
+        {
+            return fail_after_checkpoint("Failed to disable all-position logits after MTP verification");
+        }
+
+        const float *all_logits = runner_->getAllPositionLogits();
+        if (!all_logits)
+        {
+            return fail_after_checkpoint("All-position logits unavailable after MTP verification");
+        }
+
+        const float *verify_row0 = all_logits;
+        const int32_t verified_next = sampler_.sample(
+            verify_row0,
+            static_cast<size_t>(vocab),
+            active_sampling_params_);
+        const bool accepted_second_draft = verified_next == mtp_token;
+
+        std::vector<int32_t> accepted_tokens;
+        accepted_tokens.push_back(first_token);
+        accepted_tokens.push_back(accepted_second_draft ? mtp_token : verified_next);
+
+        for (size_t i = 0; i < accepted_tokens.size(); ++i)
+        {
+            if (std::find(stop_tokens_.begin(), stop_tokens_.end(), accepted_tokens[i]) != stop_tokens_.end())
+            {
+                accepted_tokens.resize(i + 1);
+                result.is_complete = true;
+                break;
+            }
+        }
+
+        if (!runner_->restoreLivePrefixState(checkpoint))
+        {
+            result.error = "MTP decode failed to restore live prefix checkpoint";
+            return result;
+        }
+        ++mtp_stats_.rollbacks;
+        if (!accepted_second_draft && accepted_tokens.size() >= 2)
+        {
+            ++mtp_stats_.rejected_tokens;
+        }
+
+        std::vector<int32_t> replay_tokens;
+        replay_tokens.reserve((use_prefill_logits ? 0 : 1) + accepted_tokens.size());
+        if (!use_prefill_logits)
+        {
+            replay_tokens.push_back(condition_token);
+        }
+        for (int32_t token : accepted_tokens)
+        {
+            replay_tokens.push_back(token);
+        }
+        if (!runner_->forward(replay_tokens.data(), static_cast<int>(replay_tokens.size())))
+        {
+            result.error = "Forward pass failed during MTP replay";
+            return result;
+        }
+
+        for (int32_t token : accepted_tokens)
+        {
+            sampler_.record_token(token);
+            result.tokens.push_back(token);
+        }
+        mtp_stats_.accepted_tokens += static_cast<uint64_t>(accepted_tokens.size());
+        if (!accepted_tokens.empty())
+        {
+            last_token_ = accepted_tokens.back();
+        }
+
+        return result;
+    }
+
     GenerationResult OrchestrationRunner::decodeStep()
     {
         GenerationResult result;
@@ -494,6 +820,17 @@ namespace llaminar2
         // Broadcast to worker ranks so they run decode in lockstep
         if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
             broadcastCommand(MPICommand::DECODE_STEP);
+
+        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        if (mtp.enabled)
+        {
+            const std::string mtp_bypass_reason = mtpDecodeBypassReason();
+            if (mtp_bypass_reason.empty())
+            {
+                return decodeStepMTP();
+            }
+            recordMTPBypass(mtp_bypass_reason);
+        }
 
         if (prefill_logits_ready_)
         {
@@ -673,6 +1010,21 @@ namespace llaminar2
         // Restore normal logits gathering after generation
         runner_->setSkipLogitsGatherDecode(false);
 
+        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        if (mtp.enabled)
+        {
+            LOG_INFO("[OrchestrationRunner] MTP summary: draft_steps="
+                     << mtp_stats_.draft_steps
+                     << " accepted_tokens=" << mtp_stats_.accepted_tokens
+                     << " rejected_tokens=" << mtp_stats_.rejected_tokens
+                     << " rollbacks=" << mtp_stats_.rollbacks
+                     << " bypasses=" << mtp_stats_.bypasses
+                     << " last_bypass_reason="
+                     << (mtp_bypass_reason_.empty() ? "none" : mtp_bypass_reason_)
+                     << " verifier_runs=" << mtp_stats_.verifier_runs
+                     << " verifier_tokens=" << mtp_stats_.verifier_token_count);
+        }
+
         return result;
     }
 
@@ -757,6 +1109,34 @@ namespace llaminar2
         ::malloc_trim(0);
 #endif
         prefill_logits_ready_ = false;
+        mtp_bypassed_ = false;
+        mtp_bypass_recorded_for_request_ = false;
+        mtp_bypass_reason_.clear();
+    }
+
+    PrefixRuntimeStateSnapshot OrchestrationRunner::prefixStateProbe() const
+    {
+        PrefixRuntimeStateSnapshot snapshot = runner_ ? runner_->prefixStateProbe()
+                                                      : PrefixRuntimeStateSnapshot{};
+        snapshot.initialized = initialized_;
+        snapshot.prefill_logits_ready = prefill_logits_ready_;
+        snapshot.current_position = currentPosition();
+        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        snapshot.mtp_config_enabled = mtp.enabled;
+        snapshot.mtp_bypassed = mtp_bypassed_;
+        snapshot.mtp_bypass_reason = mtp_bypass_reason_;
+        snapshot.mtp_draft_steps = mtp_stats_.draft_steps;
+        snapshot.mtp_accepted_tokens = mtp_stats_.accepted_tokens;
+        snapshot.mtp_rejected_tokens = mtp_stats_.rejected_tokens;
+        snapshot.mtp_rollbacks = mtp_stats_.rollbacks;
+        snapshot.mtp_bypasses = mtp_stats_.bypasses;
+        snapshot.mtp_verifier_runs = mtp_stats_.verifier_runs;
+        snapshot.mtp_verifier_token_count = mtp_stats_.verifier_token_count;
+        if (snapshot.architecture.empty() && model_ctx_)
+        {
+            snapshot.architecture = model_ctx_->architecture();
+        }
+        return snapshot;
     }
 
     // =========================================================================

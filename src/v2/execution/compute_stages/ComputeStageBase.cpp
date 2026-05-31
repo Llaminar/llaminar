@@ -138,6 +138,8 @@ namespace llaminar2
             return "GDN_RECURRENCE";
         case ComputeStageType::Q_GATE_SPLIT:
             return "Q_GATE_SPLIT";
+        case ComputeStageType::MTP_CONCAT:
+            return "MTP_CONCAT";
         default:
             return "UNKNOWN";
         }

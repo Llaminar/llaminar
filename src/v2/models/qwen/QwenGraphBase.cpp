@@ -311,6 +311,9 @@ namespace llaminar2
     {
         dependency_out = dependency_node;
 
+        if (config_.compute_all_position_logits)
+            return final_norm_output;
+
         // Only bucketed prefill needs a dynamic row-select. Normal exact-shape
         // prefill and decode preserve the existing LMHeadStage offset behavior.
         const bool bucketed_prefill = bucket_seq_len > 0 && bucket_seq_len == total_tokens && total_tokens > 1;
@@ -643,6 +646,9 @@ namespace llaminar2
                                         : BufferId::LM_HEAD_INPUT_ROW;
         lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
         lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
+        lm_params.compute_all_positions =
+            config_.compute_all_position_logits &&
+            lm_head_input == buffers_.layer_buffers.normalized;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -662,7 +668,7 @@ namespace llaminar2
             allgather_params.mpi_ctx = mpi_ctx_.get();
             // LM head always computes only the last token's logits (lm_m=1),
             // so the AllGather always transfers 1 row regardless of total_tokens
-            allgather_params.actual_seq_len = 1;
+            allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             // Multi-domain TP typically doesn't route LM head to a specific domain
             allgather_params.domain = nullptr;
@@ -983,6 +989,9 @@ namespace llaminar2
                                             : BufferId::LM_HEAD_INPUT_ROW;
             lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
             lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
+            lm_params.compute_all_positions =
+                config_.compute_all_position_logits &&
+                lm_head_input == buffers_.layer_buffers.normalized;
 
             graph.addNode("lm_head",
                           ComputeStageFactory::createLMHead(lm_params),
@@ -1001,7 +1010,7 @@ namespace llaminar2
                 allgather_params.full_output = buffers_.logits;
                 allgather_params.mpi_ctx = mpi_ctx_.get();
                 // LM head always computes only the last token's logits (lm_m=1)
-                allgather_params.actual_seq_len = 1;
+                allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
                 allgather_params.domain = nullptr;
                 allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
                 allgather_params.output_buffer_id = BufferId::LOGITS;
@@ -1339,6 +1348,9 @@ namespace llaminar2
                                                 : BufferId::LM_HEAD_INPUT_ROW;
                 lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
                 lm_params.use_prefill_replay_row_offset = (lm_head_input == buffers_.layer_buffers.normalized);
+                lm_params.compute_all_positions =
+                    config_.compute_all_position_logits &&
+                    lm_head_input == buffers_.layer_buffers.normalized;
 
                 graph.addNode("lm_head",
                               ComputeStageFactory::createLMHead(lm_params),
@@ -1357,7 +1369,7 @@ namespace llaminar2
                     allgather_params.full_output = buffers_.logits;
                     allgather_params.mpi_ctx = mpi_ctx_.get();
                     // LM head always computes only the last token's logits (lm_m=1)
-                    allgather_params.actual_seq_len = 1;
+                    allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
                     allgather_params.domain = nullptr;
                     allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
                     allgather_params.output_buffer_id = BufferId::LOGITS;
@@ -1576,6 +1588,7 @@ namespace llaminar2
         lm_params.bias_tensor = nullptr;
         lm_params.device_id = device;
         lm_params.prepared_store = prepared_weight_store_;
+        lm_params.compute_all_positions = config_.compute_all_position_logits;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
@@ -1595,7 +1608,7 @@ namespace llaminar2
             allgather_params.full_output = output_logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
             // LM head always computes only the last token's logits (lm_m=1)
-            allgather_params.actual_seq_len = 1;
+            allgather_params.actual_seq_len = config_.compute_all_position_logits ? total_tokens : 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             allgather_params.domain = nullptr;
             allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
@@ -1629,6 +1642,12 @@ namespace llaminar2
         // Compute total tokens for GEMM m parameter
         int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        const WeightBinding *gate_proj_binding =
+            layer.gate_proj_binding ? layer.gate_proj_binding : layer_bindings.gate_proj;
+        const WeightBinding *up_proj_binding =
+            layer.up_proj_binding ? layer.up_proj_binding : layer_bindings.up_proj;
+        const WeightBinding *down_proj_binding =
+            layer.down_proj_binding ? layer.down_proj_binding : layer_bindings.down_proj;
 
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
         // Combines the attention output residual add with FFN normalization.
@@ -1668,11 +1687,11 @@ namespace llaminar2
             gate_up_params.m = total_tokens; // Use total_tokens = batch_size * seq_len
             gate_up_params.k = k;
             gate_up_params.w_gate = layer.gate_proj;
-            gate_up_params.prepared_ref_gate = preparedRefForGraphWeight(layer_bindings.gate_proj, device);
+            gate_up_params.prepared_ref_gate = preparedRefForGraphWeight(gate_proj_binding, device);
             gate_up_params.output_gate = buffers.gate;
             gate_up_params.n_gate = gate_n;
             gate_up_params.w_up = layer.up_proj;
-            gate_up_params.prepared_ref_up = preparedRefForGraphWeight(layer_bindings.up_proj, device);
+            gate_up_params.prepared_ref_up = preparedRefForGraphWeight(up_proj_binding, device);
             gate_up_params.output_up = buffers.up;
             gate_up_params.n_up = up_n;
             gate_up_params.mpi_ctx = mpi_ctx_.get();
@@ -1716,7 +1735,7 @@ namespace llaminar2
                 .gemm_context = GemmContext::FFN,
                 .a_buffer_id = BufferId::UP_PROJ,
                 .c_buffer_id = BufferId::ATTN_PROJ,
-                .prepared_ref = preparedRefForGraphWeight(layer_bindings.down_proj, device),
+                .prepared_ref = preparedRefForGraphWeight(down_proj_binding, device),
                 .prepared_store = prepared_weight_store_};
 
             // SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + GEMM

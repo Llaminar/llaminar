@@ -13,6 +13,7 @@
 #include "../tensors/ITensor.h"                // Lightweight interface (no MPI)
 #include "../tensors/TensorLayout.h"
 #include "../utils/Logger.h"
+#include <cstddef>
 #include <vector>
 
 namespace llaminar2
@@ -30,6 +31,51 @@ namespace llaminar2
     {
     public:
         virtual ~IKVCache() = default;
+
+        /**
+         * @brief Descriptor for copying a logical KV block in oldest-to-newest order.
+         *
+         * The token range is logical within the sequence, not a physical ring row
+         * range. Implementations may remap global_layer through first_layer_index().
+         */
+        struct KVCacheLogicalBlockDescriptor
+        {
+            int layer = 0;
+            int seq_idx = 0;
+            int logical_token_start = 0;
+            int token_count = 0;
+            void *stream = nullptr;
+        };
+
+        /**
+         * @brief Packed byte layout for a logical KV block payload.
+         *
+         * Payloads preserve native K/V precision and KV cache layout. For
+         * KV_POS_HEAD_DIM, rows are packed by token. For KV_HEAD_POS_DIM, rows
+         * are packed by head, then logical token, then head dimension.
+         */
+        struct KVCacheLogicalBlockLayout
+        {
+            ActivationPrecision k_precision = ActivationPrecision::FP32;
+            ActivationPrecision v_precision = ActivationPrecision::FP32;
+            TensorLayout layout = TensorLayout::UNKNOWN;
+            int local_kv_heads = 0;
+            int kv_head_start = 0;
+            int head_dim = 0;
+            size_t k_bytes = 0;
+            size_t v_bytes = 0;
+            bool device_resident = false;
+        };
+
+        /**
+         * @brief Logical sequence state for cache import/export planning.
+         */
+        struct KVCacheSequenceState
+        {
+            int cached_tokens = 0;
+            int implementation_head = 0;
+            bool wrapped = false;
+        };
 
         // =================================================================
         // Query Operations
@@ -119,6 +165,72 @@ namespace llaminar2
          *         Default is KV_POS_HEAD_DIM (position-major)
          */
         virtual TensorLayout kv_layout() const { return TensorLayout::KV_POS_HEAD_DIM; }
+
+        /**
+         * @brief Inspect the current physical ring head for diagnostics.
+         *
+         * For ring caches this is the physical row that represents the oldest
+         * valid token. Non-ring implementations may return 0.
+         */
+        virtual int ring_head(int layer, int seq_idx = 0) const
+        {
+            (void)layer;
+            (void)seq_idx;
+            return 0;
+        }
+
+        /**
+         * @brief Describe the byte layout for a packed logical KV block.
+         */
+        virtual KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const
+        {
+            (void)global_layer;
+            (void)token_count;
+            return {};
+        }
+
+        /**
+         * @brief Inspect logical sequence state for a global layer/sequence.
+         */
+        virtual KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const
+        {
+            (void)global_layer;
+            (void)seq_idx;
+            return {};
+        }
+
+        /**
+         * @brief Export a logical KV block into packed native-precision buffers.
+         */
+        virtual bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
+        {
+            (void)desc;
+            (void)dst_k;
+            (void)dst_v;
+            return false;
+        }
+
+        /**
+         * @brief Import a packed logical KV block into this cache.
+         */
+        virtual bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
+        {
+            (void)desc;
+            (void)src_k;
+            (void)src_v;
+            return false;
+        }
+
+        /**
+         * @brief Truncate every layer for one sequence to cached_tokens.
+         */
+        virtual bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr)
+        {
+            (void)seq_idx;
+            (void)cached_tokens;
+            (void)stream;
+            return false;
+        }
 
         // =================================================================
         // ITensor Access (unified CPU/GPU interface)
@@ -436,6 +548,14 @@ namespace llaminar2
          * @return Number of KV heads on this rank (default: 0)
          */
         virtual int local_n_kv_heads() const { return 0; }
+
+        /**
+         * @brief Get total number of KV heads across all ranks.
+         *
+         * Most concrete caches already expose this. The default preserves
+         * non-sharded semantics for older implementations.
+         */
+        virtual int n_kv_heads() const { return local_n_kv_heads(); }
 
         /**
          * @brief Get local KV dimension (local_n_kv_heads * head_dim)

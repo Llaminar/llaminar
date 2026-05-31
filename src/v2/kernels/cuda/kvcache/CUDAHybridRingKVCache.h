@@ -15,6 +15,10 @@
 #include "CUDARingKVCache.h"
 #include "../../HybridKVCacheConfig.h"
 #include "../../IHybridKVCache.h"
+#include "../../../tensors/TensorKernels.h"
+
+#include <cstdint>
+#include <cstring>
 
 namespace llaminar2
 {
@@ -298,6 +302,51 @@ namespace llaminar2
             }
         }
 
+        typename IKVCache::KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(global_layer);
+            if (kv_idx < 0)
+                return {};
+            return Base::logicalBlockLayout(kv_idx, token_count);
+        }
+
+        typename IKVCache::KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(global_layer);
+            if (kv_idx < 0)
+                return {};
+            return Base::sequenceState(kv_idx, seq_idx);
+        }
+
+        bool exportLogicalBlock(const IKVCache::KVCacheLogicalBlockDescriptor &desc,
+                                void *dst_k,
+                                void *dst_v) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(desc.layer);
+            if (kv_idx < 0)
+                return false;
+            auto remapped = desc;
+            remapped.layer = kv_idx;
+            return Base::exportLogicalBlock(remapped, dst_k, dst_v);
+        }
+
+        bool importLogicalBlock(const IKVCache::KVCacheLogicalBlockDescriptor &desc,
+                                const void *src_k,
+                                const void *src_v) override
+        {
+            int kv_idx = layer_map_.toKVIndex(desc.layer);
+            if (kv_idx < 0)
+                return false;
+            auto remapped = desc;
+            remapped.layer = kv_idx;
+            return Base::importLogicalBlock(remapped, src_k, src_v);
+        }
+
+        bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr) override
+        {
+            return Base::truncateSequence(seq_idx, cached_tokens, stream);
+        }
+
         bool get_kv_converted(int layer, int seq_idx,
                               ActivationPrecision target,
                               ITensor **out_k, ITensor **out_v,
@@ -402,12 +451,174 @@ namespace llaminar2
             return total;
         }
 
+        HybridPrefixStateMetadata hybridPrefixStateMetadata() const override
+        {
+            return buildHybridPrefixStateMetadata();
+        }
+
+        bool exportHybridPrefixState(
+            const HybridPrefixStateDescriptor &desc,
+            void *dst_host,
+            void *dst_device) const override
+        {
+            if (desc.seq_idx < 0)
+                return false;
+
+            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if ((metadata.host_bytes > 0 && !dst_host) ||
+                (metadata.device_bytes > 0 && !dst_device))
+            {
+                return false;
+            }
+
+            auto *host_cursor = reinterpret_cast<uint8_t *>(dst_host);
+            auto *device_cursor = reinterpret_cast<uint8_t *>(dst_device);
+            return exportHybridStatePayload(host_cursor, device_cursor, desc.stream);
+        }
+
+        bool importHybridPrefixState(
+            const HybridPrefixStateDescriptor &desc,
+            const void *src_host,
+            const void *src_device) override
+        {
+            if (desc.seq_idx < 0)
+                return false;
+
+            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            if ((metadata.host_bytes > 0 && !src_host) ||
+                (metadata.device_bytes > 0 && !src_device))
+            {
+                return false;
+            }
+
+            const auto *host_cursor = reinterpret_cast<const uint8_t *>(src_host);
+            const auto *device_cursor = reinterpret_cast<const uint8_t *>(src_device);
+            return importHybridStatePayload(host_cursor, device_cursor, desc.stream);
+        }
+
         const HybridLayerMap &layerMap() const { return layer_map_; }
 
     private:
         int total_layers_;
         HybridLayerMap layer_map_;
         std::vector<HybridGDNLayerState> gdn_states_;
+
+        HybridPrefixStateMetadata buildHybridPrefixStateMetadata() const
+        {
+            HybridPrefixStateMetadata metadata;
+            metadata.total_layers = total_layers_;
+            metadata.gdn_layers = layer_map_.gdnLayerCount();
+            metadata.host_bytes = gdnMemoryBytes();
+
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                const auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+                if (state->conv_kernel)
+                    metadata.device_bytes += state->conv_kernel->stateBytes();
+                if (state->rec_kernel)
+                    metadata.device_bytes += state->rec_kernel->stateBytes();
+            }
+            metadata.has_device_kernel_state = metadata.device_bytes > 0;
+            return metadata;
+        }
+
+        bool exportHybridStatePayload(
+            uint8_t *&host_cursor,
+            uint8_t *&device_cursor,
+            void *stream) const
+        {
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                const auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+
+                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                if (recurrence_bytes > 0)
+                {
+                    std::memcpy(host_cursor, state->recurrence_state.data(), recurrence_bytes);
+                    host_cursor += recurrence_bytes;
+                }
+                if (conv_bytes > 0)
+                {
+                    std::memcpy(host_cursor, state->conv_state.data(), conv_bytes);
+                    host_cursor += conv_bytes;
+                }
+
+                if (state->conv_kernel)
+                {
+                    const size_t bytes = state->conv_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (!state->conv_kernel->exportState(nullptr, device_cursor, stream))
+                            return false;
+                        device_cursor += bytes;
+                    }
+                }
+                if (state->rec_kernel)
+                {
+                    const size_t bytes = state->rec_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (!state->rec_kernel->exportState(nullptr, device_cursor, stream))
+                            return false;
+                        device_cursor += bytes;
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool importHybridStatePayload(
+            const uint8_t *&host_cursor,
+            const uint8_t *&device_cursor,
+            void *stream)
+        {
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+
+                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                if (recurrence_bytes > 0)
+                {
+                    std::memcpy(state->recurrence_state.data(), host_cursor, recurrence_bytes);
+                    host_cursor += recurrence_bytes;
+                }
+                if (conv_bytes > 0)
+                {
+                    std::memcpy(state->conv_state.data(), host_cursor, conv_bytes);
+                    host_cursor += conv_bytes;
+                }
+
+                if (state->conv_kernel)
+                {
+                    const size_t bytes = state->conv_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (!state->conv_kernel->importState(nullptr, device_cursor, stream))
+                            return false;
+                        device_cursor += bytes;
+                    }
+                }
+                if (state->rec_kernel)
+                {
+                    const size_t bytes = state->rec_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (!state->rec_kernel->importState(nullptr, device_cursor, stream))
+                            return false;
+                        device_cursor += bytes;
+                    }
+                }
+            }
+            return true;
+        }
 
         void initHybrid(const HybridKVCacheConfig &config)
         {

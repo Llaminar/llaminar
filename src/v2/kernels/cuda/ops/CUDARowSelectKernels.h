@@ -75,4 +75,23 @@ namespace llaminar2::cuda
         int d_model,
         void *stream);
 
+    /**
+     * @brief Launch FP32 MTP concat: output[row] = [hidden[row], embedding[row]].
+     *
+     * @param hidden Device pointer to [rows, hidden_dim].
+     * @param embedding Device pointer to [rows, hidden_dim].
+     * @param output Device pointer to [rows, hidden_dim * 2].
+     * @param rows Number of token rows.
+     * @param hidden_dim Hidden width of each input.
+     * @param stream Opaque CUDA stream pointer for the kernel launch.
+     * @return true when launch was successful.
+     */
+    bool launchMTPConcatFP32(
+        const float *hidden,
+        const float *embedding,
+        float *output,
+        int rows,
+        int hidden_dim,
+        void *stream);
+
 } // namespace llaminar2::cuda

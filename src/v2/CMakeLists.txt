@@ -65,6 +65,18 @@ option(HAVE_CUDA "Enable CUDA backend" ON)
 option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
 
+set(LLAMINAR_SHARED_CORE_DEFAULT OFF)
+if(HAVE_CUDA OR HAVE_ROCM)
+    set(LLAMINAR_SHARED_CORE_DEFAULT ON)
+endif()
+option(LLAMINAR_SHARED_CORE
+    "Build llaminar2_core as a shared library so GPU device links are paid once and tests link the core DSO"
+    ${LLAMINAR_SHARED_CORE_DEFAULT})
+if(LLAMINAR_SHARED_CORE)
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    message(STATUS "V2: Shared llaminar2_core enabled; GPU backend archives will be folded into the core link once")
+endif()
+
 # ML Heuristic auto-retraining option
 # When enabled, automatically checks CSV hash and retrains ML model on every build
 # Only retrains if benchmark data actually changed (hash-based, fast check)
@@ -1125,7 +1137,11 @@ endif()
 # Typed Register Enforcement (JIT Code Quality)
 # =============================================================================
 # V2 Core Library
-add_library(llaminar2_core STATIC
+set(LLAMINAR2_CORE_LIBRARY_TYPE STATIC)
+if(LLAMINAR_SHARED_CORE)
+    set(LLAMINAR2_CORE_LIBRARY_TYPE SHARED)
+endif()
+add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     # Interfaces
     interfaces/IMPIContext.cpp
     backends/ComputeBackend.cpp
@@ -1172,6 +1188,7 @@ add_library(llaminar2_core STATIC
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp
+    execution/compute_stages/stages/MTPConcatStage.cpp
     execution/moe/IMoERouter.cpp
     execution/moe/IMoEDispatcher.cpp
     execution/moe/IMoEExpertExecutor.cpp
@@ -1197,6 +1214,19 @@ add_library(llaminar2_core STATIC
     execution/moe/ExpertWeightPayloadProvider.cpp
     execution/moe/GPUExpertTransfer.cpp
     execution/moe/MoEPipeline.cpp
+    execution/prefix_cache/BlockHash.cpp
+    execution/prefix_cache/DeviceHotPrefixStorageBackend.cpp
+    execution/prefix_cache/DiskPrefixStorageBackend.cpp
+    execution/prefix_cache/PrefixCacheCoordinator.cpp
+    execution/prefix_cache/PrefixCacheFingerprint.cpp
+    execution/prefix_cache/PrefixCacheKey.cpp
+    execution/prefix_cache/PrefixPayloadLayout.cpp
+    execution/prefix_cache/PrefixCacheStateProbe.cpp
+    execution/prefix_cache/PrefixStateSnapshot.cpp
+    execution/prefix_cache/PrefixStateCache.cpp
+    execution/prefix_cache/PrefixStorageBackend.cpp
+    execution/prefix_cache/RamPrefixStorageBackend.cpp
+    execution/mtp/MTPWeightManifest.cpp
     execution/cache/HybridCacheManager.cpp
     execution/compute_stages/stages/KVCacheAppendStage.cpp
     execution/compute_stages/stages/KVCacheGatherStage.cpp
@@ -1653,7 +1683,13 @@ endif()
 # Link GPU Backend Libraries (Phase 3)
 # =============================================================================
 if(HAVE_CUDA)
-    target_link_libraries(llaminar2_core PUBLIC cuda_backend)
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(llaminar2_core PRIVATE
+            -Wl,--whole-archive cuda_backend -Wl,--no-whole-archive
+        )
+    else()
+        target_link_libraries(llaminar2_core PUBLIC cuda_backend)
+    endif()
     
     # Add CUDA kernel C++ adapter files (compiled with C++ compiler, NOT nvcc)
     # These implement ITensorGemm interface and can include MPI headers
@@ -1672,7 +1708,13 @@ if(HAVE_CUDA)
 endif()
 
 if(HAVE_ROCM)
-    target_link_libraries(llaminar2_core PUBLIC rocm_backend)
+    if(LLAMINAR_SHARED_CORE)
+        target_link_libraries(llaminar2_core PRIVATE
+            -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive
+        )
+    else()
+        target_link_libraries(llaminar2_core PUBLIC rocm_backend)
+    endif()
     
     # Add ROCm kernel C++ adapter files (compiled with C++ compiler, NOT hipcc)
     # These implement ITensorGemm interface and can include MPI headers
@@ -1692,12 +1734,27 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmEmbeddingKernelT.cpp             # Embedding ITensor implementation
         kernels/rocm/moe/ROCmMoEKernel.cpp                    # MoE kernel (routing, gather, scatter, gate, swiglu)
     )
+
+    if(LLAMINAR_SHARED_CORE)
+        target_include_directories(llaminar2_core PUBLIC
+            ${ROCM_PATH}/include
+            ${ROCM_PATH}/hip/include
+            ${ROCM_PATH}/hipblas/include
+            ${ROCM_PATH}/hipblaslt/include
+        )
+    endif()
     
     message(STATUS "V2: Linked ROCm backend library with hipBLAS GEMM")
 endif()
 
 # Link device benchmarks library
-target_link_libraries(llaminar2_core PUBLIC device_benchmarks)
+if(LLAMINAR_SHARED_CORE)
+    target_link_libraries(llaminar2_core PRIVATE
+        -Wl,--whole-archive device_benchmarks -Wl,--no-whole-archive
+    )
+else()
+    target_link_libraries(llaminar2_core PUBLIC device_benchmarks)
+endif()
 message(STATUS "V2: Linked device benchmarks library")
 
 if(HAVE_CUDA)
@@ -1803,8 +1860,10 @@ add_subdirectory(../../tests/v2 ${CMAKE_BINARY_DIR}/tests/v2)
 # TODO: Intel MKL backend - not yet implemented
 
 # Install targets
-install(TARGETS llaminar2
+install(TARGETS llaminar2 llaminar2_core
     RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
 )
 
 install(FILES

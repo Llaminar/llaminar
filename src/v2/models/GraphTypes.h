@@ -28,6 +28,7 @@
 #include "../config/TPDomain.h"
 #include "../loaders/WeightPlan.h"
 #include "../utils/ToolCallTypes.h"
+#include <algorithm>
 #include <functional>
 #include <exception>
 #include <map>
@@ -43,6 +44,7 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+    class IKVCache;
     class IMPIContext;
     class ITPContext;
     class ILocalTPContext;
@@ -133,6 +135,16 @@ namespace llaminar2
 
         /// Explicit KV cache precision mode (AUTO preserves legacy behavior).
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
+
+        /// Prefix-state cache feature gates and storage limits.
+        PrefixCacheRuntimeConfig prefix_cache;
+
+        /// Multi-token prediction feature gates and verification mode.
+        MTPRuntimeConfig mtp;
+
+        /// Runtime-only decode verifier mode: compute LM-head logits for every
+        /// input row instead of the selected final row.
+        bool compute_all_position_logits = false;
 
         /// TurboQuant context for TQ4 KV cache quantization.
         /// Holds rotation matrix. Not owned by GraphConfig.
@@ -571,6 +583,17 @@ namespace llaminar2
         TensorBase *shared_expert_up = nullptr;       ///< Shared expert up proj [intermediate, d_model]
         TensorBase *shared_expert_down = nullptr;     ///< Shared expert down proj [d_model, intermediate]
         TensorBase *shared_expert_gate_inp = nullptr; ///< Shared expert sigmoid gate [d_model]
+
+        // Optional graph-facing bindings for prepared-weight lookup. Legacy
+        // tests and hand-built graphs can leave these null; frozen model paths
+        // populate them through toLegacyLayerWeights().
+        const WeightBinding *wq_binding = nullptr;
+        const WeightBinding *wk_binding = nullptr;
+        const WeightBinding *wv_binding = nullptr;
+        const WeightBinding *wo_binding = nullptr;
+        const WeightBinding *gate_proj_binding = nullptr;
+        const WeightBinding *up_proj_binding = nullptr;
+        const WeightBinding *down_proj_binding = nullptr;
     };
 
     /**
@@ -627,6 +650,93 @@ namespace llaminar2
         const WeightBinding *shared_expert_gate_inp = nullptr;
     };
 
+    /**
+     * @brief Model-facing weights for one MTP/next-token-prediction depth.
+     *
+     * MTP sidecars are not part of the main transformer layer loop. They still
+     * contain a normal full-attention block plus projection/norm weights that
+     * combine the terminal hidden row with the draft-token embedding.
+     */
+    struct MTPDepthWeights
+    {
+        int depth_index = 0;
+        int source_layer_index = -1;
+        bool nextn_block_layout = false;
+
+        TensorBase *fc = nullptr;
+        TensorBase *pre_fc_norm_hidden = nullptr;
+        TensorBase *pre_fc_norm_embedding = nullptr;
+        TensorBase *final_norm = nullptr;
+        const WeightBinding *fc_binding = nullptr;
+        LayerWeights fa_block;
+    };
+
+    struct MTPWeights
+    {
+        int depth = 0;
+        bool use_dedicated_embeddings = false;
+        std::vector<MTPDepthWeights> depths;
+
+        bool empty() const { return depth <= 0 || depths.empty(); }
+    };
+
+    struct MTPForwardInput
+    {
+        const int *draft_token_ids = nullptr;
+        TensorBase *terminal_hidden = nullptr;
+        IKVCache *kv_cache = nullptr;
+        const int *position_ids = nullptr;
+        const std::vector<int> *sequence_lengths = nullptr;
+        int batch_size = 1;
+        int seq_len = 1;
+        DeviceId device = DeviceId::cpu();
+    };
+
+    struct MTPForwardOutput
+    {
+        TensorBase *logits = nullptr;
+        TensorBase *hidden = nullptr;
+
+        TensorBase *embedding = nullptr;
+        TensorBase *norm_hidden = nullptr;
+        TensorBase *norm_embedding = nullptr;
+        TensorBase *concat = nullptr;
+        TensorBase *projected = nullptr;
+
+        TensorBase *q = nullptr;
+        TensorBase *k = nullptr;
+        TensorBase *v = nullptr;
+        TensorBase *q_raw = nullptr;
+        TensorBase *q_gate = nullptr;
+        TensorBase *attn_output = nullptr;
+        TensorBase *attn_proj = nullptr;
+        TensorBase *gate = nullptr;
+        TensorBase *up = nullptr;
+        TensorBase *ffn_output = nullptr;
+    };
+
+    struct MTPDepthWeightBindings
+    {
+        int depth_index = 0;
+        int source_layer_index = -1;
+        bool nextn_block_layout = false;
+
+        const WeightBinding *fc = nullptr;
+        const WeightBinding *pre_fc_norm_hidden = nullptr;
+        const WeightBinding *pre_fc_norm_embedding = nullptr;
+        const WeightBinding *final_norm = nullptr;
+        LayerWeightBindings fa_block;
+    };
+
+    struct MTPWeightBindings
+    {
+        int depth = 0;
+        bool use_dedicated_embeddings = false;
+        std::vector<MTPDepthWeightBindings> depths;
+
+        bool empty() const { return depth <= 0 || depths.empty(); }
+    };
+
     inline TensorBase *legacyTensor(const WeightBinding *binding)
     {
         return binding ? binding->tensor : nullptr;
@@ -666,6 +776,39 @@ namespace llaminar2
         weights.shared_expert_up = legacyTensor(bindings.shared_expert_up);
         weights.shared_expert_down = legacyTensor(bindings.shared_expert_down);
         weights.shared_expert_gate_inp = legacyTensor(bindings.shared_expert_gate_inp);
+        weights.wq_binding = bindings.wq;
+        weights.wk_binding = bindings.wk;
+        weights.wv_binding = bindings.wv;
+        weights.wo_binding = bindings.wo;
+        weights.gate_proj_binding = bindings.gate_proj;
+        weights.up_proj_binding = bindings.up_proj;
+        weights.down_proj_binding = bindings.down_proj;
+        return weights;
+    }
+
+    inline MTPDepthWeights toLegacyMTPDepthWeights(const MTPDepthWeightBindings &bindings)
+    {
+        MTPDepthWeights weights;
+        weights.depth_index = bindings.depth_index;
+        weights.source_layer_index = bindings.source_layer_index;
+        weights.nextn_block_layout = bindings.nextn_block_layout;
+        weights.fc = legacyTensor(bindings.fc);
+        weights.pre_fc_norm_hidden = legacyTensor(bindings.pre_fc_norm_hidden);
+        weights.pre_fc_norm_embedding = legacyTensor(bindings.pre_fc_norm_embedding);
+        weights.final_norm = legacyTensor(bindings.final_norm);
+        weights.fc_binding = bindings.fc;
+        weights.fa_block = toLegacyLayerWeights(bindings.fa_block);
+        return weights;
+    }
+
+    inline MTPWeights toLegacyMTPWeights(const MTPWeightBindings &bindings)
+    {
+        MTPWeights weights;
+        weights.depth = bindings.depth;
+        weights.use_dedicated_embeddings = bindings.use_dedicated_embeddings;
+        weights.depths.reserve(bindings.depths.size());
+        for (const auto &depth : bindings.depths)
+            weights.depths.push_back(toLegacyMTPDepthWeights(depth));
         return weights;
     }
 
@@ -677,6 +820,7 @@ namespace llaminar2
         const WeightBinding *embedding_table = nullptr;
         const WeightBinding *final_norm = nullptr;
         const WeightBinding *lm_head = nullptr;
+        MTPWeightBindings mtp;
 
         std::function<LayerWeightBindings(int layer_idx)> get_layer_weights;
     };
@@ -691,6 +835,7 @@ namespace llaminar2
         TensorBase *embedding_table = nullptr; ///< [vocab_size, d_model]
         TensorBase *final_norm = nullptr;      ///< [d_model]
         TensorBase *lm_head = nullptr;         ///< [vocab_size, d_model]
+        MTPWeights mtp;
 
         /// Accessor for per-layer weights
         std::function<LayerWeights(int layer_idx)> get_layer_weights;
@@ -702,6 +847,7 @@ namespace llaminar2
         weights.embedding_table = legacyTensor(bindings.embedding_table);
         weights.final_norm = legacyTensor(bindings.final_norm);
         weights.lm_head = legacyTensor(bindings.lm_head);
+        weights.mtp = toLegacyMTPWeights(bindings.mtp);
         if (bindings.get_layer_weights)
         {
             weights.get_layer_weights = [get_layer_weights = bindings.get_layer_weights](int layer_idx)
@@ -726,12 +872,120 @@ namespace llaminar2
         }
     }
 
+    inline std::vector<int> discoverNextNMTPLayers(const FrozenModelWeightSet &weight_set)
+    {
+        std::vector<int> layers;
+        for (const auto &binding : weight_set.bindings())
+        {
+            const std::string &name = binding.identity.canonical_name;
+            if (name.find(".nextn.eh_proj.weight") == std::string::npos)
+                continue;
+            const int layer = inferWeightLayer(name);
+            if (layer >= 0)
+                layers.push_back(layer);
+        }
+
+        std::sort(layers.begin(), layers.end());
+        layers.erase(std::unique(layers.begin(), layers.end()), layers.end());
+        return layers;
+    }
+
+    inline MTPDepthWeightBindings makeNextNDepthWeightBindings(
+        const FrozenModelWeightSet &weight_set,
+        int depth_index,
+        int source_layer_index)
+    {
+        auto get = [&weight_set, source_layer_index](const std::string &suffix)
+        {
+            return weight_set.optionalLayer(source_layer_index, suffix);
+        };
+
+        MTPDepthWeightBindings depth;
+        depth.depth_index = depth_index;
+        depth.source_layer_index = source_layer_index;
+        depth.nextn_block_layout = true;
+        depth.fc = get("nextn.eh_proj.weight");
+        depth.pre_fc_norm_hidden = get("nextn.hnorm.weight");
+        depth.pre_fc_norm_embedding = get("nextn.enorm.weight");
+        depth.final_norm = get("nextn.shared_head_norm.weight");
+
+        depth.fa_block.wq = get("attn_q.weight");
+        depth.fa_block.wk = get("attn_k.weight");
+        depth.fa_block.wv = get("attn_v.weight");
+        depth.fa_block.wo = get("attn_output.weight");
+        depth.fa_block.attn_norm = get("attn_norm.weight");
+        depth.fa_block.q_norm = get("attn_q_norm.weight");
+        depth.fa_block.k_norm = get("attn_k_norm.weight");
+        depth.fa_block.ffn_norm = get("post_attention_norm.weight");
+        depth.fa_block.gate_proj = get("ffn_gate.weight");
+        depth.fa_block.up_proj = get("ffn_up.weight");
+        depth.fa_block.down_proj = get("ffn_down.weight");
+
+        depth.fa_block.moe_gate = get("ffn_gate_inp.weight");
+        depth.fa_block.moe_gate_exps = get("ffn_gate_exps.weight");
+        depth.fa_block.moe_up_exps = get("ffn_up_exps.weight");
+        depth.fa_block.moe_down_exps = get("ffn_down_exps.weight");
+        depth.fa_block.shared_expert_gate = get("ffn_gate_shexp.weight");
+        depth.fa_block.shared_expert_up = get("ffn_up_shexp.weight");
+        depth.fa_block.shared_expert_down = get("ffn_down_shexp.weight");
+        depth.fa_block.shared_expert_gate_inp = get("ffn_gate_inp_shexp.weight");
+        return depth;
+    }
+
+    inline MTPWeightBindings makeMTPWeightBindings(const FrozenModelWeightSet &weight_set)
+    {
+        MTPWeightBindings bindings;
+
+        auto nextn_layers = discoverNextNMTPLayers(weight_set);
+        if (!nextn_layers.empty())
+        {
+            bindings.depth = static_cast<int>(nextn_layers.size());
+            bindings.depths.reserve(nextn_layers.size());
+            for (size_t i = 0; i < nextn_layers.size(); ++i)
+            {
+                bindings.depths.push_back(makeNextNDepthWeightBindings(
+                    weight_set,
+                    static_cast<int>(i),
+                    nextn_layers[i]));
+            }
+            return bindings;
+        }
+
+        if (!optionalGlobalBinding(weight_set, "mtp.fc.weight"))
+            return bindings;
+
+        MTPDepthWeightBindings depth;
+        depth.depth_index = 0;
+        depth.fc = optionalGlobalBinding(weight_set, "mtp.fc.weight");
+        depth.pre_fc_norm_hidden = optionalGlobalBinding(weight_set, "mtp.pre_fc_norm_hidden.weight");
+        depth.pre_fc_norm_embedding = optionalGlobalBinding(weight_set, "mtp.pre_fc_norm_embedding.weight");
+        depth.final_norm = optionalGlobalBinding(weight_set, "mtp.norm.weight");
+
+        const std::string prefix = "mtp.layers.0.";
+        depth.fa_block.attn_norm = optionalGlobalBinding(weight_set, prefix + "input_layernorm.weight");
+        depth.fa_block.wq = optionalGlobalBinding(weight_set, prefix + "self_attn.q_proj.weight");
+        depth.fa_block.wk = optionalGlobalBinding(weight_set, prefix + "self_attn.k_proj.weight");
+        depth.fa_block.wv = optionalGlobalBinding(weight_set, prefix + "self_attn.v_proj.weight");
+        depth.fa_block.wo = optionalGlobalBinding(weight_set, prefix + "self_attn.o_proj.weight");
+        depth.fa_block.q_norm = optionalGlobalBinding(weight_set, prefix + "self_attn.q_norm.weight");
+        depth.fa_block.k_norm = optionalGlobalBinding(weight_set, prefix + "self_attn.k_norm.weight");
+        depth.fa_block.ffn_norm = optionalGlobalBinding(weight_set, prefix + "post_attention_layernorm.weight");
+        depth.fa_block.gate_proj = optionalGlobalBinding(weight_set, prefix + "mlp.gate_proj.weight");
+        depth.fa_block.up_proj = optionalGlobalBinding(weight_set, prefix + "mlp.up_proj.weight");
+        depth.fa_block.down_proj = optionalGlobalBinding(weight_set, prefix + "mlp.down_proj.weight");
+
+        bindings.depth = 1;
+        bindings.depths.push_back(depth);
+        return bindings;
+    }
+
     inline ModelWeightBindings makeModelWeightBindings(const FrozenModelWeightSet &weight_set)
     {
         ModelWeightBindings bindings;
         bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
         bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");
         bindings.lm_head = optionalGlobalBinding(weight_set, "output.weight");
+        bindings.mtp = makeMTPWeightBindings(weight_set);
         bindings.get_layer_weights = [&weight_set](int layer_idx)
         {
             LayerWeightBindings layer;

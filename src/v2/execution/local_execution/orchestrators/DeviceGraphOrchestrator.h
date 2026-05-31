@@ -47,6 +47,8 @@
 #include "../../../loaders/IWeightStreamer.h"          // For weight streaming (Option B)
 #include "../../../interfaces/IModelContext.h"         // For interface-based construction
 #include "../../../memory/BufferArena.h"               // Phase 2: unified buffer management
+#include "../../prefix_cache/PrefixCacheFingerprint.h"
+#include "../../prefix_cache/PrefixCacheStats.h"
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
@@ -63,6 +65,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cstdint>
 
 namespace llaminar2
 {
@@ -80,8 +83,13 @@ namespace llaminar2
     class ExpertWeightPayloadProvider;
     class PreparedWeightStore;
     class FrozenModelWeightSet;
+    class PrefixStateCache;
+    class RamPrefixStorageBackend;
+    class DiskPrefixStorageBackend;
+    class DeviceHotPrefixStorageBackend;
     struct ExpertReplicaSet;
     class ActivationRotation;
+    enum class KVCacheLayoutMode : uint8_t;
 
     /**
      * @brief Configuration for graph caching behavior
@@ -190,6 +198,7 @@ namespace llaminar2
         // === Core Buffers ===
         std::shared_ptr<TensorBase> hidden; ///< [batch_size * seq_len, d_model]
         std::shared_ptr<TensorBase> logits; ///< [batch_size * seq_len, vocab_size]
+        std::shared_ptr<TensorBase> all_position_logits; ///< Runtime verifier logits [tokens, vocab_size]
 
         /// Local logits for column-parallel LM head [batch_size * seq_len, vocab_local]
         /// Only allocated when lm_head_column_parallel is enabled
@@ -197,6 +206,17 @@ namespace llaminar2
 
         // === KV Cache ===
         std::unique_ptr<IKVCache> kv_cache; ///< Attention KV history (single-device mode)
+
+        /// Request-local MTP sidecar KV caches, one cache per MTP depth.
+        /// These are shifted relative to the main cache and are populated only
+        /// when MTP support is explicitly enabled.
+        std::vector<std::unique_ptr<IKVCache>> mtp_kv_caches;
+
+        /// Terminal state restored from a prefix hit. MTP full hits require the
+        /// hidden row as well as logits; dense prefix-cache reuse can use logits
+        /// alone to preserve first-token semantics.
+        std::shared_ptr<TensorBase> prefix_terminal_hidden;
+        std::shared_ptr<TensorBase> prefix_terminal_logits;
 
         /// Per-device KV caches for Pipeline Parallelism
         /// When PP is enabled, each PP stage device has its own KV cache containing
@@ -279,6 +299,11 @@ namespace llaminar2
         {
             if (kv_cache)
                 kv_cache->clear();
+            for (auto &cache : mtp_kv_caches)
+            {
+                if (cache)
+                    cache->clear();
+            }
             for (auto &[device, cache] : pp_kv_caches)
             {
                 if (cache)
@@ -1366,6 +1391,11 @@ namespace llaminar2
          */
         const float *logits() const override;
 
+        bool forwardMTP(int32_t draft_condition_token) override;
+        const float *mtpLogits() const override;
+        bool setComputeAllPositionLogits(bool enabled) override;
+        const float *getAllPositionLogits() const override;
+
         /**
          * @brief Get current position offset for a sequence
          *
@@ -1789,6 +1819,19 @@ namespace llaminar2
          */
         const std::vector<int> &sequence_lengths() const override { return state_.sequence_lengths; }
 
+        PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
+        bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
+        bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
+        bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
+        bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
+
+        /**
+         * @brief Inspect request-local runtime state for prefix-cache/MTP probes.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+
         // =========================================================================
         // Snapshot Capture API (delegated to SnapshotCapture — Phase 2 extract)
         // =========================================================================
@@ -2040,6 +2083,47 @@ namespace llaminar2
         /// Inference state (Phase 5 - owned buffers)
         InferenceState state_;
 
+        /// Persistent prefix cache state. This intentionally lives outside
+        /// InferenceState so clear_cache() preserves cross-request blocks.
+        std::shared_ptr<PrefixStateCache> prefix_cache_;
+        std::shared_ptr<RamPrefixStorageBackend> prefix_ram_backend_;
+        std::shared_ptr<DiskPrefixStorageBackend> prefix_disk_backend_;
+        std::shared_ptr<DeviceHotPrefixStorageBackend> prefix_device_hot_backend_;
+        PrefixPayloadLayout prefix_layout_;
+        PrefixCacheStats prefix_cache_stats_;
+        uint64_t prefix_fingerprint_ = 0;
+        bool prefix_cache_bypassed_ = false;
+        std::string prefix_cache_bypass_reason_;
+
+        bool ensurePrefixCacheReady();
+        bool isPrefixCacheMoEModel() const;
+        PrefixCacheFingerprintResult buildCurrentPrefixFingerprint(
+            const PrefixCacheRuntimeConfig &prefix_config) const;
+        PrefixCacheKey makePrefixKeyForBlock(
+            const std::vector<int32_t> &tokens,
+            int block_index,
+            uint64_t parent_hash) const;
+        void disablePrefixCacheForRunner(const std::string &reason);
+        bool initializeMTPKVCaches(
+            int batch_size,
+            int max_seq_len,
+            ActivationPrecision kv_cache_prec,
+            KVCacheLayoutMode kv_layout_mode,
+            DeviceId device,
+            const std::shared_ptr<IMPIContext> &local_mpi_ctx,
+            bool use_sharded_cache,
+            bool has_tp,
+            bool is_global_tp);
+        bool selectMTPTerminalHiddenRow(int row_idx, int seq_len);
+        bool executeMTPDepth0(int32_t draft_condition_token,
+                              TensorBase *terminal_hidden,
+                              int position_id);
+        bool populateMTPShiftedCacheFromPrefill(const int *tokens,
+                                                int seq_len,
+                                                int batch_size,
+                                                int position_offset);
+        void updateMTPShiftedCacheMetadata(int active_batch_size);
+
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)
         // =========================================================================
@@ -2224,6 +2308,8 @@ namespace llaminar2
         /// Used to detect stale kernel state across inference sessions
         uint64_t session_epoch_ = 0;
 
+        bool compute_all_position_logits_ = false;
+
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;
         bool release_host_resident_after_forward_ = true;
@@ -2252,6 +2338,12 @@ namespace llaminar2
             const ModelWeights &weights,
             const std::unordered_map<int, LayerWeights> &resolved_layers,
             int first_layer, int last_layer);
+
+        /// Ensure a stable one-row terminal hidden buffer exists for MTP sidecar input.
+        bool ensureMTPTerminalHiddenBuffer();
+
+        /// Copy the latest forward pass terminal hidden row into the stable MTP input buffer.
+        bool refreshMTPTerminalHiddenState(int seq_len, int batch_size);
 
         /// Reset input-dependent dynamic state on all cached kernels
         /// Implemented in .cpp to avoid including KernelFactory.h in the header

@@ -41,6 +41,7 @@
 #include "stages/AttentionOutputGateStage.h"
 #include "stages/QGateSplitStage.h"
 #include "stages/FusedAddAllreduceStage.h"
+#include "stages/MTPConcatStage.h"
 
 namespace llaminar2
 {
@@ -266,6 +267,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createQGateSplit(
             const QGateSplitStage::Params &params);
+
+        /**
+         * @brief Create an MTP hidden/embedding concat stage
+         */
+        static std::unique_ptr<IComputeStage> createMTPConcat(
+            const MTPConcatStage::Params &params);
 
         // =====================================================================
         // MPI Communication Stages

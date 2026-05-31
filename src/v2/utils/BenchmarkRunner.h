@@ -70,6 +70,9 @@ namespace llaminar2
 
         // Generated text (for verification)
         std::string generated_text;
+
+        // Prefix-cache / MTP observability captured after the benchmark loop.
+        PrefixRuntimeStateSnapshot prefix_state;
     };
 
     /**

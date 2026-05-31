@@ -888,6 +888,15 @@ namespace llaminar2
             }
         }
 
+        if (prefix_cache.block_size <= 0)
+        {
+            errors.push_back("Prefix cache block size must be > 0");
+        }
+        if (mtp.draft_tokens <= 0)
+        {
+            errors.push_back("MTP draft tokens must be > 0");
+        }
+
         return errors;
     }
 
@@ -962,6 +971,25 @@ namespace llaminar2
         oss << "    rebalance_window_growth: " << moe_rebalance.window_growth_factor << "\n";
         oss << "    release_raw_expert_weights: "
             << (moe_rebalance.release_raw_expert_weights ? "true" : "false") << "\n";
+
+        oss << "  prefix_cache:\n";
+        oss << "    enabled: " << (prefix_cache.enabled ? "true" : "false") << "\n";
+        oss << "    storage: " << prefixCacheStorageModeToString(prefix_cache.storage_mode) << "\n";
+        oss << "    block_size: " << prefix_cache.block_size << "\n";
+        oss << "    ram_budget_bytes: " << prefix_cache.ram_budget_bytes << "\n";
+        oss << "    device_budget_bytes: " << prefix_cache.device_budget_bytes << "\n";
+        oss << "    disk_budget_bytes: " << prefix_cache.disk_budget_bytes << "\n";
+        if (!prefix_cache.disk_dir.empty())
+            oss << "    disk_dir: " << prefix_cache.disk_dir << "\n";
+        oss << "    terminal_state: " << prefixCacheTerminalStateModeToString(prefix_cache.terminal_state) << "\n";
+        oss << "    moe_policy: " << prefixCacheMoEPolicyToString(prefix_cache.moe_policy) << "\n";
+
+        oss << "  mtp:\n";
+        oss << "    enabled: " << (mtp.enabled ? "true" : "false") << "\n";
+        oss << "    draft_tokens: " << mtp.draft_tokens << "\n";
+        oss << "    verify_mode: " << mtpVerifyModeToString(mtp.verify_mode) << "\n";
+        oss << "    require_terminal_hidden_for_full_hit: "
+            << (mtp.require_terminal_hidden_for_full_hit ? "true" : "false") << "\n";
 
         // Simple TP
         oss << "  tp_degree: " << tp_degree << "\n";

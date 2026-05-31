@@ -30,6 +30,7 @@
 #include "../../../kernels/cpu/CPUKVCache.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/HybridKVCacheConfig.h"
+#include "../../../kernels/IHybridKVCache.h"
 #include "../../compute_stages/stages/MoEExpertComputeStage.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/ExpertWeightPayloadProvider.h"
@@ -39,10 +40,21 @@
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../../utils/Sampler.h" // LogitPenalty
+#include "execution/prefix_cache/BlockHash.h"
+#include "execution/prefix_cache/DeviceHotPrefixStorageBackend.h"
+#include "execution/prefix_cache/DiskPrefixStorageBackend.h"
+#include "execution/prefix_cache/PrefixCacheFingerprint.h"
+#include "execution/prefix_cache/PrefixStateCache.h"
+#include "execution/prefix_cache/RamPrefixStorageBackend.h"
+#include "transfer/TransferEngine.h"
 #include <chrono>
 #include <algorithm>
+#include <cctype>
+#include <cstring>
 #include <iomanip>
+#include <initializer_list>
 #include <stdexcept>
+#include <utility>
 
 namespace llaminar2
 {
@@ -67,6 +79,289 @@ namespace llaminar2
                                      << " used_mib=" << (used_bytes / (1024 * 1024))
                                      << " free_mib=" << (free_bytes / (1024 * 1024))
                                      << " total_mib=" << (total_bytes / (1024 * 1024)));
+        }
+
+        std::string lowerASCII(std::string value)
+        {
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch)
+                           { return static_cast<char>(std::tolower(ch)); });
+            return value;
+        }
+
+        bool containsAny(const std::string &haystack, std::initializer_list<const char *> needles)
+        {
+            for (const char *needle : needles)
+            {
+                if (haystack.find(needle) != std::string::npos)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        int prefixFALayerForIndex(const IKVCache &cache, int fa_index)
+        {
+            if (fa_index < 0)
+            {
+                return -1;
+            }
+
+            const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
+            if (!hybrid)
+            {
+                return cache.first_layer_index() + fa_index;
+            }
+
+            int seen = 0;
+            for (int layer = 0; layer < cache.n_layers(); ++layer)
+            {
+                if (!hybrid->isFullAttentionLayer(layer))
+                {
+                    continue;
+                }
+                if (seen == fa_index)
+                {
+                    return layer;
+                }
+                ++seen;
+            }
+            return -1;
+        }
+
+        bool attachMTPPayloadLayout(PrefixPayloadLayout &layout, const IKVCache &mtp_cache)
+        {
+            if (layout.block_size <= 0)
+            {
+                return false;
+            }
+
+            PrefixPayloadLayout mtp_layout = buildDensePrefixPayloadLayout(
+                mtp_cache,
+                layout.device,
+                layout.block_size);
+            if (mtp_layout.fa_layers <= 0 || mtp_layout.faKVBytes() == 0)
+            {
+                return false;
+            }
+
+            layout.mtp_layers = mtp_layout.fa_layers;
+            layout.mtp_local_kv_heads = mtp_layout.local_kv_heads;
+            layout.mtp_kv_head_start = mtp_layout.kv_head_start;
+            layout.mtp_head_dim = mtp_layout.head_dim;
+            layout.mtp_k_precision = mtp_layout.k_precision;
+            layout.mtp_v_precision = mtp_layout.v_precision;
+            layout.mtp_kv_layout = mtp_layout.kv_layout;
+            layout.bytes_per_mtp_layer_k = mtp_layout.bytes_per_fa_layer_k;
+            layout.bytes_per_mtp_layer_v = mtp_layout.bytes_per_fa_layer_v;
+            layout.mtp_kv_bytes = mtp_layout.faKVBytes();
+            layout.includes_mtp_state = layout.mtp_kv_bytes > 0;
+            return layout.includes_mtp_state;
+        }
+
+        int mtpTokenStartForPrefixBlock(const PrefixCacheKey &key)
+        {
+            return key.token_start == 0 ? 0 : key.token_start - 1;
+        }
+
+        int mtpTokenCountForPrefixBlock(const PrefixCacheKey &key)
+        {
+            if (key.token_count <= 0)
+            {
+                return 0;
+            }
+            return key.token_start == 0 ? std::max(0, key.token_count - 1) : key.token_count;
+        }
+
+        bool exportMTPPrefixPayload(const IKVCache &mtp_cache,
+                                    int seq_idx,
+                                    const PrefixCacheKey &key,
+                                    PrefixBlockHandle *handle)
+        {
+            if (!handle || !handle->layout.includes_mtp_state)
+            {
+                return true;
+            }
+
+            const int token_count = mtpTokenCountForPrefixBlock(key);
+            if (token_count == 0)
+            {
+                return true;
+            }
+            if (token_count < 0 || !handle->mtpKData() || !handle->mtpVData())
+            {
+                return false;
+            }
+
+            for (int local_layer = 0; local_layer < handle->layout.mtp_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(mtp_cache, local_layer);
+                if (global_layer < 0)
+                {
+                    return false;
+                }
+
+                uint8_t *k_dst = handle->mtpKData() +
+                                 static_cast<size_t>(local_layer) * handle->layout.bytes_per_mtp_layer_k;
+                uint8_t *v_dst = handle->mtpVData() +
+                                 static_cast<size_t>(local_layer) * handle->layout.bytes_per_mtp_layer_v;
+
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = seq_idx;
+                desc.logical_token_start = mtpTokenStartForPrefixBlock(key);
+                desc.token_count = token_count;
+                if (!mtp_cache.exportLogicalBlock(desc, k_dst, v_dst))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool importMTPPrefixPayload(IKVCache &mtp_cache,
+                                    int seq_idx,
+                                    const PrefixBlockHandle &handle)
+        {
+            if (!handle.layout.includes_mtp_state)
+            {
+                return true;
+            }
+
+            const int token_count = mtpTokenCountForPrefixBlock(handle.key);
+            if (token_count == 0)
+            {
+                return true;
+            }
+            if (token_count < 0 || !handle.mtpKData() || !handle.mtpVData())
+            {
+                return false;
+            }
+
+            for (int local_layer = 0; local_layer < handle.layout.mtp_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(mtp_cache, local_layer);
+                if (global_layer < 0)
+                {
+                    return false;
+                }
+
+                const uint8_t *k_src = handle.mtpKData() +
+                                       static_cast<size_t>(local_layer) * handle.layout.bytes_per_mtp_layer_k;
+                const uint8_t *v_src = handle.mtpVData() +
+                                       static_cast<size_t>(local_layer) * handle.layout.bytes_per_mtp_layer_v;
+
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = seq_idx;
+                desc.logical_token_start = mtpTokenStartForPrefixBlock(handle.key);
+                desc.token_count = token_count;
+                if (!mtp_cache.importLogicalBlock(desc, k_src, v_src))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        void *hybridPayloadHostPtr(PrefixBlockHandle &handle)
+        {
+            return handle.layout.hybrid_host_state_bytes > 0 ? handle.hybrid_payload : nullptr;
+        }
+
+        const void *hybridPayloadHostPtr(const PrefixBlockHandle &handle)
+        {
+            return handle.layout.hybrid_host_state_bytes > 0 ? handle.hybrid_payload : nullptr;
+        }
+
+        void *hybridPayloadDevicePtr(PrefixBlockHandle &handle)
+        {
+            if (handle.layout.hybrid_device_state_bytes == 0 || !handle.hybrid_payload)
+            {
+                return nullptr;
+            }
+            auto *base = static_cast<uint8_t *>(handle.hybrid_payload);
+            return base + handle.layout.hybrid_host_state_bytes;
+        }
+
+        const void *hybridPayloadDevicePtr(const PrefixBlockHandle &handle)
+        {
+            if (handle.layout.hybrid_device_state_bytes == 0 || !handle.hybrid_payload)
+            {
+                return nullptr;
+            }
+            const auto *base = static_cast<const uint8_t *>(handle.hybrid_payload);
+            return base + handle.layout.hybrid_host_state_bytes;
+        }
+
+        bool exportHybridPrefixPayload(
+            const IKVCache &cache,
+            int seq_idx,
+            int logical_token_count,
+            PrefixBlockHandle *handle)
+        {
+            if (!handle || !handle->layout.includes_hybrid_state)
+            {
+                return true;
+            }
+            const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
+            if (!hybrid || !handle->hybrid_payload)
+            {
+                return false;
+            }
+
+            HybridPrefixStateDescriptor desc;
+            desc.seq_idx = seq_idx;
+            desc.logical_token_count = logical_token_count;
+            if (!hybrid->exportHybridPrefixState(
+                    desc,
+                    hybridPayloadHostPtr(*handle),
+                    hybridPayloadDevicePtr(*handle)))
+            {
+                return false;
+            }
+            handle->has_hybrid_state = true;
+            return true;
+        }
+
+        bool importHybridPrefixPayload(
+            IKVCache &cache,
+            const PrefixBlockHandle &handle,
+            int seq_idx)
+        {
+            if (!handle.layout.includes_hybrid_state)
+            {
+                return true;
+            }
+            auto *hybrid = dynamic_cast<IHybridKVCache *>(&cache);
+            if (!hybrid || !handle.has_hybrid_state || !handle.hybrid_payload)
+            {
+                return false;
+            }
+
+            HybridPrefixStateDescriptor desc;
+            desc.seq_idx = seq_idx;
+            desc.logical_token_count = handle.key.token_start + handle.key.token_count;
+            return hybrid->importHybridPrefixState(
+                desc,
+                hybridPayloadHostPtr(handle),
+                hybridPayloadDevicePtr(handle));
+        }
+
+        void resetHybridPrefixPayloadState(IKVCache &cache)
+        {
+            auto *hybrid = dynamic_cast<IHybridKVCache *>(&cache);
+            if (!hybrid)
+            {
+                return;
+            }
+            for (int layer = 0; layer < cache.n_layers(); ++layer)
+            {
+                if (hybrid->isGDNLayer(layer))
+                {
+                    cache.clear_layer(layer);
+                }
+            }
         }
     }
 
@@ -683,6 +978,62 @@ namespace llaminar2
                   << (original / 1024.0) << " KB -> " << (optimized / 1024.0) << " KB"
                   << " (" << savings << "% reduction)");
 
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::initializeMTPKVCaches(
+        int batch_size,
+        int max_seq_len,
+        ActivationPrecision kv_cache_prec,
+        KVCacheLayoutMode kv_layout_mode,
+        DeviceId device,
+        const std::shared_ptr<IMPIContext> &local_mpi_ctx,
+        bool use_sharded_cache,
+        bool has_tp,
+        bool is_global_tp)
+    {
+        const auto &config = graph_builder_->config();
+        state_.mtp_kv_caches.clear();
+
+        // Qwen3.5/Qwen3.6 support is currently D=1. Additional depths need
+        // distinct sidecar weights before they can have independent caches.
+        constexpr int kSupportedMTPDepth = 1;
+        state_.mtp_kv_caches.reserve(kSupportedMTPDepth);
+
+        for (int depth = 0; depth < kSupportedMTPDepth; ++depth)
+        {
+            llaminar::v2::kernels::KVCacheConfig kv_config;
+            kv_config.precision = kv_cache_prec;
+            kv_config.device = device;
+            kv_config.num_layers = 1;
+            kv_config.first_layer_index = 0;
+            kv_config.batch_size = batch_size;
+            kv_config.max_seq_len = max_seq_len;
+            kv_config.n_kv_heads = config.n_kv_heads;
+            kv_config.head_dim = config.head_dim;
+            kv_config.layout_mode = kv_layout_mode;
+            kv_config.mpi_ctx = local_mpi_ctx.get();
+            kv_config.turboquant_ctx = config.turboquant_ctx;
+
+            if (use_sharded_cache && (has_tp || is_global_tp))
+            {
+                kv_config.local_n_kv_heads = config.local_n_kv_heads;
+                kv_config.kv_head_start = has_tp
+                                               ? config.tp_device_idx * config.local_n_kv_heads
+                                               : mpi_ctx_->rank() * config.local_n_kv_heads;
+            }
+
+            auto cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+            if (!cache)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create MTP KV cache depth " << depth);
+                return false;
+            }
+            state_.mtp_kv_caches.push_back(std::move(cache));
+        }
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Created " << state_.mtp_kv_caches.size()
+                                                       << " request-local MTP KV cache(s)");
         return true;
     }
 
@@ -2025,6 +2376,32 @@ namespace llaminar2
             state_.kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
         }
 
+        if (config.mtp.enabled)
+        {
+            if (pipeline_config_ && pipeline_config_->hasPP())
+            {
+                state_.mtp_kv_caches.clear();
+                LOG_WARN("[DeviceGraphOrchestrator] MTP request-local KV caches are single-device only in Phase 5");
+            }
+            else if (!initializeMTPKVCaches(
+                         batch_size,
+                         max_seq_len,
+                         kv_cache_prec,
+                         kv_layout_mode,
+                         device,
+                         local_mpi_ctx,
+                         use_sharded_cache,
+                         has_tp,
+                         is_global_tp))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            state_.mtp_kv_caches.clear();
+        }
+
         return true;
     }
 
@@ -2090,8 +2467,40 @@ namespace llaminar2
             }
         }
 
+        TensorBase *logits_output = state_.logits.get();
+        if (compute_all_position_logits_)
+        {
+            const auto &config = graph_builder_->config();
+            if (config.lm_head_column_parallel)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] All-position logits are not wired for column-parallel LM head yet");
+                return nullptr;
+            }
+            if (!tensor_factory_)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] All-position logits require an initialized TensorFactory");
+                return nullptr;
+            }
+
+            const size_t rows = static_cast<size_t>(total_tokens);
+            const size_t vocab = static_cast<size_t>(state_.vocab_size);
+            bool needs_allocate = !state_.all_position_logits;
+            if (state_.all_position_logits)
+            {
+                const auto &shape = state_.all_position_logits->shape();
+                needs_allocate = shape.size() != 2 || shape[0] != rows || shape[1] != vocab;
+            }
+            if (needs_allocate)
+            {
+                auto tensor = tensor_factory_->createFP32({rows, vocab}, state_.device_id);
+                state_.all_position_logits = std::shared_ptr<TensorBase>(tensor.release());
+            }
+            logits_output = state_.all_position_logits.get();
+        }
+
         // Prepare model buffers from state
         ModelBuffers model_buffers = state_.toModelBuffers();
+        model_buffers.logits = logits_output;
 
         setBuffers(model_buffers);
 
@@ -2126,7 +2535,7 @@ namespace llaminar2
 
         // Build forward output
         ForwardOutput output;
-        output.logits = state_.logits.get();
+        output.logits = logits_output;
         output.hidden = state_.hidden.get();
 
         // Execute forward pass
@@ -2154,6 +2563,19 @@ namespace llaminar2
             state_.sequence_lengths[b] += seq_len;
         }
 
+        if (new_phase == InferencePhase::PREFILL &&
+            !populateMTPShiftedCacheFromPrefill(tokens, seq_len, batch_size, input.position_offset))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to populate MTP shifted prefill cache");
+            return nullptr;
+        }
+
+        if (!refreshMTPTerminalHiddenState(seq_len, batch_size))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to refresh MTP terminal hidden state");
+            return nullptr;
+        }
+
         LOG_TRACE("[FORWARD_TRACE] seq_len=" << seq_len
                                              << " pos_offset=" << input.position_offset
                                              << " token_ids[0]=" << (tokens ? tokens[0] : -1)
@@ -2164,8 +2586,331 @@ namespace llaminar2
         // Callers that need host data should call logits() explicitly.
         // CPU: logits are already on host, fp32_data() is essentially free.
         if (state_.device_id.is_gpu())
-            return reinterpret_cast<const float *>(state_.logits.get());
-        return state_.logits->fp32_data();
+            return reinterpret_cast<const float *>(logits_output);
+        return logits_output ? logits_output->fp32_data() : nullptr;
+    }
+
+    bool DeviceGraphOrchestrator::ensureMTPTerminalHiddenBuffer()
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+
+        if (state_.prefix_terminal_hidden)
+        {
+            const auto &shape = state_.prefix_terminal_hidden->shape();
+            if (shape.size() == 2 &&
+                shape[0] >= 1 &&
+                shape[1] >= static_cast<size_t>(state_.d_model))
+            {
+                return true;
+            }
+            state_.prefix_terminal_hidden.reset();
+        }
+
+        if (!tensor_factory_ || state_.d_model <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot allocate MTP terminal hidden buffer without tensor factory/d_model");
+            return false;
+        }
+
+        auto tensor = tensor_factory_->createFP32(
+            {1, static_cast<size_t>(state_.d_model)},
+            state_.device_id);
+        if (!tensor)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate MTP terminal hidden buffer");
+            return false;
+        }
+
+        state_.prefix_terminal_hidden = std::shared_ptr<TensorBase>(tensor.release());
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::refreshMTPTerminalHiddenState(int seq_len, int batch_size)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (seq_len <= 0 || batch_size <= 0)
+            return false;
+        if (batch_size != 1)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP terminal hidden capture currently supports batch_size=1 only");
+            return false;
+        }
+        if (!state_.hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot refresh MTP terminal hidden without hidden-state buffer");
+            return false;
+        }
+        if (!ensureMTPTerminalHiddenBuffer())
+            return false;
+
+        HiddenStateRowSelectStage::Params params;
+        params.device_id = state_.device_id;
+        params.input = state_.hidden.get();
+        params.output = state_.prefix_terminal_hidden.get();
+        params.seq_len = seq_len;
+        params.d_model = state_.d_model;
+        params.selected_row_idx = seq_len - 1;
+
+        ComputeGraph graph;
+        graph.addNode("mtp_terminal_hidden_row_select",
+                      ComputeStageFactory::createHiddenStateRowSelect(params),
+                      state_.device_id);
+
+        IDeviceContext *ctx = getDeviceContext(state_.device_id);
+        if (!ctx)
+            return false;
+
+        return execute(graph, ctx);
+    }
+
+    bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRow(int row_idx, int seq_len)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (row_idx < 0 || row_idx >= seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP hidden row selection: row="
+                      << row_idx << " seq_len=" << seq_len);
+            return false;
+        }
+        if (!state_.hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden row without hidden-state buffer");
+            return false;
+        }
+        if (!ensureMTPTerminalHiddenBuffer())
+            return false;
+
+        HiddenStateRowSelectStage::Params params;
+        params.device_id = state_.device_id;
+        params.input = state_.hidden.get();
+        params.output = state_.prefix_terminal_hidden.get();
+        params.seq_len = seq_len;
+        params.d_model = state_.d_model;
+        params.selected_row_idx = row_idx;
+
+        ComputeGraph graph;
+        graph.addNode("mtp_prefill_hidden_row_select",
+                      ComputeStageFactory::createHiddenStateRowSelect(params),
+                      state_.device_id);
+
+        IDeviceContext *ctx = getDeviceContext(state_.device_id);
+        if (!ctx)
+            return false;
+
+        return execute(graph, ctx);
+    }
+
+    bool DeviceGraphOrchestrator::executeMTPDepth0(
+        int32_t draft_condition_token,
+        TensorBase *terminal_hidden,
+        int position_id)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return false;
+        if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar requires an initialized MTP KV cache");
+            return false;
+        }
+        if (!frozen_weight_set_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar requires frozen MTP weight bindings");
+            return false;
+        }
+
+        auto bindings = makeModelWeightBindings(*frozen_weight_set_);
+        if (bindings.mtp.empty() || bindings.mtp.depths.empty())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar requested without MTP weight bindings");
+            return false;
+        }
+
+        auto get_extension = [&](BufferId id) -> TensorBase *
+        {
+            auto it = state_.extension_buffers.find(id);
+            return it == state_.extension_buffers.end() ? nullptr : it->second.get();
+        };
+
+        TensorBase *mtp_logits = get_extension(BufferId::MTP_LOGITS);
+        TensorBase *mtp_hidden = get_extension(BufferId::MTP_HIDDEN);
+        TensorBase *mtp_embedding = get_extension(BufferId::MTP_EMBEDDING);
+        TensorBase *mtp_norm_hidden = get_extension(BufferId::MTP_NORM_HIDDEN);
+        TensorBase *mtp_norm_embedding = get_extension(BufferId::MTP_NORM_EMBEDDING);
+        TensorBase *mtp_concat = get_extension(BufferId::MTP_CONCAT);
+        TensorBase *mtp_projected = get_extension(BufferId::MTP_PROJECTED);
+        TensorBase *mtp_q = get_extension(BufferId::MTP_Q_PROJ);
+        TensorBase *mtp_k = get_extension(BufferId::MTP_K_PROJ);
+        TensorBase *mtp_v = get_extension(BufferId::MTP_V_PROJ);
+        TensorBase *mtp_q_raw = get_extension(BufferId::FA_Q_RAW);
+        TensorBase *mtp_q_gate = get_extension(BufferId::FA_GATE);
+        TensorBase *mtp_attn_output = get_extension(BufferId::MTP_ATTN_OUTPUT);
+        TensorBase *mtp_attn_proj = get_extension(BufferId::MTP_ATTN_PROJ);
+        TensorBase *mtp_gate = get_extension(BufferId::MTP_GATE_PROJ);
+        TensorBase *mtp_up = get_extension(BufferId::MTP_UP_PROJ);
+        TensorBase *mtp_ffn_output = get_extension(BufferId::MTP_FFN_OUTPUT);
+
+        if (!terminal_hidden ||
+            !mtp_logits || !mtp_hidden || !mtp_embedding || !mtp_norm_hidden ||
+            !mtp_norm_embedding || !mtp_concat || !mtp_projected ||
+            !mtp_q || !mtp_k || !mtp_v || !mtp_q_raw || !mtp_q_gate ||
+            !mtp_attn_output || !mtp_attn_proj || !mtp_gate || !mtp_up ||
+            !mtp_ffn_output)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar missing required buffers");
+            return false;
+        }
+
+        MTPForwardInput input;
+        input.draft_token_ids = &draft_condition_token;
+        input.terminal_hidden = terminal_hidden;
+        input.kv_cache = state_.mtp_kv_caches[0].get();
+        input.position_ids = &position_id;
+        input.sequence_lengths = nullptr;
+        input.batch_size = 1;
+        input.seq_len = 1;
+        input.device = state_.device_id;
+
+        MTPForwardOutput output;
+        output.logits = mtp_logits;
+        output.hidden = mtp_hidden;
+        output.embedding = mtp_embedding;
+        output.norm_hidden = mtp_norm_hidden;
+        output.norm_embedding = mtp_norm_embedding;
+        output.concat = mtp_concat;
+        output.projected = mtp_projected;
+        output.q = mtp_q;
+        output.k = mtp_k;
+        output.v = mtp_v;
+        output.q_raw = mtp_q_raw;
+        output.q_gate = mtp_q_gate;
+        output.attn_output = mtp_attn_output;
+        output.attn_proj = mtp_attn_proj;
+        output.gate = mtp_gate;
+        output.up = mtp_up;
+        output.ffn_output = mtp_ffn_output;
+
+        ComputeGraph graph = graph_builder_->buildMTPGraph(
+            0,
+            bindings.mtp.depths[0],
+            input,
+            output);
+        if (graph.size() == 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to build MTP sidecar graph");
+            return false;
+        }
+
+        IDeviceContext *ctx = getDeviceContext(state_.device_id);
+        if (!ctx)
+            return false;
+
+        return execute(graph, ctx);
+    }
+
+    bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(
+        const int *tokens,
+        int seq_len,
+        int batch_size,
+        int position_offset)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled || state_.mtp_kv_caches.empty())
+            return true;
+        if (!tokens || seq_len <= 0)
+            return false;
+
+        if (batch_size != 1)
+        {
+            updateMTPShiftedCacheMetadata(batch_size);
+            return true;
+        }
+
+        if (!frozen_weight_set_)
+        {
+            updateMTPShiftedCacheMetadata(batch_size);
+            return true;
+        }
+
+        auto bindings = makeModelWeightBindings(*frozen_weight_set_);
+        if (bindings.mtp.empty() || bindings.mtp.depths.empty())
+        {
+            updateMTPShiftedCacheMetadata(batch_size);
+            return true;
+        }
+
+        const int previous_tokens = std::max(0, position_offset);
+        auto &cache = state_.mtp_kv_caches[0];
+        if (!cache)
+            return true;
+
+        const int current_mtp_tokens = cache->get_cached_tokens(cache->first_layer_index(), 0);
+        const int expected_previous_mtp_tokens = std::max(0, previous_tokens - 1);
+        if (current_mtp_tokens != expected_previous_mtp_tokens)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] MTP shifted prefill payload replay skipped: "
+                      "cache_count=" << current_mtp_tokens
+                                     << " expected_previous=" << expected_previous_mtp_tokens);
+            updateMTPShiftedCacheMetadata(batch_size);
+            return true;
+        }
+
+        if (previous_tokens > 0 && state_.prefix_terminal_hidden)
+        {
+            if (!executeMTPDepth0(tokens[0],
+                                  state_.prefix_terminal_hidden.get(),
+                                  previous_tokens))
+            {
+                return false;
+            }
+        }
+
+        for (int row = 0; row + 1 < seq_len; ++row)
+        {
+            if (!selectMTPTerminalHiddenRow(row, seq_len))
+                return false;
+            if (!executeMTPDepth0(tokens[row + 1],
+                                  state_.prefix_terminal_hidden.get(),
+                                  position_offset + row + 1))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::updateMTPShiftedCacheMetadata(int active_batch_size)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled || state_.mtp_kv_caches.empty())
+            return;
+
+        const int seq_count = std::min(active_batch_size, state_.batch_size);
+        for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+        {
+            auto &cache = state_.mtp_kv_caches[depth];
+            if (!cache)
+                continue;
+
+            for (int layer = 0; layer < cache->n_layers(); ++layer)
+            {
+                for (int seq = 0; seq < seq_count; ++seq)
+                {
+                    const int shifted_count = std::max(
+                        0,
+                        state_.positions[seq] - static_cast<int>(depth) - 1);
+                    const int bounded_count = std::min(shifted_count, cache->max_seq_len());
+
+                    // Phase 5 wires the request-local shifted state contract before
+                    // decode consumes it. The sidecar execution slice will replace
+                    // this metadata-only update with real MTP K/V appends.
+                    cache->clear_sequence(layer, seq);
+                    if (bounded_count > 0)
+                        cache->advanceHead(layer, seq, bounded_count);
+                }
+            }
+        }
     }
 
     const float *DeviceGraphOrchestrator::logits() const
@@ -2177,9 +2922,1128 @@ namespace llaminar2
         return state_.logits->fp32_data();
     }
 
+    bool DeviceGraphOrchestrator::forwardMTP(int32_t draft_condition_token)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+        if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTP requires an initialized MTP KV cache");
+            return false;
+        }
+        if (!frozen_weight_set_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTP requires frozen MTP weight bindings");
+            return false;
+        }
+
+        auto bindings = makeModelWeightBindings(*frozen_weight_set_);
+        if (bindings.mtp.empty() || bindings.mtp.depths.empty())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTP requested without MTP weight bindings");
+            return false;
+        }
+
+        int position_id = state_.positions.empty() ? 0 : state_.positions[0];
+        TensorBase *terminal_hidden =
+            state_.prefix_terminal_hidden ? state_.prefix_terminal_hidden.get() : state_.hidden.get();
+        if (!terminal_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTP requires a terminal hidden row");
+            return false;
+        }
+        return executeMTPDepth0(draft_condition_token, terminal_hidden, position_id);
+    }
+
+    const float *DeviceGraphOrchestrator::mtpLogits() const
+    {
+        auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        if (it == state_.extension_buffers.end() || !it->second)
+        {
+            return nullptr;
+        }
+        return it->second->fp32_data();
+    }
+
+    bool DeviceGraphOrchestrator::setComputeAllPositionLogits(bool enabled)
+    {
+        if (!graph_builder_)
+        {
+            return false;
+        }
+        if (!graph_builder_->setComputeAllPositionLogits(enabled))
+        {
+            return false;
+        }
+        compute_all_position_logits_ = enabled;
+        return true;
+    }
+
+    const float *DeviceGraphOrchestrator::getAllPositionLogits() const
+    {
+        if (!state_.all_position_logits)
+        {
+            return nullptr;
+        }
+        return state_.all_position_logits->fp32_data();
+    }
+
+    PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const
+    {
+        PrefixRuntimeStateSnapshot snapshot;
+        snapshot.initialized = state_.isInitialized();
+        snapshot.has_hidden = static_cast<bool>(state_.hidden);
+        snapshot.has_logits = static_cast<bool>(state_.logits);
+        snapshot.architecture = architecture();
+        snapshot.execution_path = "graph";
+        snapshot.primary_device = state_.device_id;
+        snapshot.current_position = getPosition(0);
+        snapshot.session_epoch = session_epoch_;
+        snapshot.prefix_cache_config_enabled =
+            graph_builder_ && graph_builder_->config().prefix_cache.enabled;
+        snapshot.prefix_cache_bypassed =
+            snapshot.prefix_cache_config_enabled && prefix_cache_bypassed_;
+        snapshot.prefix_cache_bypass_reason =
+            snapshot.prefix_cache_bypassed ? prefix_cache_bypass_reason_ : "";
+        snapshot.prefix_cache_ready =
+            static_cast<bool>(prefix_cache_) && !snapshot.prefix_cache_bypassed;
+        if (prefix_cache_)
+        {
+            const auto &stats = prefix_cache_->stats();
+            snapshot.prefix_cache_lookups = stats.lookups;
+            snapshot.prefix_cache_hits = stats.hits;
+            snapshot.prefix_cache_partial_hits = stats.partial_hits;
+            snapshot.prefix_cache_misses = stats.misses;
+            snapshot.prefix_cache_matched_blocks = stats.matched_blocks;
+            snapshot.prefix_cache_matched_tokens = stats.matched_tokens;
+            snapshot.prefix_cache_stores = stats.stores;
+            snapshot.prefix_cache_inserts = stats.inserts;
+            snapshot.prefix_cache_evictions = stats.evictions;
+            snapshot.prefix_cache_promotions = stats.promotions;
+            snapshot.prefix_cache_disk_hydrations = stats.disk_hydrations;
+            snapshot.prefix_cache_terminal_state_hits = stats.terminal_state_hits;
+            snapshot.prefix_cache_ram_bytes = stats.ram_bytes;
+            snapshot.prefix_cache_device_bytes = stats.device_bytes;
+            snapshot.prefix_cache_disk_bytes = stats.disk_bytes;
+            snapshot.prefix_cache_hybrid_state_bytes = stats.hybrid_state_bytes;
+            snapshot.prefix_cache_mtp_state_bytes = stats.mtp_state_bytes;
+        }
+        snapshot.prefix_cache_bypasses = prefix_cache_stats_.bypasses;
+        snapshot.prefix_cache_unsupported_backend_bypasses =
+            prefix_cache_stats_.unsupported_backend_bypasses;
+        snapshot.prefix_cache_fingerprint_bypasses =
+            prefix_cache_stats_.fingerprint_bypasses;
+        snapshot.prefix_cache_terminal_state_bypasses =
+            prefix_cache_stats_.terminal_state_bypasses;
+        snapshot.mtp_config_enabled =
+            graph_builder_ && graph_builder_->config().mtp.enabled;
+        snapshot.positions = state_.positions;
+        snapshot.sequence_lengths = state_.sequence_lengths;
+
+        const int sequence_count = state_.batch_size > 0 ? state_.batch_size : 1;
+        if (state_.kv_cache)
+        {
+            auto cache_probe = inspectKVCacheForPrefixProbe(
+                *state_.kv_cache, "primary", state_.device_id, sequence_count);
+            auto gdn_probes = inspectHybridGDNForPrefixProbe(*state_.kv_cache);
+            snapshot.gdn_layers.insert(snapshot.gdn_layers.end(),
+                                       gdn_probes.begin(), gdn_probes.end());
+            snapshot.kv_caches.push_back(std::move(cache_probe));
+        }
+
+        for (const auto &[device, cache] : state_.pp_kv_caches)
+        {
+            if (!cache)
+            {
+                continue;
+            }
+            auto cache_probe = inspectKVCacheForPrefixProbe(
+                *cache, "pp:" + device.to_string(), device, sequence_count);
+            auto gdn_probes = inspectHybridGDNForPrefixProbe(*cache);
+            snapshot.gdn_layers.insert(snapshot.gdn_layers.end(),
+                                       gdn_probes.begin(), gdn_probes.end());
+            snapshot.kv_caches.push_back(std::move(cache_probe));
+        }
+
+        for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+        {
+            const auto &cache = state_.mtp_kv_caches[depth];
+            if (!cache)
+            {
+                continue;
+            }
+            snapshot.mtp_kv_caches.push_back(inspectKVCacheForPrefixProbe(
+                *cache,
+                "mtp:" + std::to_string(depth),
+                state_.device_id,
+                sequence_count));
+        }
+
+        return snapshot;
+    }
+
+    void DeviceGraphOrchestrator::disablePrefixCacheForRunner(const std::string &reason)
+    {
+        const bool should_record =
+            !prefix_cache_bypassed_ &&
+            graph_builder_ &&
+            graph_builder_->config().prefix_cache.enabled &&
+            reason != "feature disabled";
+
+        if (should_record)
+        {
+            ++prefix_cache_stats_.bypasses;
+            const std::string normalized_reason = lowerASCII(reason);
+            if (containsAny(normalized_reason, {"fingerprint", "moe placement policy"}))
+            {
+                ++prefix_cache_stats_.fingerprint_bypasses;
+            }
+            else if (containsAny(normalized_reason, {"terminal"}))
+            {
+                ++prefix_cache_stats_.terminal_state_bypasses;
+            }
+            else if (containsAny(normalized_reason,
+                                 {"unavailable",
+                                  "not implemented",
+                                  "does not expose",
+                                  "without an initialized",
+                                  "graph builder unavailable"}))
+            {
+                ++prefix_cache_stats_.unsupported_backend_bypasses;
+            }
+        }
+        prefix_cache_bypassed_ = true;
+        prefix_cache_bypass_reason_ = reason;
+        if (!reason.empty())
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Prefix cache bypassed: " << reason);
+        }
+    }
+
+    bool DeviceGraphOrchestrator::isPrefixCacheMoEModel() const
+    {
+        if (!graph_builder_)
+            return false;
+        const std::string architecture = graph_builder_->architectureName();
+        return architecture.find("moe") != std::string::npos ||
+               architecture.find("MoE") != std::string::npos;
+    }
+
+    PrefixCacheFingerprintResult DeviceGraphOrchestrator::buildCurrentPrefixFingerprint(
+        const PrefixCacheRuntimeConfig &prefix_config) const
+    {
+        const auto &config = graph_builder_->config();
+        PrefixFingerprintMaterial material;
+        material.model = {
+            {"architecture", graph_builder_->architectureName()},
+            {"n_layers", std::to_string(config.n_layers)},
+            {"d_model", std::to_string(config.d_model)},
+            {"n_heads", std::to_string(config.n_heads)},
+            {"n_kv_heads", std::to_string(config.n_kv_heads)},
+            {"vocab_size", std::to_string(config.vocab_size)},
+        };
+        material.runtime = {
+            {"activation_precision", activationPrecisionToString(config.activation_precision)},
+            {"kv_cache_precision", kvCachePrecisionToString(config.kv_cache_precision)},
+            {"k_precision", activationPrecisionToString(prefix_layout_.k_precision)},
+            {"v_precision", activationPrecisionToString(prefix_layout_.v_precision)},
+            {"kv_layout", std::to_string(static_cast<int>(prefix_layout_.kv_layout))},
+            {"block_size", std::to_string(prefix_layout_.block_size)},
+            {"terminal_state", prefixCacheTerminalStateModeToString(prefix_config.terminal_state)},
+        };
+        material.topology = {
+            {"device", state_.device_id.toString()},
+            {"first_layer_index", std::to_string(prefix_layout_.first_layer_index)},
+            {"total_layers", std::to_string(prefix_layout_.total_layers)},
+            {"local_kv_heads", std::to_string(prefix_layout_.local_kv_heads)},
+            {"kv_head_start", std::to_string(prefix_layout_.kv_head_start)},
+            {"head_dim", std::to_string(prefix_layout_.head_dim)},
+        };
+        material.hybrid = prefix_layout_.includes_hybrid_state
+                              ? std::vector<PrefixFingerprintField>{
+                                    {"enabled", "true"},
+                                    {"gdn_layers", std::to_string(prefix_layout_.gdn_layers)},
+                                    {"hybrid_host_state_bytes", std::to_string(prefix_layout_.hybrid_host_state_bytes)},
+                                    {"hybrid_device_state_bytes", std::to_string(prefix_layout_.hybrid_device_state_bytes)},
+                                    {"hybrid_state_bytes", std::to_string(prefix_layout_.hybrid_state_bytes)},
+                                }
+                              : std::vector<PrefixFingerprintField>{{"enabled", "false"}};
+        material.mtp = config.mtp.enabled
+                           ? std::vector<PrefixFingerprintField>{
+                                 {"enabled", "true"},
+                                 {"draft_tokens", std::to_string(config.mtp.draft_tokens)},
+                                 {"verify_mode", mtpVerifyModeToString(config.mtp.verify_mode)},
+                                 {"require_terminal_hidden_for_full_hit",
+                                  config.mtp.require_terminal_hidden_for_full_hit ? "true" : "false"},
+                                 {"terminal_hidden_bytes", std::to_string(prefix_layout_.terminal_hidden_bytes)},
+                             }
+                           : std::vector<PrefixFingerprintField>{{"enabled", "false"}};
+
+        const bool model_is_moe = isPrefixCacheMoEModel();
+        if (model_is_moe)
+        {
+            material.moe.push_back({"policy", prefixCacheMoEPolicyToString(prefix_config.moe_policy)});
+            material.moe.push_back({"model_is_moe", "true"});
+            if (moe_rebalance_controller_)
+            {
+                const auto *controller = moe_rebalance_controller_.get();
+                material.moe.push_back({"controller.num_layers", std::to_string(controller->numLayers())});
+                material.moe.push_back({"controller.num_experts", std::to_string(controller->numExperts())});
+                material.moe.push_back({"controller.top_k", std::to_string(controller->topK())});
+                material.moe.push_back({"controller.total_rebalances", std::to_string(controller->totalRebalances())});
+
+                const auto &placement = controller->currentPlacement();
+                for (size_t expert = 0; expert < placement.size(); ++expert)
+                {
+                    material.moe.push_back({"controller.expert." + std::to_string(expert) + ".owner_socket",
+                                            std::to_string(placement[expert])});
+                }
+
+                const auto &replicas = controller->currentReplicas();
+                material.moe.push_back({"controller.replicas.count", std::to_string(replicas.num_replicated)});
+                for (size_t expert = 0; expert < replicas.is_replicated.size(); ++expert)
+                {
+                    const std::string prefix = "controller.replica." + std::to_string(expert);
+                    material.moe.push_back({prefix + ".enabled", replicas.is_replicated[expert] ? "1" : "0"});
+                    if (expert < replicas.owner_socket.size())
+                    {
+                        material.moe.push_back({prefix + ".owner_socket",
+                                                std::to_string(replicas.owner_socket[expert])});
+                    }
+                }
+            }
+        }
+
+        if (graph_builder_)
+            graph_builder_->appendPrefixCacheFingerprintMaterial(material);
+
+        return buildPrefixCacheFingerprint(
+            material,
+            model_is_moe,
+            prefix_config.moe_policy);
+    }
+
+    bool DeviceGraphOrchestrator::ensurePrefixCacheReady()
+    {
+        if (!graph_builder_)
+        {
+            disablePrefixCacheForRunner("graph builder unavailable");
+            return false;
+        }
+
+        const auto &config = graph_builder_->config();
+        const auto &prefix_config = config.prefix_cache;
+        if (prefix_cache_bypassed_)
+        {
+            return false;
+        }
+        if (prefix_cache_)
+        {
+            auto fingerprint = buildCurrentPrefixFingerprint(prefix_config);
+            if (fingerprint.bypass || fingerprint.key == 0)
+            {
+                disablePrefixCacheForRunner(
+                    fingerprint.bypass_reason.empty() ? "fingerprint refresh requested bypass"
+                                                      : fingerprint.bypass_reason);
+                return false;
+            }
+            if (fingerprint.key != prefix_fingerprint_)
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Prefix cache fingerprint refreshed for "
+                          << graph_builder_->architectureName());
+                prefix_fingerprint_ = fingerprint.key;
+            }
+            return true;
+        }
+        if (!prefix_config.enabled ||
+            prefix_config.storage_mode == PrefixCacheStorageMode::Disabled)
+        {
+            disablePrefixCacheForRunner("feature disabled");
+            return false;
+        }
+        if (prefix_config.storage_mode == PrefixCacheStorageMode::Device)
+        {
+            disablePrefixCacheForRunner("device-only prefix cache tier is not implemented yet");
+            return false;
+        }
+        if (!state_.isInitialized() || !state_.kv_cache)
+        {
+            disablePrefixCacheForRunner("inference state or KV cache unavailable");
+            return false;
+        }
+        if (!state_.pp_kv_caches.empty())
+        {
+            disablePrefixCacheForRunner("pipeline-parallel KV cache restore is not implemented yet");
+            return false;
+        }
+        const int block_size = prefix_config.block_size > 0 ? prefix_config.block_size : 64;
+        const bool terminal_state_enabled =
+            prefix_config.terminal_state != PrefixCacheTerminalStateMode::Off;
+        const size_t terminal_hidden_bytes =
+            config.mtp.enabled && terminal_state_enabled && state_.d_model > 0
+                ? static_cast<size_t>(state_.d_model) * sizeof(float)
+                : 0;
+        const size_t terminal_logits_bytes =
+            !terminal_state_enabled
+                ? 0
+                : static_cast<size_t>(state_.vocab_size) * sizeof(float);
+
+        prefix_layout_ = buildDensePrefixPayloadLayout(
+            *state_.kv_cache,
+            state_.device_id,
+            block_size,
+            terminal_hidden_bytes,
+            terminal_logits_bytes);
+
+        if (config.mtp.enabled)
+        {
+            if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+            {
+                disablePrefixCacheForRunner("MTP prefix cache requested without an initialized MTP KV cache");
+                return false;
+            }
+            if (!attachMTPPayloadLayout(prefix_layout_, *state_.mtp_kv_caches[0]))
+            {
+                disablePrefixCacheForRunner("MTP KV cache does not expose a logical payload layout");
+                return false;
+            }
+        }
+
+        if (prefix_layout_.fa_layers <= 0 || prefix_layout_.faKVBytes() == 0)
+        {
+            disablePrefixCacheForRunner("KV cache does not expose a dense logical payload layout");
+            return false;
+        }
+        const size_t block_bytes = prefix_layout_.totalBytes();
+        if (block_bytes == 0 || prefix_config.ram_budget_bytes < block_bytes)
+        {
+            disablePrefixCacheForRunner("RAM budget cannot hold one complete prefix block");
+            return false;
+        }
+
+        auto fingerprint = buildCurrentPrefixFingerprint(prefix_config);
+        if (fingerprint.bypass || fingerprint.key == 0)
+        {
+            disablePrefixCacheForRunner(
+                fingerprint.bypass_reason.empty() ? "fingerprint build requested bypass"
+                                                  : fingerprint.bypass_reason);
+            return false;
+        }
+
+        prefix_fingerprint_ = fingerprint.key;
+        prefix_ram_backend_ = std::make_shared<RamPrefixStorageBackend>(prefix_config.ram_budget_bytes);
+        prefix_device_hot_backend_.reset();
+        if (prefix_config.storage_mode == PrefixCacheStorageMode::Tiered &&
+            state_.device_id.is_gpu() &&
+            prefix_config.device_budget_bytes >= block_bytes)
+        {
+            prefix_device_hot_backend_ = std::make_shared<DeviceHotPrefixStorageBackend>(
+                state_.device_id,
+                prefix_config.device_budget_bytes);
+        }
+        prefix_disk_backend_.reset();
+        if (prefix_config.storage_mode == PrefixCacheStorageMode::Tiered &&
+            prefix_config.disk_budget_bytes > 0 &&
+            !prefix_config.disk_dir.empty())
+        {
+            prefix_disk_backend_ = std::make_shared<DiskPrefixStorageBackend>(
+                prefix_config.disk_dir,
+                prefix_config.disk_budget_bytes);
+        }
+        prefix_cache_ = std::make_shared<PrefixStateCache>(
+            prefix_config.ram_budget_bytes,
+            prefix_ram_backend_,
+            prefix_disk_backend_,
+            prefix_device_hot_backend_);
+        prefix_cache_bypassed_ = false;
+        prefix_cache_bypass_reason_.clear();
+        LOG_INFO("[DeviceGraphOrchestrator] Prefix cache enabled: block_size="
+                 << prefix_layout_.block_size
+                 << " block_bytes=" << block_bytes
+                 << " ram_budget_bytes=" << prefix_config.ram_budget_bytes
+                 << " device_hot_budget_bytes=" << (prefix_device_hot_backend_ ? prefix_config.device_budget_bytes : 0)
+                 << " disk_budget_bytes=" << (prefix_disk_backend_ ? prefix_config.disk_budget_bytes : 0)
+                 << " disk_dir=" << (prefix_disk_backend_ ? prefix_config.disk_dir : ""));
+        return true;
+    }
+
+    PrefixCacheKey DeviceGraphOrchestrator::makePrefixKeyForBlock(
+        const std::vector<int32_t> &tokens,
+        int block_index,
+        uint64_t parent_hash) const
+    {
+        const int start = block_index * prefix_layout_.block_size;
+        const int end = std::min<int>(start + prefix_layout_.block_size, tokens.size());
+        std::vector<int32_t> block_tokens(tokens.begin() + start, tokens.begin() + end);
+        return makePrefixCacheKey(prefix_fingerprint_, parent_hash, block_index, start, block_tokens);
+    }
+
+    PrefixLookupResult DeviceGraphOrchestrator::lookupPrefix(const std::vector<int32_t> &tokens)
+    {
+        PrefixLookupResult result;
+        result.cache_enabled = graph_builder_ && graph_builder_->config().prefix_cache.enabled;
+
+        if (!ensurePrefixCacheReady())
+        {
+            result.bypass_reason = prefix_cache_bypass_reason_;
+            return result;
+        }
+
+        result.supported = true;
+        result.block_size = prefix_layout_.block_size;
+        result.fingerprint_key = prefix_fingerprint_;
+        if (tokens.empty() || prefix_layout_.block_size <= 0)
+        {
+            return result;
+        }
+
+        const int complete_blocks = static_cast<int>(tokens.size()) / prefix_layout_.block_size;
+        uint64_t parent_hash = 0;
+        for (int block = 0; block < complete_blocks; ++block)
+        {
+            PrefixCacheKey key = makePrefixKeyForBlock(tokens, block, parent_hash);
+            auto handle = prefix_cache_->find(key);
+            if (!handle || !handle->layout.compatiblePayloadShape(prefix_layout_))
+            {
+                break;
+            }
+
+            result.blocks.push_back(*handle);
+            result.cached_tokens += handle->key.token_count;
+            result.has_terminal_hidden = handle->has_terminal_hidden;
+            result.has_terminal_logits = handle->has_terminal_logits;
+            parent_hash = key.stableHash();
+        }
+
+        prefix_cache_->recordRequestLookup(
+            static_cast<int>(tokens.size()),
+            result.cached_tokens,
+            static_cast<int>(result.blocks.size()));
+
+        return result;
+    }
+
+    bool DeviceGraphOrchestrator::populatePrefix(const PrefixLookupResult &hit, int seq_idx)
+    {
+        if (hit.cached_tokens <= 0)
+        {
+            return true;
+        }
+        if (!ensurePrefixCacheReady() || !state_.kv_cache)
+        {
+            return false;
+        }
+        if (seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            return false;
+        }
+        if (hit.blocks.empty())
+        {
+            return false;
+        }
+
+        for (const auto &handle : hit.blocks)
+        {
+            if (!handle.valid() || !handle.layout.compatiblePayloadShape(prefix_layout_) ||
+                !handle.kvKData() || !handle.kvVData())
+            {
+                return false;
+            }
+
+            for (int local_layer = 0; local_layer < prefix_layout_.fa_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(*state_.kv_cache, local_layer);
+                if (global_layer < 0)
+                {
+                    return false;
+                }
+                const uint8_t *k_src = handle.kvKData() +
+                                       static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_k;
+                const uint8_t *v_src = handle.kvVData() +
+                                       static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_v;
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = seq_idx;
+                desc.logical_token_start = handle.key.token_start;
+                desc.token_count = handle.key.token_count;
+                if (!state_.kv_cache->importLogicalBlock(desc, k_src, v_src))
+                {
+                    return false;
+                }
+            }
+
+            if (prefix_layout_.includes_mtp_state)
+            {
+                if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+                {
+                    return false;
+                }
+                if (!importMTPPrefixPayload(*state_.mtp_kv_caches[0], seq_idx, handle))
+                {
+                    return false;
+                }
+            }
+        }
+
+        if (prefix_layout_.includes_hybrid_state &&
+            !importHybridPrefixPayload(*state_.kv_cache, hit.blocks.back(), seq_idx))
+        {
+            return false;
+        }
+
+        if (graph_builder_ && graph_builder_->config().mtp.enabled &&
+            hit.has_terminal_hidden &&
+            hit.blocks.back().has_terminal_hidden &&
+            hit.blocks.back().terminal_hidden)
+        {
+            if (!ensureMTPTerminalHiddenBuffer())
+                return false;
+            void *hidden_dst = state_.prefix_terminal_hidden
+                                   ? state_.prefix_terminal_hidden->raw_mutable_data()
+                                   : nullptr;
+            if (!hidden_dst || prefix_layout_.terminal_hidden_bytes == 0)
+                return false;
+            std::memcpy(hidden_dst,
+                        hit.blocks.back().terminal_hidden,
+                        prefix_layout_.terminal_hidden_bytes);
+            if (state_.device_id.is_gpu())
+            {
+                auto upload = TransferEngine::instance().upload(
+                    state_.prefix_terminal_hidden.get(),
+                    state_.device_id);
+                if (!upload.success)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal hidden: "
+                              << upload.error);
+                    return false;
+                }
+            }
+        }
+
+        state_.positions[seq_idx] = hit.cached_tokens;
+        state_.sequence_lengths[seq_idx] = hit.cached_tokens;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::restorePrefixTerminalState(const PrefixLookupResult &hit)
+    {
+        if (!hit.has_terminal_logits || hit.blocks.empty() || !state_.logits)
+        {
+            return false;
+        }
+
+        const PrefixBlockHandle &terminal = hit.blocks.back();
+        if (!terminal.has_terminal_logits || !terminal.terminal_logits)
+        {
+            return false;
+        }
+
+        void *dst = state_.logits->raw_mutable_data();
+        if (!dst)
+        {
+            return false;
+        }
+        std::memcpy(dst, terminal.terminal_logits, prefix_layout_.terminal_logits_bytes);
+        if (state_.device_id.is_gpu())
+        {
+            auto upload = TransferEngine::instance().upload(state_.logits.get(), state_.device_id);
+            if (!upload.success)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal logits: "
+                          << upload.error);
+                return false;
+            }
+        }
+        if (prefix_cache_)
+        {
+            prefix_cache_->recordTerminalStateHit();
+        }
+
+        if (graph_builder_ && graph_builder_->config().mtp.enabled &&
+            terminal.has_terminal_hidden && terminal.terminal_hidden)
+        {
+            if (!ensureMTPTerminalHiddenBuffer())
+                return false;
+            void *hidden_dst = state_.prefix_terminal_hidden
+                                   ? state_.prefix_terminal_hidden->raw_mutable_data()
+                                   : nullptr;
+            if (!hidden_dst || prefix_layout_.terminal_hidden_bytes == 0)
+                return false;
+            std::memcpy(hidden_dst, terminal.terminal_hidden, prefix_layout_.terminal_hidden_bytes);
+            if (state_.device_id.is_gpu())
+            {
+                auto upload = TransferEngine::instance().upload(
+                    state_.prefix_terminal_hidden.get(),
+                    state_.device_id);
+                if (!upload.success)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal hidden: "
+                              << upload.error);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::harvestPrefix(
+        const std::vector<int32_t> &tokens,
+        int prompt_token_count)
+    {
+        if (prompt_token_count <= 0 || prompt_token_count > static_cast<int>(tokens.size()))
+        {
+            return false;
+        }
+        if (!ensurePrefixCacheReady() || !state_.kv_cache || !prefix_ram_backend_)
+        {
+            return false;
+        }
+
+        const int complete_blocks = prompt_token_count / prefix_layout_.block_size;
+        if (prefix_layout_.includes_hybrid_state && complete_blocks != 1)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Hybrid prefix harvest currently requires one complete block");
+            return false;
+        }
+
+        uint64_t parent_hash = 0;
+        for (int block = 0; block < complete_blocks; ++block)
+        {
+            PrefixCacheKey key = makePrefixKeyForBlock(tokens, block, parent_hash);
+            parent_hash = key.stableHash();
+            if (prefix_cache_->contains(key))
+            {
+                continue;
+            }
+
+            if (!prefix_cache_->reserveRam(prefix_layout_.totalBytes()))
+            {
+                return false;
+            }
+
+            PrefixBlockHandle handle = prefix_ram_backend_->allocate(key, prefix_layout_);
+            if (!handle.valid())
+            {
+                return false;
+            }
+
+            bool ok = true;
+            for (int local_layer = 0; local_layer < prefix_layout_.fa_layers && ok; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(*state_.kv_cache, local_layer);
+                if (global_layer < 0)
+                {
+                    ok = false;
+                    break;
+                }
+                uint8_t *k_dst = handle.kvKData() +
+                                 static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_k;
+                uint8_t *v_dst = handle.kvVData() +
+                                 static_cast<size_t>(local_layer) * prefix_layout_.bytes_per_fa_layer_v;
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = 0;
+                desc.logical_token_start = key.token_start;
+                desc.token_count = key.token_count;
+                ok = state_.kv_cache->exportLogicalBlock(desc, k_dst, v_dst);
+            }
+
+            if (ok && prefix_layout_.includes_mtp_state)
+            {
+                if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+                {
+                    ok = false;
+                }
+                else
+                {
+                    ok = exportMTPPrefixPayload(*state_.mtp_kv_caches[0], 0, key, &handle);
+                }
+            }
+
+            const bool terminal_block =
+                (key.token_start + key.token_count) == prompt_token_count;
+            if (ok && terminal_block && prefix_layout_.includes_hybrid_state)
+            {
+                ok = exportHybridPrefixPayload(
+                    *state_.kv_cache,
+                    0,
+                    key.token_start + key.token_count,
+                    &handle);
+            }
+
+            if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
+                state_.logits && handle.terminal_logits)
+            {
+                if (state_.device_id.is_gpu())
+                {
+                    auto download = TransferEngine::instance().download(state_.logits.get());
+                    if (!download.success)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to download prefix terminal logits: "
+                                  << download.error);
+                        ok = false;
+                    }
+                }
+                const float *logits = ok ? state_.logits->fp32_data() : nullptr;
+                if (ok && logits)
+                {
+                    std::memcpy(handle.terminal_logits, logits, prefix_layout_.terminal_logits_bytes);
+                    handle.has_terminal_logits = true;
+                }
+            }
+
+            if (ok && terminal_block && prefix_layout_.includes_terminal_hidden &&
+                state_.prefix_terminal_hidden && handle.terminal_hidden)
+            {
+                if (state_.device_id.is_gpu())
+                {
+                    auto download = TransferEngine::instance().download(state_.prefix_terminal_hidden.get());
+                    if (!download.success)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to download prefix terminal hidden: "
+                                  << download.error);
+                        ok = false;
+                    }
+                }
+                const void *hidden = ok ? state_.prefix_terminal_hidden->raw_data() : nullptr;
+                if (ok && hidden)
+                {
+                    std::memcpy(handle.terminal_hidden, hidden, prefix_layout_.terminal_hidden_bytes);
+                    handle.has_terminal_hidden = true;
+                }
+            }
+
+            if (!ok || !prefix_cache_->insert(handle))
+            {
+                prefix_ram_backend_->release(handle);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixState(int seq_idx) const
+    {
+        PrefixStateSnapshot snapshot;
+        if (!state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            return snapshot;
+        }
+
+        const int first_layer = state_.kv_cache->first_layer_index();
+        const int cached_tokens = state_.kv_cache->get_cached_tokens(first_layer, seq_idx);
+        if (cached_tokens < 0 || cached_tokens > state_.kv_cache->max_seq_len())
+        {
+            return snapshot;
+        }
+
+        snapshot.valid = true;
+        snapshot.cached_tokens = cached_tokens;
+        if (cached_tokens > 0)
+        {
+            PrefixPayloadLayout layout = buildDensePrefixPayloadLayout(
+                *state_.kv_cache,
+                state_.device_id,
+                cached_tokens);
+
+            PrefixBlockHandle handle;
+            handle.key.fingerprint = prefix_fingerprint_ != 0 ? prefix_fingerprint_ : 1;
+            handle.key.block_index = 0;
+            handle.key.token_start = 0;
+            handle.key.token_count = cached_tokens;
+            handle.layout = layout;
+            handle.total_bytes = layout.totalBytes();
+
+            const size_t kv_bytes = layout.faKVBytes();
+            if (kv_bytes == 0)
+            {
+                return {};
+            }
+            handle.kv_storage = std::make_shared<std::vector<uint8_t>>(kv_bytes, 0);
+            handle.kv_payload = handle.kv_storage->data();
+            if (layout.includes_hybrid_state && layout.hybrid_state_bytes > 0)
+            {
+                handle.hybrid_storage = std::make_shared<std::vector<uint8_t>>(layout.hybrid_state_bytes, 0);
+                handle.hybrid_payload = handle.hybrid_storage->data();
+            }
+
+            for (int local_layer = 0; local_layer < layout.fa_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(*state_.kv_cache, local_layer);
+                if (global_layer < 0)
+                {
+                    return {};
+                }
+                uint8_t *k_dst = handle.kvKData() +
+                                 static_cast<size_t>(local_layer) * layout.bytes_per_fa_layer_k;
+                uint8_t *v_dst = handle.kvVData() +
+                                 static_cast<size_t>(local_layer) * layout.bytes_per_fa_layer_v;
+
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = seq_idx;
+                desc.logical_token_start = 0;
+                desc.token_count = cached_tokens;
+                if (!state_.kv_cache->exportLogicalBlock(desc, k_dst, v_dst))
+                {
+                    return {};
+                }
+            }
+
+            if (!exportHybridPrefixPayload(
+                    *state_.kv_cache,
+                    seq_idx,
+                    cached_tokens,
+                    &handle))
+            {
+                return {};
+            }
+
+            snapshot.blocks.push_back(std::move(handle));
+        }
+
+        for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+        {
+            const auto &cache = state_.mtp_kv_caches[depth];
+            if (!cache)
+            {
+                continue;
+            }
+
+            const int first_mtp_layer = cache->first_layer_index();
+            const int mtp_cached_tokens = cache->get_cached_tokens(first_mtp_layer, seq_idx);
+            if (mtp_cached_tokens < 0 || mtp_cached_tokens > cache->max_seq_len())
+            {
+                return {};
+            }
+            if (mtp_cached_tokens == 0)
+            {
+                continue;
+            }
+
+            PrefixPayloadLayout layout = buildDensePrefixPayloadLayout(
+                *cache,
+                state_.device_id,
+                mtp_cached_tokens);
+
+            PrefixBlockHandle handle;
+            handle.key.fingerprint = prefix_fingerprint_ != 0 ? prefix_fingerprint_ : 1;
+            handle.key.block_index = static_cast<int>(depth);
+            handle.key.token_start = 0;
+            handle.key.token_count = mtp_cached_tokens;
+            handle.layout = layout;
+            handle.total_bytes = layout.totalBytes();
+
+            const size_t kv_bytes = layout.faKVBytes();
+            if (kv_bytes == 0)
+            {
+                return {};
+            }
+            handle.kv_storage = std::make_shared<std::vector<uint8_t>>(kv_bytes, 0);
+            handle.kv_payload = handle.kv_storage->data();
+
+            for (int local_layer = 0; local_layer < layout.fa_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(*cache, local_layer);
+                if (global_layer < 0)
+                {
+                    return {};
+                }
+                uint8_t *k_dst = handle.kvKData() +
+                                 static_cast<size_t>(local_layer) * layout.bytes_per_fa_layer_k;
+                uint8_t *v_dst = handle.kvVData() +
+                                 static_cast<size_t>(local_layer) * layout.bytes_per_fa_layer_v;
+
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = seq_idx;
+                desc.logical_token_start = 0;
+                desc.token_count = mtp_cached_tokens;
+                if (!cache->exportLogicalBlock(desc, k_dst, v_dst))
+                {
+                    return {};
+                }
+            }
+
+            snapshot.mtp_blocks.push_back(std::move(handle));
+        }
+
+        return snapshot;
+    }
+
+    bool DeviceGraphOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)
+    {
+        if (!snapshot.valid || !state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            return false;
+        }
+        if (snapshot.cached_tokens < 0 || snapshot.cached_tokens > state_.kv_cache->max_seq_len())
+        {
+            return false;
+        }
+
+        state_.kv_cache->clear_sequence(seq_idx);
+        for (auto &cache : state_.mtp_kv_caches)
+        {
+            if (cache)
+            {
+                cache->clear_sequence(seq_idx);
+            }
+        }
+
+        if (snapshot.cached_tokens == 0)
+        {
+            if (!snapshot.mtp_blocks.empty())
+            {
+                return false;
+            }
+            resetHybridPrefixPayloadState(*state_.kv_cache);
+            state_.positions[seq_idx] = 0;
+            state_.sequence_lengths[seq_idx] = 0;
+            return true;
+        }
+
+        for (const auto &handle : snapshot.blocks)
+        {
+            if (!handle.valid() || !handle.kvKData() || !handle.kvVData())
+            {
+                return false;
+            }
+
+            PrefixPayloadLayout expected = buildDensePrefixPayloadLayout(
+                *state_.kv_cache,
+                state_.device_id,
+                handle.key.token_count);
+            if (!handle.layout.compatiblePayloadShape(expected))
+            {
+                return false;
+            }
+
+            for (int local_layer = 0; local_layer < handle.layout.fa_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(*state_.kv_cache, local_layer);
+                if (global_layer < 0)
+                {
+                    return false;
+                }
+                const uint8_t *k_src = handle.kvKData() +
+                                       static_cast<size_t>(local_layer) * handle.layout.bytes_per_fa_layer_k;
+                const uint8_t *v_src = handle.kvVData() +
+                                       static_cast<size_t>(local_layer) * handle.layout.bytes_per_fa_layer_v;
+
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = seq_idx;
+                desc.logical_token_start = handle.key.token_start;
+                desc.token_count = handle.key.token_count;
+                if (!state_.kv_cache->importLogicalBlock(desc, k_src, v_src))
+                {
+                    return false;
+                }
+            }
+        }
+
+        if (!snapshot.blocks.empty() &&
+            !importHybridPrefixPayload(*state_.kv_cache, snapshot.blocks.back(), seq_idx))
+        {
+            return false;
+        }
+
+        for (const auto &handle : snapshot.mtp_blocks)
+        {
+            if (!handle.valid() || !handle.kvKData() || !handle.kvVData())
+            {
+                return false;
+            }
+
+            const int depth = handle.key.block_index;
+            if (depth < 0 || depth >= static_cast<int>(state_.mtp_kv_caches.size()))
+            {
+                return false;
+            }
+            auto &cache = state_.mtp_kv_caches[static_cast<size_t>(depth)];
+            if (!cache || handle.key.token_count < 0 || handle.key.token_count > cache->max_seq_len())
+            {
+                return false;
+            }
+
+            PrefixPayloadLayout expected = buildDensePrefixPayloadLayout(
+                *cache,
+                state_.device_id,
+                handle.key.token_count);
+            if (!handle.layout.compatiblePayloadShape(expected))
+            {
+                return false;
+            }
+
+            for (int local_layer = 0; local_layer < handle.layout.fa_layers; ++local_layer)
+            {
+                const int global_layer = prefixFALayerForIndex(*cache, local_layer);
+                if (global_layer < 0)
+                {
+                    return false;
+                }
+                const uint8_t *k_src = handle.kvKData() +
+                                       static_cast<size_t>(local_layer) * handle.layout.bytes_per_fa_layer_k;
+                const uint8_t *v_src = handle.kvVData() +
+                                       static_cast<size_t>(local_layer) * handle.layout.bytes_per_fa_layer_v;
+
+                IKVCache::KVCacheLogicalBlockDescriptor desc;
+                desc.layer = global_layer;
+                desc.seq_idx = seq_idx;
+                desc.logical_token_start = handle.key.token_start;
+                desc.token_count = handle.key.token_count;
+                if (!cache->importLogicalBlock(desc, k_src, v_src))
+                {
+                    return false;
+                }
+            }
+        }
+
+        state_.positions[seq_idx] = snapshot.cached_tokens;
+        state_.sequence_lengths[seq_idx] = snapshot.cached_tokens;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::truncateLivePrefixState(int cached_tokens, int seq_idx)
+    {
+        if (!state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            return false;
+        }
+        if (!state_.kv_cache->truncateSequence(seq_idx, cached_tokens))
+        {
+            return false;
+        }
+        for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+        {
+            auto &cache = state_.mtp_kv_caches[depth];
+            if (!cache)
+            {
+                continue;
+            }
+            const int shifted_count = std::max(
+                0,
+                cached_tokens - static_cast<int>(depth) - 1);
+            const int bounded_count = std::min(shifted_count, cache->max_seq_len());
+            if (!cache->truncateSequence(seq_idx, bounded_count))
+            {
+                return false;
+            }
+        }
+        state_.positions[seq_idx] = cached_tokens;
+        state_.sequence_lengths[seq_idx] = cached_tokens;
+        return true;
+    }
+
     int DeviceGraphOrchestrator::sampleGreedyOnDevice()
     {
         if (!state_.device_id.is_gpu() || !state_.logits)
+            return -1;
+        if (!state_.logits->deviceValid())
             return -1;
 
         IBackend *backend = getBackendFor(state_.device_id);
@@ -2220,6 +4084,8 @@ namespace llaminar2
             return true; // Nothing to apply, success
 
         if (!state_.device_id.is_gpu() || !state_.logits)
+            return false;
+        if (!state_.logits->deviceValid())
             return false;
 
         IBackend *backend = getBackendFor(state_.device_id);

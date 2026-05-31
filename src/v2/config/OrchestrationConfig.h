@@ -450,6 +450,13 @@ namespace llaminar2
         std::string kv_cache_precision = "auto";   ///< "auto" (q16_1 on CPU, fp16 on GPU), "fp32", "fp16", "q8_1", "q16_1"
 
         // =========================================================================
+        // Prefix Cache and MTP
+        // =========================================================================
+
+        PrefixCacheRuntimeConfig prefix_cache; ///< Disabled-by-default prefix-state cache settings
+        MTPRuntimeConfig mtp;                  ///< Disabled-by-default multi-token prediction settings
+
+        // =========================================================================
         // Weight Sharding
         // =========================================================================
 

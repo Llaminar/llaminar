@@ -47,6 +47,7 @@ namespace llaminar2
         void setSuppressTimeline(bool suppress) override;
         void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
 
     private:
         IOrchestrationRunner *orch_runner_;

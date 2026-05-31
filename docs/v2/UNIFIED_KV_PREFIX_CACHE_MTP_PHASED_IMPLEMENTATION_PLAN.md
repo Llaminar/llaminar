@@ -16,6 +16,8 @@ The phases below are ordered to keep correctness ahead of performance. Each phas
 - RAM is the primary correctness tier. Device memory is a hot promotion tier, and disk is durable backing. Device-tier eviction must never invalidate RAM/disk source blocks.
 - GDN rollback is snapshot/restore/replay first. GDN recurrence and short-conv state mutate in place and cannot be treated like append-only KV rows.
 - MoE decode histograms are telemetry, not prefix payload. MoE placement, masks, replicas, and rebalance epoch are key material.
+- MoE rebalance is domain-scoped, not socket-scoped. Placement, masks, replicas, histograms, and epochs are keyed by ExpertParallel domain id and participant id.
+- Sparse ExpertParallel graph capture is segmented around explicit dispatch/return collective boundaries. Rebalance can happen only between prefill chunks or decode steps, never during capture/replay or while a sparse collective is incomplete.
 - MTP support starts with Qwen3.5/Qwen3.6 D=1 shared-embedding models and stays config-gated until greedy parity is stable.
 - All config parsing follows the V2 pipeline: `OrchestrationConfig` -> `RuntimeConfig` / `RankExecutionPlan` -> `GraphConfig` -> graph builders and runners.
 
@@ -981,15 +983,15 @@ Hybrid payload layout adds one complete GDN-state snapshot per prefix block. Thi
 - Hybrid MTP rollback is correct under forced mismatch.
 - Existing CUDA/ROCm hybrid reset tests still pass.
 
-## Phase 8: MoE Safety, Rebalance, And Parallelism
+## Phase 8: MoE Safety, Domain-Scoped Rebalance, And Parallelism
 
 ### Goal
 
-Make prefix cache and MTP safe across MoE placement changes and multi-device execution.
+Make prefix cache and MTP safe across MoE placement changes, dynamic rebalance, and multi-device execution. This phase incorporates the Tier 1.5 rebalance-domain cleanup from `PREFILL_HIP_GRAPH_CAPTURE_PLAN.md`: the rebalance controller must stop being a CPU-socket special case and become an ExpertParallel domain controller with explicit participants, placement epochs, masks, replicas, and histogram ownership.
 
 ### Implementation Details
 
-Build MoE fingerprint material from `MoERuntimeTable`:
+Build MoE fingerprint material from domain-scoped placement state:
 
 - `DeviceMoELayerRuntime::active_bank`
 - `DeviceMoELayerRuntime::active_epoch`
@@ -1000,6 +1002,9 @@ Build MoE fingerprint material from `MoERuntimeTable`:
 - `DeviceMoEPlacementBank::experts[].flags`
 - `DeviceMoEPlacementBank::local_compute_mask[]`
 - `DeviceMoEPlacementBank::replica_role[]`
+- ExpertParallel domain id/name.
+- Domain participant ids and `GlobalDeviceAddress` metadata.
+- Routed tier domain, continuation domain, and shared expert domain where an overlay plan is active.
 
 Expose fingerprint material with either:
 
@@ -1009,10 +1014,70 @@ virtual uint64_t placementFingerprint() const = 0;
 
 or a helper over public `hostLayerState(layer_idx)` if a virtual addition is too invasive.
 
-When `MoERebalanceController` applies a placement update or replica mask change, it must either:
+Add explicit rebalance domain types:
 
-1. Increment the placement epoch used in `moe_fingerprint`, or
-2. Call `PrefixStateCache::invalidateWhere(predicate)` for entries matching the old MoE fingerprint.
+```cpp
+using ExpertParallelDomainId = std::string;
+using ExpertParallelParticipantId = int;
+
+struct ExpertParallelParticipant
+{
+    ExpertParallelParticipantId participant_id = -1;
+    GlobalDeviceAddress global_device;
+    DeviceId local_device;
+    int world_rank = -1;
+    int rank_in_domain = -1;
+    int numa_node = -1;
+    std::string domain_kind; // cpu_global_tp, local_tp, routed_overlay, single, ...
+};
+
+struct MoERebalanceDomainConfig
+{
+    ExpertParallelDomainId domain_id;
+    std::vector<ExpertParallelParticipant> participants;
+    bool observe_only = false;
+    bool can_rebalance = false;
+    uint64_t placement_epoch = 0;
+};
+```
+
+Domain model and vocabulary:
+
+- Public rebalance APIs should use `domain`, `participant`, and `device` language.
+- `computeExpertMasks(int participant_id)` replaces socket-oriented APIs.
+- `owner_participant` replaces `owner_socket`; `num_participants` replaces `num_sockets`.
+- Compatibility wrappers may remain temporarily, but new call sites should not introduce new public `socket_id` terminology except CPU topology adapters.
+- `DecodeExpertHistogram` may remain as an implementation, but the runtime contract is a domain-scoped histogram. Add `DomainExpertHistogram` wrapper/alias if renaming is too much churn.
+
+Wiring and ownership:
+
+- Resolve zero or more `MoERebalanceDomainConfig` objects from the execution plan and optional overlay plan.
+- Attach exactly one controller per ExpertParallel rebalance domain.
+- Expose controller lookup by domain id and iteration over all active domains; do not use "first DGO controller" as the multi-domain API.
+- Single-device MoE domains are observe-only: collect telemetry when requested, but never mutate masks or transfer weights.
+- CPU `-d cpu` remains one CPU GlobalTP domain whose participant ids match rank-in-domain.
+- LocalTP participants are local devices in plan order.
+- Multi-node GlobalTP uses global/domain rank, not `local_rank`, as participant identity.
+- Overlay routed expert tiers are eligible rebalance domains. Continuation/base dense domains are not expert-placement rebalance domains.
+
+Placement, masks, replicas, and epochs:
+
+- Treat expert masks as domain-local placement views: `mask[layer][expert] == participant owns or serves this expert`.
+- Track base owner participant, replica participant(s), active compute participant, and prefill owner participant separately.
+- `ExpertReplicaSet` stores a domain id and cannot be applied to a different domain.
+- Weight transfer is domain-aware. CPU cross-rank paths can keep MPI send/recv; local-device and overlay transfers use domain-specific transfer code.
+- `DeviceGraphOrchestrator::applyExpertMasks()` and `RankOrchestrator` mask fanout must carry domain id and participant id.
+- Every successful base placement, mask, replica, owner-map, or runtime-table bank update increments only the affected domain's placement epoch.
+- When a placement update occurs, either the new epoch is part of the prefix/MTP fingerprint or `PrefixStateCache::invalidateWhere(predicate)` invalidates entries for the old fingerprint.
+
+Histogram contract:
+
+- Add histogram source identity: `DecodeToken`, `PrefillChunk`, `SyntheticTest`, or equivalent.
+- Decode remains the first production histogram source.
+- Prefill histogram support is chunk-boundary only. Counts merge after a chunk completes; no mid-graph or mid-stage rebalance.
+- Window accounting counts real tokens, not padded bucket tokens.
+- Single-participant domains may collect histograms in observe mode, but `shouldRebalance()` returns false with reason `single_participant_observe_only`.
+- Rebalance decisions expose reason codes such as `window_not_full`, `mode_off`, `dynamic_disabled_for_domain`, `single_participant_observe_only`, and `ready`.
 
 Parallelism coordination:
 
@@ -1025,14 +1090,23 @@ Parallelism coordination:
 Graph capture:
 
 - Prefill graph capture keys or invalidation must include MoE placement epoch.
-- Sparse host/collective overlay stages stay non-capturable until graph-native collectives exist.
+- Tier 1 graph capture can invalidate conservatively on any mask/replica/domain placement mutation.
+- Tier 2 segmented graph capture uses placement epoch and runtime-table bank flips at chunk boundaries only.
+- Sparse host/collective overlay stages stay non-capturable until the segmented Tier 2 path defines explicit manual collective boundaries.
 - If a MoE sparse collective has not completed, follow-on transfers must wait for `collective_complete` before continuing.
 
 ### Files
 
 - `src/v2/execution/moe/MoERuntimeTable.h/.cpp`
 - `src/v2/execution/moe/MoERebalanceController.*`
+- `src/v2/execution/moe/DecodeExpertHistogram.h/.cpp`
+- `src/v2/execution/moe/MoEExpertParallelPlan.h`
 - `src/v2/execution/moe/MoEExpertOverlayRuntimePlan.*`
+- `src/v2/config/ExecutionDomainDefinition.h/.cpp`
+- `src/v2/execution/config/RuntimeConfig.h`
+- `src/v2/execution/factory/InferenceRunnerFactory.cpp`
+- `src/v2/execution/mpi_orchestration/ExecutionPlanBuilder.cpp`
+- `src/v2/execution/mpi_orchestration/RankExecutionPlan.h`
 - `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h/.cpp`
 - `src/v2/execution/runner/OrchestrationRunner.h/.cpp`
 - `src/v2/execution/prefix_cache/PrefixCacheFingerprint.*`
@@ -1042,6 +1116,13 @@ Graph capture:
 - Stable MoE placement hits cache.
 - Rebalance epoch change misses or invalidates.
 - Decode histogram is not restored as payload.
+- Domain construction for CPU GlobalTP, LocalTP, single-device, synthetic multi-node GlobalTP, and overlay routed tiers.
+- Legacy two-CPU-rank rebalance produces the same masks through participant APIs as the previous socket APIs.
+- Single-device dynamic config degrades to observe-only with a clear reason and no mask mutation.
+- Domain mismatch when applying masks or replicas fails before mutation.
+- Placement epoch increments only for the affected domain.
+- Prefill chunk histogram unit test merges only real-token counts.
+- Static grep guard: new rebalance code should not introduce new public `socket_id` terminology outside compatibility wrappers or CPU topology adapters.
 - LOCAL TP child miss clamps all children to common min prefix length.
 - GLOBAL TP rank miss clamps all ranks via MPI min reduction.
 - PP stage miss clamps the full pipeline to common min prefix length.
@@ -1052,16 +1133,21 @@ Graph capture:
 - MoE prefix cache never reuses state across incompatible expert placement.
 - Dynamic rebalance and prefix cache can coexist without silent wrong outputs.
 - Multi-device prefix hits are all-or-common-prefix, never partially divergent.
+- Public rebalance APIs and diagnostics use domain/participant/device language.
+- Existing CPU GlobalTP `-d cpu` rebalance behavior is preserved as one domain-scoped instance.
+- Single-device MoE is formalized as observe-only/no-rebalance.
+- LocalTP and multi-node GlobalTP have unambiguous participant ids.
+- Overlay routed expert domains have a controller attachment point before graph-captured sparse collectives are enabled.
 
-## Phase 9: Observability, Performance, And Rollout
+## Phase 9: Observability, Diagnostics, And Rollout Controls
 
 ### Goal
 
-Add production controls, diagnostics, and benchmark coverage after correctness has landed.
+Make prefix cache and MTP behavior explainable before expanding into TP, MoE, and performance work. Operators and tests must be able to tell whether a request hit, partially hit, missed, bypassed, rolled back, or accepted speculative tokens, and why.
 
 ### Implementation Details
 
-Add stats:
+Add stats and request summaries:
 
 ```cpp
 struct PrefixCacheStats
@@ -1081,6 +1167,10 @@ struct PrefixCacheStats
     uint64_t terminal_state_hits = 0;
     uint64_t hybrid_state_bytes = 0;
     uint64_t mtp_state_bytes = 0;
+    uint64_t bypasses = 0;
+    uint64_t unsupported_backend_bypasses = 0;
+    uint64_t fingerprint_bypasses = 0;
+    uint64_t terminal_state_bypasses = 0;
 };
 
 struct MTPStats
@@ -1089,38 +1179,74 @@ struct MTPStats
     uint64_t accepted_tokens = 0;
     uint64_t rejected_tokens = 0;
     uint64_t rollbacks = 0;
+    uint64_t bypasses = 0;
+    uint64_t verifier_runs = 0;
+    uint64_t verifier_token_count = 0;
 };
 ```
 
-Expose stats through:
+Add structured per-request summary objects:
+
+```cpp
+struct PrefixCacheRequestSummary
+{
+    bool enabled = false;
+    bool bypassed = false;
+    std::string bypass_reason;
+    bool hit = false;
+    bool partial_hit = false;
+    int requested_tokens = 0;
+    int matched_tokens = 0;
+    int matched_blocks = 0;
+    bool terminal_logits_restored = false;
+    bool terminal_hidden_restored = false;
+    bool mtp_state_restored = false;
+    bool hybrid_state_restored = false;
+    std::string storage_tier; // ram, device-hot, disk-hydrated, mixed, none
+};
+
+struct MTPRequestSummary
+{
+    bool enabled = false;
+    bool bypassed = false;
+    std::string bypass_reason;
+    uint64_t draft_steps = 0;
+    uint64_t accepted_tokens = 0;
+    uint64_t rejected_tokens = 0;
+    uint64_t rollbacks = 0;
+    double acceptance_rate = 0.0;
+};
+```
+
+Expose summaries through:
 
 - INFO-level per-request summary when prefix cache or MTP is enabled.
+- DEBUG-level bypass details for unsupported topology, missing terminal hidden, missing MTP weights, fingerprint mismatch, RAM budget too small, or backend logical I/O unavailable.
 - Existing profiling output where appropriate.
+- `PrefixRuntimeStateSnapshot` so integration tests can inspect counters without parsing logs.
 - Optional future server response headers/metadata.
-
-Benchmark scenarios:
-
-- Prefix disabled baseline.
-- RAM-only prefix cache.
-- RAM plus device-hot tier.
-- Disk warm/hydrated path.
-- MTP-only greedy decode.
-- Prefix plus MTP.
-- Hybrid Qwen3.5/Qwen3.6 prefix cache.
-- MoE Qwen3.6 model-gated run.
 
 Rollout controls:
 
 - Keep prefix cache and MTP off by default.
 - Allow dense RAM prefix cache to graduate first.
-- Enable GPU/device-hot tier only after GPU logical I/O tests pass.
-- Enable MTP only for model families with verified MTP tensor inventory and greedy parity.
+- Enable GPU/device-hot tier only after GPU logical I/O tests and focused GPU prefix integration tests pass.
+- Enable dynamic MoE rebalance with prefix/MTP only after Phase 8 domain-scoped participant, placement epoch, and histogram tests pass.
+- Enable LocalTP or GlobalTP prefix cache only after the Phase 10 common-prefix coordination tests pass.
+- Enable MTP on single-device dense runners only after Phase 13 single-device parity passes.
+- Enable MTP on TP runners only after Phase 11 parity passes for the relevant TP scope.
+- Enable MTP on MoE/ExpertParallel runners only after Phase 12 and Phase 13 MoE parity pass.
+- Enable ExpertParallel graph-captured sparse overlay paths only after Phase 12 segmented-capture tests and Phase 14 benchmarks pass.
 - Keep stochastic speculative sampling deferred until greedy correctness and acceptance telemetry are stable.
+- Keep every large-model parity and benchmark test model-gated or opt-in.
 
 ### Files
 
 - `src/v2/execution/prefix_cache/PrefixCacheStats.h`
 - `src/v2/execution/runner/OrchestrationRunner.cpp`
+- `src/v2/execution/prefix_cache/PrefixCacheStateProbe.h/.cpp`
+- `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp`
+- `src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp`
 - `src/v2/utils/BenchmarkRunner.cpp`
 - `docs/v2/` follow-up benchmark notes or changelog files.
 
@@ -1128,19 +1254,543 @@ Rollout controls:
 
 - Stats counters increment deterministically in unit tests.
 - Disabled feature paths produce zero/no-op stats.
+- Unsupported feature paths increment bypass counters and preserve normal inference.
+- INFO summaries are covered through state snapshots or log-capture tests.
 - Benchmark smoke tests do not require large model files unless explicitly enabled.
 - Regression filters before considering defaults:
 
 ```bash
 cmake --build build_v2_integration --parallel
-ctest --test-dir build_v2_integration -R "^V2_Unit_|^V2_Integration_" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^V2_Unit_|^V2_Integration_PrefixCacheStateProbe" --output-on-failure --parallel
 ```
 
 ### Exit Criteria
 
 - Users can tell whether a request hit, partially hit, missed, or bypassed prefix cache and why.
 - MTP acceptance and rollback rates are visible.
-- Benchmark data supports any future default enablement decision.
+- Default-off behavior is unchanged and visible in stats.
+- Later parity and benchmark phases can consume structured counters instead of scraping logs.
+
+## Phase 10: Prefix Cache Coordination Across TP, PP, And MoE Domains
+
+### Goal
+
+Make prefix-cache lookup, populate, and harvest correct for multi-device execution before enabling MTP on those topologies. A prefix hit must be an all-or-common-prefix decision across every participant that owns restorable request state.
+
+### Implementation Details
+
+Add a coordinator layer above per-device prefix lookup:
+
+```cpp
+struct PrefixParticipantLookup
+{
+    std::string domain_id;
+    int participant_id = -1;
+    DeviceId device;
+    uint64_t placement_epoch = 0;
+    uint64_t fingerprint_key = 0;
+    bool cache_enabled = false;
+    bool hit = false;
+    int matched_tokens = 0;
+    int matched_blocks = 0;
+    bool has_terminal_logits = false;
+    bool has_terminal_hidden = false;
+    std::string bypass_reason;
+};
+
+struct PrefixCoordinationResult
+{
+    bool cache_enabled = false;
+    std::string domain_id;
+    uint64_t placement_epoch = 0;
+    uint64_t fingerprint_key = 0;
+    int common_matched_tokens = 0;
+    int common_matched_blocks = 0;
+    bool common_terminal_logits = false;
+    bool common_terminal_hidden = false;
+    std::string clamp_reason;
+    std::vector<PrefixParticipantLookup> participants;
+};
+```
+
+Coordination rules:
+
+- Every participant computes lookup against the same token chain and fingerprint part set.
+- MoE participants use the Phase 8 domain id, participant id, and placement epoch in lookup summaries and diagnostics.
+- A non-zero fingerprint key mismatch across participants makes the coordinated hit unusable, even if all participants report the same token count.
+- The usable hit length is the minimum matched token count across required participants.
+- Terminal logits/hidden are usable only if every participant that needs them has them.
+- Populate must be clamped before any participant imports state.
+- If populate fails on one participant, all participants clear request-local state and replay from the common fallback point.
+- Harvest happens only after successful prefill and stores each participant's local shard under the same logical block keys.
+- Device-hot and disk tiers remain local to the participant that owns the payload. Promotion must not imply other participants have the same block.
+
+Topology-specific behavior:
+
+- SingleDevice: existing `DeviceGraphOrchestrator` lookup is the coordination result.
+- LocalTP: `RankOrchestrator` queries all child `DeviceGraphOrchestrator` instances, computes the local minimum, then populates every child to that common length.
+- GlobalTP / NodeLocalTP: each rank computes its local result, then a scalar domain reduction computes the minimum matched tokens and terminal-state availability. Prefer a small typed scalar coordination helper over ad hoc MPI calls in runner code.
+- PP: each stage owns only its local layer range, but the logical token count is global. The pipeline uses the minimum across stages.
+- ExpertParallel MoE: continuation participants own main hidden/KV/logits state. Routed expert-only participants own expert weights and sparse collective scratch, not prefix KV payload. MoE placement, domain participant ids, placement epoch, and overlay plan remain fingerprint material for all roles.
+
+Add scalar coordination helpers:
+
+```cpp
+class IPrefixCollectiveCoordinator
+{
+public:
+    virtual ~IPrefixCollectiveCoordinator() = default;
+    virtual bool allMinInt(int local_value, int *global_value) = 0;
+    virtual bool allMinUInt64(uint64_t local_value, uint64_t *global_value) = 0;
+    virtual bool allMaxUInt64(uint64_t local_value, uint64_t *global_value) = 0;
+    virtual bool allAndBool(bool local_value, bool *global_value) = 0;
+    virtual bool allOrBool(bool local_value, bool *global_value) = 0;
+};
+```
+
+Implementations can wrap:
+
+- Local in-process reduction for LocalTP.
+- Domain communicator or `IMPIContext` for GlobalTP / NodeLocalTP.
+- Pipeline stage coordination where `RankOrchestrator` already owns the stage list.
+
+The coordinator must be used for prefix-cache decisions only. Tensor data movement still goes through `TransferEngine`, `IKVCache` logical I/O, and existing collective stages.
+
+### Files
+
+- `src/v2/execution/prefix_cache/PrefixCacheCoordinator.h/.cpp`
+- `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h/.cpp`
+- `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h/.cpp`
+- `src/v2/execution/runner/OrchestrationRunner.h/.cpp`
+- `src/v2/interfaces/ICollectiveContext.h` or a narrow prefix-specific coordinator wrapper.
+
+### Tests
+
+- Unit tests for min-token clamping, terminal-state AND logic, and failed-populate fallback.
+- LocalTP fake-runner test where one child misses and all children replay from the clamped prefix.
+- GlobalTP/NodeLocalTP MPI unit or focused integration test using small CPU runners and an intentional rank-local miss.
+- PP staged fake-runner test where one stage lacks a block and the whole pipeline clamps.
+- Fingerprint mismatch test proving equal token counts do not permit a coordinated hit when participants restored incompatible state.
+- MoE fingerprint test proving overlay placement changes still miss even when token blocks exist.
+
+### Exit Criteria
+
+- Multi-device prefix hits are common-prefix only, never participant-divergent.
+- Prefix cache remains disabled or bypassed on any topology without a working coordinator.
+- The focused multi-device prefix tests pass without running the full heavy integration suite.
+
+## Phase 11: TP-Compatible MTP Sidecar Execution
+
+### Goal
+
+Promote MTP sidecar execution from a single-device helper into a normal TP-aware graph path for dense models. The sidecar must participate in the same LocalTP, NodeLocalTP, and GlobalTP collectives as the main graph.
+
+### Implementation Details
+
+The sidecar graph is a graph fragment, not a nested multi-device subgraph. For TP, each participant builds and executes its participant-local MTP graph using the same `GraphConfig`, `ITPContext`, sharded weights, prepared-weight store, and collective ordering as the main graph.
+
+Required changes:
+
+- Remove the `RankOrchestrator::forwardMTP()` single-child limitation after TP tests exist.
+- Add `RankOrchestrator` MTP coordination that launches `forwardMTP()` on every child runner for LocalTP.
+- For GlobalTP/NodeLocalTP, all ranks in the TP domain must enter `forwardMTP()` in identical order.
+- Add domain-wide MTP checkpoint/restore wrappers around `captureLivePrefixState()` and `restoreLivePrefixState()`.
+- Gather or reduce MTP logits with the same policy as main logits. Vocab-sharded LM head output cannot be sampled from only participant 0.
+- Broadcast or otherwise coordinate the selected greedy draft token so every participant verifies the same sequence.
+- Disable the current MPI-world-size guard in `OrchestrationRunner::canUseMTP()` only after domain-wide checkpoint, logits, sampling, and rollback tests pass.
+
+MTP graph requirements:
+
+- Column-parallel stages produce local shards only.
+- Row-parallel stages insert `TPAllreduceStage` through `QwenGraphBase::createTPAllreduceStage()`.
+- LM-head sharding follows the existing logits gather or distributed sampling path.
+- MTP KV cache uses the same local KV-head assignment as the participant's attention block.
+- Terminal hidden must be the replicated post-allreduce hidden row. If a topology only has sharded hidden at that point, it must allgather or bypass MTP.
+- All tensor movement for terminal hidden/logits and sidecar inputs goes through `TransferEngine` or graph-stage buffer contracts.
+
+Rollback rules:
+
+- A checkpoint covers main KV, MTP KV, hybrid state if present, positions, terminal hidden/logits, and per-runner decode bookkeeping.
+- Restore happens on every participant before replay.
+- A verifier mismatch increments rollback counters once per request step, not once per participant.
+- If one participant cannot restore, all participants clear and replay from the last agreed safe state.
+
+### Files
+
+- `src/v2/execution/local_execution/orchestrators/RankOrchestrator.h/.cpp`
+- `src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h/.cpp`
+- `src/v2/execution/local_execution/orchestrators/IInferenceRunner.h`
+- `src/v2/execution/runner/OrchestrationRunner.h/.cpp`
+- `src/v2/models/qwen/QwenGraphBase.cpp`
+- `src/v2/models/qwen35/Qwen35Graph.cpp`
+- `src/v2/execution/prefix_cache/PrefixStateSnapshot.h`
+
+### Tests
+
+- Unit graph-construction test proving dense MTP sidecar inserts TP allreduce when row-parallel MTP weights are sharded.
+- LocalTP dense focused integration test on CPU or ROCm: MTP-enabled greedy output equals MTP-disabled greedy output.
+- GlobalTP/NodeLocalTP CPU focused integration test with two ranks: domain-wide MTP draft token and rollback are consistent.
+- Forced mismatch rollback test across TP participants.
+- Full prefix hit plus MTP test across TP participants, including terminal hidden/logit restore.
+
+### Exit Criteria
+
+- Dense MTP is correct for SingleDevice CPU/CUDA/ROCm and for the first supported LocalTP/GlobalTP dense topology.
+- No TP participant runs a sidecar step alone.
+- The sidecar uses existing collective abstractions rather than direct MPI/NCCL/RCCL calls in MTP-specific code.
+
+## Phase 12: ExpertParallel Sparse MoE MTP Sidecar And Segmented Graph Capture
+
+### Goal
+
+Make MTP compatible with MoE models and ExpertParallel overlay execution, including sparse collectives across heterogeneous devices such as 2x ROCm plus 2x CPU dual-socket. This phase also incorporates Tier 2 from `PREFILL_HIP_GRAPH_CAPTURE_PLAN.md`: ExpertParallel overlay prefill graph capture through fixed-size chunks, domain-local graph caches, placement epochs, runtime-table bank flips, and explicit manual sparse collective boundaries.
+
+### Implementation Details
+
+The MoE MTP sidecar must reuse graph-native MoE building blocks instead of taking a dense-only shortcut. Current dense MTP graph construction rejects MoE weights; this phase removes that limitation only after the sparse sidecar path is implemented and tested.
+
+Graph rules:
+
+- Keep graphs per-device and symmetric. Do not introduce nested multi-device sidecar graphs.
+- Add an MTP-specific graph namespace for MoE collective keys, including request generation, decode step, MTP depth, layer, tier, participant, and direction.
+- Every participant in the ExpertParallel plan executes the same logical sequence of dispatch, local expert, return-reduce, and no-op stages.
+- Participants with no routed rows no-op but still participate in the collective sequence when required.
+- Sparse collective completion must be observed before the continuation domain consumes returned rows.
+- Failure or abort in one sparse collective aborts the sidecar step for all participants and rolls back to the domain checkpoint.
+- Rebalance is allowed between graph executions only. It is never allowed during capture, replay, or while a sparse dispatch/return collective is incomplete.
+
+Sidecar MoE sequence:
+
+1. Build MTP projected hidden on continuation participants.
+2. Run the MTP attention block and MTP KV append on the attention/continuation domain.
+3. Run MTP FFN norm and MoE router using the MTP block's gate weights.
+4. Build sparse dispatch payloads from MTP route indices and weights.
+5. Dispatch routed rows to ExpertParallel owner participants.
+6. Execute local routed experts on owner devices using resident expert GEMM engines.
+7. Return/reduce sparse expert outputs to the continuation domain.
+8. Run shared expert path if present and combine routed plus shared output.
+9. Run final MTP norm and LM head, then gather/sample logits consistently across the continuation domain.
+
+Persistent and rollback state:
+
+- Persist MTP shifted KV payload for attention participants when prefix cache is enabled.
+- Persist terminal hidden/logits as in dense MTP.
+- Do not persist MoE route/grouped scratch, sparse payload buffers, histograms, or transient workspaces.
+- Fingerprints include ExpertParallel plan id, owner map generation, active bank/epoch, expert masks, replica roles, routed tier domains, continuation domain, and shared expert domain.
+- Dynamic rebalance invalidates or misses old MoE prefix blocks before they can restore MTP state.
+
+Heterogeneous execution:
+
+- ROCm expert participants use prepared ROCm expert GEMM engines.
+- CPU expert participants use CPU expert GEMM engines and host-staged sparse transfer where needed.
+- Continuation-domain transfer back to GPU must use `TransferEngine` or existing sparse-return staging, not tensor flag mutation.
+- The correctness path may use host-staged sparse collectives first; optimized device-native sparse collectives can follow after parity.
+
+Tier 2 chunked prefill and graph capture:
+
+```text
+chunk 0: captured prefill segment(s) for tokens [0, n)
+         merge prefill expert histograms
+         optional rebalance + placement epoch flip
+
+chunk 1: captured prefill segment(s) for tokens [n, 2n)
+         merge prefill expert histograms
+         optional rebalance + placement epoch flip
+```
+
+Chunk scheduler requirements:
+
+- Promote the bucket/chunk primitive into a reusable scheduler, not only a server padding trick.
+- Add explicit chunk policy fields: fixed interval, bucket list, minimum/maximum rebalance interval, and real-token range.
+- Padded bucket tokens must not contribute to expert histograms, prefix terminal logits, or rebalance windows.
+- After each graph chunk completes, merge per-layer prefill counts into the domain histogram outside graph replay.
+- Reset per-chunk runtime counters after successful merge so repeated syncs are idempotent.
+- If `LLAMINAR_GPU_GRAPHS=1` selects this path and preflight/capture/replay cannot satisfy the contract, fail with phase/domain/stage reason rather than silently falling back.
+
+Placement epochs and runtime-table bank flips:
+
+- Placement epoch advances whenever expert masks, replicas, owner maps, or runtime-table banks change.
+- Conservative implementation: include placement epoch in graph cache keys and recapture on epoch change.
+- Target implementation: captured kernels read placement through stable `DeviceMoELayerRuntime*` pointers and double-buffered banks; cache keys include runtime-table schema/capacity, while replay observes active-bank changes.
+- Use `MoERuntimeTable::prepareInactiveBank()` and `flipActiveBank()` outside capture/replay.
+- Every active local expert descriptor in a new bank must have resident prepared gate/up/down payloads before the bank flip.
+- Hidden stage-local placement state must not be the source of truth for captured replay once runtime-table indirection is active.
+
+Domain-local graph caches:
+
+- Cache graph segments per overlay domain and participant, not only per root device.
+- Cache key fields include domain id/name, participant id, bucket length, real-token count, placement epoch or runtime-table schema, layer range, and graph topology signature.
+- Continuation/base-domain graph segments are separate from expert-domain graph segments.
+- All participants must agree on chunk id, bucket length, placement epoch, graph topology signature, and collective keys before capture/replay starts.
+- Multi-node GlobalTP and overlay tests must prove domain participant id is used instead of `local_rank` aliases.
+
+Segmented sparse collective capture:
+
+- Keep sparse overlay collectives outside monolithic HIP/CUDA graph capture until the collective backend has a graph-safe contract.
+- Split each overlay prefill chunk into explicit segments:
+    - captured base/route segment
+    - manual sparse dispatch collective
+    - captured expert-domain local compute segment(s)
+    - manual sparse return-reduce collective
+    - captured continuation segment
+- Preserve `MoEOverlayCollectiveResult::collective_complete` gating. No captured continuation segment or transfer may launch until the collective has completed.
+- Fixed-capacity device-resident descriptors can become capturable later; host-staged sparse row metadata remains a manual boundary.
+- For every manual boundary, define tensors and coherence states that must be ready before the next captured segment launches.
+
+Chunk-boundary rebalance:
+
+- Add a prefill-chunk maintenance hook called only after graph execution completes, histograms are merged, and all required sparse collectives complete.
+- Rebalance must enforce: no active capture, no active replay, all participating domains at the same chunk boundary, and all required collectives complete.
+- Transfer or prepare expert payloads before publishing a new placement epoch/runtime-table bank.
+- If topology, capacity, or descriptor schema changes, invalidate and recapture the next chunk graph explicitly.
+- Raw expert payload release must be delayed until no future rebalance arrival or recapture can require it.
+
+### Files
+
+- `src/v2/models/qwen35moe/Qwen35MoEGraph.h/.cpp`
+- `src/v2/models/qwen35/Qwen35Graph.h/.cpp`
+- `src/v2/execution/local_execution/engine/ForwardExecutionEngine.cpp`
+- `src/v2/execution/local_execution/engine/ForwardGraphTypes.h`
+- `src/v2/execution/local_execution/engine/PrefillGraphCache.h/.cpp`
+- `src/v2/execution/moe/MoEOverlaySparseCollective.h/.cpp`
+- `src/v2/execution/moe/MoERuntimeTable.h/.cpp`
+- `src/v2/execution/moe/MoERebalanceController.h/.cpp`
+- `src/v2/execution/moe/DecodeExpertHistogram.h/.cpp`
+- `src/v2/execution/moe/ExpertWeightTransfer.*`
+- `src/v2/execution/compute_stages/stages/MoESparseDispatchStage.*`
+- `src/v2/execution/compute_stages/stages/MoESparseReturnReduceStage.*`
+- `src/v2/execution/compute_stages/stages/MoELocalExpertStage.*`
+- `src/v2/execution/compute_stages/stages/MoEExpertDispatchStage.*`
+- `src/v2/execution/compute_stages/stages/MoEExpertParallelReduceStage.*`
+- `src/v2/execution/moe/MoEExpertOverlayRuntimePlan.*`
+- `src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp`
+- `src/v2/execution/prefix_cache/PrefixCacheFingerprint.*`
+
+### Tests
+
+- Unit tests for MTP MoE collective-key uniqueness and namespace separation from main MoE layers.
+- Unit tests for zero-row sparse dispatch/return no-op participation.
+- Unit tests proving MoE placement fingerprint changes when owner map, masks, replicas, or active bank changes.
+- Focused integration test with synthetic small MoE weights and ExpertParallel plan.
+- Model-gated Qwen3.6 MoE test on available hardware for greedy MTP parity.
+- Heterogeneous ExpertParallel smoke test for 2x ROCm plus 2x CPU dual-socket when the hardware is present.
+- Chunk histogram merge test: two chunks with known routed experts match direct host-side counts and exclude padded tokens.
+- Runtime-table bank flip capture/replay test: stable runtime-table pointer, active-bank flip between replays, output follows the new mask.
+- Domain-local graph cache key test: same bucket length in different domains/participants must not alias.
+- Segmented graph execution test with mock sparse collectives: captured segments replay, collectives run exactly once per chunk, continuation work waits for `collective_complete`.
+- Negative test: incomplete/failed sparse collective prevents the next captured segment from launching.
+- Forced chunk-boundary rebalance test: run chunk 0, rebalance, run chunk 1, compare against non-captured chunked reference with the same schedule.
+
+### Exit Criteria
+
+- MoE MTP sidecar no longer bypasses only because the MTP block contains MoE weights.
+- ExpertParallel participants stay in lockstep through MTP sidecar sparse collectives.
+- Prefix cache never reuses MoE/MTP state across incompatible expert placement.
+- Tiered overlay prefill graph capture matches the non-captured overlay path for fixed and rebalanced schedules.
+- Rebalance is deterministic for the same prompt, bucket policy, and interval.
+- Sparse dispatch/return collectives preserve `collective_complete` ordering.
+- Observability reports chunk id, bucket length, real-token range, domain id, participant id, placement epoch, capture/replay phase, and recapture reason.
+
+## Phase 13: PyTorch Parity Acceptance Matrix
+
+### Goal
+
+Define the correctness gates required before claiming the plan is implemented end to end. Parity must cover prefix cache, MTP, TP collectives, hybrid state, and MoE sparse collectives.
+
+### Implementation Details
+
+Add a parity harness that records:
+
+- Prompt tokens, suffix tokens, generated tokens, stop reason.
+- Per-step greedy sampled token from Llaminar and PyTorch.
+- Main logits for compared rows.
+- MTP logits for draft rows when MTP is enabled.
+- MTP acceptance/rejection trace.
+- Prefix cache hit summary.
+- MoE route indices and weights for compared MoE layers when deterministic enough for the model/precision.
+
+Reference rules:
+
+- Greedy mode only for acceptance.
+- Fixed prompt fixtures and deterministic sampling.
+- Compare exact generated tokens first.
+- Compare logits with precision-specific tolerances. Quantized GGUF parity should use top-token equality plus bounded logit error rather than FP32-exact expectations.
+- For prefix tests, PyTorch runs the full prompt while Llaminar may restore a prefix and run only the suffix. Final logits and generated tokens must match the no-cache Llaminar baseline and the PyTorch reference within tolerance.
+- For MTP tests, PyTorch verifies the accepted token stream with the main model. MTP drafts may differ internally, but accepted output must equal greedy main-model output.
+
+Required matrix:
+
+| Topology | Model class | Prefix | MTP | Required parity |
+|----------|-------------|--------|-----|-----------------|
+| SingleDevice CPU | Dense Qwen3.6/Qwen3.5 fixture or small model | Off/RAM | Off | Baseline logits/tokens |
+| SingleDevice CPU | Dense | RAM full/partial hit | Off | Suffix logits/tokens |
+| SingleDevice CPU | Dense | RAM full/partial hit | Greedy | Accepted tokens equal main greedy |
+| SingleDevice CUDA | Dense | RAM/device-hot where supported | Greedy | Same as CPU, model-gated |
+| SingleDevice ROCm | Dense | RAM/device-hot where supported | Greedy | Same as CPU, model-gated |
+| NodeLocalTP CPU | Dense | RAM | Greedy | Rank-wide common-prefix and MTP rollback |
+| LocalTP ROCm | Dense | RAM/device-hot where supported | Greedy | LocalTP common-prefix and MTP rollback |
+| SingleDevice CPU/ROCm | Hybrid Qwen3.5/Qwen3.6 | RAM | Greedy forced reject | GDN restore/replay |
+| ExpertParallel CPU sockets | MoE Qwen3.6 | RAM | Off/Greedy | Placement fingerprint and sparse route correctness |
+| ExpertParallel ROCm | MoE Qwen3.6 | RAM/device-hot where supported | Off/Greedy | Sparse collective parity |
+| ExpertParallel ROCm+CPU | MoE Qwen3.6 | RAM | Greedy | Heterogeneous sparse sidecar parity |
+| ExpertParallel ROCm+CPU graph-captured chunks | MoE Qwen3.6 | RAM | Off/Greedy | Captured fixed/rebalanced schedule equals non-captured chunked reference |
+
+Large-model parity is opt-in:
+
+```text
+LLAMINAR_ENABLE_LARGE_MODEL_PARITY=1
+LLAMINAR_PARITY_DENSE_MODEL=/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf
+LLAMINAR_PARITY_MOE_MODEL=/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf
+```
+
+Small deterministic fixtures should remain in normal unit/focused integration coverage so CI can prove the contract without large model files.
+
+### Files
+
+- `tests/v2/integration/parity/`
+- `tests/v2/integration/parity/Test__PrefixCacheMTPParity.cpp`
+- `tests/v2/integration/parity/Test__TPPrefixCacheMTPParity.cpp`
+- `tests/v2/integration/parity/Test__MoEPrefixCacheMTPParity.cpp`
+- Python reference helpers under the existing parity framework.
+- `src/v2/testing/` helpers if a C++ parity adapter is needed.
+
+### Tests
+
+- Prefix disabled baseline parity.
+- Prefix partial-hit parity.
+- Prefix full-hit parity with terminal logits.
+- Prefix full-hit plus MTP terminal-hidden restore parity.
+- Forced MTP rejection parity.
+- LocalTP and GlobalTP common-prefix parity.
+- Hybrid GDN rollback parity.
+- ExpertParallel MoE placement fingerprint and sparse-sidecar parity.
+- ExpertParallel segmented graph-capture parity for fixed placement and forced chunk-boundary rebalance.
+
+Focused command shape:
+
+```bash
+cmake --build build_v2_integration --parallel
+ctest --test-dir build_v2_integration -R "^V2_Unit_|^V2_Integration_PrefixCache|^V2_Integration_Parity_PrefixCacheMTP" --output-on-failure --parallel
+```
+
+Large-model opt-in command shape:
+
+```bash
+LLAMINAR_ENABLE_LARGE_MODEL_PARITY=1 \
+ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_.*Qwen36" --output-on-failure --parallel
+```
+
+### Exit Criteria
+
+- All non-gated unit and focused integration parity tests pass.
+- Large dense Qwen3.6 parity passes on each available SingleDevice backend requested for rollout.
+- NodeLocalTP CPU and LocalTP ROCm dense parity pass before enabling TP MTP.
+- ExpertParallel MoE parity passes before enabling MoE MTP.
+- ExpertParallel segmented graph-capture parity passes before enabling graph-captured sparse overlay paths.
+- Accepted token streams are identical to greedy main-model output for every tested MTP topology.
+
+## Phase 14: Benchmark Acceptance And Default-Enablement Readiness
+
+### Goal
+
+Measure whether prefix cache and MTP provide real speedups on the supported correctness matrix, and define the evidence needed before any future default enablement.
+
+### Implementation Details
+
+Add benchmark scenarios that emit machine-readable JSON plus human summaries:
+
+- Prefix disabled baseline.
+- RAM-only prefix cache miss and hit.
+- RAM plus device-hot tier hit.
+- Disk warm/hydrated path.
+- Prefix partial-hit with long shared prompt and short suffix.
+- Prefix full-hit with terminal logits.
+- MTP-only greedy decode.
+- Prefix plus MTP greedy decode.
+- Hybrid Qwen3.5/Qwen3.6 prefix cache.
+- Dense LocalTP/GlobalTP prefix and MTP.
+- MoE Qwen3.6 ExpertParallel prefix and MTP.
+- ExpertParallel overlay prefill graph capture with fixed placement.
+- ExpertParallel overlay prefill graph capture with forced chunk-boundary rebalance.
+
+Metrics:
+
+- Prefill wall time and tokens/sec.
+- Decode wall time and tokens/sec.
+- Prefix lookup time, populate time, harvest time, disk hydration time, and device promotion time.
+- Matched blocks/tokens and hit tier.
+- MTP draft steps, verifier runs, accepted tokens, rejected tokens, rollbacks, and acceptance rate.
+- Sparse MoE dispatch/return bytes and dense bytes avoided.
+- Graph chunk capture time, replay time, recapture count, and ineligible/fail-fast reason.
+- Per-chunk histogram merge time, rebalance decision time, placement epoch flip time, and expert payload transfer/prepare time.
+- Peak RAM, device-hot bytes, and disk bytes.
+- Disabled-feature overhead compared with baseline.
+
+Acceptance targets before considering default enablement:
+
+- Prefix disabled overhead is within noise of baseline, target less than 2% median regression.
+- RAM prefix hit shows a real prefill speedup on long shared prompts, with matched-token and timing counters proving prefill was skipped rather than hidden by measurement noise.
+- Device-hot tier is faster than RAM hydrate for GPU restore or is documented as not worth enabling for that backend.
+- Disk warm path improves repeated process startup or cross-process reuse workloads, or remains opt-in only.
+- Dense MTP target is approximately 2x decode throughput versus disabled on Qwen3.6 27B for the supported GPU backend.
+- MoE MTP target is approximately 1.5x decode throughput versus disabled on Qwen3.6 35B MoE for the supported ExpertParallel topology.
+- Prefix plus MTP must not regress versus the faster of prefix-only and MTP-only for the benchmarked prompt class without an explicit documented reason.
+- ExpertParallel graph-captured chunks should reduce host dispatch overhead inside domain-local compute segments. Sparse collective and rebalance overhead must be reported separately from graph replay time.
+- Chunk-boundary rebalance should improve or preserve end-to-end long-context MoE throughput for skewed routing prompts; if it does not, the benchmark must expose whether placement transfer, recapture, or sparse collective overhead dominated.
+
+Large-model benchmark inputs:
+
+```text
+/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf
+/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf
+```
+
+Required benchmark topology coverage, when hardware is present:
+
+- SingleDevice CUDA dense.
+- SingleDevice ROCm dense.
+- SingleDevice CPU dense.
+- NodeLocalTP CPU dense.
+- LocalTP ROCm dense.
+- ExpertParallel 2x socket CPU MoE.
+- ExpertParallel 2x ROCm MoE.
+- ExpertParallel 2x ROCm plus 2x CPU dual-socket MoE.
+
+### Files
+
+- `src/v2/utils/BenchmarkRunner.cpp`
+- `src/v2/app/` benchmark CLI plumbing if new flags are needed.
+- `tests/v2/performance/`
+- `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md`
+
+### Tests
+
+- Benchmark smoke tests with tiny fixtures and no large model requirement.
+- JSON schema test for benchmark output.
+- Disabled-feature overhead smoke test.
+- Model-gated dense Qwen3.6 benchmark.
+- Model-gated MoE Qwen3.6 ExpertParallel benchmark.
+
+Command shape:
+
+```bash
+cmake --build build_v2_release --parallel
+ctest --test-dir build_v2_release -R "^V2_Perf_PrefixCacheMTP" --output-on-failure --parallel
+```
+
+Large-model opt-in:
+
+```bash
+LLAMINAR_ENABLE_LARGE_MODEL_BENCHMARKS=1 \
+ctest --test-dir build_v2_release -R "^V2_Perf_.*Qwen36" --output-on-failure --parallel
+```
+
+### Exit Criteria
+
+- Benchmark JSON contains enough counters to explain every reported speedup.
+- Dense and MoE target speedups are met or blockers are documented with traces.
+- Graph replay, sparse collective, histogram merge, rebalance, and recapture timings are separated in output.
+- No feature is considered for default enablement until its matching parity phase and benchmark phase have passed.
 
 ## Recommended First Implementation Slice
 
@@ -1158,7 +1808,14 @@ Then proceed in this order:
 1. Dense single-runner RAM prefix cache.
 2. CUDA/ROCm logical I/O and shadow invalidation.
 3. Hybrid GDN state import/export.
-4. MTP sidecar loading and shifted prefill cache.
-5. MTP greedy verification and rollback.
-6. MoE placement fingerprint and multi-device min coordination.
-7. Device-hot and disk tiers.
+4. Persistent MTP shifted-KV payload through prefix harvest/populate.
+5. MTP sidecar loading and shifted prefill cache.
+6. SingleDevice MTP greedy verification and rollback.
+7. Phase 8 MoE placement fingerprint, domain-scoped rebalance controller, and rebalance invalidation.
+8. Device-hot and disk tiers.
+9. Phase 9 observability summaries and bypass counters.
+10. Phase 10 common-prefix coordination for LocalTP, GlobalTP/NodeLocalTP, PP, and MoE continuation domains.
+11. Phase 11 TP-compatible dense MTP sidecar.
+12. Phase 12 ExpertParallel sparse-MoE MTP sidecar plus segmented overlay graph capture.
+13. Phase 13 PyTorch parity matrix.
+14. Phase 14 benchmark acceptance matrix.

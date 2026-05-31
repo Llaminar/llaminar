@@ -15,6 +15,7 @@
 #include "../kernels/IPackedWeights.h"
 #include "BlockStructures.h"
 #include "KernelSnapshotInfo.h"
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -2775,6 +2776,27 @@ namespace llaminar2
         /// Reset GPU state to zero (no-op for CPU implementations)
         virtual void resetGPUState() {}
 
+        /// Size of implementation-owned recurrent state, if exportable.
+        virtual size_t stateBytes() const { return 0; }
+
+        /// Export implementation-owned state. CPU implementations normally return true for empty state.
+        virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
+        {
+            (void)dst_host;
+            (void)dst_device;
+            (void)stream;
+            return stateBytes() == 0;
+        }
+
+        /// Import implementation-owned state. CPU implementations normally return true for empty state.
+        virtual bool importState(const void *src_host, const void *src_device, void *stream)
+        {
+            (void)src_host;
+            (void)src_device;
+            (void)stream;
+            return stateBytes() == 0;
+        }
+
         /**
          * @brief Apply causal depthwise conv1d + optional SiLU activation
          *
@@ -2859,6 +2881,27 @@ namespace llaminar2
 
         /// Reset GPU state to zero (no-op for CPU implementations)
         virtual void resetGPUState() {}
+
+        /// Size of implementation-owned recurrent state, if exportable.
+        virtual size_t stateBytes() const { return 0; }
+
+        /// Export implementation-owned state. CPU implementations normally return true for empty state.
+        virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
+        {
+            (void)dst_host;
+            (void)dst_device;
+            (void)stream;
+            return stateBytes() == 0;
+        }
+
+        /// Import implementation-owned state. CPU implementations normally return true for empty state.
+        virtual bool importState(const void *src_host, const void *src_device, void *stream)
+        {
+            (void)src_host;
+            (void)src_device;
+            (void)stream;
+            return stateBytes() == 0;
+        }
 
         /// Check if GPU state is allocated with the required size.
         /// Used by graph capture preflight to verify warmup has occurred.

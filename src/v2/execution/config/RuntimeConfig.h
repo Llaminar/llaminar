@@ -15,6 +15,7 @@
 #include "../../utils/Logger.h"
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cmath>
 #include <optional>
 #include <sstream>
@@ -276,6 +277,172 @@ namespace llaminar2
             return is_cpu ? ActivationPrecision::Q16_1 : ActivationPrecision::FP16;
         }
     }
+
+    inline std::string normalizeRuntimeConfigToken(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        std::replace(value.begin(), value.end(), '-', '_');
+        return value;
+    }
+
+    enum class PrefixCacheStorageMode
+    {
+        Disabled,
+        Ram,
+        Device,
+        Tiered,
+    };
+
+    inline const char *prefixCacheStorageModeToString(PrefixCacheStorageMode mode)
+    {
+        switch (mode)
+        {
+        case PrefixCacheStorageMode::Disabled:
+            return "disabled";
+        case PrefixCacheStorageMode::Ram:
+            return "ram";
+        case PrefixCacheStorageMode::Device:
+            return "device";
+        case PrefixCacheStorageMode::Tiered:
+            return "tiered";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<PrefixCacheStorageMode> parsePrefixCacheStorageMode(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "disabled" || normalized == "off")
+            return PrefixCacheStorageMode::Disabled;
+        if (normalized == "ram")
+            return PrefixCacheStorageMode::Ram;
+        if (normalized == "device" || normalized == "vram")
+            return PrefixCacheStorageMode::Device;
+        if (normalized == "tiered")
+            return PrefixCacheStorageMode::Tiered;
+        return std::nullopt;
+    }
+
+    enum class PrefixCacheTerminalStateMode
+    {
+        Off,
+        Auto,
+        Always,
+    };
+
+    inline const char *prefixCacheTerminalStateModeToString(PrefixCacheTerminalStateMode mode)
+    {
+        switch (mode)
+        {
+        case PrefixCacheTerminalStateMode::Off:
+            return "off";
+        case PrefixCacheTerminalStateMode::Auto:
+            return "auto";
+        case PrefixCacheTerminalStateMode::Always:
+            return "always";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<PrefixCacheTerminalStateMode> parsePrefixCacheTerminalStateMode(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "off" || normalized == "disabled")
+            return PrefixCacheTerminalStateMode::Off;
+        if (normalized == "auto")
+            return PrefixCacheTerminalStateMode::Auto;
+        if (normalized == "always")
+            return PrefixCacheTerminalStateMode::Always;
+        return std::nullopt;
+    }
+
+    enum class PrefixCacheMoEPolicy
+    {
+        Disabled,
+        PlacementFingerprint,
+        InvalidateOnRebalance,
+    };
+
+    inline const char *prefixCacheMoEPolicyToString(PrefixCacheMoEPolicy policy)
+    {
+        switch (policy)
+        {
+        case PrefixCacheMoEPolicy::Disabled:
+            return "disabled";
+        case PrefixCacheMoEPolicy::PlacementFingerprint:
+            return "placement-fingerprint";
+        case PrefixCacheMoEPolicy::InvalidateOnRebalance:
+            return "invalidate-on-rebalance";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<PrefixCacheMoEPolicy> parsePrefixCacheMoEPolicy(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "disabled" || normalized == "off")
+            return PrefixCacheMoEPolicy::Disabled;
+        if (normalized == "placement_fingerprint" || normalized == "fingerprint")
+            return PrefixCacheMoEPolicy::PlacementFingerprint;
+        if (normalized == "invalidate_on_rebalance" || normalized == "invalidate")
+            return PrefixCacheMoEPolicy::InvalidateOnRebalance;
+        return std::nullopt;
+    }
+
+    struct PrefixCacheRuntimeConfig
+    {
+        bool enabled = false;
+        PrefixCacheStorageMode storage_mode = PrefixCacheStorageMode::Tiered;
+        int block_size = 64;
+        size_t ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
+        size_t device_budget_bytes = 256ull * 1024ull * 1024ull;
+        size_t disk_budget_bytes = 0;
+        std::string disk_dir;
+        PrefixCacheTerminalStateMode terminal_state = PrefixCacheTerminalStateMode::Auto;
+        PrefixCacheMoEPolicy moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
+    };
+
+    enum class MTPVerifyMode
+    {
+        Greedy,
+        SpeculativeSampling,
+    };
+
+    inline const char *mtpVerifyModeToString(MTPVerifyMode mode)
+    {
+        switch (mode)
+        {
+        case MTPVerifyMode::Greedy:
+            return "greedy";
+        case MTPVerifyMode::SpeculativeSampling:
+            return "speculative-sampling";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MTPVerifyMode> parseMTPVerifyMode(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "greedy")
+            return MTPVerifyMode::Greedy;
+        if (normalized == "speculative_sampling" || normalized == "sampling")
+            return MTPVerifyMode::SpeculativeSampling;
+        return std::nullopt;
+    }
+
+    struct MTPRuntimeConfig
+    {
+        bool enabled = false;
+        int draft_tokens = 1;
+        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
+        bool require_terminal_hidden_for_full_hit = true;
+    };
 
     /**
      * @brief Get bytes per element for ActivationPrecision
@@ -562,6 +729,12 @@ namespace llaminar2
         /// MoE rebalance runtime configuration.
         MoERebalanceRuntimeConfig moe_rebalance;
 
+        /// Cross-request prefix-state cache configuration.
+        PrefixCacheRuntimeConfig prefix_cache;
+
+        /// Multi-token prediction speculative decode configuration.
+        MTPRuntimeConfig mtp;
+
         RuntimeConfig() = default;
 
         explicit RuntimeConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
@@ -576,7 +749,9 @@ namespace llaminar2
             FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT,
             MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel,
             MoEHotExpertCacheConfig moe_hot_expert_cache = {},
-            MoERebalanceRuntimeConfig moe_rebalance = {})
+            MoERebalanceRuntimeConfig moe_rebalance = {},
+            PrefixCacheRuntimeConfig prefix_cache = {},
+            MTPRuntimeConfig mtp = {})
         {
             RuntimeConfig rc;
             rc.max_seq_len = max_seq_len;
@@ -586,6 +761,8 @@ namespace llaminar2
             rc.moe_expert_mode = moe_expert_mode;
             rc.moe_hot_expert_cache = moe_hot_expert_cache;
             rc.moe_rebalance = moe_rebalance;
+            rc.prefix_cache = prefix_cache;
+            rc.mtp = mtp;
             return rc;
         }
     };

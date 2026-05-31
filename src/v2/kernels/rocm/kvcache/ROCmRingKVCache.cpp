@@ -1093,6 +1093,246 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
+    typename IKVCache::KVCacheLogicalBlockLayout
+    ROCmRingKVCache<Precision>::logicalBlockLayout(int global_layer, int token_count) const
+    {
+        KVCacheLogicalBlockLayout layout;
+        layout.k_precision = Precision;
+        layout.v_precision = Precision;
+        layout.layout = TensorLayout::KV_POS_HEAD_DIM;
+        layout.local_kv_heads = local_n_kv_heads_;
+        layout.kv_head_start = kv_head_start_;
+        layout.head_dim = head_dim_;
+        layout.device_resident = true;
+
+        const int local_layer = remapLayerIndex(global_layer);
+        if (local_layer < 0 || local_layer >= n_layers_ || batch_size_ <= 0 || token_count <= 0)
+        {
+            return layout;
+        }
+
+        const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        layout.k_bytes = static_cast<size_t>(token_count) * row_bytes;
+        layout.v_bytes = static_cast<size_t>(token_count) * row_bytes;
+        return layout;
+    }
+
+    template <ActivationPrecision Precision>
+    typename IKVCache::KVCacheSequenceState
+    ROCmRingKVCache<Precision>::sequenceState(int global_layer, int seq_idx) const
+    {
+        const int local_layer = remapLayerIndex(global_layer);
+        if (local_layer < 0 || local_layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            return {};
+        }
+
+        const auto &entry = entries_[local_layer][seq_idx];
+        KVCacheSequenceState state;
+        state.cached_tokens = entry.count;
+        state.implementation_head = entry.head;
+        state.wrapped = entry.is_wrapped(max_seq_len_);
+        return state;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::exportLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
+    {
+        const int local_layer = remapLayerIndex(desc.layer);
+        if (local_layer < 0 || local_layer >= n_layers_ ||
+            desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0)
+        {
+            return false;
+        }
+
+        const auto &entry = entries_[local_layer][desc.seq_idx];
+        if (desc.logical_token_start > entry.count ||
+            desc.token_count > entry.count - desc.logical_token_start)
+        {
+            return false;
+        }
+        if (desc.token_count == 0)
+        {
+            return true;
+        }
+        if (!dst_k || !dst_v || !entry.d_K || !entry.d_V)
+        {
+            return false;
+        }
+
+        hipSetDevice(device_id_);
+        hipStream_t stream = desc.stream ? static_cast<hipStream_t>(desc.stream)
+                                         : getEffectiveStream(nullptr);
+        const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        const int tail = entry.tail(max_seq_len_);
+        auto *out_k = static_cast<uint8_t *>(dst_k);
+        auto *out_v = static_cast<uint8_t *>(dst_v);
+
+        for (int i = 0; i < desc.token_count; ++i)
+        {
+            const int logical = desc.logical_token_start + i;
+            const int phys = (tail + logical) % max_seq_len_;
+            const size_t dst_offset = static_cast<size_t>(i) * row_bytes;
+            const size_t src_offset = static_cast<size_t>(phys) * static_cast<size_t>(kv_storage_dim_);
+
+            hipError_t err = hipMemcpyAsync(out_k + dst_offset,
+                                            entry.d_K + src_offset,
+                                            row_bytes,
+                                            hipMemcpyDeviceToHost,
+                                            stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRingKVCache::exportLogicalBlock] K copy failed: "
+                          << hipGetErrorString(err));
+                return false;
+            }
+            err = hipMemcpyAsync(out_v + dst_offset,
+                                 entry.d_V + src_offset,
+                                 row_bytes,
+                                 hipMemcpyDeviceToHost,
+                                 stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmRingKVCache::exportLogicalBlock] V copy failed: "
+                          << hipGetErrorString(err));
+                return false;
+            }
+        }
+
+        const hipError_t sync_err = hipStreamSynchronize(stream);
+        if (sync_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache::exportLogicalBlock] stream sync failed: "
+                      << hipGetErrorString(sync_err));
+            return false;
+        }
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::importLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
+    {
+        const int local_layer = remapLayerIndex(desc.layer);
+        if (local_layer < 0 || local_layer >= n_layers_ ||
+            desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0 ||
+            desc.logical_token_start > max_seq_len_ ||
+            desc.token_count > max_seq_len_ - desc.logical_token_start)
+        {
+            return false;
+        }
+
+        auto &entry = entries_[local_layer][desc.seq_idx];
+        if (desc.token_count == 0)
+        {
+            if (desc.logical_token_start == 0)
+            {
+                entry.head = 0;
+                entry.count = 0;
+                invalidateRoPEShadow(local_layer, desc.seq_idx);
+            }
+            return true;
+        }
+        if (!src_k || !src_v || !entry.d_K || !entry.d_V)
+        {
+            return false;
+        }
+        if (desc.logical_token_start != entry.count ||
+            entry.head != (entry.count % max_seq_len_))
+        {
+            return false;
+        }
+
+        hipSetDevice(device_id_);
+        hipStream_t stream = desc.stream ? static_cast<hipStream_t>(desc.stream)
+                                         : getEffectiveStream(nullptr);
+        const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        const size_t bytes = static_cast<size_t>(desc.token_count) * row_bytes;
+        const size_t dst_offset = static_cast<size_t>(desc.logical_token_start) *
+                                  static_cast<size_t>(kv_storage_dim_);
+
+        hipError_t err = hipMemcpyAsync(entry.d_K + dst_offset,
+                                        src_k,
+                                        bytes,
+                                        hipMemcpyHostToDevice,
+                                        stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache::importLogicalBlock] K copy failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        err = hipMemcpyAsync(entry.d_V + dst_offset,
+                             src_v,
+                             bytes,
+                             hipMemcpyHostToDevice,
+                             stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache::importLogicalBlock] V copy failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        const hipError_t sync_err = hipStreamSynchronize(stream);
+        if (sync_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCache::importLogicalBlock] stream sync failed: "
+                      << hipGetErrorString(sync_err));
+            return false;
+        }
+
+        entry.count = desc.logical_token_start + desc.token_count;
+        entry.head = entry.count % max_seq_len_;
+        invalidateRoPEShadow(local_layer, desc.seq_idx);
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool ROCmRingKVCache<Precision>::truncateSequence(int seq_idx, int cached_tokens, void *stream)
+    {
+        (void)stream;
+        if (seq_idx < 0 || seq_idx >= batch_size_ ||
+            cached_tokens < 0 || cached_tokens > max_seq_len_)
+        {
+            return false;
+        }
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            if (cached_tokens > entries_[layer][seq_idx].count)
+            {
+                return false;
+            }
+        }
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            auto &entry = entries_[layer][seq_idx];
+            if (entry.count == cached_tokens)
+            {
+                continue;
+            }
+            if (cached_tokens == 0)
+            {
+                entry.head = 0;
+            }
+            else
+            {
+                const int tail = entry.tail(max_seq_len_);
+                entry.head = (tail + cached_tokens) % max_seq_len_;
+            }
+            entry.count = cached_tokens;
+            invalidateRoPEShadow(layer, seq_idx);
+        }
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
     void ROCmRingKVCache<Precision>::evict_oldest(int layer, int seq_idx, int num_tokens)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
@@ -2029,82 +2269,5 @@ namespace llaminar2
     template class ROCmRingKVCache<ActivationPrecision::FP16>;
     template class ROCmRingKVCache<ActivationPrecision::BF16>;
     template class ROCmRingKVCache<ActivationPrecision::Q8_1>;
-
-    // =========================================================================
-    // Factory Function
-    // =========================================================================
-
-    std::unique_ptr<IROCmRingKVCache> createROCmRingKVCache(
-        ActivationPrecision precision,
-        int n_layers, int batch_size, int max_seq_len,
-        int n_kv_heads, int head_dim, int device_id)
-    {
-        switch (precision)
-        {
-        case ActivationPrecision::FP32:
-            return std::make_unique<ROCmRingKVCacheFP32>(
-                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
-
-        case ActivationPrecision::FP16:
-            return std::make_unique<ROCmRingKVCacheFP16>(
-                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
-
-        case ActivationPrecision::BF16:
-            return std::make_unique<ROCmRingKVCacheBF16>(
-                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
-
-        case ActivationPrecision::Q8_1:
-            return std::make_unique<ROCmRingKVCacheQ8_1>(
-                n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, device_id);
-
-        default:
-            LOG_ERROR("[createROCmRingKVCache] Unsupported precision: "
-                      << static_cast<int>(precision));
-            return nullptr;
-        }
-    }
-
-    // =========================================================================
-    // Sharded Factory Function (for Tensor Parallelism)
-    // =========================================================================
-
-    std::unique_ptr<IROCmRingKVCache> createShardedROCmRingKVCache(
-        ActivationPrecision precision,
-        int n_layers, int batch_size, int max_seq_len,
-        int n_kv_heads, int local_n_kv_heads, int kv_head_start,
-        int head_dim, int device_id)
-    {
-        switch (precision)
-        {
-        case ActivationPrecision::FP32:
-            return std::make_unique<ROCmRingKVCacheFP32>(
-                n_layers, batch_size, max_seq_len,
-                n_kv_heads, local_n_kv_heads, kv_head_start,
-                head_dim, device_id);
-
-        case ActivationPrecision::FP16:
-            return std::make_unique<ROCmRingKVCacheFP16>(
-                n_layers, batch_size, max_seq_len,
-                n_kv_heads, local_n_kv_heads, kv_head_start,
-                head_dim, device_id);
-
-        case ActivationPrecision::BF16:
-            return std::make_unique<ROCmRingKVCacheBF16>(
-                n_layers, batch_size, max_seq_len,
-                n_kv_heads, local_n_kv_heads, kv_head_start,
-                head_dim, device_id);
-
-        case ActivationPrecision::Q8_1:
-            return std::make_unique<ROCmRingKVCacheQ8_1>(
-                n_layers, batch_size, max_seq_len,
-                n_kv_heads, local_n_kv_heads, kv_head_start,
-                head_dim, device_id);
-
-        default:
-            LOG_ERROR("[createShardedROCmRingKVCache] Unsupported precision: "
-                      << static_cast<int>(precision));
-            return nullptr;
-        }
-    }
 
 } // namespace llaminar2

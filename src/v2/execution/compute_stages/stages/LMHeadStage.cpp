@@ -129,8 +129,10 @@ namespace llaminar2
         //   - D2H copy from seq_len × vocab_size × 4 bytes to 1 × vocab_size × 4 bytes
         //     (e.g., 345 MB → 608 KB for Qwen2.5-7B with vocab_size=152064)
         // The result is written to row 0 of the logits tensor.
-        const int lm_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
-        const int lm_activation_offset = activationRowOffsetForLogits();
+        const int lm_m = params_.compute_all_positions
+                             ? params_.seq_len
+                             : ((params_.seq_len > 1) ? 1 : params_.seq_len);
+        const int lm_activation_offset = params_.compute_all_positions ? 0 : activationRowOffsetForLogits();
         if (lm_activation_offset < 0 || lm_activation_offset >= params_.seq_len)
         {
             LOG_ERROR("[LMHeadStage] Invalid activation row offset " << lm_activation_offset
@@ -159,21 +161,30 @@ namespace llaminar2
             return false;
         }
 
+        if (params_.device_id.is_gpu())
+        {
+            logits->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                          params_.device_id,
+                                          gpuStream());
+        }
+
         return true;
     }
 
     size_t LMHeadStage::estimatedFlops() const
     {
-        // During prefill (seq_len > 1), only 1 row is computed
-        const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+        const int effective_m = params_.compute_all_positions
+                                    ? params_.seq_len
+                                    : ((params_.seq_len > 1) ? 1 : params_.seq_len);
         // GEMM: 2 * m * vocab_size * d_model
         return 2ULL * effective_m * params_.vocab_size * params_.d_model;
     }
 
     size_t LMHeadStage::estimatedMemoryBytes() const
     {
-        // During prefill (seq_len > 1), only 1 row of hidden states and logits
-        const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+        const int effective_m = params_.compute_all_positions
+                                    ? params_.seq_len
+                                    : ((params_.seq_len > 1) ? 1 : params_.seq_len);
         // Read: hidden [m, d_model], lm_head [vocab_size, d_model]
         // Write: logits [m, vocab_size]
         size_t hidden_bytes = effective_m * params_.d_model * sizeof(float);
@@ -213,8 +224,9 @@ namespace llaminar2
 
         if (params_.logits)
         {
-            // During prefill, only 1 row of logits is computed (at row 0)
-            const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+            const int effective_m = params_.compute_all_positions
+                                        ? params_.seq_len
+                                        : ((params_.seq_len > 1) ? 1 : params_.seq_len);
             info.addOutput("logits", params_.logits,
                            effective_m, params_.vocab_size);
         }
@@ -222,6 +234,7 @@ namespace llaminar2
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("vocab_size", params_.vocab_size);
+        info.addScalarBool("compute_all_positions", params_.compute_all_positions);
         info.addScalarBool("has_bias", params_.bias_tensor != nullptr);
         info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 

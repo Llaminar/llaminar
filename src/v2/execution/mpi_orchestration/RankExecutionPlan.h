@@ -550,6 +550,12 @@ namespace llaminar2
             ss << "    activation_precision: " << activationPrecisionToString(runtime.activation_precision) << "\n";
             ss << "    kv_cache_precision: " << kvCachePrecisionToString(runtime.kv_cache_precision) << "\n";
             ss << "    fused_attention_backend: " << fusedAttentionBackendToString(runtime.fused_attention_backend) << "\n";
+            ss << "    prefix_cache.enabled: " << (runtime.prefix_cache.enabled ? "true" : "false") << "\n";
+            ss << "    prefix_cache.storage: " << prefixCacheStorageModeToString(runtime.prefix_cache.storage_mode) << "\n";
+            ss << "    prefix_cache.block_size: " << runtime.prefix_cache.block_size << "\n";
+            ss << "    mtp.enabled: " << (runtime.mtp.enabled ? "true" : "false") << "\n";
+            ss << "    mtp.draft_tokens: " << runtime.mtp.draft_tokens << "\n";
+            ss << "    mtp.verify_mode: " << mtpVerifyModeToString(runtime.mtp.verify_mode) << "\n";
             ss << "}";
             return ss.str();
         }

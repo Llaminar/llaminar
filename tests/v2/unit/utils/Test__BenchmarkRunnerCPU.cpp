@@ -145,6 +145,17 @@ namespace
         bool skip_logits_gather_decode_ = false;
     };
 
+    class MockStatsInferenceRunner : public MockCPUInferenceRunner
+    {
+    public:
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override
+        {
+            return snapshot;
+        }
+
+        PrefixRuntimeStateSnapshot snapshot;
+    };
+
     /**
      * @brief Helper to create a MockTokenizer with standard expectations.
      *
@@ -282,4 +293,76 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeSucceedsWithDeviceArgmax)
         << "GPU benchmark must succeed using device-side argmax";
     EXPECT_TRUE(result.decode_success)
         << "GPU decode phase must succeed";
+}
+
+/**
+ * @brief Verify benchmark captures prefix-cache and MTP observability.
+ */
+TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
+{
+    auto runner = std::make_shared<MockStatsInferenceRunner>();
+    runner->snapshot.prefix_cache_config_enabled = true;
+    runner->snapshot.prefix_cache_ready = true;
+    runner->snapshot.prefix_cache_bypassed = true;
+    runner->snapshot.prefix_cache_bypass_reason = "RAM budget cannot hold one complete prefix block";
+    runner->snapshot.prefix_cache_lookups = 4;
+    runner->snapshot.prefix_cache_hits = 2;
+    runner->snapshot.prefix_cache_partial_hits = 1;
+    runner->snapshot.prefix_cache_misses = 1;
+    runner->snapshot.prefix_cache_matched_blocks = 3;
+    runner->snapshot.prefix_cache_matched_tokens = 6;
+    runner->snapshot.prefix_cache_stores = 5;
+    runner->snapshot.prefix_cache_ram_bytes = 4096;
+    runner->snapshot.prefix_cache_terminal_state_hits = 2;
+    runner->snapshot.prefix_cache_bypasses = 1;
+    runner->snapshot.prefix_cache_unsupported_backend_bypasses = 0;
+    runner->snapshot.prefix_cache_fingerprint_bypasses = 0;
+    runner->snapshot.prefix_cache_terminal_state_bypasses = 0;
+    runner->snapshot.mtp_draft_steps = 3;
+    runner->snapshot.mtp_accepted_tokens = 2;
+    runner->snapshot.mtp_rejected_tokens = 1;
+    runner->snapshot.mtp_rollbacks = 3;
+    runner->snapshot.mtp_config_enabled = true;
+    runner->snapshot.mtp_bypassed = true;
+    runner->snapshot.mtp_bypass_reason = "sampling is not greedy";
+    runner->snapshot.mtp_bypasses = 1;
+    runner->snapshot.mtp_verifier_runs = 4;
+    runner->snapshot.mtp_verifier_token_count = 8;
+
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 1;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.prefix_state.prefix_cache_lookups, 4u);
+    EXPECT_EQ(result.prefix_state.prefix_cache_hits, 2u);
+    EXPECT_EQ(result.prefix_state.prefix_cache_partial_hits, 1u);
+    EXPECT_EQ(result.prefix_state.prefix_cache_matched_tokens, 6u);
+    EXPECT_EQ(result.prefix_state.prefix_cache_terminal_state_hits, 2u);
+    EXPECT_TRUE(result.prefix_state.prefix_cache_bypassed);
+    EXPECT_EQ(result.prefix_state.prefix_cache_bypasses, 1u);
+    EXPECT_EQ(result.prefix_state.mtp_draft_steps, 3u);
+    EXPECT_EQ(result.prefix_state.mtp_rejected_tokens, 1u);
+    EXPECT_TRUE(result.prefix_state.mtp_bypassed);
+    EXPECT_EQ(result.prefix_state.mtp_bypasses, 1u);
+    EXPECT_EQ(result.prefix_state.mtp_verifier_runs, 4u);
+    EXPECT_EQ(result.prefix_state.mtp_verifier_token_count, 8u);
+
+    testing::internal::CaptureStdout();
+    bench.printResults(result);
+    const std::string output = testing::internal::GetCapturedStdout();
+
+    EXPECT_NE(output.find("PREFIX / MTP STATE"), std::string::npos);
+    EXPECT_NE(output.find("Lookup results"), std::string::npos);
+    EXPECT_NE(output.find("Bypasses"), std::string::npos);
+    EXPECT_NE(output.find("RAM budget cannot hold one complete prefix block"), std::string::npos);
+    EXPECT_NE(output.find("sampling is not greedy"), std::string::npos);
+    EXPECT_NE(output.find("MTP decode"), std::string::npos);
 }

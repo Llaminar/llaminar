@@ -45,6 +45,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     config.n_heads = 16;
     config.n_kv_heads = 4;
     config.head_dim = 256;
+    config.vocab_size = 248320;
     config.seq_len = 4096;
     config.batch_size = 1;
     config.local_n_heads = 16;
@@ -65,8 +66,8 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    // Qwen3.5 has 20 layer buffers, including the stable LM-head input row.
-    EXPECT_EQ(reqs.buffers.size(), 20u) << "Expected 20 layer buffers";
+    // Qwen3.5 has 20 main layer buffers plus 15 one-row MTP sidecar buffers.
+    EXPECT_EQ(reqs.buffers.size(), 35u) << "Expected 35 layer buffers";
 
     // ── Shared buffers ──
 
@@ -217,6 +218,38 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     ASSERT_EQ(lm_head_input_row->shape.size(), 2u);
     EXPECT_EQ(lm_head_input_row->shape[0], 1u);
     EXPECT_EQ(lm_head_input_row->shape[1], 2560u);
+
+    // ── MTP sidecar buffers ──
+
+    auto *mtp_embedding = findBuf(reqs, "mtp_embedding");
+    ASSERT_NE(mtp_embedding, nullptr);
+    EXPECT_EQ(mtp_embedding->shape[0], 1u);
+    EXPECT_EQ(mtp_embedding->shape[1], 2560u);
+
+    auto *mtp_concat = findBuf(reqs, "mtp_concat");
+    ASSERT_NE(mtp_concat, nullptr);
+    EXPECT_EQ(mtp_concat->shape[0], 1u);
+    EXPECT_EQ(mtp_concat->shape[1], 5120u);
+
+    auto *mtp_q = findBuf(reqs, "mtp_q");
+    ASSERT_NE(mtp_q, nullptr);
+    EXPECT_EQ(mtp_q->shape[0], 1u);
+    EXPECT_EQ(mtp_q->shape[1], 4096u);
+
+    auto *mtp_k = findBuf(reqs, "mtp_k");
+    ASSERT_NE(mtp_k, nullptr);
+    EXPECT_EQ(mtp_k->shape[0], 1u);
+    EXPECT_EQ(mtp_k->shape[1], 1024u);
+
+    auto *mtp_gate = findBuf(reqs, "mtp_gate");
+    ASSERT_NE(mtp_gate, nullptr);
+    EXPECT_EQ(mtp_gate->shape[0], 1u);
+    EXPECT_EQ(mtp_gate->shape[1], 9216u);
+
+    auto *mtp_logits = findBuf(reqs, "mtp_logits");
+    ASSERT_NE(mtp_logits, nullptr);
+    EXPECT_EQ(mtp_logits->shape[0], 1u);
+    EXPECT_EQ(mtp_logits->shape[1], 248320u);
 }
 
 // ============================================================================
@@ -302,6 +335,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     config.n_heads = 16;
     config.n_kv_heads = 4;
     config.head_dim = 256;
+    config.vocab_size = 248320;
     config.seq_len = 4096;
     config.batch_size = 1;
     config.local_n_heads = 8;    // 16/2
@@ -322,7 +356,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    EXPECT_EQ(reqs.buffers.size(), 20u);
+    EXPECT_EQ(reqs.buffers.size(), 35u);
 
     // Q: [4096, 8*256=2048] under TP=2
     auto *Q = findBuf(reqs, "Q");
@@ -358,4 +392,21 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     ASSERT_NE(lm_head_input_row, nullptr);
     EXPECT_EQ(lm_head_input_row->shape[0], 1u);
     EXPECT_EQ(lm_head_input_row->shape[1], 2560u);
+
+    auto *mtp_q = findBuf(reqs, "mtp_q");
+    ASSERT_NE(mtp_q, nullptr);
+    EXPECT_EQ(mtp_q->shape[1], 2048u);
+
+    auto *mtp_k = findBuf(reqs, "mtp_k");
+    ASSERT_NE(mtp_k, nullptr);
+    EXPECT_EQ(mtp_k->shape[1], 512u);
+
+    auto *mtp_gate = findBuf(reqs, "mtp_gate");
+    ASSERT_NE(mtp_gate, nullptr);
+    EXPECT_EQ(mtp_gate->shape[1], 4608u);
+
+    auto *mtp_logits = findBuf(reqs, "mtp_logits");
+    ASSERT_NE(mtp_logits, nullptr);
+    EXPECT_EQ(mtp_logits->shape[0], 1u);
+    EXPECT_EQ(mtp_logits->shape[1], 248320u);
 }

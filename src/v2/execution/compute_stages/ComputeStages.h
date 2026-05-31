@@ -51,5 +51,8 @@
 // Qwen 3.5 FA stages
 #include "stages/QGateSplitStage.h"
 
+// MTP sidecar stages
+#include "stages/MTPConcatStage.h"
+
 // Factory
 #include "ComputeStageFactory.h"

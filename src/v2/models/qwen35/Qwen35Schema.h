@@ -325,6 +325,25 @@ namespace llaminar2
                 {"workspace_context", {"batch_size * local_n_heads * seq_len", "head_dim"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention context"},
                 {"workspace_mask", {"batch_size * seq_len", "seq_len"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention mask"},
                 {"lm_head_input_row", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Stable selected hidden row for bucketed prefill LM head"},
+
+                // MTP sidecar buffers are one-token scratch surfaces. They stay
+                // separate from main graph scratch so speculative sidecar work
+                // cannot trample the terminal hidden/logit state being verified.
+                {"mtp_embedding", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding"},
+                {"mtp_norm_hidden", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden"},
+                {"mtp_norm_embedding", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding"},
+                {"mtp_concat", {"1", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized hidden and embedding"},
+                {"mtp_projected", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
+                {"mtp_hidden", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
+                {"mtp_q", {"1", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
+                {"mtp_k", {"1", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
+                {"mtp_v", {"1", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
+                {"mtp_attn_output", {"1", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention output"},
+                {"mtp_attn_proj", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
+                {"mtp_gate", {"1", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
+                {"mtp_up", {"1", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
+                {"mtp_ffn_output", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
+                {"mtp_logits", {"1", "vocab_size"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits"},
             };
 
             schema.model_buffers = {

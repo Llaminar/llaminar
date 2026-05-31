@@ -96,4 +96,9 @@ namespace llaminar2
         orch_runner_->flushStageTimeline();
     }
 
+    PrefixRuntimeStateSnapshot InferenceRunnerAdapter::prefixStateProbe() const
+    {
+        return orch_runner_ ? orch_runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+    }
+
 } // namespace llaminar2

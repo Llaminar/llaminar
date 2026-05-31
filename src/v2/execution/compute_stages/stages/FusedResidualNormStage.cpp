@@ -123,8 +123,12 @@ namespace llaminar2
             }
 
             // Mark both outputs as device-dirty (GPU is authoritative)
-            residual_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-            norm_output_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            residual_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                                 params_.device_id,
+                                                 stream);
+            norm_output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                                    params_.device_id,
+                                                    stream);
 
             traceOutput("residual", params_.residual);
             traceOutput("norm_output", params_.norm_output);
