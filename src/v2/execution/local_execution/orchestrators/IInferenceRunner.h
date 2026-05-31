@@ -456,6 +456,22 @@ namespace llaminar2
          */
         virtual LogitsLocalInfo getLogitsLocalInfo() const { return {}; }
 
+        /**
+         * @brief Check if this runner has column-parallel local MTP logits
+         *
+         * True when the MTP sidecar LM head writes a local vocabulary shard
+         * instead of a full replicated logits row.
+         */
+        virtual bool hasMTPLogitsLocal() const { return false; }
+
+        /**
+         * @brief Get local MTP logits info for column-parallel gathering
+         *
+         * Uses the same LogitsLocalInfo contract as the main LM head so TP
+         * orchestration can gather sidecar logits without knowing runner internals.
+         */
+        virtual LogitsLocalInfo getMTPLogitsLocalInfo() const { return {}; }
+
         // =====================================================================
         // Profiling API
         // =====================================================================

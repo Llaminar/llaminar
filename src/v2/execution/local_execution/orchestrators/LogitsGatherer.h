@@ -25,6 +25,7 @@ namespace llaminar2
     class IBackend;
     class IInferenceRunner;
     struct DeviceId;
+    struct LogitsLocalInfo;
 
     /**
      * @brief Manages the combined logits buffer and gather operations for multi-device inference.
@@ -97,6 +98,17 @@ namespace llaminar2
          */
         bool gather(const std::vector<std::unique_ptr<IInferenceRunner>> &runners,
                     size_t seq_len, int full_vocab_size);
+
+        /**
+         * @brief Gather already-resolved local logits shards into the combined buffer.
+         *
+         * This is used for logits surfaces that are not the main LOGITS_LOCAL buffer,
+         * such as MTP sidecar logits. The copy semantics and CPU/GPU fallbacks are
+         * identical to gather().
+         */
+        bool gatherLocalInfos(const std::vector<LogitsLocalInfo> &device_infos,
+                              size_t seq_len,
+                              int full_vocab_size);
 
         /**
          * @brief Copy logits from a PP stage runner into the combined buffer.

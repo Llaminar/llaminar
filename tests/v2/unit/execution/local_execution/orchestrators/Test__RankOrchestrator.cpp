@@ -91,6 +91,27 @@ public:
         return mtp_logits_.empty() ? logits_.data() : mtp_logits_.data();
     }
 
+    bool hasMTPLogitsLocal() const override
+    {
+        return mtp_logits_local_ != nullptr;
+    }
+
+    LogitsLocalInfo getMTPLogitsLocalInfo() const override
+    {
+        if (!mtp_logits_local_)
+            return {};
+        const auto &shape = mtp_logits_local_->shape();
+        return LogitsLocalInfo{
+            nullptr,
+            std::nullopt,
+            shape.size() >= 2 ? shape[1] : 0,
+            mtp_logits_local_.get(),
+            nullptr,
+            nullptr,
+            nullptr,
+            0};
+    }
+
     bool setComputeAllPositionLogits(bool enabled) override
     {
         set_all_position_logits_calls_.fetch_add(1, std::memory_order_relaxed);
@@ -223,6 +244,15 @@ public:
         mtp_logits_ = logits;
     }
 
+    void set_mock_mtp_logits_local(int local_vocab, const std::vector<float> &logits)
+    {
+        mtp_logits_local_ = std::make_shared<FP32Tensor>(
+            std::vector<size_t>{1, static_cast<size_t>(local_vocab)},
+            DeviceId::cpu());
+        std::memcpy(mtp_logits_local_->mutable_data(), logits.data(),
+                    logits.size() * sizeof(float));
+    }
+
     void set_mock_all_position_logits(const std::vector<float> &logits)
     {
         all_position_logits_ = logits;
@@ -281,6 +311,7 @@ private:
     std::vector<float> logits_;
     std::vector<float> mtp_logits_;
     std::vector<float> all_position_logits_;
+    std::shared_ptr<FP32Tensor> mtp_logits_local_;
     PrefixLookupResult prefix_lookup_result_;
     bool prefix_populate_ok_ = true;
     bool prefix_harvest_ok_ = true;
@@ -1318,6 +1349,61 @@ TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsRequireMatchingReplicas)
     EXPECT_FLOAT_EQ(orchestrator->mtpLogits()[1], 5.0f);
 
     runner1_ptr->set_mock_mtp_logits({0.0f, 4.0f, 1.0f});
+    EXPECT_EQ(orchestrator->mtpLogits(), nullptr);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsGatherColumnParallelShards)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_mock_mtp_logits_local(2, {0.0f, 5.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner1->set_mock_mtp_logits_local(3, {1.0f, 9.0f, 2.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setVocabSize(5);
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    const float *logits = orchestrator->mtpLogits();
+    ASSERT_NE(logits, nullptr);
+    EXPECT_FLOAT_EQ(logits[0], 0.0f);
+    EXPECT_FLOAT_EQ(logits[1], 5.0f);
+    EXPECT_FLOAT_EQ(logits[2], 1.0f);
+    EXPECT_FLOAT_EQ(logits[3], 9.0f);
+    EXPECT_FLOAT_EQ(logits[4], 2.0f);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsRejectMixedLocalAndReplicatedShards)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_mock_mtp_logits_local(2, {0.0f, 5.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner1->set_vocab_size(3);
+    runner1->set_mock_mtp_logits({1.0f, 9.0f, 2.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setVocabSize(5);
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
     EXPECT_EQ(orchestrator->mtpLogits(), nullptr);
 }
 

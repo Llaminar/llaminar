@@ -343,7 +343,7 @@ namespace llaminar2
                 {"mtp_gate", {"1", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
                 {"mtp_up", {"1", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
                 {"mtp_ffn_output", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
-                {"mtp_logits", {"1", "vocab_size"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits"},
+                {"mtp_logits", {"1", "local_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits shard"},
             };
 
             schema.model_buffers = {

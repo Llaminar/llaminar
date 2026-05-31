@@ -1368,6 +1368,39 @@ namespace llaminar2
                 argmax_partial_capacity_};
         }
 
+        bool hasMTPLogitsLocal() const override
+        {
+            if (!graph_builder_ || !graph_builder_->config().lm_head_column_parallel)
+                return false;
+            auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+            return it != state_.extension_buffers.end() && it->second != nullptr;
+        }
+
+        LogitsLocalInfo getMTPLogitsLocalInfo() const override
+        {
+            if (!hasMTPLogitsLocal())
+                return {};
+
+            auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+            TensorBase *mtp_logits = it->second.get();
+            const auto &shape = mtp_logits->shape();
+            auto device_opt = mtp_logits->current_device();
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = GPUDeviceContextPool::instance().getContext(*device_opt).defaultStream();
+            }
+            return LogitsLocalInfo{
+                mtp_logits->gpu_data_ptr(),
+                device_opt,
+                shape.size() >= 2 ? shape[1] : 0,
+                mtp_logits,
+                stream,
+                nullptr,
+                nullptr,
+                0};
+        }
+
         /**
          * @brief Simplified forward pass using orchestrator-owned state
          *

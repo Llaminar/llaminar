@@ -493,6 +493,11 @@ namespace llaminar2
                       device);
         graph.addDependency(prefix + "final_norm", ffn_terminal);
 
+        const int mtp_lm_head_vocab_size =
+            (config_.lm_head_column_parallel && config_.vocab_local > 0)
+                ? config_.vocab_local
+                : config_.vocab_size;
+
         graph.addNode(prefix + "lm_head",
                       ComputeStageFactory::createLMHead({
                           .device_id = device,
@@ -501,7 +506,7 @@ namespace llaminar2
                           .logits = output.logits,
                           .seq_len = total_tokens,
                           .d_model = config_.d_model,
-                          .vocab_size = config_.vocab_size,
+                          .vocab_size = mtp_lm_head_vocab_size,
                           .use_prefill_replay_row_offset = false,
                           .input_buffer_id = BufferId::MTP_HIDDEN,
                           .output_buffer_id = BufferId::MTP_LOGITS,

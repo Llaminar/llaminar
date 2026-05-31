@@ -51,6 +51,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
     config.local_n_heads = 16;
     config.local_n_kv_heads = 4;
     config.local_d_ff = 9216;
+    config.local_vocab = 248320;
 
     // GDN custom formulas (as computed by Qwen35Graph::getResolverConfig)
     // n_k_heads=16, d_k=128, key_dim=16*128=2048
@@ -341,6 +342,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     config.local_n_heads = 8;    // 16/2
     config.local_n_kv_heads = 2; // 4/2
     config.local_d_ff = 4608;    // 9216/2
+    config.local_vocab = 124160; // 248320/2
 
     // GDN formulas under TP=2 (n_k=8, n_v=16, d_k=128)
     // key_dim = 8*128 = 1024
@@ -408,5 +410,5 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
     auto *mtp_logits = findBuf(reqs, "mtp_logits");
     ASSERT_NE(mtp_logits, nullptr);
     EXPECT_EQ(mtp_logits->shape[0], 1u);
-    EXPECT_EQ(mtp_logits->shape[1], 248320u);
+    EXPECT_EQ(mtp_logits->shape[1], 124160u);
 }

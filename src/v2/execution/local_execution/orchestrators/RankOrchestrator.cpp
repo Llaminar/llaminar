@@ -1962,6 +1962,50 @@ namespace llaminar2
             return nullptr;
         }
 
+        bool has_local_mtp_logits = false;
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner)
+                return nullptr;
+            has_local_mtp_logits = has_local_mtp_logits || runner->hasMTPLogitsLocal();
+        }
+
+        if (has_local_mtp_logits)
+        {
+            std::vector<LogitsLocalInfo> local_infos;
+            local_infos.reserve(device_runners_.size());
+            for (const auto &runner : device_runners_)
+            {
+                if (!runner->hasMTPLogitsLocal())
+                {
+                    LOG_WARN("RankOrchestrator::mtpLogits: mixed local and replicated MTP logits are unsupported");
+                    return nullptr;
+                }
+
+                LogitsLocalInfo info = runner->getMTPLogitsLocalInfo();
+                if (!info)
+                    return nullptr;
+                local_infos.push_back(info);
+            }
+
+            const int full_vocab = vocab_size();
+            if (full_vocab <= 0)
+                return nullptr;
+
+            if (!mtp_logits_gatherer_ ||
+                mtp_logits_gatherer_->bufferNumel() < static_cast<size_t>(full_vocab))
+            {
+                mtp_logits_gatherer_ = std::make_unique<LogitsGatherer>(full_vocab, 1);
+            }
+
+            if (!mtp_logits_gatherer_ ||
+                !mtp_logits_gatherer_->gatherLocalInfos(local_infos, 1, full_vocab))
+            {
+                return nullptr;
+            }
+            return mtp_logits_gatherer_->data();
+        }
+
         const int compare_vocab = device_runners_[0] ? device_runners_[0]->vocab_size() : 0;
         if (compare_vocab <= 0)
         {
