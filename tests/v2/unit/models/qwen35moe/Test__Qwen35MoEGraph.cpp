@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include "execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
 #include "kernels/KernelFactory.h"
@@ -29,6 +31,19 @@ namespace
         return std::find(node->dependencies.begin(), node->dependencies.end(), dependency) != node->dependencies.end();
     }
 
+    bool hasFingerprintField(
+        const PrefixFingerprintMaterial &material,
+        const std::string &name,
+        const std::string &value)
+    {
+        return std::any_of(material.moe.begin(),
+                           material.moe.end(),
+                           [&](const PrefixFingerprintField &field)
+                           {
+                               return field.name == name && field.value == value;
+                           });
+    }
+
     GraphConfig makeMoEConfig(ITPContext *tp_ctx = nullptr)
     {
         GraphConfig config;
@@ -50,6 +65,96 @@ namespace
         config.moe.has_shared_expert = true;
         config.moe.shared_intermediate_size = 3;
         return config;
+    }
+
+    ExecutionDomainDefinition denseDomain(
+        std::string name,
+        ExecutionDomainScope scope,
+        CollectiveBackendType backend,
+        std::vector<GlobalDeviceAddress> participants)
+    {
+        ExecutionDomainDefinition domain;
+        domain.name = std::move(name);
+        domain.scope = scope;
+        domain.backend = backend;
+        domain.participants = std::move(participants);
+        domain.compute_kind = ExecutionDomainComputeKind::REPLICATED_EXPERTS;
+        domain.owner_rank = 0;
+        domain.ranks = {0};
+        return domain;
+    }
+
+    ExpertComputeDomain expertDomain(
+        std::string name,
+        ExpertDomainKind kind,
+        CollectiveBackendType backend,
+        ExpertDomainComputeKind compute_kind,
+        std::vector<GlobalDeviceAddress> participants,
+        std::vector<int> ranks)
+    {
+        ExpertComputeDomain domain;
+        domain.name = std::move(name);
+        domain.kind = kind;
+        domain.backend = backend;
+        domain.compute_kind = compute_kind;
+        domain.participants = std::move(participants);
+        domain.world_ranks = std::move(ranks);
+        domain.owner_rank = 0;
+        return domain;
+    }
+
+    std::shared_ptr<MoEExpertParallelPlan> makeOverlayPlan(const std::string &routed_domain)
+    {
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->continuation_domain = "continuation";
+        plan->base_model_domain = "base";
+        plan->shared_expert_domain = "shared";
+        plan->residency_policy = ExpertResidencyPolicy::RoutedTierRebalanced;
+        plan->continuation_domain_spec.domain = "continuation";
+        plan->continuation_domain_spec.logical_root_participant = 0;
+        plan->continuation_domain_spec.dense_tp_enabled = false;
+        plan->continuation_domain_spec.hidden_layout = MoEContinuationActivationLayout::ReplicatedHidden;
+        plan->continuation_domain_spec.shared_expert_uses_dense_tp = true;
+
+        plan->dense_domains.push_back(denseDomain(
+            "continuation",
+            ExecutionDomainScope::SINGLE,
+            CollectiveBackendType::HOST,
+            {GlobalDeviceAddress::cpu(0, "node0")}));
+        plan->dense_domains.push_back(denseDomain(
+            "base",
+            ExecutionDomainScope::SINGLE,
+            CollectiveBackendType::HOST,
+            {GlobalDeviceAddress::cpu(0, "node0")}));
+        plan->dense_domains.push_back(denseDomain(
+            "shared",
+            ExecutionDomainScope::SINGLE,
+            CollectiveBackendType::HOST,
+            {GlobalDeviceAddress::cpu(0, "node0")}));
+
+        plan->domains.push_back(expertDomain(
+            routed_domain,
+            ExpertDomainKind::NodeLocalTP,
+            CollectiveBackendType::HOST,
+            ExpertDomainComputeKind::ExpertIdSharded,
+            {GlobalDeviceAddress::cpu(0, "node0"), GlobalDeviceAddress::cpu(1, "node0")},
+            {0, 1}));
+
+        plan->routed_tiers.push_back(ExpertRoutedTier{
+            .name = "cold",
+            .domain = routed_domain,
+            .priority = 10,
+            .max_experts_per_layer = 2,
+            .memory_budget_bytes = 4096,
+            .fallback = true,
+        });
+        plan->placements.push_back(ExpertLayerPlacement{
+            .layer = 0,
+            .routed_expert_tier = {0, 0},
+        });
+        return plan;
     }
 
     class TensorArena
@@ -234,4 +339,50 @@ TEST(Test__Qwen35MoEGraph, FARopeOnReadAppendsNormalizedKToCache)
     EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_k_norm"));
     EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_rope"))
         << "rope_on_read stores pre-RoPE K, but it must still wait for K norm";
+}
+
+TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopology)
+{
+    GraphConfig config = makeMoEConfig();
+    config.moe.expert_parallel_plan = makeOverlayPlan("cold_cpu");
+    config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
+        config.moe.expert_parallel_plan,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 0,
+            .validate_mvp_root_reachability = false,
+        });
+
+    Qwen35MoEGraph graph_builder(config, nullptr);
+    PrefixFingerprintMaterial material;
+    graph_builder.appendPrefixCacheFingerprintMaterial(material);
+
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.enabled", "true"));
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.continuation_domain", "continuation"));
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.shared_expert_domain", "shared"));
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.routed_tier.0.domain", "cold_cpu"));
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.plan.expert_domain.0.participant.1",
+                                    GlobalDeviceAddress::cpu(1, "node0").toString()));
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.runtime.enabled", "true"));
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.runtime.domain.3.name", "cold_cpu"));
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.runtime.domain.3.participant.1.world_rank", "1"));
+    EXPECT_TRUE(hasFingerprintField(material, "expert_overlay.runtime.routed_tier.0.domain_name", "cold_cpu"));
+
+    const uint64_t original_hash = hashPrefixFingerprintFields("moe", material.moe);
+
+    GraphConfig changed_config = makeMoEConfig();
+    changed_config.moe.expert_parallel_plan = makeOverlayPlan("warm_rocm");
+    changed_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
+        changed_config.moe.expert_parallel_plan,
+        MoEExpertOverlayRuntimeResolverOptions{
+            .current_world_rank = 0,
+            .validate_mvp_root_reachability = false,
+        });
+
+    Qwen35MoEGraph changed_graph_builder(changed_config, nullptr);
+    PrefixFingerprintMaterial changed_material;
+    changed_graph_builder.appendPrefixCacheFingerprintMaterial(changed_material);
+    const uint64_t changed_hash = hashPrefixFingerprintFields("moe", changed_material.moe);
+
+    EXPECT_NE(changed_hash, original_hash)
+        << "Changing routed expert overlay domains must invalidate MoE prefix-cache payloads";
 }

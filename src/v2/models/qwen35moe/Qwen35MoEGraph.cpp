@@ -156,6 +156,203 @@ namespace llaminar2
                 direction);
         }
 
+        std::string boolField(bool value)
+        {
+            return value ? "true" : "false";
+        }
+
+        void appendAddressVectorFields(
+            std::vector<PrefixFingerprintField> &fields,
+            const std::string &prefix,
+            const std::vector<GlobalDeviceAddress> &addresses)
+        {
+            fields.push_back({prefix + ".count", std::to_string(addresses.size())});
+            for (size_t index = 0; index < addresses.size(); ++index)
+                fields.push_back({prefix + "." + std::to_string(index), addresses[index].toString()});
+        }
+
+        void appendRankVectorFields(
+            std::vector<PrefixFingerprintField> &fields,
+            const std::string &prefix,
+            const std::vector<int> &ranks)
+        {
+            fields.push_back({prefix + ".count", std::to_string(ranks.size())});
+            for (size_t index = 0; index < ranks.size(); ++index)
+                fields.push_back({prefix + "." + std::to_string(index), std::to_string(ranks[index])});
+        }
+
+        void appendWeightVectorFields(
+            std::vector<PrefixFingerprintField> &fields,
+            const std::string &prefix,
+            const std::vector<float> &weights)
+        {
+            fields.push_back({prefix + ".count", std::to_string(weights.size())});
+            for (size_t index = 0; index < weights.size(); ++index)
+                fields.push_back({prefix + "." + std::to_string(index), std::to_string(weights[index])});
+        }
+
+        void appendDenseDomainFingerprintFields(
+            std::vector<PrefixFingerprintField> &fields,
+            const ExecutionDomainDefinition &domain,
+            const std::string &prefix)
+        {
+            fields.push_back({prefix + ".name", domain.name});
+            fields.push_back({prefix + ".scope", executionDomainScopeToString(domain.scope)});
+            fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
+            fields.push_back({prefix + ".compute_kind", executionDomainComputeKindToString(domain.compute_kind)});
+            fields.push_back({prefix + ".owner_rank", domain.owner_rank ? std::to_string(*domain.owner_rank) : "-1"});
+            appendAddressVectorFields(fields, prefix + ".participant", domain.participants);
+            appendRankVectorFields(fields, prefix + ".rank", domain.ranks);
+            appendWeightVectorFields(fields, prefix + ".weight", domain.weights);
+        }
+
+        void appendExpertDomainFingerprintFields(
+            std::vector<PrefixFingerprintField> &fields,
+            const ExpertComputeDomain &domain,
+            const std::string &prefix)
+        {
+            fields.push_back({prefix + ".name", domain.name});
+            fields.push_back({prefix + ".kind", toString(domain.kind)});
+            fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
+            fields.push_back({prefix + ".compute_kind", toString(domain.compute_kind)});
+            fields.push_back({prefix + ".owner_rank", std::to_string(domain.owner_rank)});
+            appendAddressVectorFields(fields, prefix + ".participant", domain.participants);
+            appendRankVectorFields(fields, prefix + ".rank", domain.world_ranks);
+            appendWeightVectorFields(fields, prefix + ".weight", domain.weights);
+        }
+
+        void appendExpertOverlayPlanFingerprintFields(
+            std::vector<PrefixFingerprintField> &fields,
+            const MoEExpertParallelPlan &plan,
+            const std::string &scope)
+        {
+            fields.push_back({scope + ".enabled", boolField(plan.enabled)});
+            fields.push_back({scope + ".execution_kind", toString(plan.execution_kind)});
+            fields.push_back({scope + ".continuation_domain", plan.continuation_domain});
+            fields.push_back({scope + ".base_model_domain", plan.base_model_domain});
+            fields.push_back({scope + ".effective_base_model_domain", plan.effectiveBaseModelDomain()});
+            fields.push_back({scope + ".shared_expert_domain", plan.shared_expert_domain});
+            fields.push_back({scope + ".residency_policy", toString(plan.residency_policy)});
+            fields.push_back({scope + ".continuation_spec.domain", plan.continuation_domain_spec.domain});
+            fields.push_back({scope + ".continuation_spec.logical_root_participant",
+                              std::to_string(plan.continuation_domain_spec.logical_root_participant)});
+            fields.push_back({scope + ".continuation_spec.dense_tp_enabled",
+                              boolField(plan.continuation_domain_spec.dense_tp_enabled)});
+            fields.push_back({scope + ".continuation_spec.hidden_layout",
+                              toString(plan.continuation_domain_spec.hidden_layout)});
+            fields.push_back({scope + ".continuation_spec.shared_expert_uses_dense_tp",
+                              boolField(plan.continuation_domain_spec.shared_expert_uses_dense_tp)});
+
+            fields.push_back({scope + ".dense_domain.count", std::to_string(plan.dense_domains.size())});
+            for (size_t index = 0; index < plan.dense_domains.size(); ++index)
+                appendDenseDomainFingerprintFields(
+                    fields,
+                    plan.dense_domains[index],
+                    scope + ".dense_domain." + std::to_string(index));
+
+            fields.push_back({scope + ".expert_domain.count", std::to_string(plan.domains.size())});
+            for (size_t index = 0; index < plan.domains.size(); ++index)
+                appendExpertDomainFingerprintFields(
+                    fields,
+                    plan.domains[index],
+                    scope + ".expert_domain." + std::to_string(index));
+
+            fields.push_back({scope + ".routed_tier.count", std::to_string(plan.routed_tiers.size())});
+            for (size_t index = 0; index < plan.routed_tiers.size(); ++index)
+            {
+                const auto &tier = plan.routed_tiers[index];
+                const std::string prefix = scope + ".routed_tier." + std::to_string(index);
+                fields.push_back({prefix + ".name", tier.name});
+                fields.push_back({prefix + ".domain", tier.domain});
+                fields.push_back({prefix + ".priority", std::to_string(tier.priority)});
+                fields.push_back({prefix + ".max_experts_per_layer", std::to_string(tier.max_experts_per_layer)});
+                fields.push_back({prefix + ".memory_budget_bytes", std::to_string(tier.memory_budget_bytes)});
+                fields.push_back({prefix + ".fallback", boolField(tier.fallback)});
+            }
+
+            fields.push_back({scope + ".placement.count", std::to_string(plan.placements.size())});
+            for (size_t placement_index = 0; placement_index < plan.placements.size(); ++placement_index)
+            {
+                const auto &placement = plan.placements[placement_index];
+                const std::string prefix = scope + ".placement." + std::to_string(placement_index);
+                fields.push_back({prefix + ".layer", std::to_string(placement.layer)});
+                fields.push_back({prefix + ".routed_expert_tier.count",
+                                  std::to_string(placement.routed_expert_tier.size())});
+                for (size_t expert = 0; expert < placement.routed_expert_tier.size(); ++expert)
+                    fields.push_back({prefix + ".routed_expert_tier." + std::to_string(expert),
+                                      std::to_string(placement.routed_expert_tier[expert])});
+            }
+        }
+
+        void appendExpertOverlayRuntimeFingerprintFields(
+            std::vector<PrefixFingerprintField> &fields,
+            const MoEExpertOverlayRuntimePlan &runtime_plan,
+            const std::string &scope)
+        {
+            fields.push_back({scope + ".enabled", "true"});
+            fields.push_back({scope + ".current_world_rank", std::to_string(runtime_plan.currentWorldRank())});
+
+            fields.push_back({scope + ".domain.count", std::to_string(runtime_plan.domains().size())});
+            for (size_t domain_index = 0; domain_index < runtime_plan.domains().size(); ++domain_index)
+            {
+                const auto &domain = runtime_plan.domains()[domain_index];
+                const std::string prefix = scope + ".domain." + std::to_string(domain_index);
+                fields.push_back({prefix + ".name", domain.name});
+                fields.push_back({prefix + ".kind", toString(domain.kind)});
+                fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
+                fields.push_back({prefix + ".compute_kind", toString(domain.compute_kind)});
+                fields.push_back({prefix + ".primary_participant", domain.primary_participant.toString()});
+                fields.push_back({prefix + ".primary_device", domain.primary_device.to_string()});
+                fields.push_back({prefix + ".primary_world_rank", std::to_string(domain.primary_world_rank)});
+                fields.push_back({prefix + ".primary_world_rank_known", boolField(domain.primary_world_rank_known)});
+                fields.push_back({prefix + ".owner_rank", std::to_string(domain.owner_rank)});
+                fields.push_back({prefix + ".primary_is_local", boolField(domain.primary_is_local)});
+                fields.push_back({prefix + ".primary_owned_by_current_rank",
+                                  boolField(domain.primary_owned_by_current_rank)});
+                fields.push_back({prefix + ".local_reachable_for_mvp", boolField(domain.local_reachable_for_mvp)});
+                fields.push_back({prefix + ".requires_domain_scoped_collective_context",
+                                  boolField(domain.requires_domain_scoped_collective_context)});
+                fields.push_back({prefix + ".domain_scoped_collective_context_ready",
+                                  boolField(domain.domain_scoped_collective_context_ready)});
+                fields.push_back({prefix + ".multi_participant_execution_pending",
+                                  boolField(domain.multi_participant_execution_pending)});
+                fields.push_back({prefix + ".pending_reason", domain.pending_reason});
+
+                fields.push_back({prefix + ".participant.count", std::to_string(domain.participants.size())});
+                for (size_t participant_index = 0; participant_index < domain.participants.size(); ++participant_index)
+                {
+                    const auto &participant = domain.participants[participant_index];
+                    const std::string participant_prefix =
+                        prefix + ".participant." + std::to_string(participant_index);
+                    fields.push_back({participant_prefix + ".address", participant.address.toString()});
+                    fields.push_back({participant_prefix + ".participant_index",
+                                      std::to_string(participant.participant_index)});
+                    fields.push_back({participant_prefix + ".world_rank", std::to_string(participant.world_rank)});
+                    fields.push_back({participant_prefix + ".world_rank_known",
+                                      boolField(participant.world_rank_known)});
+                    fields.push_back({participant_prefix + ".owned_by_current_rank",
+                                      boolField(participant.owned_by_current_rank)});
+                    fields.push_back({participant_prefix + ".locally_addressable",
+                                      boolField(participant.locally_addressable)});
+                    fields.push_back({participant_prefix + ".local_device", participant.local_device.to_string()});
+                }
+            }
+
+            fields.push_back({scope + ".routed_tier.count", std::to_string(runtime_plan.routedTiers().size())});
+            for (size_t tier_index = 0; tier_index < runtime_plan.routedTiers().size(); ++tier_index)
+            {
+                const auto &tier = runtime_plan.routedTiers()[tier_index];
+                const std::string prefix = scope + ".routed_tier." + std::to_string(tier_index);
+                fields.push_back({prefix + ".tier_index", std::to_string(tier.tier_index)});
+                fields.push_back({prefix + ".name", tier.tier.name});
+                fields.push_back({prefix + ".domain_name", tier.domain_name});
+                fields.push_back({prefix + ".primary_device", tier.primary_device.to_string()});
+                fields.push_back({prefix + ".local_reachable_for_mvp", boolField(tier.local_reachable_for_mvp)});
+                fields.push_back({prefix + ".multi_participant_execution_pending",
+                                  boolField(tier.multi_participant_execution_pending)});
+            }
+        }
+
         DeviceId participantDeviceForGraphNativeOverlay(
             const MoEExpertOwnerMap &owner_map,
             int participant_id)
@@ -206,6 +403,30 @@ namespace llaminar2
         material.moe.push_back({"graph.num_experts", std::to_string(config_.moe.num_experts)});
         material.moe.push_back({"graph.top_k", std::to_string(config_.moe.top_k)});
         material.moe.push_back({"graph.runtime_table_count", std::to_string(moe_runtime_tables_.size())});
+
+        if (config_.moe.expert_parallel_plan)
+        {
+            appendExpertOverlayPlanFingerprintFields(
+                material.moe,
+                *config_.moe.expert_parallel_plan,
+                "expert_overlay.plan");
+        }
+        else
+        {
+            material.moe.push_back({"expert_overlay.plan.enabled", "false"});
+        }
+
+        if (config_.moe.expert_overlay_runtime_plan)
+        {
+            appendExpertOverlayRuntimeFingerprintFields(
+                material.moe,
+                *config_.moe.expert_overlay_runtime_plan,
+                "expert_overlay.runtime");
+        }
+        else
+        {
+            material.moe.push_back({"expert_overlay.runtime.enabled", "false"});
+        }
 
         for (const auto &[key, table] : moe_runtime_tables_)
         {
