@@ -417,6 +417,37 @@ namespace llaminar2
         return true;
     }
 
+    bool ForwardExecutionEngine::runPrefillChunkSchedule(
+        const ForwardInput &base_input,
+        const PrefillChunkRuntimeSchedule &schedule,
+        ForwardOutput &output,
+        IForwardExecutionHost &host)
+    {
+        if (!schedule)
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Invalid prefill chunk schedule: "
+                      << schedule.error);
+            return false;
+        }
+        if (schedule.chunks.empty())
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Prefill chunk schedule is empty");
+            return false;
+        }
+
+        for (const auto &chunk_plan : schedule.chunks)
+        {
+            if (!runPrefillChunk(base_input, chunk_plan, output, host))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill chunk schedule failed at chunk "
+                          << chunk_plan.chunk_index);
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     void ForwardExecutionEngine::invalidateAll()
     {
         for (auto &[_, cache] : cache_)

@@ -314,6 +314,19 @@ namespace llaminar2
             ForwardOutput &output,
             IForwardExecutionHost &host);
 
+        /**
+         * @brief Execute all chunks in a prepared prefill runtime schedule.
+         *
+         * Chunks run in schedule order. Each successful chunk passes through
+         * the same chunk-boundary maintenance gate as runPrefillChunk(); the
+         * first failed execution or maintenance hook stops the schedule.
+         */
+        bool runPrefillChunkSchedule(
+            const ForwardInput &base_input,
+            const PrefillChunkRuntimeSchedule &schedule,
+            ForwardOutput &output,
+            IForwardExecutionHost &host);
+
         // ----- Cache Management -----
 
         /** Invalidate all cached graphs and release resources. */

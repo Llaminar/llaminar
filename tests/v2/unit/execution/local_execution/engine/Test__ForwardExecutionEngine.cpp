@@ -106,6 +106,9 @@ namespace
         const int *last_position_ids_pointer = nullptr;
         std::vector<int> last_token_ids;
         std::vector<int> last_position_ids;
+        std::vector<int> forward_token_offsets;
+        std::vector<int> forward_real_seq_lens;
+        std::vector<std::vector<int>> forward_token_batches;
         int prefill_chunk_maintenance_state_calls = 0;
         int prefill_chunk_maintenance_calls = 0;
         PrefillChunkPlan last_maintenance_chunk{};
@@ -140,6 +143,9 @@ namespace
                 last_token_ids.assign(input.token_ids, input.token_ids + total_tokens);
             if (input.position_ids && total_tokens > 0)
                 last_position_ids.assign(input.position_ids, input.position_ids + total_tokens);
+            forward_token_offsets.push_back(input.token_offset);
+            forward_real_seq_lens.push_back(input.real_seq_len);
+            forward_token_batches.push_back(last_token_ids);
 
             if (build_should_fail)
                 return GraphBuildResult(build_error_message);
@@ -708,6 +714,95 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_MaintenanceHookFailureFails
     EXPECT_TRUE(host.last_maintenance_decision.can_run);
     EXPECT_TRUE(host.last_maintenance_decision.required);
     EXPECT_EQ(host.last_maintenance_decision.reason, "required");
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_ExecutesChunksInOrderAndMaintainsBoundaries)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    const std::vector<int> tokens = {10, 11, 12, 13, 14, 15, 16, 17};
+    auto input = makeTestInput(static_cast<int>(tokens.size()), 1, DeviceId::cpu(), tokens.data(), nullptr);
+
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {4};
+    policy.fixed_chunk_real_tokens = 4;
+    policy.min_rebalance_interval_tokens = 4;
+    policy.max_rebalance_interval_tokens = 4;
+    policy.real_token_count = static_cast<int>(tokens.size());
+
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(schedule) << schedule.error;
+    ASSERT_EQ(schedule.chunks.size(), 2u);
+    ASSERT_TRUE(schedule.chunks[0].rebalance_required_after);
+    ASSERT_TRUE(schedule.chunks[1].rebalance_required_after);
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.runPrefillChunkSchedule(input, schedule, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 2);
+    EXPECT_EQ(host.prefill_chunk_maintenance_state_calls, 2);
+    EXPECT_EQ(host.prefill_chunk_maintenance_calls, 2);
+    EXPECT_EQ(host.forward_token_offsets, (std::vector<int>{0, 4}));
+    EXPECT_EQ(host.forward_real_seq_lens, (std::vector<int>{4, 4}));
+    ASSERT_EQ(host.forward_token_batches.size(), 2u);
+    EXPECT_EQ(host.forward_token_batches[0], (std::vector<int>{10, 11, 12, 13}));
+    EXPECT_EQ(host.forward_token_batches[1], (std::vector<int>{14, 15, 16, 17}));
+    EXPECT_EQ(host.last_maintenance_chunk.chunk_index, 1);
+    EXPECT_TRUE(host.last_maintenance_decision.required);
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_StopsOnMaintenanceFailure)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+    host.maintenance_should_fail = true;
+
+    const std::vector<int> tokens = {10, 11, 12, 13, 14, 15, 16, 17};
+    auto input = makeTestInput(static_cast<int>(tokens.size()), 1, DeviceId::cpu(), tokens.data(), nullptr);
+
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {4};
+    policy.fixed_chunk_real_tokens = 4;
+    policy.max_rebalance_interval_tokens = 4;
+    policy.real_token_count = static_cast<int>(tokens.size());
+
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(schedule) << schedule.error;
+
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.runPrefillChunkSchedule(input, schedule, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    EXPECT_EQ(host.prefill_chunk_maintenance_calls, 1);
+    EXPECT_EQ(host.forward_token_offsets, (std::vector<int>{0}));
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_InvalidScheduleRejectedWithoutHostCall)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    const std::vector<int> tokens = {10, 11, 12, 13};
+    auto input = makeTestInput(static_cast<int>(tokens.size()), 1, DeviceId::cpu(), tokens.data(), nullptr);
+
+    ForwardExecutionEngine::PrefillChunkRuntimeSchedule schedule;
+    schedule.error = "not prepared";
+
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.runPrefillChunkSchedule(input, schedule, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 0);
+    EXPECT_EQ(host.prefill_chunk_maintenance_calls, 0);
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedPlanDelegatesWithBucketMetadata)
