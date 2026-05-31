@@ -13,10 +13,12 @@
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "loaders/WeightPlan.h"
@@ -95,6 +97,61 @@ public:
     ModelWeights captured_weights;
     ModelWeightBindings captured_bindings;
 };
+
+namespace
+{
+    MoERebalanceController::Config makeMaintenanceMoEConfig(
+        MoERebalanceMode mode,
+        int num_experts = 8,
+        int num_sockets = 2,
+        int num_layers = 2,
+        int top_k = 2,
+        int window_size = 16)
+    {
+        MoERebalanceController::Config cfg;
+        cfg.mode = mode;
+        cfg.num_layers = num_layers;
+        cfg.num_experts = num_experts;
+        cfg.top_k = top_k;
+        cfg.window_size = window_size;
+
+        for (int s = 0; s < num_sockets; ++s)
+            cfg.sockets.push_back(DeviceId(DeviceType::CPU, s));
+
+        cfg.initial_expert_to_socket.resize(num_experts);
+        for (int e = 0; e < num_experts; ++e)
+            cfg.initial_expert_to_socket[e] = e % num_sockets;
+
+        cfg.rebalance_config.imbalance_threshold = 1.3f;
+        cfg.rebalance_config.max_swaps_per_layer = 4;
+        cfg.rebalance_config.max_total_swaps = 16;
+        cfg.rebalance_config.min_improvement_ratio = 0.05f;
+        cfg.rebalance_config.layer_cooldown_generations = 0;
+        cfg.rebalance_config.min_window_activations = 1;
+        return cfg;
+    }
+
+    void fillMaintenanceWindowSkewed(DecodeExpertHistogram &hist,
+                                     int window_size,
+                                     int num_layers,
+                                     int top_k)
+    {
+        for (int t = 0; t < window_size; ++t)
+        {
+            for (int layer = 0; layer < num_layers; ++layer)
+            {
+                std::vector<int> experts(static_cast<size_t>(top_k));
+                std::vector<float> weights(static_cast<size_t>(top_k));
+                for (int k = 0; k < top_k; ++k)
+                {
+                    experts[static_cast<size_t>(k)] = k;
+                    weights[static_cast<size_t>(k)] = 1.0f / static_cast<float>(top_k);
+                }
+                hist.record(layer, experts.data(), weights.data(), top_k);
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Construction Tests
@@ -846,6 +903,170 @@ TEST_F(Test__DeviceGraphOrchestrator, PrefixCacheBudgetBypassIsReportedInProbe)
     PrefixLookupResult second_hit = orchestrator->lookupPrefix({1, 2});
     EXPECT_FALSE(second_hit.supported);
     EXPECT_EQ(orchestrator->prefixStateProbe().prefix_cache_bypasses, 1u);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateDefaultsSafeWithoutMoE)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 7;
+
+    auto state = host.prefillChunkMaintenanceState(chunk);
+    EXPECT_EQ(state.chunk_index, 7);
+    EXPECT_TRUE(state.histograms_merged);
+    EXPECT_TRUE(state.manual_boundaries_complete);
+    EXPECT_FALSE(state.graph_capture_active);
+    EXPECT_FALSE(state.graph_replay_active);
+    EXPECT_TRUE(state.participants_at_same_boundary);
+    EXPECT_FALSE(state.rebalance_requested);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateReportsGraphCapture)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 2;
+
+    GraphCaptureGuard guard;
+    auto state = host.prefillChunkMaintenanceState(chunk);
+    EXPECT_TRUE(state.graph_capture_active);
+    EXPECT_TRUE(state.histograms_merged);
+    EXPECT_FALSE(state.rebalance_requested);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateSyncsMoERuntimeHistograms)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto controller = std::make_unique<MoERebalanceController>(
+        makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC,
+                                 /*num_experts=*/2,
+                                 /*num_sockets=*/2,
+                                 /*num_layers=*/1,
+                                 /*top_k=*/1,
+                                 /*window_size=*/1));
+    auto *controller_ptr = controller.get();
+
+    bool sync_called = false;
+    controller_ptr->histogram()->registerRuntimeHistogramSync(
+        [controller_ptr, &sync_called]()
+        {
+            sync_called = true;
+            int expert = 0;
+            float weight = 1.0f;
+            controller_ptr->histogram()->record(0, &expert, &weight, 1);
+            return true;
+        });
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 3;
+
+    auto state = host.prefillChunkMaintenanceState(chunk);
+    EXPECT_TRUE(sync_called);
+    EXPECT_TRUE(state.histograms_merged);
+    EXPECT_TRUE(state.rebalance_requested);
+    EXPECT_TRUE(controller_ptr->shouldRebalance());
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateBlocksOnHistogramSyncFailure)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto controller = std::make_unique<MoERebalanceController>(
+        makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC,
+                                 /*num_experts=*/2,
+                                 /*num_sockets=*/2,
+                                 /*num_layers=*/1,
+                                 /*top_k=*/1,
+                                 /*window_size=*/1));
+    controller->histogram()->registerRuntimeHistogramSync([]()
+                                                          { return false; });
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 4;
+    chunk.rebalance_allowed_after = true;
+
+    auto state = host.prefillChunkMaintenanceState(chunk);
+    EXPECT_FALSE(state.histograms_merged);
+    EXPECT_FALSE(state.rebalance_requested);
+
+    auto decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_FALSE(decision.can_run);
+    EXPECT_EQ(decision.reason, "histograms_not_merged");
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceHookAppliesLocalMoERebalance)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto cfg = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    for (int expert = 0; expert < 8; ++expert)
+        cfg.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+
+    auto controller = std::make_unique<MoERebalanceController>(cfg);
+    auto *controller_ptr = controller.get();
+
+    fillMaintenanceWindowSkewed(*controller_ptr->histogram(),
+                                /*window_size=*/16,
+                                /*num_layers=*/2,
+                                /*top_k=*/2);
+    ASSERT_TRUE(controller_ptr->shouldRebalance());
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 5;
+    chunk.rebalance_allowed_after = true;
+
+    PrefillChunkMaintenanceDecision decision;
+    decision.ok = true;
+    decision.can_run = true;
+
+    EXPECT_TRUE(host.onPrefillChunkMaintenance(chunk, decision));
+    EXPECT_FALSE(controller_ptr->shouldRebalance());
+    EXPECT_EQ(controller_ptr->placementEpoch(), 1u);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceHookSkipsOptionalReplicaMaintenance)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto cfg = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    cfg.max_replicas = 1;
+
+    auto controller = std::make_unique<MoERebalanceController>(cfg);
+    auto *controller_ptr = controller.get();
+    fillMaintenanceWindowSkewed(*controller_ptr->histogram(),
+                                /*window_size=*/16,
+                                /*num_layers=*/2,
+                                /*top_k=*/2);
+    ASSERT_TRUE(controller_ptr->shouldRebalance());
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 6;
+    chunk.rebalance_allowed_after = true;
+
+    PrefillChunkMaintenanceDecision optional_decision;
+    optional_decision.ok = true;
+    optional_decision.can_run = true;
+    optional_decision.required = false;
+
+    EXPECT_TRUE(host.onPrefillChunkMaintenance(chunk, optional_decision));
+    EXPECT_TRUE(controller_ptr->shouldRebalance());
+
+    PrefillChunkMaintenanceDecision required_decision = optional_decision;
+    required_decision.required = true;
+    EXPECT_FALSE(host.onPrefillChunkMaintenance(chunk, required_decision));
 }
 
 // =============================================================================

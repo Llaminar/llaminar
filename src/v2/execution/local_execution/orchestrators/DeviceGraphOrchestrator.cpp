@@ -22,6 +22,7 @@
 #include "../../../collective/PPStage.h"         // PPStage variant type
 #include "../../../collective/BackendRouter.h"   // GlobalBackendRouter for PP copy
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/MPIContext.h"
@@ -717,6 +718,94 @@ namespace llaminar2
         if (!moe_rebalance_controller_)
             return 0;
         return moe_rebalance_controller_->placementEpoch();
+    }
+
+    PrefillChunkMaintenanceState DeviceGraphOrchestrator::prefillChunkMaintenanceState(
+        const PrefillChunkPlan &chunk) const
+    {
+        PrefillChunkMaintenanceState state;
+        state.chunk_index = chunk.chunk_index;
+        state.histograms_merged = true;
+        state.manual_boundaries_complete = true;
+        state.graph_capture_active = isGraphCaptureActive();
+        state.graph_replay_active = false;
+        state.participants_at_same_boundary = true;
+
+        if (!moe_rebalance_controller_)
+            return state;
+
+        if (auto *histogram = moe_rebalance_controller_->histogram())
+        {
+            state.histograms_merged = histogram->syncRuntimeHistograms();
+        }
+
+        state.rebalance_requested =
+            state.histograms_merged && moe_rebalance_controller_->shouldRebalance();
+        return state;
+    }
+
+    bool DeviceGraphOrchestrator::onPrefillChunkMaintenance(
+        const PrefillChunkPlan &chunk,
+        const PrefillChunkMaintenanceDecision &decision)
+    {
+        if (!decision.ok)
+            return false;
+        if (!decision.can_run || !moe_rebalance_controller_)
+            return true;
+        if (!moe_rebalance_controller_->shouldRebalance())
+            return true;
+
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+        {
+            LOG_WARN("[DGO] Prefill chunk maintenance reached a multi-rank MoE rebalance "
+                     "boundary at chunk "
+                     << chunk.chunk_index
+                     << "; deferring to rank/runner-level coordination");
+            return !decision.required;
+        }
+
+        if (moe_rebalance_controller_->maxReplicasPerSocket() > 0 ||
+            debugEnv().moe_rebalance.gpu_cache_experts_per_layer > 0)
+        {
+            LOG_WARN("[DGO] Prefill chunk maintenance reached a MoE replica/cache rebalance "
+                     "boundary at chunk "
+                     << chunk.chunk_index
+                     << "; replica and GPU-cache placement require runner-level coordination");
+            return !decision.required;
+        }
+
+        try
+        {
+            const auto old_placement = moe_rebalance_controller_->currentPlacement();
+            const auto new_placement = moe_rebalance_controller_->rebalance();
+            moe_rebalance_controller_->syncReplicaPlacement();
+
+            if (new_placement.empty())
+                return true;
+
+            ReceivedWeightsMap received;
+            auto manifest = ExpertWeightTransfer::buildManifest(old_placement, new_placement);
+            if (!manifest.empty())
+                received = transferExpertWeights(manifest, moe_rebalance_controller_->numLayers());
+
+            const int socket_id = mpi_ctx_ ? mpi_ctx_->local_rank() : 0;
+            auto masks = moe_rebalance_controller_->computeExpertMasks(socket_id);
+            applyExpertMasks(masks, received);
+
+            if (forward_engine_)
+                forward_engine_->clearCache();
+            for (auto &cache : layer_graph_cache_)
+                cache.invalidate();
+            resetKernelDynamicState();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DGO] Prefill chunk MoE maintenance failed at chunk "
+                      << chunk.chunk_index << ": " << e.what());
+            return false;
+        }
+
+        return true;
     }
 
     // =========================================================================

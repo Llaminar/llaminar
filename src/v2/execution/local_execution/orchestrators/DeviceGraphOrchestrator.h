@@ -2114,6 +2114,15 @@ namespace llaminar2
         /** Resolve PP copy info for cache-miss builds. */
         PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const override;
 
+        /** Report host-side safety state for chunk-boundary maintenance. */
+        PrefillChunkMaintenanceState prefillChunkMaintenanceState(
+            const PrefillChunkPlan &chunk) const override;
+
+        /** Run local chunk-boundary maintenance after the engine gate allows it. */
+        bool onPrefillChunkMaintenance(
+            const PrefillChunkPlan &chunk,
+            const PrefillChunkMaintenanceDecision &decision) override;
+
         /** Create and return the ForwardExecutionEngine with current config. */
         void ensureForwardEngine();
 
