@@ -88,6 +88,10 @@ namespace llaminar2
                snapshot.prefix_cache_unsupported_backend_bypasses != 0 ||
                snapshot.prefix_cache_fingerprint_bypasses != 0 ||
                snapshot.prefix_cache_terminal_state_bypasses != 0 ||
+               snapshot.prefix_request.enabled ||
+               snapshot.prefix_request.requested_tokens != 0 ||
+               snapshot.prefix_request.matched_tokens != 0 ||
+               snapshot.prefix_request.bypassed ||
                snapshot.mtp_config_enabled ||
                snapshot.mtp_bypassed ||
                snapshot.mtp_draft_steps != 0 ||
@@ -97,6 +101,12 @@ namespace llaminar2
                snapshot.mtp_bypasses != 0 ||
                snapshot.mtp_verifier_runs != 0 ||
                snapshot.mtp_verifier_token_count != 0 ||
+               snapshot.mtp_request.enabled ||
+               snapshot.mtp_request.bypassed ||
+               snapshot.mtp_request.draft_steps != 0 ||
+               snapshot.mtp_request.accepted_tokens != 0 ||
+               snapshot.mtp_request.rejected_tokens != 0 ||
+               snapshot.mtp_request.rollbacks != 0 ||
                snapshot.prefill_chunk_schedules != 0 ||
                snapshot.prefill_chunk_successful_schedules != 0 ||
                snapshot.prefill_chunks != 0 ||
@@ -812,6 +822,44 @@ namespace llaminar2
                 }
                 state_table << "Prefix cache" << status.str() << fort::endr;
             }
+            if (prefix_state.prefix_request.enabled ||
+                prefix_state.prefix_request.requested_tokens != 0 ||
+                prefix_state.prefix_request.matched_tokens != 0 ||
+                prefix_state.prefix_request.bypassed)
+            {
+                const auto &request = prefix_state.prefix_request;
+                std::ostringstream summary;
+                if (request.bypassed)
+                {
+                    summary << "bypassed";
+                    if (!request.bypass_reason.empty())
+                        summary << " (" << request.bypass_reason << ")";
+                }
+                else if (request.hit)
+                {
+                    summary << "hit";
+                }
+                else if (request.partial_hit)
+                {
+                    summary << "partial-hit";
+                }
+                else
+                {
+                    summary << "miss";
+                }
+                summary << ", requested " << request.requested_tokens
+                        << ", matched " << request.matched_tokens
+                        << " tokens/" << request.matched_blocks
+                        << " blocks, tier " << request.storage_tier;
+                if (request.terminal_logits_restored || request.terminal_hidden_restored)
+                {
+                    summary << ", terminal logits "
+                            << (request.terminal_logits_restored ? "restored" : "not restored")
+                            << ", hidden "
+                            << (request.terminal_hidden_restored ? "restored" : "not restored");
+                }
+                state_table << "Prefix request" << summary.str() << fort::endr;
+            }
             if (prefix_state.prefix_cache_bypasses != 0 ||
                 prefix_state.prefix_cache_unsupported_backend_bypasses != 0 ||
                 prefix_state.prefix_cache_fingerprint_bypasses != 0 ||
@@ -901,6 +949,29 @@ namespace llaminar2
                         }
                     }
                     state_table << "MTP" << status.str() << fort::endr;
+                }
+                if (prefix_state.mtp_request.enabled ||
+                    prefix_state.mtp_request.bypassed ||
+                    prefix_state.mtp_request.draft_steps != 0 ||
+                    prefix_state.mtp_request.accepted_tokens != 0 ||
+                    prefix_state.mtp_request.rejected_tokens != 0 ||
+                    prefix_state.mtp_request.rollbacks != 0)
+                {
+                    const auto &request = prefix_state.mtp_request;
+                    std::ostringstream mtp_request;
+                    mtp_request << request.draft_steps << " draft steps, "
+                                << request.accepted_tokens << " accepted, "
+                                << request.rejected_tokens << " rejected, "
+                                << request.rollbacks << " rollbacks, "
+                                << std::fixed << std::setprecision(2)
+                                << (request.acceptance_rate * 100.0) << "% acceptance";
+                    if (request.bypassed)
+                    {
+                        mtp_request << ", bypassed";
+                        if (!request.bypass_reason.empty())
+                            mtp_request << " (" << request.bypass_reason << ")";
+                    }
+                    state_table << "MTP request" << mtp_request.str() << fort::endr;
                 }
                 {
                     std::ostringstream mtp;

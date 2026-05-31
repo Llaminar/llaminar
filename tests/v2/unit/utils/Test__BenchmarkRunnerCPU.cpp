@@ -318,6 +318,12 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     runner->snapshot.prefix_cache_unsupported_backend_bypasses = 0;
     runner->snapshot.prefix_cache_fingerprint_bypasses = 0;
     runner->snapshot.prefix_cache_terminal_state_bypasses = 0;
+    runner->snapshot.prefix_request.enabled = true;
+    runner->snapshot.prefix_request.partial_hit = true;
+    runner->snapshot.prefix_request.requested_tokens = 10;
+    runner->snapshot.prefix_request.matched_tokens = 6;
+    runner->snapshot.prefix_request.matched_blocks = 3;
+    runner->snapshot.prefix_request.storage_tier = "ram";
     runner->snapshot.mtp_draft_steps = 3;
     runner->snapshot.mtp_accepted_tokens = 2;
     runner->snapshot.mtp_rejected_tokens = 1;
@@ -328,6 +334,14 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     runner->snapshot.mtp_bypasses = 1;
     runner->snapshot.mtp_verifier_runs = 4;
     runner->snapshot.mtp_verifier_token_count = 8;
+    runner->snapshot.mtp_request.enabled = true;
+    runner->snapshot.mtp_request.bypassed = true;
+    runner->snapshot.mtp_request.bypass_reason = "sampling is not greedy";
+    runner->snapshot.mtp_request.draft_steps = 3;
+    runner->snapshot.mtp_request.accepted_tokens = 2;
+    runner->snapshot.mtp_request.rejected_tokens = 1;
+    runner->snapshot.mtp_request.rollbacks = 3;
+    runner->snapshot.mtp_request.acceptance_rate = 2.0 / 3.0;
     runner->snapshot.prefill_chunk_schedules = 2;
     runner->snapshot.prefill_chunk_successful_schedules = 1;
     runner->snapshot.prefill_chunks = 3;
@@ -354,10 +368,14 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     EXPECT_EQ(result.prefix_state.prefix_cache_terminal_state_hits, 2u);
     EXPECT_TRUE(result.prefix_state.prefix_cache_bypassed);
     EXPECT_EQ(result.prefix_state.prefix_cache_bypasses, 1u);
+    EXPECT_TRUE(result.prefix_state.prefix_request.partial_hit);
+    EXPECT_EQ(result.prefix_state.prefix_request.matched_tokens, 6);
     EXPECT_EQ(result.prefix_state.mtp_draft_steps, 3u);
     EXPECT_EQ(result.prefix_state.mtp_rejected_tokens, 1u);
     EXPECT_TRUE(result.prefix_state.mtp_bypassed);
     EXPECT_EQ(result.prefix_state.mtp_bypasses, 1u);
+    EXPECT_EQ(result.prefix_state.mtp_request.accepted_tokens, 2u);
+    EXPECT_DOUBLE_EQ(result.prefix_state.mtp_request.acceptance_rate, 2.0 / 3.0);
     EXPECT_EQ(result.prefix_state.mtp_verifier_runs, 4u);
     EXPECT_EQ(result.prefix_state.mtp_verifier_token_count, 8u);
     EXPECT_EQ(result.prefix_state.prefill_chunk_schedules, 2u);
@@ -373,9 +391,13 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
 
     EXPECT_NE(output.find("PREFIX / MTP STATE"), std::string::npos);
     EXPECT_NE(output.find("Lookup results"), std::string::npos);
+    EXPECT_NE(output.find("Prefix request"), std::string::npos);
+    EXPECT_NE(output.find("partial-hit"), std::string::npos);
     EXPECT_NE(output.find("Bypasses"), std::string::npos);
     EXPECT_NE(output.find("RAM budget cannot hold one complete prefix block"), std::string::npos);
     EXPECT_NE(output.find("sampling is not greedy"), std::string::npos);
+    EXPECT_NE(output.find("MTP request"), std::string::npos);
+    EXPECT_NE(output.find("66.67% acceptance"), std::string::npos);
     EXPECT_NE(output.find("MTP decode"), std::string::npos);
     EXPECT_NE(output.find("Prefill chunks"), std::string::npos);
     EXPECT_NE(output.find("1/2 schedules"), std::string::npos);
