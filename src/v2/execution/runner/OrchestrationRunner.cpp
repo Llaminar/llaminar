@@ -565,16 +565,33 @@ namespace llaminar2
                 {
                     coordination = coordinatePrefixLookups({participant});
                 }
-                int matched_tokens = coordination.common_matched_tokens;
+                const int coordination_block_size =
+                    local_hit.block_size > 0 ? local_hit.block_size : plan_prefix.block_size;
+                PrefixLookupResult coordinated_hit =
+                    makePrefixLookupResult(coordination, coordination_block_size);
+                int matched_tokens = coordinated_hit.cached_tokens;
 
                 runner_->clear_cache();
                 prefill_logits_ready_ = false;
 
-                PrefixLookupResult common_hit = local_hit.clampedTo(matched_tokens);
-                common_hit.has_terminal_logits =
-                    common_hit.has_terminal_logits && coordination.common_terminal_logits;
-                common_hit.has_terminal_hidden =
-                    common_hit.has_terminal_hidden && coordination.common_terminal_hidden;
+                auto make_common_hit = [&]()
+                {
+                    PrefixLookupResult hit = local_hit.clampedTo(matched_tokens);
+                    hit.cache_enabled = coordinated_hit.cache_enabled;
+                    hit.supported = coordinated_hit.supported;
+                    hit.fingerprint_key = coordinated_hit.fingerprint_key != 0
+                                              ? coordinated_hit.fingerprint_key
+                                              : hit.fingerprint_key;
+                    hit.placement_epoch = coordinated_hit.placement_epoch;
+                    hit.bypass_reason = coordinated_hit.bypass_reason;
+                    hit.has_terminal_logits =
+                        hit.has_terminal_logits && coordinated_hit.has_terminal_logits;
+                    hit.has_terminal_hidden =
+                        hit.has_terminal_hidden && coordinated_hit.has_terminal_hidden;
+                    return hit;
+                };
+
+                PrefixLookupResult common_hit = make_common_hit();
                 if (active_mtp.enabled &&
                     matched_tokens > 0 &&
                     matched_tokens < static_cast<int>(prompt_tokens.size()) &&
@@ -583,13 +600,13 @@ namespace llaminar2
                     const int block_size =
                         common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
                     matched_tokens = std::max(0, matched_tokens - std::max(1, block_size));
-                    common_hit = local_hit.clampedTo(matched_tokens);
+                    common_hit = make_common_hit();
                 }
 
                 if (matched_tokens > 0 && !runner_->populatePrefix(common_hit))
                 {
                     matched_tokens = 0;
-                    common_hit = local_hit.clampedTo(0);
+                    common_hit = make_common_hit();
                     runner_->clear_cache();
                 }
 
@@ -616,7 +633,7 @@ namespace llaminar2
                     const int block_size =
                         common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
                     matched_tokens = std::max(0, matched_tokens - std::max(1, block_size));
-                    common_hit = local_hit.clampedTo(matched_tokens);
+                    common_hit = make_common_hit();
                     runner_->clear_cache();
                     if (matched_tokens > 0 && !runner_->populatePrefix(common_hit))
                     {

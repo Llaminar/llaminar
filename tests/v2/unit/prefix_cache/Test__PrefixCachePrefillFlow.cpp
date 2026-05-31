@@ -296,6 +296,25 @@ TEST(Test__PrefixCachePrefillFlow, SharedPrefixRunsOnlySuffixAndHarvestsPrompt)
     EXPECT_THAT(mock_ptr->harvested_tokens, ElementsAre(1, 2, 3, 4, 5));
 }
 
+TEST(Test__PrefixCachePrefillFlow, CoordinatedPrefixHitPopulatesOnlyCompleteBlocks)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 3;
+
+    auto runner = makeRunner(std::move(mock));
+    const std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(2));
+    EXPECT_EQ(mock_ptr->forward_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(3, 4, 5));
+}
+
 TEST(Test__PrefixCachePrefillFlow, LongPrefixSuffixUsesChunkScheduleWhenRunnerSupportsIt)
 {
     ScopedPrefillChunkScheduleEnv env;
