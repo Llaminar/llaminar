@@ -294,6 +294,17 @@ TEST(Test__PrefixCachePrefillFlow, SharedPrefixRunsOnlySuffixAndHarvestsPrompt)
     EXPECT_EQ(mock_ptr->harvest_calls, 1);
     EXPECT_EQ(mock_ptr->harvested_prompt_token_count, 5);
     EXPECT_THAT(mock_ptr->harvested_tokens, ElementsAre(1, 2, 3, 4, 5));
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_TRUE(probe.prefix_request.enabled);
+    EXPECT_FALSE(probe.prefix_request.bypassed);
+    EXPECT_FALSE(probe.prefix_request.hit);
+    EXPECT_TRUE(probe.prefix_request.partial_hit);
+    EXPECT_EQ(probe.prefix_request.requested_tokens, 5);
+    EXPECT_EQ(probe.prefix_request.matched_tokens, 2);
+    EXPECT_EQ(probe.prefix_request.matched_blocks, 1);
+    EXPECT_FALSE(probe.prefix_request.terminal_logits_restored);
+    EXPECT_EQ(probe.prefix_request.storage_tier, "none");
 }
 
 TEST(Test__PrefixCachePrefillFlow, CoordinatedPrefixHitPopulatesOnlyCompleteBlocks)
@@ -445,6 +456,13 @@ TEST(Test__PrefixCachePrefillFlow, FullHitWithTerminalLogitsSkipsForward)
     EXPECT_EQ(mock_ptr->restore_terminal_calls, 1);
     EXPECT_EQ(mock_ptr->restored_tokens, 4);
 
+    auto probe = runner->prefixStateProbe();
+    EXPECT_TRUE(probe.prefix_request.hit);
+    EXPECT_FALSE(probe.prefix_request.partial_hit);
+    EXPECT_EQ(probe.prefix_request.matched_tokens, 4);
+    EXPECT_TRUE(probe.prefix_request.terminal_logits_restored);
+    EXPECT_FALSE(probe.prefix_request.terminal_hidden_restored);
+
     auto step = runner->decodeStep();
     ASSERT_TRUE(step.success()) << step.error;
     ASSERT_EQ(step.tokens.size(), 1u);
@@ -480,6 +498,15 @@ TEST(Test__PrefixCachePrefillFlow, FullHitWithMTPReplaysAcceptedTokensWithoutPro
                             mock_ptr->mtp_argmax_token));
 
     const auto probe = runner->prefixStateProbe();
+    EXPECT_TRUE(probe.prefix_request.hit);
+    EXPECT_TRUE(probe.prefix_request.terminal_logits_restored);
+    EXPECT_TRUE(probe.prefix_request.terminal_hidden_restored);
+    EXPECT_TRUE(probe.mtp_request.enabled);
+    EXPECT_FALSE(probe.mtp_request.bypassed);
+    EXPECT_EQ(probe.mtp_request.draft_steps, 1u);
+    EXPECT_EQ(probe.mtp_request.accepted_tokens, 2u);
+    EXPECT_EQ(probe.mtp_request.rejected_tokens, 0u);
+    EXPECT_DOUBLE_EQ(probe.mtp_request.acceptance_rate, 1.0);
     EXPECT_EQ(probe.mtp_draft_steps, 1u);
     EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
     EXPECT_EQ(probe.mtp_rejected_tokens, 0u);

@@ -485,6 +485,7 @@ namespace llaminar2
         std::shared_ptr<ITokenizer> tokenizer_;
         MTPStats mtp_stats_;
         PrefillChunkStats prefill_chunk_stats_;
+        PrefixCacheRequestSummary prefix_request_summary_;
         bool mtp_bypassed_{false};
         bool mtp_bypass_recorded_for_request_{false};
         std::string mtp_bypass_reason_;

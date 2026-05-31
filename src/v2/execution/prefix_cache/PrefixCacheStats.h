@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace llaminar2
 {
@@ -53,6 +54,35 @@ namespace llaminar2
         uint64_t real_tokens = 0;
         uint64_t padded_tokens = 0;
         uint64_t failures = 0;
+    };
+
+    struct PrefixCacheRequestSummary
+    {
+        bool enabled = false;
+        bool bypassed = false;
+        std::string bypass_reason;
+        bool hit = false;
+        bool partial_hit = false;
+        int requested_tokens = 0;
+        int matched_tokens = 0;
+        int matched_blocks = 0;
+        bool terminal_logits_restored = false;
+        bool terminal_hidden_restored = false;
+        bool mtp_state_restored = false;
+        bool hybrid_state_restored = false;
+        std::string storage_tier = "none";
+    };
+
+    struct MTPRequestSummary
+    {
+        bool enabled = false;
+        bool bypassed = false;
+        std::string bypass_reason;
+        uint64_t draft_steps = 0;
+        uint64_t accepted_tokens = 0;
+        uint64_t rejected_tokens = 0;
+        uint64_t rollbacks = 0;
+        double acceptance_rate = 0.0;
     };
 
 } // namespace llaminar2

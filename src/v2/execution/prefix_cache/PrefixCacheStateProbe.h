@@ -2,6 +2,7 @@
 
 #include "backends/DeviceId.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/prefix_cache/PrefixCacheStats.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -100,6 +101,8 @@ namespace llaminar2
         uint64_t prefill_chunk_real_tokens = 0;
         uint64_t prefill_chunk_padded_tokens = 0;
         uint64_t prefill_chunk_failures = 0;
+        PrefixCacheRequestSummary prefix_request;
+        MTPRequestSummary mtp_request;
         std::vector<int> positions;
         std::vector<int> sequence_lengths;
         std::vector<PrefixKVCacheProbe> kv_caches;

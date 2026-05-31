@@ -73,6 +73,54 @@ namespace llaminar2
             return false;
         }
 
+        const char *prefixStorageTierName(PrefixStorageTier tier)
+        {
+            switch (tier)
+            {
+            case PrefixStorageTier::Ram:
+                return "ram";
+            case PrefixStorageTier::DeviceHot:
+                return "device-hot";
+            case PrefixStorageTier::Disk:
+                return "disk-hydrated";
+            }
+            return "none";
+        }
+
+        std::string summarizePrefixStorageTiers(const std::vector<PrefixBlockHandle> &blocks)
+        {
+            if (blocks.empty())
+                return "none";
+
+            PrefixStorageTier first_tier = blocks.front().tier;
+            for (const auto &block : blocks)
+            {
+                if (block.tier != first_tier)
+                    return "mixed";
+            }
+            return prefixStorageTierName(first_tier);
+        }
+
+        bool prefixBlocksContainHybridState(const std::vector<PrefixBlockHandle> &blocks)
+        {
+            return std::any_of(blocks.begin(), blocks.end(),
+                               [](const PrefixBlockHandle &block)
+                               {
+                                   return block.has_hybrid_state;
+                               });
+        }
+
+        bool prefixBlocksContainMTPState(const std::vector<PrefixBlockHandle> &blocks)
+        {
+            return std::any_of(blocks.begin(), blocks.end(),
+                               [](const PrefixBlockHandle &block)
+                               {
+                                   return block.mtp_payload != nullptr ||
+                                          (block.mtp_storage && !block.mtp_storage->empty()) ||
+                                          block.device_mtp_storage != nullptr;
+                               });
+        }
+
         std::shared_ptr<const MoEExpertOverlayExecutionPlan> resolveOverlayExecutionPlanForRunner(
             const std::shared_ptr<const MoEExpertParallelPlan> &plan,
             const std::shared_ptr<IMPIContext> &mpi_ctx)
@@ -541,6 +589,9 @@ namespace llaminar2
             config_prefix.storage_mode != PrefixCacheStorageMode::Disabled;
         const bool mtp_full_hit_requires_terminal_hidden =
             active_mtp.enabled && active_mtp.require_terminal_hidden_for_full_hit;
+        prefix_request_summary_ = {};
+        prefix_request_summary_.enabled = prefix_cache_enabled;
+        prefix_request_summary_.requested_tokens = static_cast<int>(prompt_tokens.size());
 
         if (prefix_cache_enabled)
         {
@@ -592,6 +643,8 @@ namespace llaminar2
                 };
 
                 PrefixLookupResult common_hit = make_common_hit();
+                prefix_request_summary_.bypassed = !coordinated_hit.supported;
+                prefix_request_summary_.bypass_reason = coordinated_hit.bypass_reason;
                 if (active_mtp.enabled &&
                     matched_tokens > 0 &&
                     matched_tokens < static_cast<int>(prompt_tokens.size()) &&
@@ -612,6 +665,7 @@ namespace llaminar2
 
                 int suffix_start = matched_tokens;
                 int suffix_len = static_cast<int>(prompt_tokens.size()) - suffix_start;
+                bool terminal_state_restored = false;
 
                 if (suffix_len > 0)
                 {
@@ -627,6 +681,7 @@ namespace llaminar2
                          runner_->restorePrefixTerminalState(common_hit))
                 {
                     prefill_logits_ready_ = true;
+                    terminal_state_restored = true;
                 }
                 else
                 {
@@ -652,6 +707,20 @@ namespace llaminar2
                 runner_->harvestPrefix(prompt_tokens, static_cast<int>(prompt_tokens.size()));
 
                 const bool full_hit = matched_tokens == static_cast<int>(prompt_tokens.size());
+                prefix_request_summary_.hit = matched_tokens > 0 && full_hit;
+                prefix_request_summary_.partial_hit = matched_tokens > 0 && !full_hit;
+                prefix_request_summary_.matched_tokens = matched_tokens;
+                prefix_request_summary_.matched_blocks =
+                    coordination_block_size > 0 ? matched_tokens / coordination_block_size : 0;
+                prefix_request_summary_.terminal_logits_restored = terminal_state_restored;
+                prefix_request_summary_.terminal_hidden_restored =
+                    terminal_state_restored && common_hit.has_terminal_hidden;
+                prefix_request_summary_.mtp_state_restored =
+                    matched_tokens > 0 && prefixBlocksContainMTPState(common_hit.blocks);
+                prefix_request_summary_.hybrid_state_restored =
+                    matched_tokens > 0 && prefixBlocksContainHybridState(common_hit.blocks);
+                prefix_request_summary_.storage_tier = summarizePrefixStorageTiers(common_hit.blocks);
+
                 LOG_INFO("[OrchestrationRunner] Prefix cache request: "
                          << (matched_tokens > 0 ? (full_hit ? "hit" : "partial-hit") : "miss")
                          << " matched_tokens=" << matched_tokens
@@ -1238,6 +1307,19 @@ namespace llaminar2
         snapshot.prefill_chunk_real_tokens = prefill_chunk_stats_.real_tokens;
         snapshot.prefill_chunk_padded_tokens = prefill_chunk_stats_.padded_tokens;
         snapshot.prefill_chunk_failures = prefill_chunk_stats_.failures;
+        snapshot.prefix_request = prefix_request_summary_;
+        snapshot.mtp_request.enabled = mtp.enabled;
+        snapshot.mtp_request.bypassed = mtp_bypassed_;
+        snapshot.mtp_request.bypass_reason = mtp_bypass_reason_;
+        snapshot.mtp_request.draft_steps = mtp_stats_.draft_steps;
+        snapshot.mtp_request.accepted_tokens = mtp_stats_.accepted_tokens;
+        snapshot.mtp_request.rejected_tokens = mtp_stats_.rejected_tokens;
+        snapshot.mtp_request.rollbacks = mtp_stats_.rollbacks;
+        const uint64_t mtp_total_tokens = mtp_stats_.accepted_tokens + mtp_stats_.rejected_tokens;
+        snapshot.mtp_request.acceptance_rate =
+            mtp_total_tokens > 0
+                ? static_cast<double>(mtp_stats_.accepted_tokens) / static_cast<double>(mtp_total_tokens)
+                : 0.0;
         if (snapshot.architecture.empty() && model_ctx_)
         {
             snapshot.architecture = model_ctx_->architecture();
