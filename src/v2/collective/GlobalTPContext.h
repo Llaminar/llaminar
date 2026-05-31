@@ -139,6 +139,7 @@ namespace llaminar2
         const std::vector<int> &worldRanks() const override;
         GlobalDeviceAddress localDevice() const override;
         void barrier() const override;
+        bool allgatherBytes(const void *send_data, void *recv_data, size_t byte_count) const override;
         bool send(const TensorBase *tensor, int dest_index) override;
         bool recv(TensorBase *tensor, int source_index) override;
 

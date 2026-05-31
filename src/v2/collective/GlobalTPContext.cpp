@@ -22,6 +22,7 @@
 #include <thread>
 #include <utility>
 #include <algorithm>
+#include <limits>
 #include <set>
 
 namespace llaminar2
@@ -671,6 +672,41 @@ namespace llaminar2
                                                                               << " on domain " << domain_id_ << " rank " << my_rank_in_domain_
                                                                               << "/" << domain_size_);
         }
+    }
+
+    bool GlobalTPContext::allgatherBytes(const void *send_data, void *recv_data, size_t byte_count) const
+    {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::allgatherBytes - abort already requested for domain "
+                      << domain_id_);
+            return false;
+        }
+        if (domain_comm_ == MPI_COMM_NULL || !send_data || !recv_data || byte_count == 0)
+        {
+            LOG_ERROR("GlobalTPContext::allgatherBytes - invalid arguments for domain "
+                      << domain_id_);
+            return false;
+        }
+        if (byte_count > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            LOG_ERROR("GlobalTPContext::allgatherBytes - byte_count too large for MPI_Allgather: "
+                      << byte_count);
+            return false;
+        }
+
+        const int count = static_cast<int>(byte_count);
+        const int result = MPI_Allgather(send_data, count, MPI_BYTE,
+                                         recv_data, count, MPI_BYTE,
+                                         domain_comm_);
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("GlobalTPContext::allgatherBytes - MPI_Allgather failed with code "
+                      << result << " on domain " << domain_id_ << " rank "
+                      << my_rank_in_domain_ << "/" << domain_size_);
+            return false;
+        }
+        return true;
     }
 
     bool GlobalTPContext::send(const TensorBase *tensor, int dest_index)

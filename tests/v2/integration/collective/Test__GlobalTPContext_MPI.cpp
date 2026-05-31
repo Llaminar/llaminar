@@ -386,6 +386,36 @@ TEST_F(Test__GlobalTPContext_MPI, Allgather_LargerShards)
     }
 }
 
+/**
+ * @test AllgatherBytes_SmallControlRecord
+ * Rank-local scalar/control records gather through the GlobalTPContext domain,
+ * which is used by TP-aware MTP greedy-token coordination.
+ */
+TEST_F(Test__GlobalTPContext_MPI, AllgatherBytes_SmallControlRecord)
+{
+    auto ctx = createTwoRankContext();
+    ASSERT_NE(ctx, nullptr);
+
+    struct ControlRecord
+    {
+        int32_t token;
+        float score;
+    };
+
+    ControlRecord local{
+        static_cast<int32_t>(10 + world_rank_),
+        1.5f + static_cast<float>(world_rank_)};
+    std::vector<ControlRecord> gathered(2);
+
+    ASSERT_TRUE(ctx->allgatherBytes(&local, gathered.data(), sizeof(ControlRecord)))
+        << "allgatherBytes failed on rank " << world_rank_;
+
+    EXPECT_EQ(gathered[0].token, 10);
+    EXPECT_FLOAT_EQ(gathered[0].score, 1.5f);
+    EXPECT_EQ(gathered[1].token, 11);
+    EXPECT_FLOAT_EQ(gathered[1].score, 2.5f);
+}
+
 // =============================================================================
 // Point-to-Point Tests
 // =============================================================================

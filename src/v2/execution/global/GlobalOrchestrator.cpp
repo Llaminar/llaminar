@@ -1222,7 +1222,7 @@ namespace llaminar2
         {
             IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
             token = runner ? runner->sampleGreedyFromMTPLogitsOnDevice() : -1;
-            if (token < 0)
+            if (token < 0 && runner && !runner->hasMTPLogitsLocal())
             {
                 token = greedyArgmaxToken(runner ? runner->mtpLogits() : nullptr,
                                           config_.vocab_size);
@@ -1253,7 +1253,7 @@ namespace llaminar2
         {
             IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
             token = runner ? runner->sampleGreedyFromAllPositionLogitsOnDevice(row) : -1;
-            if (token < 0 && runner && row >= 0)
+            if (token < 0 && runner && row >= 0 && !runner->hasAllPositionLogitsLocal())
             {
                 const float *all_logits = runner->getAllPositionLogits();
                 if (all_logits)

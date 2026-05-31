@@ -53,6 +53,7 @@
 #include <cstring>
 #include <iomanip>
 #include <initializer_list>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -98,6 +99,149 @@ namespace llaminar2
                 }
             }
             return false;
+        }
+
+        struct GreedyLogitCandidate
+        {
+            float value = 0.0f;
+            int32_t token = -1;
+            int32_t valid = 0;
+            int32_t reserved = 0;
+        };
+
+        int vocabOffsetForTPConfig(const GraphConfig &config)
+        {
+            if (!config.lm_head_column_parallel || !config.tp_config)
+                return 0;
+
+            const int rank = config.local_rank >= 0 ? config.local_rank : config.tp_device_idx;
+            if (rank < 0 || rank >= config.tp_config->worldSize())
+                return 0;
+
+            return config.tp_config->forRank(rank).vocab_start;
+        }
+
+        bool isBetterGreedyCandidate(const GreedyLogitCandidate &candidate,
+                                     const GreedyLogitCandidate &best)
+        {
+            if (!candidate.valid)
+                return false;
+            if (!best.valid)
+                return true;
+            if (candidate.value > best.value)
+                return true;
+            return candidate.value == best.value && candidate.token >= 0 &&
+                   (best.token < 0 || candidate.token < best.token);
+        }
+
+        GreedyLogitCandidate sampleGreedyCandidateFromTensor(
+            TensorBase *tensor,
+            int row,
+            int token_offset)
+        {
+            GreedyLogitCandidate candidate;
+            if (!tensor || row < 0)
+                return candidate;
+
+            const auto &shape = tensor->shape();
+            if (shape.empty())
+                return candidate;
+
+            const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+            const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+            if (cols == 0 || static_cast<size_t>(row) >= rows ||
+                cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return candidate;
+            }
+
+            const size_t row_offset = static_cast<size_t>(row) * cols;
+            float max_val = 0.0f;
+            int max_idx = -1;
+
+            auto device_opt = tensor->current_device();
+            if (device_opt.has_value() && device_opt->is_gpu() && tensor->deviceValid())
+            {
+                IBackend *backend = getBackendFor(*device_opt);
+                const void *gpu_ptr = tensor->gpu_data_ptr();
+                if (backend && gpu_ptr)
+                {
+                    const auto *base = static_cast<const float *>(gpu_ptr);
+                    const void *target_row = base + row_offset;
+                    if (backend->argmaxF32(target_row,
+                                           static_cast<int>(cols),
+                                           device_opt->gpu_ordinal(),
+                                           &max_val,
+                                           &max_idx,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           0))
+                    {
+                        candidate.value = max_val;
+                        candidate.token = token_offset + max_idx;
+                        candidate.valid = 1;
+                        return candidate;
+                    }
+                }
+            }
+
+            if (!tensor->hostValid())
+            {
+                auto download = TransferEngine::instance().download(tensor);
+                if (!download.success)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to download logits for greedy sampling: "
+                              << download.error);
+                    return candidate;
+                }
+            }
+
+            const float *data = tensor->fp32_data();
+            if (!data)
+                return candidate;
+
+            const float *row_data = data + row_offset;
+            max_idx = 0;
+            max_val = row_data[0];
+            for (size_t i = 1; i < cols; ++i)
+            {
+                if (row_data[i] > max_val)
+                {
+                    max_val = row_data[i];
+                    max_idx = static_cast<int>(i);
+                }
+            }
+
+            candidate.value = max_val;
+            candidate.token = token_offset + max_idx;
+            candidate.valid = 1;
+            return candidate;
+        }
+
+        int coordinateGreedyCandidate(
+            const GreedyLogitCandidate &local_candidate,
+            IGlobalTPContext *ctx)
+        {
+            if (!ctx || ctx->degree() <= 1)
+                return local_candidate.valid ? local_candidate.token : -1;
+
+            std::vector<GreedyLogitCandidate> candidates(static_cast<size_t>(ctx->degree()));
+            if (!ctx->allgatherBytes(&local_candidate,
+                                     candidates.data(),
+                                     sizeof(GreedyLogitCandidate)))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to allgather GlobalTP greedy candidates");
+                return -1;
+            }
+
+            GreedyLogitCandidate best;
+            for (const auto &candidate : candidates)
+            {
+                if (isBetterGreedyCandidate(candidate, best))
+                    best = candidate;
+            }
+            return best.valid ? best.token : -1;
         }
 
         int prefixFALayerForIndex(const IKVCache &cache, int fa_index)
@@ -3029,6 +3173,76 @@ namespace llaminar2
     std::string DeviceGraphOrchestrator::mtpDecodeUnsupportedReason() const
     {
         return {};
+    }
+
+    bool DeviceGraphOrchestrator::supportsMTPTokenCoordination() const
+    {
+        const IGlobalTPContext *ctx = globalTPContextForMTPCoordination();
+        return ctx && ctx->degree() > 1;
+    }
+
+    IGlobalTPContext *DeviceGraphOrchestrator::globalTPContextForMTPCoordination() const
+    {
+        if (global_tp_ctx_ && global_tp_ctx_->degree() > 1)
+        {
+            return global_tp_ctx_.get();
+        }
+        if (!graph_builder_)
+        {
+            return nullptr;
+        }
+
+        ITPContext *tp_ctx = graph_builder_->config().tp_ctx;
+        if (!tp_ctx || tp_ctx->isLocal())
+        {
+            return nullptr;
+        }
+
+        auto *global_ctx = dynamic_cast<IGlobalTPContext *>(tp_ctx);
+        return global_ctx && global_ctx->degree() > 1 ? global_ctx : nullptr;
+    }
+
+    int DeviceGraphOrchestrator::sampleGreedyFromMTPLogitsOnDevice()
+    {
+        auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        if (it == state_.extension_buffers.end() || !it->second)
+        {
+            return -1;
+        }
+
+        const int token_offset = graph_builder_
+                                     ? vocabOffsetForTPConfig(graph_builder_->config())
+                                     : 0;
+        return coordinateGreedyCandidate(
+            sampleGreedyCandidateFromTensor(it->second.get(), 0, token_offset),
+            globalTPContextForMTPCoordination());
+    }
+
+    int DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(int row)
+    {
+        if (row < 0)
+        {
+            return -1;
+        }
+
+        if (state_.all_position_logits)
+        {
+            return coordinateGreedyCandidate(
+                sampleGreedyCandidateFromTensor(state_.all_position_logits.get(), row, 0),
+                globalTPContextForMTPCoordination());
+        }
+
+        if (state_.all_position_logits_local)
+        {
+            const int token_offset = graph_builder_
+                                         ? vocabOffsetForTPConfig(graph_builder_->config())
+                                         : 0;
+            return coordinateGreedyCandidate(
+                sampleGreedyCandidateFromTensor(state_.all_position_logits_local.get(), row, token_offset),
+                globalTPContextForMTPCoordination());
+        }
+
+        return -1;
     }
 
     PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const

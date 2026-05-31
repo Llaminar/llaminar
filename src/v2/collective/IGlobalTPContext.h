@@ -122,6 +122,26 @@ namespace llaminar2
         virtual void barrier() const = 0;
 
         /**
+         * @brief All-gather fixed-size scalar/control payloads across the TP domain.
+         *
+         * Use this for small coordination records, not tensor payloads. Tensor
+         * data should continue to move through allgather(), broadcast(),
+         * TransferEngine, or graph-stage buffer contracts.
+         *
+         * @param send_data Local byte payload
+         * @param recv_data Output buffer sized degree() * byte_count
+         * @param byte_count Bytes contributed by each participant
+         * @return true on success, false when unsupported or invalid
+         */
+        virtual bool allgatherBytes(const void *send_data, void *recv_data, size_t byte_count) const
+        {
+            (void)send_data;
+            (void)recv_data;
+            (void)byte_count;
+            return false;
+        }
+
+        /**
          * @brief Point-to-point send to another rank in domain
          *
          * Blocking send of tensor data to another participant in this domain.

@@ -1460,6 +1460,9 @@ namespace llaminar2
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;
         std::string mtpDecodeUnsupportedReason() const override;
+        bool supportsMTPTokenCoordination() const override;
+        int sampleGreedyFromMTPLogitsOnDevice() override;
+        int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
 
         /**
          * @brief Get current position offset for a sequence
@@ -2334,6 +2337,9 @@ namespace llaminar2
 
         /// Global TP context for cross-MPI-rank tensor parallelism (owns communicator lifetime)
         std::shared_ptr<IGlobalTPContext> global_tp_ctx_;
+
+        /// Resolve the active GlobalTP/NodeLocalTP domain context for scalar MTP coordination.
+        IGlobalTPContext *globalTPContextForMTPCoordination() const;
 
         // =========================================================================
         // Pipeline Parallelism Configuration (Legacy - Single Stage)
