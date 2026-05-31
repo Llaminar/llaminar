@@ -2583,7 +2583,7 @@ namespace llaminar2
     bool RankOrchestrator::restorePrefixTerminalState(const PrefixLookupResult &hit)
     {
         const int common_tokens = std::max(0, hit.cached_tokens);
-        if (common_tokens <= 0)
+        if (common_tokens <= 0 || !hit.has_terminal_logits)
             return false;
 
         auto restore_runners = [&](std::vector<std::unique_ptr<IInferenceRunner>> &runners,

@@ -1184,6 +1184,33 @@ TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreRunsOnAllChildrenAtCommonLen
     EXPECT_EQ(runner1_ptr->terminal_restored_tokens(), std::vector<int>({4}));
 }
 
+TEST_F(Test__RankOrchestrator, PrefixTerminalRestoreSkipsWhenAggregateTerminalUnavailable)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/true));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_prefix_lookup_result(makePrefixHit(/*cached_tokens=*/4, /*terminal_logits=*/false));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2, 3, 4});
+    ASSERT_FALSE(hit.has_terminal_logits);
+    EXPECT_FALSE(orchestrator->restorePrefixTerminalState(hit));
+    EXPECT_EQ(runner0_ptr->prefix_terminal_restore_call_count(), 0u);
+    EXPECT_EQ(runner1_ptr->prefix_terminal_restore_call_count(), 0u);
+}
+
 TEST_F(Test__RankOrchestrator, PrefixPopulateFailureClearsAllChildren)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
