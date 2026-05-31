@@ -8906,6 +8906,11 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;Parity;Attention;FlashAttention;FlashDecode;GQA;FP32;CosineSimilarity;gfx906"
         MPI_PROCS 1
     )
+    add_v2_test(V2_Integration_ROCmFlashAttentionExternalMask
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity> --gtest_filter=Test__ROCmFlashAttentionParity.RocblasPrefillHonorsExternalMask
+        LABELS "V2;Integration;ROCm;Attention;ExternalMask;MTP;FP32;gfx906"
+        MPI_PROCS 1
+    )
     message(STATUS "V2 Tests: Added ROCm Flash Attention parity tests")
 
     # Integration Test: ROCm attention padding parity for Phase 6 bucket safety

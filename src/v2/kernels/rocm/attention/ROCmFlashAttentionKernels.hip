@@ -1791,7 +1791,9 @@ void causal_softmax_inplace_kernel(
     int total_rows,
     int seq_len,
     int kv_len,
-    int position_offset)
+    int position_offset,
+    const float* __restrict__ mask,
+    int mask_stride)
 {
     const int row = blockIdx.x;
     if (row >= total_rows) return;
@@ -1806,8 +1808,9 @@ void causal_softmax_inplace_kernel(
     // Pass 1: Find row max (read-only — scores are pre-scaled by GEMM alpha)
     float local_max = -FLT_MAX;
     for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        if (j <= last_valid) {
-            local_max = fmaxf(local_max, row_data[j]);
+        const float mask_val = mask ? mask[static_cast<size_t>(seq_pos) * mask_stride + j] : 0.0f;
+        if (j <= last_valid && mask_val > -1.0e20f) {
+            local_max = fmaxf(local_max, row_data[j] + mask_val);
         }
     }
 
@@ -1843,8 +1846,11 @@ void causal_softmax_inplace_kernel(
     for (int i = 0; i < elems_per_thread; i++) {
         int j = threadIdx.x + i * blockDim.x;
         float val = 0.0f;
-        if (j < kv_len && j <= last_valid) {
-            val = exp2f((row_data[j] - row_max) * LOG2E);
+        if (j < kv_len) {
+            const float mask_val = mask ? mask[static_cast<size_t>(seq_pos) * mask_stride + j] : 0.0f;
+            if (j <= last_valid && mask_val > -1.0e20f) {
+                val = exp2f((row_data[j] + mask_val - row_max) * LOG2E);
+            }
         }
         local_exp[i] = val;
         local_sum += val;
@@ -1986,6 +1992,8 @@ static int rocblas_prefill_impl(
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
     hipStream_t hip_stream,
+    const float *mask = nullptr,
+    int mask_stride = 0,
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
@@ -2041,12 +2049,16 @@ static int rocblas_prefill_impl(
     const long long strideC_pv = head_dim;              // O: interleaved heads
 
     int pos_off = causal ? position_offset : (kv_len - 1);
+    if (mask && mask_stride <= 0) {
+        mask_stride = kv_len;
+    }
 
     for (int b = 0; b < batch_size; b++) {
         const float* Q_batch = Q + static_cast<size_t>(b) * seq_len * lda_q;
         const float* K_batch = K + static_cast<size_t>(b) * kv_len * lda_k;
         const float* V_batch = V + static_cast<size_t>(b) * kv_len * lda_v;
         float* O_batch = O + static_cast<size_t>(b) * seq_len * lda_o;
+        const float* mask_batch = mask ? mask + static_cast<size_t>(b) * seq_len * mask_stride : nullptr;
 
         for (int kh = 0; kh < n_kv_heads; kh++) {
             // TP-aware GQA mapping: compute which LOCAL Q heads map to this KV head
@@ -2096,7 +2108,8 @@ static int rocblas_prefill_impl(
             hipLaunchKernelGGL(
                 causal_softmax_inplace_kernel,
                 grid_sm, block_sm, 0, ctx.stream,
-                ctx.scores_buf, local_group_size * seq_len, seq_len, kv_len, pos_off);
+                ctx.scores_buf, local_group_size * seq_len, seq_len, kv_len, pos_off,
+                mask_batch, mask_stride);
 
             // ─── Pass 3: O = P @ V ───
             status = hipblasSgemmStridedBatched(
@@ -2241,6 +2254,8 @@ static int rocblas_prefill_fp16_impl(
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
     hipStream_t hip_stream,
+    const float *mask = nullptr,
+    int mask_stride = 0,
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
@@ -2274,6 +2289,7 @@ static int rocblas_prefill_fp16_impl(
         n_heads, n_kv_heads, head_dim,
         softmax_scale, causal, position_offset,
         hip_stream,
+        mask, mask_stride,
         head_start, gqa_n_rep);
 }
 
@@ -2288,6 +2304,8 @@ static int rocblas_prefill_q8_1_impl(
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
     hipStream_t hip_stream,
+    const float *mask = nullptr,
+    int mask_stride = 0,
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
@@ -2324,6 +2342,7 @@ static int rocblas_prefill_q8_1_impl(
         n_heads, n_kv_heads, head_dim,
         softmax_scale, causal, position_offset,
         hip_stream,
+        mask, mask_stride,
         head_start, gqa_n_rep);
 }
 
@@ -2373,7 +2392,7 @@ extern "C"
                 batch_size, seq_len, kv_len,
                 n_heads, n_kv_heads, head_dim,
                 softmax_scale, causal, position_offset,
-                hip_stream, head_start, gqa_n_rep);
+                hip_stream, mask, kv_len, head_start, gqa_n_rep);
         }
 
         // Fall through to existing tiled kernel for head_dim < 64
@@ -2513,6 +2532,7 @@ extern "C"
             n_heads, n_kv_heads, head_dim,
             softmax_scale, causal, position_offset,
             hip_stream,
+            mask, kv_len,
             head_start, gqa_n_rep);
     }
 
@@ -2567,6 +2587,7 @@ extern "C"
             n_heads, n_kv_heads, head_dim,
             softmax_scale, causal, position_offset,
             hip_stream,
+            mask, kv_len,
             head_start, gqa_n_rep);
     }
 

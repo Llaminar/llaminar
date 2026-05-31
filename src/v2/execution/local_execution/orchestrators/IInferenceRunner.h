@@ -196,15 +196,6 @@ namespace llaminar2
         virtual bool supportsMTPTokenCoordination() const { return false; }
 
         /**
-         * @brief True when MTP verification must use one-token main-model decode.
-         *
-         * Recurrent/hybrid models can require decode-phase state transitions for
-         * verifier parity. Dense transformer runners should return false so MTP
-         * can use the faster all-position verifier.
-         */
-        virtual bool requiresSequentialMTPVerification() const { return false; }
-
-        /**
          * @brief Sample the current MTP sidecar logits in greedy mode.
          *
          * Returns -1 when unavailable; callers may fall back to mtpLogits() on

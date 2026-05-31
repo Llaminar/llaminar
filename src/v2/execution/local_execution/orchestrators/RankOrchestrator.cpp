@@ -2252,18 +2252,6 @@ namespace llaminar2
         return {};
     }
 
-    bool RankOrchestrator::requiresSequentialMTPVerification() const
-    {
-        for (const auto &runner : device_runners_)
-        {
-            if (runner && runner->requiresSequentialMTPVerification())
-            {
-                return true;
-            }
-        }
-        return false;
-    }
-
     void RankOrchestrator::setSkipLogitsGatherDecode(bool skip)
     {
         if (logits_gatherer_)

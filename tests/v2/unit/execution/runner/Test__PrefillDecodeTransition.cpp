@@ -183,11 +183,6 @@ namespace
             return supports_mtp_token_coordination_;
         }
 
-        bool requiresSequentialMTPVerification() const override
-        {
-            return requires_sequential_mtp_verification_;
-        }
-
         int sampleGreedyFromMTPLogitsOnDevice() override
         {
             ++sample_mtp_logits_count_;
@@ -277,11 +272,6 @@ namespace
             supports_mtp_token_coordination_ = true;
             hide_local_logits_ = hide_local_logits;
         }
-        void setRequiresSequentialMTPVerification(bool required)
-        {
-            requires_sequential_mtp_verification_ = required;
-        }
-
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
         {
             (void)seq_idx;
@@ -415,7 +405,6 @@ namespace
         bool column_parallel_logits_{false};
         bool supports_mtp_token_coordination_{false};
         bool hide_local_logits_{false};
-        bool requires_sequential_mtp_verification_{false};
         int vocab_start_{0};
         int vocab_local_{VOCAB_SIZE};
         std::string mtp_unsupported_reason_;
@@ -461,8 +450,7 @@ namespace
                                                                              std::string mtp_unsupported_reason = {},
                                                                              std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
                                                                              bool mtp_token_coordination = false,
-                                                                             bool hide_local_logits = false,
-                                                                             bool sequential_mtp_verifier = false)
+                                                                             bool hide_local_logits = false)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -475,7 +463,6 @@ namespace
             {
                 mock_ptr->enableMTPTokenCoordination(hide_local_logits);
             }
-            mock_ptr->setRequiresSequentialMTPVerification(sequential_mtp_verifier);
 
             OrchestrationConfig config;
             config.device_for_this_rank = GlobalDeviceAddress::cpu();
@@ -757,38 +744,6 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
-        EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
-    }
-
-    TEST_F(Test__PrefillDecodeTransition, MTPSequentialVerifierUsesOneTokenMainDecode)
-    {
-        auto [runner, mock] = createRunner(
-            /*mtp_enabled=*/true,
-            /*mtp_accept=*/true,
-            /*mtp_unsupported_reason=*/std::string{},
-            /*mpi_ctx=*/nullptr,
-            /*mtp_token_coordination=*/false,
-            /*hide_local_logits=*/false,
-            /*sequential_mtp_verifier=*/true);
-
-        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
-        ASSERT_TRUE(runner->prefill(prompt));
-
-        GenerationResult step1 = runner->decodeStep();
-        ASSERT_TRUE(step1.success()) << step1.error;
-        EXPECT_THAT(step1.tokens,
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::DECODE_ARGMAX_TOKEN));
-        EXPECT_EQ(mock->forwardMTPCount(), 1);
-        EXPECT_EQ(mock->setAllPositionCount(), 0);
-        EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::DECODE_ARGMAX_TOKEN));
-
-        const auto probe = runner->prefixStateProbe();
-        EXPECT_EQ(probe.mtp_draft_steps, 1u);
-        EXPECT_EQ(probe.mtp_verifier_runs, 1u);
-        EXPECT_EQ(probe.mtp_verifier_token_count, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
     }
 

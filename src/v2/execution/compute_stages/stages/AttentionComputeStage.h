@@ -211,6 +211,11 @@ namespace llaminar2
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
 
+        /// Persistent additive mask for multi-token decode/continuation.
+        /// Kept on the stage so GPU kernels never see a mask tensor whose
+        /// device allocation is freed before stream work completes.
+        std::unique_ptr<FP32Tensor> decode_mask_storage_;
+
         /// Debug-only FP32 copies of the effective K/V tensors passed to the
         /// attention kernel. Populated only when
         /// LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT is enabled.

@@ -104,16 +104,6 @@ namespace llaminar2
                 const float *w = weight + c * kernel_size;
                 const float b = bias ? bias[c] : 0.0f;
 
-                if (conv_state)
-                {
-                    for (int s = 0; s < state_len; ++s)
-                    {
-                        const int src_t = seq_len - state_len + s;
-                        conv_state[c * state_len + s] =
-                            (src_t >= 0) ? input[src_t * channels + c] : 0.0f;
-                    }
-                }
-
                 for (int t = seq_len - 1; t >= 0; --t)
                 {
                     float sum = b;
@@ -122,6 +112,8 @@ namespace llaminar2
                         const int input_t = t - state_len + k;
                         if (input_t >= 0)
                             sum += w[k] * input[input_t * channels + c];
+                        else if (conv_state)
+                            sum += w[k] * conv_state[c * state_len + state_len + input_t];
                     }
                     if (apply_silu)
                     {
@@ -131,6 +123,17 @@ namespace llaminar2
                     else
                     {
                         output[t * channels + c] = sum;
+                    }
+                }
+
+                if (conv_state)
+                {
+                    float *state = conv_state + c * state_len;
+                    for (int s = 0; s < state_len; ++s)
+                    {
+                        const int src_t = seq_len - state_len + s;
+                        state[s] = (src_t >= 0) ? input[src_t * channels + c]
+                                                 : state[state_len + src_t];
                     }
                 }
             }
@@ -154,20 +157,6 @@ namespace llaminar2
 
         auto do_work = [&]()
         {
-            if (conv_state)
-            {
-#pragma omp for schedule(static) nowait
-                for (int c = 0; c < channels; ++c)
-                {
-                    for (int s = 0; s < state_len; ++s)
-                    {
-                        const int src_t = seq_len - state_len + s;
-                        conv_state[c * state_len + s] =
-                            (src_t >= 0) ? input[src_t * channels + c] : 0.0f;
-                    }
-                }
-            }
-
             const int n_blocks = (channels + 7) / 8;
 
 #pragma omp for schedule(static)
@@ -198,12 +187,36 @@ namespace llaminar2
                                 __m256 vin = _mm256_loadu_ps(&input[input_t * channels + c_start]);
                                 vsum = _mm256_fmadd_ps(vw[k], vin, vsum);
                             }
+                            else if (conv_state)
+                            {
+                                alignas(32) float hist[8];
+                                const int state_idx = state_len + input_t;
+                                for (int lane = 0; lane < 8; ++lane)
+                                    hist[lane] = conv_state[(c_start + lane) * state_len + state_idx];
+                                __m256 vh = _mm256_load_ps(hist);
+                                vsum = _mm256_fmadd_ps(vw[k], vh, vsum);
+                            }
                         }
 
                         if (apply_silu)
                             vsum = avx2::fast_silu(vsum);
 
                         _mm256_storeu_ps(&output[t * channels + c_start], vsum);
+                    }
+
+                    if (conv_state)
+                    {
+                        for (int ci = 0; ci < c_width; ++ci)
+                        {
+                            const int c = c_start + ci;
+                            float *state = conv_state + c * state_len;
+                            for (int s = 0; s < state_len; ++s)
+                            {
+                                const int src_t = seq_len - state_len + s;
+                                state[s] = (src_t >= 0) ? input[src_t * channels + c]
+                                                         : state[state_len + src_t];
+                            }
+                        }
                     }
                 }
                 else
@@ -221,6 +234,8 @@ namespace llaminar2
                                 const int input_t = t - state_len + k;
                                 if (input_t >= 0)
                                     sum += wt[k * channels + c] * input[input_t * channels + c];
+                                else if (conv_state)
+                                    sum += wt[k * channels + c] * conv_state[c * state_len + state_len + input_t];
                             }
                             if (apply_silu)
                             {
@@ -230,6 +245,17 @@ namespace llaminar2
                             else
                             {
                                 output[t * channels + c] = sum;
+                            }
+                        }
+
+                        if (conv_state)
+                        {
+                            float *state = conv_state + c * state_len;
+                            for (int s = 0; s < state_len; ++s)
+                            {
+                                const int src_t = seq_len - state_len + s;
+                                state[s] = (src_t >= 0) ? input[src_t * channels + c]
+                                                         : state[state_len + src_t];
                             }
                         }
                     }
@@ -256,20 +282,6 @@ namespace llaminar2
 
         auto do_work = [&]()
         {
-            if (conv_state)
-            {
-#pragma omp for schedule(static) nowait
-                for (int c = 0; c < channels; ++c)
-                {
-                    for (int s = 0; s < state_len; ++s)
-                    {
-                        const int src_t = seq_len - state_len + s;
-                        conv_state[c * state_len + s] =
-                            (src_t >= 0) ? input[src_t * channels + c] : 0.0f;
-                    }
-                }
-            }
-
             const int n_blocks = (channels + 15) / 16;
 
 #pragma omp for schedule(static)
@@ -300,12 +312,36 @@ namespace llaminar2
                                 __m512 vin = _mm512_loadu_ps(&input[input_t * channels + c_start]);
                                 vsum = _mm512_fmadd_ps(vw[k], vin, vsum);
                             }
+                            else if (conv_state)
+                            {
+                                alignas(64) float hist[16];
+                                const int state_idx = state_len + input_t;
+                                for (int lane = 0; lane < 16; ++lane)
+                                    hist[lane] = conv_state[(c_start + lane) * state_len + state_idx];
+                                __m512 vh = _mm512_load_ps(hist);
+                                vsum = _mm512_fmadd_ps(vw[k], vh, vsum);
+                            }
                         }
 
                         if (apply_silu)
                             vsum = avx512_silu(vsum);
 
                         _mm512_storeu_ps(&output[t * channels + c_start], vsum);
+                    }
+
+                    if (conv_state)
+                    {
+                        for (int ci = 0; ci < c_width; ++ci)
+                        {
+                            const int c = c_start + ci;
+                            float *state = conv_state + c * state_len;
+                            for (int s = 0; s < state_len; ++s)
+                            {
+                                const int src_t = seq_len - state_len + s;
+                                state[s] = (src_t >= 0) ? input[src_t * channels + c]
+                                                         : state[state_len + src_t];
+                            }
+                        }
                     }
                 }
                 else
@@ -323,6 +359,8 @@ namespace llaminar2
                                 const int input_t = t - state_len + k;
                                 if (input_t >= 0)
                                     sum += wt[k * channels + c] * input[input_t * channels + c];
+                                else if (conv_state)
+                                    sum += wt[k * channels + c] * conv_state[c * state_len + state_len + input_t];
                             }
                             if (apply_silu)
                             {
@@ -332,6 +370,17 @@ namespace llaminar2
                             else
                             {
                                 output[t * channels + c] = sum;
+                            }
+                        }
+
+                        if (conv_state)
+                        {
+                            float *state = conv_state + c * state_len;
+                            for (int s = 0; s < state_len; ++s)
+                            {
+                                const int src_t = seq_len - state_len + s;
+                                state[s] = (src_t >= 0) ? input[src_t * channels + c]
+                                                         : state[state_len + src_t];
                             }
                         }
                     }

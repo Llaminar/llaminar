@@ -627,9 +627,7 @@ __global__ void rocm_short_conv1d_prefill_kernel(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int ks_minus1 = kernel_size - 1;
     int total = seq_len * channels;
-    int state_total = channels * ks_minus1;
-    int total_work = total > state_total ? total : state_total;
-    if (idx >= total_work) return;
+    if (idx >= total) return;
 
     int effective_seq_len = seq_len;
     if (effective_seq_len_ptr)
@@ -638,31 +636,53 @@ __global__ void rocm_short_conv1d_prefill_kernel(
         effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
     }
 
-    if (idx < total) {
-        int t = idx / channels;
-        int ch = idx % channels;
+    int t = idx / channels;
+    int ch = idx % channels;
 
-        float sum = 0.0f;
-        if (t < effective_seq_len) {
-            for (int k = 0; k < kernel_size; k++) {
-                int src_t = t - ks_minus1 + k;
-                float val = (src_t >= 0) ? input[src_t * channels + ch] : 0.0f;
-                sum += val * weight[ch * kernel_size + k];
-            }
-
-            if (bias) sum += bias[ch];
-            if (apply_silu)
-                sum = sum / (1.0f + expf(-sum));
+    float sum = 0.0f;
+    if (t < effective_seq_len) {
+        for (int k = 0; k < kernel_size; k++) {
+            int src_t = t - ks_minus1 + k;
+            float val = 0.0f;
+            if (src_t >= 0)
+                val = input[src_t * channels + ch];
+            else if (conv_state)
+                val = conv_state[ch * ks_minus1 + ks_minus1 + src_t];
+            sum += val * weight[ch * kernel_size + k];
         }
-        output[t * channels + ch] = sum;
+
+        if (bias) sum += bias[ch];
+        if (apply_silu)
+            sum = sum / (1.0f + expf(-sum));
+    }
+    output[t * channels + ch] = sum;
+}
+
+__global__ void rocm_short_conv1d_state_update_kernel(
+    const float *__restrict__ input,
+    float *__restrict__ conv_state,
+    const int *__restrict__ effective_seq_len_ptr,
+    int seq_len, int channels, int kernel_size)
+{
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= channels || !conv_state) return;
+
+    int ks_minus1 = kernel_size - 1;
+    if (ks_minus1 <= 0) return;
+
+    int effective_seq_len = seq_len;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
     }
 
-    if (idx < state_total && conv_state) {
-        int ch = idx / ks_minus1;
-        int state_idx = idx % ks_minus1;
+    float *state = conv_state + ch * ks_minus1;
+    for (int state_idx = 0; state_idx < ks_minus1; ++state_idx) {
         int src_t = effective_seq_len - ks_minus1 + state_idx;
-        conv_state[ch * ks_minus1 + state_idx] =
-            (src_t >= 0 && src_t < effective_seq_len) ? input[src_t * channels + ch] : 0.0f;
+        state[state_idx] =
+            (src_t >= 0 && src_t < effective_seq_len) ? input[src_t * channels + ch]
+                                                       : state[ks_minus1 + src_t];
     }
 }
 
@@ -1147,15 +1167,18 @@ bool rocmGDN_short_conv1d(
             channels, kernel_size, apply_silu);
     } else {
         int total = seq_len * channels;
-        int state_total = channels * (kernel_size - 1);
-        int total_work = total > state_total ? total : state_total;
         int threads = 256;
-        int blocks = (total_work + threads - 1) / threads;
+        int blocks = (total + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_prefill_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output, conv_state,
             nullptr,
             seq_len, channels, kernel_size, apply_silu);
+        int state_blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_state_update_kernel,
+            dim3(state_blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, conv_state, nullptr,
+            seq_len, channels, kernel_size);
     }
 
     hipError_t err = hipGetLastError();
@@ -1185,15 +1208,18 @@ bool rocmGDN_short_conv1d_effective(
             channels, kernel_size, apply_silu);
     } else {
         int total = seq_len * channels;
-        int state_total = channels * (kernel_size - 1);
-        int total_work = total > state_total ? total : state_total;
         int threads = 256;
-        int blocks = (total_work + threads - 1) / threads;
+        int blocks = (total + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_prefill_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output, conv_state,
             device_effective_seq_len,
             seq_len, channels, kernel_size, apply_silu);
+        int state_blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_state_update_kernel,
+            dim3(state_blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, conv_state, device_effective_seq_len,
+            seq_len, channels, kernel_size);
     }
 
     hipError_t err = hipGetLastError();

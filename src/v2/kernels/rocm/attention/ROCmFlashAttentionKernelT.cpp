@@ -322,7 +322,7 @@ namespace llaminar2
             return apply_typed(Q, K, V, output,
                                1, seq_len, seq_len, // batch=1, kv_len=seq_len
                                n_heads, n_kv_heads, head_dim,
-                               causal, window_size, 0, dev, nullptr, nullptr);
+                               causal, window_size, 0, dev, nullptr, mask_ptr);
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_batch(

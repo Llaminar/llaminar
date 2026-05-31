@@ -30,6 +30,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "loaders/ModelContext.h"
+#include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 
@@ -734,6 +735,86 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_GQA)
     EXPECT_LE(l2_error, 0.05) << "L2 error too high";
 
     LOG_INFO("[FlashAttn2_FP32_LargeHeadDim_GQA] PASSED");
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, RocblasPrefillHonorsExternalMask)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int seq_len = 2;
+    constexpr int n_heads = 1;
+    constexpr int n_kv_heads = 1;
+    constexpr int head_dim = 64; // Forces the rocBLAS prefill implementation.
+    const size_t q_size = seq_len * n_heads * head_dim;
+    const size_t kv_size = seq_len * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    std::vector<float> Q_data(q_size, 0.0f);
+    std::vector<float> K_data(kv_size, 0.0f);
+    std::vector<float> V_data(kv_size, 0.0f);
+    for (int d = 0; d < head_dim; ++d)
+    {
+        V_data[d] = 1.0f;
+        V_data[head_dim + d] = 100.0f;
+    }
+    std::vector<float> rocm_output(out_size, 0.0f);
+
+    FP32Tensor mask_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(seq_len)});
+    float *mask = mask_tensor.mutable_data();
+    mask[0] = 0.0f;
+    mask[1] = -std::numeric_limits<float>::infinity();
+    mask[2] = 0.0f;
+    mask[3] = 0.0f;
+    auto upload = TransferEngine::instance().uploadFull(&mask_tensor, DeviceId::rocm(0));
+    ASSERT_TRUE(upload.success) << upload.error;
+    ASSERT_NE(mask_tensor.gpu_data_ptr(), nullptr);
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+
+    float *d_Q = nullptr;
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    float *d_output = nullptr;
+    ASSERT_EQ(hipMalloc(&d_Q, q_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_K, kv_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_V, kv_size * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_output, out_size * sizeof(float)), hipSuccess);
+
+    ASSERT_EQ(hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemset(d_output, 0, out_size * sizeof(float)), hipSuccess);
+
+    const bool rocm_success = rocm_kernel.compute(
+        d_Q, d_K, d_V, d_output,
+        seq_len, n_heads, n_kv_heads, head_dim,
+        false,   // external mask owns causality for continuation chunks
+        -1,
+        nullptr,
+        nullptr,
+        nullptr,
+        &mask_tensor,
+        false,
+        &mpi_ctx_,
+        0);
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    ASSERT_TRUE(rocm_success);
+
+    ASSERT_EQ(hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
+
+    hipFree(d_Q);
+    hipFree(d_K);
+    hipFree(d_V);
+    hipFree(d_output);
+
+    for (int d = 0; d < head_dim; ++d)
+    {
+        EXPECT_NEAR(rocm_output[d], 1.0f, 1e-4f) << "row 0 dim " << d;
+        EXPECT_NEAR(rocm_output[head_dim + d], 50.5f, 1e-4f) << "row 1 dim " << d;
+    }
 }
 
 // ============================================================================
