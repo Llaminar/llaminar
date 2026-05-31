@@ -56,6 +56,18 @@ namespace llaminar2
             int batch_size,
             DeviceId device) override;
 
+        ComputeGraph buildMTPGraph(
+            int depth_idx,
+            const MTPDepthWeights &weights,
+            const MTPForwardInput &input,
+            MTPForwardOutput &output);
+
+        ComputeGraph buildMTPGraph(
+            int depth_idx,
+            const MTPDepthWeightBindings &bindings,
+            const MTPForwardInput &input,
+            MTPForwardOutput &output) override;
+
         /// Override resolver config to register MoE buffer IDs and formulas
         GraphResolverConfig getResolverConfig(int seq_len) const override;
 
@@ -66,11 +78,23 @@ namespace llaminar2
         void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const override;
 
     private:
+        struct ScopedMTPGraphContext
+        {
+            ScopedMTPGraphContext(Qwen35MoEGraph &graph, int depth_idx);
+            ~ScopedMTPGraphContext();
+
+            Qwen35MoEGraph &graph;
+            bool previous_active = false;
+            int previous_depth_idx = -1;
+        };
+
         IMoERuntimeTable *moeRuntimeTableForDevice(DeviceId device,
                                                    int prefill_token_capacity = 0,
                                                    const std::string &key_suffix = {});
 
         std::unordered_map<std::string, std::unique_ptr<MoERuntimeTable>> moe_runtime_tables_;
+        bool mtp_graph_context_active_ = false;
+        int mtp_graph_depth_idx_ = -1;
     };
 
 } // namespace llaminar2

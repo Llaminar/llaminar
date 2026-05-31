@@ -5,9 +5,12 @@
 #include "collective/ITPContext.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/compute_stages/stages/MTPConcatStage.h"
+#include "execution/compute_stages/stages/MoESparseDispatchStage.h"
+#include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/moe/MoEExpertParallelPlan.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "loaders/PreparedWeightStore.h"
 #include "mocks/MockMPIContext.h"
@@ -326,6 +329,32 @@ namespace
             out.moe_up_scratch = moe_up_scratch.get();
             return out;
         }
+
+        LayerWeights moeLayerWeights() const
+        {
+            LayerWeights layer;
+            layer.ffn_norm = ffn_norm.get();
+            layer.moe_gate = moe_gate.get();
+            layer.moe_gate_exps = moe_gate_exps.get();
+            layer.moe_up_exps = moe_up_exps.get();
+            layer.moe_down_exps = moe_down_exps.get();
+            return layer;
+        }
+
+        ActivationBuffers moeActivationBuffers()
+        {
+            ActivationBuffers buffers;
+            buffers.current_hidden = projected.get();
+            buffers.normalized = norm_hidden.get();
+            buffers.attn_proj = attn_proj.get();
+            buffers.extensions[BufferId::MOE_EXPERT_INDICES] = moe_expert_indices.get();
+            buffers.extensions[BufferId::MOE_EXPERT_WEIGHTS] = moe_expert_weights.get();
+            buffers.extensions[BufferId::MOE_COMBINED_OUTPUT] = moe_combined_output.get();
+            buffers.extensions[BufferId::MOE_SHARED_EXPERT_OUTPUT] = moe_shared_expert_output.get();
+            buffers.extensions[BufferId::MOE_GATE_SCRATCH] = moe_gate_scratch.get();
+            buffers.extensions[BufferId::MOE_UP_SCRATCH] = moe_up_scratch.get();
+            return buffers;
+        }
     };
 
     struct TinyQwenForwardFixture
@@ -524,6 +553,72 @@ namespace
         if (!n)
             return false;
         return std::find(n->dependencies.begin(), n->dependencies.end(), dep) != n->dependencies.end();
+    }
+
+    template <typename StageType>
+    const StageType *firstStageOfType(const ComputeGraph &graph)
+    {
+        for (const auto &node_name : graph.getExecutionOrder())
+        {
+            const auto *node = graph.getNode(node_name);
+            if (!node || !node->stage)
+                continue;
+            if (const auto *stage = dynamic_cast<const StageType *>(node->stage.get()))
+                return stage;
+        }
+        return nullptr;
+    }
+
+    ExpertComputeDomain mtpOverlayDomain(const std::string &name, GlobalDeviceAddress participant)
+    {
+        ExpertComputeDomain result;
+        result.name = name;
+        result.kind = ExpertDomainKind::SingleDevice;
+        result.backend = CollectiveBackendType::HOST;
+        result.participants = {participant};
+        result.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        result.owner_rank = 0;
+        return result;
+    }
+
+    ExpertRoutedTier mtpOverlayTier(const std::string &name, const std::string &domain_name, int priority, bool fallback = false)
+    {
+        ExpertRoutedTier result;
+        result.name = name;
+        result.domain = domain_name;
+        result.priority = priority;
+        result.fallback = fallback;
+        return result;
+    }
+
+    std::shared_ptr<MoEExpertParallelPlan> makeMTPOverlayPlanForLayer(int layer_idx)
+    {
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->continuation_domain = "continuation";
+        plan->base_model_domain = "continuation";
+        plan->shared_expert_domain = "continuation";
+        plan->continuation_domain_spec.domain = "continuation";
+        plan->continuation_domain_spec.logical_root_participant = 0;
+        plan->residency_policy = ExpertResidencyPolicy::ExplicitMasks;
+        plan->domains = {
+            mtpOverlayDomain("continuation", GlobalDeviceAddress::cpu(0)),
+            mtpOverlayDomain("hot_domain", GlobalDeviceAddress::cpu(0)),
+            mtpOverlayDomain("cold_domain", GlobalDeviceAddress::cpu(1)),
+        };
+        plan->routed_tiers = {
+            mtpOverlayTier("hot", "hot_domain", 0),
+            mtpOverlayTier("cold", "cold_domain", 1, true),
+        };
+        plan->placements.push_back(ExpertLayerPlacement{
+            .layer = layer_idx,
+            .routed_expert_tier = {0, 1, 0, 1},
+        });
+        validateMoEExpertParallelPlanOrThrow(
+            *plan,
+            {.routed_expert_count = 4});
+        return plan;
     }
 
     int maxCachedTokens(const std::vector<PrefixKVCacheProbe> &caches)
@@ -864,6 +959,66 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
     EXPECT_TRUE(hasDependency(graph, "layer1_moe_combine", "layer1_moe_expert_ffn"));
     EXPECT_TRUE(hasDependency(graph, "layer1_ffn_residual", "layer1_moe_combine"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer1_ffn_residual"));
+}
+
+TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespace)
+{
+    DenseMTPGraphFixture fixture;
+    fixture.config.moe.num_experts = 4;
+    fixture.config.moe.top_k = 2;
+    fixture.config.moe.intermediate_size = 32;
+    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.has_shared_expert = false;
+    fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(1);
+
+    Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto weights = fixture.mtpWeights();
+    weights.fa_block.moe_gate = fixture.moe_gate.get();
+    weights.fa_block.moe_gate_exps = fixture.moe_gate_exps.get();
+    weights.fa_block.moe_up_exps = fixture.moe_up_exps.get();
+    weights.fa_block.moe_down_exps = fixture.moe_down_exps.get();
+    weights.fa_block.gate_proj = nullptr;
+    weights.fa_block.up_proj = nullptr;
+    weights.fa_block.down_proj = nullptr;
+
+    auto input = fixture.input();
+    auto output = fixture.output();
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    const auto *dispatch_stage = firstStageOfType<MoESparseDispatchStage>(graph);
+    const auto *return_stage = firstStageOfType<MoESparseReturnReduceStage>(graph);
+    ASSERT_NE(dispatch_stage, nullptr);
+    ASSERT_NE(return_stage, nullptr);
+
+    const auto &dispatch_key = dispatch_stage->params().key;
+    const auto &return_key = return_stage->params().key;
+    EXPECT_TRUE(dispatch_key.isValid());
+    EXPECT_TRUE(return_key.isValid());
+    EXPECT_EQ(dispatch_key.key_namespace, MoEOverlayCollectiveNamespace::MTP);
+    EXPECT_EQ(return_key.key_namespace, MoEOverlayCollectiveNamespace::MTP);
+    EXPECT_EQ(dispatch_key.mtp_depth, 0);
+    EXPECT_EQ(return_key.mtp_depth, 0);
+    EXPECT_EQ(dispatch_key.layer_idx, 1);
+    EXPECT_EQ(return_key.layer_idx, 1);
+    EXPECT_EQ(dispatch_key.direction, MoEOverlayCollectiveDirection::Dispatch);
+    EXPECT_EQ(return_key.direction, MoEOverlayCollectiveDirection::ReturnReduce);
+
+    auto main_layer = fixture.moeLayerWeights();
+    auto main_buffers = fixture.moeActivationBuffers();
+    ComputeGraph main_graph = graph_builder.buildFFNGraph(
+        main_layer,
+        main_buffers,
+        1,
+        1,
+        1,
+        DeviceId::cpu());
+    const auto *main_dispatch_stage = firstStageOfType<MoESparseDispatchStage>(main_graph);
+    ASSERT_NE(main_dispatch_stage, nullptr);
+    EXPECT_EQ(main_dispatch_stage->params().key.key_namespace, MoEOverlayCollectiveNamespace::Main);
+    EXPECT_EQ(main_dispatch_stage->params().key.mtp_depth, -1);
 }
 
 TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)

@@ -144,8 +144,23 @@ namespace llaminar2
             int layer_idx,
             int tier_idx,
             int target_participant,
-            MoEOverlayCollectiveDirection direction)
+            MoEOverlayCollectiveDirection direction,
+            bool mtp_sidecar_context,
+            int mtp_depth_idx)
         {
+            if (mtp_sidecar_context)
+            {
+                return makeMTPMoEOverlayCollectiveKey(
+                    1,
+                    0,
+                    std::max(0, mtp_depth_idx),
+                    layer_idx,
+                    tier_idx,
+                    std::max(0, target_participant),
+                    std::max(0, target_participant),
+                    direction);
+            }
+
             return makeMoEOverlayCollectiveKey(
                 1,
                 0,
@@ -383,6 +398,43 @@ namespace llaminar2
     {
     }
 
+    Qwen35MoEGraph::ScopedMTPGraphContext::ScopedMTPGraphContext(
+        Qwen35MoEGraph &graph,
+        int depth_idx)
+        : graph(graph),
+          previous_active(graph.mtp_graph_context_active_),
+          previous_depth_idx(graph.mtp_graph_depth_idx_)
+    {
+        graph.mtp_graph_context_active_ = true;
+        graph.mtp_graph_depth_idx_ = depth_idx;
+    }
+
+    Qwen35MoEGraph::ScopedMTPGraphContext::~ScopedMTPGraphContext()
+    {
+        graph.mtp_graph_context_active_ = previous_active;
+        graph.mtp_graph_depth_idx_ = previous_depth_idx;
+    }
+
+    ComputeGraph Qwen35MoEGraph::buildMTPGraph(
+        int depth_idx,
+        const MTPDepthWeights &weights,
+        const MTPForwardInput &input,
+        MTPForwardOutput &output)
+    {
+        ScopedMTPGraphContext context(*this, depth_idx);
+        return Qwen35Graph::buildMTPGraph(depth_idx, weights, input, output);
+    }
+
+    ComputeGraph Qwen35MoEGraph::buildMTPGraph(
+        int depth_idx,
+        const MTPDepthWeightBindings &bindings,
+        const MTPForwardInput &input,
+        MTPForwardOutput &output)
+    {
+        ScopedMTPGraphContext context(*this, depth_idx);
+        return Qwen35Graph::buildMTPGraph(depth_idx, bindings, input, output);
+    }
+
     void Qwen35MoEGraph::resetState()
     {
         Qwen35Graph::resetState();
@@ -567,6 +619,8 @@ namespace llaminar2
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        const bool mtp_sidecar_context = mtp_graph_context_active_;
+        const int mtp_depth_idx = mtp_graph_depth_idx_;
 
         auto overlay_runtime_plan = runtimePlanForGraph(config_);
         const auto &overlay_plan = overlay_runtime_plan
@@ -967,7 +1021,9 @@ namespace llaminar2
                             layer_idx,
                             static_cast<int>(tier_index),
                             target_participant,
-                            MoEOverlayCollectiveDirection::Dispatch);
+                            MoEOverlayCollectiveDirection::Dispatch,
+                            mtp_sidecar_context,
+                            mtp_depth_idx);
 
                         std::string previous_dispatch_node;
                         std::string target_dispatch_node;
@@ -1065,7 +1121,9 @@ namespace llaminar2
                             layer_idx,
                             static_cast<int>(tier_index),
                             target_participant,
-                            MoEOverlayCollectiveDirection::ReturnReduce);
+                            MoEOverlayCollectiveDirection::ReturnReduce,
+                            mtp_sidecar_context,
+                            mtp_depth_idx);
                         std::string previous_return_node = last_return_reduce;
                         std::string root_return_node;
                         for (const int source_participant : participantsWithLast(participant_count, continuation_root_participant))
