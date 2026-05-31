@@ -1158,6 +1158,53 @@ TEST(Test__PrefillGraphCache, CacheKey_PlacementEpochDifference)
     EXPECT_EQ(cache.phase(key2), PrefillGraphPhase::Warmup);
 }
 
+TEST(Test__PrefillGraphCache, CacheKey_DomainParticipantAndChunkRangesDoNotAlias)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+
+    PrefillGraphCacheKey base = makeGPUKey(512);
+    base.domain_id = "continuation";
+    base.participant_id = 0;
+    base.real_token_count = 384;
+    base.first_layer = 0;
+    base.layer_count = 8;
+    base.placement_epoch = 7;
+    base.topology_signature = 101;
+
+    auto different_domain = base;
+    different_domain.domain_id = "expert_hot";
+
+    auto different_participant = base;
+    different_participant.participant_id = 1;
+
+    auto different_real_tokens = base;
+    different_real_tokens.real_token_count = 256;
+
+    auto different_layer_range = base;
+    different_layer_range.first_layer = 8;
+
+    cache.markWarmedUp(base);
+    cache.markWarmedUp(different_domain);
+    cache.markWarmedUp(different_participant);
+    cache.markWarmedUp(different_real_tokens);
+    cache.markWarmedUp(different_layer_range);
+
+    EXPECT_EQ(cache.size(), 5u);
+    EXPECT_EQ(cache.phase(base), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.phase(different_domain), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.phase(different_participant), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.phase(different_real_tokens), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.phase(different_layer_range), PrefillGraphPhase::Warmup);
+
+    cache.invalidate(base);
+    EXPECT_EQ(cache.phase(base), PrefillGraphPhase::Cold);
+    EXPECT_EQ(cache.phase(different_domain), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.phase(different_participant), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.phase(different_real_tokens), PrefillGraphPhase::Warmup);
+    EXPECT_EQ(cache.phase(different_layer_range), PrefillGraphPhase::Warmup);
+}
+
 // =============================================================================
 // Test: toString helper
 // =============================================================================

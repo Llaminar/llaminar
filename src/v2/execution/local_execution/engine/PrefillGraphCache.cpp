@@ -46,6 +46,10 @@ namespace llaminar2
         return seq_len == other.seq_len &&
                device_id == other.device_id &&
                domain_id == other.domain_id &&
+               participant_id == other.participant_id &&
+               real_token_count == other.real_token_count &&
+               first_layer == other.first_layer &&
+               layer_count == other.layer_count &&
                placement_epoch == other.placement_epoch &&
                topology_signature == other.topology_signature;
     }
@@ -60,8 +64,12 @@ namespace llaminar2
         h ^= std::hash<int>{}(static_cast<int>(k.device_id.type)) << 1;
         h ^= std::hash<int>{}(k.device_id.ordinal) << 2;
         h ^= std::hash<std::string>{}(k.domain_id) << 3;
-        h ^= std::hash<uint64_t>{}(k.placement_epoch) << 4;
-        h ^= std::hash<uint64_t>{}(k.topology_signature) << 5;
+        h ^= std::hash<int>{}(k.participant_id) << 4;
+        h ^= std::hash<int>{}(k.real_token_count) << 5;
+        h ^= std::hash<int>{}(k.first_layer) << 6;
+        h ^= std::hash<int>{}(k.layer_count) << 7;
+        h ^= std::hash<uint64_t>{}(k.placement_epoch) << 8;
+        h ^= std::hash<uint64_t>{}(k.topology_signature) << 9;
         return h;
     }
 
@@ -145,6 +153,8 @@ namespace llaminar2
             ++eviction_count_;
             LOG_INFO("[PrefillGraphCache] Evicted prefill graph bucket seq_len="
                      << evicted_key.seq_len << " device=" << evicted_key.device_id.toString()
+                     << " domain=" << evicted_key.domain_id
+                     << " participant=" << evicted_key.participant_id
                      << " due to cache cap=" << config_.max_cached_entries);
         }
     }
@@ -250,6 +260,8 @@ namespace llaminar2
         {
             LOG_INFO("[PrefillGraphCache] Warmup complete for seq_len="
                      << key.seq_len << " device=" << key.device_id.toString()
+                     << " domain=" << key.domain_id
+                     << " participant=" << key.participant_id
                      << " → armed for capture");
         }
     }

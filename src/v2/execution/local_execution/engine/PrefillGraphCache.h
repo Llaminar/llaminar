@@ -34,6 +34,10 @@ namespace llaminar2
         int seq_len = 0;                      ///< Bucket/actual seq_len
         DeviceId device_id = DeviceId::cpu(); ///< Target device
         std::string domain_id = "single";     ///< EP rebalance domain (Tier 1: always "single")
+        int participant_id = 0;               ///< Domain-local participant id for segmented ExpertParallel caches
+        int real_token_count = 0;             ///< Real tokens represented inside a padded bucket (0 means exact/unspecified)
+        int first_layer = 0;                  ///< First layer covered by this segment cache key
+        int layer_count = 0;                  ///< Number of layers covered by this segment (0 means whole graph/unspecified)
         uint64_t placement_epoch = 0;         ///< Expert placement epoch (Tier 1: always 0)
         uint64_t topology_signature = 0;      ///< Hash of stage topology (Tier 1: 0)
 
