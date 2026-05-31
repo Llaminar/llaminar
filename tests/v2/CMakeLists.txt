@@ -659,6 +659,25 @@ add_v2_test(V2_Unit_MoEForbiddenDependencyScan
     MPI_PROCS 1
 )
 
+# Test: MoE overlay collective workspace and key namespace behavior
+add_executable(v2_unit_moe_overlay_collective_workspace
+    unit/execution/moe/Test__MoEOverlayCollectiveWorkspace.cpp
+)
+target_include_directories(v2_unit_moe_overlay_collective_workspace PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_unit_moe_overlay_collective_workspace
+    llaminar2_core
+    GTest::gtest
+    GTest::gmock
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEOverlayCollectiveWorkspace
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_collective_workspace>
+    LABELS "V2;Unit;Execution;MoE;Overlay;SparseCollective"
+    MPI_PROCS 1
+)
+
 # Test: Tensor Host Release Lifecycle (CPU-only tensor release guard regression)
 # Regression tests for the bug where releaseAllHostWeightData() released CPU-only
 # tensors that were never uploaded to GPU, causing null data access in graph stages.
@@ -8085,6 +8104,21 @@ add_v2_test(V2_Integration_TPAllreduceStage_MPI
     COMMAND $<TARGET_FILE:v2_integration_tp_allreduce_stage_mpi>
     MPI_PROCS 2
     LABELS "V2;Integration;TPAllreduce;GlobalTP;MPI;TensorParallel;ComputeStage;Phase4"
+)
+
+add_executable(v2_integration_moe_overlay_sparse_transport_mpi
+    integration/moe/Test__MoEOverlaySparseTransport_MPI.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_link_libraries(v2_integration_moe_overlay_sparse_transport_mpi
+    llaminar2_core
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_MoEOverlaySparseTransport_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_overlay_sparse_transport_mpi>
+    LABELS "V2;Integration;MoE;Overlay;SparseCollective;MPI"
+    MPI_PROCS 2
 )
 
 # Test: TPAllreduceStage Local NCCL Integration

@@ -27,15 +27,25 @@ namespace llaminar2
         ReturnReduce = 1,
     };
 
+    enum class MoEOverlayCollectiveNamespace : uint8_t
+    {
+        Main = 0,
+        MTP = 1,
+    };
+
     const char *toString(MoEOverlayCollectiveDirection direction);
+    const char *toString(MoEOverlayCollectiveNamespace key_namespace);
 
     struct MoEOverlayCollectiveKey
     {
         uint64_t generation_id = 0;
         uint64_t step_id = 0;
+        MoEOverlayCollectiveNamespace key_namespace = MoEOverlayCollectiveNamespace::Main;
+        int32_t mtp_depth = -1;
         int32_t layer_idx = -1;
         int32_t tier_idx = -1;
         int32_t domain_id = -1;
+        int32_t participant_id = -1;
         MoEOverlayCollectiveDirection direction = MoEOverlayCollectiveDirection::Dispatch;
         uint64_t sequence = 0;
 
@@ -46,6 +56,25 @@ namespace llaminar2
     bool operator==(const MoEOverlayCollectiveKey &lhs, const MoEOverlayCollectiveKey &rhs);
     bool operator!=(const MoEOverlayCollectiveKey &lhs, const MoEOverlayCollectiveKey &rhs);
     bool operator<(const MoEOverlayCollectiveKey &lhs, const MoEOverlayCollectiveKey &rhs);
+
+    MoEOverlayCollectiveKey makeMoEOverlayCollectiveKey(
+        uint64_t generation_id,
+        uint64_t step_id,
+        int layer_idx,
+        int tier_idx,
+        int domain_id,
+        int participant_id,
+        MoEOverlayCollectiveDirection direction);
+
+    MoEOverlayCollectiveKey makeMTPMoEOverlayCollectiveKey(
+        uint64_t generation_id,
+        uint64_t decode_step_id,
+        int mtp_depth,
+        int layer_idx,
+        int tier_idx,
+        int domain_id,
+        int participant_id,
+        MoEOverlayCollectiveDirection direction);
 
     struct MoEOverlaySparseRows
     {

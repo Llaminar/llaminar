@@ -146,19 +146,14 @@ namespace llaminar2
             int target_participant,
             MoEOverlayCollectiveDirection direction)
         {
-            MoEOverlayCollectiveKey key;
-            key.generation_id = 1;
-            key.step_id = 0;
-            key.layer_idx = layer_idx;
-            key.tier_idx = tier_idx;
-            key.domain_id = std::max(0, target_participant);
-            key.direction = direction;
-            const uint64_t direction_offset = direction == MoEOverlayCollectiveDirection::Dispatch ? 0ull : 2048ull;
-            key.sequence = static_cast<uint64_t>(std::max(layer_idx, 0)) * 8192ull +
-                           direction_offset +
-                           static_cast<uint64_t>(std::max(tier_idx, 0)) * 128ull +
-                           static_cast<uint64_t>(std::max(target_participant, 0));
-            return key;
+            return makeMoEOverlayCollectiveKey(
+                1,
+                0,
+                layer_idx,
+                tier_idx,
+                std::max(0, target_participant),
+                std::max(0, target_participant),
+                direction);
         }
 
         DeviceId participantDeviceForGraphNativeOverlay(

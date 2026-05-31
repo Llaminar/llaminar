@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <set>
+
 using namespace llaminar2;
 
 namespace
@@ -89,6 +91,137 @@ TEST(Test__MoEOverlayCollectiveWorkspace, EnsureCapacityAndResetReuseStoragePoin
     EXPECT_EQ(after.route_weights_host, route_weights_ptr);
     EXPECT_EQ(after.hidden_rows_fp32, hidden_ptr);
     EXPECT_EQ(after.entry_offsets_host[0], 0);
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace, MTPCollectiveKeysDoNotAliasMainGraphKeys)
+{
+    const auto main_key = makeMoEOverlayCollectiveKey(
+        5,
+        8,
+        3,
+        1,
+        7,
+        2,
+        MoEOverlayCollectiveDirection::Dispatch);
+    const auto mtp_key = makeMTPMoEOverlayCollectiveKey(
+        5,
+        8,
+        0,
+        3,
+        1,
+        7,
+        2,
+        MoEOverlayCollectiveDirection::Dispatch);
+
+    EXPECT_TRUE(main_key.isValid());
+    EXPECT_TRUE(mtp_key.isValid());
+    EXPECT_EQ(main_key.key_namespace, MoEOverlayCollectiveNamespace::Main);
+    EXPECT_EQ(mtp_key.key_namespace, MoEOverlayCollectiveNamespace::MTP);
+    EXPECT_NE(main_key, mtp_key);
+    EXPECT_NE(main_key.sequence, mtp_key.sequence);
+    EXPECT_NE(main_key.toString(), mtp_key.toString());
+    EXPECT_STREQ(toString(main_key.key_namespace), "Main");
+    EXPECT_STREQ(toString(mtp_key.key_namespace), "MTP");
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace, MTPCollectiveKeysSeparateDepthParticipantAndDirection)
+{
+    const auto depth0 = makeMTPMoEOverlayCollectiveKey(
+        5,
+        8,
+        0,
+        3,
+        1,
+        7,
+        2,
+        MoEOverlayCollectiveDirection::Dispatch);
+    const auto depth1 = makeMTPMoEOverlayCollectiveKey(
+        5,
+        8,
+        1,
+        3,
+        1,
+        7,
+        2,
+        MoEOverlayCollectiveDirection::Dispatch);
+    const auto participant3 = makeMTPMoEOverlayCollectiveKey(
+        5,
+        8,
+        0,
+        3,
+        1,
+        7,
+        3,
+        MoEOverlayCollectiveDirection::Dispatch);
+    const auto return_key = makeMTPMoEOverlayCollectiveKey(
+        5,
+        8,
+        0,
+        3,
+        1,
+        7,
+        2,
+        MoEOverlayCollectiveDirection::ReturnReduce);
+
+    std::set<MoEOverlayCollectiveKey> keys{depth0, depth1, participant3, return_key};
+    EXPECT_EQ(keys.size(), 4u);
+    EXPECT_TRUE(depth0.isValid());
+    EXPECT_TRUE(depth1.isValid());
+    EXPECT_TRUE(participant3.isValid());
+    EXPECT_TRUE(return_key.isValid());
+    EXPECT_NE(depth0.sequence, depth1.sequence);
+    EXPECT_NE(depth0.sequence, participant3.sequence);
+    EXPECT_NE(depth0.sequence, return_key.sequence);
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace, MTPCollectiveKeyRequiresDepth)
+{
+    auto key = dispatchKey(77);
+    key.key_namespace = MoEOverlayCollectiveNamespace::MTP;
+    key.participant_id = 0;
+    EXPECT_FALSE(key.isValid());
+
+    key.mtp_depth = 0;
+    EXPECT_TRUE(key.isValid());
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace, LocalSparseCollectiveSeparatesMainAndMTPNamespaces)
+{
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(4, 8, 4, 2, DeviceId::cpu());
+
+    MoEOverlayLocalSparseCollectiveContext collective({.participant_count = 1, .slot_count = 1});
+    const auto main_key = dispatchKey(33);
+    auto mtp_key = main_key;
+    mtp_key.key_namespace = MoEOverlayCollectiveNamespace::MTP;
+    mtp_key.mtp_depth = 0;
+    mtp_key.participant_id = 0;
+
+    auto main_outbound = workspace.localExpertInput(3, 1);
+    main_outbound.key = main_key;
+    main_outbound.source_participant = 0;
+    main_outbound.target_participant = 0;
+    main_outbound.live_row_count = 0;
+    main_outbound.live_entry_count = 0;
+    main_outbound.entry_offsets_host[0] = 0;
+
+    auto main_inbound = workspace.dispatchReceive(3, 1);
+    const auto main_result = collective.dispatch(main_key, main_outbound, &main_inbound, nullptr);
+    ASSERT_TRUE(main_result.ok) << main_result.error;
+    EXPECT_TRUE(main_result.collective_complete);
+
+    auto mtp_outbound = workspace.localExpertInput(3, 1);
+    mtp_outbound.key = mtp_key;
+    mtp_outbound.source_participant = 0;
+    mtp_outbound.target_participant = 0;
+    mtp_outbound.live_row_count = 0;
+    mtp_outbound.live_entry_count = 0;
+    mtp_outbound.entry_offsets_host[0] = 0;
+
+    auto mtp_inbound = workspace.dispatchReceive(3, 1);
+    const auto mtp_result = collective.dispatch(mtp_key, mtp_outbound, &mtp_inbound, nullptr);
+    EXPECT_TRUE(mtp_result.ok) << mtp_result.error;
+    EXPECT_TRUE(mtp_result.collective_complete);
 }
 
 TEST(Test__MoEOverlayCollectiveWorkspace, LocalSparseDispatchMovesPayloadAndNoOpCompletesKey)

@@ -22,7 +22,7 @@ namespace llaminar2
     namespace
     {
         constexpr uint32_t kPacketMagic = 0x32454f4dU; // "MOE2"
-        constexpr uint32_t kPacketVersion = 1;
+        constexpr uint32_t kPacketVersion = 2;
         constexpr uint8_t kPacketKindDispatch = 1;
         constexpr uint8_t kPacketKindReturn = 2;
 
@@ -49,14 +49,40 @@ namespace llaminar2
         std::string keyToStableString(const MoEOverlayCollectiveKey &key)
         {
             std::ostringstream ss;
-            ss << key.generation_id << ':'
+            ss << static_cast<int>(key.key_namespace) << ':'
+               << key.generation_id << ':'
                << key.step_id << ':'
+               << key.mtp_depth << ':'
                << key.layer_idx << ':'
                << key.tier_idx << ':'
                << key.domain_id << ':'
+               << key.participant_id << ':'
                << static_cast<int>(key.direction) << ':'
                << key.sequence;
             return ss.str();
+        }
+
+        uint64_t makeCollectiveSequence(MoEOverlayCollectiveNamespace key_namespace,
+                                        int mtp_depth,
+                                        int layer_idx,
+                                        int tier_idx,
+                                        int participant_id,
+                                        MoEOverlayCollectiveDirection direction)
+        {
+            const uint64_t namespace_offset =
+                key_namespace == MoEOverlayCollectiveNamespace::MTP ? (1ull << 56) : 0ull;
+            const uint64_t depth_component =
+                key_namespace == MoEOverlayCollectiveNamespace::MTP
+                    ? static_cast<uint64_t>(std::max(mtp_depth, 0)) * (1ull << 40)
+                    : 0ull;
+            const uint64_t direction_offset =
+                direction == MoEOverlayCollectiveDirection::Dispatch ? 0ull : 2048ull;
+            return namespace_offset +
+                   depth_component +
+                   static_cast<uint64_t>(std::max(layer_idx, 0)) * 8192ull +
+                   direction_offset +
+                   static_cast<uint64_t>(std::max(tier_idx, 0)) * 128ull +
+                   static_cast<uint64_t>(std::max(participant_id, 0));
         }
 
         bool validateSparseRows(const MoEOverlaySparseRows &rows,
@@ -302,11 +328,14 @@ namespace llaminar2
             appendPod(bytes, kPacketMagic);
             appendPod(bytes, kPacketVersion);
             appendPod(bytes, kPacketKindDispatch);
+            appendPod(bytes, static_cast<uint8_t>(payload.key.key_namespace));
             appendPod(bytes, payload.key.generation_id);
             appendPod(bytes, payload.key.step_id);
+            appendPod(bytes, payload.key.mtp_depth);
             appendPod(bytes, payload.key.layer_idx);
             appendPod(bytes, payload.key.tier_idx);
             appendPod(bytes, payload.key.domain_id);
+            appendPod(bytes, payload.key.participant_id);
             appendPod(bytes, static_cast<uint8_t>(payload.key.direction));
             appendPod(bytes, payload.key.sequence);
             appendPod(bytes, payload.source_participant);
@@ -373,14 +402,18 @@ namespace llaminar2
                 return false;
             }
 
+            uint8_t key_namespace = 0;
             uint8_t direction = 0;
             uint32_t row_count = 0;
             uint32_t entry_count = 0;
-            if (!readPod(data, size, &offset, &out->key.generation_id) ||
+            if (!readPod(data, size, &offset, &key_namespace) ||
+                !readPod(data, size, &offset, &out->key.generation_id) ||
                 !readPod(data, size, &offset, &out->key.step_id) ||
+                !readPod(data, size, &offset, &out->key.mtp_depth) ||
                 !readPod(data, size, &offset, &out->key.layer_idx) ||
                 !readPod(data, size, &offset, &out->key.tier_idx) ||
                 !readPod(data, size, &offset, &out->key.domain_id) ||
+                !readPod(data, size, &offset, &out->key.participant_id) ||
                 !readPod(data, size, &offset, &direction) ||
                 !readPod(data, size, &offset, &out->key.sequence) ||
                 !readPod(data, size, &offset, &out->source_participant) ||
@@ -395,11 +428,18 @@ namespace llaminar2
                 return false;
             }
 
+            out->key.key_namespace = static_cast<MoEOverlayCollectiveNamespace>(key_namespace);
             out->key.direction = static_cast<MoEOverlayCollectiveDirection>(direction);
             if (out->key.direction != MoEOverlayCollectiveDirection::Dispatch)
             {
                 if (error)
                     *error = "dispatch packet has wrong collective direction";
+                return false;
+            }
+            if (!out->key.isValid())
+            {
+                if (error)
+                    *error = "dispatch packet has invalid collective key";
                 return false;
             }
 
@@ -448,11 +488,14 @@ namespace llaminar2
             appendPod(bytes, kPacketMagic);
             appendPod(bytes, kPacketVersion);
             appendPod(bytes, kPacketKindReturn);
+            appendPod(bytes, static_cast<uint8_t>(payload.key.key_namespace));
             appendPod(bytes, payload.key.generation_id);
             appendPod(bytes, payload.key.step_id);
+            appendPod(bytes, payload.key.mtp_depth);
             appendPod(bytes, payload.key.layer_idx);
             appendPod(bytes, payload.key.tier_idx);
             appendPod(bytes, payload.key.domain_id);
+            appendPod(bytes, payload.key.participant_id);
             appendPod(bytes, static_cast<uint8_t>(payload.key.direction));
             appendPod(bytes, payload.key.sequence);
             appendPod(bytes, payload.source_participant);
@@ -504,13 +547,17 @@ namespace llaminar2
                 return false;
             }
 
+            uint8_t key_namespace = 0;
             uint8_t direction = 0;
             uint32_t row_count = 0;
-            if (!readPod(data, size, &offset, &out->key.generation_id) ||
+            if (!readPod(data, size, &offset, &key_namespace) ||
+                !readPod(data, size, &offset, &out->key.generation_id) ||
                 !readPod(data, size, &offset, &out->key.step_id) ||
+                !readPod(data, size, &offset, &out->key.mtp_depth) ||
                 !readPod(data, size, &offset, &out->key.layer_idx) ||
                 !readPod(data, size, &offset, &out->key.tier_idx) ||
                 !readPod(data, size, &offset, &out->key.domain_id) ||
+                !readPod(data, size, &offset, &out->key.participant_id) ||
                 !readPod(data, size, &offset, &direction) ||
                 !readPod(data, size, &offset, &out->key.sequence) ||
                 !readPod(data, size, &offset, &out->source_participant) ||
@@ -523,11 +570,18 @@ namespace llaminar2
                 return false;
             }
 
+            out->key.key_namespace = static_cast<MoEOverlayCollectiveNamespace>(key_namespace);
             out->key.direction = static_cast<MoEOverlayCollectiveDirection>(direction);
             if (out->key.direction != MoEOverlayCollectiveDirection::ReturnReduce)
             {
                 if (error)
                     *error = "return packet has wrong collective direction";
+                return false;
+            }
+            if (!out->key.isValid())
+            {
+                if (error)
+                    *error = "return packet has invalid collective key";
                 return false;
             }
 
@@ -603,9 +657,31 @@ namespace llaminar2
         return "Unknown";
     }
 
+    const char *toString(MoEOverlayCollectiveNamespace key_namespace)
+    {
+        switch (key_namespace)
+        {
+        case MoEOverlayCollectiveNamespace::Main:
+            return "Main";
+        case MoEOverlayCollectiveNamespace::MTP:
+            return "MTP";
+        }
+        return "Unknown";
+    }
+
     bool MoEOverlayCollectiveKey::isValid() const
     {
-        return layer_idx >= 0 && tier_idx >= 0 && domain_id >= 0;
+        if (layer_idx < 0 || tier_idx < 0 || domain_id < 0)
+            return false;
+
+        switch (key_namespace)
+        {
+        case MoEOverlayCollectiveNamespace::Main:
+            return mtp_depth < 0;
+        case MoEOverlayCollectiveNamespace::MTP:
+            return mtp_depth >= 0;
+        }
+        return false;
     }
 
     std::string MoEOverlayCollectiveKey::toString() const
@@ -617,9 +693,12 @@ namespace llaminar2
     {
         return lhs.generation_id == rhs.generation_id &&
                lhs.step_id == rhs.step_id &&
+               lhs.key_namespace == rhs.key_namespace &&
+               lhs.mtp_depth == rhs.mtp_depth &&
                lhs.layer_idx == rhs.layer_idx &&
                lhs.tier_idx == rhs.tier_idx &&
                lhs.domain_id == rhs.domain_id &&
+               lhs.participant_id == rhs.participant_id &&
                lhs.direction == rhs.direction &&
                lhs.sequence == rhs.sequence;
     }
@@ -633,18 +712,81 @@ namespace llaminar2
     {
         return std::tie(lhs.generation_id,
                         lhs.step_id,
+                        lhs.key_namespace,
+                        lhs.mtp_depth,
                         lhs.layer_idx,
                         lhs.tier_idx,
                         lhs.domain_id,
+                        lhs.participant_id,
                         lhs.direction,
                         lhs.sequence) <
                std::tie(rhs.generation_id,
                         rhs.step_id,
+                        rhs.key_namespace,
+                        rhs.mtp_depth,
                         rhs.layer_idx,
                         rhs.tier_idx,
                         rhs.domain_id,
+                        rhs.participant_id,
                         rhs.direction,
                         rhs.sequence);
+    }
+
+    MoEOverlayCollectiveKey makeMoEOverlayCollectiveKey(
+        uint64_t generation_id,
+        uint64_t step_id,
+        int layer_idx,
+        int tier_idx,
+        int domain_id,
+        int participant_id,
+        MoEOverlayCollectiveDirection direction)
+    {
+        MoEOverlayCollectiveKey key;
+        key.generation_id = generation_id;
+        key.step_id = step_id;
+        key.key_namespace = MoEOverlayCollectiveNamespace::Main;
+        key.mtp_depth = -1;
+        key.layer_idx = layer_idx;
+        key.tier_idx = tier_idx;
+        key.domain_id = domain_id;
+        key.participant_id = participant_id;
+        key.direction = direction;
+        key.sequence = makeCollectiveSequence(key.key_namespace,
+                                              key.mtp_depth,
+                                              key.layer_idx,
+                                              key.tier_idx,
+                                              key.participant_id,
+                                              key.direction);
+        return key;
+    }
+
+    MoEOverlayCollectiveKey makeMTPMoEOverlayCollectiveKey(
+        uint64_t generation_id,
+        uint64_t decode_step_id,
+        int mtp_depth,
+        int layer_idx,
+        int tier_idx,
+        int domain_id,
+        int participant_id,
+        MoEOverlayCollectiveDirection direction)
+    {
+        MoEOverlayCollectiveKey key;
+        key.generation_id = generation_id;
+        key.step_id = decode_step_id;
+        key.key_namespace = MoEOverlayCollectiveNamespace::MTP;
+        key.mtp_depth = mtp_depth;
+        key.layer_idx = layer_idx;
+        key.tier_idx = tier_idx;
+        key.domain_id = domain_id;
+        key.participant_id = participant_id;
+        key.direction = direction;
+        key.sequence = makeCollectiveSequence(key.key_namespace,
+                                              key.mtp_depth,
+                                              key.layer_idx,
+                                              key.tier_idx,
+                                              key.participant_id,
+                                              key.direction);
+        return key;
     }
 
     size_t denseMoEOverlayDispatchBytes(int seq_len, int top_k, int d_model)
