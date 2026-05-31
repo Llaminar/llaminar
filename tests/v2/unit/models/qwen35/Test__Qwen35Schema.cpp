@@ -19,10 +19,12 @@
 #include <algorithm>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 
 #include "models/qwen35/Qwen35Schema.h"
 #include "models/qwen35/Qwen35GraphConfigBuilder.h"
 #include "models/qwen35/Qwen35Graph.h"
+#include "execution/factory/EagerWeightValidator.h"
 #include "execution/local_execution/graph/GraphBuilderRegistry.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "execution/local_execution/graph/GraphSchema.h"
@@ -730,6 +732,58 @@ TEST(Test__Qwen35Schema, ConfigBuilder_ExcludesTrailingNextNBlocksFromMainGraph)
     ASSERT_EQ(config.layer_types.size(), 4u);
     EXPECT_EQ(config.layer_types[3], "gdn")
         << "The trailing nextn block owns layer 4 tensors but must not enter the main graph";
+}
+
+TEST(Test__Qwen35Schema, ConfigBuilder_MainLayerCountDrivesEagerValidation)
+{
+    auto ctx = MockModelContextBuilder()
+                   .setArchitecture("qwen35")
+                   .setBlockCount(5)
+                   .setEmbeddingLength(256)
+                   .setHeadCount(4)
+                   .setHeadCountKV(1)
+                   .setFeedForwardLength(512)
+                   .setVocabSize(1024)
+                   .build();
+
+    auto &loader = ctx->mockLoader();
+    loader.setIntParam("qwen35.ssm.conv_kernel", 4);
+    loader.setIntParam("qwen35.ssm.state_size", 64);
+    loader.setIntParam("qwen35.ssm.inner_size", 256);
+    loader.setIntParam("qwen35.ssm.group_count", 2);
+    loader.setIntParam("qwen35.ssm.time_step_rank", 4);
+    loader.setIntParam("qwen35.full_attention_interval", 4);
+    loader.setIntParam("qwen35.nextn_predict_layers", 1);
+    loader.addFP32ZerosTensor("blk.4.nextn.eh_proj.weight", {256, 512});
+
+    GraphConfig config;
+    Qwen35GraphConfigBuilder builder;
+    ASSERT_TRUE(builder.populateFromModelContext(*ctx, config));
+    ASSERT_EQ(config.n_layers, 4);
+
+    Qwen35SchemaFactory schema;
+    std::unordered_set<std::string> tensors;
+    for (int layer = 0; layer < config.n_layers; ++layer)
+    {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        tensors.insert(prefix + "attn_norm.weight");
+        tensors.insert(prefix + "post_attention_norm.weight");
+        tensors.insert(prefix + "ffn_gate.weight");
+        tensors.insert(prefix + "ffn_up.weight");
+        tensors.insert(prefix + "ffn_down.weight");
+    }
+
+    auto has_tensor = [&tensors](const std::string &name)
+    {
+        return tensors.count(name) != 0;
+    };
+
+    auto main_validation = validateLayerWeights(schema, config.n_layers, has_tensor);
+    EXPECT_TRUE(main_validation.success) << main_validation.error_message();
+
+    auto raw_validation = validateLayerWeights(schema, ctx->blockCount(), has_tensor);
+    EXPECT_FALSE(raw_validation.success)
+        << "Raw GGUF block_count includes the trailing nextn sidecar block and must not drive main eager validation";
 }
 
 TEST(Test__Qwen35Schema, IsFullAttentionLayer_Shortcut)

@@ -2005,7 +2005,9 @@ namespace llaminar2
         const std::string arch = model_ctx->architecture();
         auto schema_factory = SchemaFactoryRegistry::getFactory(arch);
 
-        int n_layers = model_ctx->blockCount();
+        const int n_layers = graph_config.n_layers > 0
+                                 ? graph_config.n_layers
+                                 : model_ctx->blockCount();
         LOG_DEBUG("[InferenceRunner] Eagerly loading " << n_layers << " layers of weights...");
         WeightLoadingProfiler::begin(WeightLoadPhase::TENSOR_LOAD);
         ScopedWeightLoadDetailTimer eager_layer_timer("weights.eager_layer_cache_load");
@@ -3207,7 +3209,9 @@ namespace llaminar2
                     auto schema_factory = SchemaFactoryRegistry::getFactory(architecture);
                     auto validation = validateLayerWeights(
                         *schema_factory,
-                        concrete_model_ctx->totalBlockCount(),
+                        graph_config.n_layers > 0
+                            ? graph_config.n_layers
+                            : concrete_model_ctx->totalBlockCount(),
                         [concrete_model_ctx](const std::string &name)
                         { return concrete_model_ctx->hasTensor(name); });
 

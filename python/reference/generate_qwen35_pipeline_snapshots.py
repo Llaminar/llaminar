@@ -107,6 +107,7 @@ def write_metadata(
 ):
     """Write metadata.txt compatible with parity test loader."""
     config = model.hf_model.config
+    output_dir.mkdir(parents=True, exist_ok=True)
     metadata_path = output_dir / "metadata.txt"
     with open(metadata_path, "w") as f:
         # Snapshot version: bumped when the snapshot format or V-head
@@ -143,6 +144,7 @@ def run_prefill_and_decode(
     decode_steps: int,
     output_dir: Path,
     verbose: bool = False,
+    save_snapshots: bool = True,
 ):
     """
     Run prefill + optional decode steps with snapshot capture.
@@ -164,10 +166,21 @@ def run_prefill_and_decode(
     # state). Without this, each decode step re-runs the full prompt + all
     # prior decoded tokens — O(S²) attention work that produces snapshots
     # we then throw away (the C++ parity test only compares the LAST row).
-    result = model.forward(token_ids, clear_snapshots=True, use_cache=True)
-    prefill_snaps = model.get_snapshots()
-    total = save_snapshots_as_npy(prefill_snaps, output_dir, prefix="", verbose=verbose)
-    print(f"  Captured {total} prefill snapshots")
+    capture_stages = None if save_snapshots else []
+    result = model.forward(
+        token_ids,
+        clear_snapshots=True,
+        use_cache=True,
+        capture_stages=capture_stages,
+    )
+    total = 0
+    if save_snapshots:
+        prefill_snaps = model.get_snapshots()
+        total = save_snapshots_as_npy(prefill_snaps, output_dir, prefix="", verbose=verbose)
+        print(f"  Captured {total} prefill snapshots")
+    else:
+        model.clear_snapshots()
+        print("  Snapshot capture disabled; metadata only")
 
     # Get next token (greedy)
     logits = result["logits"]
@@ -190,13 +203,21 @@ def run_prefill_and_decode(
         # Single-token forward using cache. Snapshots from this step have
         # shape [1, 1, H] (one new position), matching what Llaminar's
         # incremental decode produces.
-        result = model.forward([next_token], clear_snapshots=True,
-                               past_key_values=cache, use_cache=True)
+        result = model.forward(
+            [next_token],
+            clear_snapshots=True,
+            past_key_values=cache,
+            use_cache=True,
+            capture_stages=capture_stages,
+        )
         cache = result.get("past_key_values")
-        step_snaps = model.get_snapshots()
-        n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
-        total += n
-        print(f"  Captured {n} decode snapshots for step {step}")
+        if save_snapshots:
+            step_snaps = model.get_snapshots()
+            n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
+            total += n
+            print(f"  Captured {n} decode snapshots for step {step}")
+        else:
+            model.clear_snapshots()
 
         # Pick next token
         logits = result["logits"]
@@ -254,6 +275,11 @@ Examples:
         action="store_true",
         help="Verbose logging",
     )
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Write metadata.txt with prompt/decode tokens without saving .npy snapshots",
+    )
 
     args = parser.parse_args()
 
@@ -265,6 +291,7 @@ Examples:
     print(f"  Prompt: '{args.prompt}'")
     print(f"  Output: {args.output}")
     print(f"  Decode steps: {args.decode_steps}")
+    print(f"  Metadata only: {args.metadata_only}")
 
     # Create and load model via registry
     print("\nLoading model...")
@@ -278,6 +305,7 @@ Examples:
         args.decode_steps,
         args.output,
         verbose=args.verbose,
+        save_snapshots=not args.metadata_only,
     )
 
     # Write metadata

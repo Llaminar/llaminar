@@ -294,6 +294,97 @@ class TestQwen35ModelRegistry:
         assert model.model_name == 'qwen35'
 
 
+class TestQwen35SnapshotGeneration:
+    """Unit tests for snapshot/metadata generation helpers."""
+
+    def test_metadata_only_prefill_and_decode_suppresses_snapshot_capture(self, tmp_path):
+        from python.reference.generate_qwen35_pipeline_snapshots import run_prefill_and_decode
+
+        class FakeTokenizer:
+            def __call__(self, prompt, return_tensors):
+                assert prompt == "hello"
+                assert return_tensors == "pt"
+                return {"input_ids": torch.tensor([[10, 11]])}
+
+        class FakeCache:
+            def __init__(self):
+                self.length = 2
+
+            def get_seq_length(self):
+                return self.length
+
+        class FakeModel:
+            def __init__(self):
+                self.tokenizer = FakeTokenizer()
+                self.capture_args = []
+                self.clear_count = 0
+
+            def forward(self, token_ids, **kwargs):
+                self.capture_args.append(kwargs.get("capture_stages"))
+                vocab = 32
+                logits = np.zeros((1, len(token_ids), vocab), dtype=np.float32)
+                logits[0, -1, 20 + len(self.capture_args)] = 1.0
+                return {"logits": logits, "past_key_values": FakeCache()}
+
+            def get_snapshots(self):
+                raise AssertionError("metadata-only generation should not request snapshots")
+
+            def clear_snapshots(self):
+                self.clear_count += 1
+
+        model = FakeModel()
+        total, token_ids, decode_tokens = run_prefill_and_decode(
+            model,
+            "hello",
+            decode_steps=2,
+            output_dir=tmp_path,
+            save_snapshots=False,
+        )
+
+        assert total == 0
+        assert token_ids == [10, 11]
+        assert decode_tokens == [21, 22, 23]
+        assert model.capture_args == [[], [], []]
+        assert model.clear_count == 3
+        assert not list(tmp_path.glob("*.npy"))
+
+    def test_write_metadata_creates_output_directory(self, tmp_path):
+        from python.reference.generate_qwen35_pipeline_snapshots import write_metadata
+
+        class FakeConfig:
+            architectures = ["Qwen3_5TextConfig"]
+            num_hidden_layers = 64
+            num_attention_heads = 24
+            num_key_value_heads = 4
+            hidden_size = 5120
+            head_dim = 256
+            intermediate_size = 17408
+            vocab_size = 248320
+
+        class FakeHFModel:
+            config = FakeConfig()
+
+        class FakeModel:
+            hf_model = FakeHFModel()
+
+        output_dir = tmp_path / "missing" / "qwen36"
+        write_metadata(
+            output_dir,
+            "/models/qwen36.gguf",
+            FakeModel(),
+            "hello",
+            [1, 2],
+            1,
+            [3, 4],
+        )
+
+        metadata = output_dir / "metadata.txt"
+        assert metadata.exists()
+        text = metadata.read_text()
+        assert "token_ids: 1,2" in text
+        assert "decode_tokens: 3,4" in text
+
+
 class TestQwen35PipelineStages:
     """Unit tests for GDN-specific pipeline stages (no model required)."""
 

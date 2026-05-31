@@ -4107,6 +4107,7 @@ namespace llaminar2
             std::memcpy(hidden_dst,
                         hit.blocks.back().terminal_hidden,
                         prefix_layout_.terminal_hidden_bytes);
+            state_.prefix_terminal_hidden->mark_host_dirty();
             if (state_.device_id.is_gpu())
             {
                 auto upload = TransferEngine::instance().upload(
@@ -4163,6 +4164,7 @@ namespace llaminar2
             return false;
         }
         std::memcpy(dst, terminal.terminal_logits, prefix_layout_.terminal_logits_bytes);
+        terminal_logits_tensor->mark_host_dirty();
         if (state_.device_id.is_gpu())
         {
             auto upload = TransferEngine::instance().upload(terminal_logits_tensor, state_.device_id);
@@ -4195,6 +4197,7 @@ namespace llaminar2
             if (!hidden_dst || prefix_layout_.terminal_hidden_bytes == 0)
                 return false;
             std::memcpy(hidden_dst, terminal.terminal_hidden, prefix_layout_.terminal_hidden_bytes);
+            state_.prefix_terminal_hidden->mark_host_dirty();
             if (state_.device_id.is_gpu())
             {
                 auto upload = TransferEngine::instance().upload(
