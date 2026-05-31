@@ -86,6 +86,19 @@ namespace llaminar2
             return chunk_input;
         }
 
+        PrefillChunkPlan makeMaintenanceChunkPlan(
+            const ForwardExecutionEngine::PrefillChunkRuntimePlan &plan)
+        {
+            PrefillChunkPlan chunk;
+            chunk.token_offset = plan.chunk.token_offset;
+            chunk.real_count = plan.chunk.real_count;
+            chunk.bucket_seq_len = plan.chunk.bucket_seq_len;
+            chunk.chunk_index = plan.chunk_index;
+            chunk.rebalance_allowed_after = plan.rebalance_allowed_after;
+            chunk.rebalance_required_after = plan.rebalance_required_after;
+            return chunk;
+        }
+
         /// @brief Build the fixed-bucket replay metadata consumed by row-select,
         ///        LM-head, and KV-cache append stages.
         IComputeStage::PrefillReplayParams makePrefillReplayParams(const ForwardInput &input)
@@ -373,7 +386,35 @@ namespace llaminar2
         // chunk buffers plus fixed-bucket metadata for the delegated launch.
         ForwardInput chunk_input = makeBucketedPrefillInput(base_input, plan);
 
-        return execute(chunk_input, output, host);
+        if (!execute(chunk_input, output, host))
+            return false;
+
+        const PrefillChunkPlan maintenance_chunk = makeMaintenanceChunkPlan(plan);
+        const PrefillChunkMaintenanceState maintenance_state =
+            host.prefillChunkMaintenanceState(maintenance_chunk);
+        const PrefillChunkMaintenanceDecision maintenance_decision =
+            evaluatePrefillChunkMaintenance(maintenance_chunk, maintenance_state);
+
+        const bool maintenance_was_requested =
+            maintenance_state.rebalance_requested ||
+            maintenance_chunk.rebalance_required_after;
+        if (maintenance_was_requested && !maintenance_decision)
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Prefill chunk maintenance blocked after chunk "
+                      << maintenance_chunk.chunk_index << ": "
+                      << maintenance_decision.reason);
+            return false;
+        }
+        if (maintenance_decision.can_run &&
+            !host.onPrefillChunkMaintenance(maintenance_chunk, maintenance_decision))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Prefill chunk maintenance failed after chunk "
+                      << maintenance_chunk.chunk_index << ": "
+                      << maintenance_decision.reason);
+            return false;
+        }
+
+        return true;
     }
 
     void ForwardExecutionEngine::invalidateAll()

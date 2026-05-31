@@ -143,6 +143,38 @@ namespace llaminar2
 
         /** Domain placement epoch for MoE-sensitive prefill graph-cache keys. */
         virtual uint64_t moePlacementEpoch() const { return 0; }
+
+        /**
+         * @brief Return safety state for optional chunk-boundary maintenance.
+         *
+         * Hosts with MoE rebalance domains can report histogram merge,
+         * sparse-boundary, capture/replay, and participant-alignment state.
+         * The default means no maintenance is requested for this chunk.
+         */
+        virtual PrefillChunkMaintenanceState prefillChunkMaintenanceState(
+            const PrefillChunkPlan &chunk) const
+        {
+            PrefillChunkMaintenanceState state;
+            state.chunk_index = chunk.chunk_index;
+            state.histograms_merged = true;
+            return state;
+        }
+
+        /**
+         * @brief Run chunk-boundary maintenance after the gate allows it.
+         *
+         * This is where later MoE implementations merge telemetry-driven
+         * rebalancing, prepared-weight transfer, runtime-table bank flips, and
+         * graph-cache invalidation. The default is a no-op for non-MoE hosts.
+         */
+        virtual bool onPrefillChunkMaintenance(
+            const PrefillChunkPlan &chunk,
+            const PrefillChunkMaintenanceDecision &decision)
+        {
+            (void)chunk;
+            (void)decision;
+            return true;
+        }
     };
 
     /**

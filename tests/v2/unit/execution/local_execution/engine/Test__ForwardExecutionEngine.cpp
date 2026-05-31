@@ -106,6 +106,10 @@ namespace
         const int *last_position_ids_pointer = nullptr;
         std::vector<int> last_token_ids;
         std::vector<int> last_position_ids;
+        int prefill_chunk_maintenance_state_calls = 0;
+        int prefill_chunk_maintenance_calls = 0;
+        PrefillChunkPlan last_maintenance_chunk{};
+        PrefillChunkMaintenanceDecision last_maintenance_decision{};
 
         // ----- Configurable Results -----
         bool build_should_fail = false;
@@ -115,6 +119,9 @@ namespace
         std::vector<ComputeStageType> graph_stage_types;
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
+        PrefillChunkMaintenanceState mock_maintenance_state{};
+        bool mock_maintenance_state_configured = false;
+        bool maintenance_should_fail = false;
 
         // ----- IForwardExecutionHost Interface -----
 
@@ -211,6 +218,27 @@ namespace
         {
             const_cast<MockForwardExecutionHost *>(this)->resolve_pp_copy_calls++;
             return mock_pp_copy;
+        }
+
+        PrefillChunkMaintenanceState prefillChunkMaintenanceState(
+            const PrefillChunkPlan &chunk) const override
+        {
+            auto *self = const_cast<MockForwardExecutionHost *>(this);
+            self->prefill_chunk_maintenance_state_calls++;
+            self->last_maintenance_chunk = chunk;
+            if (mock_maintenance_state_configured)
+                return mock_maintenance_state;
+            return IForwardExecutionHost::prefillChunkMaintenanceState(chunk);
+        }
+
+        bool onPrefillChunkMaintenance(
+            const PrefillChunkPlan &chunk,
+            const PrefillChunkMaintenanceDecision &decision) override
+        {
+            prefill_chunk_maintenance_calls++;
+            last_maintenance_chunk = chunk;
+            last_maintenance_decision = decision;
+            return !maintenance_should_fail;
         }
 
     private:
@@ -563,6 +591,123 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_ExactPlanDelegatesWithChunk
     EXPECT_EQ(host.last_forward_input.token_offset, plan.chunk.token_offset);
     EXPECT_EQ(host.last_forward_input.position_offset, plan.chunk.token_offset);
     EXPECT_EQ(host.last_workspace_seq_len, plan.chunk.bucket_seq_len);
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_MaintenanceRunsWhenRequestedAndAllowed)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    const std::vector<int> tokens = {40, 41, 42, 43};
+    auto base_input = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), nullptr);
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        base_input,
+        std::vector<int>{4},
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(plan) << plan.error;
+    plan.chunk_index = 2;
+    plan.rebalance_allowed_after = true;
+
+    host.mock_maintenance_state_configured = true;
+    host.mock_maintenance_state.chunk_index = 2;
+    host.mock_maintenance_state.rebalance_requested = true;
+    host.mock_maintenance_state.histograms_merged = true;
+    host.mock_maintenance_state.manual_boundaries_complete = true;
+    host.mock_maintenance_state.participants_at_same_boundary = true;
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.runPrefillChunk(base_input, plan, output, host));
+
+    EXPECT_EQ(host.prefill_chunk_maintenance_state_calls, 1);
+    EXPECT_EQ(host.prefill_chunk_maintenance_calls, 1);
+    EXPECT_EQ(host.last_maintenance_chunk.chunk_index, 2);
+    EXPECT_EQ(host.last_maintenance_chunk.real_count, 4);
+    EXPECT_TRUE(host.last_maintenance_decision.can_run);
+    EXPECT_FALSE(host.last_maintenance_decision.required);
+    EXPECT_EQ(host.last_maintenance_decision.reason, "ready");
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_OptionalMaintenanceNotRequestedDoesNotRunHook)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    const std::vector<int> tokens = {40, 41, 42, 43};
+    auto base_input = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), nullptr);
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        base_input,
+        std::vector<int>{4},
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(plan) << plan.error;
+    plan.rebalance_allowed_after = true;
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.runPrefillChunk(base_input, plan, output, host));
+
+    EXPECT_EQ(host.prefill_chunk_maintenance_state_calls, 1);
+    EXPECT_EQ(host.prefill_chunk_maintenance_calls, 0);
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_RequiredMaintenanceFailsWhenBoundaryUnsafe)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    const std::vector<int> tokens = {40, 41, 42, 43};
+    auto base_input = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), nullptr);
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        base_input,
+        std::vector<int>{4},
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(plan) << plan.error;
+    plan.chunk_index = 5;
+    plan.rebalance_required_after = true;
+
+    host.mock_maintenance_state_configured = true;
+    host.mock_maintenance_state.chunk_index = 5;
+    host.mock_maintenance_state.histograms_merged = false;
+    host.mock_maintenance_state.manual_boundaries_complete = true;
+    host.mock_maintenance_state.participants_at_same_boundary = true;
+
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.runPrefillChunk(base_input, plan, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    EXPECT_EQ(host.prefill_chunk_maintenance_state_calls, 1);
+    EXPECT_EQ(host.prefill_chunk_maintenance_calls, 0);
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_MaintenanceHookFailureFailsChunk)
+{
+    auto engine = makeEngine(/*cache_enabled=*/false);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+    host.maintenance_should_fail = true;
+
+    const std::vector<int> tokens = {40, 41, 42, 43};
+    auto base_input = makeTestInput(4, 1, DeviceId::cpu(), tokens.data(), nullptr);
+    auto plan = ForwardExecutionEngine::prepareSinglePrefillChunkRuntimePlan(
+        base_input,
+        std::vector<int>{4},
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(plan) << plan.error;
+    plan.rebalance_required_after = true;
+
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.runPrefillChunk(base_input, plan, output, host));
+
+    EXPECT_EQ(host.prefill_chunk_maintenance_state_calls, 1);
+    EXPECT_EQ(host.prefill_chunk_maintenance_calls, 1);
+    EXPECT_TRUE(host.last_maintenance_decision.can_run);
+    EXPECT_TRUE(host.last_maintenance_decision.required);
+    EXPECT_EQ(host.last_maintenance_decision.reason, "required");
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_PaddedPlanDelegatesWithBucketMetadata)
