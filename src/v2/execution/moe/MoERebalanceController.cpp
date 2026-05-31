@@ -196,6 +196,7 @@ namespace llaminar2
         // Apply swaps to get new placement
         auto new_placement = rebalancer_->apply(current_placement_, proposal);
         current_placement_ = new_placement;
+        ++placement_epoch_;
 
         // Update histogram's socket mapping for next window
         histogram_->updatePlacement(current_placement_);
@@ -498,6 +499,8 @@ namespace llaminar2
         per_layer_after /= num_layers;
 
         current_placement_ = new_placement;
+        if (experts_moved > 0)
+            ++placement_epoch_;
         use_per_layer_placement_ = false; // global partition, not per-layer
         total_rebalances_++;
         last_experts_moved_ = experts_moved;
@@ -588,8 +591,10 @@ namespace llaminar2
             }
         }
 
-        // Store as current replicas
+        const bool replica_placement_changed = !current_replicas_.sameReplicaPlacement(result);
         current_replicas_ = result;
+        if (replica_placement_changed && result.num_replicated > 0)
+            ++placement_epoch_;
 
         LOG_DEBUG("[MoERebalanceController] Proposed " << result.num_replicated
                                                        << " expert replicas (max " << max_replicas_per_socket << " per socket)");

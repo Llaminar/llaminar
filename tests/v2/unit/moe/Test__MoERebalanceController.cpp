@@ -177,6 +177,7 @@ TEST(Test__MoERebalanceController, Rebalance_WithImbalance)
     // With heavy imbalance, rebalancer should propose swaps and return new placement
     EXPECT_FALSE(result.empty());
     EXPECT_EQ(static_cast<int>(result.size()), 8); // Full placement vector
+    EXPECT_EQ(ctrl.placementEpoch(), 1u);
 }
 
 TEST(Test__MoERebalanceController, Rebalance_UpdatesPlacement)
@@ -338,6 +339,31 @@ static bool anyCpuSocketHas(const std::vector<std::vector<std::vector<bool>>> &m
     return masks[2][layer][expert] || masks[3][layer][expert];
 }
 
+TEST(Test__MoERebalanceController, PlacementEpochTracksBasePlacementAndReplicas)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
+                          /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
+    for (int e = 0; e < 8; ++e)
+        cfg.initial_expert_to_socket[e] = (e < 4) ? 0 : 1;
+
+    MoERebalanceController ctrl(cfg);
+    EXPECT_EQ(ctrl.placementEpoch(), 0u);
+
+    fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
+    const auto rebalanced = ctrl.rebalance();
+    ASSERT_FALSE(rebalanced.empty());
+    EXPECT_EQ(ctrl.placementEpoch(), 1u);
+
+    fillWindowWithExperts(*ctrl.histogram(), 16, 2, {0, 4});
+    const auto replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    ASSERT_GT(replicas.num_replicated, 0);
+    EXPECT_EQ(ctrl.placementEpoch(), 2u);
+
+    const auto same_replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    EXPECT_EQ(same_replicas.num_replicated, replicas.num_replicated);
+    EXPECT_EQ(ctrl.placementEpoch(), 2u);
+}
+
 TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
@@ -359,6 +385,8 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
 
     auto socket0_masks = ctrl.computeExpertMasks(0);
     auto socket1_masks = ctrl.computeExpertMasks(1);
+    EXPECT_EQ(ctrl.computeExpertMasksForParticipant(0), socket0_masks);
+    EXPECT_EQ(ctrl.computeExpertMasksForParticipant(1), socket1_masks);
     ASSERT_EQ(static_cast<int>(socket0_masks.size()), 2);
     ASSERT_EQ(static_cast<int>(socket1_masks.size()), 2);
 

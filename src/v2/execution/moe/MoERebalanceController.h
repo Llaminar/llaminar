@@ -16,6 +16,7 @@
 #include "SocketAwareRebalancer.h"
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -145,6 +146,9 @@ namespace llaminar2
         /// Get total swaps performed across all rebalances
         int totalSwaps() const { return total_swaps_; }
 
+        /// Get the domain placement epoch used by prefix and graph-cache keys.
+        uint64_t placementEpoch() const { return placement_epoch_; }
+
         /// Get duration of last rebalanceLPT() call in milliseconds
         double lastRebalanceDurationMs() const { return last_rebalance_duration_ms_; }
 
@@ -174,6 +178,12 @@ namespace llaminar2
         /// After rebalanceLPT(), uses per-layer placement. Otherwise uses global placement.
         /// When replicas are active, the mask includes both owned and replicated experts.
         std::vector<std::vector<bool>> computeExpertMasks(int socket_id) const;
+
+        /// Domain/participant vocabulary alias for new ExpertParallel call sites.
+        std::vector<std::vector<bool>> computeExpertMasksForParticipant(int participant_id) const
+        {
+            return computeExpertMasks(participant_id);
+        }
 
         /// Compute expert masks for all sockets with a bounded GPU routed-expert cache.
         /// The hottest experts per layer are placed on GPU sockets up to
@@ -217,6 +227,7 @@ namespace llaminar2
         double last_rebalance_duration_ms_ = 0.0;
         int last_experts_moved_ = 0;
         double last_prep_duration_ms_ = 0.0;
+        uint64_t placement_epoch_ = 0;
         float last_avg_imbalance_before_ = 0.0f;
         float last_avg_imbalance_after_ = 0.0f;
         float last_worst_imbalance_before_ = 0.0f;
