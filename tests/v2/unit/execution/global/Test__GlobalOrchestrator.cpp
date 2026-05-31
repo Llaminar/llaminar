@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <deque>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -30,13 +31,15 @@ namespace llaminar2::test
     class MTPMockDeviceRunner : public MockDeviceRunner
     {
     public:
-        MTPMockDeviceRunner()
+        explicit MTPMockDeviceRunner(int mtp_token = 17,
+                                     int verifier_row0_token = 17,
+                                     int verifier_row1_token = 23)
         {
             mtp_logits_.assign(1000, -10.0f);
-            mtp_logits_[17] = 10.0f;
+            mtp_logits_[mtp_token] = 10.0f;
             all_position_logits_.assign(2 * 1000, -10.0f);
-            all_position_logits_[17] = 10.0f;
-            all_position_logits_[1000 + 23] = 10.0f;
+            all_position_logits_[verifier_row0_token] = 10.0f;
+            all_position_logits_[1000 + verifier_row1_token] = 10.0f;
         }
 
         bool forwardMTP(int32_t draft_condition_token) override
@@ -124,6 +127,38 @@ namespace llaminar2::test
         bool restore_ok_ = true;
         bool truncate_ok_ = true;
         std::string mtp_unsupported_reason_;
+    };
+
+    class ScriptedBroadcastMPIContext : public MockMPIContext
+    {
+    public:
+        ScriptedBroadcastMPIContext(int rank, int world_size)
+            : MockMPIContext(rank, world_size) {}
+
+        void scriptInt32(std::vector<int32_t> data)
+        {
+            scripted_int32_.push_back(std::move(data));
+        }
+
+        void broadcast_int32(int32_t *data, size_t count, int root) const override
+        {
+            MockMPIContext::broadcast_int32(data, count, root);
+            broadcast_roots_.push_back(root);
+            if (rank() == root || scripted_int32_.empty())
+                return;
+
+            const std::vector<int32_t> scripted = scripted_int32_.front();
+            scripted_int32_.pop_front();
+            const size_t n = std::min(count, scripted.size());
+            std::copy(scripted.begin(), scripted.begin() + static_cast<std::ptrdiff_t>(n), data);
+        }
+
+        size_t remainingScriptedInt32() const { return scripted_int32_.size(); }
+        const std::vector<int> &broadcastRoots() const { return broadcast_roots_; }
+
+    private:
+        mutable std::deque<std::vector<int32_t>> scripted_int32_;
+        mutable std::vector<int> broadcast_roots_;
     };
 
     // =========================================================================
@@ -898,6 +933,31 @@ namespace llaminar2::test
         EXPECT_TRUE(orch.truncateLivePrefixState(5));
         EXPECT_EQ(runner_raw->truncate_live_calls(), 1);
         EXPECT_EQ(runner_raw->get_position(), 5);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, GlobalTPMTPDraftSamplingUsesBroadcastRootTokenOnNonRootRank)
+    {
+        ScriptedBroadcastMPIContext mpi(1, 2);
+        mpi.scriptInt32({17});
+        mpi.scriptInt32({23});
+        auto topo = buildSingleStageTopo(2);
+        auto runner = std::make_unique<MTPMockDeviceRunner>(
+            /*mtp_token=*/99,
+            /*verifier_row0_token=*/88,
+            /*verifier_row1_token=*/77);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 2, &mpi, std::move(runner)));
+        ASSERT_TRUE(orch.isPipelineTail());
+        EXPECT_TRUE(orch.supportsMTPTokenCoordination());
+        EXPECT_TRUE(orch.forwardMTP(42));
+
+        EXPECT_EQ(orch.sampleGreedyFromMTPLogitsOnDevice(), 17);
+        EXPECT_TRUE(orch.setComputeAllPositionLogits(true));
+        EXPECT_EQ(orch.sampleGreedyFromAllPositionLogitsOnDevice(1), 23);
+        EXPECT_EQ(mpi.remainingScriptedInt32(), 0u);
+        ASSERT_EQ(mpi.broadcastRoots().size(), 2u);
+        EXPECT_EQ(mpi.broadcastRoots()[0], 0);
+        EXPECT_EQ(mpi.broadcastRoots()[1], 0);
     }
 
     TEST_F(Test__GlobalOrchestrator, GlobalPPMTPReportsTopologyBypassBeforeDelegation)
