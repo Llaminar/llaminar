@@ -89,6 +89,11 @@ namespace llaminar2
         if (!ctx_opt)
             return config.dry_run ? 0 : 1;
         auto ctx = std::move(*ctx_opt);
+        // RuntimeInitPhase reparses argv after MPI_Init. The benchmark
+        // subcommand is represented by command dispatch rather than a required
+        // --benchmark flag, so re-apply the mode bit to the runtime config that
+        // benchmark summaries and JSON artifacts report.
+        ctx.config.benchmark_mode = true;
 
         // Run benchmark directly — no mode chain needed
         BenchmarkMode mode;
