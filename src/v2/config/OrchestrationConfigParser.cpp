@@ -964,6 +964,13 @@ namespace llaminar2
             .description = "(deprecated) Use 'llaminar2 benchmark' subcommand instead",
             .setter = setters::assignBoolTrue(&OrchestrationConfig::benchmark_mode),
         });
+        spec.add({
+            .long_name = "--benchmark-json-output",
+            .category = "Benchmark Configuration",
+            .value_label = "<path>",
+            .description = "Write machine-readable benchmark JSON to a file",
+            .setter = setters::assignString(&OrchestrationConfig::benchmark_json_output_path),
+        });
 
         // --- Server Configuration --------------------------------------------
         spec.add({

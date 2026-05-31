@@ -379,7 +379,8 @@ namespace llaminar2
         // Benchmark Configuration
         // =========================================================================
 
-        bool benchmark_mode = false; ///< Run benchmark
+        bool benchmark_mode = false;              ///< Run benchmark
+        std::string benchmark_json_output_path;   ///< Optional machine-readable benchmark JSON output path
 
         // =========================================================================
         // Server Configuration

@@ -972,6 +972,14 @@ namespace llaminar2
         oss << "    release_raw_expert_weights: "
             << (moe_rebalance.release_raw_expert_weights ? "true" : "false") << "\n";
 
+        if (benchmark_mode || !benchmark_json_output_path.empty())
+        {
+            oss << "  benchmark:\n";
+            oss << "    enabled: " << (benchmark_mode ? "true" : "false") << "\n";
+            if (!benchmark_json_output_path.empty())
+                oss << "    json_output: " << benchmark_json_output_path << "\n";
+        }
+
         oss << "  prefix_cache:\n";
         oss << "    enabled: " << (prefix_cache.enabled ? "true" : "false") << "\n";
         oss << "    storage: " << prefixCacheStorageModeToString(prefix_cache.storage_mode) << "\n";

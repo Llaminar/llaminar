@@ -24,6 +24,7 @@
 #include <sstream>
 #include <mpi.h>
 #include <numeric>
+#include <nlohmann/json.hpp>
 
 namespace llaminar2
 {
@@ -113,6 +114,146 @@ namespace llaminar2
                snapshot.prefill_chunk_real_tokens != 0 ||
                snapshot.prefill_chunk_padded_tokens != 0 ||
                snapshot.prefill_chunk_failures != 0;
+    }
+
+    static nlohmann::json prefixRequestToJson(const PrefixCacheRequestSummary &request)
+    {
+        return nlohmann::json{
+            {"enabled", request.enabled},
+            {"bypassed", request.bypassed},
+            {"bypass_reason", request.bypass_reason},
+            {"hit", request.hit},
+            {"partial_hit", request.partial_hit},
+            {"requested_tokens", request.requested_tokens},
+            {"matched_tokens", request.matched_tokens},
+            {"matched_blocks", request.matched_blocks},
+            {"terminal_logits_restored", request.terminal_logits_restored},
+            {"terminal_hidden_restored", request.terminal_hidden_restored},
+            {"mtp_state_restored", request.mtp_state_restored},
+            {"hybrid_state_restored", request.hybrid_state_restored},
+            {"storage_tier", request.storage_tier},
+        };
+    }
+
+    static nlohmann::json mtpRequestToJson(const MTPRequestSummary &request)
+    {
+        return nlohmann::json{
+            {"enabled", request.enabled},
+            {"bypassed", request.bypassed},
+            {"bypass_reason", request.bypass_reason},
+            {"draft_steps", request.draft_steps},
+            {"accepted_tokens", request.accepted_tokens},
+            {"rejected_tokens", request.rejected_tokens},
+            {"rollbacks", request.rollbacks},
+            {"acceptance_rate", request.acceptance_rate},
+        };
+    }
+
+    std::string benchmarkResultToJsonString(
+        const BenchmarkResult &result,
+        const OrchestrationConfig *config)
+    {
+        const auto &state = result.prefix_state;
+
+        nlohmann::json doc{
+            {"schema", "llaminar.benchmark.v1"},
+            {"success", result.success},
+            {"prefill_success", result.prefill_success},
+            {"decode_success", result.decode_success},
+            {"tokens", {{"prefill", result.prefill_tokens},
+                         {"decode", result.decode_tokens},
+                         {"total", result.prefill_tokens + result.decode_tokens}}},
+            {"timing_ms", {{"prefill", result.prefill_time_ms},
+                            {"decode", result.decode_time_ms},
+                            {"total", result.total_time_ms}}},
+            {"throughput_tokens_per_sec", {{"prefill", result.prefill_tokens_per_sec},
+                                            {"decode", result.decode_tokens_per_sec},
+                                            {"overall", result.total_time_ms > 0.0
+                                                            ? ((result.prefill_tokens + result.decode_tokens) * 1000.0) /
+                                                                  result.total_time_ms
+                                                            : 0.0}}},
+            {"generated_text_bytes", result.generated_text.size()},
+            {"runtime_state", {{"initialized", state.initialized},
+                                {"architecture", state.architecture},
+                                {"execution_path", state.execution_path},
+                                {"primary_device", state.primary_device.toString()},
+                                {"current_position", state.current_position},
+                                {"session_epoch", state.session_epoch},
+                                {"prefill_logits_ready", state.prefill_logits_ready},
+                                {"has_hidden", state.has_hidden},
+                                {"has_logits", state.has_logits},
+                                {"kv_cache_count", state.kv_caches.size()},
+                                {"mtp_kv_cache_count", state.mtp_kv_caches.size()},
+                                {"gdn_layer_count", state.gdn_layers.size()},
+                                {"cached_tokens", state.totalCachedTokens()},
+                                {"mtp_cached_tokens", state.totalMTPCachedTokens()}}},
+            {"prefix_cache", {{"config_enabled", state.prefix_cache_config_enabled},
+                               {"ready", state.prefix_cache_ready},
+                               {"bypassed", state.prefix_cache_bypassed},
+                               {"bypass_reason", state.prefix_cache_bypass_reason},
+                               {"lookups", state.prefix_cache_lookups},
+                               {"hits", state.prefix_cache_hits},
+                               {"partial_hits", state.prefix_cache_partial_hits},
+                               {"misses", state.prefix_cache_misses},
+                               {"matched_blocks", state.prefix_cache_matched_blocks},
+                               {"matched_tokens", state.prefix_cache_matched_tokens},
+                               {"stores", state.prefix_cache_stores},
+                               {"inserts", state.prefix_cache_inserts},
+                               {"evictions", state.prefix_cache_evictions},
+                               {"promotions", state.prefix_cache_promotions},
+                               {"disk_hydrations", state.prefix_cache_disk_hydrations},
+                               {"terminal_state_hits", state.prefix_cache_terminal_state_hits},
+                               {"bypasses", state.prefix_cache_bypasses},
+                               {"unsupported_backend_bypasses", state.prefix_cache_unsupported_backend_bypasses},
+                               {"fingerprint_bypasses", state.prefix_cache_fingerprint_bypasses},
+                               {"terminal_state_bypasses", state.prefix_cache_terminal_state_bypasses},
+                               {"ram_bytes", state.prefix_cache_ram_bytes},
+                               {"device_bytes", state.prefix_cache_device_bytes},
+                               {"disk_bytes", state.prefix_cache_disk_bytes},
+                               {"hybrid_state_bytes", state.prefix_cache_hybrid_state_bytes},
+                               {"mtp_state_bytes", state.prefix_cache_mtp_state_bytes},
+                               {"request", prefixRequestToJson(state.prefix_request)}}},
+            {"mtp", {{"config_enabled", state.mtp_config_enabled},
+                      {"bypassed", state.mtp_bypassed},
+                      {"bypass_reason", state.mtp_bypass_reason},
+                      {"draft_steps", state.mtp_draft_steps},
+                      {"accepted_tokens", state.mtp_accepted_tokens},
+                      {"rejected_tokens", state.mtp_rejected_tokens},
+                      {"rollbacks", state.mtp_rollbacks},
+                      {"bypasses", state.mtp_bypasses},
+                      {"verifier_runs", state.mtp_verifier_runs},
+                      {"verifier_token_count", state.mtp_verifier_token_count},
+                      {"acceptance_rate", state.mtp_draft_steps > 0
+                                              ? static_cast<double>(state.mtp_accepted_tokens) /
+                                                    static_cast<double>(state.mtp_draft_steps)
+                                              : 0.0},
+                      {"request", mtpRequestToJson(state.mtp_request)}}},
+            {"prefill_chunks", {{"schedules", state.prefill_chunk_schedules},
+                                 {"successful_schedules", state.prefill_chunk_successful_schedules},
+                                 {"chunks", state.prefill_chunks},
+                                 {"real_tokens", state.prefill_chunk_real_tokens},
+                                 {"padded_tokens", state.prefill_chunk_padded_tokens},
+                                 {"failures", state.prefill_chunk_failures}}},
+        };
+
+        if (config)
+        {
+            nlohmann::json config_json{
+                {"benchmark_mode", config->benchmark_mode},
+                {"n_predict", config->n_predict},
+                {"prefix_cache_enabled", config->prefix_cache.enabled},
+                {"mtp_enabled", config->mtp.enabled},
+            };
+            if (!config->model_path.empty())
+                config_json["model_path"] = config->model_path;
+            if (!config->benchmark_json_output_path.empty())
+                config_json["benchmark_json_output_path"] = config->benchmark_json_output_path;
+            if (config->device_for_this_rank)
+                config_json["device"] = config->device_for_this_rank->toString();
+            doc["config"] = std::move(config_json);
+        }
+
+        return doc.dump(2);
     }
 
     static std::string formatByteCount(uint64_t bytes)

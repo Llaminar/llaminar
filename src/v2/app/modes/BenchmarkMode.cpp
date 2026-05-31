@@ -17,6 +17,7 @@
 #include "app/MPIShutdown.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -224,6 +225,26 @@ namespace llaminar2
 
         BenchmarkResult result = benchmark.run(ctx.config);
         benchmark.printResults(result);
+        if (mpi_ctx->rank() == 0 && !ctx.config.benchmark_json_output_path.empty())
+        {
+            std::ofstream json_out(ctx.config.benchmark_json_output_path);
+            if (!json_out)
+            {
+                LOG_ERROR("Failed to open benchmark JSON output path: "
+                          << ctx.config.benchmark_json_output_path);
+                MoEExpertOverlayProfiler::flush();
+                return shutdownAndFinalize(false, "failed to write benchmark JSON");
+            }
+            json_out << benchmarkResultToJsonString(result, &ctx.config) << '\n';
+            if (!json_out)
+            {
+                LOG_ERROR("Failed to write benchmark JSON output path: "
+                          << ctx.config.benchmark_json_output_path);
+                MoEExpertOverlayProfiler::flush();
+                return shutdownAndFinalize(false, "failed to write benchmark JSON");
+            }
+            LOG_INFO("Benchmark JSON written to " << ctx.config.benchmark_json_output_path);
+        }
         MoEExpertOverlayProfiler::flush();
 
         // Log MoE histogram if controller is active

@@ -76,6 +76,20 @@ namespace llaminar2
     };
 
     /**
+     * @brief Serialize a benchmark result to stable machine-readable JSON.
+     *
+     * The JSON schema is intentionally compact and carries the counters needed
+     * to explain prefix-cache and MTP benchmark results without parsing logs.
+     *
+     * @param result Benchmark result to serialize.
+     * @param config Optional config used to include requested benchmark knobs.
+     * @return Pretty-printed JSON document.
+     */
+    std::string benchmarkResultToJsonString(
+        const BenchmarkResult &result,
+        const OrchestrationConfig *config = nullptr);
+
+    /**
      * @brief Benchmark runner for prefill and decode performance measurement
      *
      * Measures performance in two distinct phases:

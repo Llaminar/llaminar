@@ -1699,6 +1699,8 @@ Measure whether prefix cache and MTP provide real speedups on the supported corr
 
 Add benchmark scenarios that emit machine-readable JSON plus human summaries:
 
+- Initial smoke path: `llaminar2 benchmark ... --benchmark-json-output <path>` writes schema `llaminar.benchmark.v1` with timing, throughput, prefix-cache, MTP, and prefill-chunk counters.
+
 - Prefix disabled baseline.
 - RAM-only prefix cache miss and hit.
 - RAM plus device-hot tier hit.

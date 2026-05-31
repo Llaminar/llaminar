@@ -1155,6 +1155,17 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_BenchmarkMode)
     EXPECT_TRUE(config.benchmark_mode);
 }
 
+TEST(Test__OrchestrationConfigParser, ParseArgs_BenchmarkJsonOutput)
+{
+    ArgvHelper args{"llaminar2", "--benchmark", "--benchmark-json-output", "/tmp/llaminar-benchmark.json"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_TRUE(config.benchmark_mode);
+    EXPECT_EQ(config.benchmark_json_output_path, "/tmp/llaminar-benchmark.json");
+}
+
 // ============================================================================
 // CLI Parsing - Fused Attention
 // ============================================================================

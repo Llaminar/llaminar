@@ -2649,6 +2649,7 @@ add_v2_test(V2_Unit_Sampler
 add_executable(v2_test_benchmark_runner_cpu unit/utils/Test__BenchmarkRunnerCPU.cpp)
 target_include_directories(v2_test_benchmark_runner_cpu PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor  # For nlohmann/json.hpp
 )
 target_link_libraries(v2_test_benchmark_runner_cpu
     llaminar2_core

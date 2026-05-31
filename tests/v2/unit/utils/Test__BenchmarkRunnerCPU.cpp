@@ -17,6 +17,7 @@
 #include "backends/DeviceId.h"
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockTokenizer.h"
+#include "nlohmann/json.hpp"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -401,4 +402,111 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     EXPECT_NE(output.find("MTP decode"), std::string::npos);
     EXPECT_NE(output.find("Prefill chunks"), std::string::npos);
     EXPECT_NE(output.find("1/2 schedules"), std::string::npos);
+}
+
+/**
+ * @brief Verify benchmark JSON carries Phase 14 counters without log parsing.
+ */
+TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
+{
+    BenchmarkResult result;
+    result.prefill_tokens = 10;
+    result.prefill_time_ms = 4.0;
+    result.prefill_tokens_per_sec = 2500.0;
+    result.prefill_success = true;
+    result.decode_tokens = 2;
+    result.decode_time_ms = 2.0;
+    result.decode_tokens_per_sec = 1000.0;
+    result.decode_success = true;
+    result.total_time_ms = 6.0;
+    result.success = true;
+    result.generated_text = "xy";
+
+    auto &snapshot = result.prefix_state;
+    snapshot.initialized = true;
+    snapshot.architecture = "mock_cpu";
+    snapshot.execution_path = "GRAPH";
+    snapshot.primary_device = DeviceId::cpu();
+    snapshot.current_position = 12;
+    snapshot.prefix_cache_config_enabled = true;
+    snapshot.prefix_cache_ready = true;
+    snapshot.prefix_cache_lookups = 3;
+    snapshot.prefix_cache_hits = 1;
+    snapshot.prefix_cache_partial_hits = 1;
+    snapshot.prefix_cache_misses = 1;
+    snapshot.prefix_cache_matched_blocks = 2;
+    snapshot.prefix_cache_matched_tokens = 8;
+    snapshot.prefix_cache_stores = 4;
+    snapshot.prefix_cache_ram_bytes = 8192;
+    snapshot.prefix_cache_device_bytes = 4096;
+    snapshot.prefix_cache_disk_bytes = 2048;
+    snapshot.prefix_cache_hybrid_state_bytes = 128;
+    snapshot.prefix_cache_mtp_state_bytes = 256;
+    snapshot.prefix_cache_bypasses = 1;
+    snapshot.prefix_cache_unsupported_backend_bypasses = 1;
+    snapshot.prefix_request.enabled = true;
+    snapshot.prefix_request.partial_hit = true;
+    snapshot.prefix_request.requested_tokens = 10;
+    snapshot.prefix_request.matched_tokens = 8;
+    snapshot.prefix_request.matched_blocks = 2;
+    snapshot.prefix_request.terminal_logits_restored = true;
+    snapshot.prefix_request.storage_tier = "ram";
+    snapshot.mtp_config_enabled = true;
+    snapshot.mtp_draft_steps = 4;
+    snapshot.mtp_accepted_tokens = 3;
+    snapshot.mtp_rejected_tokens = 1;
+    snapshot.mtp_rollbacks = 1;
+    snapshot.mtp_verifier_runs = 2;
+    snapshot.mtp_verifier_token_count = 5;
+    snapshot.mtp_request.enabled = true;
+    snapshot.mtp_request.draft_steps = 4;
+    snapshot.mtp_request.accepted_tokens = 3;
+    snapshot.mtp_request.rejected_tokens = 1;
+    snapshot.mtp_request.rollbacks = 1;
+    snapshot.mtp_request.acceptance_rate = 0.75;
+    snapshot.prefill_chunk_schedules = 2;
+    snapshot.prefill_chunk_successful_schedules = 2;
+    snapshot.prefill_chunks = 5;
+    snapshot.prefill_chunk_real_tokens = 1024;
+    snapshot.prefill_chunk_padded_tokens = 64;
+
+    OrchestrationConfig config;
+    config.benchmark_mode = true;
+    config.model_path = "model.gguf";
+    config.n_predict = 2;
+    config.prefix_cache.enabled = true;
+    config.mtp.enabled = true;
+    config.benchmark_json_output_path = "/tmp/bench.json";
+
+    const auto doc = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+
+    EXPECT_EQ(doc.at("schema"), "llaminar.benchmark.v1");
+    EXPECT_TRUE(doc.at("success").get<bool>());
+    EXPECT_EQ(doc.at("tokens").at("prefill"), 10);
+    EXPECT_EQ(doc.at("tokens").at("decode"), 2);
+    EXPECT_DOUBLE_EQ(doc.at("timing_ms").at("total").get<double>(), 6.0);
+    EXPECT_DOUBLE_EQ(doc.at("throughput_tokens_per_sec").at("overall").get<double>(), 2000.0);
+    EXPECT_EQ(doc.at("generated_text_bytes"), 2);
+
+    const auto &prefix = doc.at("prefix_cache");
+    EXPECT_TRUE(prefix.at("config_enabled").get<bool>());
+    EXPECT_EQ(prefix.at("lookups"), 3);
+    EXPECT_EQ(prefix.at("matched_tokens"), 8);
+    EXPECT_EQ(prefix.at("ram_bytes"), 8192);
+    EXPECT_EQ(prefix.at("device_bytes"), 4096);
+    EXPECT_EQ(prefix.at("request").at("storage_tier"), "ram");
+    EXPECT_TRUE(prefix.at("request").at("partial_hit").get<bool>());
+    EXPECT_TRUE(prefix.at("request").at("terminal_logits_restored").get<bool>());
+
+    const auto &mtp = doc.at("mtp");
+    EXPECT_EQ(mtp.at("draft_steps"), 4);
+    EXPECT_EQ(mtp.at("accepted_tokens"), 3);
+    EXPECT_DOUBLE_EQ(mtp.at("acceptance_rate").get<double>(), 0.75);
+    EXPECT_EQ(mtp.at("request").at("accepted_tokens"), 3);
+
+    EXPECT_EQ(doc.at("prefill_chunks").at("chunks"), 5);
+    EXPECT_EQ(doc.at("prefill_chunks").at("padded_tokens"), 64);
+    EXPECT_TRUE(doc.at("config").at("prefix_cache_enabled").get<bool>());
+    EXPECT_TRUE(doc.at("config").at("mtp_enabled").get<bool>());
+    EXPECT_EQ(doc.at("config").at("benchmark_json_output_path"), "/tmp/bench.json");
 }
