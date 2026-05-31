@@ -199,6 +199,7 @@ namespace llaminar2
         std::shared_ptr<TensorBase> hidden; ///< [batch_size * seq_len, d_model]
         std::shared_ptr<TensorBase> logits; ///< [batch_size * seq_len, vocab_size]
         std::shared_ptr<TensorBase> all_position_logits; ///< Runtime verifier logits [tokens, vocab_size]
+        std::shared_ptr<TensorBase> all_position_logits_local; ///< Runtime verifier logits [tokens, vocab_local]
 
         /// Local logits for column-parallel LM head [batch_size * seq_len, vocab_local]
         /// Only allocated when lm_head_column_parallel is enabled
@@ -1395,6 +1396,36 @@ namespace llaminar2
                 device_opt,
                 shape.size() >= 2 ? shape[1] : 0,
                 mtp_logits,
+                stream,
+                nullptr,
+                nullptr,
+                0};
+        }
+
+        bool hasAllPositionLogitsLocal() const override
+        {
+            if (!graph_builder_ || !graph_builder_->config().lm_head_column_parallel)
+                return false;
+            return state_.all_position_logits_local != nullptr;
+        }
+
+        LogitsLocalInfo getAllPositionLogitsLocalInfo() const override
+        {
+            if (!hasAllPositionLogitsLocal())
+                return {};
+
+            const auto &shape = state_.all_position_logits_local->shape();
+            auto device_opt = state_.all_position_logits_local->current_device();
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = GPUDeviceContextPool::instance().getContext(*device_opt).defaultStream();
+            }
+            return LogitsLocalInfo{
+                state_.all_position_logits_local->gpu_data_ptr(),
+                device_opt,
+                shape.size() >= 2 ? shape[1] : 0,
+                state_.all_position_logits_local.get(),
                 stream,
                 nullptr,
                 nullptr,

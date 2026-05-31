@@ -2468,39 +2468,75 @@ namespace llaminar2
         }
 
         TensorBase *logits_output = state_.logits.get();
+        TensorBase *logits_local_output = state_.logits_local.get();
         if (compute_all_position_logits_)
         {
             const auto &config = graph_builder_->config();
             if (config.lm_head_column_parallel)
             {
-                LOG_ERROR("[DeviceGraphOrchestrator] All-position logits are not wired for column-parallel LM head yet");
-                return nullptr;
-            }
-            if (!tensor_factory_)
-            {
-                LOG_ERROR("[DeviceGraphOrchestrator] All-position logits require an initialized TensorFactory");
-                return nullptr;
-            }
+                if (!state_.logits_local)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] All-position local logits require logits_local");
+                    return nullptr;
+                }
+                if (!tensor_factory_)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] All-position logits require an initialized TensorFactory");
+                    return nullptr;
+                }
 
-            const size_t rows = static_cast<size_t>(total_tokens);
-            const size_t vocab = static_cast<size_t>(state_.vocab_size);
-            bool needs_allocate = !state_.all_position_logits;
-            if (state_.all_position_logits)
-            {
-                const auto &shape = state_.all_position_logits->shape();
-                needs_allocate = shape.size() != 2 || shape[0] != rows || shape[1] != vocab;
+                const auto &local_shape = state_.logits_local->shape();
+                const size_t rows = static_cast<size_t>(total_tokens);
+                const size_t local_vocab =
+                    local_shape.size() >= 2 ? local_shape[1] : static_cast<size_t>(std::max(0, config.vocab_local));
+                if (local_vocab == 0)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] All-position local logits require a non-zero local vocab");
+                    return nullptr;
+                }
+
+                bool needs_allocate = !state_.all_position_logits_local;
+                if (state_.all_position_logits_local)
+                {
+                    const auto &shape = state_.all_position_logits_local->shape();
+                    needs_allocate = shape.size() != 2 || shape[0] != rows || shape[1] != local_vocab;
+                }
+                if (needs_allocate)
+                {
+                    auto tensor = tensor_factory_->createFP32({rows, local_vocab}, state_.device_id);
+                    state_.all_position_logits_local = std::shared_ptr<TensorBase>(tensor.release());
+                }
+                logits_local_output = state_.all_position_logits_local.get();
             }
-            if (needs_allocate)
+            else
             {
-                auto tensor = tensor_factory_->createFP32({rows, vocab}, state_.device_id);
-                state_.all_position_logits = std::shared_ptr<TensorBase>(tensor.release());
+                if (!tensor_factory_)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] All-position logits require an initialized TensorFactory");
+                    return nullptr;
+                }
+
+                const size_t rows = static_cast<size_t>(total_tokens);
+                const size_t vocab = static_cast<size_t>(state_.vocab_size);
+                bool needs_allocate = !state_.all_position_logits;
+                if (state_.all_position_logits)
+                {
+                    const auto &shape = state_.all_position_logits->shape();
+                    needs_allocate = shape.size() != 2 || shape[0] != rows || shape[1] != vocab;
+                }
+                if (needs_allocate)
+                {
+                    auto tensor = tensor_factory_->createFP32({rows, vocab}, state_.device_id);
+                    state_.all_position_logits = std::shared_ptr<TensorBase>(tensor.release());
+                }
+                logits_output = state_.all_position_logits.get();
             }
-            logits_output = state_.all_position_logits.get();
         }
 
         // Prepare model buffers from state
         ModelBuffers model_buffers = state_.toModelBuffers();
         model_buffers.logits = logits_output;
+        model_buffers.logits_local = logits_local_output;
 
         setBuffers(model_buffers);
 
@@ -2992,10 +3028,6 @@ namespace llaminar2
 
     std::string DeviceGraphOrchestrator::mtpDecodeUnsupportedReason() const
     {
-        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
-        {
-            return "MTP decode all-position logits are not enabled for column-parallel LM head";
-        }
         return {};
     }
 

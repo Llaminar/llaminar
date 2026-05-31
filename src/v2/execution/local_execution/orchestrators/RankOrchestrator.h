@@ -847,6 +847,7 @@ namespace llaminar2
         /// Logits buffer management and D2H gather operations (extracted helper)
         std::unique_ptr<LogitsGatherer> logits_gatherer_;
         mutable std::unique_ptr<LogitsGatherer> mtp_logits_gatherer_;
+        mutable std::unique_ptr<LogitsGatherer> all_position_logits_gatherer_;
 
         /// Aggregated executor stats (mutable for lazy computation)
         mutable std::unique_ptr<GraphExecutorStats> aggregated_stats_;

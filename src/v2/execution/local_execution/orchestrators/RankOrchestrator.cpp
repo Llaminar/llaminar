@@ -2064,13 +2064,60 @@ namespace llaminar2
             return nullptr;
         }
 
+        const size_t rows = std::max<size_t>(1, static_cast<size_t>(std::max(0, current_padded_seq_len_)));
+
+        bool has_local_all_position_logits = false;
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner)
+                return nullptr;
+            has_local_all_position_logits =
+                has_local_all_position_logits || runner->hasAllPositionLogitsLocal();
+        }
+
+        if (has_local_all_position_logits)
+        {
+            std::vector<LogitsLocalInfo> local_infos;
+            local_infos.reserve(device_runners_.size());
+            for (const auto &runner : device_runners_)
+            {
+                if (!runner->hasAllPositionLogitsLocal())
+                {
+                    LOG_WARN("RankOrchestrator::getAllPositionLogits: mixed local and replicated verifier logits are unsupported");
+                    return nullptr;
+                }
+
+                LogitsLocalInfo info = runner->getAllPositionLogitsLocalInfo();
+                if (!info)
+                    return nullptr;
+                local_infos.push_back(info);
+            }
+
+            const int full_vocab = vocab_size();
+            if (full_vocab <= 0)
+                return nullptr;
+
+            const size_t required_elements = rows * static_cast<size_t>(full_vocab);
+            if (!all_position_logits_gatherer_ ||
+                all_position_logits_gatherer_->bufferNumel() < required_elements)
+            {
+                all_position_logits_gatherer_ = std::make_unique<LogitsGatherer>(full_vocab, rows);
+            }
+
+            if (!all_position_logits_gatherer_ ||
+                !all_position_logits_gatherer_->gatherLocalInfos(local_infos, rows, full_vocab))
+            {
+                return nullptr;
+            }
+            return all_position_logits_gatherer_->data();
+        }
+
         const int compare_vocab = device_runners_[0] ? device_runners_[0]->vocab_size() : 0;
         if (compare_vocab <= 0)
         {
             return nullptr;
         }
 
-        const size_t rows = std::max<size_t>(1, static_cast<size_t>(std::max(0, current_padded_seq_len_)));
         const size_t count = rows * static_cast<size_t>(compare_vocab);
 
         const float *primary_logits = nullptr;

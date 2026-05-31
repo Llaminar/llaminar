@@ -135,6 +135,19 @@ namespace llaminar2
             return nullptr;
         }
 
+        /**
+         * @brief Check if this runner has column-parallel local all-position logits.
+         *
+         * Used by MTP verification when TP participants each own a vocabulary shard
+         * for every verified position.
+         */
+        virtual bool hasAllPositionLogitsLocal() const { return false; }
+
+        /**
+         * @brief Get local all-position verifier logits info for TP gathering.
+         */
+        virtual LogitsLocalInfo getAllPositionLogitsLocalInfo() const { return {}; }
+
         virtual std::string mtpDecodeUnsupportedReason() const
         {
             return {};
