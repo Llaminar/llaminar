@@ -631,14 +631,15 @@ namespace llaminar2
         {
             return "sampling penalties are active";
         }
-        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
-        {
-            return "MTP decode is not enabled for MPI world_size > 1";
-        }
         const std::string runner_reason = runner_->mtpDecodeUnsupportedReason();
         if (!runner_reason.empty())
         {
             return runner_reason;
+        }
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1 &&
+            !runner_->supportsMTPTokenCoordination())
+        {
+            return "MTP decode is not enabled for MPI world_size > 1";
         }
         return {};
     }
@@ -696,30 +697,38 @@ namespace llaminar2
             return fail_after_checkpoint("Forward pass failed during MTP condition decode");
         }
 
-        const float *main_logits = runner_->logits();
-        if (!main_logits)
+        int32_t first_token = runner_->sampleGreedyOnDevice();
+        if (first_token < 0)
         {
-            return fail_after_checkpoint("No logits available for MTP first draft token");
+            const float *main_logits = runner_->logits();
+            if (!main_logits)
+            {
+                return fail_after_checkpoint("No logits available for MTP first draft token");
+            }
+            first_token = sampler_.sample(
+                main_logits,
+                static_cast<size_t>(vocab),
+                active_sampling_params_);
         }
-        const int32_t first_token = sampler_.sample(
-            main_logits,
-            static_cast<size_t>(vocab),
-            active_sampling_params_);
 
         if (!runner_->forwardMTP(first_token))
         {
             return fail_after_checkpoint("MTP sidecar forward failed");
         }
 
-        const float *mtp_logits = runner_->mtpLogits();
-        if (!mtp_logits)
+        int32_t mtp_token = runner_->sampleGreedyFromMTPLogitsOnDevice();
+        if (mtp_token < 0)
         {
-            return fail_after_checkpoint("No MTP logits available");
+            const float *mtp_logits = runner_->mtpLogits();
+            if (!mtp_logits)
+            {
+                return fail_after_checkpoint("No MTP logits available");
+            }
+            mtp_token = sampler_.sample(
+                mtp_logits,
+                static_cast<size_t>(vocab),
+                active_sampling_params_);
         }
-        const int32_t mtp_token = sampler_.sample(
-            mtp_logits,
-            static_cast<size_t>(vocab),
-            active_sampling_params_);
         ++mtp_stats_.draft_steps;
 
         if (!runner_->setComputeAllPositionLogits(true))
@@ -739,17 +748,21 @@ namespace llaminar2
             return fail_after_checkpoint("Failed to disable all-position logits after MTP verification");
         }
 
-        const float *all_logits = runner_->getAllPositionLogits();
-        if (!all_logits)
+        int32_t verified_next = runner_->sampleGreedyFromAllPositionLogitsOnDevice(0);
+        if (verified_next < 0)
         {
-            return fail_after_checkpoint("All-position logits unavailable after MTP verification");
-        }
+            const float *all_logits = runner_->getAllPositionLogits();
+            if (!all_logits)
+            {
+                return fail_after_checkpoint("All-position logits unavailable after MTP verification");
+            }
 
-        const float *verify_row0 = all_logits;
-        const int32_t verified_next = sampler_.sample(
-            verify_row0,
-            static_cast<size_t>(vocab),
-            active_sampling_params_);
+            const float *verify_row0 = all_logits;
+            verified_next = sampler_.sample(
+                verify_row0,
+                static_cast<size_t>(vocab),
+                active_sampling_params_);
+        }
         const bool accepted_second_draft = verified_next == mtp_token;
 
         std::vector<int32_t> accepted_tokens;

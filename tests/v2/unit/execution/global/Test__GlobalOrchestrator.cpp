@@ -865,6 +865,7 @@ namespace llaminar2::test
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
 
         EXPECT_TRUE(orch.mtpDecodeUnsupportedReason().empty());
+        EXPECT_TRUE(orch.supportsMTPTokenCoordination());
         EXPECT_TRUE(orch.forwardMTP(42));
         EXPECT_EQ(runner_raw->forward_mtp_calls(), 1);
         EXPECT_EQ(runner_raw->last_mtp_condition_token(), 42);
@@ -872,6 +873,7 @@ namespace llaminar2::test
         const float *mtp_logits = orch.mtpLogits();
         ASSERT_NE(mtp_logits, nullptr);
         EXPECT_FLOAT_EQ(mtp_logits[17], 10.0f);
+        EXPECT_EQ(orch.sampleGreedyFromMTPLogitsOnDevice(), 17);
 
         EXPECT_TRUE(orch.setComputeAllPositionLogits(true));
         EXPECT_EQ(runner_raw->set_all_position_calls(), 1);
@@ -881,6 +883,7 @@ namespace llaminar2::test
         ASSERT_NE(verifier_logits, nullptr);
         EXPECT_FLOAT_EQ(verifier_logits[17], 10.0f);
         EXPECT_FLOAT_EQ(verifier_logits[VOCAB_SIZE + 23], 10.0f);
+        EXPECT_EQ(orch.sampleGreedyFromAllPositionLogitsOnDevice(1), 23);
 
         PrefixStateSnapshot snapshot = orch.captureLivePrefixState();
         ASSERT_TRUE(snapshot.valid);
@@ -907,6 +910,7 @@ namespace llaminar2::test
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
 
         EXPECT_NE(orch.mtpDecodeUnsupportedReason().find("GlobalPP"), std::string::npos);
+        EXPECT_FALSE(orch.supportsMTPTokenCoordination());
         EXPECT_FALSE(orch.forwardMTP(7));
         EXPECT_FALSE(orch.setComputeAllPositionLogits(true));
         EXPECT_EQ(runner_raw->forward_mtp_calls(), 0);

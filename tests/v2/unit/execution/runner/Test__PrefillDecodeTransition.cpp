@@ -29,6 +29,7 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "tensors/Tensors.h"
 #include "../../../mocks/MockModelContext.h"
+#include "../../../mocks/MockMPIContext.h"
 
 #include <algorithm>
 #include <memory>
@@ -100,6 +101,8 @@ namespace
 
         const float *logits() const override
         {
+            if (hide_local_logits_)
+                return nullptr;
             if (column_parallel_logits_)
                 return nullptr;
             return logits_.data();
@@ -123,6 +126,8 @@ namespace
 
         const float *mtpLogits() const override
         {
+            if (hide_local_logits_)
+                return nullptr;
             if (column_parallel_logits_)
                 return nullptr;
             return mtp_logits_.empty() ? nullptr : mtp_logits_.data();
@@ -149,6 +154,8 @@ namespace
 
         const float *getAllPositionLogits() const override
         {
+            if (hide_local_logits_)
+                return nullptr;
             if (column_parallel_logits_)
                 return nullptr;
             return all_position_logits_.empty() ? nullptr : all_position_logits_.data();
@@ -167,6 +174,30 @@ namespace
         std::string mtpDecodeUnsupportedReason() const override
         {
             return mtp_unsupported_reason_;
+        }
+
+        bool supportsMTPTokenCoordination() const override
+        {
+            return supports_mtp_token_coordination_;
+        }
+
+        int sampleGreedyFromMTPLogitsOnDevice() override
+        {
+            ++sample_mtp_logits_count_;
+            if (!supports_mtp_token_coordination_ || mtp_logits_.empty())
+                return -1;
+            return greedyArgmax(mtp_logits_.data(), VOCAB_SIZE);
+        }
+
+        int sampleGreedyFromAllPositionLogitsOnDevice(int row) override
+        {
+            ++sample_all_position_logits_count_;
+            if (!supports_mtp_token_coordination_ || row < 0 || all_position_logits_.empty())
+                return -1;
+            const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(VOCAB_SIZE);
+            if (offset + static_cast<size_t>(VOCAB_SIZE) > all_position_logits_.size())
+                return -1;
+            return greedyArgmax(all_position_logits_.data() + offset, VOCAB_SIZE);
         }
 
         int vocab_size() const override { return VOCAB_SIZE; }
@@ -194,8 +225,14 @@ namespace
             return makeLocalInfo(logits_local_.get());
         }
 
-        // GPU sampling returns -1 to force CPU fallback (for test coverage)
-        int sampleGreedyOnDevice() override { return -1; }
+        // GPU sampling returns -1 by default to force CPU fallback.
+        int sampleGreedyOnDevice() override
+        {
+            ++sample_main_logits_count_;
+            if (!supports_mtp_token_coordination_)
+                return -1;
+            return greedyArgmax(logits_.data(), VOCAB_SIZE);
+        }
 
         // =====================================================================
         // Test inspection methods
@@ -207,6 +244,9 @@ namespace
         int restoreCount() const { return restore_count_; }
         int setAllPositionCount() const { return set_all_position_count_; }
         int lastMTPConditionToken() const { return last_mtp_condition_token_; }
+        int sampleMainLogitsCount() const { return sample_main_logits_count_; }
+        int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
+        int sampleAllPositionLogitsCount() const { return sample_all_position_logits_count_; }
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
         int lastForwardSeqLen() const { return last_forward_seq_len_; }
         void enableMTP(bool accept_mtp_token)
@@ -224,6 +264,11 @@ namespace
             vocab_start_ = vocab_start;
             vocab_local_ = vocab_local;
             setupPrefillLogits();
+        }
+        void enableMTPTokenCoordination(bool hide_local_logits)
+        {
+            supports_mtp_token_coordination_ = true;
+            hide_local_logits_ = hide_local_logits;
         }
 
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
@@ -247,6 +292,23 @@ namespace
         }
 
     private:
+        static int greedyArgmax(const float *logits, int vocab)
+        {
+            if (!logits || vocab <= 0)
+                return -1;
+            int token = 0;
+            float best = logits[0];
+            for (int i = 1; i < vocab; ++i)
+            {
+                if (logits[i] > best)
+                {
+                    best = logits[i];
+                    token = i;
+                }
+            }
+            return token;
+        }
+
         void setupPrefillLogits()
         {
             logits_.assign(VOCAB_SIZE, -10.0f);
@@ -331,12 +393,17 @@ namespace
         int clear_cache_count_{0};
         int restore_count_{0};
         int set_all_position_count_{0};
+        int sample_main_logits_count_{0};
+        int sample_mtp_logits_count_{0};
+        int sample_all_position_logits_count_{0};
         int last_mtp_condition_token_{-1};
         bool is_first_forward_in_cycle_{true};
         bool mtp_enabled_{false};
         bool accept_mtp_token_{true};
         bool all_position_logits_enabled_{false};
         bool column_parallel_logits_{false};
+        bool supports_mtp_token_coordination_{false};
+        bool hide_local_logits_{false};
         int vocab_start_{0};
         int vocab_local_{VOCAB_SIZE};
         std::string mtp_unsupported_reason_;
@@ -379,7 +446,10 @@ namespace
          */
         std::pair<OrchestrationRunner *, MockInferenceRunner *> createRunner(bool mtp_enabled = false,
                                                                              bool mtp_accept = true,
-                                                                             std::string mtp_unsupported_reason = {})
+                                                                             std::string mtp_unsupported_reason = {},
+                                                                             std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
+                                                                             bool mtp_token_coordination = false,
+                                                                             bool hide_local_logits = false)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -388,6 +458,10 @@ namespace
                 mock_ptr->enableMTP(mtp_accept);
             }
             mock_ptr->setMTPUnsupportedReason(std::move(mtp_unsupported_reason));
+            if (mtp_token_coordination)
+            {
+                mock_ptr->enableMTPTokenCoordination(hide_local_logits);
+            }
 
             OrchestrationConfig config;
             config.device_for_this_rank = GlobalDeviceAddress::cpu();
@@ -395,8 +469,17 @@ namespace
             config.mtp.draft_tokens = 1;
             config.mtp.verify_mode = MTPVerifyMode::Greedy;
 
-            auto runner = std::make_unique<OrchestrationRunner>(
-                std::move(config), plan_, std::move(mock));
+            std::unique_ptr<OrchestrationRunner> runner;
+            if (mpi_ctx)
+            {
+                runner = std::make_unique<OrchestrationRunner>(
+                    std::move(config), plan_, std::move(mock), std::move(mpi_ctx));
+            }
+            else
+            {
+                runner = std::make_unique<OrchestrationRunner>(
+                    std::move(config), plan_, std::move(mock));
+            }
 
             // Set greedy sampling (temperature=0)
             SamplingParams greedy;
@@ -696,6 +779,64 @@ namespace
         EXPECT_NE(probe.mtp_bypass_reason.find("TP logits"), std::string::npos);
         EXPECT_EQ(probe.mtp_bypasses, 1u);
         EXPECT_EQ(probe.mtp_draft_steps, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPBypassForWorldSizeWithoutTokenCoordination)
+    {
+        auto mpi = std::make_shared<llaminar2::test::MockMPIContext>(0, 2);
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/std::string{},
+            mpi);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        ASSERT_EQ(step1.tokens.size(), 1u);
+        EXPECT_EQ(step1.tokens[0], MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+
+        auto probe = runner->prefixStateProbe();
+        EXPECT_TRUE(probe.mtp_config_enabled);
+        EXPECT_TRUE(probe.mtp_bypassed);
+        EXPECT_NE(probe.mtp_bypass_reason.find("world_size > 1"), std::string::npos);
+        EXPECT_EQ(probe.mtp_bypasses, 1u);
+        EXPECT_EQ(probe.mtp_draft_steps, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPWorldSizeUsesCoordinatedSamplingWithoutLocalLogits)
+    {
+        auto mpi = std::make_shared<llaminar2::test::MockMPIContext>(0, 2);
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/std::string{},
+            mpi,
+            /*mtp_token_coordination=*/true,
+            /*hide_local_logits=*/true);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_GE(mock->sampleMainLogitsCount(), 1);
+        EXPECT_EQ(mock->sampleMTPLogitsCount(), 1);
+        EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 1);
+
+        auto probe = runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, LocalTPMTPDecodeRunsEveryParticipantAndRecordsOneRollback)

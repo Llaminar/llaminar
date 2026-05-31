@@ -267,6 +267,9 @@ namespace llaminar2
         bool hasAllPositionLogitsLocal() const override;
         LogitsLocalInfo getAllPositionLogitsLocalInfo() const override;
         std::string mtpDecodeUnsupportedReason() const override;
+        bool supportsMTPTokenCoordination() const override;
+        int sampleGreedyFromMTPLogitsOnDevice() override;
+        int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;

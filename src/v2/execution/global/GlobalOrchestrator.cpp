@@ -65,6 +65,26 @@ namespace llaminar2
             return "layer" + std::to_string(layer) + suffix;
         }
 
+        int greedyArgmaxToken(const float *logits, int vocab_size)
+        {
+            if (!logits || vocab_size <= 0)
+            {
+                return -1;
+            }
+
+            int token = 0;
+            float best = logits[0];
+            for (int i = 1; i < vocab_size; ++i)
+            {
+                if (logits[i] > best)
+                {
+                    best = logits[i];
+                    token = i;
+                }
+            }
+            return token;
+        }
+
         bool stageOwnsGlobalLayer(const StageRunnerEntry &entry, int layer)
         {
             if (!entry.pp_stage_config.has_value())
@@ -1187,6 +1207,78 @@ namespace llaminar2
         if (config_.topology.numStages() != 1)
             return "MTP decode is not enabled for GlobalPP topologies";
         return stage_runners_.mtpDecodeUnsupportedReasonAll();
+    }
+
+    bool GlobalOrchestrator::supportsMTPTokenCoordination() const
+    {
+        return mtpDecodeUnsupportedReason().empty();
+    }
+
+    int GlobalOrchestrator::sampleGreedyFromMTPLogitsOnDevice()
+    {
+        int32_t token = -1;
+
+        if (is_pipeline_tail_)
+        {
+            IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            token = runner ? runner->sampleGreedyFromMTPLogitsOnDevice() : -1;
+            if (token < 0)
+            {
+                token = greedyArgmaxToken(runner ? runner->mtpLogits() : nullptr,
+                                          config_.vocab_size);
+            }
+        }
+
+        if (config_.mpi_ctx)
+        {
+            try
+            {
+                config_.mpi_ctx->broadcast_int32(&token, 1, tail_rank_);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                          << " MTP token broadcast_int32 failed: " << e.what());
+                return -1;
+            }
+        }
+        return token;
+    }
+
+    int GlobalOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(int row)
+    {
+        int32_t token = -1;
+
+        if (is_pipeline_tail_)
+        {
+            IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+            token = runner ? runner->sampleGreedyFromAllPositionLogitsOnDevice(row) : -1;
+            if (token < 0 && runner && row >= 0)
+            {
+                const float *all_logits = runner->getAllPositionLogits();
+                if (all_logits)
+                {
+                    token = greedyArgmaxToken(
+                        all_logits + static_cast<size_t>(row) * static_cast<size_t>(config_.vocab_size),
+                        config_.vocab_size);
+                }
+            }
+        }
+
+        if (config_.mpi_ctx)
+        {
+            try
+            {
+                config_.mpi_ctx->broadcast_int32(&token, 1, tail_rank_);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("GlobalOrchestrator: rank " << config_.rank
+                          << " MTP verifier token broadcast_int32 failed: " << e.what());
+                return -1;
+            }
+        }
+        return token;
     }
 
     PrefixStateSnapshot GlobalOrchestrator::captureLivePrefixState(int seq_idx) const

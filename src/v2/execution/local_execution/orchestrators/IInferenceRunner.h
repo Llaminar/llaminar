@@ -154,6 +154,37 @@ namespace llaminar2
         }
 
         /**
+         * @brief True when this runner coordinates MTP draft-token choices across its domain.
+         *
+         * Multi-rank MTP decode requires every participant to verify and replay the
+         * same draft sequence. Runners that span an MPI or TP domain should return
+         * true only when their MTP sampling methods broadcast or otherwise agree on
+         * MTP draft and verifier tokens.
+         */
+        virtual bool supportsMTPTokenCoordination() const { return false; }
+
+        /**
+         * @brief Sample the current MTP sidecar logits in greedy mode.
+         *
+         * Returns -1 when unavailable; callers may fall back to mtpLogits() on
+         * single-rank paths. Multi-rank runners should coordinate the returned
+         * token across all participants.
+         */
+        virtual int sampleGreedyFromMTPLogitsOnDevice() { return -1; }
+
+        /**
+         * @brief Sample one row from all-position verifier logits in greedy mode.
+         *
+         * @param row Logical verifier row to sample.
+         * @return Token id, or -1 when unavailable.
+         */
+        virtual int sampleGreedyFromAllPositionLogitsOnDevice(int row)
+        {
+            (void)row;
+            return -1;
+        }
+
+        /**
          * @brief Batched forward pass
          *
          * Process multiple sequences in parallel with automatic padding.
