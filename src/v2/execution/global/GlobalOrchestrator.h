@@ -139,6 +139,12 @@ namespace llaminar2
         void setSuppressTimelineAll(bool suppress);
         void setAccumulatePrefillAll(bool accumulate);
         void flushStageTimelineAll();
+        bool forwardMTPAll(int32_t draft_condition_token);
+        bool setComputeAllPositionLogitsAll(bool enabled);
+        PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
+        bool restoreLivePrefixStateAll(const PrefixStateSnapshot &snapshot, int seq_idx = 0);
+        bool truncateLivePrefixStateAll(int cached_tokens, int seq_idx = 0);
+        std::string mtpDecodeUnsupportedReasonAll() const;
         void enableSnapshotCaptureAll(const std::string &output_dir);
         void disableSnapshotCaptureAll();
         void clearSnapshotsAll();
@@ -252,6 +258,18 @@ namespace llaminar2
         int get_position() const override;
         ExecutionPath executionPath() const override;
         const char *architecture() const override;
+        bool forwardMTP(int32_t draft_condition_token) override;
+        const float *mtpLogits() const override;
+        bool setComputeAllPositionLogits(bool enabled) override;
+        const float *getAllPositionLogits() const override;
+        bool hasMTPLogitsLocal() const override;
+        LogitsLocalInfo getMTPLogitsLocalInfo() const override;
+        bool hasAllPositionLogitsLocal() const override;
+        LogitsLocalInfo getAllPositionLogitsLocalInfo() const override;
+        std::string mtpDecodeUnsupportedReason() const override;
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
+        bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
 
         // =================================================================
         // IInferenceRunner — GPU-side Sampling

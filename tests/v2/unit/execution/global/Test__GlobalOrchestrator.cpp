@@ -12,7 +12,11 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <memory>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "execution/global/GlobalOrchestrator.h"
 #include "execution/global_pp/GlobalPPTopology.h"
@@ -23,6 +27,104 @@
 
 namespace llaminar2::test
 {
+    class MTPMockDeviceRunner : public MockDeviceRunner
+    {
+    public:
+        MTPMockDeviceRunner()
+        {
+            mtp_logits_.assign(1000, -10.0f);
+            mtp_logits_[17] = 10.0f;
+            all_position_logits_.assign(2 * 1000, -10.0f);
+            all_position_logits_[17] = 10.0f;
+            all_position_logits_[1000 + 23] = 10.0f;
+        }
+
+        bool forwardMTP(int32_t draft_condition_token) override
+        {
+            ++forward_mtp_calls_;
+            last_mtp_condition_token_ = draft_condition_token;
+            return forward_mtp_ok_;
+        }
+
+        const float *mtpLogits() const override
+        {
+            return mtp_logits_.data();
+        }
+
+        bool setComputeAllPositionLogits(bool enabled) override
+        {
+            ++set_all_position_calls_;
+            all_position_enabled_ = enabled;
+            return set_all_position_ok_;
+        }
+
+        const float *getAllPositionLogits() const override
+        {
+            return all_position_logits_.data();
+        }
+
+        std::string mtpDecodeUnsupportedReason() const override
+        {
+            return mtp_unsupported_reason_;
+        }
+
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
+        {
+            (void)seq_idx;
+            PrefixStateSnapshot snapshot;
+            snapshot.valid = capture_ok_;
+            snapshot.cached_tokens = get_position();
+            return snapshot;
+        }
+
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            ++restore_live_calls_;
+            if (!restore_ok_ || !snapshot.valid)
+                return false;
+            set_position(snapshot.cached_tokens);
+            return true;
+        }
+
+        bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            ++truncate_live_calls_;
+            if (!truncate_ok_)
+                return false;
+            set_position(cached_tokens);
+            return true;
+        }
+
+        int forward_mtp_calls() const { return forward_mtp_calls_; }
+        int last_mtp_condition_token() const { return last_mtp_condition_token_; }
+        int set_all_position_calls() const { return set_all_position_calls_; }
+        bool all_position_enabled() const { return all_position_enabled_; }
+        int restore_live_calls() const { return restore_live_calls_; }
+        int truncate_live_calls() const { return truncate_live_calls_; }
+
+        void set_mtp_unsupported_reason(std::string reason)
+        {
+            mtp_unsupported_reason_ = std::move(reason);
+        }
+
+    private:
+        std::vector<float> mtp_logits_;
+        std::vector<float> all_position_logits_;
+        int forward_mtp_calls_ = 0;
+        int set_all_position_calls_ = 0;
+        int restore_live_calls_ = 0;
+        int truncate_live_calls_ = 0;
+        int last_mtp_condition_token_ = -1;
+        bool forward_mtp_ok_ = true;
+        bool set_all_position_ok_ = true;
+        bool all_position_enabled_ = false;
+        bool capture_ok_ = true;
+        bool restore_ok_ = true;
+        bool truncate_ok_ = true;
+        std::string mtp_unsupported_reason_;
+    };
 
     // =========================================================================
     // Test Fixture
@@ -746,6 +848,71 @@ namespace llaminar2::test
         // Runner returned 99, broadcast to all ranks
         EXPECT_EQ(token, 99);
         EXPECT_EQ(mpi.broadcast_call_count(), broadcast_before + 1);
+    }
+
+    // =========================================================================
+    // MTP Delegation Tests
+    // =========================================================================
+
+    TEST_F(Test__GlobalOrchestrator, SingleStageGlobalTPDelegatesMTPSurfacesAndLiveSnapshots)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildSingleStageTopo(2);
+        auto runner = std::make_unique<MTPMockDeviceRunner>();
+        auto *runner_raw = runner.get();
+        runner_raw->set_position(11);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        EXPECT_TRUE(orch.mtpDecodeUnsupportedReason().empty());
+        EXPECT_TRUE(orch.forwardMTP(42));
+        EXPECT_EQ(runner_raw->forward_mtp_calls(), 1);
+        EXPECT_EQ(runner_raw->last_mtp_condition_token(), 42);
+
+        const float *mtp_logits = orch.mtpLogits();
+        ASSERT_NE(mtp_logits, nullptr);
+        EXPECT_FLOAT_EQ(mtp_logits[17], 10.0f);
+
+        EXPECT_TRUE(orch.setComputeAllPositionLogits(true));
+        EXPECT_EQ(runner_raw->set_all_position_calls(), 1);
+        EXPECT_TRUE(runner_raw->all_position_enabled());
+
+        const float *verifier_logits = orch.getAllPositionLogits();
+        ASSERT_NE(verifier_logits, nullptr);
+        EXPECT_FLOAT_EQ(verifier_logits[17], 10.0f);
+        EXPECT_FLOAT_EQ(verifier_logits[VOCAB_SIZE + 23], 10.0f);
+
+        PrefixStateSnapshot snapshot = orch.captureLivePrefixState();
+        ASSERT_TRUE(snapshot.valid);
+        EXPECT_EQ(snapshot.cached_tokens, 11);
+        ASSERT_EQ(snapshot.participant_snapshots.size(), 1u);
+
+        runner_raw->set_position(19);
+        EXPECT_TRUE(orch.restoreLivePrefixState(snapshot));
+        EXPECT_EQ(runner_raw->restore_live_calls(), 1);
+        EXPECT_EQ(runner_raw->get_position(), 11);
+
+        EXPECT_TRUE(orch.truncateLivePrefixState(5));
+        EXPECT_EQ(runner_raw->truncate_live_calls(), 1);
+        EXPECT_EQ(runner_raw->get_position(), 5);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, GlobalPPMTPReportsTopologyBypassBeforeDelegation)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStagePPTopo();
+        auto runner = std::make_unique<MTPMockDeviceRunner>();
+        auto *runner_raw = runner.get();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        EXPECT_NE(orch.mtpDecodeUnsupportedReason().find("GlobalPP"), std::string::npos);
+        EXPECT_FALSE(orch.forwardMTP(7));
+        EXPECT_FALSE(orch.setComputeAllPositionLogits(true));
+        EXPECT_EQ(runner_raw->forward_mtp_calls(), 0);
+        EXPECT_EQ(runner_raw->set_all_position_calls(), 0);
+        EXPECT_EQ(orch.mtpLogits(), nullptr);
+        EXPECT_EQ(orch.getAllPositionLogits(), nullptr);
     }
 
     // =========================================================================

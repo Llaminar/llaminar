@@ -431,6 +431,159 @@ namespace llaminar2
         }
     }
 
+    bool StageRunnerRegistry::forwardMTPAll(int32_t draft_condition_token)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->forwardMTP(draft_condition_token) && ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->forwardMTP(draft_condition_token) && ok;
+        }
+        return saw_runner && ok;
+    }
+
+    bool StageRunnerRegistry::setComputeAllPositionLogitsAll(bool enabled)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->setComputeAllPositionLogits(enabled) && ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->setComputeAllPositionLogits(enabled) && ok;
+        }
+        return saw_runner && ok;
+    }
+
+    PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixStateAll(int seq_idx) const
+    {
+        PrefixStateSnapshot aggregate;
+        bool saw_runner = false;
+        bool have_common_tokens = false;
+        int common_tokens = 0;
+
+        auto capture_runner = [&](const IInferenceRunner &runner)
+        {
+            saw_runner = true;
+            PrefixStateSnapshot child = runner.captureLivePrefixState(seq_idx);
+            if (!child.valid)
+                return false;
+
+            if (!have_common_tokens)
+            {
+                common_tokens = child.cached_tokens;
+                have_common_tokens = true;
+            }
+            else if (child.cached_tokens != common_tokens)
+            {
+                return false;
+            }
+
+            aggregate.participant_snapshots.push_back(std::move(child));
+            return true;
+        };
+
+        for (const auto &entry : entries_)
+        {
+            if (!capture_runner(*entry.runner))
+                return {};
+        }
+        if (compatibility_runner_ && !capture_runner(*compatibility_runner_))
+        {
+            return {};
+        }
+        if (!saw_runner || !have_common_tokens)
+        {
+            return {};
+        }
+
+        aggregate.valid = true;
+        aggregate.cached_tokens = common_tokens;
+        return aggregate;
+    }
+
+    bool StageRunnerRegistry::restoreLivePrefixStateAll(const PrefixStateSnapshot &snapshot, int seq_idx)
+    {
+        if (!snapshot.valid || snapshot.participant_snapshots.empty())
+            return false;
+
+        size_t participant_index = 0;
+        bool saw_runner = false;
+        bool ok = true;
+
+        auto restore_runner = [&](IInferenceRunner &runner)
+        {
+            saw_runner = true;
+            if (participant_index >= snapshot.participant_snapshots.size())
+            {
+                ok = false;
+                return;
+            }
+            ok = runner.restoreLivePrefixState(
+                     snapshot.participant_snapshots[participant_index++],
+                     seq_idx) &&
+                 ok;
+        };
+
+        for (auto &entry : entries_)
+        {
+            restore_runner(*entry.runner);
+        }
+        if (compatibility_runner_)
+        {
+            restore_runner(*compatibility_runner_);
+        }
+
+        return saw_runner && ok && participant_index == snapshot.participant_snapshots.size();
+    }
+
+    bool StageRunnerRegistry::truncateLivePrefixStateAll(int cached_tokens, int seq_idx)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->truncateLivePrefixState(cached_tokens, seq_idx) && ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->truncateLivePrefixState(cached_tokens, seq_idx) && ok;
+        }
+        return saw_runner && ok;
+    }
+
+    std::string StageRunnerRegistry::mtpDecodeUnsupportedReasonAll() const
+    {
+        bool saw_runner = false;
+        for (const auto &entry : entries_)
+        {
+            saw_runner = true;
+            std::string reason = entry.runner->mtpDecodeUnsupportedReason();
+            if (!reason.empty())
+                return reason;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            std::string reason = compatibility_runner_->mtpDecodeUnsupportedReason();
+            if (!reason.empty())
+                return reason;
+        }
+        return saw_runner ? std::string{} : "MTP decode requires a global stage runner";
+    }
+
     void StageRunnerRegistry::enableSnapshotCaptureAll(const std::string &output_dir)
     {
         for (auto &entry : entries_)
@@ -965,6 +1118,90 @@ namespace llaminar2
     const char *GlobalOrchestrator::architecture() const
     {
         return config_.architecture_name.c_str();
+    }
+
+    bool GlobalOrchestrator::forwardMTP(int32_t draft_condition_token)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.forwardMTPAll(draft_condition_token);
+    }
+
+    const float *GlobalOrchestrator::mtpLogits() const
+    {
+        if (!is_pipeline_tail_)
+            return nullptr;
+        const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner ? runner->mtpLogits() : nullptr;
+    }
+
+    bool GlobalOrchestrator::setComputeAllPositionLogits(bool enabled)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.setComputeAllPositionLogitsAll(enabled);
+    }
+
+    const float *GlobalOrchestrator::getAllPositionLogits() const
+    {
+        if (!is_pipeline_tail_)
+            return nullptr;
+        const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner ? runner->getAllPositionLogits() : nullptr;
+    }
+
+    bool GlobalOrchestrator::hasMTPLogitsLocal() const
+    {
+        if (!is_pipeline_tail_)
+            return false;
+        const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner ? runner->hasMTPLogitsLocal() : false;
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::getMTPLogitsLocalInfo() const
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner ? runner->getMTPLogitsLocalInfo() : LogitsLocalInfo{};
+    }
+
+    bool GlobalOrchestrator::hasAllPositionLogitsLocal() const
+    {
+        if (!is_pipeline_tail_)
+            return false;
+        const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner ? runner->hasAllPositionLogitsLocal() : false;
+    }
+
+    LogitsLocalInfo GlobalOrchestrator::getAllPositionLogitsLocalInfo() const
+    {
+        if (!is_pipeline_tail_)
+            return {};
+        const IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
+        return runner ? runner->getAllPositionLogitsLocalInfo() : LogitsLocalInfo{};
+    }
+
+    std::string GlobalOrchestrator::mtpDecodeUnsupportedReason() const
+    {
+        if (config_.topology.numStages() != 1)
+            return "MTP decode is not enabled for GlobalPP topologies";
+        return stage_runners_.mtpDecodeUnsupportedReasonAll();
+    }
+
+    PrefixStateSnapshot GlobalOrchestrator::captureLivePrefixState(int seq_idx) const
+    {
+        return stage_runners_.captureLivePrefixStateAll(seq_idx);
+    }
+
+    bool GlobalOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)
+    {
+        return stage_runners_.restoreLivePrefixStateAll(snapshot, seq_idx);
+    }
+
+    bool GlobalOrchestrator::truncateLivePrefixState(int cached_tokens, int seq_idx)
+    {
+        return stage_runners_.truncateLivePrefixStateAll(cached_tokens, seq_idx);
     }
 
     // =========================================================================
