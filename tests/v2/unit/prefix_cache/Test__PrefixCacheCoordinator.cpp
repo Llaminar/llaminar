@@ -196,6 +196,28 @@ TEST(Test__PrefixCacheCoordinator, BuildsAggregateLookupResultForRunnerCode)
     EXPECT_TRUE(aggregate.bypass_reason.empty());
 }
 
+TEST(Test__PrefixCacheCoordinator, AggregateLookupDoesNotAdvertisePartialBlockTokens)
+{
+    PrefixCoordinationResult coordination;
+    coordination.supported = true;
+    coordination.cache_enabled = true;
+    coordination.common_matched_tokens = 5;
+    coordination.common_matched_blocks = 2;
+    coordination.fingerprint_key = 0x1000;
+    coordination.common_terminal_logits = true;
+    coordination.common_terminal_hidden = true;
+
+    PrefixLookupResult aggregate = makePrefixLookupResult(coordination, /*block_size=*/2);
+
+    EXPECT_TRUE(aggregate.supported);
+    EXPECT_TRUE(aggregate.cache_enabled);
+    EXPECT_EQ(aggregate.cached_tokens, 4);
+    EXPECT_EQ(aggregate.block_size, 2);
+    EXPECT_EQ(aggregate.fingerprint_key, 0x1000u);
+    EXPECT_FALSE(aggregate.has_terminal_logits);
+    EXPECT_FALSE(aggregate.has_terminal_hidden);
+}
+
 TEST(Test__PrefixCacheCoordinator, MPICoordinatorReducesSingleRankScalars)
 {
     int initialized = 0;

@@ -256,11 +256,25 @@ namespace llaminar2
         PrefixLookupResult result;
         result.supported = coordination.supported;
         result.cache_enabled = coordination.cache_enabled;
-        result.cached_tokens = coordination.common_matched_tokens;
         result.block_size = block_size;
         result.fingerprint_key = coordination.fingerprint_key;
-        result.has_terminal_logits = coordination.common_terminal_logits;
-        result.has_terminal_hidden = coordination.common_terminal_hidden;
+
+        int restorable_tokens = nonNegative(coordination.common_matched_tokens);
+        if (block_size > 0)
+        {
+            const int block_tokens =
+                nonNegative(coordination.common_matched_blocks) * block_size;
+            restorable_tokens = std::min(restorable_tokens, block_tokens);
+        }
+
+        result.cached_tokens = restorable_tokens;
+        const bool preserved_terminal_token =
+            restorable_tokens > 0 &&
+            restorable_tokens == coordination.common_matched_tokens;
+        result.has_terminal_logits =
+            preserved_terminal_token && coordination.common_terminal_logits;
+        result.has_terminal_hidden =
+            preserved_terminal_token && coordination.common_terminal_hidden;
         if (!coordination.supported)
             result.bypass_reason = coordination.clamp_reason;
         return result;
