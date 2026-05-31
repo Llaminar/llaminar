@@ -161,6 +161,16 @@ namespace llaminar2
             const SamplingParams &sampling) = 0;
 
         /**
+         * @brief Limit how many tokens the next decodeStep() may accept.
+         *
+         * A value <= 0 means unlimited. This is a no-op for runners that only
+         * ever return one token per decode step, but MTP/speculative runners use
+         * it to keep direct decode loops from advancing state past a caller's
+         * remaining token budget.
+         */
+        virtual void setDecodeStepTokenBudget(int max_tokens) { (void)max_tokens; }
+
+        /**
          * @brief Apply any decode-boundary maintenance after a successful token step.
          *
          * Server and streaming paths drive decodeStep() directly instead of using

@@ -36,6 +36,19 @@ namespace llaminar2
                               json::error_handler_t::replace);
         }
 
+        GenerationResult decodeStepWithBudget(IOrchestrationRunner &runner, int max_tokens)
+        {
+            struct BudgetGuard
+            {
+                IOrchestrationRunner &runner;
+                ~BudgetGuard() { runner.setDecodeStepTokenBudget(0); }
+            };
+
+            runner.setDecodeStepTokenBudget(max_tokens);
+            BudgetGuard guard{runner};
+            return runner.decodeStep();
+        }
+
         class RequestCacheCleanup
         {
         public:
@@ -572,17 +585,19 @@ namespace llaminar2
             return response;
         };
 
-        for (int i = 0; i < effective_max_tokens; ++i)
+        bool stop_generation = false;
+        while (completion_tokens < effective_max_tokens && !stop_generation)
         {
-            int32_t next_token;
+            std::vector<int32_t> step_tokens;
+            bool step_complete = false;
 
             // Check if we're injecting stop-thinking tokens
             if (stop_thinking_idx > 0 && stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
             {
                 // Inject next token from stop-thinking sequence
-                next_token = stop_thinking_tokens[stop_thinking_idx++];
+                step_tokens.push_back(stop_thinking_tokens[stop_thinking_idx++]);
                 // Feed the injected token through the model (for KV cache consistency)
-                GenerationResult result = runner_.decodeStep(); // Run forward pass but discard the sampled token
+                GenerationResult result = decodeStepWithBudget(runner_, 1); // Run forward pass but discard the sampled token
                 if (!result.success())
                 {
                     response.http_status = 500;
@@ -593,7 +608,9 @@ namespace llaminar2
             }
             else
             {
-                GenerationResult result = runner_.decodeStep();
+                const int remaining = effective_max_tokens - completion_tokens;
+                const int step_budget = thinking_budget_active ? 1 : remaining;
+                GenerationResult result = decodeStepWithBudget(runner_, step_budget);
 
                 if (!result.success())
                 {
@@ -609,12 +626,22 @@ namespace llaminar2
                     break;
                 }
 
-                next_token = result.tokens[0];
+                step_tokens = result.tokens;
+                step_complete = result.is_complete;
+            }
 
-                if (result.is_complete || tokenizer_.is_stop_token(next_token))
+            for (size_t token_idx = 0;
+                 token_idx < step_tokens.size() && completion_tokens < effective_max_tokens;
+                 ++token_idx)
+            {
+                int32_t next_token = step_tokens[token_idx];
+                const bool is_final_returned_token = token_idx + 1 == step_tokens.size();
+                if (tokenizer_.is_stop_token(next_token) ||
+                    (step_complete && is_final_returned_token))
                 {
                     completion_tokens++;
                     finish_reason = "stop";
+                    stop_generation = true;
                     break;
                 }
 
@@ -641,13 +668,13 @@ namespace llaminar2
                         }
                     }
                 }
+
+                completion_tokens++;
+                generated_text += tokenizer_.decode_token(next_token);
             }
 
-            if (!runner_.maybeApplyMoERebalance())
+            if (!stop_generation && !runner_.maybeApplyMoERebalance())
                 return rebalance_error();
-
-            completion_tokens++;
-            generated_text += tokenizer_.decode_token(next_token);
         }
 
         runner_.flushStageTimeline();
@@ -842,16 +869,17 @@ namespace llaminar2
             return response;
         };
 
-        for (int i = 0; i < effective_max_tokens; ++i)
+        bool stop_generation = false;
+        while (completion_tokens < effective_max_tokens && !stop_generation)
         {
-            int32_t next_token;
-            bool is_complete = false;
+            std::vector<int32_t> step_tokens;
+            bool step_complete = false;
 
             // Check if we're injecting stop-thinking tokens
             if (stop_thinking_idx > 0 && stop_thinking_idx < static_cast<int>(stop_thinking_tokens.size()))
             {
-                next_token = stop_thinking_tokens[stop_thinking_idx++];
-                GenerationResult result = runner_.decodeStep(); // Keep model state consistent
+                step_tokens.push_back(stop_thinking_tokens[stop_thinking_idx++]);
+                GenerationResult result = decodeStepWithBudget(runner_, 1); // Keep model state consistent
                 if (!result.success())
                 {
                     json error_data = {{"error", result.error}};
@@ -866,7 +894,9 @@ namespace llaminar2
             }
             else
             {
-                GenerationResult result = runner_.decodeStep();
+                const int remaining = effective_max_tokens - completion_tokens;
+                const int step_budget = thinking_budget_active ? 1 : remaining;
+                GenerationResult result = decodeStepWithBudget(runner_, step_budget);
 
                 if (!result.success())
                 {
@@ -886,80 +916,104 @@ namespace llaminar2
                     break;
                 }
 
-                next_token = result.tokens[0];
-                is_complete = result.is_complete;
+                step_tokens = result.tokens;
+                step_complete = result.is_complete;
             }
 
-            completion_tokens++;
-
-            if (is_complete || tokenizer_.is_stop_token(next_token))
+            bool rebalance_applied = false;
+            for (size_t token_idx = 0;
+                 token_idx < step_tokens.size() && completion_tokens < effective_max_tokens;
+                 ++token_idx)
             {
-                finish_reason = "stop";
-                break;
-            }
+                int32_t next_token = step_tokens[token_idx];
+                const bool is_final_returned_token = token_idx + 1 == step_tokens.size();
 
-            if (!runner_.maybeApplyMoERebalance())
-                return emit_rebalance_error();
+                completion_tokens++;
 
-            std::string token_text = tokenizer_.decode_token(next_token);
-
-            // Check thinking budget (before emitting)
-            if (thinking_budget_active && use_think_split && splitter.inThinking() &&
-                stop_thinking_idx == 0)
-            {
-                thinking_tokens++;
-                if (thinking_tokens >= request.thinking_budget_tokens &&
-                    !stop_thinking_tokens.empty())
+                if (tokenizer_.is_stop_token(next_token) ||
+                    (step_complete && is_final_returned_token))
                 {
-                    LOG_DEBUG("[ChatCompletion/stream] Thinking budget exhausted ("
-                              << thinking_tokens << " tokens), injecting stop-thinking prompt");
-                    next_token = stop_thinking_tokens[0];
-                    stop_thinking_idx = 1;
-                    token_text = tokenizer_.decode_token(next_token);
+                    finish_reason = "stop";
+                    stop_generation = true;
+                    break;
                 }
-            }
 
-            if (use_think_split)
-            {
-                auto split = splitter.process(token_text);
-                if (!split.text.empty())
+                if (!rebalance_applied)
                 {
-                    accumulated_text += split.text;
-                    if (!has_tools)
+                    if (!runner_.maybeApplyMoERebalance())
+                        return emit_rebalance_error();
+                    rebalance_applied = true;
+                }
+
+                std::string token_text = tokenizer_.decode_token(next_token);
+
+                // Check thinking budget (before emitting)
+                if (thinking_budget_active && use_think_split && splitter.inThinking() &&
+                    stop_thinking_idx == 0)
+                {
+                    thinking_tokens++;
+                    if (thinking_tokens >= request.thinking_budget_tokens &&
+                        !stop_thinking_tokens.empty())
                     {
-                        json delta;
-                        delta[split.field] = split.text;
-                        if (!emit_chunk(delta, nullptr))
-                            break;
+                        LOG_DEBUG("[ChatCompletion/stream] Thinking budget exhausted ("
+                                  << thinking_tokens << " tokens), injecting stop-thinking prompt");
+                        next_token = stop_thinking_tokens[0];
+                        stop_thinking_idx = 1;
+                        token_text = tokenizer_.decode_token(next_token);
                     }
                 }
 
-                // Check if the splitter transitioned and has buffered content
-                if (!splitter.inThinking())
+                if (use_think_split)
                 {
-                    auto flushed = splitter.flush();
-                    if (!flushed.text.empty())
+                    auto split = splitter.process(token_text);
+                    if (!split.text.empty())
                     {
-                        accumulated_text += flushed.text;
+                        accumulated_text += split.text;
                         if (!has_tools)
                         {
                             json delta;
-                            delta[flushed.field] = flushed.text;
+                            delta[split.field] = split.text;
                             if (!emit_chunk(delta, nullptr))
+                            {
+                                stop_generation = true;
                                 break;
+                            }
+                        }
+                    }
+
+                    // Check if the splitter transitioned and has buffered content
+                    if (!splitter.inThinking())
+                    {
+                        auto flushed = splitter.flush();
+                        if (!flushed.text.empty())
+                        {
+                            accumulated_text += flushed.text;
+                            if (!has_tools)
+                            {
+                                json delta;
+                                delta[flushed.field] = flushed.text;
+                                if (!emit_chunk(delta, nullptr))
+                                {
+                                    stop_generation = true;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
-            }
-            else
-            {
-                accumulated_text += token_text;
-                if (!has_tools)
+                else
                 {
-                    json delta;
-                    delta["content"] = token_text;
-                    if (!emit_chunk(delta, nullptr))
-                        break;
+                    accumulated_text += token_text;
+                    if (!has_tools)
+                    {
+                        json delta;
+                        delta["content"] = token_text;
+                        if (!emit_chunk(delta, nullptr))
+                        {
+                            stop_generation = true;
+                            break;
+                        }
+                    }
                 }
             }
         }

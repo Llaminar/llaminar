@@ -93,6 +93,7 @@ namespace llaminar2
             const std::vector<int32_t> &prompt_tokens,
             int max_new_tokens,
             const SamplingParams &sampling) override;
+        void setDecodeStepTokenBudget(int max_tokens) override;
 
         // ==================================================================
         // IOrchestrationRunner: Configuration / Status

@@ -30,6 +30,14 @@ namespace
         return result;
     }
 
+    GenerationResult tokenResult(std::initializer_list<int32_t> tokens, bool complete = false)
+    {
+        GenerationResult result;
+        result.tokens.assign(tokens.begin(), tokens.end());
+        result.is_complete = complete;
+        return result;
+    }
+
     GenerationResult errorResult(const std::string &error)
     {
         GenerationResult result;
@@ -84,7 +92,7 @@ TEST(Test__CompletionMode, RootRankShutsDownWorkersOnSuccess)
     EXPECT_CALL(*h.runner, prefill(ElementsAre(1, 2))).WillOnce(Return(true));
     EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
     EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult(42)));
-    EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(2).WillRepeatedly(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(1).WillRepeatedly(Return(false));
     EXPECT_CALL(*h.tokenizer, decode_token(42)).WillOnce(Return(" answer"));
     EXPECT_CALL(*h.runner, flushStageTimeline()).Times(1);
     EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
@@ -191,8 +199,31 @@ TEST(Test__CompletionMode, SingleRankUsesDirectExecutionWithoutWorkerCoordinatio
     EXPECT_CALL(*h.runner, prefill(ElementsAre(1))).WillOnce(Return(true));
     EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
     EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult(42)));
-    EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(2).WillRepeatedly(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(1).WillRepeatedly(Return(false));
     EXPECT_CALL(*h.tokenizer, decode_token(42)).WillOnce(Return(" answer"));
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    CompletionMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 0);
+}
+
+TEST(Test__CompletionMode, EmitsAllTokensReturnedByMultiTokenDecodeStep)
+{
+    ModeHarness h(/*rank=*/0, /*world_size=*/1);
+    h.ctx.config.n_predict = 2;
+
+    EXPECT_CALL(*h.tokenizer, encode("Hello", false, false)).WillOnce(Return(std::vector<int>{1}));
+    EXPECT_CALL(*h.runner, prefill(ElementsAre(1))).WillOnce(Return(true));
+    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
+    EXPECT_CALL(*h.runner, setDecodeStepTokenBudget(2)).Times(1);
+    EXPECT_CALL(*h.runner, setDecodeStepTokenBudget(0)).Times(1);
+    EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult({10, 11, 12})));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(10)).WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(11)).WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(12)).Times(0);
+    EXPECT_CALL(*h.tokenizer, decode_token(10)).WillOnce(Return("A"));
+    EXPECT_CALL(*h.tokenizer, decode_token(11)).WillOnce(Return("B"));
+    EXPECT_CALL(*h.tokenizer, decode_token(12)).Times(0);
     EXPECT_CALL(*h.runner, shutdown()).Times(1);
 
     CompletionMode mode;
@@ -229,7 +260,7 @@ TEST(Test__SingleShotChatMode, RootRankShutsDownWorkersOnSuccess)
     EXPECT_CALL(*h.runner, prefill(ElementsAre(7, 8))).WillOnce(Return(true));
     EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
     EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult(42)));
-    EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(2).WillRepeatedly(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(1).WillRepeatedly(Return(false));
     EXPECT_CALL(*h.tokenizer, decode_token(42)).WillOnce(Return(" answer"));
     EXPECT_CALL(*h.runner, flushStageTimeline()).Times(1);
     EXPECT_CALL(*h.runner, shutdownMPIWorkers()).Times(1);
@@ -310,8 +341,33 @@ TEST(Test__SingleShotChatMode, SingleRankUsesDirectExecutionWithoutWorkerCoordin
     EXPECT_CALL(*h.runner, prefill(ElementsAre(7))).WillOnce(Return(true));
     EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
     EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult(42)));
-    EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(2).WillRepeatedly(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(42)).Times(1).WillRepeatedly(Return(false));
     EXPECT_CALL(*h.tokenizer, decode_token(42)).WillOnce(Return(" answer"));
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    SingleShotChatMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 0);
+}
+
+TEST(Test__SingleShotChatMode, EmitsAllTokensReturnedByMultiTokenDecodeStep)
+{
+    ModeHarness h(/*rank=*/0, /*world_size=*/1);
+    h.ctx.config.single_shot_chat = true;
+    h.ctx.config.n_predict = 2;
+
+    EXPECT_CALL(*h.tokenizer, hasChatTemplate()).WillOnce(Return(true));
+    EXPECT_CALL(*h.tokenizer, encodeChat(_, true, "")).WillOnce(Return(std::vector<int>{7}));
+    EXPECT_CALL(*h.runner, prefill(ElementsAre(7))).WillOnce(Return(true));
+    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
+    EXPECT_CALL(*h.runner, setDecodeStepTokenBudget(2)).Times(1);
+    EXPECT_CALL(*h.runner, setDecodeStepTokenBudget(0)).Times(1);
+    EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult({20, 21, 22})));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(20)).WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(21)).WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(22)).Times(0);
+    EXPECT_CALL(*h.tokenizer, decode_token(20)).WillOnce(Return("H"));
+    EXPECT_CALL(*h.tokenizer, decode_token(21)).WillOnce(Return("i"));
+    EXPECT_CALL(*h.tokenizer, decode_token(22)).Times(0);
     EXPECT_CALL(*h.runner, shutdown()).Times(1);
 
     SingleShotChatMode mode;

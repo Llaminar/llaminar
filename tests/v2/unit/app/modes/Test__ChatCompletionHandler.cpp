@@ -77,6 +77,15 @@ protected:
         return r;
     }
 
+    static GenerationResult makeTokens(std::initializer_list<int32_t> token_ids,
+                                       bool is_complete = false)
+    {
+        GenerationResult r;
+        r.tokens.assign(token_ids.begin(), token_ids.end());
+        r.is_complete = is_complete;
+        return r;
+    }
+
     /// Helper: make an empty decode result (no more tokens)
     static GenerationResult makeEmpty()
     {
@@ -547,6 +556,41 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ResponseFormat_OpenAICompatibl
     EXPECT_EQ(body["usage"]["prompt_tokens"], 3);
     EXPECT_EQ(body["usage"]["completion_tokens"], 3); // 100, 200, 0(stop)
     EXPECT_EQ(body["usage"]["total_tokens"], 6);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ConsumesMultiTokenDecodeStep)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("A"));
+    ON_CALL(*tokenizer_, decode_token(11))
+        .WillByDefault(Return("B"));
+    ON_CALL(*tokenizer_, decode_token(12))
+        .WillByDefault(Return("C"));
+
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(2)).Times(1);
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(0)).Times(1);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeTokens({10, 11, 12})));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "greet")};
+    request.max_tokens = 2;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+
+    ASSERT_TRUE(response.ok);
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["choices"][0]["message"]["content"], "AB");
+    EXPECT_EQ(body["usage"]["completion_tokens"], 2);
 }
 
 TEST_F(Test__ChatCompletionHandler, HandleRequest_ReplacesInvalidUtf8InGeneratedContent)
@@ -1946,6 +1990,51 @@ TEST_F(Test__ChatCompletionHandler, Streaming_TokenByToken_ContentInDelta)
     // Third chunk: " world"
     auto c2 = json::parse(chunks[2].substr(6, chunks[2].find("\n\n") - 6));
     EXPECT_EQ(c2["choices"][0]["delta"]["content"], " world");
+}
+
+TEST_F(Test__ChatCompletionHandler, Streaming_EmitsEachTokenFromMultiTokenDecodeStep)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("A"));
+    ON_CALL(*tokenizer_, decode_token(11))
+        .WillByDefault(Return("B"));
+    ON_CALL(*tokenizer_, decode_token(12))
+        .WillByDefault(Return("C"));
+
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(2)).Times(1);
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(0)).Times(1);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeTokens({10, 11, 12})));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+    request.max_tokens = 2;
+    request.enable_thinking = false;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+    ASSERT_TRUE(response.ok);
+    ASSERT_GE(chunks.size(), 4u);
+
+    auto c1 = json::parse(chunks[1].substr(6, chunks[1].find("\n\n") - 6));
+    auto c2 = json::parse(chunks[2].substr(6, chunks[2].find("\n\n") - 6));
+    EXPECT_EQ(c1["choices"][0]["delta"]["content"], "A");
+    EXPECT_EQ(c2["choices"][0]["delta"]["content"], "B");
 }
 
 TEST_F(Test__ChatCompletionHandler, Streaming_ReplacesInvalidUtf8InContentDelta)

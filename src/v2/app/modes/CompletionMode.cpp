@@ -165,46 +165,65 @@ namespace llaminar2
         // Configure GPU-side sampling
         runner->setSamplingParams(sampling_params);
 
-        // Generate tokens autoregressively
+        // Generate tokens autoregressively. decodeStep() may return more than
+        // one token when MTP accepts a draft, so count output tokens rather
+        // than decode calls.
         int max_tokens = (config.n_predict == -1) ? INT_MAX : config.n_predict;
-        for (int i = 0; i < max_tokens; ++i)
+        int generated_tokens = 0;
+        bool stop_generation = false;
+        while (generated_tokens < max_tokens && !stop_generation)
         {
-            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Starting decode iteration " << i);
+            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Starting decode iteration " << generated_tokens);
 
+            const int remaining_budget =
+                (max_tokens == INT_MAX) ? 0 : (max_tokens - generated_tokens);
+            runner->setDecodeStepTokenBudget(remaining_budget);
             GenerationResult result = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
 
             if (!result.success())
             {
                 if (mpi_ctx->rank() == 0)
                 {
-                    LOG_ERROR("\nError: Decode step failed at token " << (i + 1) << ": " << result.error);
+                    LOG_ERROR("\nError: Decode step failed at token "
+                              << (generated_tokens + 1) << ": " << result.error);
                 }
                 return shutdownAndFinalize(1);
             }
 
             if (result.tokens.empty())
             {
-                LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] No token generated at iteration " << i);
+                LOG_DEBUG("[Rank " << mpi_ctx->rank()
+                                   << "] No token generated at iteration " << generated_tokens);
                 break;
             }
 
-            int32_t next_token = result.tokens[0];
-
-            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Generated token: " << next_token);
-
-            if (mpi_ctx->rank() == 0 && !tokenizer->is_stop_token(next_token))
+            for (size_t token_idx = 0; token_idx < result.tokens.size() && generated_tokens < max_tokens; ++token_idx)
             {
-                std::string token_text = tokenizer->decode_token(next_token);
-                std::cout << token_text << std::flush;
-            }
+                const int32_t next_token = result.tokens[token_idx];
+                const bool is_final_returned_token = token_idx + 1 == result.tokens.size();
+                const bool is_stop = tokenizer->is_stop_token(next_token) ||
+                                     (result.is_complete && is_final_returned_token);
 
-            if (result.is_complete || tokenizer->is_stop_token(next_token))
-            {
-                if (mpi_ctx->rank() == 0 && config.verbose_level > 0)
+                LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Generated token: " << next_token);
+
+                ++generated_tokens;
+
+                if (mpi_ctx->rank() == 0 && !is_stop)
                 {
-                    LOG_DEBUG("\nGeneration stopped: stop token " << next_token << " encountered");
+                    std::string token_text = tokenizer->decode_token(next_token);
+                    std::cout << token_text << std::flush;
                 }
-                break;
+
+                if (is_stop)
+                {
+                    if (mpi_ctx->rank() == 0 && config.verbose_level > 0)
+                    {
+                        LOG_DEBUG("\nGeneration stopped: stop token " << next_token << " encountered");
+                    }
+                    stop_generation = true;
+                    break;
+                }
             }
         }
 

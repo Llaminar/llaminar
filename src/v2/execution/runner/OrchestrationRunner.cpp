@@ -1121,6 +1121,11 @@ namespace llaminar2
         return result;
     }
 
+    void OrchestrationRunner::setDecodeStepTokenBudget(int max_tokens)
+    {
+        decode_step_token_budget_ = std::max(0, max_tokens);
+    }
+
     GenerationResult OrchestrationRunner::generate(
         const std::vector<int32_t> &prompt_tokens,
         int max_new_tokens,

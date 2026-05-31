@@ -431,6 +431,14 @@ namespace llaminar2
         return inner_->generate(prompt_tokens, max_new_tokens, sampling);
     }
 
+    void NamedDomainGlobalRunner::setDecodeStepTokenBudget(int max_tokens)
+    {
+        if (inner_)
+        {
+            inner_->setDecodeStepTokenBudget(max_tokens);
+        }
+    }
+
     // =========================================================================
     // Configuration / Status delegation
     // =========================================================================

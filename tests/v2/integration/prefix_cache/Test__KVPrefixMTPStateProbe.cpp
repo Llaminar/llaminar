@@ -950,7 +950,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
     {
         OrchestrationConfig config = OrchestrationConfig::defaults();
         config.model_path = model_path;
-        config.max_seq_len = 16;
+        config.max_seq_len = 32;
         config.batch_size = 1;
         config.tp_degree = 1;
         config.pp_degree = 1;
@@ -973,7 +973,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
         const auto encoded = tokenizer->encode(prompt_text, /*add_bos=*/false, /*add_eos=*/false);
         ASSERT_FALSE(encoded.empty());
         const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
-        *result = runner->generate(prompt, 2, greedy);
+        *result = runner->generate(prompt, 4, greedy);
         *snapshot = runner->prefixStateProbe();
         runner->shutdown();
     };
@@ -988,13 +988,13 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
 
     ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
     ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
-    ASSERT_FALSE(baseline_result.tokens.empty());
-    ASSERT_FALSE(mtp_result.tokens.empty());
+    ASSERT_EQ(baseline_result.tokens.size(), 4u);
+    ASSERT_EQ(mtp_result.tokens.size(), 4u);
     EXPECT_EQ(mtp_result.tokens, baseline_result.tokens);
     EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
-    EXPECT_GE(mtp_snapshot.mtp_draft_steps, 1u);
-    EXPECT_GE(mtp_snapshot.mtp_verifier_runs, 1u);
-    EXPECT_GE(mtp_snapshot.mtp_rollbacks, 1u);
+    EXPECT_GE(mtp_snapshot.mtp_draft_steps, 2u);
+    EXPECT_GE(mtp_snapshot.mtp_verifier_runs, 2u);
+    EXPECT_GE(mtp_snapshot.mtp_rollbacks, 2u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)

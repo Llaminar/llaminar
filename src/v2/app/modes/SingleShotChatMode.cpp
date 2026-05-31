@@ -166,10 +166,15 @@ namespace llaminar2
         sampling_params.seed = config.seed;
         runner->setSamplingParams(sampling_params);
 
-        // Decode loop
-        for (int i = 0; i < max_tokens; ++i)
+        // Decode loop. MTP can return multiple accepted tokens in one step, so
+        // keep the loop bounded by emitted tokens rather than decode calls.
+        int generated_tokens = 0;
+        bool stop_generation = false;
+        while (generated_tokens < max_tokens && !stop_generation)
         {
+            runner->setDecodeStepTokenBudget(max_tokens - generated_tokens);
             GenerationResult result = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
 
             if (!result.success())
             {
@@ -185,21 +190,30 @@ namespace llaminar2
                 break;
             }
 
-            int32_t next_token = result.tokens[0];
-
-            if (mpi_ctx->rank() == 0 && !tokenizer->is_stop_token(next_token))
+            for (size_t token_idx = 0; token_idx < result.tokens.size() && generated_tokens < max_tokens; ++token_idx)
             {
-                std::string token_text = tokenizer->decode_token(next_token);
-                std::cout << token_text << std::flush;
-            }
+                const int32_t next_token = result.tokens[token_idx];
+                const bool is_final_returned_token = token_idx + 1 == result.tokens.size();
+                const bool is_stop = tokenizer->is_stop_token(next_token) ||
+                                     (result.is_complete && is_final_returned_token);
 
-            if (result.is_complete || tokenizer->is_stop_token(next_token))
-            {
-                if (mpi_ctx->rank() == 0)
+                ++generated_tokens;
+
+                if (mpi_ctx->rank() == 0 && !is_stop)
                 {
-                    LOG_DEBUG("Stop token encountered (" << next_token << "), stopping generation");
+                    std::string token_text = tokenizer->decode_token(next_token);
+                    std::cout << token_text << std::flush;
                 }
-                break;
+
+                if (is_stop)
+                {
+                    if (mpi_ctx->rank() == 0)
+                    {
+                        LOG_DEBUG("Stop token encountered (" << next_token << "), stopping generation");
+                    }
+                    stop_generation = true;
+                    break;
+                }
             }
         }
 

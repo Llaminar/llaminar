@@ -45,6 +45,8 @@ namespace llaminar2::test
             ON_CALL(*this, lastError()).WillByDefault(testing::ReturnRef(empty_error_));
             ON_CALL(*this, executionPlan()).WillByDefault(testing::ReturnRef(default_plan_));
             ON_CALL(*this, config()).WillByDefault(testing::ReturnRef(default_config_));
+            ON_CALL(*this, setDecodeStepTokenBudget(testing::_)).WillByDefault(testing::Return());
+            ON_CALL(*this, maybeApplyMoERebalance()).WillByDefault(testing::Return(true));
         }
 
         // Lifecycle
@@ -59,6 +61,7 @@ namespace llaminar2::test
                      int max_new_tokens,
                      const SamplingParams &sampling),
                     (override));
+        MOCK_METHOD(void, setDecodeStepTokenBudget, (int max_tokens), (override));
         MOCK_METHOD(bool, maybeApplyMoERebalance, (), (override));
 
         // Configuration
