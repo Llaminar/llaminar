@@ -10278,6 +10278,18 @@ add_v2_test(V2_Unit_DecodeExpertHistogram
     LABELS "V2;Unit;MoE;Histogram;DecodeTracking;DynamicPlacement"
 )
 
+# Test: MoERuntimeTable — graph-facing runtime placement tables and bank flips
+add_executable(v2_test_moe_runtime_table unit/execution/moe/Test__MoERuntimeTable.cpp)
+target_link_libraries(v2_test_moe_runtime_table
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoERuntimeTable
+    COMMAND $<TARGET_FILE:v2_test_moe_runtime_table>
+    LABELS "V2;Unit;MoE;RuntimeTable;GraphCapture;DynamicPlacement"
+)
+
 # Test: SocketAwareRebalancer — socket-load-aware expert swap proposals
 add_executable(v2_test_socket_aware_rebalancer unit/moe/Test__SocketAwareRebalancer.cpp)
 target_link_libraries(v2_test_socket_aware_rebalancer

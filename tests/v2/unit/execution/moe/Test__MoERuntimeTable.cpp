@@ -147,6 +147,38 @@ namespace llaminar2::test
                   static_cast<uint8_t>(DeviceMoEReplicaRole::PreferredReplica));
     }
 
+    TEST(Test__MoERuntimeTable, StableLayerPointerObservesActiveBankMaskFlip)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto *captured_runtime_ptr = table.deviceLayerState(0);
+
+        auto first_update = updateForEpoch(1, 4);
+        first_update.local_compute_mask = {1, 0, 1, 0};
+        ASSERT_TRUE(table.prepareInactiveBank(0, first_update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        auto active_mask = [&]()
+        {
+            const auto &bank = captured_runtime_ptr->banks[captured_runtime_ptr->active_bank];
+            return std::vector<uint8_t>(
+                bank.local_compute_mask,
+                bank.local_compute_mask + captured_runtime_ptr->expert_count);
+        };
+
+        ASSERT_EQ(captured_runtime_ptr, table.deviceLayerState(0));
+        EXPECT_EQ(captured_runtime_ptr->active_epoch, 1u);
+        EXPECT_EQ(active_mask(), (std::vector<uint8_t>{1, 0, 1, 0}));
+
+        auto second_update = updateForEpoch(2, 4);
+        second_update.local_compute_mask = {0, 1, 0, 1};
+        ASSERT_TRUE(table.prepareInactiveBank(0, second_update));
+        ASSERT_TRUE(table.flipActiveBank(0, 2, nullptr));
+
+        ASSERT_EQ(captured_runtime_ptr, table.deviceLayerState(0));
+        EXPECT_EQ(captured_runtime_ptr->active_epoch, 2u);
+        EXPECT_EQ(active_mask(), (std::vector<uint8_t>{0, 1, 0, 1}));
+    }
+
     TEST(Test__MoERuntimeTable, InvalidLayerBoundsAndUpdatesThrowConsistently)
     {
         MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
