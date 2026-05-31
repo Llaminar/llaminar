@@ -712,6 +712,13 @@ namespace llaminar2
         return moe_rebalance_controller_->mode() == MoERebalanceMode::DYNAMIC;
     }
 
+    uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const
+    {
+        if (!moe_rebalance_controller_)
+            return 0;
+        return moe_rebalance_controller_->placementEpoch();
+    }
+
     // =========================================================================
     // Weight and Buffer Configuration
     // =========================================================================

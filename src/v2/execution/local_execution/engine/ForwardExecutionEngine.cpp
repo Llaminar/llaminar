@@ -1107,7 +1107,8 @@ namespace llaminar2
         PrefillGraphCacheKey key;
         key.seq_len = input.seq_len;
         key.device_id = input.device;
-        // Tier 1 defaults: domain_id="single", placement_epoch=0, topology_signature=0
+        key.placement_epoch = host.moePlacementEpoch();
+        // Tier 1 defaults: domain_id="single", topology_signature=0
 
         auto phase = cache.phase(key);
         const int real_seq_len = effectiveRealSeqLen(input);
@@ -1407,6 +1408,7 @@ namespace llaminar2
             PrefillGraphCacheKey key;
             key.seq_len = effective_input.seq_len;
             key.device_id = effective_input.device;
+            key.placement_epoch = host.moePlacementEpoch();
 
             const PrefillGraphRejectReason reject_reason = preflightPrefillGraph(
                 preflight_cache,

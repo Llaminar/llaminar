@@ -1740,6 +1740,9 @@ namespace llaminar2
         /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
         bool isMoeRebalancingActive() const override;
 
+        /** Return the active MoE placement epoch for graph-cache keying. */
+        uint64_t moePlacementEpoch() const override;
+
         // =========================================================================
         // IInferenceRunner Interface Implementation
         // =========================================================================

@@ -445,6 +445,7 @@ TEST(Test__PrefillGraphCacheIntegration, DefaultHostMoERebalancingReturnsFalse)
 {
     MinimalTestHost host;
     EXPECT_FALSE(host.isMoeRebalancingActive());
+    EXPECT_EQ(host.moePlacementEpoch(), 0u);
 }
 
 // =============================================================================
