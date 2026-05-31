@@ -5019,7 +5019,7 @@ if(ZLIB_FOUND)
 
     message(STATUS "V2: Qwen3.5 MoE SingleDevice parity tests enabled")
 
-    # ---- Long-context MoE CPU-vs-ROCm numeric sweep (manual/gated) ----
+    # ---- Long-context MoE CPU-vs-ROCm numeric sweep ----
     add_executable(v2_integration_parity_qwen35moe_long_context
         integration/parity/qwen35moe/Test__Qwen35MoE_LongContext_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -5033,12 +5033,12 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_long_context
         TEST_PREFIX V2_Integration_Parity_Qwen35MoE_LongContext
-        LABELS "V2;Integration;Parity;Qwen35MoE;LongContext;CPU;ROCm;SingleDevice;FullModel;Manual"
+        LABELS "V2;Integration;Parity;Qwen35MoE;LongContext;CPU;ROCm;SingleDevice;FullModel"
         MPI_PROCS 1
         TIMEOUT 1800
     )
 
-    message(STATUS "V2: Qwen3.5 MoE LongContext CPU-vs-ROCm parity sweep enabled (manual/gated)")
+    message(STATUS "V2: Qwen3.5 MoE LongContext CPU-vs-ROCm parity sweep enabled")
 
     # ---- LocalTP MoE Parity (2x ROCm with Expert Parallelism + RCCL) ----
     add_executable(v2_integration_parity_qwen35moe_local_tp

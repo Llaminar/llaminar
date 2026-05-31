@@ -28,14 +28,13 @@
 
 /**
  * @file Test__Qwen35MoE_LongContext_Parity.cpp
- * @brief Gated Qwen3.5 35B MoE long-context CPU-vs-ROCm parity sweep.
+ * @brief Qwen3.5 35B MoE long-context CPU-vs-ROCm parity sweep.
  *
  * Exercises one CPU and one ROCm single-device graph runner over configurable
  * prefill lengths, then drives incremental decode with CPU greedy tokens so
  * both backends receive identical decode input. The test intentionally compares
  * Llaminar CPU against Llaminar ROCm directly rather than using PyTorch
- * snapshots; it is a numeric debugging harness for long-context ROCm drift and
- * is skipped unless LLAMINAR_QWEN35MOE_LONG_CONTEXT_SWEEP=1 is set.
+ * snapshots; it is a numeric debugging harness for long-context ROCm drift.
  *
  * Lifecycle: each backend owns a separate ModelContext and IInferenceRunner so
  * prepared weights, KV caches, and device resources cannot interfere across the
@@ -48,7 +47,6 @@ using namespace llaminar2::test::parity;
 
 namespace
 {
-    constexpr const char *kGateEnv = "LLAMINAR_QWEN35MOE_LONG_CONTEXT_SWEEP";
     constexpr const char *kLengthsEnv = "LLAMINAR_QWEN35MOE_SWEEP_LENGTHS";
     constexpr const char *kDecodeStepsEnv = "LLAMINAR_QWEN35MOE_SWEEP_DECODE_STEPS";
     constexpr const char *kContinueOnFailureEnv = "LLAMINAR_QWEN35MOE_SWEEP_CONTINUE_ON_FAILURE";
@@ -66,7 +64,7 @@ namespace
     constexpr float kRoutingOverlapThreshold = 1.0f;
 
     /**
-     * @brief Runtime knobs for the opt-in sweep.
+     * @brief Runtime knobs for the sweep.
      */
     struct SweepConfig
     {
@@ -134,7 +132,7 @@ namespace
         std::string missing_reason;
     };
 
-    /// @brief Returns true only for the explicit opt-in value used by CI/manual runs.
+    /// @brief Returns true only for explicit boolean runtime knobs.
     bool envFlagEnabled(const char *name)
     {
         const char *value = std::getenv(name);
@@ -1008,17 +1006,13 @@ namespace
 }
 
 /**
- * @brief Gated CPU-vs-ROCm long-context parity fixture for Qwen3.5 MoE.
+ * @brief CPU-vs-ROCm long-context parity fixture for Qwen3.5 MoE.
  */
 class Qwen35MoELongContextParityTest : public ::testing::Test
 {
 protected:
     void SetUp() override
     {
-        if (!envFlagEnabled(kGateEnv))
-        {
-            GTEST_SKIP() << "Set " << kGateEnv << "=1 to run the Qwen3.5 MoE long-context sweep";
-        }
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "ROCm support is not compiled in (HAVE_ROCM=OFF)";
 #else
