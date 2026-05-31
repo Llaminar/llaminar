@@ -59,6 +59,11 @@ namespace llaminar2
         std::string name() const override { return "moe_sparse_dispatch"; }
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return false; }
+        bool isManualGraphBoundary() const override { return true; }
+        bool manualGraphBoundaryComplete() const override
+        {
+            return last_collective_result_.ok && last_collective_result_.collective_complete;
+        }
         bool allowsZeroOutput() const override { return true; }
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
         StageBufferRequirements getBufferRequirements() const override;
@@ -68,6 +73,7 @@ namespace llaminar2
 
     private:
         Params params_;
+        MoEOverlayCollectiveResult last_collective_result_{};
         uint64_t execution_count_ = 0;
     };
 

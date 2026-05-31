@@ -583,6 +583,27 @@ namespace llaminar2
         virtual bool isGraphCapturable() const { return true; }
 
         /**
+         * @brief Whether this manual stage must complete before a following graph segment may run.
+         *
+         * Segmented GPU graph execution runs non-capturable stages between
+         * captured graph segments. Sparse MoE dispatch/return stages are manual
+         * collective boundaries: a later captured continuation segment must not
+         * consume their outputs until every participant has completed the same
+         * collective key.
+         */
+        virtual bool isManualGraphBoundary() const { return false; }
+
+        /**
+         * @brief True when the last manual boundary execution completed globally.
+         *
+         * Only meaningful when isManualGraphBoundary() is true. Direct normal
+         * execution may still accept an incomplete nonblocking collective result,
+         * but segmented graph replay uses this to stop before launching the next
+         * captured segment.
+         */
+        virtual bool manualGraphBoundaryComplete() const { return true; }
+
+        /**
          * @brief Whether this stage allows all-zero output tensors
          *
          * By default, all-zero outputs are treated as bugs (likely uninitialized

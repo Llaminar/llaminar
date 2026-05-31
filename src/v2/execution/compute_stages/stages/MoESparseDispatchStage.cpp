@@ -161,6 +161,8 @@ namespace llaminar2
 
     bool MoESparseDispatchStage::execute(IDeviceContext *ctx)
     {
+        last_collective_result_ = {};
+
         if (!validateHostStagedStage(ctx, params_.device_id, "MoESparseDispatchStage"))
             return false;
         if (!params_.collective_context || !params_.workspace || !params_.inbound_rows)
@@ -277,10 +279,10 @@ namespace llaminar2
         if (MoEExpertOverlayProfiler::isEnabled())
             t_dispatch_start = std::chrono::steady_clock::now();
 
-        auto result = params_.collective_context->dispatch(runtime_key, outbound, params_.inbound_rows, ctx);
-        if (!result.ok)
+        last_collective_result_ = params_.collective_context->dispatch(runtime_key, outbound, params_.inbound_rows, ctx);
+        if (!last_collective_result_.ok)
         {
-            LOG_ERROR("[MoESparseDispatchStage] Dispatch collective failed: " << result.error);
+            LOG_ERROR("[MoESparseDispatchStage] Dispatch collective failed: " << last_collective_result_.error);
             return false;
         }
 

@@ -83,6 +83,8 @@ namespace llaminar2
 
     bool MoESparseReturnReduceStage::execute(IDeviceContext *ctx)
     {
+        last_collective_result_ = {};
+
         if (!validateHostStagedStage(ctx, params_.device_id, "MoESparseReturnReduceStage"))
             return false;
         if (!params_.collective_context || !params_.outbound_rows || !params_.inbound_rows)
@@ -126,10 +128,10 @@ namespace llaminar2
         if (MoEExpertOverlayProfiler::isEnabled())
             t_return_start = std::chrono::steady_clock::now();
 
-        auto result = params_.collective_context->returnReduce(runtime_key, outbound, params_.inbound_rows, ctx);
-        if (!result.ok)
+        last_collective_result_ = params_.collective_context->returnReduce(runtime_key, outbound, params_.inbound_rows, ctx);
+        if (!last_collective_result_.ok)
         {
-            LOG_ERROR("[MoESparseReturnReduceStage] Return-reduce collective failed: " << result.error);
+            LOG_ERROR("[MoESparseReturnReduceStage] Return-reduce collective failed: " << last_collective_result_.error);
             return false;
         }
 
@@ -174,7 +176,7 @@ namespace llaminar2
 
         double prof_broadcast_ms = 0.0;
 
-        if (params_.broadcast_after_scatter && result.collective_complete)
+        if (params_.broadcast_after_scatter && last_collective_result_.collective_complete)
         {
             if (!params_.continuation_tp_context)
             {

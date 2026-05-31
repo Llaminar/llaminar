@@ -266,6 +266,13 @@ namespace llaminar2
                     LOG_ERROR("[DeviceGraphCaptureController] Stream-only stage failed: " << stage_name);
                     return false;
                 }
+                if (node->stage->isManualGraphBoundary() &&
+                    !node->stage->manualGraphBoundaryComplete())
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Stream-only manual boundary incomplete: "
+                              << stage_name);
+                    return false;
+                }
                 graph.markCompleted(stage_name);
             }
         }
@@ -431,6 +438,14 @@ namespace llaminar2
                     LOG_ERROR("[DeviceGraphCaptureController] Manual stage failed on replay: " << stage_name);
                     return false;
                 }
+            }
+
+            if (node->stage->isManualGraphBoundary() &&
+                !node->stage->manualGraphBoundaryComplete())
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Manual boundary incomplete on replay: "
+                          << stage_name);
+                return false;
             }
         }
 
@@ -967,6 +982,14 @@ namespace llaminar2
             else if (!node->stage->execute(ctx))
             {
                 LOG_ERROR("[DeviceGraphCaptureController] Capture manual stage failed: " << stage_name);
+                return false;
+            }
+
+            if (node->stage->isManualGraphBoundary() &&
+                !node->stage->manualGraphBoundaryComplete())
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Capture manual boundary incomplete: "
+                          << stage_name);
                 return false;
             }
 
