@@ -119,6 +119,29 @@ TEST(Test__MoERebalanceController, Construction_DynamicMode)
     EXPECT_FALSE(ctrl.shouldRebalance());
 }
 
+TEST(Test__MoERebalanceController, ParticipantVocabularyAliasesLegacySocketState)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/6, /*num_sockets=*/3,
+                          /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
+    MoERebalanceController ctrl(cfg);
+
+    EXPECT_EQ(ctrl.participantCount(), 3);
+    EXPECT_EQ(ctrl.participantDevices(), cfg.sockets);
+    EXPECT_EQ(ctrl.currentParticipantPlacement(), ctrl.currentPlacement());
+    EXPECT_EQ(ctrl.computeExpertMasksForParticipant(2), ctrl.computeExpertMasks(2));
+
+    fillWindowBalanced(*ctrl.histogram(), 16, 2, 6, 2);
+    const auto legacy_replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+
+    auto cfg_alias = cfg;
+    MoERebalanceController alias_ctrl(cfg_alias);
+    fillWindowBalanced(*alias_ctrl.histogram(), 16, 2, 6, 2);
+    const auto participant_replicas =
+        alias_ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+
+    EXPECT_TRUE(participant_replicas.sameReplicaPlacement(legacy_replicas));
+}
+
 TEST(Test__MoERebalanceController, ShouldRebalance_WindowNotFull)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);

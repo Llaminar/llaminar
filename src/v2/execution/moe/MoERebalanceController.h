@@ -125,6 +125,15 @@ namespace llaminar2
         /// Get current global expert-to-socket mapping (used by swap-based rebalance)
         const std::vector<int> &currentPlacement() const { return current_placement_; }
 
+        /// Domain/participant vocabulary alias for new ExpertParallel call sites.
+        const std::vector<int> &currentParticipantPlacement() const { return current_placement_; }
+
+        /// Number of participants in this rebalance domain.
+        int participantCount() const { return static_cast<int>(config_.sockets.size()); }
+
+        /// Devices that back the participants in this rebalance domain.
+        const std::vector<DeviceId> &participantDevices() const { return config_.sockets; }
+
         /// Get the rebalance mode
         MoERebalanceMode mode() const { return config_.mode; }
 
@@ -199,6 +208,12 @@ namespace llaminar2
         /// how many experts each socket gets as replicas.
         /// Returns empty set if no replicas are beneficial.
         ExpertReplicaSet proposeReplicas(int max_replicas_per_socket);
+
+        /// Domain/participant vocabulary alias for replica planning.
+        ExpertReplicaSet proposeReplicasForParticipants(int max_replicas_per_participant)
+        {
+            return proposeReplicas(max_replicas_per_participant);
+        }
 
         /// Get the current active replica set (empty if no replicas configured).
         const ExpertReplicaSet &currentReplicas() const { return current_replicas_; }
