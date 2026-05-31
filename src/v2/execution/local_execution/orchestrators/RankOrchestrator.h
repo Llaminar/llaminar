@@ -428,6 +428,7 @@ namespace llaminar2
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;
         std::string mtpDecodeUnsupportedReason() const override;
+        bool requiresSequentialMTPVerification() const override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
 

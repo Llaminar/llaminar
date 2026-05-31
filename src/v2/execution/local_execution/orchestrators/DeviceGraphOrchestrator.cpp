@@ -3498,6 +3498,23 @@ namespace llaminar2
         return ctx && ctx->degree() > 1;
     }
 
+    bool DeviceGraphOrchestrator::requiresSequentialMTPVerification() const
+    {
+        if (!graph_builder_)
+        {
+            return false;
+        }
+
+        const auto &layer_types = graph_builder_->config().layer_types;
+        return std::any_of(
+            layer_types.begin(),
+            layer_types.end(),
+            [](const std::string &type)
+            {
+                return type == "gdn";
+            });
+    }
+
     IGlobalTPContext *DeviceGraphOrchestrator::globalTPContextForMTPCoordination() const
     {
         if (global_tp_ctx_ && global_tp_ctx_->degree() > 1)

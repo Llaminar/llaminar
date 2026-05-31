@@ -887,43 +887,76 @@ namespace llaminar2
         }
         ++mtp_stats_.draft_steps;
 
-        if (!runner_->setComputeAllPositionLogits(true))
+        int32_t verified_next = -1;
+        if (runner_->requiresSequentialMTPVerification())
         {
-            return fail_after_checkpoint("Runner does not support all-position logits for MTP verification");
-        }
-
-        const std::vector<int32_t> draft_tokens = {first_token, mtp_token};
-        if (!runner_->forward(draft_tokens.data(), static_cast<int>(draft_tokens.size())))
-        {
-            return fail_after_checkpoint("Forward pass failed during MTP verification");
-        }
-        ++mtp_stats_.verifier_runs;
-        mtp_stats_.verifier_token_count += static_cast<uint64_t>(draft_tokens.size());
-        if (!runner_->setComputeAllPositionLogits(false))
-        {
-            return fail_after_checkpoint("Failed to disable all-position logits after MTP verification");
-        }
-
-        int32_t verified_next = runner_->sampleGreedyFromAllPositionLogitsOnDevice(0);
-        if (verified_next < 0)
-        {
-            const float *all_logits = runner_->getAllPositionLogits();
-            if (!all_logits)
+            if (!runner_->forward(&first_token, 1))
             {
-                return fail_after_checkpoint("All-position logits unavailable after MTP verification");
+                return fail_after_checkpoint("Forward pass failed during sequential MTP verification");
+            }
+            ++mtp_stats_.verifier_runs;
+            ++mtp_stats_.verifier_token_count;
+
+            verified_next = runner_->sampleGreedyOnDevice();
+            if (verified_next < 0)
+            {
+                const float *verify_logits = runner_->logits();
+                if (!verify_logits)
+                {
+                    return fail_after_checkpoint("Sequential MTP verifier logits unavailable");
+                }
+                verified_next = sampler_.sample(
+                    verify_logits,
+                    static_cast<size_t>(vocab),
+                    active_sampling_params_);
+            }
+        }
+        else
+        {
+            if (!runner_->setComputeAllPositionLogits(true))
+            {
+                return fail_after_checkpoint("Runner does not support all-position logits for MTP verification");
             }
 
-            const float *verify_row0 = all_logits;
-            verified_next = sampler_.sample(
-                verify_row0,
-                static_cast<size_t>(vocab),
-                active_sampling_params_);
+            const std::vector<int32_t> draft_tokens = {first_token, mtp_token};
+            if (!runner_->forward(draft_tokens.data(), static_cast<int>(draft_tokens.size())))
+            {
+                return fail_after_checkpoint("Forward pass failed during MTP verification");
+            }
+            ++mtp_stats_.verifier_runs;
+            mtp_stats_.verifier_token_count += static_cast<uint64_t>(draft_tokens.size());
+            if (!runner_->setComputeAllPositionLogits(false))
+            {
+                return fail_after_checkpoint("Failed to disable all-position logits after MTP verification");
+            }
+
+            verified_next = runner_->sampleGreedyFromAllPositionLogitsOnDevice(0);
+            if (verified_next < 0)
+            {
+                const float *all_logits = runner_->getAllPositionLogits();
+                if (!all_logits)
+                {
+                    return fail_after_checkpoint("All-position logits unavailable after MTP verification");
+                }
+
+                const float *verify_row0 = all_logits;
+                verified_next = sampler_.sample(
+                    verify_row0,
+                    static_cast<size_t>(vocab),
+                    active_sampling_params_);
+            }
         }
         const bool accepted_second_draft = verified_next == mtp_token;
 
         std::vector<int32_t> accepted_tokens;
         accepted_tokens.push_back(first_token);
         accepted_tokens.push_back(accepted_second_draft ? mtp_token : verified_next);
+
+        if (decode_step_token_budget_ > 0 &&
+            accepted_tokens.size() > static_cast<size_t>(decode_step_token_budget_))
+        {
+            accepted_tokens.resize(static_cast<size_t>(decode_step_token_budget_));
+        }
 
         for (size_t i = 0; i < accepted_tokens.size(); ++i)
         {
@@ -1146,10 +1179,12 @@ namespace llaminar2
         // Enable GPU-side logits skip for decode (GPU sampling avoids full D2H)
         runner_->setSkipLogitsGatherDecode(true);
 
-        for (int i = 0; i < max_new_tokens; ++i)
+        while (static_cast<int>(result.tokens.size()) < max_new_tokens)
         {
             // Use decodeStep() which uses last_token_ internally
+            decode_step_token_budget_ = max_new_tokens - static_cast<int>(result.tokens.size());
             GenerationResult step = decodeStep();
+            decode_step_token_budget_ = 0;
 
             if (!step.error.empty())
             {

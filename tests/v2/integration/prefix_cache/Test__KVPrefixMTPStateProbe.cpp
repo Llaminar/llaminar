@@ -940,35 +940,55 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmokeOptIn)
         GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP smoke";
     }
 
-    OrchestrationConfig config = OrchestrationConfig::defaults();
-    config.model_path = model_path;
-    config.max_seq_len = 16;
-    config.batch_size = 1;
-    config.tp_degree = 1;
-    config.pp_degree = 1;
-    config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
-    config.kv_cache_precision = "auto";
-    config.mtp.enabled = true;
-    config.mtp.draft_tokens = 1;
-
     auto factory = createOrchestrationRunnerFactory();
-    auto runner = factory->createFromOrchestrationConfig(config);
-    ASSERT_NE(runner, nullptr);
-    ASSERT_TRUE(runner->initialize()) << runner->lastError();
-
     SamplingParams greedy;
     greedy.temperature = 0.0f;
     const std::vector<int32_t> prompt = {1, 2};
-    auto result = runner->generate(prompt, 1, greedy);
-    const auto snapshot = runner->prefixStateProbe();
-    runner->shutdown();
 
-    ASSERT_TRUE(result.error.empty()) << result.error;
-    ASSERT_FALSE(result.tokens.empty());
-    ASSERT_LE(result.tokens.size(), 2u);
-    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
-    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
-    EXPECT_GE(snapshot.mtp_rollbacks, 1u);
+    auto make_config = [&](bool enable_mtp)
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = 16;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+        config.kv_cache_precision = "auto";
+        config.mtp.enabled = enable_mtp;
+        config.mtp.draft_tokens = 1;
+        return config;
+    };
+
+    auto run_once = [&](bool enable_mtp,
+                        GenerationResult *result,
+                        PrefixRuntimeStateSnapshot *snapshot)
+    {
+        auto runner = factory->createFromOrchestrationConfig(make_config(enable_mtp));
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        *result = runner->generate(prompt, 2, greedy);
+        *snapshot = runner->prefixStateProbe();
+        runner->shutdown();
+    };
+
+    GenerationResult baseline_result;
+    PrefixRuntimeStateSnapshot baseline_snapshot;
+    run_once(false, &baseline_result, &baseline_snapshot);
+
+    GenerationResult mtp_result;
+    PrefixRuntimeStateSnapshot mtp_snapshot;
+    run_once(true, &mtp_result, &mtp_snapshot);
+
+    ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+    ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
+    ASSERT_FALSE(baseline_result.tokens.empty());
+    ASSERT_FALSE(mtp_result.tokens.empty());
+    EXPECT_EQ(mtp_result.tokens, baseline_result.tokens);
+    EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+    EXPECT_GE(mtp_snapshot.mtp_draft_steps, 1u);
+    EXPECT_GE(mtp_snapshot.mtp_verifier_runs, 1u);
+    EXPECT_GE(mtp_snapshot.mtp_rollbacks, 1u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)
