@@ -219,6 +219,16 @@ namespace
             moe_gate_exps = std::make_shared<FP32Tensor>(std::vector<size_t>{d, moe_intermediate, moe_experts});
             moe_up_exps = std::make_shared<FP32Tensor>(std::vector<size_t>{d, moe_intermediate, moe_experts});
             moe_down_exps = std::make_shared<FP32Tensor>(std::vector<size_t>{moe_intermediate, d, moe_experts});
+            auto fill_moe = [](FP32Tensor &tensor, float scale)
+            {
+                float *data = tensor.mutable_data();
+                for (size_t i = 0; i < tensor.numel(); ++i)
+                    data[i] = scale * static_cast<float>((i % 17) + 1);
+            };
+            fill_moe(*moe_gate, 0.001f);
+            fill_moe(*moe_gate_exps, 0.0007f);
+            fill_moe(*moe_up_exps, 0.0009f);
+            fill_moe(*moe_down_exps, 0.0005f);
 
             terminal_hidden = TestTensorFactory::createFP32Random({1, d});
             embedding = TestTensorFactory::createFP32({1, d});
@@ -780,6 +790,61 @@ namespace
         return frozen;
     }
 
+    std::unique_ptr<FrozenModelWeightSet> makeMoEMTPFrozenWeightSet(
+        const DenseMTPGraphFixture &fixture)
+    {
+        InferenceStrategy strategy;
+        strategy.mode = WeightInferenceMode::SingleDevice;
+        strategy.devices.push_back(DeviceId::cpu());
+
+        ModelWeightSetBuilder builder(strategy);
+        auto add = [&](const std::string &name, TensorBase *tensor, WeightRole role)
+        {
+            WeightBinding binding;
+            binding.identity.canonical_name = name;
+            binding.identity.role = role;
+            binding.identity.layer = inferWeightLayer(name);
+            binding.identity.logical_id = stableWeightLogicalId(name);
+            binding.residency.home_device = DeviceId::cpu();
+            binding.residency.resident_device = DeviceId::cpu();
+            binding.tensor = tensor;
+            binding.immutable = true;
+            builder.addBinding(std::move(binding));
+        };
+
+        add("token_embd.weight", fixture.embedding_table.get(), WeightRole::Embedding);
+        add("output.weight", fixture.lm_head.get(), WeightRole::LMHead);
+
+        constexpr int source_layer = 64;
+        auto add_nextn = [&](const std::string &suffix, TensorBase *tensor, WeightRole role)
+        {
+            add("blk." + std::to_string(source_layer) + "." + suffix, tensor, role);
+        };
+
+        add_nextn("nextn.eh_proj.weight", fixture.fc.get(), WeightRole::Other);
+        add_nextn("nextn.hnorm.weight", fixture.pre_hidden_norm.get(), WeightRole::Norm);
+        add_nextn("nextn.enorm.weight", fixture.pre_embedding_norm.get(), WeightRole::Norm);
+        add_nextn("nextn.shared_head_norm.weight", fixture.final_norm.get(), WeightRole::Norm);
+        add_nextn("attn_norm.weight", fixture.attn_norm.get(), WeightRole::Norm);
+        add_nextn("attn_q.weight", fixture.wq.get(), WeightRole::AttentionQ);
+        add_nextn("attn_k.weight", fixture.wk.get(), WeightRole::AttentionK);
+        add_nextn("attn_v.weight", fixture.wv.get(), WeightRole::AttentionV);
+        add_nextn("attn_output.weight", fixture.wo.get(), WeightRole::AttentionWO);
+        add_nextn("attn_q_norm.weight", fixture.q_norm.get(), WeightRole::Norm);
+        add_nextn("attn_k_norm.weight", fixture.k_norm.get(), WeightRole::Norm);
+        add_nextn("post_attention_norm.weight", fixture.ffn_norm.get(), WeightRole::Norm);
+        add_nextn("ffn_gate_inp.weight", fixture.moe_gate.get(), WeightRole::MoERouter);
+        add_nextn("ffn_gate_exps.weight", fixture.moe_gate_exps.get(), WeightRole::MoEExpertGate);
+        add_nextn("ffn_up_exps.weight", fixture.moe_up_exps.get(), WeightRole::MoEExpertUp);
+        add_nextn("ffn_down_exps.weight", fixture.moe_down_exps.get(), WeightRole::MoEExpertDown);
+
+        auto frozen = std::make_unique<FrozenModelWeightSet>(
+            strategy,
+            builder.freezeBindings());
+        frozen->validateForGraph();
+        return frozen;
+    }
+
     void prepareFrozenGemmWeightsForCPU(
         const FrozenModelWeightSet &frozen,
         PreparedWeightStore &store)
@@ -930,20 +995,19 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
     fixture.config.moe.has_shared_expert = false;
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
-    graph_builder.setWeights(fixture.modelWeights());
+    auto frozen = makeMoEMTPFrozenWeightSet(fixture);
+    auto bindings = makeModelWeightBindings(*frozen);
+    graph_builder.setWeightBindings(bindings);
+    graph_builder.setWeights(toLegacyModelWeights(bindings));
 
-    auto weights = fixture.mtpWeights();
-    weights.fa_block.moe_gate = fixture.moe_gate.get();
-    weights.fa_block.moe_gate_exps = fixture.moe_gate_exps.get();
-    weights.fa_block.moe_up_exps = fixture.moe_up_exps.get();
-    weights.fa_block.moe_down_exps = fixture.moe_down_exps.get();
-    weights.fa_block.gate_proj = nullptr;
-    weights.fa_block.up_proj = nullptr;
-    weights.fa_block.down_proj = nullptr;
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    graph_builder.setPreparedWeightStore(&store);
 
     auto input = fixture.input();
     auto output = fixture.output();
-    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+    ASSERT_FALSE(bindings.mtp.depths.empty());
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
 
     ASSERT_GT(graph.size(), 0u);
     EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head");
@@ -972,20 +1036,19 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(1);
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
-    graph_builder.setWeights(fixture.modelWeights());
+    auto frozen = makeMoEMTPFrozenWeightSet(fixture);
+    auto bindings = makeModelWeightBindings(*frozen);
+    graph_builder.setWeightBindings(bindings);
+    graph_builder.setWeights(toLegacyModelWeights(bindings));
 
-    auto weights = fixture.mtpWeights();
-    weights.fa_block.moe_gate = fixture.moe_gate.get();
-    weights.fa_block.moe_gate_exps = fixture.moe_gate_exps.get();
-    weights.fa_block.moe_up_exps = fixture.moe_up_exps.get();
-    weights.fa_block.moe_down_exps = fixture.moe_down_exps.get();
-    weights.fa_block.gate_proj = nullptr;
-    weights.fa_block.up_proj = nullptr;
-    weights.fa_block.down_proj = nullptr;
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    graph_builder.setPreparedWeightStore(&store);
 
     auto input = fixture.input();
     auto output = fixture.output();
-    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+    ASSERT_FALSE(bindings.mtp.depths.empty());
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
 
     ASSERT_GT(graph.size(), 0u);
     const auto *dispatch_stage = firstStageOfType<MoESparseDispatchStage>(graph);
@@ -1027,6 +1090,65 @@ TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)
     Qwen35Graph graph_builder(fixture.config, fixture.mpi);
 
     auto frozen = makeDenseMTPFrozenWeightSet(fixture);
+    auto bindings = makeModelWeightBindings(*frozen);
+    graph_builder.setWeightBindings(bindings);
+    graph_builder.setWeights(toLegacyModelWeights(bindings));
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    graph_builder.setPreparedWeightStore(&store);
+
+    auto input = fixture.input();
+    auto output = fixture.output();
+    ASSERT_FALSE(bindings.mtp.depths.empty());
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
+    ASSERT_GT(graph.size(), 0u);
+
+    CPUDeviceContext ctx(DeviceId::cpu());
+    DeviceGraphExecutor executor;
+    ASSERT_TRUE(executor.execute(graph, &ctx));
+
+    ASSERT_EQ(fixture.kv_cache->get_cached_tokens(0, 0), 1);
+    const auto layout = fixture.kv_cache->logicalBlockLayout(0, 1);
+    ASSERT_GT(layout.k_bytes, 0u);
+    ASSERT_GT(layout.v_bytes, 0u);
+
+    std::vector<uint8_t> k_payload(layout.k_bytes, 0);
+    std::vector<uint8_t> v_payload(layout.v_bytes, 0);
+    IKVCache::KVCacheLogicalBlockDescriptor desc;
+    desc.layer = 0;
+    desc.seq_idx = 0;
+    desc.logical_token_start = 0;
+    desc.token_count = 1;
+    ASSERT_TRUE(fixture.kv_cache->exportLogicalBlock(
+        desc,
+        k_payload.data(),
+        v_payload.data()));
+
+    auto fp32_abs_sum = [](const std::vector<uint8_t> &bytes)
+    {
+        const auto *values = reinterpret_cast<const float *>(bytes.data());
+        const size_t count = bytes.size() / sizeof(float);
+        float sum = 0.0f;
+        for (size_t i = 0; i < count; ++i)
+            sum += std::abs(values[i]);
+        return sum;
+    };
+    EXPECT_GT(fp32_abs_sum(k_payload), 0.0f);
+    EXPECT_GT(fp32_abs_sum(v_payload), 0.0f);
+}
+
+TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
+{
+    DenseMTPGraphFixture fixture;
+    fixture.config.moe.num_experts = 4;
+    fixture.config.moe.top_k = 2;
+    fixture.config.moe.intermediate_size = 32;
+    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.has_shared_expert = false;
+
+    Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
+    auto frozen = makeMoEMTPFrozenWeightSet(fixture);
     auto bindings = makeModelWeightBindings(*frozen);
     graph_builder.setWeightBindings(bindings);
     graph_builder.setWeights(toLegacyModelWeights(bindings));
