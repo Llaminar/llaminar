@@ -34,6 +34,34 @@ namespace llaminar2
         std::vector<int> expert_to_socket;
     };
 
+    enum class ExpertHistogramSource
+    {
+        DecodeToken,
+        PrefillChunk,
+        SyntheticTest,
+    };
+
+    struct RoutedExpertHistogramMerge
+    {
+        ExpertHistogramSource source = ExpertHistogramSource::SyntheticTest;
+        int layer_idx = -1;
+        int real_token_count = 0;
+        int bucket_token_count = 0;
+        int top_k = 0;
+        int route_stride = 0;
+        bool count_window_tokens = true;
+    };
+
+    struct ExpertHistogramMergeResult
+    {
+        bool ok = false;
+        uint64_t tokens_counted = 0;
+        uint64_t activations_merged = 0;
+        std::string error;
+
+        explicit operator bool() const { return ok; }
+    };
+
     class DecodeExpertHistogram
     {
     public:
@@ -67,6 +95,12 @@ namespace llaminar2
                               const uint64_t *expert_counts,
                               int num_experts,
                               bool count_window_tokens = false);
+
+        /// Merge a routed-token slice into the histogram. Only the leading
+        /// real_token_count rows are counted; padded bucket rows are ignored.
+        ExpertHistogramMergeResult mergeRoutedExpertRows(
+            const int *expert_indices,
+            const RoutedExpertHistogramMerge &merge);
 
         using RuntimeHistogramSyncCallback = std::function<bool()>;
 
@@ -164,5 +198,7 @@ namespace llaminar2
         mutable std::mutex runtime_sync_mutex_;
         std::vector<RuntimeHistogramSyncCallback> runtime_sync_callbacks_;
     };
+
+    using DomainExpertHistogram = DecodeExpertHistogram;
 
 } // namespace llaminar2

@@ -575,3 +575,77 @@ TEST(Test__DecodeExpertHistogram, RuntimeSyncCallbackMergesOnceAndCanAdvanceWind
     EXPECT_EQ(hist.activationCount(0, 0), 2u);
     EXPECT_EQ(hist.activationCount(1, 1), 2u);
 }
+
+TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeCountsOnlyRealRows)
+{
+    auto cfg = makeConfig(2, 8, 2, 8);
+    DomainExpertHistogram hist(cfg);
+
+    const std::vector<int> chunk0_routes = {
+        0, 1,
+        1, 2,
+        2, 3,
+        99, 99};
+    RoutedExpertHistogramMerge chunk0;
+    chunk0.source = ExpertHistogramSource::PrefillChunk;
+    chunk0.layer_idx = 1;
+    chunk0.real_token_count = 3;
+    chunk0.bucket_token_count = 4;
+    chunk0.top_k = 2;
+
+    auto result = hist.mergeRoutedExpertRows(chunk0_routes.data(), chunk0);
+
+    ASSERT_TRUE(result) << result.error;
+    EXPECT_EQ(result.tokens_counted, 3u);
+    EXPECT_EQ(result.activations_merged, 6u);
+    EXPECT_EQ(hist.windowTokenCount(), 3u);
+    EXPECT_EQ(hist.activationCount(1, 0), 1u);
+    EXPECT_EQ(hist.activationCount(1, 1), 2u);
+    EXPECT_EQ(hist.activationCount(1, 2), 2u);
+    EXPECT_EQ(hist.activationCount(1, 3), 1u);
+    EXPECT_EQ(hist.activationCount(1, 7), 0u);
+
+    const std::vector<int> chunk1_routes = {
+        4, 5,
+        5, 6,
+        99, 99,
+        99, 99};
+    RoutedExpertHistogramMerge chunk1 = chunk0;
+    chunk1.real_token_count = 2;
+
+    result = hist.mergeRoutedExpertRows(chunk1_routes.data(), chunk1);
+
+    ASSERT_TRUE(result) << result.error;
+    EXPECT_EQ(result.tokens_counted, 2u);
+    EXPECT_EQ(result.activations_merged, 4u);
+    EXPECT_EQ(hist.windowTokenCount(), 5u);
+    EXPECT_EQ(hist.activationCount(1, 4), 1u);
+    EXPECT_EQ(hist.activationCount(1, 5), 2u);
+    EXPECT_EQ(hist.activationCount(1, 6), 1u);
+    EXPECT_EQ(hist.activationCount(1, 7), 0u);
+}
+
+TEST(Test__DecodeExpertHistogram, PrefillChunkRouteMergeRejectsInvalidRealRowsBeforeMutation)
+{
+    auto cfg = makeConfig(1, 4, 2, 8);
+    DecodeExpertHistogram hist(cfg);
+
+    const std::vector<int> routes = {
+        0, 1,
+        2, 99,
+        3, 3};
+    RoutedExpertHistogramMerge merge;
+    merge.source = ExpertHistogramSource::PrefillChunk;
+    merge.layer_idx = 0;
+    merge.real_token_count = 2;
+    merge.bucket_token_count = 3;
+    merge.top_k = 2;
+
+    auto result = hist.mergeRoutedExpertRows(routes.data(), merge);
+
+    EXPECT_FALSE(result);
+    EXPECT_NE(result.error.find("expert id"), std::string::npos);
+    EXPECT_EQ(hist.windowTokenCount(), 0u);
+    for (int expert = 0; expert < cfg.num_experts; ++expert)
+        EXPECT_EQ(hist.activationCount(0, expert), 0u);
+}

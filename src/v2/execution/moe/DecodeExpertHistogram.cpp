@@ -129,6 +129,85 @@ namespace llaminar2
         }
     }
 
+    ExpertHistogramMergeResult DecodeExpertHistogram::mergeRoutedExpertRows(
+        const int *expert_indices,
+        const RoutedExpertHistogramMerge &merge)
+    {
+        ExpertHistogramMergeResult result;
+
+        if (!expert_indices)
+        {
+            result.error = "expert_indices must not be null";
+            return result;
+        }
+        if (merge.layer_idx < 0 || merge.layer_idx >= config_.num_layers)
+        {
+            result.error = "layer_idx is out of range";
+            return result;
+        }
+        if (merge.real_token_count < 0)
+        {
+            result.error = "real_token_count must be non-negative";
+            return result;
+        }
+        if (merge.bucket_token_count <= 0)
+        {
+            result.error = "bucket_token_count must be positive";
+            return result;
+        }
+        if (merge.bucket_token_count < merge.real_token_count)
+        {
+            result.error = "bucket_token_count must cover real_token_count";
+            return result;
+        }
+        if (merge.top_k <= 0 || merge.top_k > config_.top_k || merge.top_k > MAX_TOP_K)
+        {
+            result.error = "top_k is incompatible with histogram config";
+            return result;
+        }
+
+        const int route_stride = merge.route_stride > 0 ? merge.route_stride : merge.top_k;
+        if (route_stride < merge.top_k)
+        {
+            result.error = "route_stride must be at least top_k";
+            return result;
+        }
+
+        std::vector<uint64_t> counts(static_cast<size_t>(config_.num_experts), 0);
+        for (int token = 0; token < merge.real_token_count; ++token)
+        {
+            const int *row = expert_indices + static_cast<size_t>(token) * static_cast<size_t>(route_stride);
+            for (int slot = 0; slot < merge.top_k; ++slot)
+            {
+                const int expert_id = row[slot];
+                if (expert_id < 0 || expert_id >= config_.num_experts)
+                {
+                    result.error = "expert id is out of range";
+                    return result;
+                }
+                counts[static_cast<size_t>(expert_id)] += 1;
+                result.activations_merged += 1;
+            }
+        }
+
+        mergeLayerCounts(
+            merge.layer_idx,
+            counts.data(),
+            config_.num_experts,
+            /*count_window_tokens=*/false);
+
+        if (merge.count_window_tokens && merge.layer_idx == config_.num_layers - 1 &&
+            merge.real_token_count > 0)
+        {
+            window_token_count_.fetch_add(static_cast<uint64_t>(merge.real_token_count),
+                                          std::memory_order_relaxed);
+            result.tokens_counted = static_cast<uint64_t>(merge.real_token_count);
+        }
+
+        result.ok = true;
+        return result;
+    }
+
     void DecodeExpertHistogram::registerRuntimeHistogramSync(RuntimeHistogramSyncCallback callback)
     {
         if (!callback)
