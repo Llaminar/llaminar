@@ -2059,6 +2059,70 @@ namespace llaminar2
         return primary_logits;
     }
 
+    int RankOrchestrator::sampleGreedyFromMTPLogitsOnDevice()
+    {
+        if (device_runners_.empty())
+        {
+            return -1;
+        }
+        if (device_runners_.size() == 1)
+        {
+            return device_runners_[0] ? device_runners_[0]->sampleGreedyFromMTPLogitsOnDevice() : -1;
+        }
+
+        std::vector<LogitsLocalInfo> local_infos;
+        local_infos.reserve(device_runners_.size());
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner || !runner->hasMTPLogitsLocal())
+            {
+                return -1;
+            }
+
+            LogitsLocalInfo info = runner->getMTPLogitsLocalInfo();
+            if (!info)
+            {
+                return -1;
+            }
+            local_infos.push_back(info);
+        }
+
+        return DeviceSampler::sampleGreedyFromLocalInfos(local_infos, 0);
+    }
+
+    int RankOrchestrator::sampleGreedyFromAllPositionLogitsOnDevice(int row)
+    {
+        if (device_runners_.empty() || row < 0)
+        {
+            return -1;
+        }
+        if (device_runners_.size() == 1)
+        {
+            return device_runners_[0]
+                       ? device_runners_[0]->sampleGreedyFromAllPositionLogitsOnDevice(row)
+                       : -1;
+        }
+
+        std::vector<LogitsLocalInfo> local_infos;
+        local_infos.reserve(device_runners_.size());
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner || !runner->hasAllPositionLogitsLocal())
+            {
+                return -1;
+            }
+
+            LogitsLocalInfo info = runner->getAllPositionLogitsLocalInfo();
+            if (!info)
+            {
+                return -1;
+            }
+            local_infos.push_back(info);
+        }
+
+        return DeviceSampler::sampleGreedyFromLocalInfos(local_infos, row);
+    }
+
     bool RankOrchestrator::setComputeAllPositionLogits(bool enabled)
     {
         if (device_runners_.empty())

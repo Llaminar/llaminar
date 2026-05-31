@@ -1413,6 +1413,30 @@ TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsGatherColumnParallelShards)
     EXPECT_FLOAT_EQ(logits[4], 2.0f);
 }
 
+TEST_F(Test__RankOrchestrator, MultiChildMTPSamplingUsesColumnParallelShardInfos)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_mock_mtp_logits_local(2, {0.1f, 0.4f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner1->set_mock_mtp_logits_local(3, {0.8f, 0.7f, 0.6f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setVocabSize(5);
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_EQ(orchestrator->sampleGreedyFromMTPLogitsOnDevice(), 2);
+}
+
 TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsRejectMixedLocalAndReplicatedShards)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
@@ -1511,6 +1535,40 @@ TEST_F(Test__RankOrchestrator, MultiChildAllPositionLogitsGatherColumnParallelSh
     EXPECT_FLOAT_EQ(logits[7], 4.0f);
     EXPECT_FLOAT_EQ(logits[8], 5.0f);
     EXPECT_FLOAT_EQ(logits[9], 6.0f);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildAllPositionSamplingUsesRequestedColumnParallelShardRow)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner0->set_mock_all_position_logits_local(
+        /*rows=*/2,
+        /*local_vocab=*/2,
+        {0.1f, 0.2f,
+         0.3f, 4.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    runner1->set_mock_all_position_logits_local(
+        /*rows=*/2,
+        /*local_vocab=*/3,
+        {0.5f, 0.4f, 0.1f,
+         5.0f, 0.1f, 0.2f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setVocabSize(5);
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        std::move(model_ctx),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_EQ(orchestrator->sampleGreedyFromAllPositionLogitsOnDevice(0), 2);
+    EXPECT_EQ(orchestrator->sampleGreedyFromAllPositionLogitsOnDevice(1), 2);
+    EXPECT_EQ(orchestrator->sampleGreedyFromAllPositionLogitsOnDevice(2), -1);
 }
 
 TEST_F(Test__RankOrchestrator, MultiChildAllPositionLogitsRejectMixedLocalAndReplicatedShards)

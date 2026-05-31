@@ -1397,9 +1397,9 @@ namespace llaminar2
                 shape.size() >= 2 ? shape[1] : 0,
                 mtp_logits,
                 stream,
-                nullptr,
-                nullptr,
-                0};
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
         }
 
         bool hasAllPositionLogitsLocal() const override
@@ -1427,9 +1427,9 @@ namespace llaminar2
                 shape.size() >= 2 ? shape[1] : 0,
                 state_.all_position_logits_local.get(),
                 stream,
-                nullptr,
-                nullptr,
-                0};
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
         }
 
         /**
