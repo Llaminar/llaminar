@@ -325,7 +325,7 @@ TEST(Test__CUDAHybridKVCacheReset, ClearLayerResetsGDNGPUKernelState)
     expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after clear_layer vs fresh");
 }
 
-TEST(Test__CUDAHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostStateAndPreservesKernels)
+TEST(Test__CUDAHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostAndGPUStateAndPreservesKernels)
 {
     if (!hasCUDA())
         GTEST_SKIP() << "CUDA not available";
@@ -349,19 +349,25 @@ TEST(Test__CUDAHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostStateAn
     auto *rec_ptr = state0->rec_kernel.get();
     ASSERT_NE(conv_ptr, nullptr);
     ASSERT_NE(rec_ptr, nullptr);
+    mutateGDNState(cache.hybrid, /*layer=*/0);
 
     const auto metadata = cache.hybrid->hybridPrefixStateMetadata();
     EXPECT_EQ(metadata.total_layers, 3);
     EXPECT_EQ(metadata.gdn_layers, 2);
     ASSERT_GT(metadata.host_bytes, 0u);
-    EXPECT_EQ(metadata.device_bytes, 0u);
-    EXPECT_FALSE(metadata.has_device_kernel_state);
+    ASSERT_GT(metadata.device_bytes, 0u);
+    EXPECT_TRUE(metadata.has_device_kernel_state);
 
-    std::vector<uint8_t> payload(metadata.host_bytes);
+    std::vector<uint8_t> payload(metadata.host_bytes + metadata.device_bytes);
+    auto *host_payload = payload.data();
+    auto *device_payload = payload.data() + metadata.host_bytes;
     llaminar2::HybridPrefixStateDescriptor desc;
     desc.seq_idx = 0;
     desc.logical_token_count = 4;
-    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(desc, payload.data(), nullptr));
+    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(desc, host_payload, device_payload));
+
+    const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
+    const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
 
     cache.owner->clear();
     EXPECT_EQ(cache.hybrid->getGDNState(0)->conv_kernel.get(), conv_ptr);
@@ -371,13 +377,18 @@ TEST(Test__CUDAHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostStateAn
     EXPECT_FLOAT_EQ(state2->recurrence_state[0], 0.0f);
     EXPECT_FLOAT_EQ(state2->conv_state[0], 0.0f);
 
-    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(desc, payload.data(), nullptr));
+    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(desc, host_payload, device_payload));
     EXPECT_EQ(cache.hybrid->getGDNState(0)->conv_kernel.get(), conv_ptr);
     EXPECT_EQ(cache.hybrid->getGDNState(0)->rec_kernel.get(), rec_ptr);
     EXPECT_FLOAT_EQ(state0->recurrence_state[0], 10.0f);
     EXPECT_FLOAT_EQ(state0->conv_state[0], 11.0f);
     EXPECT_FLOAT_EQ(state2->recurrence_state[0], 20.0f);
     EXPECT_FLOAT_EQ(state2->conv_state[0], 21.0f);
+
+    const auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
+    const auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
+    expectNearVector(actual_conv, expected_conv, 1e-5f, "conv output after hybrid prefix import");
+    expectNearVector(actual_rec, expected_rec, 1e-4f, "recurrence output after hybrid prefix import");
 }
 
 TEST(Test__CUDAHybridKVCacheReset, ClearLayerResetsCompressedFullAttentionEntry)

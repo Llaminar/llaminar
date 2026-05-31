@@ -56,6 +56,10 @@ extern "C"
     void cudaGDN_gpu_free(float *ptr);
     void cudaGDN_gpu_memset_zero(float *ptr, size_t count);
     void cudaGDN_gpu_memset_zero_async(float *ptr, size_t count, void *stream);
+    void cudaGDN_gpu_memcpy(float *dst, const float *src, size_t count);
+    void cudaGDN_gpu_memcpy_async(float *dst, const float *src, size_t count, void *stream);
+    void cudaGDN_gpu_memcpy_d2h(float *host_dst, const float *device_src, size_t count);
+    void cudaGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void cudaGDN_gpu_set_device(int ordinal);
     void cudaGDN_stream_synchronize(void *stream);
 
@@ -94,6 +98,10 @@ namespace llaminar2
             return gpu_state_ != nullptr && state_size_ == required_state_size;
         }
         bool supportsPaddedPrefillRealLength() const override { return true; }
+        size_t stateBytes() const override
+        {
+            return state_size_ > 0 ? static_cast<size_t>(state_size_) * sizeof(float) : 0;
+        }
 
         /// Allocate GPU state buffer for the recurrence state [n_heads * d_k * d_v]
         void allocateState(int state_size)
@@ -252,6 +260,53 @@ namespace llaminar2
         }
 
         void setGPUStream(void *stream) override { stream_ = stream; }
+
+        bool exportState(void *dst_host, void *dst_device, void *stream) const override
+        {
+            if (stateBytes() == 0)
+                return true;
+            auto *dst = static_cast<float *>(dst_host ? dst_host : dst_device);
+            if (!dst || !gpu_state_)
+                return false;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            if (stream)
+            {
+                cudaGDN_gpu_memcpy_d2h_async(dst, gpu_state_, static_cast<size_t>(state_size_), stream);
+                cudaGDN_stream_synchronize(stream);
+            }
+            else
+            {
+                cudaGDN_gpu_memcpy_d2h(dst, gpu_state_, static_cast<size_t>(state_size_));
+            }
+            return true;
+        }
+
+        bool importState(const void *src_host, const void *src_device, void *stream) override
+        {
+            if (stateBytes() == 0)
+                return true;
+            const auto *src = static_cast<const float *>(src_host ? src_host : src_device);
+            if (!src)
+                return false;
+
+            if (!gpu_state_)
+                allocateState(state_size_);
+            if (!gpu_state_)
+                return false;
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            if (stream)
+            {
+                cudaGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
+                cudaGDN_stream_synchronize(stream);
+            }
+            else
+            {
+                cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
+            }
+            return true;
+        }
 
         void bindDeinterleaveWorkspace(float *scratch, size_t scratch_size) override
         {

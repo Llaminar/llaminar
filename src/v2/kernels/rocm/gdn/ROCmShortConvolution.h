@@ -38,7 +38,10 @@ extern "C"
     void rocmGDN_gpu_free(float *ptr);
     void rocmGDN_gpu_memset_zero(float *ptr, size_t count);
     void rocmGDN_gpu_memset_zero_async(float *ptr, size_t count, void *stream);
+    void rocmGDN_gpu_memcpy(float *dst, const float *src, size_t count);
     void rocmGDN_gpu_memcpy_async(float *dst, const float *src, size_t count, void *stream);
+    void rocmGDN_gpu_memcpy_d2h(float *host_dst, const float *device_src, size_t count);
+    void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void rocmGDN_gpu_set_device(int ordinal);
     void rocmGDN_stream_synchronize(void *stream);
 }
@@ -63,6 +66,10 @@ namespace llaminar2
         bool allocateGPUScratch(int scratch_size) override { return allocateScratch(scratch_size); }
         void resetGPUState() override { resetState(); }
         bool supportsPaddedPrefillRealLength() const override { return true; }
+        size_t stateBytes() const override
+        {
+            return state_size_ > 0 ? static_cast<size_t>(state_size_) * sizeof(float) : 0;
+        }
 
         void allocateState(int state_size)
         {
@@ -205,6 +212,53 @@ namespace llaminar2
         }
 
         void setGPUStream(void *stream) override { stream_ = stream; }
+
+        bool exportState(void *dst_host, void *dst_device, void *stream) const override
+        {
+            if (stateBytes() == 0)
+                return true;
+            auto *dst = static_cast<float *>(dst_host ? dst_host : dst_device);
+            if (!dst || !gpu_state_)
+                return false;
+
+            rocmGDN_gpu_set_device(device_ordinal_);
+            if (stream)
+            {
+                rocmGDN_gpu_memcpy_d2h_async(dst, gpu_state_, static_cast<size_t>(state_size_), stream);
+                rocmGDN_stream_synchronize(stream);
+            }
+            else
+            {
+                rocmGDN_gpu_memcpy_d2h(dst, gpu_state_, static_cast<size_t>(state_size_));
+            }
+            return true;
+        }
+
+        bool importState(const void *src_host, const void *src_device, void *stream) override
+        {
+            if (stateBytes() == 0)
+                return true;
+            const auto *src = static_cast<const float *>(src_host ? src_host : src_device);
+            if (!src)
+                return false;
+
+            if (!gpu_state_)
+                allocateState(state_size_);
+            if (!gpu_state_)
+                return false;
+
+            rocmGDN_gpu_set_device(device_ordinal_);
+            if (stream)
+            {
+                rocmGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
+                rocmGDN_stream_synchronize(stream);
+            }
+            else
+            {
+                rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
+            }
+            return true;
+        }
 
         void bindScratchWorkspace(float *scratch, int scratch_size) override
         {
