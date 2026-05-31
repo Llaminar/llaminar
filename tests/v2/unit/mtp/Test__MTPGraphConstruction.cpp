@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include "backends/ComputeBackend.h"
+#include "collective/IGlobalTPContext.h"
 #include "collective/ITPContext.h"
+#include "config/TensorParallelConfig.h"
 #include "execution/compute_stages/stages/MTPConcatStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
@@ -16,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -40,6 +43,60 @@ namespace
     private:
         bool abort_requested_ = false;
     };
+
+    class ScriptedGlobalTPContext : public IGlobalTPContext
+    {
+    public:
+        int degree() const override { return 2; }
+        int myIndex() const override { return 0; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::MPI; }
+        bool allreduce(TensorBase * /*tensor*/) override { return true; }
+        bool broadcast(TensorBase * /*tensor*/, int /*source_index*/ = 0) override { return true; }
+        bool allgather(const TensorBase * /*local_shard*/, TensorBase * /*global_tensor*/) override { return true; }
+
+        MPI_Comm communicator() const override { return MPI_COMM_NULL; }
+        int domainId() const override { return 7; }
+        const std::vector<int> &worldRanks() const override { return world_ranks_; }
+        GlobalDeviceAddress localDevice() const override { return GlobalDeviceAddress::cpu(0, "rank0"); }
+        void barrier() const override {}
+        bool send(const TensorBase * /*tensor*/, int /*dest_index*/) override { return false; }
+        bool recv(TensorBase * /*tensor*/, int /*source_index*/) override { return false; }
+
+        void setRemoteRecordBytes(const void *record, size_t byte_count)
+        {
+            remote_record_.resize(byte_count);
+            std::memcpy(remote_record_.data(), record, byte_count);
+        }
+
+        bool allgatherBytes(const void *send_data, void *recv_data, size_t byte_count) const override
+        {
+            ++allgather_bytes_calls_;
+            if (!send_data || !recv_data || byte_count == 0 || remote_record_.size() != byte_count)
+                return false;
+
+            auto *out = static_cast<uint8_t *>(recv_data);
+            std::memcpy(out, send_data, byte_count);
+            std::memcpy(out + byte_count, remote_record_.data(), byte_count);
+            return true;
+        }
+
+        int allgatherBytesCalls() const { return allgather_bytes_calls_; }
+
+    private:
+        std::vector<int> world_ranks_ = {0, 1};
+        std::vector<uint8_t> remote_record_;
+        mutable int allgather_bytes_calls_ = 0;
+    };
+
+    struct GreedyCandidateRecord
+    {
+        float value = 0.0f;
+        int32_t token = -1;
+        int32_t valid = 0;
+        int32_t reserved = 0;
+    };
+
+    static_assert(sizeof(GreedyCandidateRecord) == 16);
 
     std::unique_ptr<TensorSlice> makeRowParallelSlice(std::unique_ptr<TensorBase> tensor)
     {
@@ -836,6 +893,82 @@ TEST(Test__MTPGraphConstruction, Qwen35PrefillPopulatesRealShiftedMTPKVPayload)
     };
     EXPECT_GT(payload_abs_sum(mtp.kvKData(), mtp.layout.bytes_per_fa_layer_k), 0.0f);
     EXPECT_GT(payload_abs_sum(mtp.kvVData(), mtp.layout.bytes_per_fa_layer_v), 0.0f);
+}
+
+TEST(Test__MTPGraphConstruction, GlobalTPMTPSamplingAllgathersShardCandidates)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            fixture.config.n_heads,
+            fixture.config.n_kv_heads,
+            fixture.config.d_ff,
+            fixture.config.vocab_size,
+            std::vector<DeviceId>{DeviceId::cpu(), DeviceId::cpu()}));
+    fixture.config.local_rank = 0;
+    fixture.config.tp_device_idx = 0;
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.tp_config->forRank(0).vocab_count;
+
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    auto global_tp = std::make_shared<ScriptedGlobalTPContext>();
+    orchestrator.setGlobalTPContext(global_tp);
+    ASSERT_TRUE(orchestrator.supportsMTPTokenCoordination());
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    ASSERT_NE(orchestrator.inferenceState().hidden, nullptr);
+    float *terminal_hidden = orchestrator.inferenceState().hidden->mutable_data();
+    ASSERT_NE(terminal_hidden, nullptr);
+    size_t terminal_hidden_elements = 1;
+    for (size_t dim : orchestrator.inferenceState().hidden->shape())
+        terminal_hidden_elements *= dim;
+    for (size_t i = 0; i < terminal_hidden_elements; ++i)
+        terminal_hidden[i] = 0.01f * static_cast<float>((i % 17) + 1);
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/3));
+
+    const float *local_logits = orchestrator.mtpLogits();
+    ASSERT_NE(local_logits, nullptr);
+    const int local_vocab = fixture.config.vocab_local;
+    ASSERT_GT(local_vocab, 0);
+
+    GreedyCandidateRecord local_best;
+    local_best.value = local_logits[0];
+    local_best.token = 0;
+    local_best.valid = 1;
+    for (int i = 1; i < local_vocab; ++i)
+    {
+        if (local_logits[i] > local_best.value)
+        {
+            local_best.value = local_logits[i];
+            local_best.token = i;
+        }
+    }
+
+    GreedyCandidateRecord remote_best;
+    remote_best.value = local_best.value + 1000.0f;
+    remote_best.token = fixture.config.tp_config->forRank(1).vocab_start + 5;
+    remote_best.valid = 1;
+    global_tp->setRemoteRecordBytes(&remote_best, sizeof(remote_best));
+
+    EXPECT_EQ(orchestrator.sampleGreedyFromMTPLogitsOnDevice(), remote_best.token);
+    EXPECT_EQ(global_tp->allgatherBytesCalls(), 1);
 }
 
 TEST(Test__MTPGraphConstruction, PrefixHarvestPersistsAndRestoresShiftedMTPKVPayload)
