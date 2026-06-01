@@ -136,6 +136,20 @@ Latest ROCm dense evidence:
     `context=mtp_shifted_prefill`, 1773 replay calls, about 2.50 ms/call.
   - The next performance target is the captured main-verifier graph's GPU work
     and completion sync, not host launch overhead or sidecar decode overhead.
+- Split final-sync diagnostic:
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-syncsplit-n8-release-bench.json`
+  and `/tmp/llaminar-mtp-bench/dense-rocm-mtp-syncsplit-n8-release-stats.json`.
+  - Decode reached 11.94 tok/s, consistent with the other `-n 8` MTP runs.
+  - Main-verifier final sync averaged about 112.40 ms/call.
+  - The capture-stream wait accounts for essentially all of that:
+    `stream=capture` averaged about 112.40 ms/call, while `stream=default`
+    averaged about 1.6 us/call.
+  - Decode-sidecar final sync is also capture-stream dominated but small:
+    about 3.12 ms/call on `stream=capture` versus about 13 us/call on
+    `stream=default`.
+  - This rules out a stray default-stream wait as the verifier blocker. The
+    captured verifier graph's GPU work and graph-completion semantics are the
+    optimization target.
 - Regression coverage:
   - `V2_Unit_MTPGraphConstruction` now includes
     `CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse`, which proves a
@@ -162,14 +176,18 @@ Latest ROCm dense evidence:
     `AllPositionShortContinuationPublishesVerifierCacheLookupStats`, which
     locks in cache hit/miss stats for the all-position two-token verifier
     shape used by greedy MTP.
+  - `V2_Unit_ForwardGraphTypes` also includes
+    `ReplayPhasePerfStatsSplitFinalStreamSync`, which locks in per-stream final
+    sync timers for graph replay diagnostics.
 
 Next graph-capture questions:
 
 - Can the two-token verifier use a true batched/two-row decode GEMV/GDN kernel
   inside the captured graph instead of serial M=1 row launches or prefill-style
   kernels?
-- Can captured verifier replay avoid a full stream-boundary wait until the
-  sampler needs logits, or is the 112 ms final sync entirely real GPU work?
+- Can captured verifier replay reduce the capture-stream completion time by
+  shrinking the captured two-token verifier graph, fusing M=2 kernels, or
+  removing unnecessary work before logits sampling?
 - For LocalTP/LocalPP/MoE, can collective/manual stages be graph captured or made
   explicit hard boundaries without falling back silently?
 
