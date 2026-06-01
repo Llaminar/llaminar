@@ -5127,6 +5127,15 @@ namespace llaminar2
                    : nullptr;
     }
 
+    int DeviceGraphOrchestrator::moeRebalanceParticipantId() const
+    {
+        if (const auto *global_ctx = globalTPContextForMTPCoordination())
+            return global_ctx->myIndex();
+        if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+            return mpi_ctx_->rank();
+        return 0;
+    }
+
     void DeviceGraphOrchestrator::initializeExpertPayloadProvider()
     {
         // Count MoE stages to decide if a provider is needed

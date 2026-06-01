@@ -822,6 +822,7 @@ namespace llaminar2
         std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
         MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const override;
+        int moeRebalanceParticipantId() const override;
 
         /// Apply expert masks to all MoEExpertComputeStages in cached FFN graphs.
         /// Called after rebalancing to update which experts each rank computes.

@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -146,6 +147,41 @@ namespace llaminar2
         {
             const size_t hashed = std::hash<std::string>{}(domain_name);
             return static_cast<int>(hashed & 0x3fffffffU);
+        }
+
+        std::string sanitizeDomainToken(std::string value)
+        {
+            for (char &ch : value)
+            {
+                if (!std::isalnum(static_cast<unsigned char>(ch)))
+                    ch = '_';
+            }
+            return value;
+        }
+
+        std::string localTPRebalanceDomainId(const ILocalTPContext &ctx)
+        {
+            std::ostringstream oss;
+            oss << "local_tp";
+            for (const auto &device : ctx.devices())
+                oss << "_" << sanitizeDomainToken(device.toLocalDeviceId().toString());
+            return oss.str();
+        }
+
+        std::string moeRebalanceDomainIdForTP(
+            const ILocalTPContext *local_tp_ctx,
+            const ITPContext *tp_ctx)
+        {
+            if (local_tp_ctx && local_tp_ctx->degree() > 1)
+                return localTPRebalanceDomainId(*local_tp_ctx);
+
+            if (const auto *global_tp_ctx = dynamic_cast<const IGlobalTPContext *>(tp_ctx))
+            {
+                if (global_tp_ctx->degree() > 1)
+                    return "global_tp_domain_" + std::to_string(global_tp_ctx->domainId());
+            }
+
+            return "single";
         }
 
         std::vector<std::string> denseMoEDomainNames(const MoEExpertParallelPlan &plan)
@@ -1730,6 +1766,13 @@ namespace llaminar2
                             sockets.push_back(device.toLocalDeviceId());
                         world_size = local_tp_ctx->degree();
                     }
+                    else if (const auto *global_tp_ctx =
+                                 dynamic_cast<const IGlobalTPContext *>(graph_config.tp_ctx))
+                    {
+                        world_size = global_tp_ctx->degree();
+                        for (int participant = 0; participant < world_size; ++participant)
+                            sockets.push_back(DeviceId(DeviceType::CPU, participant));
+                    }
                     else
                     {
                         for (int s = 0; s < world_size; ++s)
@@ -1742,6 +1785,7 @@ namespace llaminar2
                         initial_placement[e] = std::min(e / std::max(1, experts_per_socket), world_size - 1);
 
                     MoERebalanceController::Config ctrl_config;
+                    ctrl_config.domain_id = moeRebalanceDomainIdForTP(local_tp_ctx, graph_config.tp_ctx);
                     ctrl_config.mode = mode;
                     ctrl_config.num_layers = graph_config.n_layers;
                     ctrl_config.num_experts = graph_config.moe.num_experts;
@@ -1766,6 +1810,7 @@ namespace llaminar2
                     LOG_DEBUG("[InferenceRunner] MoE rebalance controller: mode="
                               << moeRebalanceRuntimeModeToString(rebalance_config.mode)
                               << " max_replicas=" << effective_replicas
+                              << " domain=" << ctrl_config.domain_id
                               << " hot_cache=" << graph_config.moe.hot_expert_cache.toString()
                               << " window=" << rebalance_config.window_size
                               << " experts=" << graph_config.moe.num_experts);

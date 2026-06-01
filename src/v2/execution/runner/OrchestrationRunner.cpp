@@ -2707,7 +2707,7 @@ namespace llaminar2
                 received = transferExpertWeights(manifest, controller->numLayers());
         }
 
-        const int participant_id = mpi_ctx_ ? mpi_ctx_->local_rank() : 0;
+        const int participant_id = runner_ ? runner_->moeRebalanceParticipantId() : 0;
         if (!gpu_cache_masks_by_participant.empty())
         {
             if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks_by_participant, controller->domainId()))

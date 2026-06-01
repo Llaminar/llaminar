@@ -658,6 +658,14 @@ namespace llaminar2
         }
 
         /**
+         * @brief Participant index used for domain-scoped MoE rebalance actions.
+         *
+         * Single-device runners return 0. GlobalTP runners return rank-in-domain,
+         * which is distinct from MPI local rank on multi-node or multi-domain runs.
+         */
+        virtual int moeRebalanceParticipantId() const { return 0; }
+
+        /**
          * @brief Find the longest reusable prefix for a token sequence.
          *
          * Default runners do not support persistent prefix state yet. Concrete

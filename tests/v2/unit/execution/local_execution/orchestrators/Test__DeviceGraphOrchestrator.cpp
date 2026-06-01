@@ -103,6 +103,37 @@ public:
 
 namespace
 {
+    class FakeGlobalTPContext : public IGlobalTPContext
+    {
+    public:
+        FakeGlobalTPContext(int domain_id, int my_index, int degree)
+            : domain_id_(domain_id), my_index_(my_index), degree_(degree)
+        {
+            for (int rank = 0; rank < degree_; ++rank)
+                world_ranks_.push_back(100 + rank);
+        }
+
+        int degree() const override { return degree_; }
+        int myIndex() const override { return my_index_; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::MPI; }
+        MPI_Comm communicator() const override { return MPI_COMM_SELF; }
+        int domainId() const override { return domain_id_; }
+        const std::vector<int> &worldRanks() const override { return world_ranks_; }
+        GlobalDeviceAddress localDevice() const override { return GlobalDeviceAddress::cpu(0); }
+        void barrier() const override {}
+        bool allreduce(TensorBase *) override { return false; }
+        bool broadcast(TensorBase *, int = 0) override { return false; }
+        bool allgather(const TensorBase *, TensorBase *) override { return false; }
+        bool send(const TensorBase *, int) override { return false; }
+        bool recv(TensorBase *, int) override { return false; }
+
+    private:
+        int domain_id_ = 0;
+        int my_index_ = 0;
+        int degree_ = 1;
+        std::vector<int> world_ranks_;
+    };
+
     MoERebalanceController::Config makeMaintenanceMoEConfig(
         MoERebalanceMode mode,
         int num_experts = 8,
@@ -1053,6 +1084,19 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped
     EXPECT_EQ(controllers.front(), controller_ptr);
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("single_cpu_moe"), controller_ptr);
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("other_domain"), nullptr);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesGlobalTPDomainIndex)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    orchestrator->setGlobalTPContext(
+        std::make_shared<FakeGlobalTPContext>(
+            /*domain_id=*/42,
+            /*my_index=*/1,
+            /*degree=*/3));
+
+    EXPECT_EQ(orchestrator->moeRebalanceParticipantId(), 1)
+        << "GlobalTP rebalance must use rank-in-domain, not MPI local rank";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceDomainMismatchFailsBeforeMutation)
