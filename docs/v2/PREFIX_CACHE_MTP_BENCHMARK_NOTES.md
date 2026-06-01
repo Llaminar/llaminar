@@ -21,7 +21,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 | SingleDevice | ROCm | Qwen3.6 MoE 35B | 21.23 | Partial: MTP GPU graphs now survive rollback/restore through the `-n 4` crash reproducer, but replay state is reset after each live-state rewind | N/A | 10.89 | 0.51x decode | `/tmp/llaminar-mtp-bench/moe-rocm-baseline-n4.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n3-fixed.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n4-fixed.json` | Crash fixed by resetting captured forward and MTP sidecar replay state after live prefix restore/truncate. MTP remains slower than baseline with 0% acceptance on this prompt; need sidecar/verifier acceptance and replay-cost work before claiming speedup. |
 | SingleDevice | CUDA `cuda:0` | Qwen3.6 MoE 35B | 27.56 at `-c 64` | Small-context MoE MTP reaches segmented replay with zero manual stages; single-participant rebalance downgrades to observe | N/A | 16.74 | 0.61x decode | `/tmp/llaminar-mtp-bench/moe-cuda-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4-stats.json` | CUDA MoE graph capture is stable at small context, but MTP is slower with 0% acceptance. Need MoE MTP acceptance quality and verifier/rollback cost reduction before speedup claims. |
 | LocalTP | ROCm `rocm:0,rocm:1` | Qwen3.6 dense 27B Q4_K_S | 24.15 at `-c 64` | Not fully captured: verifier graphs detect collectives and disable segmented capture | RCCL collectives currently force non-captured verifier execution (`has_collectives=true`, `collectives_graph_capturable=false`) | 20.46 | 0.85x decode | `/tmp/llaminar-mtp-bench/dense-localtp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-c64-n4-stats.json` | Correct LocalTP MTP with 100% acceptance is present, but collectives prevent segmented graph capture. Need graph-safe RCCL/allreduce capture or explicit optimized manual collective boundaries before speedup claims. |
-| LocalPP | ROCm | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | PP activation transfers must be graph-capturable or explicit manual boundaries | Pending | Pending | Pending | Need local PP MTP verifier path and full graph-capture audit. |
+| LocalPP | ROCm `stage0=rocm:0, stage1=rocm:1` | Qwen3.6 dense 27B Q4_K_S | 20.47 at `-c 64` | Blocked: MTP is a hard fail before prefill on PP topologies | PP activation transfers are present in the baseline path, but MTP graph capture is not attempted | Blocked | N/A | `/tmp/llaminar-mtp-bench/dense-localpp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localpp-rocm-mtp-gpugraphs-c64-n4-hardfail.json` | PP MTP shifted-prefill and verifier execution are not implemented. The previous late stage-1 shifted-cache failure is now a prefill hard-fail with an explicit unsupported-topology message. |
 | NodeLocalTP | CPU sockets | Qwen3.6 dense 27B Q4_K_S | Pending | N/A for GPU graphs | Host/MPI coordination only | Pending | Pending | Pending | Needed for correctness/speed evidence, but not GPU graph-capture gating. |
 | Expert overlay EP | 2x ROCm | Qwen3.6 MoE 35B | Pending | Pending | Sparse dispatch/return graph capture required where ROCm supports it | Pending | Pending | Pending | Need graph-native sparse collectives and MoE MTP sidecar lockstep. |
 | Expert overlay EP | 2x ROCm plus 2x CPU dual-socket | Qwen3.6 MoE 35B | Pending | Pending | Heterogeneous sparse collectives must be graph-aware with hard fail for unsupported legs | Pending | Pending | Pending | Need host-staged sparse return path through `TransferEngine`, then graph capture where possible. |
@@ -230,6 +230,34 @@ Latest LocalTP ROCm dense evidence:
     supports it, or a deliberately optimized manual collective boundary.
   - Current best MTP decode throughput is about 0.85x the same-prompt
     baseline despite perfect acceptance.
+
+Latest LocalPP ROCm dense evidence:
+
+- Baseline: `/tmp/llaminar-mtp-bench/dense-localpp-rocm-baseline-c64-n4.json`.
+  - Model: `/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf`.
+  - Domain: `--define-domain stage0=rocm:0 --define-domain stage1=rocm:1
+    --pp-stage 0=stage0:0-31 --pp-stage 1=stage1:32-63`, `-c 64`,
+    deterministic 9-token prompt, `-n 4`, prefix disabled, MTP disabled.
+  - Prefill 231.91 ms, 38.81 tok/s.
+  - Decode 195.39 ms for 4 tokens, 20.47 tok/s.
+- MTP hard-fail before the fix:
+  `/tmp/llaminar-mtp-bench/dense-localpp-rocm-mtp-gpugraphs-c64-n4.json`.
+  - Same model/domain/context/prompt with `LLAMINAR_GPU_GRAPHS=1 --mtp
+    --mtp-draft-tokens 1`.
+  - Warmup prefill reached stage 1 and failed with
+    `Failed to populate MTP shifted prefill cache`, because PP stage 1 is
+    invoked with transferred hidden state and no token-id pointer.
+- MTP hard-fail after the regression fix:
+  `/tmp/llaminar-mtp-bench/dense-localpp-rocm-mtp-gpugraphs-c64-n4-hardfail.json`.
+  - Same command now fails before prefill forward with
+    `MTP is not enabled for PP topologies; disable MTP or use a supported
+    SingleDevice/TP topology`.
+  - `V2_Unit_PrefillDecodeTransition` includes
+    `MTPPPTopologyFailsBeforePrefillForward`, proving this remains a hard fail
+    and does not enter runner `forward()` or a fallback decode path.
+  - LocalPP MTP remains unimplemented; the next work is a proper PP-aware MTP
+    shifted-prefill and verifier path, then graph-capture/manual-boundary
+    analysis for PP activation transfers.
 
 Latest ROCm MoE evidence:
 

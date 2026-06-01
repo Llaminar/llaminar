@@ -1073,6 +1073,27 @@ namespace
         EXPECT_EQ(runner->prefixStateProbe().mtp_bypasses, 1u);
     }
 
+    TEST_F(Test__PrefillDecodeTransition, MTPPPTopologyFailsBeforePrefillForward)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            "MTP decode is not enabled for PP topologies");
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        EXPECT_FALSE(runner->prefill(prompt));
+        EXPECT_NE(runner->lastError().find("MTP is not enabled for PP topologies"),
+                  std::string::npos);
+        EXPECT_EQ(mock->forwardCallCount(), 0)
+            << "Unsupported PP MTP must fail before shifted-prefill sidecar state is populated";
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+
+        auto probe = runner->prefixStateProbe();
+        EXPECT_TRUE(probe.mtp_config_enabled);
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_EQ(probe.mtp_bypasses, 0u);
+    }
+
     TEST_F(Test__PrefillDecodeTransition, MTPBypassForRunnerTopologyReasonPreservesGreedyDecode)
     {
         auto [runner, mock] = createRunner(

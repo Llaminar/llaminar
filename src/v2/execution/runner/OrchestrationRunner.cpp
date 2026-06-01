@@ -599,6 +599,16 @@ namespace llaminar2
         prefix_request_summary_.enabled = prefix_cache_enabled;
         prefix_request_summary_.requested_tokens = static_cast<int>(prompt_tokens.size());
 
+        if (active_mtp.enabled && runner_)
+        {
+            const std::string unsupported_reason = runner_->mtpDecodeUnsupportedReason();
+            if (unsupported_reason == "MTP decode is not enabled for PP topologies")
+            {
+                return setError(
+                    "MTP is not enabled for PP topologies; disable MTP or use a supported SingleDevice/TP topology");
+            }
+        }
+
         if (prefix_cache_enabled)
         {
             try
