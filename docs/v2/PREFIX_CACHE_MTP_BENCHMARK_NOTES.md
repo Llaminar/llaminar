@@ -19,7 +19,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 | SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP verifier and sidecar reach segmented-graph replay with no manual stages in longer decode runs | N/A | 14.81 | 0.81x decode, diagnostic `-n 4` run | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-forward-cache-n8-release-stats.json` | Opt-in M=2 row-overlap plus perfect-acceptance short run reached 14.81 tok/s, but MTP is still slower than baseline. Main verifier replay is graph captured, yet replay final sync is about 112 ms/call on the `-n 8` run; need true two-row/batched verifier kernels and lower captured verifier GPU/sync time. |
 | SingleDevice | CUDA `cuda:0` | Qwen3.6 dense 27B Q4_K_S | 43.92 at `-c 64` | Small-context dense MTP reaches segmented replay with zero manual stages; default 4096-context run still does not fit this 24 GB device | N/A | 7.46 | 0.17x decode | `/tmp/llaminar-mtp-bench/dense-cuda-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-cuda-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-cuda-mtp-gpugraphs-c64-n4-stats.json` | CUDA graph capture is viable at small context, but MTP is much slower than baseline with 50% acceptance. Need verifier/rollback cost reduction and larger-context evidence on a GPU that fits the model. |
 | SingleDevice | ROCm | Qwen3.6 MoE 35B | 21.23 | Partial: MTP GPU graphs now survive rollback/restore through the `-n 4` crash reproducer, but replay state is reset after each live-state rewind | N/A | 10.89 | 0.51x decode | `/tmp/llaminar-mtp-bench/moe-rocm-baseline-n4.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n3-fixed.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n4-fixed.json` | Crash fixed by resetting captured forward and MTP sidecar replay state after live prefix restore/truncate. MTP remains slower than baseline with 0% acceptance on this prompt; need sidecar/verifier acceptance and replay-cost work before claiming speedup. |
-| SingleDevice | CUDA | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and CUDA availability check. |
+| SingleDevice | CUDA `cuda:0` | Qwen3.6 MoE 35B | 27.56 at `-c 64` | Small-context MoE MTP reaches segmented replay with zero manual stages; single-participant rebalance downgrades to observe | N/A | 16.74 | 0.61x decode | `/tmp/llaminar-mtp-bench/moe-cuda-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4-stats.json` | CUDA MoE graph capture is stable at small context, but MTP is slower with 0% acceptance. Need MoE MTP acceptance quality and verifier/rollback cost reduction before speedup claims. |
 | LocalTP | ROCm | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | Target graph-capturable RCCL/allreduce segments where supported | Pending | Pending | Pending | Need TP-compatible dense MTP sidecar and verifier collectives in identical order. |
 | LocalPP | ROCm | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | PP activation transfers must be graph-capturable or explicit manual boundaries | Pending | Pending | Pending | Need local PP MTP verifier path and full graph-capture audit. |
 | NodeLocalTP | CPU sockets | Qwen3.6 dense 27B Q4_K_S | Pending | N/A for GPU graphs | Host/MPI coordination only | Pending | Pending | Pending | Needed for correctness/speed evidence, but not GPU graph-capture gating. |
@@ -176,6 +176,32 @@ Latest CUDA dense evidence:
   - This proves CUDA small-context graph capture is functioning, but it is not
     close to speedup-ready. Current best MTP decode throughput is about 0.17x
     the same-prompt baseline.
+
+Latest CUDA MoE evidence:
+
+- Baseline: `/tmp/llaminar-mtp-bench/moe-cuda-baseline-c64-n4.json`.
+  - Model: `/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf`.
+  - Device/context: `cuda:0` RTX 3090, `-c 64`, deterministic 9-token
+    prompt, `-n 4`, prefix disabled, MTP disabled.
+  - Prefill 87.89 ms, 102.40 tok/s.
+  - Decode 145.13 ms for 4 tokens, 27.56 tok/s.
+- MTP graph run: `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4.json`.
+  - Same model/device/context/prompt with `LLAMINAR_GPU_GRAPHS=1 --mtp
+    --mtp-draft-tokens 1`.
+  - Prefill 100.68 ms, 89.39 tok/s.
+  - Decode 238.94 ms for 4 tokens, 16.74 tok/s.
+  - MTP counters: 8 draft steps, 0 accepted tokens, 8 rejected tokens,
+    8 rollbacks, 8 verifier runs, 16 verifier tokens, 0% acceptance.
+- Graph stats: `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4-stats.json`
+  and `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4-stats-bench.json`.
+  - Decode segmented phase counters: 12 warmup, 3 capture, 18 replay.
+  - Segmented decode plans included MoE router/expert stages, 0 manual
+    segments, and no collectives in the single-device capture policy.
+  - MTP decode sidecar replay is graph captured and small: one 24-stage
+    capturable segment, about 0.98 ms/call total replay time.
+  - This is a stable graph-captured small-context path, but it is not
+    speedup-ready. Current best MTP decode throughput is about 0.61x the
+    same-prompt baseline, driven by 0% draft acceptance and rollback/replay.
 
 Latest ROCm MoE evidence:
 
