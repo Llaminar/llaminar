@@ -68,6 +68,10 @@ namespace llaminar2
         static std::string csvString(
             const std::vector<std::string> &filters = {});
 
+        static std::string summaryString(
+            const std::vector<std::string> &filters = {},
+            size_t max_records = 120);
+
         static bool writeJson(
             const std::string &path,
             const std::vector<std::string> &filters = {});
@@ -75,6 +79,10 @@ namespace llaminar2
         static bool writeCsv(
             const std::string &path,
             const std::vector<std::string> &filters = {});
+
+        static void printSummary(
+            const std::vector<std::string> &filters = {},
+            size_t max_records = 120);
 
         static bool flushFromEnv();
 

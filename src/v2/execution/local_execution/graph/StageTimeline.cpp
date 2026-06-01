@@ -4,6 +4,7 @@
  */
 
 #include "StageTimeline.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "fort.hpp"
 #include <iostream>
 
@@ -376,6 +377,58 @@ namespace llaminar2
         }
 
         std::cout << table.to_string() << std::flush;
+    }
+
+    void StageTimeline::recordPerfStats(const char *phase_name,
+                                        const char *device_name,
+                                        const char *domain) const
+    {
+        if (!PerfStatsCollector::isEnabled())
+            return;
+
+        const std::string phase = phase_name ? phase_name : "";
+        const std::string device = device_name ? device_name : "";
+        const std::string perf_domain = domain ? domain : "stage_gpu";
+
+        const float total_ms = totalGpuMs();
+        if (total_ms > 0.0f)
+        {
+            PerfStatsCollector::recordTimingNs(
+                perf_domain,
+                "total",
+                static_cast<uint64_t>(static_cast<double>(total_ms) * 1.0e6),
+                phase,
+                device);
+        }
+
+        auto agg = aggregateByType();
+        for (const auto &entry : agg)
+        {
+            if (entry.total_ms <= 0.0f)
+                continue;
+            PerfStatsCollector::recordTimingNs(
+                perf_domain,
+                std::string("type.") + entry.type_name,
+                static_cast<uint64_t>(static_cast<double>(entry.total_ms) * 1.0e6),
+                phase,
+                device,
+                {{"stage_count", std::to_string(entry.count)}});
+        }
+
+        for (size_t i = 0; i < records_.size(); ++i)
+        {
+            const auto &rec = records_[i];
+            if (!rec.valid || rec.gpu_ms <= 0.0f)
+                continue;
+            PerfStatsCollector::recordTimingNs(
+                perf_domain,
+                rec.name.empty() ? "(unnamed)" : rec.name,
+                static_cast<uint64_t>(static_cast<double>(rec.gpu_ms) * 1.0e6),
+                phase,
+                device,
+                {{"type", computeStageTypeName(rec.type)},
+                 {"index", std::to_string(i)}});
+        }
     }
 
 } // namespace llaminar2

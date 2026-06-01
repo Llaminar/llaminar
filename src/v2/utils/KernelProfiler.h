@@ -40,6 +40,8 @@
 #include <algorithm>
 
 #include "DebugEnv.h"
+#include "PerfStatsCollector.h"
+#include "ProfilingContext.h"
 #include "fort.hpp"
 
 namespace llaminar2
@@ -201,7 +203,7 @@ namespace llaminar2
          */
         static bool isEnabled()
         {
-            return debugEnv().profile.enabled;
+            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
         }
 
         /**
@@ -246,6 +248,16 @@ namespace llaminar2
                 std::lock_guard<std::mutex> lock(inst.stage_mutex_);
                 inst.stage_stats_[stage].h2d.add(bytes, duration_ns);
             }
+
+            PerfStatsCollector::Tags tags;
+            if (!stage.empty())
+                tags["stage"] = stage;
+            std::string device;
+            if (ProfilingContext::hasDeviceContext())
+                device = ProfilingContext::getCurrentDeviceKey();
+            PerfStatsCollector::addCounter("transfer", "h2d_bytes", static_cast<double>(bytes), {}, device, tags);
+            if (duration_ns > 0)
+                PerfStatsCollector::recordTimingNs("transfer", "h2d", duration_ns, {}, device, std::move(tags));
         }
 
         /**
@@ -270,6 +282,16 @@ namespace llaminar2
                 std::lock_guard<std::mutex> lock(inst.stage_mutex_);
                 inst.stage_stats_[stage].d2h.add(bytes, duration_ns);
             }
+
+            PerfStatsCollector::Tags tags;
+            if (!stage.empty())
+                tags["stage"] = stage;
+            std::string device;
+            if (ProfilingContext::hasDeviceContext())
+                device = ProfilingContext::getCurrentDeviceKey();
+            PerfStatsCollector::addCounter("transfer", "d2h_bytes", static_cast<double>(bytes), {}, device, tags);
+            if (duration_ns > 0)
+                PerfStatsCollector::recordTimingNs("transfer", "d2h", duration_ns, {}, device, std::move(tags));
         }
 
         /**
@@ -653,7 +675,7 @@ namespace llaminar2
         static bool isEnabled()
         {
             // Use DebugEnv for centralized configuration
-            return debugEnv().profile.enabled;
+            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
         }
 
         /**
@@ -702,6 +724,7 @@ namespace llaminar2
                 std::lock_guard<std::mutex> lock(inst.device_mutex_);
                 inst.device_stats_[device].stats[static_cast<size_t>(type)].add(duration_ns);
             }
+            recordUnified(type, duration_ns, device);
         }
 
         /**
@@ -733,6 +756,7 @@ namespace llaminar2
                 std::lock_guard<std::mutex> lock(inst.device_mutex_);
                 inst.device_stats_[device_key].stats[static_cast<size_t>(type)].add(duration_ns);
             }
+            recordUnified(type, duration_ns, device_key);
         }
 
         /**
@@ -1172,6 +1196,34 @@ namespace llaminar2
 
     private:
         KernelProfiler() = default;
+
+        static const char *phaseKey(Phase phase)
+        {
+            switch (phase)
+            {
+            case Phase::PREFILL:
+                return "prefill";
+            case Phase::DECODE:
+                return "decode";
+            case Phase::COMBINED:
+            default:
+                return "combined";
+            }
+        }
+
+        static void recordUnified(KernelType type, uint64_t duration_ns, std::string device_key)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+            if (device_key.empty() && ProfilingContext::hasDeviceContext())
+                device_key = ProfilingContext::getCurrentDeviceKey();
+            PerfStatsCollector::recordTimingNs(
+                "kernel",
+                kernelTypeName(type),
+                duration_ns,
+                phaseKey(current_phase()),
+                std::move(device_key));
+        }
 
         static KernelProfiler &getInstance()
         {

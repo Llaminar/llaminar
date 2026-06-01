@@ -1,4 +1,7 @@
 #include "utils/PerfStatsCollector.h"
+#include "utils/KernelProfiler.h"
+#include "utils/KVCacheProfiler.h"
+#include "utils/WeightLoadingProfiler.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -116,6 +119,54 @@ TEST(Test__PerfStatsCollector, ExportsFilteredJsonAndCsv)
     EXPECT_NE(csv.find("kind,domain,name,phase,device,tags,count,value"), std::string::npos);
     EXPECT_NE(csv.find("counter,mtp,accepted_tokens,decode"), std::string::npos);
     EXPECT_EQ(csv.find("prefix_cache"), std::string::npos);
+}
+
+TEST(Test__PerfStatsCollector, SummaryTableCanBeRequestedByEnv)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_TABLE", "1");
+    PerfStatsCollector::reset();
+
+    ASSERT_TRUE(PerfStatsCollector::isEnabled());
+
+    PerfStatsCollector::addCounter("mtp", "draft_steps", 3.0, "decode", "rocm:0");
+    PerfStatsCollector::recordTimingNs("mtp", "sidecar_forward", 5000, "decode", "rocm:0");
+
+    const std::string summary = PerfStatsCollector::summaryString({"mtp"});
+    EXPECT_NE(summary.find("UNIFIED PERF STATS"), std::string::npos);
+    EXPECT_NE(summary.find("mtp.draft_steps"), std::string::npos);
+    EXPECT_NE(summary.find("mtp.sidecar_forward"), std::string::npos);
+}
+
+TEST(Test__PerfStatsCollector, ExistingProfilersPublishStructuredRecords)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    KernelProfiler::resetAll();
+    KVCacheProfiler::reset();
+    WeightLoadingProfiler::reset();
+
+    KernelProfiler::setCurrentPhase(KernelProfiler::Phase::DECODE);
+    KernelProfiler::record(KernelType::LM_HEAD, 2000, "rocm:0");
+
+    KVCacheProfiler::setCurrentPhase(KVCacheProfiler::Phase::DECODE);
+    KVCacheProfiler::record(KVCacheOpType::APPEND, 3000, 4, 128);
+
+    WeightLoadingProfiler::addDetail("weights.gemm_pack.test", 0.25);
+
+    const auto records = PerfStatsCollector::snapshot();
+    auto has_record = [&](const std::string &domain, const std::string &name)
+    {
+        return std::any_of(records.begin(), records.end(), [&](const auto &record)
+                           {
+                               return record.domain == domain && record.name == name;
+                           });
+    };
+
+    EXPECT_TRUE(has_record("kernel", "LM_HEAD"));
+    EXPECT_TRUE(has_record("kv_cache", "KV_APPEND"));
+    EXPECT_TRUE(has_record("kv_cache", "tokens"));
+    EXPECT_TRUE(has_record("kv_cache", "bytes"));
+    EXPECT_TRUE(has_record("weight_loading", "weights.gemm_pack.test"));
 }
 
 TEST(Test__PerfStatsCollector, FlushFromEnvWritesMachineReadableFiles)

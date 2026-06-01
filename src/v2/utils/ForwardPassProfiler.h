@@ -24,6 +24,7 @@
 #include <iomanip>
 #include <sstream>
 
+#include "PerfStatsCollector.h"
 #include "fort.hpp"
 
 namespace llaminar2
@@ -146,6 +147,7 @@ namespace llaminar2
             decode_setup_dynamic_params_ns_ += timings.setup_dynamic_params_ns;
             decode_setup_graph_reset_ns_ += timings.setup_graph_reset_ns;
             decode_iterations_++;
+            recordUnified("decode", timings);
         }
 
         /**
@@ -165,6 +167,7 @@ namespace llaminar2
             prefill_setup_dynamic_params_ns_ += timings.setup_dynamic_params_ns;
             prefill_setup_graph_reset_ns_ += timings.setup_graph_reset_ns;
             prefill_iterations_++;
+            recordUnified("prefill", timings);
         }
 
         // ----- Reporting -----
@@ -245,6 +248,30 @@ namespace llaminar2
         }
 
     private:
+        static void recordIfNonZero(const char *name, const char *phase, uint64_t ns)
+        {
+            if (ns == 0)
+                return;
+            PerfStatsCollector::recordTimingNs("forward_pass", name, ns, phase);
+        }
+
+        static void recordUnified(const char *phase, const PhaseTimings &timings)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+            recordIfNonZero("setup", phase, timings.setup_ns);
+            recordIfNonZero("execute", phase, timings.execute_ns);
+            recordIfNonZero("sync", phase, timings.sync_ns);
+            recordIfNonZero("setup_workspace", phase, timings.setup_workspace_ns);
+            recordIfNonZero("setup_token_copy", phase, timings.setup_token_copy_ns);
+            recordIfNonZero("setup_stream", phase, timings.setup_stream_ns);
+            recordIfNonZero("setup_dynamic_params", phase, timings.setup_dynamic_params_ns);
+            recordIfNonZero("setup_graph_reset", phase, timings.setup_graph_reset_ns);
+            recordIfNonZero("graph_launch", phase, timings.graph_launch_ns);
+            recordIfNonZero("post_launch", phase, timings.post_launch_ns);
+            recordIfNonZero("stream_sync", phase, timings.stream_sync_ns);
+        }
+
         /**
          * @brief Render a single phase summary table to stdout
          */

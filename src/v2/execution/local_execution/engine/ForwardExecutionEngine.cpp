@@ -20,6 +20,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <cstring>
 #include <iomanip>
@@ -1727,7 +1728,7 @@ namespace llaminar2
         const ForwardInput &input,
         std::chrono::high_resolution_clock::time_point start)
     {
-        if (!debugEnv().gpu_stage_timing ||
+        if (!(debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled()) ||
             !ctx || !ctx->deviceId().is_gpu())
         {
             return;
@@ -1757,6 +1758,8 @@ namespace llaminar2
                              .count();
         std::string dev_str = ctx->deviceId().toString();
         const char *dev_name = dev_str.c_str();
+        const char *phase_name = is_decode ? "decode" : "prefill";
+        timeline.recordPerfStats(phase_name, dev_name, "stage_gpu");
 
         if (is_decode)
         {

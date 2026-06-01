@@ -20,6 +20,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/KernelProfiler.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
@@ -527,7 +528,8 @@ namespace llaminar2
         // GPU Stage Timing: event-based per-stage profiling
         // Gated by policy AND env var. ~1μs CPU overhead per event record.
         // =====================================================================
-        const bool timeline_active = policy.timeline && debugEnv().gpu_stage_timing && ctx->isGPU() && !isGraphCaptureActive();
+        const bool timeline_requested = debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled();
+        const bool timeline_active = policy.timeline && timeline_requested && ctx->isGPU() && !isGraphCaptureActive();
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
         void *timeline_stream = nullptr;
         if (timeline_active)
@@ -537,18 +539,16 @@ namespace llaminar2
             {
                 timeline_stream = timeline_gpu_ctx->defaultStream();
                 stage_timeline_.ensureCapacity(timeline_gpu_ctx, schedule.size());
+                stage_timeline_.resetTimings();
 
-                // Pre-populate stage metadata once — names/types never change
-                if (!stage_timeline_info_populated_)
+                // Stage metadata is graph-shape specific; refresh it for each profiled execution.
+                for (size_t i = 0; i < schedule.size(); ++i)
                 {
-                    for (size_t i = 0; i < schedule.size(); ++i)
-                    {
-                        auto *node = schedule[i].node;
-                        if (node && node->stage)
-                            stage_timeline_.setStageInfo(i, node->name, node->stage->type());
-                    }
-                    stage_timeline_info_populated_ = true;
+                    auto *node = schedule[i].node;
+                    if (node && node->stage)
+                        stage_timeline_.setStageInfo(i, node->name, node->stage->type());
                 }
+                stage_timeline_info_populated_ = true;
             }
         }
 

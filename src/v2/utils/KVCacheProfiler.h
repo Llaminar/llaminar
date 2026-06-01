@@ -13,6 +13,7 @@
 #include <sstream>
 
 #include "DebugEnv.h"
+#include "PerfStatsCollector.h"
 #include "fort.hpp"
 
 namespace llaminar2
@@ -103,7 +104,7 @@ namespace llaminar2
 
         static bool isEnabled()
         {
-            return debugEnv().profile.enabled;
+            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
         }
 
         static void setCurrentPhase(Phase phase)
@@ -143,6 +144,36 @@ namespace llaminar2
             {
                 inst.decode_stats_[idx].add(duration_ns, tokens, bytes);
             }
+
+            const char *phase_key = "unknown";
+            if (phase == Phase::PREFILL)
+                phase_key = "prefill";
+            else if (phase == Phase::DECODE)
+                phase_key = "decode";
+
+            const char *op_name = kvCacheOpTypeName(type);
+            PerfStatsCollector::recordTimingNs(
+                "kv_cache",
+                op_name,
+                duration_ns,
+                phase_key);
+            PerfStatsCollector::Tags tags{{"op", op_name}};
+            if (tokens > 0)
+                PerfStatsCollector::addCounter(
+                    "kv_cache",
+                    "tokens",
+                    static_cast<double>(tokens),
+                    phase_key,
+                    {},
+                    tags);
+            if (bytes > 0)
+                PerfStatsCollector::addCounter(
+                    "kv_cache",
+                    "bytes",
+                    static_cast<double>(bytes),
+                    phase_key,
+                    {},
+                    std::move(tags));
         }
 
         static void reset()

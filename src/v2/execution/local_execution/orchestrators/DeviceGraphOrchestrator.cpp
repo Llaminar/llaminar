@@ -3558,6 +3558,20 @@ namespace llaminar2
                 {{"depth", "0"}});
             ok = execute(graph, ctx);
         }
+        if (ok && state_.device_id.is_gpu() &&
+            (debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled()))
+        {
+            auto &timeline = executor_.stageTimeline();
+            if (timeline.isInitialized())
+            {
+                auto &pool = GPUDeviceContextPool::instance();
+                auto &gpu_ctx = pool.getContext(state_.device_id);
+                timeline.collect(&gpu_ctx);
+                const std::string mtp_phase = "mtp_" + phase;
+                timeline.recordPerfStats(mtp_phase.c_str(), device_key.c_str(), "mtp_stage_gpu");
+                timeline.resetTimings();
+            }
+        }
         return ok;
     }
 

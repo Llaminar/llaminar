@@ -290,6 +290,13 @@ namespace llaminar2
         void printDetailedTimeline(const char *phase_name = "STAGES",
                                    const char *device_name = nullptr) const;
 
+        /**
+         * @brief Export current per-stage GPU event timings into PerfStatsCollector.
+         */
+        void recordPerfStats(const char *phase_name,
+                             const char *device_name = nullptr,
+                             const char *domain = "stage_gpu") const;
+
         bool isInitialized() const { return initialized_; }
 
         /**

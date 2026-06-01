@@ -1225,8 +1225,10 @@ namespace llaminar2
             runner_->flushStageTimeline();
         }
 
-        // Print kernel profiling summary if enabled
-        if (KernelProfiler::isEnabled())
+        const bool print_legacy_profile_tables = debugEnv().profile.enabled;
+
+        // Print kernel profiling summary only for the legacy human-readable profiling mode.
+        if (print_legacy_profile_tables)
         {
             // Kernel profilers accumulate stats across ALL benchmark iterations,
             // but result.prefill_time_ms/decode_time_ms are averages.
@@ -1256,7 +1258,7 @@ namespace llaminar2
         }
 
         // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1)
-        if (KernelProfiler::isEnabled() && runner_)
+        if (print_legacy_profile_tables && runner_)
         {
             const auto *stats = runner_->executorStats();
             if (stats && stats->total_stages_executed > 0)
@@ -1268,7 +1270,7 @@ namespace llaminar2
         }
 
         // Print weight loading profiling if enabled
-        if (KernelProfiler::isEnabled())
+        if (print_legacy_profile_tables)
         {
             std::string wl_summary = WeightLoadingProfiler::getSummary();
             if (!wl_summary.empty())
@@ -1278,7 +1280,7 @@ namespace llaminar2
         }
 
         // Print decode loop inter-step overhead (sampling + broadcast + housekeeping)
-        if (KernelProfiler::isEnabled() && !decode_loop_profile_.empty())
+        if (print_legacy_profile_tables && !decode_loop_profile_.empty())
         {
             const auto &dlp = decode_loop_profile_;
             double avg_sampler_us = dlp.sampler_total_us / dlp.decode_tokens;

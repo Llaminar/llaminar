@@ -1150,8 +1150,15 @@ namespace llaminar2
             // Print forward pass wall-clock profiler (always, when profiling is on)
             if (forward_engine_ && forward_engine_->forwardPassProfiler().hasData())
             {
-                std::string dev_str = state_.device_id.toString();
-                forward_engine_->forwardPassProfiler().printAndReset(dev_str.c_str());
+                if (debugEnv().profile.enabled)
+                {
+                    std::string dev_str = state_.device_id.toString();
+                    forward_engine_->forwardPassProfiler().printAndReset(dev_str.c_str());
+                }
+                else
+                {
+                    forward_engine_->forwardPassProfiler().reset();
+                }
             }
 
             if (!debugEnv().gpu_stage_timing)

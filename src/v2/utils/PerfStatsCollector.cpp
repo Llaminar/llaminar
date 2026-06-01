@@ -7,6 +7,8 @@
 
 #include "DebugEnv.h"
 #include "Logger.h"
+#include "ProfilingContext.h"
+#include "fort.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -14,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -57,6 +60,7 @@ namespace llaminar2
             size_t version = 0;
             size_t json_version = 0;
             size_t csv_version = 0;
+            size_t summary_version = 0;
         };
 
         PerfStatsState &state()
@@ -104,6 +108,28 @@ namespace llaminar2
             const std::string normalized = normalizedEnvValue(value);
             return normalized.empty() || normalized == "0" || normalized == "false" ||
                    normalized == "off" || normalized == "no";
+        }
+
+        bool isSummaryRequested()
+        {
+            return !isFalseyEnvValue(std::getenv("LLAMINAR_PERF_STATS_TABLE")) ||
+                   !isFalseyEnvValue(std::getenv("LLAMINAR_PERF_STATS_SUMMARY"));
+        }
+
+        size_t summaryLimitFromEnv()
+        {
+            const char *env = std::getenv("LLAMINAR_PERF_STATS_TABLE_LIMIT");
+            if (!env)
+                return 120;
+            const std::string normalized = normalizedEnvValue(env);
+            if (normalized.empty() ||
+                !std::all_of(normalized.begin(), normalized.end(), [](unsigned char ch)
+                             { return std::isdigit(ch) != 0; }))
+            {
+                return 120;
+            }
+            const size_t parsed = static_cast<size_t>(std::strtoull(normalized.c_str(), nullptr, 10));
+            return parsed == 0 ? 120 : parsed;
         }
 
         std::string exportPathFromEnv(const char *env_name, const char *default_path)
@@ -223,6 +249,14 @@ namespace llaminar2
             return out.str();
         }
 
+        std::string tagsToDisplay(const PerfStatsCollector::Tags &tags)
+        {
+            const std::string value = tagsToCsv(tags);
+            if (value.size() <= 48)
+                return value;
+            return value.substr(0, 45) + "...";
+        }
+
         bool writeTextFile(const std::string &path, const std::string &contents)
         {
             if (path.empty())
@@ -247,6 +281,7 @@ namespace llaminar2
     bool PerfStatsCollector::isEnabled()
     {
         return debugEnv().profile.enabled ||
+               isSummaryRequested() ||
                exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
                exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv").size() > 0;
     }
@@ -259,6 +294,7 @@ namespace llaminar2
         ++s.version;
         s.json_version = 0;
         s.csv_version = 0;
+        s.summary_version = 0;
     }
 
     void PerfStatsCollector::addCounter(
@@ -424,6 +460,134 @@ namespace llaminar2
         return out.str();
     }
 
+    std::string PerfStatsCollector::summaryString(
+        const std::vector<std::string> &filters,
+        size_t max_records)
+    {
+        auto records = snapshot(filters);
+        if (records.empty())
+            return {};
+
+        std::sort(records.begin(), records.end(), [](const auto &a, const auto &b)
+                  {
+                      const uint64_t a_weight =
+                          a.kind == PerfStatRecord::Kind::Timer ? a.total_ns : static_cast<uint64_t>(a.value);
+                      const uint64_t b_weight =
+                          b.kind == PerfStatRecord::Kind::Timer ? b.total_ns : static_cast<uint64_t>(b.value);
+                      if (a_weight != b_weight)
+                          return a_weight > b_weight;
+                      return std::tie(a.domain, a.name, a.phase, a.device, a.tags) <
+                             std::tie(b.domain, b.name, b.phase, b.device, b.tags);
+                  });
+
+        if (max_records == 0)
+            max_records = records.size();
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+
+        {
+            std::ostringstream title;
+            title << "UNIFIED PERF STATS";
+            if (!filters.empty())
+            {
+                title << " [";
+                for (size_t i = 0; i < filters.size(); ++i)
+                {
+                    if (i > 0)
+                        title << ",";
+                    title << filters[i];
+                }
+                title << "]";
+            }
+            table << title.str() << "" << "" << "" << "" << "" << "" << "" << fort::endr;
+            table[0][0].set_cell_span(8);
+            table[0][0].set_cell_text_align(fort::text_align::center);
+        }
+
+        table << fort::header
+              << "Kind" << "Metric" << "Phase" << "Device" << "Count"
+              << "Value/Total" << "Avg" << "Tags" << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::left);
+        table.column(2).set_cell_text_align(fort::text_align::left);
+        table.column(3).set_cell_text_align(fort::text_align::left);
+        table.column(4).set_cell_text_align(fort::text_align::right);
+        table.column(5).set_cell_text_align(fort::text_align::right);
+        table.column(6).set_cell_text_align(fort::text_align::right);
+        table.column(7).set_cell_text_align(fort::text_align::left);
+
+        auto fmt_ms = [](double ms)
+        {
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(3) << ms << " ms";
+            return out.str();
+        };
+        auto fmt_us = [](double us)
+        {
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(2) << us << " us";
+            return out.str();
+        };
+        auto fmt_value = [](double value)
+        {
+            std::ostringstream out;
+            out << std::setprecision(10) << value;
+            return out.str();
+        };
+
+        const size_t display_count = std::min(records.size(), max_records);
+        for (size_t i = 0; i < display_count; ++i)
+        {
+            const auto &record = records[i];
+            const std::string metric = record.domain + "." + record.name;
+            if (record.kind == PerfStatRecord::Kind::Timer)
+            {
+                const double total_ms = static_cast<double>(record.total_ns) / 1.0e6;
+                const double avg_us = record.count > 0
+                                          ? (static_cast<double>(record.total_ns) / static_cast<double>(record.count)) / 1.0e3
+                                          : 0.0;
+                table << "timer"
+                      << metric
+                      << record.phase
+                      << record.device
+                      << std::to_string(record.count)
+                      << fmt_ms(total_ms)
+                      << fmt_us(avg_us)
+                      << tagsToDisplay(record.tags)
+                      << fort::endr;
+            }
+            else
+            {
+                const double avg = record.count > 0
+                                       ? record.value / static_cast<double>(record.count)
+                                       : 0.0;
+                table << "counter"
+                      << metric
+                      << record.phase
+                      << record.device
+                      << std::to_string(record.count)
+                      << fmt_value(record.value)
+                      << fmt_value(avg)
+                      << tagsToDisplay(record.tags)
+                      << fort::endr;
+            }
+        }
+
+        if (records.size() > display_count)
+        {
+            table << fort::separator;
+            table << "..."
+                  << ("and " + std::to_string(records.size() - display_count) + " more records")
+                  << "" << "" << "" << "" << "" << "" << fort::endr;
+        }
+
+        std::ostringstream out;
+        out << table.to_string();
+        return out.str();
+    }
+
     bool PerfStatsCollector::writeJson(
         const std::string &path,
         const std::vector<std::string> &filters)
@@ -436,6 +600,15 @@ namespace llaminar2
         const std::vector<std::string> &filters)
     {
         return writeTextFile(path, csvString(filters));
+    }
+
+    void PerfStatsCollector::printSummary(
+        const std::vector<std::string> &filters,
+        size_t max_records)
+    {
+        const std::string summary = summaryString(filters, max_records);
+        if (!summary.empty())
+            std::cout << summary << std::flush;
     }
 
     bool PerfStatsCollector::flushFromEnv()
@@ -455,12 +628,14 @@ namespace llaminar2
         size_t version = 0;
         size_t json_version = 0;
         size_t csv_version = 0;
+        size_t summary_version = 0;
         bool empty = true;
         {
             std::lock_guard<std::mutex> lock(s.mutex);
             version = s.version;
             json_version = s.json_version;
             csv_version = s.csv_version;
+            summary_version = s.summary_version;
             empty = s.records.empty();
         }
         if (empty)
@@ -485,6 +660,12 @@ namespace llaminar2
                 s.csv_version = s.version;
             }
         }
+        if (isSummaryRequested() && summary_version != version)
+        {
+            printSummary(filters, summaryLimitFromEnv());
+            std::lock_guard<std::mutex> lock(s.mutex);
+            s.summary_version = s.version;
+        }
         return ok;
     }
 
@@ -501,6 +682,8 @@ namespace llaminar2
           device_(std::move(device)),
           tags_(std::move(tags))
     {
+        if (device_.empty() && ProfilingContext::hasDeviceContext())
+            device_ = ProfilingContext::getCurrentDeviceKey();
         if (enabled_)
             start_ = Clock::now();
     }
