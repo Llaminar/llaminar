@@ -210,6 +210,23 @@ public:
         return moe_placement_epoch_;
     }
 
+    std::vector<MoERebalanceController *> moeRebalanceControllers() const override
+    {
+        if (!moe_rebalance_controller_)
+            return {};
+        return {moe_rebalance_controller_.get()};
+    }
+
+    MoERebalanceController *moeRebalanceControllerForDomain(
+        const std::string &domain_id) const override
+    {
+        if (!moe_rebalance_controller_)
+            return nullptr;
+        return moe_rebalance_controller_->domainId() == domain_id
+                   ? moe_rebalance_controller_.get()
+                   : nullptr;
+    }
+
     PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override
     {
         ++prefix_lookup_calls_;
@@ -344,6 +361,10 @@ public:
     void set_prefix_live_restore_ok(bool ok) { prefix_live_restore_ok_ = ok; }
     void set_prefix_live_truncate_ok(bool ok) { prefix_live_truncate_ok_ = ok; }
     void set_moe_placement_epoch(uint64_t epoch) { moe_placement_epoch_ = epoch; }
+    void set_moe_rebalance_controller(std::unique_ptr<MoERebalanceController> controller)
+    {
+        moe_rebalance_controller_ = std::move(controller);
+    }
     void set_forward_mtp_rendezvous(std::shared_ptr<ForwardMTPRendezvous> rendezvous)
     {
         forward_mtp_rendezvous_ = std::move(rendezvous);
@@ -395,6 +416,7 @@ private:
     bool set_all_position_logits_ok_ = true;
     bool compute_all_position_logits_ = false;
     std::string mtp_unsupported_reason_;
+    std::unique_ptr<MoERebalanceController> moe_rebalance_controller_;
     bool prefix_live_capture_ok_ = true;
     bool prefix_live_restore_ok_ = true;
     bool prefix_live_truncate_ok_ = true;
@@ -777,6 +799,21 @@ static PrefixLookupResult makePrefixHit(int cached_tokens,
     return hit;
 }
 
+static std::unique_ptr<MoERebalanceController> makeDomainController(
+    const std::string &domain_id)
+{
+    MoERebalanceController::Config cfg;
+    cfg.domain_id = domain_id;
+    cfg.mode = MoERebalanceMode::OBSERVE;
+    cfg.num_layers = 1;
+    cfg.num_experts = 2;
+    cfg.top_k = 1;
+    cfg.window_size = 4;
+    cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
+    cfg.initial_expert_to_socket = {0, 1};
+    return std::make_unique<MoERebalanceController>(std::move(cfg));
+}
+
 static std::unique_ptr<MockLocalTPContext> makeTPContextForRunnerCount(int count)
 {
     MockLocalTPContext::Config tp_config;
@@ -1151,6 +1188,38 @@ TEST_F(Test__RankOrchestrator, LocalTPContextReturnsContext)
     ASSERT_NE(mock_tp_ctx_, nullptr);
     EXPECT_EQ(mock_tp_ctx_->degree(), 2);
     EXPECT_EQ(mock_tp_ctx_->backend(), CollectiveBackendType::HOST);
+}
+
+TEST_F(Test__RankOrchestrator, MoERebalanceControllersAreLookupByDomain)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_moe_rebalance_controller(makeDomainController("hot_rocm"));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_moe_rebalance_controller(makeDomainController("cold_cpu"));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    auto controllers = orchestrator->moeRebalanceControllers();
+    ASSERT_EQ(controllers.size(), 2u);
+    EXPECT_EQ(controllers[0]->domainId(), "hot_rocm");
+    EXPECT_EQ(controllers[1]->domainId(), "cold_cpu");
+
+    EXPECT_EQ(orchestrator->moeRebalanceController(), controllers[0])
+        << "Compatibility lookup remains first-controller only";
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("hot_rocm"), controllers[0]);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("cold_cpu"), controllers[1]);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("missing"), nullptr);
 }
 
 TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)

@@ -819,6 +819,9 @@ namespace llaminar2
 
         /// Get MoE rebalance controller (for post-decode logging)
         MoERebalanceController *moeRebalanceController() const { return moe_rebalance_controller_.get(); }
+        std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
+        MoERebalanceController *moeRebalanceControllerForDomain(
+            const std::string &domain_id) const override;
 
         /// Apply expert masks to all MoEExpertComputeStages in cached FFN graphs.
         /// Called after rebalancing to update which experts each rank computes.

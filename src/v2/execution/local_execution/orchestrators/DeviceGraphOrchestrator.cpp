@@ -5086,6 +5086,23 @@ namespace llaminar2
         moe_rebalance_controller_ = std::move(controller);
     }
 
+    std::vector<MoERebalanceController *> DeviceGraphOrchestrator::moeRebalanceControllers() const
+    {
+        if (!moe_rebalance_controller_)
+            return {};
+        return {moe_rebalance_controller_.get()};
+    }
+
+    MoERebalanceController *DeviceGraphOrchestrator::moeRebalanceControllerForDomain(
+        const std::string &domain_id) const
+    {
+        if (!moe_rebalance_controller_)
+            return nullptr;
+        return moe_rebalance_controller_->domainId() == domain_id
+                   ? moe_rebalance_controller_.get()
+                   : nullptr;
+    }
+
     void DeviceGraphOrchestrator::initializeExpertPayloadProvider()
     {
         // Count MoE stages to decide if a provider is needed

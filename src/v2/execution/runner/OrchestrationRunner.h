@@ -209,6 +209,9 @@ namespace llaminar2
 
         /// Get MoE rebalance controller from the underlying DGO (if any)
         MoERebalanceController *moeRebalanceController() const;
+        std::vector<MoERebalanceController *> moeRebalanceControllers() const;
+        MoERebalanceController *moeRebalanceControllerForDomain(
+            const std::string &domain_id) const;
 
         /// Apply rebalanced expert masks to DGO's cached MoEExpertComputeStages
         void applyMoEExpertMasks(

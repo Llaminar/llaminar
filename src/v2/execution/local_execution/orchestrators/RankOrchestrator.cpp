@@ -3693,26 +3693,42 @@ namespace llaminar2
 
     MoERebalanceController *RankOrchestrator::moeRebalanceController() const
     {
-        for (const auto &runner : device_runners_)
+        auto controllers = moeRebalanceControllers();
+        return controllers.empty() ? nullptr : controllers.front();
+    }
+
+    std::vector<MoERebalanceController *> RankOrchestrator::moeRebalanceControllers() const
+    {
+        std::vector<MoERebalanceController *> controllers;
+        auto append_from = [&](const std::vector<std::unique_ptr<IInferenceRunner>> &runners)
         {
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+            for (const auto &runner : runners)
             {
-                if (auto *controller = dgo->moeRebalanceController())
-                    return controller;
+                if (!runner)
+                    continue;
+                for (auto *controller : runner->moeRebalanceControllers())
+                {
+                    if (controller &&
+                        std::find(controllers.begin(), controllers.end(), controller) == controllers.end())
+                    {
+                        controllers.push_back(controller);
+                    }
+                }
             }
-        }
-        for (const auto &runner : pp_stage_runners_)
+        };
+
+        append_from(device_runners_);
+        append_from(pp_stage_runners_);
+        return controllers;
+    }
+
+    MoERebalanceController *RankOrchestrator::moeRebalanceControllerForDomain(
+        const std::string &domain_id) const
+    {
+        for (auto *controller : moeRebalanceControllers())
         {
-            if (auto *rank = dynamic_cast<RankOrchestrator *>(runner.get()))
-            {
-                if (auto *controller = rank->moeRebalanceController())
-                    return controller;
-            }
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
-            {
-                if (auto *controller = dgo->moeRebalanceController())
-                    return controller;
-            }
+            if (controller && controller->domainId() == domain_id)
+                return controller;
         }
         return nullptr;
     }

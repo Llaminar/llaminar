@@ -28,6 +28,7 @@ namespace llaminar2
     struct SamplingParams;
     struct LogitPenalty;
     struct PrefillChunkSchedulerPolicy;
+    class MoERebalanceController;
 
     /**
      * @brief Lightweight view of a device runner's local logits state
@@ -636,6 +637,25 @@ namespace llaminar2
          * ownership, masks, replicas, or runtime-table placement changes.
          */
         virtual uint64_t moePlacementEpoch() const { return 0; }
+
+        /**
+         * @brief Enumerate MoE rebalance controllers owned by this runner.
+         *
+         * Single-device runners return zero or one controller. Composite runners
+         * return every local domain controller so callers can avoid treating the
+         * first available device controller as the multi-domain API.
+         */
+        virtual std::vector<MoERebalanceController *> moeRebalanceControllers() const { return {}; }
+
+        /**
+         * @brief Lookup a MoE rebalance controller by ExpertParallel domain id.
+         */
+        virtual MoERebalanceController *moeRebalanceControllerForDomain(
+            const std::string &domain_id) const
+        {
+            (void)domain_id;
+            return nullptr;
+        }
 
         /**
          * @brief Find the longest reusable prefix for a token sequence.

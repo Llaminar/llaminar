@@ -2544,18 +2544,23 @@ namespace llaminar2
 
     MoERebalanceController *OrchestrationRunner::moeRebalanceController() const
     {
-        if (runner_)
-        {
-            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
-            {
-                return dgo->moeRebalanceController();
-            }
-            if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
-            {
-                return rank->moeRebalanceController();
-            }
-        }
-        return nullptr;
+        auto controllers = moeRebalanceControllers();
+        return controllers.empty() ? nullptr : controllers.front();
+    }
+
+    std::vector<MoERebalanceController *> OrchestrationRunner::moeRebalanceControllers() const
+    {
+        if (!runner_)
+            return {};
+        return runner_->moeRebalanceControllers();
+    }
+
+    MoERebalanceController *OrchestrationRunner::moeRebalanceControllerForDomain(
+        const std::string &domain_id) const
+    {
+        if (!runner_)
+            return nullptr;
+        return runner_->moeRebalanceControllerForDomain(domain_id);
     }
 
     void OrchestrationRunner::applyMoEExpertMasks(

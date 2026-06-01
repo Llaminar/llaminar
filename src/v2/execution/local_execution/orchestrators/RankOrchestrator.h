@@ -738,6 +738,9 @@ namespace llaminar2
         void synchronizeDevices() override;
 
         MoERebalanceController *moeRebalanceController() const;
+        std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
+        MoERebalanceController *moeRebalanceControllerForDomain(
+            const std::string &domain_id) const override;
         void applyMoEExpertMasksForAllDevices(const MoERebalanceController &controller);
         void applyMoEExpertMasksForAllDevices(
             const std::vector<std::vector<std::vector<bool>>> &masks_by_participant);

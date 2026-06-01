@@ -106,6 +106,7 @@ namespace llaminar2
     public:
         struct Config
         {
+            std::string domain_id = "single";
             MoERebalanceMode mode = MoERebalanceMode::OFF;
             int num_layers = 0;
             int num_experts = 0;
@@ -159,6 +160,9 @@ namespace llaminar2
 
         /// Get the originally requested mode before domain safety downgrades.
         MoERebalanceMode requestedMode() const { return requested_mode_; }
+
+        /// Rebalance domain id this controller owns.
+        const std::string &domainId() const { return config_.domain_id; }
 
         /// Get the number of MoE layers
         int numLayers() const { return config_.num_layers; }

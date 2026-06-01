@@ -1036,6 +1036,24 @@ TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochRefreshesPrefixFingerprin
         << "MoE placement epoch changes must invalidate prefix-cache key material";
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+
+    auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::OBSERVE);
+    controller_config.domain_id = "single_cpu_moe";
+    auto controller = std::make_unique<MoERebalanceController>(controller_config);
+    auto *controller_ptr = controller.get();
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+
+    auto controllers = orchestrator->moeRebalanceControllers();
+    ASSERT_EQ(controllers.size(), 1u);
+    EXPECT_EQ(controllers.front(), controller_ptr);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("single_cpu_moe"), controller_ptr);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("other_domain"), nullptr);
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateDefaultsSafeWithoutMoE)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
