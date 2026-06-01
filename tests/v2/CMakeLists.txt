@@ -4268,6 +4268,24 @@ add_v2_test(V2_Perf_CoherenceTransferOverhead
     MPI_PROCS 1  # Benchmarks run locally, no MPI needed
 )
 
+# Prefix-cache / MTP benchmark JSON smoke.
+# Keeps Phase 14 machine-readable benchmark acceptance counters covered without
+# requiring large model files in the performance suite.
+add_executable(v2_perf_prefix_cache_mtp_benchmark performance/Perf__PrefixCacheMTPBenchmark.cpp)
+target_include_directories(v2_perf_prefix_cache_mtp_benchmark PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
+)
+target_link_libraries(v2_perf_prefix_cache_mtp_benchmark
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_PrefixCacheMTP
+    COMMAND $<TARGET_FILE:v2_perf_prefix_cache_mtp_benchmark>
+    LABELS "V2;Performance;Benchmark;PrefixCache;MTP;JSON;Smoke"
+    MPI_PROCS 1
+)
+
 # HostBackend Cross-Vendor Copy Benchmark
 # =============================================================================
 add_executable(v2_perf_host_backend_cross_vendor performance/Perf__HostBackendCrossVendorCopy.cpp)
