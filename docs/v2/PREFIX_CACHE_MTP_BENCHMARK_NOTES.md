@@ -16,7 +16,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
-| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP decode and sidecar are segmented-graph captured with no manual stages | N/A | 14.81 | 0.81x decode, diagnostic `-n 4` run | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-stats.json` | Opt-in M=2 row-overlap plus perfect-acceptance short run reached 14.81 tok/s, but MTP is still slower than baseline. Verifier GPU time is led by GEMM, GDN projection, and fused gate/up, with additional wall/GPU gap; need a true two-row/batched verifier kernel path and lower verifier replay overhead. |
+| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP verifier and sidecar reach segmented-graph replay with no manual stages in longer decode runs | N/A | 14.81 | 0.81x decode, diagnostic `-n 4` run | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-forward-cache-n8-release-stats.json` | Opt-in M=2 row-overlap plus perfect-acceptance short run reached 14.81 tok/s, but MTP is still slower than baseline. Main verifier replay is graph captured, yet replay final sync is about 112 ms/call on the `-n 8` run; need true two-row/batched verifier kernels and lower captured verifier GPU/sync time. |
 | SingleDevice | CUDA | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | N/A | Pending | Pending | Pending | Need first dense CUDA baseline/MTP graph-capture run. |
 | SingleDevice | ROCm | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and MoE MTP sidecar capture audit. |
 | SingleDevice | CUDA | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and CUDA availability check. |
@@ -116,6 +116,26 @@ Latest ROCm dense evidence:
   - This recovers only a small part of the deficit, so profiling overhead is
     not the main blocker. It did expose that GPU stage timing must remain
     opt-in outside explicit profiling runs.
+- Replay-context and verifier-cache diagnostics:
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-forward-cache-release-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-forward-cache-release-stats.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-forward-cache-n8-release-bench.json`,
+  and `/tmp/llaminar-mtp-bench/dense-rocm-mtp-forward-cache-n8-release-stats.json`.
+  - Short `-n 4` run reached 14.76 decode tok/s, but each measured iteration
+    had only one main-verifier miss and one main-verifier hit, so verifier
+    graph replay did not reach steady Phase 3.
+  - Longer `-n 8` run reached 11.98 decode tok/s with 75% acceptance and did
+    reach main-verifier replay: 3 replay calls, one capturable segment, 644
+    stages, zero manual stages.
+  - Main-verifier replay averaged about 119.56 ms/call. Graph launch plus
+    segment bookkeeping averaged about 7.14 ms/call, while final stream sync
+    averaged about 112.38 ms/call.
+  - Decode sidecar replay is graph captured and remains small: 12 replay calls,
+    one capturable 21-stage segment, about 3.24 ms/call total.
+  - Shifted-prefill sidecar replay is also separated now:
+    `context=mtp_shifted_prefill`, 1773 replay calls, about 2.50 ms/call.
+  - The next performance target is the captured main-verifier graph's GPU work
+    and completion sync, not host launch overhead or sidecar decode overhead.
 - Regression coverage:
   - `V2_Unit_MTPGraphConstruction` now includes
     `CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse`, which proves a
@@ -134,12 +154,22 @@ Latest ROCm dense evidence:
   - The same focused integration test covers the opt-in
     `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` native-VNNI row-overlap path against
     the CPU reference before it is used in real-model benchmark experiments.
+  - `V2_Unit_ForwardGraphTypes` includes
+    `CapturedReplayPerfStatsIncludeContextTag`, which locks in structured
+    replay context tags such as `main_verifier`, `mtp_decode_sidecar`, and
+    `mtp_shifted_prefill`.
+  - `V2_Unit_ForwardExecutionEngine` includes
+    `AllPositionShortContinuationPublishesVerifierCacheLookupStats`, which
+    locks in cache hit/miss stats for the all-position two-token verifier
+    shape used by greedy MTP.
 
 Next graph-capture questions:
 
 - Can the two-token verifier use a true batched/two-row decode GEMV/GDN kernel
   inside the captured graph instead of serial M=1 row launches or prefill-style
   kernels?
+- Can captured verifier replay avoid a full stream-boundary wait until the
+  sampler needs logits, or is the 112 ms final sync entirely real GPU work?
 - For LocalTP/LocalPP/MoE, can collective/manual stages be graph captured or made
   explicit hard boundaries without falling back silently?
 
