@@ -76,7 +76,7 @@ namespace llaminar2::cuda
         void *stream);
 
     /**
-     * @brief Launch FP32 MTP concat: output[row] = [hidden[row], embedding[row]].
+     * @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]].
      *
      * @param hidden Device pointer to [rows, hidden_dim].
      * @param embedding Device pointer to [rows, hidden_dim].

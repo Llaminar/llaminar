@@ -341,7 +341,7 @@ namespace llaminar2
         Q_GATE_SPLIT, ///< Split interleaved Q+gate GEMM output into separate buffers
 
         // MTP sidecar
-        MTP_CONCAT, ///< Concatenate normalized terminal hidden and draft embedding rows
+        MTP_CONCAT, ///< Concatenate normalized draft embedding and terminal hidden rows
     };
 
     /**

@@ -269,7 +269,7 @@ namespace llaminar2
             const QGateSplitStage::Params &params);
 
         /**
-         * @brief Create an MTP hidden/embedding concat stage
+         * @brief Create an MTP embedding/hidden concat stage
          */
         static std::unique_ptr<IComputeStage> createMTPConcat(
             const MTPConcatStage::Params &params);

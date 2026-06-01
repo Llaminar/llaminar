@@ -42,7 +42,7 @@ namespace llaminar2::cuda
             }
         }
 
-        /// @brief Concatenate two [rows, hidden_dim] matrices row-wise.
+        /// @brief Concatenate two [rows, hidden_dim] matrices row-wise as [embedding, hidden].
         __global__ void mtpConcatFP32Kernel(
             const float *__restrict__ hidden,
             const float *__restrict__ embedding,
@@ -61,8 +61,8 @@ namespace llaminar2::cuda
                 const size_t dst_offset =
                     (static_cast<size_t>(row) * static_cast<size_t>(hidden_dim) * 2) +
                     static_cast<size_t>(col);
-                output[dst_offset] = hidden[src_offset];
-                output[dst_offset + static_cast<size_t>(hidden_dim)] = embedding[src_offset];
+                output[dst_offset] = embedding[src_offset];
+                output[dst_offset + static_cast<size_t>(hidden_dim)] = hidden[src_offset];
             }
         }
 

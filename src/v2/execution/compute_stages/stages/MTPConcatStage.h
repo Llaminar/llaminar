@@ -1,6 +1,6 @@
 /**
  * @file MTPConcatStage.h
- * @brief Concatenate terminal hidden and draft embedding rows for MTP projection.
+ * @brief Concatenate draft embedding and terminal hidden rows for MTP projection.
  */
 
 #pragma once

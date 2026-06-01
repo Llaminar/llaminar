@@ -655,7 +655,7 @@ namespace llaminar2
      *
      * MTP sidecars are not part of the main transformer layer loop. They still
      * contain a normal full-attention block plus projection/norm weights that
-     * combine the terminal hidden row with the draft-token embedding.
+     * combine the draft-token embedding with the terminal hidden row.
      */
     struct MTPDepthWeights
     {

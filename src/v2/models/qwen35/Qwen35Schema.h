@@ -332,7 +332,7 @@ namespace llaminar2
                 {"mtp_embedding", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding"},
                 {"mtp_norm_hidden", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden"},
                 {"mtp_norm_embedding", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding"},
-                {"mtp_concat", {"1", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized hidden and embedding"},
+                {"mtp_concat", {"1", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized embedding and hidden"},
                 {"mtp_projected", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
                 {"mtp_hidden", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
                 {"mtp_q_raw", {"1", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output"},

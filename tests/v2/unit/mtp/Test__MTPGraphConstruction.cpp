@@ -929,7 +929,7 @@ namespace
     }
 } // namespace
 
-TEST(Test__MTPGraphConstruction, ConcatStageCopiesHiddenThenEmbedding)
+TEST(Test__MTPGraphConstruction, ConcatStageCopiesEmbeddingThenHidden)
 {
     auto hidden = TestTensorFactory::createFP32({2, 3});
     auto embedding = TestTensorFactory::createFP32({2, 3});
@@ -953,8 +953,8 @@ TEST(Test__MTPGraphConstruction, ConcatStageCopiesHiddenThenEmbedding)
     ASSERT_TRUE(stage.execute(&ctx));
 
     const std::vector<float> expected = {
-        1, 2, 3, 101, 102, 103,
-        4, 5, 6, 104, 105, 106};
+        101, 102, 103, 1, 2, 3,
+        104, 105, 106, 4, 5, 6};
     for (size_t i = 0; i < expected.size(); ++i)
         EXPECT_FLOAT_EQ(output->data()[i], expected[i]);
 }

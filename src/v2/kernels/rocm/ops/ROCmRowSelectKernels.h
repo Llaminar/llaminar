@@ -43,7 +43,7 @@ namespace llaminar2::rocm
         int d_model,
         void *stream);
 
-    /** @brief Launch FP32 MTP concat: output[row] = [hidden[row], embedding[row]]. */
+    /** @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]]. */
     bool launchMTPConcatFP32(
         const float *hidden,
         const float *embedding,

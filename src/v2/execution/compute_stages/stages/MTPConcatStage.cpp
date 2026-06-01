@@ -1,6 +1,6 @@
 /**
  * @file MTPConcatStage.cpp
- * @brief Implementation of the MTP hidden/embedding concat stage.
+ * @brief Implementation of the MTP embedding/hidden concat stage.
  */
 
 #include "MTPConcatStage.h"
@@ -139,10 +139,10 @@ namespace llaminar2
                 const size_t src_offset = static_cast<size_t>(row) * hidden_dim;
                 const size_t dst_offset = static_cast<size_t>(row) * hidden_dim * 2;
                 std::memcpy(out_data + dst_offset,
-                            hidden_data + src_offset,
+                            embedding_data + src_offset,
                             static_cast<size_t>(hidden_dim) * sizeof(float));
                 std::memcpy(out_data + dst_offset + hidden_dim,
-                            embedding_data + src_offset,
+                            hidden_data + src_offset,
                             static_cast<size_t>(hidden_dim) * sizeof(float));
             }
         };
@@ -182,8 +182,8 @@ namespace llaminar2
         StageDumpInfo info;
         const size_t rows = static_cast<size_t>(std::max(params_.num_tokens, 0));
         const size_t dim = static_cast<size_t>(std::max(params_.hidden_dim, 0));
-        info.addInput("hidden", params_.hidden, rows, dim);
         info.addInput("embedding", params_.embedding, rows, dim);
+        info.addInput("hidden", params_.hidden, rows, dim);
         info.addOutput("output", params_.output, rows, dim * 2);
         return info;
     }
