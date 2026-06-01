@@ -164,6 +164,24 @@ namespace llaminar2::test
             return plan;
         }
 
+        std::shared_ptr<MoEExpertParallelPlan> continuationOnlyDensePlan()
+        {
+            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            plan->enabled = true;
+            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->continuation_domain = "dense_cont";
+            plan->shared_expert_domain = "dense_cont";
+            plan->residency_policy = ExpertResidencyPolicy::StaticById;
+            plan->domains = {
+                cudaSingleDomain("dense_cont"),
+                cpuSingleFallbackDomain("cpu_routed", 0),
+            };
+            plan->routed_tiers = {
+                tier("cold", "cpu_routed", 0, true),
+            };
+            return plan;
+        }
+
         std::string thrownMessageFor(
             std::shared_ptr<MoEExpertParallelPlan> plan,
             MoEExpertOverlayRuntimeResolverOptions options = {.current_world_rank = 0})
@@ -225,6 +243,12 @@ namespace llaminar2::test
         EXPECT_EQ(cpu_domain->backend, CollectiveBackendType::UPI);
         EXPECT_EQ(rocm_domain->compute_kind, ExpertDomainComputeKind::TensorParallelExperts);
         EXPECT_EQ(cpu_domain->compute_kind, ExpertDomainComputeKind::TensorParallelExperts);
+        EXPECT_TRUE(rocm_domain->routed_rebalance_controller_eligible);
+        EXPECT_EQ(rocm_domain->rebalance_domain_id, "overlay_routed_rocm_hot");
+        EXPECT_EQ(rocm_domain->routed_tier_count, 1);
+        EXPECT_TRUE(cpu_domain->routed_rebalance_controller_eligible);
+        EXPECT_EQ(cpu_domain->rebalance_domain_id, "overlay_routed_cpu_cold");
+        EXPECT_EQ(cpu_domain->routed_tier_count, 1);
         ASSERT_EQ(cpu_domain->participants.size(), 2u);
         EXPECT_EQ(cpu_domain->participants[0].world_rank, 0);
         EXPECT_TRUE(cpu_domain->participants[0].owned_by_current_rank);
@@ -240,6 +264,25 @@ namespace llaminar2::test
         EXPECT_NE(diagnostics.find("continuation_device=ROCm:0"), std::string::npos);
         EXPECT_EQ(diagnostics.find("multi_participant_execution_pending=true"), std::string::npos);
         EXPECT_NE(diagnostics.find("collective_context=ready"), std::string::npos);
+        EXPECT_NE(diagnostics.find("routed_rebalance=overlay_routed_cpu_cold"), std::string::npos);
+    }
+
+    TEST(Test__MoEExpertOverlayRuntimePlan, ContinuationOnlyDomainIsNotRoutedRebalanceEligible)
+    {
+        auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(continuationOnlyDensePlan());
+
+        const auto *dense_domain = runtime_plan->domainForName("dense_cont");
+        const auto *routed_domain = runtime_plan->domainForName("cpu_routed");
+        ASSERT_NE(dense_domain, nullptr);
+        ASSERT_NE(routed_domain, nullptr);
+
+        EXPECT_FALSE(dense_domain->routed_rebalance_controller_eligible);
+        EXPECT_TRUE(dense_domain->rebalance_domain_id.empty());
+        EXPECT_EQ(dense_domain->routed_tier_count, 0);
+
+        EXPECT_TRUE(routed_domain->routed_rebalance_controller_eligible);
+        EXPECT_EQ(routed_domain->rebalance_domain_id, "overlay_routed_cpu_routed");
+        EXPECT_EQ(routed_domain->routed_tier_count, 1);
     }
 
     TEST(Test__MoEExpertOverlayRuntimePlan, LayoutBResolvesCudaContinuationWithRocmAndCpuTiers)

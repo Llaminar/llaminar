@@ -3,6 +3,7 @@
 #include "utils/Logger.h"
 
 #include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <stdexcept>
 
@@ -85,6 +86,21 @@ namespace llaminar2
         {
             return isCpuNodeLocalFallbackDomain(domain) ||
                    isAcceleratorLocalTPTensorParallelDomain(domain);
+        }
+
+        std::string sanitizeDomainToken(std::string value)
+        {
+            for (char &ch : value)
+            {
+                if (!std::isalnum(static_cast<unsigned char>(ch)))
+                    ch = '_';
+            }
+            return value;
+        }
+
+        std::string routedRebalanceDomainId(const std::string &domain_name)
+        {
+            return "overlay_routed_" + sanitizeDomainToken(domain_name);
         }
 
         void validateRootDomainReachable(
@@ -299,6 +315,8 @@ namespace llaminar2
             else
                 out << "current";
             out << " local_reachable_for_mvp=" << (domain.local_reachable_for_mvp ? "true" : "false")
+                << " routed_rebalance="
+                << (domain.routed_rebalance_controller_eligible ? domain.rebalance_domain_id : "not_applicable")
                 << " multi_participant_execution_pending="
                 << (domain.multi_participant_execution_pending ? "true" : "false")
                 << " collective_context="
@@ -382,6 +400,18 @@ namespace llaminar2
             resolved_tier.local_reachable_for_mvp = domain.local_reachable_for_mvp;
             resolved_tier.multi_participant_execution_pending = domain.multi_participant_execution_pending;
             routed_tiers.push_back(std::move(resolved_tier));
+
+            auto domain_it = std::find_if(domains.begin(), domains.end(),
+                                          [&](const auto &resolved_domain)
+                                          {
+                                              return resolved_domain.name == tier.domain;
+                                          });
+            if (domain_it != domains.end())
+            {
+                ++domain_it->routed_tier_count;
+                domain_it->routed_rebalance_controller_eligible = true;
+                domain_it->rebalance_domain_id = routedRebalanceDomainId(domain_it->name);
+            }
         }
 
         auto runtime_plan = std::make_shared<MoEExpertOverlayRuntimePlan>(

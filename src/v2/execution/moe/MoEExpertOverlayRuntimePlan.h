@@ -53,6 +53,10 @@ namespace llaminar2
         bool domain_scoped_collective_context_ready = false;
         bool multi_participant_execution_pending = false;
         std::string pending_reason;
+
+        int routed_tier_count = 0;
+        bool routed_rebalance_controller_eligible = false;
+        std::string rebalance_domain_id;
     };
 
     struct MoEOverlayRuntimeTier

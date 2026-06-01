@@ -651,6 +651,21 @@ add_v2_test(V2_Unit_MoEExpertParallelPlan
     MPI_PROCS 1
 )
 
+# Test: MoE Expert Overlay Runtime Plan - resolved domain roles and rank plans
+add_executable(v2_unit_moe_expert_overlay_runtime_plan
+    unit/execution/moe/Test__MoEExpertOverlayRuntimePlan.cpp
+)
+target_link_libraries(v2_unit_moe_expert_overlay_runtime_plan
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEExpertOverlayRuntimePlan
+    COMMAND $<TARGET_FILE:v2_unit_moe_expert_overlay_runtime_plan>
+    LABELS "V2;Unit;Execution;MoE;ExpertParallel;Configuration"
+    MPI_PROCS 1
+)
+
 # Test: MoE Expert Parallel Planner - static same-layer expert residency planning
 add_executable(v2_unit_moe_expert_parallel_planner unit/execution/moe/Test__MoEExpertParallelPlanner.cpp)
 target_link_libraries(v2_unit_moe_expert_parallel_planner
