@@ -29,6 +29,7 @@
 #ifdef HAVE_ROCM
 #include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "../kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
+#include "../kernels/rocm/ROCmWeightPacker.h"
 #endif
 #ifdef HAVE_CUDA
 #include "../kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
@@ -4618,6 +4619,18 @@ namespace llaminar2
                 continue;
             }
 
+#ifdef HAVE_ROCM
+            if (target_device.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
+            {
+                if (!rocm::ensureIQGridTablesInitialized(target_device.ordinal))
+                {
+                    LOG_ERROR("[WeightManager] GPU pipeline: failed to initialize ROCm IQ grid tables for "
+                              << target_device.to_string());
+                    return false;
+                }
+            }
+#endif
+
             WeightJob job;
             job.name = name;
             job.host_raw_data = tensor->raw_data();
@@ -4661,6 +4674,18 @@ namespace llaminar2
                          << moe_jobs[i].slot_name);
                 continue;
             }
+
+#ifdef HAVE_ROCM
+            if (target_device.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
+            {
+                if (!rocm::ensureIQGridTablesInitialized(target_device.ordinal))
+                {
+                    LOG_ERROR("[WeightManager] GPU pipeline: failed to initialize ROCm IQ grid tables for "
+                              << target_device.to_string());
+                    return false;
+                }
+            }
+#endif
 
             WeightJob job;
             job.name = moe_jobs[i].slot_name;

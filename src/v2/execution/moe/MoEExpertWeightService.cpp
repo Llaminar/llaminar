@@ -1214,6 +1214,18 @@ namespace llaminar2
                     return false;
                 }
 
+#ifdef HAVE_ROCM
+                if (ctx.device_id.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
+                {
+                    if (!rocm::ensureIQGridTablesInitialized(gpu_ordinal))
+                    {
+                        LOG_ERROR("[MoEWeightService::GPU-rebalance] Failed to initialize ROCm IQ grid tables for "
+                                  << ctx.device_id.to_string());
+                        return false;
+                    }
+                }
+#endif
+
                 const int N = static_cast<int>(view->rows());
                 const int K = static_cast<int>(view->cols());
                 const size_t raw_bytes = quantizedViewRawBytes(*view);
@@ -1560,6 +1572,18 @@ namespace llaminar2
                                                                 << " has no VNNI format info — cannot use GPU repack");
                     return false;
                 }
+
+#ifdef HAVE_ROCM
+                if (ctx.device_id.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
+                {
+                    if (!rocm::ensureIQGridTablesInitialized(gpu_ordinal))
+                    {
+                        LOG_ERROR("[MoEWeightService::GPU] Failed to initialize ROCm IQ grid tables for "
+                                  << ctx.device_id.to_string());
+                        return false;
+                    }
+                }
+#endif
 
                 const int N = static_cast<int>(view->rows());
                 const int K = static_cast<int>(view->cols());

@@ -249,6 +249,7 @@ namespace
         int sampleMainLogitsCount() const { return sample_main_logits_count_; }
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
         int sampleAllPositionLogitsCount() const { return sample_all_position_logits_count_; }
+        const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
         int lastForwardSeqLen() const { return last_forward_seq_len_; }
         void enableMTP(bool accept_mtp_token)
@@ -272,9 +273,20 @@ namespace
             supports_mtp_token_coordination_ = true;
             hide_local_logits_ = hide_local_logits;
         }
+        void setCapturedSnapshot(PrefixStateSnapshot snapshot)
+        {
+            captured_snapshot_ = std::move(snapshot);
+            use_captured_snapshot_ = true;
+        }
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
         {
             (void)seq_idx;
+            if (use_captured_snapshot_)
+            {
+                PrefixStateSnapshot snapshot = captured_snapshot_;
+                snapshot.cached_tokens = position_;
+                return snapshot;
+            }
             PrefixStateSnapshot snapshot;
             snapshot.valid = mtp_enabled_;
             snapshot.cached_tokens = position_;
@@ -287,6 +299,7 @@ namespace
             if (!snapshot.valid)
                 return false;
             restore_count_++;
+            last_restored_snapshot_ = snapshot;
             position_ = snapshot.cached_tokens;
             all_position_logits_enabled_ = false;
             return true;
@@ -405,9 +418,12 @@ namespace
         bool column_parallel_logits_{false};
         bool supports_mtp_token_coordination_{false};
         bool hide_local_logits_{false};
+        bool use_captured_snapshot_{false};
         int vocab_start_{0};
         int vocab_local_{VOCAB_SIZE};
         std::string mtp_unsupported_reason_;
+        PrefixStateSnapshot captured_snapshot_;
+        PrefixStateSnapshot last_restored_snapshot_;
         std::vector<int> last_forward_tokens_;
         int last_forward_seq_len_{0};
         int position_{0};
@@ -744,6 +760,59 @@ namespace
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPForcedRejectRestoresHybridPayloadSnapshot)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/false);
+
+        PrefixPayloadLayout hybrid_layout;
+        hybrid_layout.block_size = 5;
+        hybrid_layout.total_layers = 2;
+        hybrid_layout.gdn_layers = 1;
+        hybrid_layout.hybrid_host_state_bytes = 16;
+        hybrid_layout.hybrid_state_bytes = 16;
+        hybrid_layout.includes_hybrid_state = true;
+
+        auto hybrid_storage = std::make_shared<std::vector<uint8_t>>(
+            std::initializer_list<uint8_t>{1, 3, 5, 7, 9, 11, 13, 15});
+
+        PrefixBlockHandle hybrid_block;
+        hybrid_block.key.fingerprint = 0x1234;
+        hybrid_block.key.block_index = 0;
+        hybrid_block.key.token_start = 0;
+        hybrid_block.key.token_count = 5;
+        hybrid_block.layout = hybrid_layout;
+        hybrid_block.total_bytes = hybrid_layout.totalBytes();
+        hybrid_block.hybrid_storage = hybrid_storage;
+        hybrid_block.hybrid_payload = hybrid_storage->data();
+        hybrid_block.has_hybrid_state = true;
+
+        PrefixStateSnapshot checkpoint;
+        checkpoint.valid = true;
+        checkpoint.cached_tokens = 5;
+        checkpoint.blocks.push_back(hybrid_block);
+        mock->setCapturedSnapshot(checkpoint);
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(runner->prefill(prompt));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+        ASSERT_EQ(mock->restoreCount(), 1);
+
+        const PrefixStateSnapshot &restored = mock->lastRestoredSnapshot();
+        ASSERT_TRUE(restored.valid);
+        ASSERT_EQ(restored.blocks.size(), 1u);
+        EXPECT_TRUE(restored.blocks[0].has_hybrid_state);
+        EXPECT_TRUE(restored.blocks[0].layout.includes_hybrid_state);
+        EXPECT_EQ(restored.blocks[0].layout.hybrid_state_bytes, 16u);
+        ASSERT_NE(restored.blocks[0].hybrid_storage, nullptr);
+        EXPECT_EQ(*restored.blocks[0].hybrid_storage, *hybrid_storage);
+        EXPECT_EQ(restored.cached_tokens, static_cast<int>(prompt.size()));
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPBypassForNonGreedySamplingIsRecordedOncePerRequest)

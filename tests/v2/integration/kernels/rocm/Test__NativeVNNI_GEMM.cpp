@@ -254,6 +254,8 @@ namespace
             weights = TestTensorFactory::createQ4_0Random({sz.first, sz.second});
         else if (p.format == "IQ4_NL")
             weights = TestTensorFactory::createIQ4_NLRandom({sz.first, sz.second});
+        else if (p.format == "IQ4_XS")
+            weights = TestTensorFactory::createIQ4_XSRandom({sz.first, sz.second});
         else if (p.format == "Q4_1")
             weights = TestTensorFactory::createQ4_1Random({sz.first, sz.second});
         else if (p.format == "Q5_0")
@@ -612,6 +614,10 @@ namespace
         {"IQ4NL_N64M32x2_Attn05_M128", "IQ4_NL", 896, 896, 128, "N64_M32_2wave", 0.990f},
         {"IQ4NL_N64M32x2_FFNDn7B_M128", "IQ4_NL", 3584, 18944, 128, "N64_M32_2wave", 0.990f},
 
+        // --- IQ4_XS (Qwen3.6 MoE routed down-proj format) ---
+        {"IQ4XS_N64M32x2_Attn05_M128", "IQ4_XS", 896, 896, 128, "N64_M32_2wave", 0.985f},
+        {"IQ4XS_N64M32x2_FFNDn05_M128", "IQ4_XS", 896, 4864, 128, "N64_M32_2wave", 0.985f},
+
         // =====================================================================
         // PATH 7: N64 / M64 / 2-wave  (N <= K, M >= ~256 → m_tile=64)
         //   native_vnni_gemm_kernel, N_TILE=64, M_TILE=64, MIN_BLOCKS=2
@@ -625,6 +631,9 @@ namespace
 
         // --- IQ4_NL ---
         {"IQ4NL_N64M64x2_FFNDn7B_M256", "IQ4_NL", 3584, 18944, 256, "N64_M64_2wave", 0.990f},
+
+        // --- IQ4_XS (Qwen3.6 MoE routed down-proj format) ---
+        {"IQ4XS_N64M64x2_FFNDn05_M256", "IQ4_XS", 896, 4864, 256, "N64_M64_2wave", 0.985f},
 
         // =====================================================================
         // NEW FORMATS: representative coverage (streaming + cooperative paths)
@@ -640,6 +649,12 @@ namespace
         {"Q4_1_Stream_LM05B_M16", "Q4_1", LM_N, 896, 16, "Streaming", 0.990f},
         {"Q4_1_N128M16x3_FFNUp05_M16", "Q4_1", 4864, 896, 16, "N128_M16_3wave", 0.990f},
         {"Q4_1_N64M16x3_Attn05_M32", "Q4_1", 896, 896, 32, "N64_M16_3wave", 0.990f},
+
+        // --- IQ4_XS (Qwen3.6 MoE routed down-proj format) ---
+        {"IQ4XS_Qwen36MoEDown_M2", "IQ4_XS", 512, 256, 2, "Qwen36MoE_DownSmallM", 0.985f},
+        {"IQ4XS_Stream_LM05B_M16", "IQ4_XS", LM_N, 896, 16, "Streaming", 0.985f},
+        {"IQ4XS_N128M16x3_FFNUp05_M16", "IQ4_XS", 4864, 896, 16, "N128_M16_3wave", 0.985f},
+        {"IQ4XS_N64M16x3_Attn05_M32", "IQ4_XS", 896, 896, 32, "N64_M16_3wave", 0.985f},
 
         // --- Q5_0 (5-bit symmetric, Pattern S) ---
         {"Q5_0_Stream_LM05B_M16", "Q5_0", LM_N, 896, 16, "Streaming", 0.990f},
@@ -677,6 +692,7 @@ namespace
         {"IQ3XXS_N64M16x3_Attn05_M32", "IQ3_XXS", 896, 896, 32, "N64_M16_3wave", 0.980f},
 
         // --- IQ2_S (2-bit grid+signs, Pattern D) ---
+        {"IQ2_S_Qwen36MoEGateUp_M2", "IQ2_S", 256, 512, 2, "Qwen36MoE_GateUpSmallM", 0.960f},
         {"IQ2_S_Stream_LM05B_M16", "IQ2_S", LM_N, 896, 16, "Streaming", 0.960f},
         {"IQ2_S_N128M16x3_FFNUp05_M16", "IQ2_S", 4864, 896, 16, "N128_M16_3wave", 0.960f},
         {"IQ2_S_N64M16x3_Attn05_M32", "IQ2_S", 896, 896, 32, "N64_M16_3wave", 0.960f},

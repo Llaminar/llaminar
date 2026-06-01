@@ -50,6 +50,15 @@ namespace llaminar2
         // =================================================================
 
         /**
+         * @brief Initialize ROCm IQ-grid constant tables for all native-VNNI TUs.
+         *
+         * IQ grid formats need per-device LUTs in the GEMV, GEMM, and MoE prefill
+         * translation units. This is normally reached through packNativeVNNI(), but
+         * GPU-pipeline loading bypasses host packing and must call it directly.
+         */
+        bool ensureIQGridTablesInitialized(int device_id);
+
+        /**
          * @brief Pack tensor to native-VNNI layout (internal, called by packWeightsToROCm)
          *
          * Converts any supported ≤6-bit quantized tensor to native-VNNI format:

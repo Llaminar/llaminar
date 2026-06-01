@@ -59,6 +59,65 @@ namespace llaminar2
 {
     namespace rocm
     {
+        bool ensureIQGridTablesInitialized(int device_id)
+        {
+#ifdef HAVE_ROCM
+            static std::mutex iq_grid_mutex;
+            static std::set<int> iq_grids_initialized_devices;
+
+            {
+                std::lock_guard<std::mutex> lock(iq_grid_mutex);
+                if (iq_grids_initialized_devices.find(device_id) != iq_grids_initialized_devices.end())
+                    return true;
+            }
+
+            LOG_DEBUG("[ROCmWeightPacker] Initializing IQ grid LUT tables on device "
+                      << device_id);
+            if (!rocmInitIQGridTables(
+                    device_id,
+                    llaminar2::iq3s_grid,
+                    llaminar2::iq3xxs_grid,
+                    llaminar2::iq2s_grid,
+                    llaminar2::iq2xs_grid,
+                    llaminar2::iq2xxs_grid,
+                    llaminar2::iq1s_grid))
+            {
+                LOG_ERROR("[ROCmWeightPacker] IQ grid GEMV init failed on device " << device_id);
+                return false;
+            }
+            if (!rocmInitIQGridTables_gemm(
+                    device_id,
+                    llaminar2::iq3s_grid,
+                    llaminar2::iq3xxs_grid,
+                    llaminar2::iq2s_grid,
+                    llaminar2::iq2xs_grid,
+                    llaminar2::iq2xxs_grid,
+                    llaminar2::iq1s_grid))
+            {
+                LOG_ERROR("[ROCmWeightPacker] IQ grid GEMM init failed on device " << device_id);
+                return false;
+            }
+            if (!rocmInitIQGridTables_moe_prefill(
+                    device_id,
+                    llaminar2::iq3s_grid,
+                    llaminar2::iq3xxs_grid,
+                    llaminar2::iq2s_grid,
+                    llaminar2::iq2xs_grid,
+                    llaminar2::iq2xxs_grid,
+                    llaminar2::iq1s_grid))
+            {
+                LOG_ERROR("[ROCmWeightPacker] IQ grid MoE prefill init failed on device " << device_id);
+                return false;
+            }
+
+            std::lock_guard<std::mutex> lock(iq_grid_mutex);
+            iq_grids_initialized_devices.insert(device_id);
+            return true;
+#else
+            (void)device_id;
+            return false;
+#endif
+        }
 
         // =================================================================
         // packNativeVNNI: polymorphic metadata + polymorphic block packing
@@ -82,66 +141,13 @@ namespace llaminar2
             // Lazy-initialize IQ grid lookup tables in GPU __constant__ memory
             if (info->codebook_id >= 11 && info->codebook_id <= 17)
             {
-                static std::mutex iq_grid_mutex;
-                static std::set<int> iq_grids_initialized_devices;
-
                 int current_device = 0;
 #ifdef HAVE_ROCM
                 hipGetDevice(&current_device);
-#elif defined(HAVE_CUDA)
-                cudaGetDevice(&current_device);
 #endif
 
-                bool needs_init = false;
-                {
-                    std::lock_guard<std::mutex> lock(iq_grid_mutex);
-                    needs_init = (iq_grids_initialized_devices.find(current_device) ==
-                                  iq_grids_initialized_devices.end());
-                }
-
-                if (needs_init)
-                {
-                    LOG_DEBUG("[packNativeVNNI] Initializing IQ grid LUT tables on device "
-                             << current_device);
-                    if (!rocmInitIQGridTables(
-                            current_device,
-                            llaminar2::iq3s_grid,
-                            llaminar2::iq3xxs_grid,
-                            llaminar2::iq2s_grid,
-                            llaminar2::iq2xs_grid,
-                            llaminar2::iq2xxs_grid,
-                            llaminar2::iq1s_grid))
-                    {
-                        LOG_ERROR("[packNativeVNNI] IQ grid GEMV init failed on device " << current_device);
-                        return false;
-                    }
-                    if (!rocmInitIQGridTables_gemm(
-                            current_device,
-                            llaminar2::iq3s_grid,
-                            llaminar2::iq3xxs_grid,
-                            llaminar2::iq2s_grid,
-                            llaminar2::iq2xs_grid,
-                            llaminar2::iq2xxs_grid,
-                            llaminar2::iq1s_grid))
-                    {
-                        LOG_ERROR("[packNativeVNNI] IQ grid GEMM init failed on device " << current_device);
-                        return false;
-                    }
-                    if (!rocmInitIQGridTables_moe_prefill(
-                            current_device,
-                            llaminar2::iq3s_grid,
-                            llaminar2::iq3xxs_grid,
-                            llaminar2::iq2s_grid,
-                            llaminar2::iq2xs_grid,
-                            llaminar2::iq2xxs_grid,
-                            llaminar2::iq1s_grid))
-                    {
-                        LOG_ERROR("[packNativeVNNI] IQ grid MoE prefill init failed on device " << current_device);
-                        return false;
-                    }
-                    std::lock_guard<std::mutex> lock(iq_grid_mutex);
-                    iq_grids_initialized_devices.insert(current_device);
-                }
+                if (!ensureIQGridTablesInitialized(current_device))
+                    return false;
             }
 
             const int N = static_cast<int>(tensor->rows());

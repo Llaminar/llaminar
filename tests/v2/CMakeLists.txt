@@ -5119,6 +5119,49 @@ if(ZLIB_FOUND)
         TIMEOUT 2400
     )
 
+    add_executable(v2_integration_parity_qwen36moe_single_device
+        integration/parity/qwen36/Test__Qwen36MoE_SingleDevice_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36moe_single_device
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen36moe_single_device PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set(QWEN36_MOE_SINGLE_DEVICE_PARITY_LABELS
+        V2 Integration Parity Qwen36MoE MixtureOfExperts GatedDeltaNet
+        CPU CUDA ROCm SingleDevice PyTorch GoldenReference FullModel
+    )
+    set(QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES
+        PrefillParity CPU  Qwen36MoE_35B_CPU_KV_FP16
+        PrefillParity CUDA Qwen36MoE_35B_CUDA_KV_FP16
+        PrefillParity ROCm Qwen36MoE_35B_ROCm_KV_FP16
+        DecodeParity  CPU  Qwen36MoE_35B_CPU_KV_FP16
+        DecodeParity  CUDA Qwen36MoE_35B_CUDA_KV_FP16
+        DecodeParity  ROCm Qwen36MoE_35B_ROCm_KV_FP16
+        SnapshotInfrastructure CPU  Qwen36MoE_35B_CPU_KV_FP16
+        SnapshotInfrastructure CUDA Qwen36MoE_35B_CUDA_KV_FP16
+        SnapshotInfrastructure ROCm Qwen36MoE_35B_ROCm_KV_FP16
+    )
+    list(LENGTH QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES QWEN36_MOE_SINGLE_DEVICE_PARITY_CASE_COUNT)
+    math(EXPR QWEN36_MOE_SINGLE_DEVICE_PARITY_CASE_LAST "${QWEN36_MOE_SINGLE_DEVICE_PARITY_CASE_COUNT} - 1")
+    foreach(CASE_INDEX RANGE 0 ${QWEN36_MOE_SINGLE_DEVICE_PARITY_CASE_LAST} 3)
+        math(EXPR BACKEND_INDEX "${CASE_INDEX} + 1")
+        math(EXPR CONFIG_INDEX "${CASE_INDEX} + 2")
+        list(GET QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES ${CASE_INDEX} CASE_NAME)
+        list(GET QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES ${BACKEND_INDEX} CASE_BACKEND)
+        list(GET QWEN36_MOE_SINGLE_DEVICE_PARITY_CASES ${CONFIG_INDEX} CASE_CONFIG)
+        add_v2_test(V2_Integration_Parity_Qwen36MoE_SingleDevice_Math_${CASE_NAME}_${CASE_BACKEND}
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen36moe_single_device>
+                    --gtest_filter=Qwen36MoE/Qwen36MoESingleDeviceParityTest.${CASE_NAME}/${CASE_CONFIG}
+            LABELS ${QWEN36_MOE_SINGLE_DEVICE_PARITY_LABELS}
+            MPI_PROCS 1
+            TIMEOUT 3600
+        )
+    endforeach()
+
     # =========================================================================
     # Test: Qwen3.5 MoE Parity (Mixture-of-Experts variant)
     #
