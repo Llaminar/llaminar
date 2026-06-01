@@ -474,6 +474,7 @@ namespace llaminar2
         }
 
         MoEExpertComputeStage compute_stage(std::move(compute_params));
+        compute_stage.setGPUStream(gpuStream());
         if (bound_workspace_)
             compute_stage.bindWorkspace(bound_workspace_);
         else if (is_gpu)

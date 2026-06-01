@@ -452,6 +452,23 @@ namespace llaminar2::test
                   std::string::npos);
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, LocalExpertPropagatesGpuStreamToNestedExpertCompute)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path path = root / "src/v2/execution/compute_stages/stages/MoELocalExpertStage.cpp";
+        ASSERT_TRUE(fs::exists(path)) << path;
+        const std::string contents = readFile(path);
+        ASSERT_FALSE(contents.empty()) << path;
+
+        const size_t construct_stage = contents.find("MoEExpertComputeStage compute_stage(std::move(compute_params));");
+        ASSERT_NE(construct_stage, std::string::npos);
+        const size_t stream_bind = contents.find("compute_stage.setGPUStream(gpuStream());", construct_stage);
+        const size_t execute_stage = contents.find("compute_stage.execute(ctx)", construct_stage);
+        ASSERT_NE(stream_bind, std::string::npos);
+        ASSERT_NE(execute_stage, std::string::npos);
+        EXPECT_LT(stream_bind, execute_stage);
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, WeightManagerUnpinsMmapWeightsBeforeMadvise)
     {
         const fs::path root = findRepoRoot();
