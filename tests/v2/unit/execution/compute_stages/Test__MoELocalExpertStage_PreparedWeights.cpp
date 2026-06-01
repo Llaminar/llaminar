@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -507,6 +508,54 @@ TEST(Test__MoELocalExpertStage_PreparedWeights,
     const auto &bank = state.banks[state.active_bank];
     for (int expert = 0; expert < kNumExperts; ++expert)
         EXPECT_EQ(bank.local_compute_mask[static_cast<size_t>(expert)], 0u);
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     ExecuteFailsOnNonFiniteSparseHiddenBeforeExpertDispatch)
+{
+    constexpr int kNumExperts = 4;
+    constexpr int kDModel = 8;
+    constexpr int kTopK = 2;
+
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(/*max_rows=*/1, /*max_entries=*/2, kDModel, kTopK, DeviceId::cpu());
+
+    auto input = workspace.localExpertInput(0, 0);
+    input.live_row_count = 1;
+    input.live_entry_count = 1;
+    input.row_ids_host[0] = 0;
+    input.entry_offsets_host[0] = 0;
+    input.entry_offsets_host[1] = 1;
+    input.expert_ids_host[0] = 0;
+    input.route_weights_host[0] = 1.0f;
+    for (int col = 0; col < kDModel; ++col)
+        input.hidden_rows_fp32[col] = static_cast<float>(col + 1);
+    input.hidden_rows_fp32[3] = std::numeric_limits<float>::quiet_NaN();
+
+    auto output = workspace.localExpertOutput(0, 0);
+    MoELocalExpertStage::Params p = makePreparedVectorParams(kNumExperts);
+    p.device_id = DeviceId::cpu();
+    p.input_rows = &input;
+    p.output_rows = &output;
+    p.d_model = kDModel;
+    p.top_k = kTopK;
+    p.expert_intermediate = 64;
+
+    MoELocalExpertStage stage(p);
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
+    EXPECT_FALSE(stage.execute(&ctx));
+    EXPECT_EQ(output.live_row_count, 0u);
+}
+
+TEST(Test__MoELocalExpertStage_PreparedWeights,
+     ExecuteFailsWhenGpuStageDeviceDoesNotMatchExecutionContext)
+{
+    MoELocalExpertStage::Params p = makePreparedVectorParams(4);
+    p.device_id = DeviceId::rocm(1);
+
+    MoELocalExpertStage stage(p);
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    EXPECT_FALSE(stage.execute(&ctx));
 }
 
 TEST(Test__MoELocalExpertStage_PreparedWeights,

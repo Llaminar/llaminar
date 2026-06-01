@@ -330,31 +330,60 @@ namespace llaminar2::cpu::native_vnni
         {
             if (!valid_)
                 return false;
+            if (!gate || !up || !output)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused SwiGLU received null tensor");
+                return false;
+            }
+            if (m <= 0 || n <= 0 || k <= 0)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused SwiGLU invalid dimensions m="
+                          << m << " n=" << n << " k=" << k);
+                return false;
+            }
+            if (packed_.N != n || packed_.K != k)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused SwiGLU dimension mismatch: packed N="
+                          << packed_.N << " K=" << packed_.K << ", call n=" << n
+                          << " k=" << k);
+                return false;
+            }
+            const size_t input_size = static_cast<size_t>(m) * static_cast<size_t>(k);
+            const size_t output_size = static_cast<size_t>(m) * static_cast<size_t>(n);
+            if (gate->numel() < input_size || up->numel() < input_size || output->numel() < output_size)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused SwiGLU tensor capacity mismatch: gate="
+                          << gate->numel() << " up=" << up->numel() << " output=" << output->numel()
+                          << ", required input=" << input_size << " output=" << output_size);
+                return false;
+            }
 
             const float *gate_fp32 = gate->data();
             const float *up_fp32 = up->data();
             float *output_fp32 = output->mutable_data();
 
             // Apply SwiGLU to get the GEMM input: temp = silu(gate) * up  [m, k]
-            const size_t input_size = static_cast<size_t>(m) * k;
 
-            // Reuse cached scratch buffer to avoid allocation on every decode token
+            // Prepared CPU expert engines are shared across graph participants in
+            // LocalTP. Keep per-call scratch thread-local so concurrent users do
+            // not race on mutable engine state.
+            thread_local std::vector<float> swiglu_scratch_tls;
             const size_t needed = input_size;
-            if (swiglu_scratch_.size() < needed)
-                swiglu_scratch_.resize(needed);
+            if (swiglu_scratch_tls.size() < needed)
+                swiglu_scratch_tls.resize(needed);
 
             // M=1 decode: use serial SwiGLU to avoid OMP fork/join overhead.
             // For MoE experts with intermediate=512, the 512-element SwiGLU
             // takes ~0.1µs in SIMD vs ~6µs OMP barrier cost.
             if (m == 1)
-                primitives::compute_swiglu_serial(gate_fp32, up_fp32, swiglu_scratch_.data(),
+                primitives::compute_swiglu_serial(gate_fp32, up_fp32, swiglu_scratch_tls.data(),
                                                   static_cast<int>(input_size));
             else
-                primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_.data(),
+                primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_tls.data(),
                                            static_cast<int>(input_size));
 
             // Apply activation rotation for kurtosis reduction (if configured)
-            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_.data(), m, k);
+            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_tls.data(), m, k);
 
             // Legacy deferred-packing guard; eager engines should never enter it.
             if (deferred_packing_)
@@ -763,9 +792,6 @@ namespace llaminar2::cpu::native_vnni
         /// Legacy flag. New CPU VNNI engine construction never sets this true.
         bool deferred_packing_ = false;
 
-        // Cached scratch buffer for fused SwiGLU+GEMM (avoids malloc per decode token)
-        mutable std::vector<float> swiglu_scratch_;
-
         // Cached Q8_1 quantization buffer for fused projections (avoids malloc per decode token)
         mutable std::vector<Q8_1Block> q8_scratch_;
 
@@ -773,9 +799,6 @@ namespace llaminar2::cpu::native_vnni
         // When set, activations are rotated before Q8_1 quantization for GEMM.
         // The weight must have been pre-rotated with the same rotation.
         const ActivationRotation *activation_rotation_ = nullptr;
-
-        // Cached scratch buffer for rotated activation (avoids malloc per call)
-        mutable std::vector<float> rotation_scratch_;
 
         // -------------------------------------------------------------------
         // Native block storage helper
@@ -983,12 +1006,13 @@ namespace llaminar2::cpu::native_vnni
                 return input;
 
             const size_t len = static_cast<size_t>(m) * k;
-            if (rotation_scratch_.size() < len)
-                rotation_scratch_.resize(len);
+            thread_local std::vector<float> rotation_scratch_tls;
+            if (rotation_scratch_tls.size() < len)
+                rotation_scratch_tls.resize(len);
 
-            std::memcpy(rotation_scratch_.data(), input, len * sizeof(float));
-            activation_rotation_->rotate_rows_inplace(rotation_scratch_.data(), m, k);
-            return rotation_scratch_.data();
+            std::memcpy(rotation_scratch_tls.data(), input, len * sizeof(float));
+            activation_rotation_->rotate_rows_inplace(rotation_scratch_tls.data(), m, k);
+            return rotation_scratch_tls.data();
         }
     };
 

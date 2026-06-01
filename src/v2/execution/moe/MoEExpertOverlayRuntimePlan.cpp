@@ -82,10 +82,28 @@ namespace llaminar2
                                });
         }
 
+        bool isLocalTPReplicatedExpertsDomain(const MoEOverlayRuntimeDomain &domain)
+        {
+            if (domain.kind != ExpertDomainKind::LocalTP ||
+                domain.compute_kind != ExpertDomainComputeKind::ReplicatedExperts ||
+                domain.participants.size() < 2)
+            {
+                return false;
+            }
+
+            return std::all_of(domain.participants.begin(), domain.participants.end(),
+                               [](const auto &participant)
+                               {
+                                   return participant.locally_addressable &&
+                                          participant.local_device.is_valid();
+                               });
+        }
+
         bool hasDomainScopedRuntimeSupport(const MoEOverlayRuntimeDomain &domain)
         {
             return isCpuNodeLocalFallbackDomain(domain) ||
-                   isAcceleratorLocalTPTensorParallelDomain(domain);
+                   isAcceleratorLocalTPTensorParallelDomain(domain) ||
+                   isLocalTPReplicatedExpertsDomain(domain);
         }
 
         std::string sanitizeDomainToken(std::string value)

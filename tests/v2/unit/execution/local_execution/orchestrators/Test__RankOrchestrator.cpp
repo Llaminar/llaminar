@@ -20,13 +20,16 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 #include "mocks/MockModelContext.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <memory>
 #include <stdexcept>
@@ -62,6 +65,7 @@ public:
         int vocab_size = 32000;
         bool forward_should_fail = false;
         std::string architecture = "mock_qwen2";
+        int forward_sleep_ms = 0;
     };
 
     MockDeviceGraphOrchestrator() : MockDeviceGraphOrchestrator(Config{}) {}
@@ -80,6 +84,10 @@ public:
     {
         (void)tokens;
         forward_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (config_.forward_sleep_ms > 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(config_.forward_sleep_ms));
+        }
         if (config_.forward_should_fail)
         {
             return false;
@@ -306,6 +314,7 @@ public:
     }
 
     void set_forward_fails(bool fails) { config_.forward_should_fail = fails; }
+    void set_forward_sleep_ms(int ms) { config_.forward_sleep_ms = ms; }
 
     void set_mock_logits(const std::vector<float> &logits)
     {
@@ -1126,6 +1135,32 @@ TEST_F(Test__RankOrchestrator, ForwardFailsIfAnyDeviceFails)
     // Both should have been called
     EXPECT_EQ(mock_runners_[0]->forward_call_count(), 1u);
     EXPECT_EQ(mock_runners_[1]->forward_call_count(), 1u);
+}
+
+TEST_F(Test__RankOrchestrator, ForwardTPWorkerTimeoutAbortsInsteadOfHanging)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+
+    auto slow_runner = std::make_unique<MockDeviceGraphOrchestrator>();
+    slow_runner->set_forward_sleep_ms(250);
+    runners.push_back(std::move(slow_runner));
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+
+    EXPECT_DEATH(
+        {
+            setenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS", "10", 1);
+            mutableDebugEnv().reload();
+
+            auto orchestrator = RankOrchestrator::createForTest(
+                llaminar2::test::MockModelContext::createMinimal(),
+                std::move(runners),
+                makeTPContextForRunnerCount(2),
+                makeRankConfigForRunnerCount(2));
+
+            int tokens[] = {1};
+            (void)orchestrator->forward(tokens, 1);
+        },
+        "");
 }
 
 TEST_F(Test__RankOrchestrator, ClearCacheClearsAllDevices)

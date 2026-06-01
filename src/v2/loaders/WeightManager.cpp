@@ -1601,6 +1601,7 @@ namespace llaminar2
             binding.residency.home_device = requirement.target_device;
             binding.residency.resident_device = requirement.target_device;
             binding.residency.host_policy = requirement.host_policy;
+            binding.tensor_owner = tensor;
             binding.tensor = tensor.get();
 
             if (weight_metadata_)
@@ -2401,7 +2402,8 @@ namespace llaminar2
         {
             try
             {
-                const auto &assignment = tp_config_->forDevice(device);
+                const auto assignment = tp_config_->forDevice(device);
+                lock.unlock();
                 return getShardedWeightForAssignment(name, device, assignment, layer_idx);
             }
             catch (const std::out_of_range &)
@@ -3809,20 +3811,36 @@ namespace llaminar2
             {
                 std::sort(group.experts.begin(), group.experts.end());
 
+                auto ensure_parent = [&](ExpertGemmRegistry::WeightRole role) -> std::shared_ptr<TensorBase>
+                {
+                    const auto parent_name = moeParentNameForRole(group.layer, role);
+                    {
+                        std::lock_guard<std::mutex> lock(cache_mutex_);
+                        auto it = cache_.find(parent_name);
+                        if (it != cache_.end() && it->second && it->second->raw_data() != nullptr)
+                            return it->second;
+                    }
+
+                    auto loaded = getReplicatedWeight(parent_name, DeviceId::cpu());
+                    if (!loaded)
+                        return nullptr;
+
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto [it, inserted] = cache_.emplace(parent_name, loaded);
+                    if (!inserted)
+                    {
+                        if (!it->second || it->second->raw_data() == nullptr)
+                            it->second = loaded;
+                    }
+                    return it->second;
+                };
+
                 std::shared_ptr<TensorBase> gate;
                 std::shared_ptr<TensorBase> up;
                 std::shared_ptr<TensorBase> down;
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-                    auto find_parent = [&](ExpertGemmRegistry::WeightRole role) -> std::shared_ptr<TensorBase>
-                    {
-                        auto it = cache_.find(moeParentNameForRole(group.layer, role));
-                        return it == cache_.end() ? nullptr : it->second;
-                    };
-                    gate = find_parent(ExpertGemmRegistry::WeightRole::GATE);
-                    up = find_parent(ExpertGemmRegistry::WeightRole::UP);
-                    down = find_parent(ExpertGemmRegistry::WeightRole::DOWN);
-                }
+                gate = ensure_parent(ExpertGemmRegistry::WeightRole::GATE);
+                up = ensure_parent(ExpertGemmRegistry::WeightRole::UP);
+                down = ensure_parent(ExpertGemmRegistry::WeightRole::DOWN);
 
                 if (!gate || !up || !down)
                 {
@@ -6281,26 +6299,29 @@ namespace llaminar2
         // WeightManager is rank-local, so device string uniquely identifies the
         // cache entry. LOCAL TP devices have distinct DeviceIds (e.g. cuda:0, cuda:1).
         std::string cache_key = device.to_string() + ":" + name;
-        auto it = per_device_cache_.find(cache_key);
-        if (it != per_device_cache_.end())
         {
-            TensorSlice *slice = dynamic_cast<TensorSlice *>(it->second.get());
-            const bool cache_matches_mode =
-                (mode == ShardingMode::REPLICATE) ||
-                (mode == ShardingMode::ROW_PARALLEL && slice && slice->is_row_parallel()) ||
-                (mode == ShardingMode::INPUT_PARALLEL && slice && slice->is_row_parallel()) ||
-                (mode == ShardingMode::COLUMN_PARALLEL && slice && slice->is_column_parallel()) ||
-                (mode == ShardingMode::EXPERT_PARALLEL);
-
-            if (cache_matches_mode)
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            auto it = per_device_cache_.find(cache_key);
+            if (it != per_device_cache_.end())
             {
-                return it->second;
-            }
+                TensorSlice *slice = dynamic_cast<TensorSlice *>(it->second.get());
+                const bool cache_matches_mode =
+                    (mode == ShardingMode::REPLICATE) ||
+                    (mode == ShardingMode::ROW_PARALLEL && slice && slice->is_row_parallel()) ||
+                    (mode == ShardingMode::INPUT_PARALLEL && slice && slice->is_row_parallel()) ||
+                    (mode == ShardingMode::COLUMN_PARALLEL && slice && slice->is_column_parallel()) ||
+                    (mode == ShardingMode::EXPERT_PARALLEL);
 
-            LOG_DEBUG("[WeightManager] Ignoring stale per-device cache entry without TP slice metadata: "
-                      << cache_key << " mode=" << static_cast<int>(mode)
-                      << " tensor=" << it->second.get());
-            per_device_cache_.erase(it);
+                if (cache_matches_mode)
+                {
+                    return it->second;
+                }
+
+                LOG_DEBUG("[WeightManager] Ignoring stale per-device cache entry without TP slice metadata: "
+                          << cache_key << " mode=" << static_cast<int>(mode)
+                          << " tensor=" << it->second.get());
+                per_device_cache_.erase(it);
+            }
         }
 
         LOG_TRACE("[WeightManager] getShardedWeightForAssignment: " << name
@@ -6320,29 +6341,37 @@ namespace llaminar2
             // clones because each device calls ensureOnDevice() which allocates
             // separate GPU memory and releaseAllHostWeightData() may free host data
             // after the first device uploads (breaking the second device's upload).
-            auto cached_it = cache_.find(name);
-            if (cached_it == cache_.end() || !cached_it->second)
+            std::shared_ptr<TensorBase> cached;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto cached_it = cache_.find(name);
+                if (cached_it != cache_.end())
+                    cached = cached_it->second;
+            }
+
+            if (!cached)
             {
                 auto original = getReplicatedWeight(name, DeviceId::cpu());
                 if (original)
                 {
-                    cache_[name] = original;
-                    cached_it = cache_.find(name);
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto [cached_it, inserted] = cache_.emplace(name, original);
+                    if (!inserted && !cached_it->second)
+                        cached_it->second = original;
+                    cached = cached_it->second;
                 }
             }
 
-            if (cached_it != cache_.end() && cached_it->second && cached_it->second->isHostResident())
+            if (cached && cached->isHostResident())
             {
-                result = cached_it->second;
+                result = cached;
                 LOG_DEBUG("[WeightManager] Sharing host-resident REPLICATE weight: " << name
                                                                                      << " for " << device.to_string()
                                                                                      << " (" << (result->size_bytes() / (1024 * 1024)) << " MB)");
             }
-            else if (cached_it != cache_.end() && cached_it->second)
+            else if (cached)
             {
-                result = cloneTensorForDevice(name, cached_it->second, device);
-                if (result)
-                    per_device_cache_[cache_key] = result;
+                result = cloneTensorForDevice(name, cached, device);
             }
             if (result)
             {
@@ -6523,6 +6552,7 @@ namespace llaminar2
         // Cache the result for subsequent requests
         if (result)
         {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
             per_device_cache_[cache_key] = result;
             result->setDebugName(name);
         }

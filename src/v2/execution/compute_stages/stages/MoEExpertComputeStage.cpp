@@ -629,7 +629,23 @@ namespace llaminar2
             {
                 int expert_id = static_cast<int>(routing_idx_data[t * top_k + k]);
                 float weight = routing_wt_data[t * top_k + k];
-                if (expert_id < 0 || expert_id >= num_experts || weight == 0.0f)
+                if (expert_id < 0 || expert_id >= num_experts)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Invalid routed expert id " << expert_id
+                                                                                  << " at token " << t
+                                                                                  << " slot " << k
+                                                                                  << " for layer " << params_.layer_idx
+                                                                                  << " (num_experts=" << num_experts << ")");
+                    return false;
+                }
+                if (!std::isfinite(weight))
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Non-finite route weight at token " << t
+                                                                                          << " slot " << k
+                                                                                          << " for layer " << params_.layer_idx);
+                    return false;
+                }
+                if (weight == 0.0f)
                     continue;
                 // With EP or dynamic mask, only accumulate tokens for local experts
                 bool is_local;
@@ -973,7 +989,23 @@ namespace llaminar2
         // Convert float indices to int for replica dispatch
         int routing_int_indices[16]; // stack-allocated, max top_k
         for (int k = 0; k < top_k; ++k)
+        {
             routing_int_indices[k] = static_cast<int>(routing_idx_data[k]);
+            if (routing_int_indices[k] < 0 || routing_int_indices[k] >= num_experts)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Invalid routed expert id " << routing_int_indices[k]
+                                                                              << " at decode slot " << k
+                                                                              << " for layer " << params_.layer_idx
+                                                                              << " (num_experts=" << num_experts << ")");
+                return false;
+            }
+            if (!std::isfinite(routing_wt_data[k]))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Non-finite decode route weight at slot "
+                          << k << " for layer " << params_.layer_idx);
+                return false;
+            }
+        }
 
         if (params_.replica_set.num_replicated > 0)
         {

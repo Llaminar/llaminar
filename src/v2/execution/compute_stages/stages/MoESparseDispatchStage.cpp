@@ -328,6 +328,18 @@ namespace llaminar2
         return reqs;
     }
 
+    StageBufferContract MoESparseDispatchStage::bufferContract() const
+    {
+        auto contract = StageBufferContract::build();
+        if (params_.hidden && params_.hidden_buffer_id)
+            contract.addInput(*params_.hidden_buffer_id, "FP32");
+        if (params_.routing_indices && params_.routing_indices_buffer_id)
+            contract.addInput(*params_.routing_indices_buffer_id, "FP32");
+        if (params_.routing_weights && params_.routing_weights_buffer_id)
+            contract.addInput(*params_.routing_weights_buffer_id, "FP32");
+        return contract;
+    }
+
     StageDumpInfo MoESparseDispatchStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;

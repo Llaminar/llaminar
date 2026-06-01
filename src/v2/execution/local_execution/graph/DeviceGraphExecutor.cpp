@@ -134,6 +134,48 @@ namespace llaminar2
                 node.stage->setGPUStream(stream);
             }
         }
+
+        bool contractReadsNeedTransfer(
+            BufferArena *arena,
+            const StageBufferContract &contract,
+            DeviceId target_device)
+        {
+            if (!arena || contract.empty())
+                return false;
+
+            for (const auto &binding : contract.allArenaReads())
+            {
+                if (!arena->isRegistered(binding.id))
+                    continue;
+
+                auto *tensor = dynamic_cast<TensorBase *>(arena->getTensor(binding.id));
+                if (!tensor)
+                    continue;
+
+                const CoherenceState state = arena->getCoherenceState(binding.id);
+                if (state.needsTransferTo(target_device, tensor->coherenceState()))
+                    return true;
+            }
+
+            return false;
+        }
+
+        bool fastPolicyRequiresContractCoherence(
+            const StageRunPolicy &policy,
+            BufferArena *arena,
+            const StageBufferContract &contract,
+            DeviceId target_device)
+        {
+            if (policy.coherence || !arena || contract.empty())
+                return false;
+
+            // Host-staged graph-native collectives must always honor arena
+            // contracts in decode: they are exactly the CPU bridges between
+            // device-resident graph stages. GPU stages also need coherence when
+            // a prior host bridge made one of their inputs CPU-authoritative.
+            return target_device.is_cpu() ||
+                   contractReadsNeedTransfer(arena, contract, target_device);
+        }
     }
 
     // =========================================================================
@@ -663,7 +705,12 @@ namespace llaminar2
             // skip the full coherence/validation pipeline, but we must still
             // accumulate profiling stats so ALLREDUCE/ALLGATHER appear in the
             // executor timing tables.
-            if (!policy.coherence)
+            const StageBufferContract contract = arena_ ? node.stage->bufferContract() : StageBufferContract{};
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+            const bool force_contract_coherence =
+                fastPolicyRequiresContractCoherence(policy, arena_, contract, target_device);
+
+            if (!policy.coherence && !force_contract_coherence)
             {
                 ensureStageGPUStreamBound(node, ctx);
 
@@ -673,6 +720,21 @@ namespace llaminar2
                     t0 = std::chrono::high_resolution_clock::now();
 
                 bool ok = node.stage->execute(ctx);
+
+                if (ok && debugEnv().validation.sync_each_stage)
+                {
+                    DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+                    if (target_device.is_gpu())
+                    {
+                        if (auto *gpu_ctx = tryGetWorkerContext(target_device); gpu_ctx && !gpu_ctx->debugSynchronize())
+                        {
+                            LOG_ERROR("[SYNC_EACH_STAGE] stage='" << node.name
+                                                                  << "' device=" << target_device.to_string()
+                                                                  << " device debug synchronization failed");
+                            ok = false;
+                        }
+                    }
+                }
 
                 if (profiling_fast)
                 {
@@ -764,20 +826,23 @@ namespace llaminar2
         // The coherence flag controls whether prepareForRead/Write are called.
         const StageBufferContract contract = arena_ ? node.stage->bufferContract() : StageBufferContract{};
         const bool use_contract = !contract.empty() && arena_ != nullptr;
+        DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+        const bool force_contract_coherence =
+            use_contract && fastPolicyRequiresContractCoherence(policy, arena_, contract, target_device);
 
         // Bind GPU stream early so coherence operations (H2D/D2H) run on
         // the same stream as the stage's compute kernels.
         ensureStageGPUStreamBound(node, ctx);
         void *stage_stream = node.stage ? node.stage->gpuStream() : nullptr;
 
-        if (policy.coherence)
+        if (policy.coherence || force_contract_coherence)
         {
             auto coh_policy = node.stage->coherencePolicy();
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
 
             LOG_DEBUG("[DeviceGraphExecutor] Stage '" << node.name << "' coherencePolicy=" << toString(coh_policy)
                                                       << " target_device=" << target_device.to_string()
-                                                      << " use_contract=" << use_contract);
+                                                      << " use_contract=" << use_contract
+                                                      << " forced_contract=" << force_contract_coherence);
 
             if (use_contract)
             {

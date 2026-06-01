@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <set>
 
 using namespace llaminar2;
@@ -62,6 +63,15 @@ namespace
         int broadcast_calls = 0;
         int last_source_index = -1;
     };
+
+    bool hasInputBinding(const StageBufferContract &contract, BufferId id)
+    {
+        return std::any_of(contract.inputs.begin(), contract.inputs.end(),
+                           [id](const BufferBinding &binding)
+                           {
+                               return binding.id == id && binding.access == BufferAccess::READ;
+                           });
+    }
 
 } // namespace
 
@@ -378,6 +388,29 @@ TEST(Test__MoEOverlayCollectiveWorkspace, SparseDispatchStageReportsManualBounda
     ASSERT_TRUE(second_stage.execute(&ctx));
     EXPECT_TRUE(second_stage.isManualGraphBoundary());
     EXPECT_TRUE(second_stage.manualGraphBoundaryComplete());
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace, SparseDispatchAdvertisesArenaInputContractForRootHostExport)
+{
+    FP32Tensor hidden({1, 4});
+    FP32Tensor routing_indices({1, 2});
+    FP32Tensor routing_weights({1, 2});
+
+    MoESparseDispatchStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.hidden = &hidden;
+    params.routing_indices = &routing_indices;
+    params.routing_weights = &routing_weights;
+    params.hidden_buffer_id = BufferId::NORMALIZED;
+    params.routing_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
+    params.routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
+
+    MoESparseDispatchStage stage(std::move(params));
+    const auto contract = stage.bufferContract();
+
+    EXPECT_TRUE(hasInputBinding(contract, BufferId::NORMALIZED));
+    EXPECT_TRUE(hasInputBinding(contract, BufferId::MOE_EXPERT_INDICES));
+    EXPECT_TRUE(hasInputBinding(contract, BufferId::MOE_EXPERT_WEIGHTS));
 }
 
 TEST(Test__MoEOverlayCollectiveWorkspace, SparseDispatchFinalBoundaryRequiresCollectiveCompletion)

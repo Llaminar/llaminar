@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <csignal>
@@ -22,6 +23,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -572,6 +574,89 @@ namespace
         // (it preserves native precision rather than double-quantizing through INT8)
         EXPECT_GE(cos_native, 0.990f);
         EXPECT_GE(cos_existing, 0.990f);
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, Q4_0_FusedSwiGLUDown_SharedKernelConcurrentDecode)
+    {
+        const int N = 128;
+        const int K = 256;
+        const int workers = 8;
+        const int iterations = 16;
+
+        auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+        ASSERT_NE(weights, nullptr);
+
+        CPUNativeVNNIGemmKernel shared_kernel(weights.get());
+        ASSERT_TRUE(shared_kernel.isValid());
+
+        std::vector<std::unique_ptr<FP32Tensor>> gates;
+        std::vector<std::unique_ptr<FP32Tensor>> ups;
+        std::vector<std::vector<float>> expected;
+        gates.reserve(workers);
+        ups.reserve(workers);
+        expected.resize(workers);
+
+        CPUNativeVNNIGemmKernel reference_kernel(weights.get());
+        ASSERT_TRUE(reference_kernel.isValid());
+        for (int worker = 0; worker < workers; ++worker)
+        {
+            const int m = 1 + (worker % 3);
+            gates.push_back(TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(m), static_cast<size_t>(K)}, -0.75f, 0.75f, 1000 + worker));
+            ups.push_back(TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(m), static_cast<size_t>(K)}, -0.75f, 0.75f, 2000 + worker));
+
+            FP32Tensor output({static_cast<size_t>(m), static_cast<size_t>(N)});
+            ASSERT_TRUE(reference_kernel.multiply_tensor_with_fused_swiglu(
+                gates.back().get(), ups.back().get(), &output, m, N, K));
+            expected[worker].assign(output.data(), output.data() + output.numel());
+        }
+
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> threads;
+        threads.reserve(workers);
+
+        for (int worker = 0; worker < workers; ++worker)
+        {
+            threads.emplace_back([&, worker]()
+                                 {
+                                     const int m = 1 + (worker % 3);
+                                     FP32Tensor output({static_cast<size_t>(m), static_cast<size_t>(N)});
+                                     ready.fetch_add(1, std::memory_order_release);
+                                     while (!go.load(std::memory_order_acquire))
+                                         std::this_thread::yield();
+
+                                     for (int iter = 0; iter < iterations; ++iter)
+                                     {
+                                         if (!shared_kernel.multiply_tensor_with_fused_swiglu(
+                                                 gates[worker].get(), ups[worker].get(), &output, m, N, K))
+                                         {
+                                             failed.store(true, std::memory_order_release);
+                                             return;
+                                         }
+
+                                         const float *actual = output.data();
+                                         const auto &ref = expected[worker];
+                                         for (size_t i = 0; i < ref.size(); ++i)
+                                         {
+                                             if (std::fabs(actual[i] - ref[i]) > 1e-5f)
+                                             {
+                                                 failed.store(true, std::memory_order_release);
+                                                 return;
+                                             }
+                                         }
+                                     } });
+        }
+
+        while (ready.load(std::memory_order_acquire) != workers)
+            std::this_thread::yield();
+        go.store(true, std::memory_order_release);
+        for (auto &thread : threads)
+            thread.join();
+
+        EXPECT_FALSE(failed.load(std::memory_order_acquire));
     }
 
     // =========================================================================

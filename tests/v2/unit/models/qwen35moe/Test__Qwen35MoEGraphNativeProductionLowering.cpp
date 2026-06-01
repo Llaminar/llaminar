@@ -11,6 +11,7 @@
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
+#include "mocks/MockLocalTPContext.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 
@@ -63,6 +64,20 @@ namespace llaminar2::test
             return result;
         }
 
+        ExpertComputeDomain localTPDomain(
+            const std::string &name,
+            std::vector<GlobalDeviceAddress> participants)
+        {
+            ExpertComputeDomain result;
+            result.name = name;
+            result.kind = ExpertDomainKind::LocalTP;
+            result.backend = CollectiveBackendType::RCCL;
+            result.participants = std::move(participants);
+            result.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            result.owner_rank = 0;
+            return result;
+        }
+
         ExpertRoutedTier tier(const std::string &name, const std::string &domain_name, int priority, bool fallback = false)
         {
             ExpertRoutedTier result;
@@ -98,6 +113,35 @@ namespace llaminar2::test
             plan->placements.push_back(ExpertLayerPlacement{
                 .layer = 0,
                 .routed_expert_tier = {0, 1, 2, 0, 1, 2},
+            });
+            validateMoEExpertParallelPlanOrThrow(
+                *plan,
+                {.layer_count = 1, .routed_expert_count = kNumExperts});
+            return plan;
+        }
+
+        std::shared_ptr<MoEExpertParallelPlan> makeLocalTPReplicatedHotPlan()
+        {
+            auto plan = std::make_shared<MoEExpertParallelPlan>();
+            plan->enabled = true;
+            plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+            plan->continuation_domain = "hot_domain";
+            plan->base_model_domain = "hot_domain";
+            plan->shared_expert_domain = "hot_domain";
+            plan->continuation_domain_spec.domain = "hot_domain";
+            plan->continuation_domain_spec.logical_root_participant = 0;
+            plan->residency_policy = ExpertResidencyPolicy::ExplicitMasks;
+            plan->domains = {
+                localTPDomain(
+                    "hot_domain",
+                    {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}),
+            };
+            plan->routed_tiers = {
+                tier("hot", "hot_domain", 0),
+            };
+            plan->placements.push_back(ExpertLayerPlacement{
+                .layer = 0,
+                .routed_expert_tier = {0, 0, 0, 0, 0, 0},
             });
             validateMoEExpertParallelPlanOrThrow(
                 *plan,
@@ -207,6 +251,34 @@ namespace llaminar2::test
             return nullptr;
         }
 
+        std::vector<const MoESparseDispatchStage *> sparseDispatchStages(const ComputeGraph &graph)
+        {
+            std::vector<const MoESparseDispatchStage *> stages;
+            for (const auto &node_name : graph.getExecutionOrder())
+            {
+                const auto *node = graph.getNode(node_name);
+                if (!node)
+                    continue;
+                if (const auto *stage = dynamic_cast<const MoESparseDispatchStage *>(node->stage.get()))
+                    stages.push_back(stage);
+            }
+            return stages;
+        }
+
+        std::vector<const MoELocalExpertStage *> localExpertStages(const ComputeGraph &graph)
+        {
+            std::vector<const MoELocalExpertStage *> stages;
+            for (const auto &node_name : graph.getExecutionOrder())
+            {
+                const auto *node = graph.getNode(node_name);
+                if (!node)
+                    continue;
+                if (const auto *stage = dynamic_cast<const MoELocalExpertStage *>(node->stage.get()))
+                    stages.push_back(stage);
+            }
+            return stages;
+        }
+
     } // namespace
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering, TieredOverlayDefaultsToGraphNativeSparseStages)
@@ -224,7 +296,14 @@ namespace llaminar2::test
         Qwen35MoEGraph graph_builder(config, nullptr);
         ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::cpu());
 
-        EXPECT_NE(graph.getNode("layer0_moe_expert_dispatch"), nullptr);
+        const auto *dispatch_node = graph.getNode("layer0_moe_expert_dispatch");
+        ASSERT_NE(dispatch_node, nullptr);
+        const auto *dispatch_stage =
+            dynamic_cast<const MoEExpertDispatchStage *>(dispatch_node->stage.get());
+        ASSERT_NE(dispatch_stage, nullptr);
+        EXPECT_EQ(dispatch_stage->params().routing_indices_buffer_id, BufferId::MOE_EXPERT_INDICES);
+        EXPECT_EQ(dispatch_stage->params().routing_weights_buffer_id, BufferId::MOE_EXPERT_WEIGHTS);
+        EXPECT_EQ(dispatch_stage->params().hidden_buffer_id, BufferId::NORMALIZED);
         EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_EXPERT_DISPATCH), 1u);
         EXPECT_GT(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_DISPATCH), 0u);
         EXPECT_GT(countStagesOfType(graph, ComputeStageType::MOE_LOCAL_EXPERT), 0u);
@@ -243,6 +322,54 @@ namespace llaminar2::test
         const auto participant_ids = owner_map.participantIdsForTier(params.key.tier_idx);
         EXPECT_NE(std::find(participant_ids.begin(), participant_ids.end(), params.target_participant),
                   participant_ids.end());
+
+        bool found_root_sparse_dispatch = false;
+        for (const auto *stage : sparseDispatchStages(graph))
+        {
+            const auto &sparse_params = stage->params();
+            if (!sparse_params.hidden)
+                continue;
+            found_root_sparse_dispatch = true;
+            EXPECT_EQ(sparse_params.hidden_buffer_id, BufferId::NORMALIZED);
+            EXPECT_EQ(sparse_params.routing_indices_buffer_id, BufferId::MOE_EXPERT_INDICES);
+            EXPECT_EQ(sparse_params.routing_weights_buffer_id, BufferId::MOE_EXPERT_WEIGHTS);
+        }
+        EXPECT_TRUE(found_root_sparse_dispatch);
+    }
+
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         LocalTPReplicatedExpertsLowerOnlyGraphLocalGpuParticipant)
+    {
+        GraphConfig config = makeConfig(makeLocalTPReplicatedHotPlan());
+        config.default_device = DeviceId::rocm(0);
+        MockLocalTPContext tp_ctx;
+        tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        config.tp_ctx = &tp_ctx;
+        config.tp_device_idx = 0;
+
+        TensorArena weight_arena;
+        auto layer = makeLayerWeights(weight_arena);
+        TensorArena activation_arena;
+        auto buffers = makeActivationBuffers(activation_arena);
+
+        Qwen35MoEGraph graph_builder(config, nullptr);
+        ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+
+        const auto stages = localExpertStages(graph);
+        ASSERT_EQ(stages.size(), 1u);
+        const auto &params = stages.front()->params();
+        EXPECT_EQ(params.device_id, DeviceId::rocm(0));
+        EXPECT_EQ(params.runtime_participant_index, 0);
+        ASSERT_EQ(params.expert_mask.size(), static_cast<size_t>(kNumExperts));
+        EXPECT_EQ(params.expert_mask,
+                  (std::vector<bool>{true, true, true, false, false, false}));
+
+        EXPECT_EQ(graph.getNode("layer0_moe_local_expert_tier0_hot_p1"), nullptr)
+            << "A per-device graph must not schedule another GPU participant's local expert kernel";
+        EXPECT_NE(graph.getNode("layer0_moe_sparse_return_reduce_tier0_hot_p0_allreduce"), nullptr)
+            << "Graph-local owner subsets must be rejoined through the continuation TP domain";
+        EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 1u);
     }
 
 } // namespace llaminar2::test

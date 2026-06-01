@@ -1,7 +1,11 @@
 #pragma once
 
 #include "Qwen36DenseParityTestBase.h"
+#include "backends/HardwareInventory.h"
+#include "execution/moe/MoEExpertParallelPlan.h"
 
+#include <chrono>
+#include <iostream>
 #include <numeric>
 
 namespace llaminar2::test::parity::qwen36
@@ -9,6 +13,7 @@ namespace llaminar2::test::parity::qwen36
     enum class MoEPrefixParityTopology
     {
         SingleDevice,
+        ExpertOverlayRocm2TPHotCpu2LocalTPCold,
     };
 
     struct MoEPrefixRestoreParityCase
@@ -25,7 +30,92 @@ namespace llaminar2::test::parity::qwen36
         int decode_steps = 3;
         int max_seq_len = 96;
         int required_rocm_devices = 0;
+        int required_cpu_sockets = 0;
+        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
     };
+
+    inline size_t gib(size_t value)
+    {
+        return value * 1024ull * 1024ull * 1024ull;
+    }
+
+    inline std::chrono::steady_clock::time_point parityPhaseStart()
+    {
+        return std::chrono::steady_clock::now();
+    }
+
+    inline void logMoEParityPhase(
+        const MoEPrefixRestoreParityCase &test_case,
+        const char *phase,
+        std::chrono::steady_clock::time_point start)
+    {
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        std::cerr << "[qwen36-moe-parity] case=" << test_case.name
+                  << " phase=" << phase
+                  << " elapsed_ms=" << ms << '\n';
+    }
+
+    inline ExpertComputeDomain localTPMoEDomain(
+        const std::string &name,
+        CollectiveBackendType backend,
+        std::vector<GlobalDeviceAddress> participants)
+    {
+        ExpertComputeDomain domain;
+        domain.name = name;
+        domain.kind = ExpertDomainKind::LocalTP;
+        domain.backend = backend;
+        domain.participants = std::move(participants);
+        domain.owner_rank = 0;
+        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        return domain;
+    }
+
+    inline ExpertRoutedTier routedTier(
+        const std::string &name,
+        const std::string &domain,
+        int priority,
+        int max_experts_per_layer,
+        size_t memory_budget_bytes,
+        bool fallback = false)
+    {
+        ExpertRoutedTier tier;
+        tier.name = name;
+        tier.domain = domain;
+        tier.priority = priority;
+        tier.max_experts_per_layer = max_experts_per_layer;
+        tier.memory_budget_bytes = memory_budget_bytes;
+        tier.fallback = fallback;
+        return tier;
+    }
+
+    inline std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayPlanRocm2TPHotCpu2LocalTPCold()
+    {
+        constexpr const char *kRocmHotDomain = "qwen36_moe_rocm_hot";
+        constexpr const char *kCpuColdDomain = "qwen36_moe_cpu_cold";
+
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->continuation_domain = kRocmHotDomain;
+        plan->shared_expert_domain = kRocmHotDomain;
+        plan->domains = {
+            localTPMoEDomain(
+                kRocmHotDomain,
+                CollectiveBackendType::RCCL,
+                {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}),
+            localTPMoEDomain(
+                kCpuColdDomain,
+                CollectiveBackendType::UPI,
+                {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)}),
+        };
+        plan->routed_tiers = {
+            routedTier("hot", kRocmHotDomain, 0, 240, gib(4)),
+            routedTier("cold", kCpuColdDomain, 1, 0, 0, true),
+        };
+        return plan;
+    }
 
     inline bool regenerateQwen36MoEMetadata(
         const std::string &model_path,
@@ -124,6 +214,19 @@ namespace llaminar2::test::parity::qwen36
             }
         }
 
+        if (test_case.required_cpu_sockets > 0)
+        {
+            const auto hw = HardwareInventory::detect();
+            if (hw.num_sockets() < test_case.required_cpu_sockets)
+            {
+                std::ostringstream oss;
+                oss << test_case.name << " requires "
+                    << test_case.required_cpu_sockets
+                    << " CPU socket(s)";
+                return oss.str();
+            }
+        }
+
         return std::nullopt;
     }
 
@@ -149,6 +252,7 @@ namespace llaminar2::test::parity::qwen36
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
         config.mtp.draft_tokens = 1;
+        config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
 
         switch (test_case.topology)
         {
@@ -158,6 +262,10 @@ namespace llaminar2::test::parity::qwen36
             config.device_for_this_rank = test_case.devices.empty()
                                               ? GlobalDeviceAddress::cpu()
                                               : test_case.devices.front();
+            break;
+        case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold:
+            config.tp_degree = 1;
+            config.pp_degree = 1;
             break;
         }
 
@@ -192,6 +300,18 @@ namespace llaminar2::test::parity::qwen36
         case MoEPrefixParityTopology::SingleDevice:
             test_case.devices = {GlobalDeviceAddress::rocm(0)};
             test_case.required_rocm_devices = 1;
+            break;
+        case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold:
+            test_case.devices = {
+                GlobalDeviceAddress::rocm(0),
+                GlobalDeviceAddress::rocm(1),
+                GlobalDeviceAddress::cpu(0),
+                GlobalDeviceAddress::cpu(1),
+            };
+            test_case.required_rocm_devices = 2;
+            test_case.required_cpu_sockets = 2;
+            test_case.moe_expert_parallel_plan =
+                qwen36MoEOverlayPlanRocm2TPHotCpu2LocalTPCold();
             break;
         }
 
@@ -239,7 +359,9 @@ namespace llaminar2::test::parity::qwen36
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
+        auto phase_start = parityPhaseStart();
         loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        logMoEParityPhase(test_case, "reference-inputs", phase_start);
 
         const int block_size = mode == PrefixRestoreParityMode::FullHit
                                    ? static_cast<int>(prompt_tokens.size())
@@ -251,8 +373,12 @@ namespace llaminar2::test::parity::qwen36
         auto baseline = factory->createFromOrchestrationConfig(
             makeMoEPrefixRestoreConfig(test_case, model_path, false, block_size));
         ASSERT_NE(baseline, nullptr);
+        phase_start = parityPhaseStart();
         ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        logMoEParityPhase(test_case, "prefix-baseline.initialize", phase_start);
+        phase_start = parityPhaseStart();
         auto baseline_result = baseline->generate(prompt_tokens, test_case.decode_steps, greedy);
+        logMoEParityPhase(test_case, "prefix-baseline.generate", phase_start);
         const auto baseline_snapshot = baseline->prefixStateProbe();
         baseline->shutdown();
 
@@ -270,7 +396,9 @@ namespace llaminar2::test::parity::qwen36
         auto cached = factory->createFromOrchestrationConfig(
             makeMoEPrefixRestoreConfig(test_case, model_path, true, block_size));
         ASSERT_NE(cached, nullptr);
+        phase_start = parityPhaseStart();
         ASSERT_TRUE(cached->initialize()) << cached->lastError();
+        logMoEParityPhase(test_case, "prefix-cached.initialize", phase_start);
 
         std::vector<int32_t> first_prompt = prompt_tokens;
         if (mode == PrefixRestoreParityMode::PartialHit)
@@ -279,7 +407,9 @@ namespace llaminar2::test::parity::qwen36
             first_prompt.assign(prompt_tokens.begin(), prompt_tokens.begin() + 4);
         }
 
+        phase_start = parityPhaseStart();
         auto first = cached->generate(first_prompt, test_case.decode_steps, greedy);
+        logMoEParityPhase(test_case, "prefix-cached.first-generate", phase_start);
         const auto after_first = cached->prefixStateProbe();
         ASSERT_TRUE(first.error.empty()) << first.error;
         EXPECT_TRUE(after_first.prefix_cache_ready);
@@ -290,7 +420,9 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_EQ(first.tokens, reference_tokens);
         }
 
+        phase_start = parityPhaseStart();
         auto second = cached->generate(prompt_tokens, test_case.decode_steps, greedy);
+        logMoEParityPhase(test_case, "prefix-cached.second-generate", phase_start);
         const auto after_second = cached->prefixStateProbe();
         cached->shutdown();
 
@@ -324,7 +456,9 @@ namespace llaminar2::test::parity::qwen36
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
+        auto phase_start = parityPhaseStart();
         loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        logMoEParityPhase(test_case, "reference-inputs", phase_start);
 
         const int block_size = enable_prefix_cache
                                    ? static_cast<int>(prompt_tokens.size())
@@ -336,8 +470,12 @@ namespace llaminar2::test::parity::qwen36
         auto baseline = factory->createFromOrchestrationConfig(
             makeMoEPrefixRestoreConfig(test_case, model_path, false, block_size, false));
         ASSERT_NE(baseline, nullptr);
+        phase_start = parityPhaseStart();
         ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        logMoEParityPhase(test_case, "mtp-baseline.initialize", phase_start);
+        phase_start = parityPhaseStart();
         auto baseline_result = baseline->generate(prompt_tokens, test_case.decode_steps, greedy);
+        logMoEParityPhase(test_case, "mtp-baseline.generate", phase_start);
         const auto baseline_snapshot = baseline->prefixStateProbe();
         baseline->shutdown();
 
@@ -359,9 +497,13 @@ namespace llaminar2::test::parity::qwen36
                 block_size,
                 true));
         ASSERT_NE(mtp, nullptr);
+        phase_start = parityPhaseStart();
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+        logMoEParityPhase(test_case, "mtp.initialize", phase_start);
 
+        phase_start = parityPhaseStart();
         auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
+        logMoEParityPhase(test_case, "mtp.first-generate", phase_start);
         const auto after_first = mtp->prefixStateProbe();
         ASSERT_TRUE(first.error.empty()) << first.error;
         ASSERT_EQ(first.tokens.size(), reference_tokens.size());
@@ -380,7 +522,9 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GE(after_first.prefix_cache_inserts, 1u);
         EXPECT_GT(after_first.prefix_cache_mtp_state_bytes, 0u);
 
+        phase_start = parityPhaseStart();
         auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
+        logMoEParityPhase(test_case, "mtp.second-generate", phase_start);
         const auto after_second = mtp->prefixStateProbe();
         mtp->shutdown();
 

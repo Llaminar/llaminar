@@ -1200,6 +1200,35 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
 
     EXPECT_EQ(graph.getNode("layer64_moe_routing")->stage->type(), ComputeStageType::MOE_ROUTER);
     EXPECT_EQ(graph.getNode("layer64_moe_expert_ffn")->stage->type(), ComputeStageType::MOE_EXPERT_FFN);
+
+    const auto ffn_norm_contract = graph.getNode("layer64_ffn_norm")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(ffn_norm_contract, BufferId::MTP_ATTN_PROJ));
+    EXPECT_TRUE(contractReads(ffn_norm_contract, BufferId::MTP_PROJECTED));
+    EXPECT_TRUE(contractWrites(ffn_norm_contract, BufferId::MTP_NORM_HIDDEN));
+    EXPECT_FALSE(contractWrites(ffn_norm_contract, BufferId::NORMALIZED));
+
+    const auto routing_contract = graph.getNode("layer64_moe_routing")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(routing_contract, BufferId::MTP_NORM_HIDDEN));
+    EXPECT_FALSE(contractReads(routing_contract, BufferId::NORMALIZED));
+    EXPECT_TRUE(contractWrites(routing_contract, BufferId::MOE_EXPERT_INDICES));
+    EXPECT_TRUE(contractWrites(routing_contract, BufferId::MOE_EXPERT_WEIGHTS));
+
+    const auto expert_contract = graph.getNode("layer64_moe_expert_ffn")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(expert_contract, BufferId::MTP_NORM_HIDDEN));
+    EXPECT_FALSE(contractReads(expert_contract, BufferId::NORMALIZED));
+    EXPECT_TRUE(contractWrites(expert_contract, BufferId::MOE_COMBINED_OUTPUT));
+
+    const auto combine_contract = graph.getNode("layer64_moe_combine")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(combine_contract, BufferId::MOE_COMBINED_OUTPUT));
+    EXPECT_TRUE(contractWrites(combine_contract, BufferId::MTP_ATTN_PROJ));
+    EXPECT_FALSE(contractWrites(combine_contract, BufferId::ATTN_PROJ));
+
+    const auto residual_contract = graph.getNode("layer64_ffn_residual")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(residual_contract, BufferId::MTP_ATTN_PROJ));
+    EXPECT_TRUE(contractReads(residual_contract, BufferId::MTP_PROJECTED));
+    EXPECT_TRUE(contractWrites(residual_contract, BufferId::MTP_PROJECTED));
+    EXPECT_FALSE(contractWrites(residual_contract, BufferId::HIDDEN_STATE));
+
     EXPECT_TRUE(hasDependency(graph, "layer64_moe_expert_ffn", "layer64_moe_routing"));
     EXPECT_TRUE(hasDependency(graph, "layer64_moe_combine", "layer64_moe_expert_ffn"));
     EXPECT_TRUE(hasDependency(graph, "layer64_ffn_residual", "layer64_moe_combine"));

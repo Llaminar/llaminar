@@ -494,7 +494,7 @@ namespace llaminar2::test
 
     inline void MockModelLoader::addTensor(const std::string &name, std::shared_ptr<TensorBase> tensor)
     {
-        tensor_shapes_[name] = {tensor->rows(), tensor->cols()};
+        tensor_shapes_[name] = tensor->shape();
         tensors_[name] = std::move(tensor);
     }
 

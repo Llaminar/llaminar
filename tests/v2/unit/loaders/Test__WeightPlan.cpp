@@ -3,6 +3,7 @@
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
+#include "config/TensorParallelConfig.h"
 #include "models/GraphTypes.h"
 #include "../../mocks/MockModelLoader.h"
 #include "tensors/Tensors.h"
@@ -359,6 +360,63 @@ TEST(Test__WeightManagerMaterialize, LookupDeviceCanDifferFromTargetDevice)
     EXPECT_EQ(binding.prepared->device, DeviceId::cuda(0));
     EXPECT_EQ(binding.prepared->kind, PreparedWeightKind::CudaInt8PackedGemm);
     EXPECT_NE(binding.tensor, nullptr);
+}
+
+TEST(Test__WeightManagerMaterialize, FrozenBindingsRetainMaterializedTPSlices)
+{
+    auto loader = MockModelLoaderBuilder()
+                      .addFP32RandomTensor("blk.0.ssm_a", {32})
+                      .build();
+
+    WeightManager manager(*loader, nullptr, nullptr,
+                          WeightDistributionStrategy::SHARDED,
+                          WeightPrecision::NATIVE);
+
+    WeightShardingConfig sharding;
+    sharding.patterns.push_back(
+        {"ssm_a", WeightShardingMode::ColumnParallel, WeightDimensionType::ProportionalHeads, "GDN decay"});
+    manager.setWeightShardingConfig(sharding);
+    manager.setTensorParallelConfig(std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            2,
+            4,
+            4,
+            64,
+            128,
+            std::vector<DeviceId>{DeviceId::rocm(0), DeviceId::rocm(1)})));
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::LocalTP;
+    strategy.model_id = ModelContextId{654};
+    strategy.tp_degree = 2;
+    strategy.devices = {DeviceId::rocm(0), DeviceId::rocm(1)};
+
+    WeightPlan plan(strategy);
+    WeightRequirement requirement;
+    requirement.canonical_name = "blk.0.ssm_a";
+    requirement.role = WeightRole::GDNSsmParam;
+    requirement.layer = 0;
+    requirement.target_device = DeviceId::rocm(0);
+    requirement.lookup_device = DeviceId::rocm(0);
+    requirement.tp_domain = 0;
+    requirement.tp_rank_or_device_index = 0;
+    plan.add(requirement);
+
+    FrozenModelWeightSet first_frozen = manager.materialize(plan);
+    const auto &first_binding = first_frozen.layer(0, "ssm_a");
+    ASSERT_NE(first_binding.tensor, nullptr);
+    ASSERT_TRUE(first_binding.tensor_owner);
+    EXPECT_EQ(first_binding.tensor_owner.get(), first_binding.tensor);
+    ASSERT_EQ(first_binding.tensor->shape().size(), 1u);
+    EXPECT_EQ(first_binding.tensor->shape()[0], 16u);
+
+    FrozenModelWeightSet second_frozen = manager.materialize(plan);
+    const auto &second_binding = second_frozen.layer(0, "ssm_a");
+    ASSERT_NE(second_binding.tensor, nullptr);
+    EXPECT_NE(second_binding.tensor, first_binding.tensor);
+
+    ASSERT_EQ(first_binding.tensor->shape().size(), 1u);
+    EXPECT_EQ(first_binding.tensor->shape()[0], 16u);
 }
 
 TEST(Test__ModelWeightBindings, AdaptsFrozenBindingsToLegacyPointers)

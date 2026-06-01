@@ -7,10 +7,12 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
 #include "MoEExpertDispatchStage.h"
 #include "../../moe/MoEOverlaySparseCollective.h"
 
 #include <memory>
+#include <optional>
 
 namespace llaminar2
 {
@@ -34,6 +36,9 @@ namespace llaminar2
             const TensorBase *hidden = nullptr;
             const TensorBase *routing_indices = nullptr;
             const TensorBase *routing_weights = nullptr;
+            std::optional<BufferId> hidden_buffer_id;
+            std::optional<BufferId> routing_indices_buffer_id;
+            std::optional<BufferId> routing_weights_buffer_id;
             int seq_len = 0;
             int top_k = 0;
             int d_model = 0;
@@ -70,6 +75,7 @@ namespace llaminar2
         bool allowsZeroOutput() const override { return true; }
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
         const Params &params() const { return params_; }

@@ -289,6 +289,13 @@ namespace
         return plan;
     }
 
+    std::shared_ptr<MoEExpertParallelPlan> makeActiveRocmLocalTPReplicatedOverlayPlan()
+    {
+        auto plan = makeActiveRocmLocalTPOverlayPlan();
+        plan->domains[0].compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        return plan;
+    }
+
     // =============================================================================
     // Test Fixture
     // =============================================================================
@@ -459,20 +466,36 @@ namespace
         }
     }
 
-    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, OverlayExecutionDeviceUsesContinuationPrimary)
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, OverlayExecutionDeviceRejectsNonContinuationParticipant)
     {
         GraphConfig graph_config;
         graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPOverlayPlan();
 
+        EXPECT_THROW(
+            (void)resolveMoEExpertOverlayExecutionDeviceForGraph(
+                graph_config,
+                nullptr,
+                DeviceId::cpu(),
+                "[InferenceRunnerFactoryTest]"),
+            std::runtime_error);
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, OverlayExecutionDevicePreservesGraphNativeContinuationParticipant)
+    {
+        GraphConfig graph_config;
+        graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPReplicatedOverlayPlan();
+
         const DeviceId effective_device = resolveMoEExpertOverlayExecutionDeviceForGraph(
             graph_config,
             nullptr,
-            DeviceId::cpu(),
+            DeviceId::rocm(1),
             "[InferenceRunnerFactoryTest]");
 
-        EXPECT_EQ(effective_device, DeviceId::rocm(0));
+        EXPECT_EQ(effective_device, DeviceId::rocm(1));
         ASSERT_NE(graph_config.moe.expert_overlay_runtime_plan, nullptr);
-        EXPECT_EQ(graph_config.moe.expert_overlay_runtime_plan->continuationDevice(), DeviceId::rocm(0));
+        const auto &continuation_domain =
+            graph_config.moe.expert_overlay_runtime_plan->continuationDomain();
+        EXPECT_TRUE(continuation_domain.domain_scoped_collective_context_ready);
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, RebalanceControllersIncludeRoutedOverlayDomains)

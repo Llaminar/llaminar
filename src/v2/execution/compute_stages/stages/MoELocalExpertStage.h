@@ -102,7 +102,7 @@ namespace llaminar2
         bool refreshRuntimePlacement();
 
     private:
-        bool ensureCompactCapacity(size_t rows) const;
+        bool ensureCompactCapacity(size_t rows, int routing_top_k) const;
         bool initializeMoERuntimePlacementBank();
         bool runtimeTableHasActiveOverlayBank() const;
         bool runtimeLocalComputeEnabled(int expert_id) const;
@@ -116,6 +116,7 @@ namespace llaminar2
         mutable std::shared_ptr<FP32Tensor> compact_routing_indices_;
         mutable std::shared_ptr<FP32Tensor> compact_routing_weights_;
         mutable std::shared_ptr<FP32Tensor> compact_output_;
+        mutable int compact_routing_top_k_ = 0;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         DeviceMoELayerRuntime *moe_runtime_layer_ = nullptr;
         bool moe_runtime_table_initialized_ = false;

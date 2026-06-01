@@ -1,8 +1,10 @@
 #include "MoEExpertOverlayPreparationPlan.h"
 
 #include "MoEExpertOverlayExecutionPlan.h"
+#include "MoEExpertOwnerMap.h"
 
 #include <algorithm>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -120,6 +122,53 @@ namespace llaminar2
                 prepared.world_rank_known = domain.primary_world_rank_known;
                 prepared.owner_rank = domain.owner_rank;
                 participants.push_back(prepared);
+            }
+
+            return participants;
+        }
+
+        std::vector<PreparationParticipant> preparationParticipantsForExpert(
+            const MoEOverlayRuntimeDomain &domain,
+            const MoEExpertOwnerMap *owner_map,
+            int layer,
+            int expert_id)
+        {
+            auto participants = preparationParticipantsFor(domain);
+            if (domain.compute_kind != ExpertDomainComputeKind::ReplicatedExperts ||
+                participants.size() <= 1 ||
+                owner_map == nullptr)
+            {
+                return participants;
+            }
+
+            const auto *owner = owner_map->ownerFor(layer, expert_id);
+            if (!owner)
+            {
+                std::ostringstream message;
+                message << "MoE expert overlay preparation plan could not resolve owner for layer "
+                        << layer << " expert " << expert_id << " in domain " << domain.name;
+                throw std::runtime_error(message.str());
+            }
+
+            participants.erase(
+                std::remove_if(
+                    participants.begin(),
+                    participants.end(),
+                    [&](const PreparationParticipant &participant)
+                    {
+                        return participant.participant_index != owner->domain_participant_index ||
+                               participant.device != owner->device;
+                    }),
+                participants.end());
+
+            if (participants.empty())
+            {
+                std::ostringstream message;
+                message << "MoE expert overlay preparation plan resolved owner participant "
+                        << owner->domain_participant_index << " for layer " << layer
+                        << " expert " << expert_id << " in domain " << domain.name
+                        << " but that participant is not locally preparable";
+                throw std::runtime_error(message.str());
             }
 
             return participants;
@@ -328,6 +377,19 @@ namespace llaminar2
         }
 
         std::set<std::tuple<std::string, DeviceId, int, int, WeightResidencyCategory, int, int>> counted_experts;
+        std::optional<MoEExpertOwnerMap> owner_map;
+        if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
+                        [](const auto &domain)
+                        {
+                            return domain.compute_kind == ExpertDomainComputeKind::ReplicatedExperts &&
+                                   domain.participants.size() > 1;
+                        }))
+        {
+            owner_map = MoEExpertOwnerMap::build(
+                source,
+                MoEExpertOwnerMapBuildOptions{.reject_tensor_parallel_experts = false});
+        }
+
         for (const auto &placement : source.placements)
         {
             for (size_t expert_index = 0; expert_index < placement.routed_expert_tier.size(); ++expert_index)
@@ -344,7 +406,11 @@ namespace llaminar2
 
                 const auto &tier = source.routed_tiers[static_cast<size_t>(tier_index)];
                 const auto &domain = runtime_plan.domainForTier(static_cast<size_t>(tier_index));
-                for (const auto &participant : preparationParticipantsFor(domain))
+                for (const auto &participant : preparationParticipantsForExpert(
+                         domain,
+                         owner_map ? &*owner_map : nullptr,
+                         placement.layer,
+                         static_cast<int>(expert_index)))
                 {
                     const auto category = routedResidencyCategoryFor(tier, participant.device);
                     auto &stats = statsFor(

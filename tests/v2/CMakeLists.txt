@@ -402,6 +402,7 @@ function(add_v2_test TEST_NAME)
     # Build base environment variables for optimal performance + logging
     set(TEST_ENV 
         "LLAMINAR_LOG_LEVEL=${DEFAULT_LOG_LEVEL}"
+        "LLAMINAR_TP_COLLECT_TIMEOUT_MS=30000"
         "HWLOC_COMPONENTS=-gl,-opencl"
         "OMP_NUM_THREADS=${CORES_PER_SOCKET}"
         "OMP_PLACES=sockets"
@@ -5134,6 +5135,22 @@ if(ZLIB_FOUND)
         TIMEOUT 2400
     )
 
+    add_executable(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_PrefixMTP_Parity.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
+        llaminar2_core GTest::gtest
+    )
+    target_include_directories(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay
+        LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;ExpertOverlay;SparseCollectives;ROCm;CPU;LocalTP;PyTorch"
+        MPI_PROCS 1
+        TIMEOUT 300
+    )
+
     add_executable(v2_integration_parity_qwen36moe_single_device
         integration/parity/qwen36/Test__Qwen36MoE_SingleDevice_Parity.cpp
         ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
@@ -8446,6 +8463,24 @@ add_v2_test(V2_Integration_MoEOverlaySparseTransport_MPI
     MPI_PROCS 2
 )
 
+add_executable(v2_integration_moe_graph_native_prepared_expert_weights_mvp
+    integration/moe/Test__MoEGraphNative_PreparedExpertWeights_MVP.cpp
+    integration/mpi_gtest_main.cpp
+)
+target_include_directories(v2_integration_moe_graph_native_prepared_expert_weights_mvp PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_integration_moe_graph_native_prepared_expert_weights_mvp
+    llaminar2_core
+    GTest::gtest
+    MPI::MPI_CXX
+)
+add_v2_test(V2_Integration_MoEGraphNative_PreparedExpertWeights_MVP
+    COMMAND $<TARGET_FILE:v2_integration_moe_graph_native_prepared_expert_weights_mvp>
+    LABELS "V2;Integration;MoE;Overlay;GraphNative;PreparedWeights"
+    MPI_PROCS 1
+)
+
 # Test: TPAllreduceStage Local NCCL Integration
 # Tests TPAllreduceStage with LocalTPContext using NCCL backend:
 # - NCCL device validation (tensor must be on TP device)
@@ -10834,6 +10869,22 @@ target_include_directories(v2_test_qwen35moe_graph PRIVATE
 add_v2_test(V2_Unit_Qwen35MoEGraph
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
     LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;TensorParallel"
+    MPI_PROCS 1
+)
+
+# Test: Qwen35MoEGraphNativeProductionLowering — graph-native overlay lowering regressions
+add_executable(v2_test_qwen35moe_graph_native_production_lowering unit/models/qwen35moe/Test__Qwen35MoEGraphNativeProductionLowering.cpp)
+target_link_libraries(v2_test_qwen35moe_graph_native_production_lowering
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+target_include_directories(v2_test_qwen35moe_graph_native_production_lowering PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_Qwen35MoEGraphNativeProductionLowering
+    COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
+    LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;GraphNativeOverlay"
     MPI_PROCS 1
 )
 

@@ -19,6 +19,7 @@
 
 #include "../../IMoEKernel.h"
 #include "../ROCmKernelBase.h"
+#include "../../../tensors/TensorType.h"
 
 #include <array>
 #include <cstddef>
@@ -390,7 +391,7 @@ namespace llaminar2
             size_t logits_count = 0;
             size_t topk_count = 0;
         };
-        bool routeCore(const float *hidden, const float *gate_weights,
+        bool routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                        int seq_len, int d_model, int num_experts, int top_k,
                        bool normalize_weights, DeviceRouteBuffers &bufs);
 

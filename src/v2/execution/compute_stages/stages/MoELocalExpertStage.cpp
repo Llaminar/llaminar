@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <set>
 #include <sstream>
@@ -32,8 +33,22 @@ namespace llaminar2
             }
             (void)device;
             // Host-staged graph-native MoE stages can be scheduled inside a GPU graph
-            // executor while executing participant-local CPU work, and GPU stages can
-            // be driven by host orchestration while uploading compact payloads.
+            // executor while executing participant-local CPU work. GPU local expert
+            // stages must still run on the matching GPU executor; executing ROCm:1
+            // kernels from a ROCm:0 context can corrupt device memory before the
+            // stage reports an ordinary failure.
+            if (device.is_gpu())
+            {
+                const DeviceId ctx_device = ctx->deviceId();
+                if (!ctx_device.is_gpu() || ctx_device != device)
+                {
+                    LOG_ERROR("[" << stage_name << "] GPU local expert stage device "
+                                  << device.to_string()
+                                  << " does not match execution context "
+                                  << ctx_device.to_string());
+                    return false;
+                }
+            }
             return true;
         }
 
@@ -288,17 +303,23 @@ namespace llaminar2
                 params_.expert_mask[static_cast<size_t>(expert_id)]);
     }
 
-    bool MoELocalExpertStage::ensureCompactCapacity(size_t rows) const
+    bool MoELocalExpertStage::ensureCompactCapacity(size_t rows, int routing_top_k) const
     {
+        if (routing_top_k <= 0)
+        {
+            LOG_ERROR("[MoELocalExpertStage] Invalid compact routing top_k=" << routing_top_k);
+            return false;
+        }
         const size_t capacity = std::max<size_t>(rows, 1u);
-        if (compact_capacity_ >= capacity)
+        if (compact_capacity_ >= capacity && compact_routing_top_k_ == routing_top_k)
             return true;
 
         compact_hidden_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(params_.d_model)});
-        compact_routing_indices_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(params_.top_k)});
-        compact_routing_weights_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(params_.top_k)});
+        compact_routing_indices_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(routing_top_k)});
+        compact_routing_weights_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(routing_top_k)});
         compact_output_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(params_.d_model)});
         compact_capacity_ = capacity;
+        compact_routing_top_k_ = routing_top_k;
         return true;
     }
 
@@ -374,19 +395,30 @@ namespace llaminar2
             return false;
         }
 
-        if (!ensureCompactCapacity(input.live_row_count))
-            return false;
+        struct ActiveRoute
+        {
+            size_t input_row = 0;
+            int expert_id = -1;
+            float weight = 0.0f;
+        };
 
-        float *hidden = compact_hidden_->mutable_data();
-        float *routing_indices = compact_routing_indices_->mutable_data();
-        float *routing_weights = compact_routing_weights_->mutable_data();
-        float *compact_output = compact_output_->mutable_data();
-        std::fill_n(routing_indices, input.live_row_count * static_cast<size_t>(params_.top_k), -1.0f);
-        std::fill_n(routing_weights, input.live_row_count * static_cast<size_t>(params_.top_k), 0.0f);
-        std::fill_n(compact_output, input.live_row_count * static_cast<size_t>(params_.d_model), 0.0f);
+        std::vector<ActiveRoute> active_routes;
+        active_routes.reserve(input.live_entry_count);
+        std::vector<int> row_output_slot(input.live_row_count, -1);
+        std::vector<bool> validated_input_rows(input.live_row_count, false);
+        std::vector<size_t> output_input_rows;
+        output_input_rows.reserve(input.live_row_count);
 
         for (size_t row = 0; row < input.live_row_count; ++row)
         {
+            const int row_id = input.row_ids_host[row];
+            if (row_id < 0)
+            {
+                LOG_ERROR("[MoELocalExpertStage] Negative sparse row id " << row_id
+                                                                           << " at compact row " << row);
+                return false;
+            }
+
             const int32_t entry_begin = input.entry_offsets_host[row];
             const int32_t entry_end = input.entry_offsets_host[row + 1u];
             if (entry_begin < 0 || entry_end < entry_begin ||
@@ -397,34 +429,87 @@ namespace llaminar2
                 return false;
             }
 
-            std::memcpy(hidden + row * static_cast<size_t>(params_.d_model),
-                        input.hidden_rows_fp32 + row * static_cast<size_t>(params_.d_model),
-                        static_cast<size_t>(params_.d_model) * sizeof(float));
-
             for (int32_t entry = entry_begin; entry < entry_end; ++entry)
             {
-                const int slot = static_cast<int>(entry - entry_begin);
                 const int expert_id = input.expert_ids_host[entry];
+                const float weight = input.route_weights_host[entry];
                 if (expert_id < 0 || expert_id >= params_.num_experts)
                 {
                     LOG_ERROR("[MoELocalExpertStage] Expert id " << expert_id
                                                                  << " outside num_experts=" << params_.num_experts);
                     return false;
                 }
-                routing_indices[row * static_cast<size_t>(params_.top_k) + static_cast<size_t>(slot)] =
-                    static_cast<float>(expert_id);
-                routing_weights[row * static_cast<size_t>(params_.top_k) + static_cast<size_t>(slot)] =
-                    input.route_weights_host[entry];
+                if (!std::isfinite(weight))
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Non-finite route weight for expert "
+                              << expert_id << " at compact row " << row);
+                    return false;
+                }
+                if (weight == 0.0f || !isExpertActiveForValidation(expert_id))
+                    continue;
+
+                if (!validated_input_rows[row])
+                {
+                    const float *hidden_row =
+                        input.hidden_rows_fp32 + row * static_cast<size_t>(params_.d_model);
+                    for (int col = 0; col < params_.d_model; ++col)
+                    {
+                        if (!std::isfinite(hidden_row[col]))
+                        {
+                            LOG_ERROR("[MoELocalExpertStage] Non-finite sparse hidden value for layer "
+                                      << params_.layer_idx
+                                      << " participant=" << params_.runtime_participant_index
+                                      << " compact_row=" << row
+                                      << " row_id=" << row_id
+                                      << " col=" << col);
+                            return false;
+                        }
+                    }
+                    validated_input_rows[row] = true;
+                }
+
+                if (row_output_slot[row] < 0)
+                {
+                    row_output_slot[row] = static_cast<int>(output_input_rows.size());
+                    output_input_rows.push_back(row);
+                }
+                active_routes.push_back(ActiveRoute{row, expert_id, weight});
             }
+        }
+
+        if (active_routes.empty())
+            return true;
+
+        constexpr int kCompactTopK = 1;
+        if (!ensureCompactCapacity(active_routes.size(), kCompactTopK))
+            return false;
+
+        float *hidden = compact_hidden_->mutable_data();
+        float *routing_indices = compact_routing_indices_->mutable_data();
+        float *routing_weights = compact_routing_weights_->mutable_data();
+        float *compact_output = compact_output_->mutable_data();
+        std::fill_n(routing_indices, active_routes.size() * static_cast<size_t>(kCompactTopK), -1.0f);
+        std::fill_n(routing_weights, active_routes.size() * static_cast<size_t>(kCompactTopK), 0.0f);
+        std::fill_n(compact_output, active_routes.size() * static_cast<size_t>(params_.d_model), 0.0f);
+
+        for (size_t compact_row = 0; compact_row < active_routes.size(); ++compact_row)
+        {
+            const auto &route = active_routes[compact_row];
+
+            std::memcpy(hidden + compact_row * static_cast<size_t>(params_.d_model),
+                        input.hidden_rows_fp32 + route.input_row * static_cast<size_t>(params_.d_model),
+                        static_cast<size_t>(params_.d_model) * sizeof(float));
+            routing_indices[compact_row] = static_cast<float>(route.expert_id);
+            routing_weights[compact_row] = route.weight;
         }
 
         MoEExpertComputeStage::Params compute_params;
         compute_params.device_id = params_.device_id;
         compute_params.input = compact_hidden_.get();
-        compute_params.seq_len = static_cast<int>(input.live_row_count);
+        compute_params.seq_len = static_cast<int>(active_routes.size());
         compute_params.d_model = params_.d_model;
         compute_params.num_experts = params_.num_experts;
-        compute_params.top_k = params_.top_k;
+        compute_params.top_k = kCompactTopK;
         compute_params.gate_exps = params_.gate_exps;
         compute_params.up_exps = params_.up_exps;
         compute_params.down_exps = params_.down_exps;
@@ -516,14 +601,67 @@ namespace llaminar2
         }
 
         const float *compact_result = compact_output_->data();
-        for (size_t row = 0; row < input.live_row_count; ++row)
+        for (size_t compact_row = 0; compact_row < active_routes.size(); ++compact_row)
         {
-            output.row_ids_host[row] = input.row_ids_host[row];
-            std::memcpy(output.output_rows_fp32 + row * static_cast<size_t>(params_.d_model),
-                        compact_result + row * static_cast<size_t>(params_.d_model),
-                        static_cast<size_t>(params_.d_model) * sizeof(float));
+            const auto &route = active_routes[compact_row];
+            const float *src = compact_result + compact_row * static_cast<size_t>(params_.d_model);
+            for (int col = 0; col < params_.d_model; ++col)
+            {
+                if (!std::isfinite(src[col]))
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Non-finite local expert output for layer "
+                              << params_.layer_idx
+                              << " participant=" << params_.runtime_participant_index
+                              << " expert=" << route.expert_id
+                              << " compact_row=" << compact_row
+                              << " input_row=" << route.input_row
+                              << " row_id=" << input.row_ids_host[route.input_row]
+                              << " col=" << col);
+                    return false;
+                }
+            }
         }
-        output.live_row_count = input.live_row_count;
+
+        for (size_t output_row = 0; output_row < output_input_rows.size(); ++output_row)
+        {
+            const size_t input_row = output_input_rows[output_row];
+            output.row_ids_host[output_row] = input.row_ids_host[input_row];
+            std::fill_n(output.output_rows_fp32 + output_row * static_cast<size_t>(params_.d_model),
+                        static_cast<size_t>(params_.d_model), 0.0f);
+        }
+
+        for (size_t compact_row = 0; compact_row < active_routes.size(); ++compact_row)
+        {
+            const auto &route = active_routes[compact_row];
+            const int output_slot = row_output_slot[route.input_row];
+            if (output_slot < 0 || static_cast<size_t>(output_slot) >= output_input_rows.size())
+            {
+                LOG_ERROR("[MoELocalExpertStage] Internal active-route aggregation slot mismatch");
+                return false;
+            }
+            const float *src = compact_result + compact_row * static_cast<size_t>(params_.d_model);
+            float *dst = output.output_rows_fp32 + static_cast<size_t>(output_slot) * static_cast<size_t>(params_.d_model);
+            for (int col = 0; col < params_.d_model; ++col)
+                dst[col] += src[col];
+        }
+        for (size_t output_row = 0; output_row < output_input_rows.size(); ++output_row)
+        {
+            const float *row = output.output_rows_fp32 + output_row * static_cast<size_t>(params_.d_model);
+            for (int col = 0; col < params_.d_model; ++col)
+            {
+                if (!std::isfinite(row[col]))
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Non-finite aggregated local expert output for layer "
+                              << params_.layer_idx
+                              << " participant=" << params_.runtime_participant_index
+                              << " output_row=" << output_row
+                              << " row_id=" << output.row_ids_host[output_row]
+                              << " col=" << col);
+                    return false;
+                }
+            }
+        }
+        output.live_row_count = output_input_rows.size();
         return true;
     }
 

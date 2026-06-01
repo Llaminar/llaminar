@@ -106,6 +106,7 @@ endif()
 
 set(_env_vars
     "LLAMINAR_LOG_LEVEL=DEBUG"
+    "LLAMINAR_TP_COLLECT_TIMEOUT_MS=30000"
     "HWLOC_COMPONENTS=-gl,-opencl"
     "OMP_NUM_THREADS=${CORES_PER_SOCKET}"
     "OMP_PLACES=sockets"

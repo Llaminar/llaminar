@@ -377,6 +377,46 @@ namespace llaminar2
                 return DeviceId::cpu();
             return participant->device;
         }
+
+        const ExpertComputeDomain *expertDomainForTier(
+            const MoEExpertParallelPlan &plan,
+            const ExpertRoutedTier &tier)
+        {
+            auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
+                                   [&](const ExpertComputeDomain &domain)
+                                   {
+                                       return domain.name == tier.domain;
+                                   });
+            return it == plan.domains.end() ? nullptr : &(*it);
+        }
+
+        bool isLocalTPReplicatedExpertsTier(
+            const MoEExpertParallelPlan &plan,
+            const ExpertRoutedTier &tier)
+        {
+            const auto *domain = expertDomainForTier(plan, tier);
+            return domain &&
+                   domain->kind == ExpertDomainKind::LocalTP &&
+                   domain->compute_kind == ExpertDomainComputeKind::ReplicatedExperts &&
+                   domain->participants.size() > 1;
+        }
+
+        int participantIdForTierDevice(
+            const MoEExpertOwnerMap &owner_map,
+            int tier_index,
+            DeviceId device)
+        {
+            for (const auto &participant : owner_map.participants())
+            {
+                if (participant.tier_idx == tier_index &&
+                    participant.device.is_valid() &&
+                    participant.device == device)
+                {
+                    return participant.participant_id;
+                }
+            }
+            return -1;
+        }
     } // namespace
 
     // =========================================================================
@@ -699,9 +739,9 @@ namespace llaminar2
             fused_params.eps = config_.rms_norm_eps;
             fused_params.seq_len = total_tokens;
             fused_params.hidden_dim = config_.d_model;
-            fused_params.input_buffer_id = BufferId::ATTN_PROJ;
-            fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
+            fused_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            fused_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            fused_params.norm_output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
 
             graph.addNode(prefix + "ffn_norm",
                           ComputeStageFactory::createFusedResidualNorm(fused_params),
@@ -712,8 +752,8 @@ namespace llaminar2
         // =====================================================================
         // Stage 2: MoE Routing (softmax top-k expert selection)
         // =====================================================================
-        TensorBase *routing_indices = buffers.get(BufferId::MOE_EXPERT_INDICES);
-        TensorBase *routing_weights = buffers.get(BufferId::MOE_EXPERT_WEIGHTS);
+        TensorBase *routing_indices = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_INDICES));
+        TensorBase *routing_weights = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS));
 
         {
             MoERoutingStage::Params route_params;
@@ -730,9 +770,9 @@ namespace llaminar2
             route_params.moe_runtime_table = moe_runtime_table;
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
-            route_params.input_buffer_id = BufferId::NORMALIZED;
-            route_params.output_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
-            route_params.output_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
+            route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+            route_params.output_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
+            route_params.output_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
 
             graph.addNode(prefix + "moe_routing",
                           ComputeStageFactory::createMoERouting(route_params),
@@ -743,7 +783,7 @@ namespace llaminar2
         // =====================================================================
         // Stage 3: MoE Expert Compute (routed expert SwiGLU FFN)
         // =====================================================================
-        TensorBase *moe_output = buffers.get(BufferId::MOE_COMBINED_OUTPUT);
+        TensorBase *moe_output = buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
 
         {
             // Infer expert intermediate size from weight shape
@@ -774,11 +814,11 @@ namespace llaminar2
                 expert_params.layer_idx = layer_idx;
                 expert_params.routing_indices = routing_indices;
                 expert_params.routing_weights = routing_weights;
-                expert_params.routing_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
-                expert_params.routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
+                expert_params.routing_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
+                expert_params.routing_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
                 expert_params.output = output;
                 expert_params.output_buffer_id = output_buffer_id;
-                expert_params.input_buffer_id = BufferId::NORMALIZED;
+                expert_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
                 expert_params.prepared_store = prepared_weight_store_;
                 expert_params.expert_mask = std::move(expert_mask);
                 expert_params.moe_runtime_table = moe_runtime_table;
@@ -802,8 +842,8 @@ namespace llaminar2
                 }
 
                 // GPU scratch buffers
-                expert_params.gate_scratch = buffers.get(BufferId::MOE_GATE_SCRATCH);
-                expert_params.up_scratch = buffers.get(BufferId::MOE_UP_SCRATCH);
+                expert_params.gate_scratch = buffers.get(buffers.idFor(BufferId::MOE_GATE_SCRATCH));
+                expert_params.up_scratch = buffers.get(buffers.idFor(BufferId::MOE_UP_SCRATCH));
 
                 return expert_params;
             };
@@ -954,6 +994,9 @@ namespace llaminar2
                 dispatch_params.routing_indices = routing_indices;
                 dispatch_params.routing_weights = routing_weights;
                 dispatch_params.hidden = buffers.normalized;
+                dispatch_params.routing_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
+                dispatch_params.routing_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
+                dispatch_params.hidden_buffer_id = buffers.idFor(BufferId::NORMALIZED);
                 dispatch_params.seq_len = total_tokens;
                 dispatch_params.top_k = config_.moe.top_k;
                 dispatch_params.d_model = config_.d_model;
@@ -1016,20 +1059,47 @@ namespace llaminar2
                         continue;
                     }
 
-                    const auto target_participants = owner_map_lifetime->participantIdsForTier(
+                    std::vector<int> target_participants = owner_map_lifetime->participantIdsForTier(
                         static_cast<int>(tier_index));
+                    const bool local_tp_replicated_tier =
+                        isLocalTPReplicatedExpertsTier(*overlay_plan, tier);
+                    const int graph_local_participant =
+                        local_tp_replicated_tier
+                            ? participantIdForTierDevice(
+                                  *owner_map_lifetime,
+                                  static_cast<int>(tier_index),
+                                  device)
+                            : -1;
+                    const bool compute_replicated_tier_on_graph_local_participant =
+                        graph_local_participant >= 0;
+                    if (compute_replicated_tier_on_graph_local_participant)
+                    {
+                        target_participants = {graph_local_participant};
+                    }
+
                     for (const int target_participant : target_participants)
                     {
-                        auto participant_mask = owner_map_lifetime->expertMaskForParticipant(
-                            layer_idx,
-                            target_participant,
-                            config_.moe.num_experts);
+                        auto participant_mask =
+                            owner_map_lifetime->expertMaskForParticipant(
+                                layer_idx,
+                                target_participant,
+                                config_.moe.num_experts);
                         if (!hasActiveExpertMask(participant_mask))
                             continue;
 
                         const DeviceId target_device = participantDeviceForGraphNativeOverlay(
                             *owner_map_lifetime,
                             target_participant);
+                        if (target_device.is_gpu() && target_device != device)
+                        {
+                            throw std::runtime_error(
+                                "Qwen35 MoE graph-native overlay would execute GPU expert participant " +
+                                std::to_string(target_participant) + " on " +
+                                target_device.to_string() + " from graph device " +
+                                device.to_string() +
+                                ". LocalTP ReplicatedExperts GPU domains must lower only the graph-local participant; "
+                                "other cross-device GPU expert execution requires a real participant/domain executor.");
+                        }
                         const std::string participant_suffix =
                             nodeSuffixForTier(tier, static_cast<int>(tier_index)) +
                             "_p" + std::to_string(target_participant);
@@ -1078,6 +1148,9 @@ namespace llaminar2
                                 sparse_dispatch_params.hidden = buffers.normalized;
                                 sparse_dispatch_params.routing_indices = routing_indices;
                                 sparse_dispatch_params.routing_weights = routing_weights;
+                                sparse_dispatch_params.hidden_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+                                sparse_dispatch_params.routing_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
+                                sparse_dispatch_params.routing_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
                                 sparse_dispatch_params.dispatch_output_lifetime = dispatch_output_lifetime;
                             }
 
@@ -1223,7 +1296,7 @@ namespace llaminar2
                             return_params.outbound_rows_lifetime = outbound_lifetime;
                             return_params.inbound_rows_lifetime = inbound_lifetime;
                             return_params.dense_output = moe_output;
-                            return_params.dense_output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
+                            return_params.dense_output_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
                             return_params.seq_len = total_tokens;
                             return_params.d_model = config_.d_model;
                             return_params.clear_output_before_scatter =
@@ -1247,7 +1320,30 @@ namespace llaminar2
 
                         if (!root_return_node.empty())
                         {
-                            last_return_reduce = root_return_node;
+                            std::string tier_terminal = root_return_node;
+                            if (compute_replicated_tier_on_graph_local_participant && needsTPAllreduce())
+                            {
+                                const size_t allreduce_count =
+                                    static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+                                const std::string ar_name = prefix + "moe_sparse_return_reduce_" +
+                                                            participant_suffix + "_allreduce";
+                                auto allreduce_stage = createTPAllreduceStage(
+                                    moe_output,
+                                    allreduce_count,
+                                    device,
+                                    layer_idx,
+                                    /*is_attention=*/false,
+                                    ar_name,
+                                    buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+                                if (allreduce_stage)
+                                {
+                                    graph.addNode(ar_name, std::move(allreduce_stage), device);
+                                    graph.addDependency(ar_name, root_return_node);
+                                    tier_terminal = ar_name;
+                                }
+                            }
+
+                            last_return_reduce = tier_terminal;
                             first_return_scatter = false;
                         }
                     }
@@ -1263,7 +1359,7 @@ namespace llaminar2
             else
             {
                 auto expert_params = makeExpertParams(moe_output,
-                                                      BufferId::MOE_COMBINED_OUTPUT,
+                                                      buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
                                                       {},
                                                       device);
                 (void)prepareExpertParams(expert_params, device);
@@ -1285,7 +1381,7 @@ namespace llaminar2
                     std::string ar_name = prefix + "moe_expert_allreduce";
                     auto allreduce_stage = createTPAllreduceStage(
                         moe_output, allreduce_count, device, layer_idx,
-                        /*is_attention=*/false, ar_name, BufferId::MOE_COMBINED_OUTPUT);
+                        /*is_attention=*/false, ar_name, buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
                     if (allreduce_stage)
                     {
                         graph.addNode(ar_name, std::move(allreduce_stage), device);
@@ -1299,7 +1395,7 @@ namespace llaminar2
         // =====================================================================
         // Stage 4: Shared Expert FFN (always-active dense SwiGLU)
         // =====================================================================
-        TensorBase *shared_output = buffers.get(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+        TensorBase *shared_output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
         std::string shared_ffn_last; // Track last shared expert stage (empty if no shared expert)
 
         if (layer.shared_expert_gate && layer.shared_expert_up && layer.shared_expert_down && shared_output)
@@ -1336,8 +1432,8 @@ namespace llaminar2
             shared_params.seq_len = total_tokens;
             shared_params.d_model = config_.d_model;
             shared_params.intermediate = shared_intermediate;
-            shared_params.input_buffer_id = BufferId::NORMALIZED;
-            shared_params.output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
+            shared_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+            shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
             shared_params.prepared_ref_gate = preparedRefForGraphWeight(
                 layer_bindings.shared_expert_gate, shared_device);
             shared_params.prepared_ref_up = preparedRefForGraphWeight(
@@ -1359,7 +1455,7 @@ namespace llaminar2
                 std::string ar_name = prefix + "shared_expert_allreduce";
                 auto allreduce_stage = createTPAllreduceStage(
                     shared_output, allreduce_count, shared_device, layer_idx,
-                    /*is_attention=*/false, ar_name, BufferId::MOE_SHARED_EXPERT_OUTPUT);
+                    /*is_attention=*/false, ar_name, buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
                 if (allreduce_stage)
                 {
                     graph.addNode(ar_name, std::move(allreduce_stage), shared_device);
@@ -1378,8 +1474,8 @@ namespace llaminar2
                 gate_params.shared_output = shared_output;
                 gate_params.seq_len = total_tokens;
                 gate_params.d_model = config_.d_model;
-                gate_params.input_buffer_id = BufferId::NORMALIZED;
-                gate_params.output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
+                gate_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+                gate_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
 
                 graph.addNode(prefix + "shared_expert_gate",
                               ComputeStageFactory::createSharedExpertGate(gate_params),
@@ -1404,9 +1500,9 @@ namespace llaminar2
                 add_params.residual = moe_output;
                 add_params.output = buffers.attn_proj;
                 add_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-                add_params.input_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
-                add_params.residual_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
-                add_params.output_buffer_id = BufferId::ATTN_PROJ;
+                add_params.input_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+                add_params.residual_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                add_params.output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
 
                 graph.addNode(prefix + "moe_combine",
                               ComputeStageFactory::createResidualAdd(add_params),
@@ -1427,8 +1523,8 @@ namespace llaminar2
                     copy_params.residual = nullptr;
                     copy_params.output = buffers.attn_proj;
                     copy_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-                    copy_params.input_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
-                    copy_params.output_buffer_id = BufferId::ATTN_PROJ;
+                    copy_params.input_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
+                    copy_params.output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
 
                     graph.addNode(prefix + "moe_combine",
                                   ComputeStageFactory::createResidualAdd(copy_params),
@@ -1451,9 +1547,9 @@ namespace llaminar2
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
             res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-            res_params.input_buffer_id = BufferId::ATTN_PROJ;
-            res_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            res_params.output_buffer_id = BufferId::HIDDEN_STATE;
+            res_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            res_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            res_params.output_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
 
             graph.addNode(prefix + "ffn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),

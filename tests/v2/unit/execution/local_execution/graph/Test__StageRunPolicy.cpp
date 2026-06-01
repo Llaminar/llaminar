@@ -21,12 +21,35 @@
 #include "execution/compute_stages/stages/AllreduceStage.h"
 #include "tensors/TensorClasses.h"
 #include "backends/DeviceId.h"
+#include "memory/StageBufferContract.h"
 #include "mocks/MockComputeStage.h"
 #include "mocks/MockCollectiveContext.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
 using llaminar2::test::MockCollectiveContext;
+
+namespace
+{
+    class CountingFP32Tensor : public FP32Tensor
+    {
+    public:
+        explicit CountingFP32Tensor(const std::vector<size_t> &shape)
+            : FP32Tensor(shape, DeviceId::cpu()) {}
+
+        bool ensureOnDevice(DeviceId target_device, void *stream = nullptr) override
+        {
+            (void)stream;
+            ++ensure_on_device_calls;
+            last_ensure_device = target_device;
+            transitionTo(TensorCoherenceState::SYNCED);
+            return true;
+        }
+
+        int ensure_on_device_calls = 0;
+        DeviceId last_ensure_device;
+    };
+}
 
 // =============================================================================
 // StageRunPolicy Factory Tests
@@ -183,6 +206,38 @@ TEST_F(Test__UnifiedExecution, BothPolicies_ProduceSameExecutionOrder)
         EXPECT_EQ(full_log[i], fast_log[i])
             << "Execution order diverged at index " << i;
     }
+}
+
+TEST_F(Test__UnifiedExecution, FastDecodeCollectiveCoheresGpuInputAfterCpuContractWrite)
+{
+    auto tensor = std::make_unique<CountingFP32Tensor>(std::vector<size_t>{1, 4});
+
+    BufferArena arena;
+    ASSERT_TRUE(arena.registerExternalBuffer(BufferId::MOE_COMBINED_OUTPUT, tensor.get()));
+    executor_->setArena(&arena);
+
+    ComputeGraph graph;
+
+    auto cpu_writer = std::make_unique<MockComputeStage>(
+        ComputeStageType::GEMM, "cpu_writer", DeviceId::cpu());
+    cpu_writer->setBufferContract(
+        StageBufferContract::build().addOutput(BufferId::MOE_COMBINED_OUTPUT));
+
+    auto gpu_collective_reader = std::make_unique<MockComputeStage>(
+        ComputeStageType::ALLREDUCE, "gpu_collective_reader", DeviceId::cuda(0));
+    gpu_collective_reader->setBufferContract(
+        StageBufferContract::build().addInput(BufferId::MOE_COMBINED_OUTPUT, "FP32"));
+
+    graph.addNode("cpu_writer", std::move(cpu_writer), DeviceId::cpu());
+    graph.addNode("gpu_collective_reader", std::move(gpu_collective_reader), DeviceId::cuda(0));
+    graph.addDependency("gpu_collective_reader", "cpu_writer");
+
+    std::unordered_set<std::string> collective_nodes = {"gpu_collective_reader"};
+    graph.buildFastSchedule(&collective_nodes);
+
+    ASSERT_TRUE(executor_->executeFastDecode(graph, cpu_ctx_.get(), &collective_nodes));
+    EXPECT_EQ(tensor->ensure_on_device_calls, 1);
+    EXPECT_EQ(tensor->last_ensure_device, DeviceId::cuda(0));
 }
 
 TEST_F(Test__UnifiedExecution, StageFailure_StopsExecution)

@@ -168,6 +168,11 @@ extern "C"
         int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_gate_logits_single_token_bf16_weights(
+        const float *hidden, const void *gate_weights_bf16, float *logits,
+        int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool hipMoE_quantize_router_gate_q8(
         const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
         int d_model, int num_experts,
@@ -490,6 +495,48 @@ namespace
             return false;
         }
         return true;
+    }
+
+    bool launchDecodeGateLogitsForGateType(
+        const float *hidden,
+        const void *gate_weights,
+        llaminar2::TensorType gate_type,
+        float *logits,
+        int d_model,
+        int num_experts,
+        int device_ordinal,
+        void *stream,
+        const char *context)
+    {
+        switch (gate_type)
+        {
+        case llaminar2::TensorType::FP32:
+            return launchDecodeGateLogits(
+                hidden, static_cast<const float *>(gate_weights), logits,
+                d_model, num_experts, device_ordinal, stream, context);
+        case llaminar2::TensorType::FP16:
+            if (!hipMoE_gate_logits_single_token_fp16_weights(
+                    hidden, gate_weights, logits,
+                    d_model, num_experts, device_ordinal, stream))
+            {
+                LOG_ERROR("[" << context << "] FP16 gate logits kernel failed");
+                return false;
+            }
+            return true;
+        case llaminar2::TensorType::BF16:
+            if (!hipMoE_gate_logits_single_token_bf16_weights(
+                    hidden, gate_weights, logits,
+                    d_model, num_experts, device_ordinal, stream))
+            {
+                LOG_ERROR("[" << context << "] BF16 gate logits kernel failed");
+                return false;
+            }
+            return true;
+        default:
+            LOG_ERROR("[" << context << "] unsupported router gate dtype "
+                          << llaminar2::tensorTypeName(gate_type));
+            return false;
+        }
     }
 }
 
@@ -1265,7 +1312,7 @@ namespace llaminar2
     // =========================================================================
 
     bool ROCmMoEKernel::routeCore(
-        const float *hidden, const float *gate_weights,
+        const float *hidden, const void *gate_weights, TensorType gate_type,
         int seq_len, int d_model, int num_experts, int top_k,
         bool normalize_weights, DeviceRouteBuffers &bufs)
     {
@@ -1282,16 +1329,24 @@ namespace llaminar2
         const bool decode_single_token = (seq_len == 1);
         if (decode_single_token)
         {
-            if (!launchDecodeGateLogits(hidden, gate_weights, bufs.d_logits,
-                                        d_model, num_experts,
-                                        device_ordinal_, getStream(),
-                                        "ROCmMoEKernel::routeCore"))
+            if (!launchDecodeGateLogitsForGateType(
+                    hidden, gate_weights, gate_type, bufs.d_logits,
+                    d_model, num_experts,
+                    device_ordinal_, getStream(),
+                    "ROCmMoEKernel::routeCore"))
             {
                 bufs = {};
                 return false;
             }
         }
-        else if (!blas_gemm_->execute(hidden, gate_weights, bufs.d_logits,
+        else if (gate_type != TensorType::FP32)
+        {
+            LOG_ERROR("[ROCmMoEKernel::routeCore] prefill routing requires FP32 gate weights; got "
+                      << tensorTypeName(gate_type));
+            bufs = {};
+            return false;
+        }
+        else if (!blas_gemm_->execute(hidden, static_cast<const float *>(gate_weights), bufs.d_logits,
                                       seq_len, num_experts, d_model,
                                       /*transA=*/false, /*transB=*/true))
         {
@@ -1328,7 +1383,7 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         DeviceRouteBuffers bufs;
-        if (!routeCore(hidden, gate_weights, seq_len, d_model,
+        if (!routeCore(hidden, gate_weights, TensorType::FP32, seq_len, d_model,
                        num_experts, top_k, normalize_weights, bufs))
             return false;
 
@@ -2220,7 +2275,8 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
-        const float *g = static_cast<const float *>(gate_weights->gpu_data_ptr());
+        const void *g = gate_weights->gpu_data_ptr();
+        const TensorType gate_type = gate_weights->native_type();
         if (!h || !g)
         {
             LOG_ERROR("[ROCmMoEKernel::routeWithTensors] null device pointer "
@@ -2230,7 +2286,7 @@ namespace llaminar2
         }
 
         DeviceRouteBuffers bufs;
-        if (!routeCore(h, g, seq_len, d_model, num_experts, top_k,
+        if (!routeCore(h, g, gate_type, seq_len, d_model, num_experts, top_k,
                        normalize_weights, bufs))
             return false;
 
@@ -2398,7 +2454,8 @@ namespace llaminar2
 #endif
 
         const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
-        const float *g = static_cast<const float *>(gate_weights->gpu_data_ptr());
+        const void *g = gate_weights->gpu_data_ptr();
+        const TensorType gate_type = gate_weights->native_type();
         if (!h || !g)
         {
             LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] null device pointer "
@@ -2435,11 +2492,13 @@ namespace llaminar2
         bool logits_ready = false;
         bool runtime_ready = false;
         const auto &rocm_env = debugEnv().rocm;
-        if (rocm_env.moe_router_q8)
+        const bool gate_is_fp32 = (gate_type == TensorType::FP32);
+        if (gate_is_fp32 && rocm_env.moe_router_q8)
         {
             if ((d_model % 32) == 0 && ensureRouterQ8HiddenScratchCapacity(d_model))
             {
-                if (const auto *q8_gate = getOrCreateQ8RouterGateCache(gate_weights, g, d_model, num_experts))
+                if (const auto *q8_gate = getOrCreateQ8RouterGateCache(
+                        gate_weights, static_cast<const float *>(g), d_model, num_experts))
                 {
                     logits_ready = hipMoE_gate_logits_single_token_q8_weights(
                         h, d_router_q8_hidden_, d_router_q8_hidden_scales_,
@@ -2463,14 +2522,14 @@ namespace llaminar2
             }
         }
 
-        if (!logits_ready && rocm_env.moe_router_kpart_decode)
+        if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
         {
             const int k_partitions = rocm_env.moe_router_kparts;
             const size_t partial_count = static_cast<size_t>(num_experts) * static_cast<size_t>(k_partitions);
             if (ensureRouteLogitsPartialsCapacity(partial_count))
             {
                 const bool partials_ready = hipMoE_gate_logits_single_token_kpart_partials(
-                    h, g, d_route_logits_partials_,
+                    h, static_cast<const float *>(g), d_route_logits_partials_,
                     d_model, num_experts, k_partitions,
                     device_ordinal_, getStream());
                 if (partials_ready)
@@ -2504,9 +2563,10 @@ namespace llaminar2
             }
         }
 
-        if (!runtime_ready && !logits_ready)
+        if (!runtime_ready && !logits_ready && gate_is_fp32)
         {
-            if (const void *g_fp16 = getOrCreateFP16RouterGateCache(gate_weights, g, d_model, num_experts))
+            if (const void *g_fp16 = getOrCreateFP16RouterGateCache(
+                    gate_weights, static_cast<const float *>(g), d_model, num_experts))
             {
                 logits_ready = hipMoE_gate_logits_single_token_fp16_weights(
                     h, g_fp16, d_route_logits_,
@@ -2519,7 +2579,12 @@ namespace llaminar2
             }
         }
 
-        if (!runtime_ready && !logits_ready && !launchDecodeGateLogits(h, g, d_route_logits_, d_model, num_experts, device_ordinal_, getStream(), "ROCmMoEKernel::decodeRouteSelect"))
+        if (!runtime_ready && !logits_ready &&
+            !launchDecodeGateLogitsForGateType(
+                h, g, gate_type, d_route_logits_,
+                d_model, num_experts,
+                device_ordinal_, getStream(),
+                "ROCmMoEKernel::decodeRouteSelect"))
         {
             return false;
         }

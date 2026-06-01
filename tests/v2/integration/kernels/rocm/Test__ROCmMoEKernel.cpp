@@ -52,6 +52,7 @@
 #include <numeric>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -1096,6 +1097,127 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectFP16RouterMatchesFP32TopK)
     }
 
     std::cout << "[DecodeRouteSelectFP16RouterMatchesFP32TopK] max_weight_diff="
+              << std::fixed << std::setprecision(8) << max_weight_diff << std::endl;
+}
+
+TEST(Test__ROCmMoEKernel, DecodeRouteSelectBF16RouterMatchesFP32TopK)
+{
+    SKIP_IF_NO_ROCM();
+
+    const DeviceId device = DeviceId::rocm(0);
+    const int d_model = 1024;
+    const int num_experts = 32;
+    const int top_k = 6;
+
+    auto hidden = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
+    auto gate_weights_fp32 = TestTensorFactory::createFP32({static_cast<size_t>(num_experts), static_cast<size_t>(d_model)});
+    auto gate_weights_bf16 = TestTensorFactory::createBF16({static_cast<size_t>(num_experts), static_cast<size_t>(d_model)});
+    auto output_indices_fp32 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
+    auto output_weights_fp32 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
+    auto output_indices_bf16 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
+    auto output_weights_bf16 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
+
+    std::vector<float> hidden_host(static_cast<size_t>(d_model));
+    fillRandom(hidden_host, -1.0f, 1.0f, 9361);
+    const float hidden_norm_sq = std::inner_product(
+        hidden_host.begin(), hidden_host.end(), hidden_host.begin(), 0.0f);
+
+    std::vector<float> gate_host(static_cast<size_t>(num_experts) * d_model);
+    std::mt19937 gen(9362);
+    std::uniform_real_distribution<float> noise(-1.0e-5f, 1.0e-5f);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const float expert_score = 2.0f - 0.05f * static_cast<float>(expert);
+        for (int i = 0; i < d_model; ++i)
+        {
+            gate_host[static_cast<size_t>(expert) * d_model + i] =
+                expert_score * hidden_host[i] / hidden_norm_sq + noise(gen);
+        }
+    }
+
+    std::copy(hidden_host.begin(), hidden_host.end(), hidden->mutable_data());
+    std::copy(gate_host.begin(), gate_host.end(), gate_weights_fp32->mutable_data());
+    gate_weights_bf16->from_fp32(gate_host.data(), gate_host.size());
+
+    ASSERT_TRUE(hidden->ensureOnDevice(device));
+    ASSERT_TRUE(gate_weights_fp32->ensureOnDevice(device));
+    ASSERT_TRUE(gate_weights_bf16->ensureOnDevice(device));
+    ASSERT_TRUE(output_indices_fp32->ensureOnDevice(device));
+    ASSERT_TRUE(output_weights_fp32->ensureOnDevice(device));
+    ASSERT_TRUE(output_indices_bf16->ensureOnDevice(device));
+    ASSERT_TRUE(output_weights_bf16->ensureOnDevice(device));
+
+    DeviceMoELayerRuntime host_runtime{};
+    host_runtime.active_bank = 0;
+    host_runtime.active_epoch = 1;
+    host_runtime.expert_count = static_cast<uint32_t>(num_experts);
+    host_runtime.top_k = static_cast<uint32_t>(top_k);
+    host_runtime.banks[0].epoch = 1;
+    host_runtime.banks[0].expert_count = static_cast<uint32_t>(num_experts);
+
+    DeviceMoELayerRuntime *runtime_fp32 = nullptr;
+    DeviceMoELayerRuntime *runtime_bf16 = nullptr;
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&runtime_fp32), sizeof(DeviceMoELayerRuntime)), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&runtime_bf16), sizeof(DeviceMoELayerRuntime)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(runtime_fp32, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
+    ASSERT_EQ(hipMemcpy(runtime_bf16, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
+
+    ROCmMoEKernel gpu_kernel(0);
+    {
+        ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
+        ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
+        ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
+        ScopedROCmEnvOverride fp16_env("LLAMINAR_ROCM_MOE_ROUTER_FP16", "0");
+        ScopedROCmEnvOverride kpart_env("LLAMINAR_ROCM_MOE_ROUTER_KPART_DECODE", "0");
+        ScopedROCmEnvOverride wave_env("LLAMINAR_ROCM_MOE_ROUTER_WAVE_TOPK", "0");
+
+        ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
+            runtime_fp32,
+            hidden.get(), gate_weights_fp32.get(),
+            d_model, num_experts, top_k,
+            true,
+            output_indices_fp32.get(), output_weights_fp32.get(),
+            true, false));
+        ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
+            runtime_bf16,
+            hidden.get(), gate_weights_bf16.get(),
+            d_model, num_experts, top_k,
+            true,
+            output_indices_bf16.get(), output_weights_bf16.get(),
+            true, false));
+    }
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    DeviceMoELayerRuntime after_fp32{};
+    DeviceMoELayerRuntime after_bf16{};
+    ASSERT_EQ(hipMemcpy(&after_fp32, runtime_fp32, sizeof(DeviceMoELayerRuntime), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipMemcpy(&after_bf16, runtime_bf16, sizeof(DeviceMoELayerRuntime), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipFree(runtime_fp32), hipSuccess);
+    ASSERT_EQ(hipFree(runtime_bf16), hipSuccess);
+
+    output_indices_fp32->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_weights_fp32->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_indices_bf16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_weights_bf16->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    const float *legacy_indices_fp32 = output_indices_fp32->data();
+    const float *legacy_weights_fp32 = output_weights_fp32->data();
+    const float *legacy_indices_bf16 = output_indices_bf16->data();
+    const float *legacy_weights_bf16 = output_weights_bf16->data();
+
+    float max_weight_diff = 0.0f;
+    for (int k = 0; k < top_k; ++k)
+    {
+        EXPECT_EQ(after_bf16.topk_expert_ids[k], after_fp32.topk_expert_ids[k]);
+        EXPECT_FLOAT_EQ(legacy_indices_fp32[k], static_cast<float>(after_fp32.topk_expert_ids[k]));
+        EXPECT_FLOAT_EQ(legacy_indices_bf16[k], static_cast<float>(after_bf16.topk_expert_ids[k]));
+        const float diff = std::fabs(after_bf16.topk_weights[k] - after_fp32.topk_weights[k]);
+        max_weight_diff = std::max(max_weight_diff, diff);
+        EXPECT_NEAR(after_bf16.topk_weights[k], after_fp32.topk_weights[k], 5.0e-3f);
+        EXPECT_NEAR(legacy_weights_bf16[k], after_bf16.topk_weights[k], 1.0e-6f);
+        EXPECT_NEAR(legacy_weights_fp32[k], after_fp32.topk_weights[k], 1.0e-6f);
+    }
+
+    std::cout << "[DecodeRouteSelectBF16RouterMatchesFP32TopK] max_weight_diff="
               << std::fixed << std::setprecision(8) << max_weight_diff << std::endl;
 }
 

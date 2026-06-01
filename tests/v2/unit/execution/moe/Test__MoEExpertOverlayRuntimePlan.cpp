@@ -267,6 +267,30 @@ namespace llaminar2::test
         EXPECT_NE(diagnostics.find("routed_rebalance=overlay_routed_cpu_cold"), std::string::npos);
     }
 
+    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPReplicatedExpertsDomainIsGraphNativeReady)
+    {
+        auto plan = layoutAPlan();
+        plan->domains[0].compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+
+        auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+
+        ASSERT_NE(runtime_plan, nullptr);
+        const auto *rocm_domain = runtime_plan->domainForName("rocm_hot");
+        ASSERT_NE(rocm_domain, nullptr);
+        EXPECT_EQ(rocm_domain->kind, ExpertDomainKind::LocalTP);
+        EXPECT_EQ(rocm_domain->compute_kind, ExpertDomainComputeKind::ReplicatedExperts);
+        EXPECT_FALSE(rocm_domain->multi_participant_execution_pending);
+        EXPECT_TRUE(rocm_domain->domain_scoped_collective_context_ready);
+        EXPECT_TRUE(rocm_domain->pending_reason.empty());
+
+        const std::string diagnostics = runtime_plan->diagnostics();
+        EXPECT_NE(diagnostics.find("rocm_hot"), std::string::npos) << diagnostics;
+        EXPECT_EQ(diagnostics.find("multi_participant_execution_pending=true"),
+                  std::string::npos) << diagnostics;
+        EXPECT_NE(diagnostics.find("collective_context=ready"), std::string::npos)
+            << diagnostics;
+    }
+
     TEST(Test__MoEExpertOverlayRuntimePlan, ContinuationOnlyDomainIsNotRoutedRebalanceEligible)
     {
         auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(continuationOnlyDensePlan());

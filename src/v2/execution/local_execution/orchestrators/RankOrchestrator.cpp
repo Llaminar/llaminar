@@ -46,6 +46,7 @@
 #include <iomanip>
 #include <limits>
 #include <numeric>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -97,6 +98,63 @@ namespace llaminar2
             sync_backend("CUDA", getCUDABackend());
             sync_backend("ROCm", getROCmBackend());
             return ok;
+        }
+
+        const ExpertComputeDomain *findMoEExpertDomain(
+            const MoEExpertParallelPlan &plan,
+            const std::string &name)
+        {
+            auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
+                                   [&](const auto &domain)
+                                   {
+                                       return domain.name == name;
+                                   });
+            return it == plan.domains.end() ? nullptr : &*it;
+        }
+
+        bool routedOverlayUsesReplicatedExperts(const std::shared_ptr<MoEExpertParallelPlan> &plan)
+        {
+            if (!plan || !plan->isTieredOverlay())
+                return false;
+
+            for (const auto &tier : plan->routed_tiers)
+            {
+                const auto *domain = findMoEExpertDomain(*plan, tier.domain);
+                if (domain && domain->compute_kind == ExpertDomainComputeKind::ReplicatedExperts)
+                    return true;
+            }
+            return false;
+        }
+
+        void forceRoutedMoEExpertParentsReplicated(WeightShardingConfig &sharding)
+        {
+            for (auto &pattern : sharding.patterns)
+            {
+                if (pattern.pattern == "ffn_gate_exps.weight" ||
+                    pattern.pattern == "ffn_up_exps.weight" ||
+                    pattern.pattern == "ffn_down_exps.weight")
+                {
+                    pattern.mode = WeightShardingMode::Replicate;
+                    pattern.description = "MoE routed expert weights - replicated for graph-native overlay";
+                }
+            }
+        }
+
+        [[noreturn]] void abortAfterTPWorkerTimeout(
+            const char *operation,
+            int timeout_ms,
+            size_t completed,
+            size_t expected)
+        {
+            LOG_ERROR("RankOrchestrator::" << operation
+                                           << ": TP worker timeout after "
+                                           << timeout_ms
+                                           << "ms (completed "
+                                           << completed
+                                           << "/" << expected
+                                           << "). Aborting process to avoid "
+                                           << "hanging on stuck worker teardown.");
+            std::abort();
         }
     }
 
@@ -582,6 +640,11 @@ namespace llaminar2
                 WeightManagerConfig wm_config;
                 wm_config.tp_config = tp_config;
                 wm_config.sharding = SchemaFactoryRegistry::getWeightShardingConfig(model_ctx_->architecture());
+                if (routedOverlayUsesReplicatedExperts(config_.moe_expert_parallel_plan))
+                {
+                    forceRoutedMoEExpertParentsReplicated(wm_config.sharding);
+                    LOG_DEBUG("RankOrchestrator: forcing routed MoE expert parent weights replicated for graph-native overlay");
+                }
 
                 // Model head dimensions for FusedQKV sub-block slicing
                 const int embed_len = model_ctx_->embeddingLength();
@@ -1607,18 +1670,28 @@ namespace llaminar2
             // throws (e.g., VerificationFailure), it can cause CUDA/HIP context
             // destruction, making other devices fail with misleading "context is
             // destroyed" errors. We want to surface the original root cause.
+            bool worker_timeout = false;
             for (auto &r : results)
             {
                 if (!r.completed)
                 {
                     LOG_ERROR("RankOrchestrator::forwardTP: Device "
                               << r.worker_index << " did not complete (stuck)");
+                    worker_timeout = true;
+                    all_success = false;
+                    if (debugEnv().tp_collect_timeout_ms > 0)
+                    {
+                        abortAfterTPWorkerTimeout(
+                            "forwardTP",
+                            debugEnv().tp_collect_timeout_ms,
+                            tp_worker_pool_->completedCount(),
+                            tp_worker_pool_->numWorkers());
+                    }
                     if (tp_ctx_)
                     {
                         LOG_WARN("RankOrchestrator::forwardTP: requesting TP context abort after worker timeout");
                         tp_ctx_->requestAbort();
                     }
-                    all_success = false;
                     continue;
                 }
 
@@ -1687,6 +1760,14 @@ namespace llaminar2
                               << r.worker_index << " forward failed");
                     all_success = false;
                 }
+            }
+            if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+            {
+                abortAfterTPWorkerTimeout(
+                    "forwardTP",
+                    debugEnv().tp_collect_timeout_ms,
+                    tp_worker_pool_->completedCount(),
+                    tp_worker_pool_->numWorkers());
             }
 
             // Capture timing for decode breakdown (only in parallel mode)
@@ -2087,18 +2168,28 @@ namespace llaminar2
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
         auto results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+        bool worker_timeout = false;
         for (auto &r : results)
         {
             if (!r.completed)
             {
                 LOG_ERROR("RankOrchestrator::forwardMTP: Device "
                           << r.worker_index << " did not complete (stuck)");
+                worker_timeout = true;
+                all_success = false;
+                if (debugEnv().tp_collect_timeout_ms > 0)
+                {
+                    abortAfterTPWorkerTimeout(
+                        "forwardMTP",
+                        debugEnv().tp_collect_timeout_ms,
+                        tp_worker_pool_->completedCount(),
+                        tp_worker_pool_->numWorkers());
+                }
                 if (tp_ctx_)
                 {
                     LOG_WARN("RankOrchestrator::forwardMTP: requesting TP context abort after worker timeout");
                     tp_ctx_->requestAbort();
                 }
-                all_success = false;
                 continue;
             }
 
@@ -2119,6 +2210,14 @@ namespace llaminar2
                           << r.worker_index << " MTP forward failed");
                 all_success = false;
             }
+        }
+        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                "forwardMTP",
+                debugEnv().tp_collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
         }
 
         if (first_exception)

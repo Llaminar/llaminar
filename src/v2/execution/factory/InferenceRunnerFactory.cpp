@@ -303,6 +303,32 @@ namespace llaminar2
             return it == plan.dense_domains.end() ? nullptr : &*it;
         }
 
+        const ExpertComputeDomain *findMoEExpertDomain(
+            const MoEExpertParallelPlan &plan,
+            const std::string &name)
+        {
+            auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
+                                   [&](const auto &domain)
+                                   {
+                                       return domain.name == name;
+                                   });
+            return it == plan.domains.end() ? nullptr : &*it;
+        }
+
+        bool allRoutedOverlayDomainsUseReplicatedExperts(const MoEExpertParallelPlan &plan)
+        {
+            if (!plan.isTieredOverlay() || plan.routed_tiers.empty())
+                return false;
+
+            for (const auto &tier : plan.routed_tiers)
+            {
+                const auto *domain = findMoEExpertDomain(plan, tier.domain);
+                if (!domain || domain->compute_kind != ExpertDomainComputeKind::ReplicatedExperts)
+                    return false;
+            }
+            return true;
+        }
+
         int participantIndexForDenseDomain(
             const ExecutionDomainDefinition &domain,
             const std::shared_ptr<IMPIContext> &runner_mpi_ctx)
@@ -425,6 +451,10 @@ namespace llaminar2
 
             if (plan->isTieredOverlay())
             {
+                if (allRoutedOverlayDomainsUseReplicatedExperts(*plan))
+                {
+                    graph_config.moe.expert_mode = MoEExpertMode::Replicated;
+                }
                 graph_config.moe.expert_overlay_runtime_plan.reset();
                 graph_config.moe.expert_overlay_execution_plan.reset();
                 LOG_DEBUG(log_prefix << " using graph-native MoE overlay lowering for tiered expert overlay");
@@ -667,15 +697,38 @@ namespace llaminar2
         if (!continuation_device.is_valid())
             return requested_device;
 
-        if (continuation_device != requested_device)
+        const auto &continuation_domain = runtime_plan->continuationDomain();
+        if (continuation_domain.requires_domain_scoped_collective_context &&
+            !continuation_domain.domain_scoped_collective_context_ready)
         {
-            LOG_DEBUG(log_prefix << " using MoE overlay continuation device "
-                                 << continuation_device.to_string()
-                                 << " instead of requested root device "
-                                 << requested_device.to_string());
+            throw std::runtime_error(
+                "MoE expert overlay continuation domain '" + continuation_domain.name +
+                "' has multiple participants but no graph-native collective runtime: " +
+                continuation_domain.pending_reason);
         }
 
-        return continuation_device;
+        const bool requested_is_continuation_participant =
+            std::any_of(
+                continuation_domain.participants.begin(),
+                continuation_domain.participants.end(),
+                [&](const MoEOverlayDomainParticipant &participant)
+                {
+                    return participant.locally_addressable &&
+                           participant.local_device == requested_device;
+                });
+        if (requested_is_continuation_participant)
+        {
+            return requested_device;
+        }
+
+        throw std::runtime_error(
+            "MoE expert overlay graph runner requested device " +
+            requested_device.to_string() +
+            " is not a participant of continuation domain '" +
+            continuation_domain.name +
+            "'; expected one of the explicit continuation participants, root=" +
+            continuation_device.to_string() +
+            ". Refusing to rewrite the graph to a different device.");
     }
 
     static MoERebalanceMode toControllerRebalanceMode(MoERebalanceRuntimeMode mode);
@@ -3429,8 +3482,9 @@ namespace llaminar2
 
             if (!prepare_ok)
             {
-                LOG_WARN("[InferenceRunner] PP stage weight preparation had issues for device "
-                         << device.to_string() << " layers [" << pp_cfg.first_layer << ", " << pp_cfg.last_layer << ")");
+                LOG_ERROR("[InferenceRunner] PP stage weight preparation failed for device "
+                          << device.to_string() << " layers [" << pp_cfg.first_layer << ", " << pp_cfg.last_layer << ")");
+                return nullptr;
             }
 
             orchestrator->setFrozenWeightSet(
@@ -3503,8 +3557,9 @@ namespace llaminar2
                             device,
                             /*include_expert_jobs=*/false))
                     {
-                        LOG_WARN("[InferenceRunner] LocalTP binding-driven weight preparation had issues for device "
-                                 << device.to_string());
+                        LOG_ERROR("[InferenceRunner] LocalTP binding-driven weight preparation failed for device "
+                                  << device.to_string());
+                        return nullptr;
                     }
 
                     if (graph_config.moe.expert_overlay_runtime_plan)

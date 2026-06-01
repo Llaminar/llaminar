@@ -4,6 +4,7 @@
 #include "WeightLifecycleTrace.h"
 
 #include <functional>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -39,6 +40,7 @@ namespace llaminar2
         WeightIdentity identity;
         WeightSliceSpec slice;
         WeightResidency residency;
+        std::shared_ptr<TensorBase> tensor_owner;
         TensorBase *tensor = nullptr;
         std::optional<PreparedWeightRef> prepared;
         bool immutable = false;

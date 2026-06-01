@@ -7,6 +7,7 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../memory/BufferId.h"
 #include "../../moe/MoEExpertParallelPlan.h"
 #include "../../moe/MoEExpertTokenRowTransfer.h"
 
@@ -87,6 +88,9 @@ namespace llaminar2
             const ITensor *routing_indices = nullptr; ///< FP32 expert ids [seq_len, top_k] or flat
             const ITensor *routing_weights = nullptr; ///< FP32 route weights [seq_len, top_k] or flat
             const ITensor *hidden = nullptr;          ///< Optional hidden state for future sparse row transfer
+            std::optional<BufferId> routing_indices_buffer_id;
+            std::optional<BufferId> routing_weights_buffer_id;
+            std::optional<BufferId> hidden_buffer_id;
 
             int seq_len = 0;
             int top_k = 0;
@@ -110,6 +114,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return false; }
         StageBufferRequirements getBufferRequirements() const override;
+        StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
         const Params &params() const { return params_; }

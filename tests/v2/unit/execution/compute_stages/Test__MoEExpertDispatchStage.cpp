@@ -93,6 +93,15 @@ namespace
             << " tier=" << tier_index;
     }
 
+    bool hasInputBinding(const StageBufferContract &contract, BufferId id)
+    {
+        return std::any_of(contract.inputs.begin(), contract.inputs.end(),
+                           [id](const BufferBinding &binding)
+                           {
+                               return binding.id == id && binding.access == BufferAccess::READ;
+                           });
+    }
+
 } // namespace
 
 class Test__MoEExpertDispatchStage : public ::testing::Test
@@ -146,6 +155,29 @@ TEST_F(Test__MoEExpertDispatchStage, PrefillTwoTiersRoutesEveryContributionOnceA
     expectContributionExactlyOnce(output, 1, 1, 1, 1, 0.60f);
     expectContributionExactlyOnce(output, 1, 2, 0, 1, 0.55f);
     expectContributionExactlyOnce(output, 0, 2, 1, 0, 0.45f);
+}
+
+TEST_F(Test__MoEExpertDispatchStage, AdvertisesArenaInputContractForHostDispatch)
+{
+    auto indices = routingTensor({1, 2}, {0.0f, 1.0f});
+    auto weights = routingTensor({1, 2}, {0.75f, 0.25f});
+    auto hidden = TestTensorFactory::createFP32({1, 8});
+    MoEExpertDispatchOutput output;
+    auto params = paramsFor(indices.get(), weights.get(), 1, 2,
+                            placement({0, 1}),
+                            {tier("hot", "gpu"), tier("cold", "cpu", true)},
+                            &output);
+    params.hidden = hidden.get();
+    params.routing_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
+    params.routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
+    params.hidden_buffer_id = BufferId::NORMALIZED;
+
+    MoEExpertDispatchStage stage(params);
+    const auto contract = stage.bufferContract();
+
+    EXPECT_TRUE(hasInputBinding(contract, BufferId::MOE_EXPERT_INDICES));
+    EXPECT_TRUE(hasInputBinding(contract, BufferId::MOE_EXPERT_WEIGHTS));
+    EXPECT_TRUE(hasInputBinding(contract, BufferId::NORMALIZED));
 }
 
 TEST_F(Test__MoEExpertDispatchStage, ArenaCapacityRoutingBuffersUseLivePrefixRows)
