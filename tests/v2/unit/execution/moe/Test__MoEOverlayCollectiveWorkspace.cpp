@@ -352,12 +352,13 @@ TEST(Test__MoEOverlayCollectiveWorkspace, SparseDispatchStageReportsManualBounda
     first_params.seq_len = 4;
     first_params.top_k = 2;
     first_params.d_model = 4;
+    first_params.manual_boundary_requires_collective_completion = false;
     first_params.inbound_rows = &inbound0;
 
     MoESparseDispatchStage first_stage(std::move(first_params));
     ASSERT_TRUE(first_stage.execute(&ctx));
     EXPECT_TRUE(first_stage.isManualGraphBoundary());
-    EXPECT_FALSE(first_stage.manualGraphBoundaryComplete());
+    EXPECT_TRUE(first_stage.manualGraphBoundaryComplete());
 
     auto inbound1 = workspace.dispatchReceive(3, 1);
     MoESparseDispatchStage::Params second_params;
@@ -370,12 +371,42 @@ TEST(Test__MoEOverlayCollectiveWorkspace, SparseDispatchStageReportsManualBounda
     second_params.seq_len = 4;
     second_params.top_k = 2;
     second_params.d_model = 4;
+    second_params.manual_boundary_requires_collective_completion = true;
     second_params.inbound_rows = &inbound1;
 
     MoESparseDispatchStage second_stage(std::move(second_params));
     ASSERT_TRUE(second_stage.execute(&ctx));
     EXPECT_TRUE(second_stage.isManualGraphBoundary());
     EXPECT_TRUE(second_stage.manualGraphBoundaryComplete());
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace, SparseDispatchFinalBoundaryRequiresCollectiveCompletion)
+{
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(16, 32, 4, 2, DeviceId::cpu());
+
+    MoEOverlayLocalSparseCollectiveContext collective({.participant_count = 2, .slot_count = 8});
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
+    auto key = dispatchKey(37);
+
+    auto inbound0 = workspace.dispatchReceive(3, 1);
+    MoESparseDispatchStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.collective_context = &collective;
+    params.workspace = &workspace;
+    params.key = key;
+    params.source_participant = 0;
+    params.target_participant = 0;
+    params.seq_len = 4;
+    params.top_k = 2;
+    params.d_model = 4;
+    params.manual_boundary_requires_collective_completion = true;
+    params.inbound_rows = &inbound0;
+
+    MoESparseDispatchStage stage(std::move(params));
+    ASSERT_TRUE(stage.execute(&ctx));
+    EXPECT_TRUE(stage.isManualGraphBoundary());
+    EXPECT_FALSE(stage.manualGraphBoundaryComplete());
 }
 
 TEST(Test__MoEOverlayCollectiveWorkspace, ReturnReduceBroadcastWaitsForCollectiveComplete)
@@ -410,6 +441,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace, ReturnReduceBroadcastWaitsForCollectiv
     first_params.dense_output = &dense0;
     first_params.seq_len = 4;
     first_params.d_model = 4;
+    first_params.manual_boundary_requires_collective_completion = false;
     first_params.broadcast_after_scatter = true;
     first_params.continuation_tp_context = &tp_context;
     first_params.continuation_root_tp_index = 1;
@@ -417,7 +449,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace, ReturnReduceBroadcastWaitsForCollectiv
     MoESparseReturnReduceStage first_stage(std::move(first_params));
     ASSERT_TRUE(first_stage.execute(&ctx));
     EXPECT_TRUE(first_stage.isManualGraphBoundary());
-    EXPECT_FALSE(first_stage.manualGraphBoundaryComplete());
+    EXPECT_TRUE(first_stage.manualGraphBoundaryComplete());
     EXPECT_EQ(tp_context.broadcast_calls, 0);
 
     auto outbound1 = workspace.localExpertOutput(3, 1);
@@ -439,6 +471,7 @@ TEST(Test__MoEOverlayCollectiveWorkspace, ReturnReduceBroadcastWaitsForCollectiv
     second_params.dense_output = &dense1;
     second_params.seq_len = 4;
     second_params.d_model = 4;
+    second_params.manual_boundary_requires_collective_completion = true;
     second_params.broadcast_after_scatter = true;
     second_params.continuation_tp_context = &tp_context;
     second_params.continuation_root_tp_index = 1;
@@ -449,4 +482,40 @@ TEST(Test__MoEOverlayCollectiveWorkspace, ReturnReduceBroadcastWaitsForCollectiv
     EXPECT_TRUE(second_stage.manualGraphBoundaryComplete());
     EXPECT_EQ(tp_context.broadcast_calls, 1);
     EXPECT_EQ(tp_context.last_source_index, 1);
+}
+
+TEST(Test__MoEOverlayCollectiveWorkspace, SparseReturnFinalBoundaryRequiresCollectiveCompletion)
+{
+    MoEOverlayCollectiveWorkspace workspace;
+    workspace.ensureCapacity(16, 32, 4, 2, DeviceId::cpu());
+
+    MoEOverlayLocalSparseCollectiveContext collective({.participant_count = 2, .slot_count = 8});
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cpu(), ComputeBackendType::CPU);
+    auto key = returnKey(38);
+
+    auto outbound0 = workspace.localExpertOutput(3, 1);
+    outbound0.key = key;
+    outbound0.source_participant = 0;
+    outbound0.target_participant = 0;
+    outbound0.live_row_count = 0;
+
+    FP32Tensor dense0(std::vector<size_t>{4, 4});
+    auto inbound0 = workspace.returnReceive(3, 1);
+    MoESparseReturnReduceStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.collective_context = &collective;
+    params.key = key;
+    params.source_participant = 0;
+    params.target_participant = 0;
+    params.outbound_rows = &outbound0;
+    params.inbound_rows = &inbound0;
+    params.dense_output = &dense0;
+    params.seq_len = 4;
+    params.d_model = 4;
+    params.manual_boundary_requires_collective_completion = true;
+
+    MoESparseReturnReduceStage stage(std::move(params));
+    ASSERT_TRUE(stage.execute(&ctx));
+    EXPECT_TRUE(stage.isManualGraphBoundary());
+    EXPECT_FALSE(stage.manualGraphBoundaryComplete());
 }

@@ -45,6 +45,7 @@ namespace llaminar2
 
             bool replicated_hidden_export = false;
             int logical_continuation_root_participant = -1;
+            bool manual_boundary_requires_collective_completion = true;
 
             MoEOverlaySparseRows *inbound_rows = nullptr;
             std::shared_ptr<MoEOverlaySparseRows> inbound_rows_lifetime;
@@ -62,7 +63,9 @@ namespace llaminar2
         bool isManualGraphBoundary() const override { return true; }
         bool manualGraphBoundaryComplete() const override
         {
-            return last_collective_result_.ok && last_collective_result_.collective_complete;
+            return last_collective_result_.ok &&
+                   (!params_.manual_boundary_requires_collective_completion ||
+                    last_collective_result_.collective_complete);
         }
         bool allowsZeroOutput() const override { return true; }
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }

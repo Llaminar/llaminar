@@ -39,6 +39,7 @@ namespace llaminar2
             int seq_len = 0;
             int d_model = 0;
             bool clear_output_before_scatter = false;
+            bool manual_boundary_requires_collective_completion = true;
 
             ITPContext *continuation_tp_context = nullptr;
             bool broadcast_after_scatter = false;
@@ -57,7 +58,9 @@ namespace llaminar2
         bool isManualGraphBoundary() const override { return true; }
         bool manualGraphBoundaryComplete() const override
         {
-            return last_collective_result_.ok && last_collective_result_.collective_complete;
+            return last_collective_result_.ok &&
+                   (!params_.manual_boundary_requires_collective_completion ||
+                    last_collective_result_.collective_complete);
         }
         bool allowsZeroOutput() const override { return true; }
         CoherencePolicy coherencePolicy() const override { return CoherencePolicy::NONE; }

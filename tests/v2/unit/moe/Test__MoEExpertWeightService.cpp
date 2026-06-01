@@ -304,6 +304,62 @@ TEST(Test__MoEExpertWeightService, PrepareGemmEngines_CPU_StoreOwnsPreparedEngin
     }
 }
 
+TEST(Test__MoEExpertWeightService, PrepareGemmEngines_CPU_IncrementallyFillsExistingStoreSlabs)
+{
+    TestWeightContextOwner owner;
+    PreparedWeightStore store(ModelContextId{8});
+    owner.prepared_store = &store;
+
+    {
+        auto ctx = owner.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+    }
+
+    owner.expert_mask = {true, false, true, false};
+    ExpertSlabRef gate_ref;
+    ExpertSlabRef up_ref;
+    ExpertSlabRef down_ref;
+    {
+        auto ctx = owner.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+        ASSERT_TRUE(ctx.gate_slab_ref.has_value());
+        ASSERT_TRUE(ctx.up_slab_ref.has_value());
+        ASSERT_TRUE(ctx.down_slab_ref.has_value());
+        gate_ref = *ctx.gate_slab_ref;
+        up_ref = *ctx.up_slab_ref;
+        down_ref = *ctx.down_slab_ref;
+    }
+
+    EXPECT_EQ(store.expertSlabCount(), 3u);
+    EXPECT_EQ(store.totalPopulatedExperts(), 6u);
+    EXPECT_NE(store.expertGemmKernel(gate_ref, 0), nullptr);
+    EXPECT_EQ(store.expertGemmKernel(gate_ref, 1), nullptr);
+    EXPECT_NE(store.expertGemmKernel(gate_ref, 2), nullptr);
+    EXPECT_EQ(store.expertGemmKernel(gate_ref, 3), nullptr);
+
+    owner.expert_mask = {false, true, false, true};
+    {
+        auto ctx = owner.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+        ASSERT_TRUE(ctx.gate_slab_ref.has_value());
+        ASSERT_TRUE(ctx.up_slab_ref.has_value());
+        ASSERT_TRUE(ctx.down_slab_ref.has_value());
+        EXPECT_EQ(*ctx.gate_slab_ref, gate_ref);
+        EXPECT_EQ(*ctx.up_slab_ref, up_ref);
+        EXPECT_EQ(*ctx.down_slab_ref, down_ref);
+    }
+
+    EXPECT_TRUE(owner.moe_owned_kernels.empty());
+    EXPECT_EQ(store.expertSlabCount(), 3u);
+    EXPECT_EQ(store.totalPopulatedExperts(), static_cast<size_t>(kNumExperts * 3));
+    for (int e = 0; e < kNumExperts; ++e)
+    {
+        EXPECT_NE(store.expertGemmKernel(gate_ref, e), nullptr) << "gate expert " << e;
+        EXPECT_NE(store.expertGemmKernel(up_ref, e), nullptr) << "up expert " << e;
+        EXPECT_NE(store.expertGemmKernel(down_ref, e), nullptr) << "down expert " << e;
+    }
+}
+
 TEST(Test__MoEExpertWeightService, PrepareGemmEngines_WithMask_OnlyMaskedExperts)
 {
     TestWeightContextOwner owner;

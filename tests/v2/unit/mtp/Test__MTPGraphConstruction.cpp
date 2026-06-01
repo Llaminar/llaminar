@@ -595,6 +595,21 @@ namespace
         return nullptr;
     }
 
+    template <typename StageType>
+    std::vector<const StageType *> stagesOfType(const ComputeGraph &graph)
+    {
+        std::vector<const StageType *> stages;
+        for (const auto &node_name : graph.getExecutionOrder())
+        {
+            const auto *node = graph.getNode(node_name);
+            if (!node || !node->stage)
+                continue;
+            if (const auto *stage = dynamic_cast<const StageType *>(node->stage.get()))
+                stages.push_back(stage);
+        }
+        return stages;
+    }
+
     ExpertComputeDomain mtpOverlayDomain(const std::string &name, GlobalDeviceAddress participant)
     {
         ExpertComputeDomain result;
@@ -879,6 +894,38 @@ namespace
             binding.residency.resident_device = DeviceId::cpu();
             store.prepareGemm(binding);
         }
+    }
+
+    void expectSingleTokenKVPayloadNonZero(IKVCache &kv_cache)
+    {
+        ASSERT_EQ(kv_cache.get_cached_tokens(0, 0), 1);
+        const auto layout = kv_cache.logicalBlockLayout(0, 1);
+        ASSERT_GT(layout.k_bytes, 0u);
+        ASSERT_GT(layout.v_bytes, 0u);
+
+        std::vector<uint8_t> k_payload(layout.k_bytes, 0);
+        std::vector<uint8_t> v_payload(layout.v_bytes, 0);
+        IKVCache::KVCacheLogicalBlockDescriptor desc;
+        desc.layer = 0;
+        desc.seq_idx = 0;
+        desc.logical_token_start = 0;
+        desc.token_count = 1;
+        ASSERT_TRUE(kv_cache.exportLogicalBlock(
+            desc,
+            k_payload.data(),
+            v_payload.data()));
+
+        auto fp32_abs_sum = [](const std::vector<uint8_t> &bytes)
+        {
+            const auto *values = reinterpret_cast<const float *>(bytes.data());
+            const size_t count = bytes.size() / sizeof(float);
+            float sum = 0.0f;
+            for (size_t i = 0; i < count; ++i)
+                sum += std::abs(values[i]);
+            return sum;
+        };
+        EXPECT_GT(fp32_abs_sum(k_payload), 0.0f);
+        EXPECT_GT(fp32_abs_sum(v_payload), 0.0f);
     }
 } // namespace
 
@@ -1203,6 +1250,37 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     EXPECT_EQ(dispatch_key.direction, MoEOverlayCollectiveDirection::Dispatch);
     EXPECT_EQ(return_key.direction, MoEOverlayCollectiveDirection::ReturnReduce);
 
+    const auto dispatch_stages = stagesOfType<MoESparseDispatchStage>(graph);
+    const auto return_stages = stagesOfType<MoESparseReturnReduceStage>(graph);
+    ASSERT_GT(dispatch_stages.size(), 1u);
+    ASSERT_GT(return_stages.size(), 1u);
+
+    bool saw_non_final_dispatch = false;
+    bool saw_final_dispatch = false;
+    for (const auto *stage : dispatch_stages)
+    {
+        const bool expected_final =
+            stage->params().source_participant == stage->params().target_participant;
+        EXPECT_EQ(stage->params().manual_boundary_requires_collective_completion, expected_final);
+        saw_non_final_dispatch = saw_non_final_dispatch || !expected_final;
+        saw_final_dispatch = saw_final_dispatch || expected_final;
+    }
+    EXPECT_TRUE(saw_non_final_dispatch);
+    EXPECT_TRUE(saw_final_dispatch);
+
+    bool saw_non_final_return = false;
+    bool saw_final_return = false;
+    for (const auto *stage : return_stages)
+    {
+        const bool expected_final =
+            stage->params().source_participant == stage->params().target_participant;
+        EXPECT_EQ(stage->params().manual_boundary_requires_collective_completion, expected_final);
+        saw_non_final_return = saw_non_final_return || !expected_final;
+        saw_final_return = saw_final_return || expected_final;
+    }
+    EXPECT_TRUE(saw_non_final_return);
+    EXPECT_TRUE(saw_final_return);
+
     auto main_layer = fixture.moeLayerWeights();
     auto main_buffers = fixture.moeActivationBuffers();
     ComputeGraph main_graph = graph_builder.buildFFNGraph(
@@ -1242,34 +1320,7 @@ TEST(Test__MTPGraphConstruction, DenseSidecarExecutionAppendsRealKVPayload)
     DeviceGraphExecutor executor;
     ASSERT_TRUE(executor.execute(graph, &ctx));
 
-    ASSERT_EQ(fixture.kv_cache->get_cached_tokens(0, 0), 1);
-    const auto layout = fixture.kv_cache->logicalBlockLayout(0, 1);
-    ASSERT_GT(layout.k_bytes, 0u);
-    ASSERT_GT(layout.v_bytes, 0u);
-
-    std::vector<uint8_t> k_payload(layout.k_bytes, 0);
-    std::vector<uint8_t> v_payload(layout.v_bytes, 0);
-    IKVCache::KVCacheLogicalBlockDescriptor desc;
-    desc.layer = 0;
-    desc.seq_idx = 0;
-    desc.logical_token_start = 0;
-    desc.token_count = 1;
-    ASSERT_TRUE(fixture.kv_cache->exportLogicalBlock(
-        desc,
-        k_payload.data(),
-        v_payload.data()));
-
-    auto fp32_abs_sum = [](const std::vector<uint8_t> &bytes)
-    {
-        const auto *values = reinterpret_cast<const float *>(bytes.data());
-        const size_t count = bytes.size() / sizeof(float);
-        float sum = 0.0f;
-        for (size_t i = 0; i < count; ++i)
-            sum += std::abs(values[i]);
-        return sum;
-    };
-    EXPECT_GT(fp32_abs_sum(k_payload), 0.0f);
-    EXPECT_GT(fp32_abs_sum(v_payload), 0.0f);
+    expectSingleTokenKVPayloadNonZero(*fixture.kv_cache);
 }
 
 TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
@@ -1301,34 +1352,47 @@ TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
     DeviceGraphExecutor executor;
     ASSERT_TRUE(executor.execute(graph, &ctx));
 
-    ASSERT_EQ(fixture.kv_cache->get_cached_tokens(0, 0), 1);
-    const auto layout = fixture.kv_cache->logicalBlockLayout(0, 1);
-    ASSERT_GT(layout.k_bytes, 0u);
-    ASSERT_GT(layout.v_bytes, 0u);
+    expectSingleTokenKVPayloadNonZero(*fixture.kv_cache);
+}
 
-    std::vector<uint8_t> k_payload(layout.k_bytes, 0);
-    std::vector<uint8_t> v_payload(layout.v_bytes, 0);
-    IKVCache::KVCacheLogicalBlockDescriptor desc;
-    desc.layer = 0;
-    desc.seq_idx = 0;
-    desc.logical_token_start = 0;
-    desc.token_count = 1;
-    ASSERT_TRUE(fixture.kv_cache->exportLogicalBlock(
-        desc,
-        k_payload.data(),
-        v_payload.data()));
+TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
+{
+    DenseMTPGraphFixture fixture;
+    fixture.config.moe.num_experts = 4;
+    fixture.config.moe.top_k = 2;
+    fixture.config.moe.intermediate_size = 32;
+    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.has_shared_expert = false;
+    fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(1);
 
-    auto fp32_abs_sum = [](const std::vector<uint8_t> &bytes)
-    {
-        const auto *values = reinterpret_cast<const float *>(bytes.data());
-        const size_t count = bytes.size() / sizeof(float);
-        float sum = 0.0f;
-        for (size_t i = 0; i < count; ++i)
-            sum += std::abs(values[i]);
-        return sum;
-    };
-    EXPECT_GT(fp32_abs_sum(k_payload), 0.0f);
-    EXPECT_GT(fp32_abs_sum(v_payload), 0.0f);
+    Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
+    auto frozen = makeMoEMTPFrozenWeightSet(fixture);
+    auto bindings = makeModelWeightBindings(*frozen);
+    graph_builder.setWeightBindings(bindings);
+    graph_builder.setWeights(toLegacyModelWeights(bindings));
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*frozen, store);
+    graph_builder.setPreparedWeightStore(&store);
+
+    auto input = fixture.input();
+    auto output = fixture.output();
+    ASSERT_FALSE(bindings.mtp.depths.empty());
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, bindings.mtp.depths[0], input, output);
+    ASSERT_GT(graph.size(), 0u);
+    ASSERT_NE(firstStageOfType<MoESparseDispatchStage>(graph), nullptr);
+    ASSERT_NE(firstStageOfType<MoESparseReturnReduceStage>(graph), nullptr);
+
+    CPUDeviceContext ctx(DeviceId::cpu());
+    DeviceGraphExecutor executor;
+    ASSERT_TRUE(executor.execute(graph, &ctx));
+
+    for (const auto *stage : stagesOfType<MoESparseDispatchStage>(graph))
+        EXPECT_TRUE(stage->manualGraphBoundaryComplete());
+    for (const auto *stage : stagesOfType<MoESparseReturnReduceStage>(graph))
+        EXPECT_TRUE(stage->manualGraphBoundaryComplete());
+
+    expectSingleTokenKVPayloadNonZero(*fixture.kv_cache);
 }
 
 TEST(Test__MTPGraphConstruction, Qwen35PrefillPopulatesRealShiftedMTPKVPayload)

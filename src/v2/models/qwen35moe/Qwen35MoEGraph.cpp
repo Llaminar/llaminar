@@ -1049,6 +1049,8 @@ namespace llaminar2
                             sparse_dispatch_params.tier_index = static_cast<int>(tier_index);
                             sparse_dispatch_params.replicated_hidden_export = true;
                             sparse_dispatch_params.logical_continuation_root_participant = continuation_root_participant;
+                            sparse_dispatch_params.manual_boundary_requires_collective_completion =
+                                source_participant == target_participant;
                             sparse_dispatch_params.inbound_rows_lifetime = inbound_lifetime;
                             if (source_participant == continuation_root_participant)
                             {
@@ -1205,6 +1207,8 @@ namespace llaminar2
                             return_params.d_model = config_.d_model;
                             return_params.clear_output_before_scatter =
                                 source_participant == continuation_root_participant && first_return_scatter;
+                            return_params.manual_boundary_requires_collective_completion =
+                                source_participant == continuation_root_participant;
 
                             const std::string return_name = prefix + "moe_sparse_return_reduce_" +
                                                             participant_suffix +

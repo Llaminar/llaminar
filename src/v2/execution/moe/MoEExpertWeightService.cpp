@@ -382,7 +382,8 @@ namespace llaminar2
             for (int e = local_start; e < local_end; ++e)
                 experts_to_prep.push_back(e);
         }
-        const int prep_count = static_cast<int>(experts_to_prep.size());
+        const std::vector<int> required_experts = experts_to_prep;
+        int prep_count = static_cast<int>(experts_to_prep.size());
 
         ctx.prepared_gate_gemm.resize(num_experts, nullptr);
         ctx.prepared_up_gemm.resize(num_experts, nullptr);
@@ -462,10 +463,36 @@ namespace llaminar2
 
             if (gate_ref && up_ref && down_ref)
             {
-                LOG_ERROR("[MoEWeightService] PreparedWeightStore expert slabs for layer "
-                          << ctx.layer_idx << " on " << ctx.device_id.to_string()
-                          << " are missing required experts; refusing raw expert repack fallback");
-                return false;
+                std::vector<int> missing_experts;
+                missing_experts.reserve(required_experts.size());
+                for (int e : required_experts)
+                {
+                    ctx.prepared_gate_gemm[e] = ctx.prepared_store->expertGemmKernel(*gate_ref, e);
+                    ctx.prepared_up_gemm[e] = ctx.prepared_store->expertGemmKernel(*up_ref, e);
+                    ctx.prepared_down_gemm[e] = ctx.prepared_store->expertGemmKernel(*down_ref, e);
+                    if (!ctx.prepared_gate_gemm[e] ||
+                        !ctx.prepared_up_gemm[e] ||
+                        !ctx.prepared_down_gemm[e])
+                    {
+                        ctx.prepared_gate_gemm[e] = nullptr;
+                        ctx.prepared_up_gemm[e] = nullptr;
+                        ctx.prepared_down_gemm[e] = nullptr;
+                        missing_experts.push_back(e);
+                    }
+                }
+
+                if (!missing_experts.empty())
+                {
+                    ctx.gate_slab_ref = *gate_ref;
+                    ctx.up_slab_ref = *up_ref;
+                    ctx.down_slab_ref = *down_ref;
+                    experts_to_prep = std::move(missing_experts);
+                    prep_count = static_cast<int>(experts_to_prep.size());
+                    LOG_DEBUG("[MoEWeightService] PreparedWeightStore slabs for layer "
+                              << ctx.layer_idx << " on " << ctx.device_id.to_string()
+                              << " are missing " << prep_count
+                              << " required expert(s); preparing incremental arrivals");
+                }
             }
         }
 
@@ -559,7 +586,8 @@ namespace llaminar2
             // Use the 3D parent tensor identity for source_identity when available.
             auto register_slab = [&](WeightRole role, const std::vector<ITensorGemm *> &engines,
                                      const std::vector<std::shared_ptr<TensorBase>> &views,
-                                     TensorBase *parent_3d) -> ExpertSlabRef
+                                     TensorBase *parent_3d,
+                                     const ExpertSlabRef *existing_ref) -> ExpertSlabRef
             {
                 ExpertSlabDescriptor desc;
                 desc.layer_idx = ctx.layer_idx;
@@ -574,7 +602,7 @@ namespace llaminar2
                 // Phase C will wire this through WeightManager lookup.
                 (void)parent_3d;
 
-                auto slab_ref = ctx.prepared_store->registerExpertSlab(desc);
+                auto slab_ref = existing_ref ? *existing_ref : ctx.prepared_store->registerExpertSlab(desc);
 
                 // Build arrivals for all prepared experts
                 std::vector<ExpertArrival> arrivals;
@@ -613,11 +641,14 @@ namespace llaminar2
             };
 
             ctx.gate_slab_ref = register_slab(WeightRole::MoEExpertGate, ctx.prepared_gate_gemm,
-                                              ctx.expert_gate_views, ctx.gate_exps);
+                                              ctx.expert_gate_views, ctx.gate_exps,
+                                              ctx.gate_slab_ref ? &*ctx.gate_slab_ref : nullptr);
             ctx.up_slab_ref = register_slab(WeightRole::MoEExpertUp, ctx.prepared_up_gemm,
-                                            ctx.expert_up_views, ctx.up_exps);
+                                            ctx.expert_up_views, ctx.up_exps,
+                                            ctx.up_slab_ref ? &*ctx.up_slab_ref : nullptr);
             ctx.down_slab_ref = register_slab(WeightRole::MoEExpertDown, ctx.prepared_down_gemm,
-                                              ctx.expert_down_views, ctx.down_exps);
+                                              ctx.expert_down_views, ctx.down_exps,
+                                              ctx.down_slab_ref ? &*ctx.down_slab_ref : nullptr);
 
             LOG_DEBUG("[MoEWeightService] Phase B: Registered " << (prep_count * 3)
                                                                 << " expert engines in PreparedWeightStore ("
