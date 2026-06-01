@@ -10,6 +10,7 @@
 #include "execution/compute_stages/stages/MoEExpertParallelReduceStage.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 
 #include "fort.hpp"
 
@@ -166,12 +167,103 @@ namespace llaminar2
             }
             return out.str();
         }
+
+        uint64_t msToNs(double ms)
+        {
+            if (ms <= 0.0)
+                return 0;
+            return static_cast<uint64_t>(ms * 1.0e6);
+        }
+
+        PerfStatsCollector::Tags unifiedTagsForRow(const MoEExpertOverlayProfileRow &row)
+        {
+            PerfStatsCollector::Tags tags{
+                {"layer", std::to_string(row.layer)},
+                {"tier", std::to_string(row.tier_index)},
+                {"domain", row.domain},
+                {"domain_kind", row.domain_kind},
+                {"backend", row.backend},
+                {"transport", row.transport_mode},
+                {"accumulation", row.accumulation_path},
+            };
+            if (!row.final_reduce_mode.empty() && row.final_reduce_mode != "unknown")
+                tags.emplace("final_reduce", row.final_reduce_mode);
+            if (!row.executed_experts.empty() && row.executed_experts != "unknown")
+                tags.emplace("experts", row.executed_experts);
+            return tags;
+        }
+
+        void addUnifiedCounterIfNonZero(
+            const MoEExpertOverlayProfileRow &row,
+            const PerfStatsCollector::Tags &tags,
+            const char *name,
+            double value)
+        {
+            if (value == 0.0)
+                return;
+            PerfStatsCollector::addCounter(
+                "moe_overlay",
+                name,
+                value,
+                row.phase,
+                row.domain,
+                tags);
+        }
+
+        void addUnifiedTimerIfNonZero(
+            const MoEExpertOverlayProfileRow &row,
+            const PerfStatsCollector::Tags &tags,
+            const char *name,
+            double ms)
+        {
+            const uint64_t ns = msToNs(ms);
+            if (ns == 0)
+                return;
+            PerfStatsCollector::recordTimingNs(
+                "moe_overlay",
+                name,
+                ns,
+                row.phase,
+                row.domain,
+                tags);
+        }
+
+        void recordUnified(const MoEExpertOverlayProfileRow &row)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            const auto tags = unifiedTagsForRow(row);
+            addUnifiedCounterIfNonZero(row, tags, "assigned_experts", row.assigned_experts);
+            addUnifiedCounterIfNonZero(row, tags, "resident_experts", row.resident_experts);
+            addUnifiedCounterIfNonZero(row, tags, "routed_entries", static_cast<double>(row.routed_entries));
+            addUnifiedCounterIfNonZero(row, tags, "selected_rows", static_cast<double>(row.selected_rows));
+            addUnifiedCounterIfNonZero(row, tags, "transfer_bytes", static_cast<double>(row.transfer_bytes));
+            addUnifiedCounterIfNonZero(row, tags, "outbound_bytes", static_cast<double>(row.outbound_bytes));
+            addUnifiedCounterIfNonZero(row, tags, "return_bytes", static_cast<double>(row.return_bytes));
+            addUnifiedCounterIfNonZero(row, tags, "participant_count", row.participant_count);
+            addUnifiedCounterIfNonZero(row, tags, "inbound_rows", static_cast<double>(row.inbound_rows));
+            addUnifiedCounterIfNonZero(row, tags, "compact_dispatch_bytes", static_cast<double>(row.compact_dispatch_bytes));
+            addUnifiedCounterIfNonZero(row, tags, "compact_return_bytes", static_cast<double>(row.compact_return_bytes));
+            addUnifiedCounterIfNonZero(row, tags, "dense_bytes_avoided", static_cast<double>(row.dense_bytes_avoided));
+            addUnifiedCounterIfNonZero(row, tags, "cpu_rows", static_cast<double>(row.cpu_fallback_rows));
+            addUnifiedCounterIfNonZero(row, tags, "gpu_rows", static_cast<double>(row.gpu_cached_rows));
+
+            addUnifiedTimerIfNonZero(row, tags, "compute", row.compute_ms);
+            addUnifiedTimerIfNonZero(row, tags, "domain_reduce", row.domain_reduce_ms);
+            addUnifiedTimerIfNonZero(row, tags, "cross_domain_reduce", row.cross_domain_reduce_ms);
+            addUnifiedTimerIfNonZero(row, tags, "scatter", row.scatter_ms);
+            addUnifiedTimerIfNonZero(row, tags, "import_broadcast", row.import_broadcast_ms);
+        }
     } // namespace
 
     bool MoEExpertOverlayProfiler::isEnabled()
     {
         const auto &env = debugEnv();
-        return env.profile.enabled || env.moe_expert_overlay.trace || env.moe_expert_overlay.profile_csv_enabled;
+        return env.profile.enabled ||
+               env.moe_expert_overlay.trace ||
+               env.moe_expert_overlay.profile_csv_enabled ||
+               PerfStatsCollector::isEnabled();
     }
 
     bool MoEExpertOverlayProfiler::shouldPrintSummary()
@@ -196,6 +288,8 @@ namespace llaminar2
             row.phase = "unknown";
         if (row.domain.empty())
             row.domain = "unknown";
+
+        recordUnified(row);
 
         auto &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);

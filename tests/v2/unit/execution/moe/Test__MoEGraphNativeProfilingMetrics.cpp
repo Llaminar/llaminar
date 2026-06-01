@@ -10,6 +10,7 @@
 
 #include "execution/moe/MoEExpertOverlayProfiler.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -27,11 +28,13 @@ protected:
     {
         mutableDebugEnv().profile.enabled = true;
         MoEExpertOverlayProfiler::reset();
+        PerfStatsCollector::reset();
     }
 
     void TearDown() override
     {
         MoEExpertOverlayProfiler::reset();
+        PerfStatsCollector::reset();
         mutableDebugEnv().profile.enabled = false;
     }
 };
@@ -44,6 +47,22 @@ static bool hasPhase(const std::vector<MoEExpertOverlayProfileRow> &rows, const 
     return std::any_of(rows.begin(), rows.end(),
                        [&](const MoEExpertOverlayProfileRow &r)
                        { return r.phase == phase; });
+}
+
+static bool hasUnifiedRecord(
+    const std::vector<PerfStatRecord> &records,
+    PerfStatRecord::Kind kind,
+    const std::string &name,
+    const std::string &phase)
+{
+    return std::any_of(records.begin(), records.end(),
+                       [&](const PerfStatRecord &record)
+                       {
+                           return record.kind == kind &&
+                                  record.domain == "moe_overlay" &&
+                                  record.name == name &&
+                                  record.phase == phase;
+                       });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +235,37 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, AllThreePhases_AllPresent)
     EXPECT_TRUE(hasPhase(rows, "gn_sparse_dispatch"));
     EXPECT_TRUE(hasPhase(rows, "gn_local_expert"));
     EXPECT_TRUE(hasPhase(rows, "gn_return_reduce"));
+}
+
+TEST_F(Test__MoEGraphNativeProfilingMetrics, GraphNativeRowsPublishUnifiedPerfStats)
+{
+    MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
+        0, 1, "dispatch_domain", 0, 1, 8, 16, 6, 1024, 4096, 0.1);
+    MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+        0, 1, "rocm:0", false, 6, 6, {0, 2}, 1.25);
+    MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
+        0, 1, "return_domain", 1, 0, 6, 8, 512, 2048, 0.2, 0.05, 0.03);
+
+    const auto records = PerfStatsCollector::snapshot({"moe_overlay"});
+    ASSERT_FALSE(records.empty());
+    EXPECT_TRUE(hasUnifiedRecord(records, PerfStatRecord::Kind::Counter, "selected_rows", "gn_sparse_dispatch"));
+    EXPECT_TRUE(hasUnifiedRecord(records, PerfStatRecord::Kind::Counter, "dense_bytes_avoided", "gn_return_reduce"));
+    EXPECT_TRUE(hasUnifiedRecord(records, PerfStatRecord::Kind::Counter, "gpu_rows", "gn_local_expert"));
+    EXPECT_TRUE(hasUnifiedRecord(records, PerfStatRecord::Kind::Timer, "compute", "gn_local_expert"));
+    EXPECT_TRUE(hasUnifiedRecord(records, PerfStatRecord::Kind::Timer, "domain_reduce", "gn_sparse_dispatch"));
+    EXPECT_TRUE(hasUnifiedRecord(records, PerfStatRecord::Kind::Timer, "scatter", "gn_return_reduce"));
+
+    const auto dispatch_counter = std::find_if(records.begin(), records.end(), [](const PerfStatRecord &record)
+                                               {
+                                                   return record.kind == PerfStatRecord::Kind::Counter &&
+                                                          record.name == "selected_rows" &&
+                                                          record.phase == "gn_sparse_dispatch";
+                                               });
+    ASSERT_NE(dispatch_counter, records.end());
+    EXPECT_DOUBLE_EQ(dispatch_counter->value, 8.0);
+    EXPECT_EQ(dispatch_counter->tags.at("layer"), "0");
+    EXPECT_EQ(dispatch_counter->tags.at("tier"), "1");
+    EXPECT_EQ(dispatch_counter->tags.at("transport"), "compact");
 }
 
 TEST_F(Test__MoEGraphNativeProfilingMetrics, CsvIncludesGraphNativePhases)
