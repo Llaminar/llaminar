@@ -7,6 +7,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstdlib>
 #include <unordered_map>
 
 #include "execution/compute_stages/IComputeStage.h"
@@ -14,6 +15,7 @@
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
+#include "utils/PerfStatsCollector.h"
 
 using namespace llaminar2;
 
@@ -56,6 +58,59 @@ namespace
             name,
             std::make_unique<FakeSegmentStage>(capturable, manual_boundary, stage_type),
             DeviceId::cpu());
+    }
+
+    class ScopedEnvVar
+    {
+    public:
+        ScopedEnvVar(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *existing = std::getenv(name);
+            if (existing)
+            {
+                had_existing_ = true;
+                existing_ = existing;
+            }
+            setenv(name, value, 1);
+        }
+
+        ~ScopedEnvVar()
+        {
+            if (had_existing_)
+            {
+                setenv(name_.c_str(), existing_.c_str(), 1);
+            }
+            else
+            {
+                unsetenv(name_.c_str());
+            }
+        }
+
+        ScopedEnvVar(const ScopedEnvVar &) = delete;
+        ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+
+    private:
+        std::string name_;
+        bool had_existing_ = false;
+        std::string existing_;
+    };
+
+    double findCounterValue(const std::vector<PerfStatRecord> &records,
+                            const std::string &name,
+                            const PerfStatsCollector::Tags &tags)
+    {
+        for (const auto &record : records)
+        {
+            if (record.kind == PerfStatRecord::Kind::Counter &&
+                record.domain == "forward_graph" &&
+                record.name == name &&
+                record.tags == tags)
+            {
+                return record.value;
+            }
+        }
+        return -1.0;
     }
 }
 
@@ -428,4 +483,48 @@ TEST(Test__GraphSegmentCache, GraphSafeNamedCollectivesRequireExplicitCapturePer
     EXPECT_TRUE(cache.segments[0].capturable);
     EXPECT_EQ(cache.segments[0].stage_names,
               std::vector<std::string>({"before", "graph_safe_collective", "after"}));
+}
+
+TEST(Test__GraphSegmentCache, SegmentedPlanPublishesPerfStats)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "gemm", true, false, ComputeStageType::GEMM);
+    addFakeSegmentStage(graph, "attention", false, true, ComputeStageType::ATTENTION);
+    addFakeSegmentStage(graph, "copy", true, false, ComputeStageType::COPY);
+    graph.addDependency("attention", "gemm");
+    graph.addDependency("copy", "attention");
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildWarmupSegments(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "segmented_plan_segments", {{"type", "total"}}), 3.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "segmented_plan_segments", {{"type", "capturable"}}), 2.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "segmented_plan_segments", {{"type", "manual"}}), 1.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "segmented_plan_stages", {{"type", "capturable"}}), 2.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "segmented_plan_stages", {{"type", "manual"}}), 1.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "segmented_plan_max_segment_stages", {{"type", "capturable"}}), 1.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "segmented_plan_max_segment_stages", {{"type", "manual"}}), 1.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            records,
+            "segmented_plan_stage_types",
+            {{"segment_type", "manual"}, {"stage_type", "ATTENTION"}}),
+        1.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            records,
+            "segmented_plan_stage_types",
+            {{"segment_type", "capturable"}, {"stage_type", "GEMM"}}),
+        1.0);
+
+    PerfStatsCollector::reset();
 }

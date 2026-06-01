@@ -156,7 +156,7 @@ namespace llaminar2
                 int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
                 kv_len += seq_len; // This step will append seq_len tokens
                 const int logical_pos_offset = std::max(0, kv_len - seq_len);
-                cached_kernel_->setDynamicAttnParams(kv_len, logical_pos_offset);
+                cached_kernel_->setDynamicAttnParams(kv_len, logical_pos_offset, seq_len);
 
                 // TQ dequant: update pinned host params for captured H2D.
                 // setDynamicDequantParams computes ring_pos, out_offset, rope_position

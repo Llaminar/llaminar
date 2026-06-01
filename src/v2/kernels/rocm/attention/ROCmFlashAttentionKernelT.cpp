@@ -20,6 +20,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -118,6 +119,7 @@ namespace llaminar2
     {
         // Default number of splits for Flash Decoding
         constexpr int DEFAULT_NUM_SPLITS = 8;
+        constexpr int MAX_SMALL_DECODE_ROWS = 2;
 
         // =====================================================================
         // FP32 Specialization Implementation
@@ -126,7 +128,8 @@ namespace llaminar2
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::ROCmFlashAttentionKernelT(int device_idx)
             : device_idx_(device_idx), stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
-              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr),
+              h_attn_params_(nullptr), h_attn_params_capacity_(0), small_decode_rows_(0)
         {
             if (device_idx < 0)
             {
@@ -141,7 +144,8 @@ namespace llaminar2
             IWorkerGPUContext *ctx)
             : stream_(nullptr),
               partial_output_buf_(nullptr), partial_m_buf_(nullptr), partial_l_buf_(nullptr),
-              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr)
+              workspace_size_(0), max_splits_(0), workspace_(nullptr), device_ctx_(nullptr),
+              h_attn_params_(nullptr), h_attn_params_capacity_(0), small_decode_rows_(0)
         {
             if (!ctx)
             {
@@ -172,6 +176,7 @@ namespace llaminar2
             {
                 hipHostFree(h_attn_params_);
                 h_attn_params_ = nullptr;
+                h_attn_params_capacity_ = 0;
             }
         }
 
@@ -185,7 +190,9 @@ namespace llaminar2
               max_splits_(other.max_splits_),
               workspace_(other.workspace_),
               device_ctx_(other.device_ctx_),
-              h_attn_params_(other.h_attn_params_)
+              h_attn_params_(other.h_attn_params_),
+              h_attn_params_capacity_(other.h_attn_params_capacity_),
+              small_decode_rows_(other.small_decode_rows_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -196,6 +203,8 @@ namespace llaminar2
             other.workspace_ = nullptr;
             other.device_ctx_ = nullptr;
             other.h_attn_params_ = nullptr;
+            other.h_attn_params_capacity_ = 0;
+            other.small_decode_rows_ = 0;
         }
 
         ROCmFlashAttentionKernelT<ActivationPrecision::FP32> &
@@ -209,6 +218,7 @@ namespace llaminar2
                 {
                     hipHostFree(h_attn_params_);
                     h_attn_params_ = nullptr;
+                    h_attn_params_capacity_ = 0;
                 }
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
@@ -220,6 +230,8 @@ namespace llaminar2
                 workspace_ = other.workspace_;
                 device_ctx_ = other.device_ctx_;
                 h_attn_params_ = other.h_attn_params_;
+                h_attn_params_capacity_ = other.h_attn_params_capacity_;
+                small_decode_rows_ = other.small_decode_rows_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -230,8 +242,52 @@ namespace llaminar2
                 other.workspace_ = nullptr;
                 other.device_ctx_ = nullptr;
                 other.h_attn_params_ = nullptr;
+                other.h_attn_params_capacity_ = 0;
+                other.small_decode_rows_ = 0;
             }
             return *this;
+        }
+
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::ensureHostAttnParamsCapacity(
+            int capacity)
+        {
+            capacity = std::max(1, capacity);
+            if (h_attn_params_ && h_attn_params_capacity_ >= capacity)
+                return true;
+
+            hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+            if (stream_)
+                hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
+            if (cap_status == hipStreamCaptureStatusActive)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] "
+                          "attention device params were not allocated before graph capture");
+                return false;
+            }
+
+            if (h_attn_params_)
+            {
+                hipHostFree(h_attn_params_);
+                h_attn_params_ = nullptr;
+                h_attn_params_capacity_ = 0;
+            }
+
+            hipError_t err = hipHostMalloc(&h_attn_params_,
+                                           sizeof(attention::AttentionDeviceParams) *
+                                               static_cast<size_t>(capacity),
+                                           hipHostMallocDefault);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] hipHostMalloc failed for "
+                          << capacity << " attention param row(s): "
+                          << hipGetErrorString(err));
+                h_attn_params_ = nullptr;
+                h_attn_params_capacity_ = 0;
+                return false;
+            }
+
+            h_attn_params_capacity_ = capacity;
+            return true;
         }
 
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::allocateWorkspace(
@@ -498,15 +554,28 @@ namespace llaminar2
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(
             int kv_len, int position_offset)
         {
-            if (!h_attn_params_)
+            setDynamicAttnParams(kv_len, position_offset, 1);
+        }
+
+        void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(
+            int kv_len, int position_offset, int query_rows)
+        {
+            small_decode_rows_ =
+                (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 0;
+            const int param_rows = std::max(1, small_decode_rows_);
+            if (!ensureHostAttnParamsCapacity(param_rows))
+                return;
+            if (small_decode_rows_ > 1)
             {
-                hipError_t err = hipHostMalloc(&h_attn_params_,
-                                               sizeof(attention::AttentionDeviceParams),
-                                               hipHostMallocDefault);
-                if (err != hipSuccess)
-                    h_attn_params_ = nullptr;
+                for (int row = 0; row < small_decode_rows_; ++row)
+                {
+                    const int row_kv_len = std::max(1, kv_len - (small_decode_rows_ - 1 - row));
+                    h_attn_params_[row].kv_len = row_kv_len;
+                    h_attn_params_[row].position_offset = std::max(0, row_kv_len - 1);
+                    h_attn_params_[row].mask_stride = row_kv_len;
+                }
             }
-            if (h_attn_params_)
+            else
             {
                 h_attn_params_->kv_len = kv_len;
                 h_attn_params_->position_offset = position_offset;
@@ -659,47 +728,32 @@ namespace llaminar2
             // memory is captured as a graph node. On replay, the memcpy re-reads
             // the updated pinned values (kv_len, position_offset, mask_stride).
             const attention::AttentionDeviceParams *d_attn_params = nullptr;
+            small_decode_rows_ = 0;
             if (stream_ && workspace_)
             {
-                // Lazy-allocate pinned host buffer (must happen BEFORE capture)
-                if (!h_attn_params_)
-                {
-                    // Guard: hipHostMalloc is forbidden during stream capture
-                    hipStreamCaptureStatus alloc_cap = hipStreamCaptureStatusNone;
-                    hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &alloc_cap);
-                    if (alloc_cap == hipStreamCaptureStatusActive)
-                    {
-                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
-                                  "h_attn_params_ not pre-allocated before capture! "
-                                  "This should have been allocated during warmup decode.");
-                    }
-                    else
-                    {
-                        hipError_t err = hipHostMalloc(&h_attn_params_,
-                                                       sizeof(attention::AttentionDeviceParams),
-                                                       hipHostMallocDefault);
-                        if (err != hipSuccess)
-                        {
-                            LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
-                                      "hipHostMalloc failed for h_attn_params_: "
-                                      << hipGetErrorString(err));
-                            h_attn_params_ = nullptr;
-                        }
-                    }
-                }
-                if (h_attn_params_)
+                const bool small_native_decode =
+                    use_native_kv &&
+                    batch_size == 1 &&
+                    causal &&
+                    !decode_via_prefill &&
+                    seq_len > 1 &&
+                    seq_len <= MAX_SMALL_DECODE_ROWS &&
+                    kv_len > seq_len;
+                small_decode_rows_ = small_native_decode ? seq_len : 0;
+                const int param_rows = small_native_decode ? seq_len : 1;
+                if (ensureHostAttnParamsCapacity(param_rows))
                 {
                     const int dynamic_position_offset =
                         (causal && kv_len > seq_len) ? (kv_len - seq_len) : 0;
-                    h_attn_params_->kv_len = kv_len;
-                    h_attn_params_->position_offset = dynamic_position_offset;
-                    h_attn_params_->mask_stride = kv_len;
+                    setDynamicAttnParams(kv_len, dynamic_position_offset,
+                                         small_native_decode ? seq_len : 1);
 
                     void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
                     if (d_buf)
                     {
                         hipMemcpyAsync(d_buf, h_attn_params_,
-                                       sizeof(attention::AttentionDeviceParams),
+                                       sizeof(attention::AttentionDeviceParams) *
+                                           static_cast<size_t>(param_rows),
                                        hipMemcpyHostToDevice, static_cast<hipStream_t>(stream_));
                         d_attn_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
                     }
@@ -727,7 +781,70 @@ namespace llaminar2
                 }
 
                 int result;
-                if (seq_len == 1 && !decode_via_prefill)
+                if (small_decode_rows_ > 1)
+                {
+                    int max_num_splits = DEFAULT_NUM_SPLITS;
+                    if (kv_len <= 64)
+                        max_num_splits = 1;
+                    else if (kv_len < 128)
+                        max_num_splits = 2;
+                    else if (kv_len < 256)
+                        max_num_splits = 4;
+
+                    allocateWorkspace(n_heads, head_dim, max_num_splits);
+
+                    if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Workspace allocation failed for small native decode");
+                        return false;
+                    }
+
+                    result = 0;
+                    ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::FLASH_ATTN_DECODE,
+                                                     static_cast<hipStream_t>(stream_));
+                    for (int row = 0; row < small_decode_rows_; ++row)
+                    {
+                        const int row_kv_len = std::max(1, kv_len - (small_decode_rows_ - 1 - row));
+                        const int row_num_splits =
+                            row_kv_len <= 64 ? 1 : (row_kv_len < 128 ? 2 : (row_kv_len < 256 ? 4 : DEFAULT_NUM_SPLITS));
+                        const float *row_q =
+                            Q_ptr + static_cast<size_t>(row) * static_cast<size_t>(n_heads) *
+                                        static_cast<size_t>(head_dim);
+                        float *row_o =
+                            O_ptr + static_cast<size_t>(row) * static_cast<size_t>(n_heads) *
+                                        static_cast<size_t>(head_dim);
+                        const attention::AttentionDeviceParams *row_params =
+                            d_attn_params ? (d_attn_params + row) : nullptr;
+
+                        if (kv_native_type == TensorType::FP16)
+                        {
+                            result = hipFlashAttn_decode_fp16(
+                                row_q, K->gpu_data_ptr(), V->gpu_data_ptr(), row_o,
+                                static_cast<float *>(partial_output_buf_),
+                                static_cast<float *>(partial_m_buf_),
+                                static_cast<float *>(partial_l_buf_),
+                                1, row_kv_len,
+                                n_heads, n_kv_heads, head_dim,
+                                row_num_splits, row_params, stream_,
+                                head_start, gqa_n_rep);
+                        }
+                        else
+                        {
+                            result = hipFlashAttn_decode_q8_1(
+                                row_q, K->gpu_data_ptr(), V->gpu_data_ptr(), row_o,
+                                static_cast<float *>(partial_output_buf_),
+                                static_cast<float *>(partial_m_buf_),
+                                static_cast<float *>(partial_l_buf_),
+                                1, row_kv_len,
+                                n_heads, n_kv_heads, head_dim,
+                                row_num_splits, row_params, stream_,
+                                head_start, gqa_n_rep);
+                        }
+                        if (result != 0)
+                            break;
+                    }
+                }
+                else if (seq_len == 1 && !decode_via_prefill)
                 {
                     // Flash Decoding with native KV cache
                     int num_splits = DEFAULT_NUM_SPLITS;
@@ -854,7 +971,8 @@ namespace llaminar2
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::DEVICE_PARAMS,
-                                    sizeof(attention::AttentionDeviceParams),
+                                    sizeof(attention::AttentionDeviceParams) *
+                                        static_cast<size_t>(MAX_SMALL_DECODE_ROWS),
                                     256,
                                     true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::K_TMP_FP32, kv_convert_bytes, 256, true});

@@ -404,6 +404,7 @@ namespace llaminar2
 
             /// Update device-side attention params for graph-capture replay
             void setDynamicAttnParams(int kv_len, int position_offset) override;
+            void setDynamicAttnParams(int kv_len, int position_offset, int query_rows) override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface
@@ -484,7 +485,10 @@ namespace llaminar2
 
             /// Pinned host memory for graph-captured H2D copy of attention device params
             attention::AttentionDeviceParams *h_attn_params_ = nullptr;
+            int h_attn_params_capacity_ = 0;
+            int small_decode_rows_ = 0;
 
+            bool ensureHostAttnParamsCapacity(int capacity);
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
         };

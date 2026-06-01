@@ -15,6 +15,7 @@
 #include "../coherence/StageCoherence.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../memory/BufferArena.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
@@ -310,6 +311,26 @@ namespace llaminar2
             segment_cache.needs_capture,
             segment_cache.decode_step);
         const uint64_t current_step = phase_transition.decode_step;
+        const char *phase_name = "unknown";
+        switch (phase_transition.phase)
+        {
+        case DeviceGraphCaptureController::Phase::Warmup:
+            phase_name = "warmup";
+            break;
+        case DeviceGraphCaptureController::Phase::Capture:
+            phase_name = "capture";
+            break;
+        case DeviceGraphCaptureController::Phase::Replay:
+            phase_name = "replay";
+            break;
+        }
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "decode_segmented_phase",
+            1.0,
+            "decode",
+            ctx ? ctx->deviceId().toString() : std::string{},
+            {{"phase", phase_name}});
 
         // ===== FAST PATH: Phase 3 (Replay) =====
         // During steady-state replay, only the post_launch hook is invoked

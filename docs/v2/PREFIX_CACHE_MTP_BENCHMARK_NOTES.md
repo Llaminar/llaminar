@@ -1,5 +1,68 @@
 # Prefix Cache And MTP Benchmark Notes
 
+## Phase 14 GPU Graph Capture And MTP Speedup Matrix
+
+This matrix is the durable scoreboard for Phase 14. Update it whenever a real
+Qwen 3.6 dense or MoE benchmark changes one of these facts:
+
+- baseline throughput without MTP,
+- whether the MTP path is fully graph captured,
+- whether collectives are graph captured where the backend technically supports it,
+- best observed MTP throughput and speedup.
+
+Use `Pending` only when no measured artifact exists yet. Use `Partial` when
+some graph-capture path is active but the whole MTP inference step still has
+manual stages, uncaptured collectives, or large host/replay overhead.
+
+| Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
+|-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
+| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP decode and sidecar are segmented-graph captured with no manual stages | N/A | 7.27 | 0.40x decode, 0.64x overall | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-rowdecode-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sidecar-capture-retry-stats.json` | Captured two-token verifier GPU work still costs about 222 ms/call. Attention and sidecar graph launch are no longer dominant; small-M GEMM/GDN verifier kernels remain. |
+| SingleDevice | CUDA | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | N/A | Pending | Pending | Pending | Need first dense CUDA baseline/MTP graph-capture run. |
+| SingleDevice | ROCm | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and MoE MTP sidecar capture audit. |
+| SingleDevice | CUDA | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and CUDA availability check. |
+| LocalTP | ROCm | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | Target graph-capturable RCCL/allreduce segments where supported | Pending | Pending | Pending | Need TP-compatible dense MTP sidecar and verifier collectives in identical order. |
+| LocalPP | ROCm | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | PP activation transfers must be graph-capturable or explicit manual boundaries | Pending | Pending | Pending | Need local PP MTP verifier path and full graph-capture audit. |
+| NodeLocalTP | CPU sockets | Qwen3.6 dense 27B Q4_K_S | Pending | N/A for GPU graphs | Host/MPI coordination only | Pending | Pending | Pending | Needed for correctness/speed evidence, but not GPU graph-capture gating. |
+| Expert overlay EP | 2x ROCm | Qwen3.6 MoE 35B | Pending | Pending | Sparse dispatch/return graph capture required where ROCm supports it | Pending | Pending | Pending | Need graph-native sparse collectives and MoE MTP sidecar lockstep. |
+| Expert overlay EP | 2x ROCm plus 2x CPU dual-socket | Qwen3.6 MoE 35B | Pending | Pending | Heterogeneous sparse collectives must be graph-aware with hard fail for unsupported legs | Pending | Pending | Pending | Need host-staged sparse return path through `TransferEngine`, then graph capture where possible. |
+
+Latest ROCm dense evidence:
+
+- Baseline: `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`.
+  - Prefill 2620.36 ms, 227.07 tok/s.
+  - Decode 1753.69 ms for 32 tokens, 18.25 tok/s.
+- MTP after causal-offset and tiny-row attention work:
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-rowdecode-bench.json`.
+  - Prefill 4488.75 ms, 132.55 tok/s.
+  - Decode 2201.57 ms for 16 tokens, 7.27 tok/s.
+  - MTP counters: 32 draft steps, 24 accepted tokens, 8 rejected tokens,
+    8 rollbacks, 75% acceptance.
+- Perf stats: `/tmp/llaminar-mtp-bench/dense-rocm-mtp-rowdecode-stats.json`.
+  - `verifier_forward`: 24 calls, 5208.07 ms total, about 217.0 ms/call.
+  - `sidecar_forward`: 24 calls, 71.05 ms total, about 2.96 ms/call.
+  - `decode_segmented_phase`: 6 warmup, 3 capture, 15 replay.
+- Segment metrics: `/tmp/llaminar-mtp-bench/dense-rocm-mtp-segment-metrics-stats.json`.
+  - Segment plan: one capturable segment, 644 stages, zero manual stages.
+  - Captured replay launch plus post-launch bookkeeping: about 2.52 ms per replay.
+  - Captured replay final sync: about 208.30 ms per replay, so GPU work inside
+    the captured verifier graph is now the dominant blocker.
+  - The short `-n 8` run reached 7.10 decode tok/s with 75% MTP acceptance.
+- Sidecar capture retry: `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sidecar-capture-retry-stats.json`.
+  - MTP sidecar graph cache: 3 prefill misses, then 1779 prefill hits and
+    12 decode hits.
+  - MTP sidecar capture path: 3 `plain_after_build` calls, then 1779 prefill
+    segmented calls and 12 decode segmented calls.
+  - Sidecar timing remains small: about 3.43 ms/call in decode.
+  - Throughput is essentially unchanged at 7.10 decode tok/s because
+    `verifier_forward` remains about 222.5 ms/call.
+
+Next graph-capture questions:
+
+- Can the two-token verifier use decode-specialized small-M GEMM/GDN kernels
+  inside the captured graph instead of prefill-style kernels?
+- For LocalTP/LocalPP/MoE, can collective/manual stages be graph captured or made
+  explicit hard boundaries without falling back silently?
+
 ## 2026-06-01 Qwen3.6 Dense ROCm Slice
 
 Hardware/topology:

@@ -994,6 +994,7 @@ namespace llaminar2
 
             if (forward_engine_)
                 forward_engine_->clearCache();
+            mtp_sidecar_depth0_cache_.invalidate();
             for (auto &cache : layer_graph_cache_)
                 cache.invalidate();
             resetKernelDynamicState();
@@ -2313,6 +2314,7 @@ namespace llaminar2
         // Clear forward graph caches
         if (forward_engine_)
             forward_engine_->clearCache();
+        mtp_sidecar_depth0_cache_.invalidate();
 
         // Clear device contexts
         device_contexts_.clear();
@@ -3553,29 +3555,96 @@ namespace llaminar2
         output.moe_gate_scratch = mtp_moe_gate_scratch;
         output.moe_up_scratch = mtp_moe_up_scratch;
 
-        ComputeGraph graph;
+        auto &sidecar_cache = mtp_sidecar_depth0_cache_;
+        const bool needs_graph_rebuild =
+            !sidecar_cache.valid ||
+            !sidecar_cache.graph ||
+            sidecar_cache.terminal_hidden != terminal_hidden;
+
+        const bool rebuilt_graph = needs_graph_rebuild;
+        if (needs_graph_rebuild)
         {
+            sidecar_cache.invalidate();
+            sidecar_cache.token_id = draft_condition_token;
+            sidecar_cache.position_id = position_id;
+            sidecar_cache.terminal_hidden = terminal_hidden;
+
+            MTPForwardInput cached_input = input;
+            cached_input.draft_token_ids = &sidecar_cache.token_id;
+            cached_input.position_ids = &sidecar_cache.position_id;
+
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
                 "sidecar_build_graph",
                 phase,
                 device_key,
                 {{"depth", "0"}});
-            graph = graph_builder_->buildMTPGraph(
+            ComputeGraph graph = graph_builder_->buildMTPGraph(
                 0,
                 bindings.mtp.depths[0],
-                input,
+                cached_input,
                 output);
+            if (graph.size() == 0)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to build MTP sidecar graph");
+                return false;
+            }
+
+            sidecar_cache.graph = std::make_unique<ComputeGraph>(std::move(graph));
+            sidecar_cache.dynamic_param_stages.clear();
+            for (const auto &node_name : sidecar_cache.graph->getExecutionOrder())
+            {
+                ComputeNode *node = sidecar_cache.graph->getNode(node_name);
+                if (node && node->stage && node->stage->hasDynamicParams())
+                    sidecar_cache.dynamic_param_stages.push_back(node->stage.get());
+            }
+            sidecar_cache.valid = true;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "sidecar_graph_cache_misses",
+                1.0,
+                phase,
+                device_key,
+                {{"depth", "0"}});
         }
-        if (graph.size() == 0)
+        else
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Failed to build MTP sidecar graph");
-            return false;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "sidecar_graph_cache_hits",
+                1.0,
+                phase,
+                device_key,
+                {{"depth", "0"}});
         }
 
         IDeviceContext *ctx = getDeviceContext(state_.device_id);
         if (!ctx)
             return false;
+
+        sidecar_cache.token_id = draft_condition_token;
+        sidecar_cache.position_id = position_id;
+        for (auto *stage : sidecar_cache.dynamic_param_stages)
+        {
+            if (stage)
+                stage->updateDynamicParams(position_id, 1);
+        }
+        sidecar_cache.graph->reset();
+
+        std::unordered_set<std::string> collective_nodes;
+        for (const auto &node_name : sidecar_cache.graph->getExecutionOrder())
+        {
+            ComputeNode *node = sidecar_cache.graph->getNode(node_name);
+            if (!node || !node->stage)
+                continue;
+            const ComputeStageType type = node->stage->type();
+            if (type == ComputeStageType::ALLREDUCE ||
+                type == ComputeStageType::ALLGATHER ||
+                type == ComputeStageType::ALLGATHER_V)
+            {
+                collective_nodes.insert(node_name);
+            }
+        }
 
         bool ok = false;
         {
@@ -3585,7 +3654,43 @@ namespace llaminar2
                 phase,
                 device_key,
                 {{"depth", "0"}});
-            ok = execute(graph, ctx);
+
+            bool used_segmented_capture = false;
+            const bool try_gpu_graph_capture =
+                state_.device_id.is_gpu() &&
+                debugEnv().execution.gpu_graphs;
+            if (try_gpu_graph_capture && !rebuilt_graph)
+            {
+                ensureDeviceWorkspaceAllocated(*sidecar_cache.graph);
+                auto &pool = GPUDeviceContextPool::instance();
+                IWorkerGPUContext &gpu_ctx = pool.getContext(state_.device_id);
+                const auto capture_policy = buildDecodeCapturePolicy(
+                    !collective_nodes.empty(),
+                    ctx,
+                    sidecar_cache.segment_cache.consecutive_failures);
+                ok = executor_.executeDecodeWithCapturePolicy(
+                    *sidecar_cache.graph,
+                    ctx,
+                    &sidecar_cache.segment_cache,
+                    gpu_ctx.defaultStream(),
+                    &gpu_ctx,
+                    collective_nodes.empty() ? nullptr : &collective_nodes,
+                    capture_policy,
+                    &used_segmented_capture);
+            }
+            else
+            {
+                ok = execute(*sidecar_cache.graph, ctx);
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "sidecar_graph_capture_path",
+                1.0,
+                phase,
+                device_key,
+                {{"depth", "0"},
+                 {"path", used_segmented_capture ? "segmented" : (rebuilt_graph ? "plain_after_build" : "plain")}});
         }
         if (ok && state_.device_id.is_gpu() &&
             (debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled()))
@@ -5616,6 +5721,7 @@ namespace llaminar2
         // in-place below because their dynamic state hooks cover the reused data.
         if (forward_engine_)
             forward_engine_->clearCache();
+        mtp_sidecar_depth0_cache_.invalidate();
 
         // Layer decode graphs can hold per-request stage/kernel state, so make
         // them rebuild after the request boundary.

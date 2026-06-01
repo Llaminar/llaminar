@@ -1495,6 +1495,12 @@ namespace llaminar2
             (void)kv_len;
             (void)position_offset;
         }
+
+        virtual void setDynamicAttnParams(int kv_len, int position_offset, int query_rows)
+        {
+            (void)query_rows;
+            setDynamicAttnParams(kv_len, position_offset);
+        }
     };
 
     // =========================================================================

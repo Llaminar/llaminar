@@ -7,11 +7,13 @@
 #include "../../../utils/ForwardPassProfiler.h"
 #include "../../../utils/KernelProfiler.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <map>
 
 namespace llaminar2
 {
@@ -183,23 +185,116 @@ namespace llaminar2
 
         size_t capturable_segments = 0, manual_segments = 0;
         size_t capturable_stages = 0, manual_stages = 0;
+        size_t max_capturable_segment_stages = 0;
+        size_t max_manual_segment_stages = 0;
+        std::map<std::string, size_t> capturable_stage_types;
+        std::map<std::string, size_t> manual_stage_types;
         for (const auto &seg : segment_cache.segments)
         {
             if (seg.capturable)
             {
                 capturable_segments++;
                 capturable_stages += seg.stage_names.size();
+                max_capturable_segment_stages =
+                    std::max(max_capturable_segment_stages, seg.stage_names.size());
             }
             else
             {
                 manual_segments++;
                 manual_stages += seg.stage_names.size();
+                max_manual_segment_stages =
+                    std::max(max_manual_segment_stages, seg.stage_names.size());
+            }
+
+            auto &stage_types = seg.capturable ? capturable_stage_types : manual_stage_types;
+            for (const auto &stage_name : seg.stage_names)
+            {
+                auto *node = graph.getNode(stage_name);
+                if (!node || !node->stage)
+                {
+                    continue;
+                }
+                stage_types[computeStageTypeName(node->stage->type())]++;
             }
         }
 
         LOG_DEBUG("[DeviceGraphExecutor] Segmented graph: " << capturable_segments << " capturable segments ("
                                                             << capturable_stages << " stages) + " << manual_segments << " manual segments ("
                                                             << manual_stages << " stages)");
+
+        if (PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_plan_segments",
+                static_cast<double>(segment_cache.segments.size()),
+                "decode",
+                "",
+                {{"type", "total"}});
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_plan_segments",
+                static_cast<double>(capturable_segments),
+                "decode",
+                "",
+                {{"type", "capturable"}});
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_plan_segments",
+                static_cast<double>(manual_segments),
+                "decode",
+                "",
+                {{"type", "manual"}});
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_plan_stages",
+                static_cast<double>(capturable_stages),
+                "decode",
+                "",
+                {{"type", "capturable"}});
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_plan_stages",
+                static_cast<double>(manual_stages),
+                "decode",
+                "",
+                {{"type", "manual"}});
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_plan_max_segment_stages",
+                static_cast<double>(max_capturable_segment_stages),
+                "decode",
+                "",
+                {{"type", "capturable"}});
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_plan_max_segment_stages",
+                static_cast<double>(max_manual_segment_stages),
+                "decode",
+                "",
+                {{"type", "manual"}});
+
+            for (const auto &[type_name, count] : capturable_stage_types)
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "segmented_plan_stage_types",
+                    static_cast<double>(count),
+                    "decode",
+                    "",
+                    {{"segment_type", "capturable"}, {"stage_type", type_name}});
+            }
+            for (const auto &[type_name, count] : manual_stage_types)
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "segmented_plan_stage_types",
+                    static_cast<double>(count),
+                    "decode",
+                    "",
+                    {{"segment_type", "manual"}, {"stage_type", type_name}});
+            }
+        }
 
         for (auto &seg : segment_cache.segments)
         {
@@ -502,6 +597,15 @@ namespace llaminar2
             ForwardPassProfiler::addReplayLaunchNs(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count()));
         }
+        if (PerfStatsCollector::isEnabled())
+        {
+            auto launch_t1 = std::chrono::high_resolution_clock::now();
+            PerfStatsCollector::recordTimingNs(
+                "forward_graph",
+                "segmented_replay_graph_launch",
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count()),
+                "decode");
+        }
 
         // Time post-launch callbacks (markOutputsDirty + onGraphReplayed)
         auto post_t0 = std::chrono::high_resolution_clock::now();
@@ -511,6 +615,15 @@ namespace llaminar2
             auto post_t1 = std::chrono::high_resolution_clock::now();
             ForwardPassProfiler::addReplayPostLaunchNs(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(post_t1 - post_t0).count()));
+        }
+        if (PerfStatsCollector::isEnabled())
+        {
+            auto post_t1 = std::chrono::high_resolution_clock::now();
+            PerfStatsCollector::recordTimingNs(
+                "forward_graph",
+                "segmented_replay_post_launch",
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(post_t1 - post_t0).count()),
+                "decode");
         }
 
         if (needs_segment_sync)
@@ -1414,23 +1527,39 @@ namespace llaminar2
 
         const bool trace_replay = exec_cfg.gpu_graph_trace_replay;
         const auto &device_id = ctx->deviceId();
+        const std::string device_name = device_id.toString();
         const int total_segments = static_cast<int>(segment_cache.segments.size());
+        PerfStatsCollector::ScopedTimer replay_timer(
+            "forward_graph",
+            "segmented_replay_total",
+            "decode",
+            device_name);
 
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
         {
+            const char *seg_type = seg.capturable ? "capturable" : "manual";
             if (trace_replay)
             {
-                const char *seg_type = seg.capturable ? "GRAPH" : "MANUAL";
+                const char *seg_display_type = seg.capturable ? "GRAPH" : "MANUAL";
                 const auto &first_name = seg.stage_names.empty() ? std::string("<empty>") : seg.stage_names.front();
                 LOG_DEBUG("[ReplayTrace] " << device_id.toString()
                                            << " step=" << current_step
                                            << " seg=" << seg_idx << "/" << total_segments
-                                           << " [" << seg_type << "]"
+                                           << " [" << seg_display_type << "]"
                                            << " stages=" << seg.stage_names.size()
                                            << " first=" << first_name);
             }
 
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "segmented_replay_segments",
+                1.0,
+                "decode",
+                device_name,
+                {{"type", seg_type}});
+
+            const auto segment_t0 = std::chrono::high_resolution_clock::now();
             // Segment execution picks capturable or manual behavior based on
             // segment metadata prepared during warmup.
             const auto replay_result = executeReplaySegment(
@@ -1448,6 +1577,18 @@ namespace llaminar2
                 hooks.cohere_inputs,
                 hooks.execute_node,
                 hooks.post_launch);
+            if (PerfStatsCollector::isEnabled())
+            {
+                const auto segment_t1 = std::chrono::high_resolution_clock::now();
+                PerfStatsCollector::recordTimingNs(
+                    "forward_graph",
+                    "segmented_replay_segment",
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(segment_t1 - segment_t0).count()),
+                    "decode",
+                    device_name,
+                    {{"type", seg_type},
+                     {"stage_count", std::to_string(seg.stage_names.size())}});
+            }
 
             if (!replay_result.success)
             {
@@ -1479,11 +1620,20 @@ namespace llaminar2
             auto sync_t0 = std::chrono::high_resolution_clock::now();
             gpu_ctx->synchronizeStream(capture_stream);
             gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
+            auto sync_t1 = std::chrono::high_resolution_clock::now();
             if (profiling)
             {
-                auto sync_t1 = std::chrono::high_resolution_clock::now();
                 ForwardPassProfiler::addReplayStreamSyncNs(
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()));
+            }
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::recordTimingNs(
+                    "forward_graph",
+                    "segmented_replay_final_sync",
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()),
+                    "decode",
+                    device_name);
             }
         }
         if (trace_replay)

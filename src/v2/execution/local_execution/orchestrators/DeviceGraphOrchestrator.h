@@ -1839,6 +1839,7 @@ namespace llaminar2
             {
                 forward_engine_->clearCache();
             }
+            mtp_sidecar_depth0_cache_.invalidate();
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();
@@ -2244,6 +2245,30 @@ namespace llaminar2
                                                 int batch_size,
                                                 int position_offset);
         void updateMTPShiftedCacheMetadata(int active_batch_size);
+
+        struct MTPSidecarGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            std::vector<IComputeStage *> dynamic_param_stages;
+            TensorBase *terminal_hidden = nullptr;
+            int32_t token_id = 0;
+            int position_id = 0;
+            bool valid = false;
+
+            void invalidate()
+            {
+                graph.reset();
+                segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+                dynamic_param_stages.clear();
+                terminal_hidden = nullptr;
+                token_id = 0;
+                position_id = 0;
+                valid = false;
+            }
+        };
+
+        MTPSidecarGraphCache mtp_sidecar_depth0_cache_;
 
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)
