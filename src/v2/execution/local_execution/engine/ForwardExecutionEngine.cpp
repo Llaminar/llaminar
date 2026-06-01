@@ -158,6 +158,30 @@ namespace llaminar2
             return collective_nodes;
         }
 
+        std::string boolTag(bool value)
+        {
+            return value ? "true" : "false";
+        }
+
+        std::string forwardGraphPerfContext(const ForwardGraphSignature &signature)
+        {
+            if (!signature.decode)
+                return signature.is_bucketed_prefill ? "prefill_bucket" : "prefill";
+            return signature.all_position_logits ? "main_verifier" : "main_decode";
+        }
+
+        PerfStatsCollector::Tags forwardCacheLookupTags(
+            const ForwardGraphSignature &signature,
+            const char *result)
+        {
+            return {
+                {"context", forwardGraphPerfContext(signature)},
+                {"result", result},
+                {"seq_len", std::to_string(signature.seq_len)},
+                {"decode_has_history", boolTag(signature.decode_has_history)},
+                {"all_position_logits", boolTag(signature.all_position_logits)}};
+        }
+
         /// @brief Run the full prefill graph preflight for a fixed-bucket input.
         PrefillGraphRejectReason preflightPrefillGraph(
             const PrefillGraphCache &cache,
@@ -738,6 +762,13 @@ namespace llaminar2
 
         if (use_cached_forward)
         {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "forward_cache_lookup",
+                1.0,
+                forward_signature.decode ? "decode" : "prefill",
+                forward_signature.device.toString(),
+                forwardCacheLookupTags(forward_signature, "hit"));
             touchBucketedPrefillForwardCache(forward_signature, *active_forward_cache);
             const bool success = executeCacheHit(effective_input, output, *active_forward_cache, host,
                                                  is_decode, start);
@@ -751,6 +782,13 @@ namespace llaminar2
         bool should_cache_after_build = false;
         if (forward_cache_eligible)
         {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "forward_cache_lookup",
+                1.0,
+                forward_signature.decode ? "decode" : "prefill",
+                forward_signature.device.toString(),
+                forwardCacheLookupTags(forward_signature, "miss"));
             auto [it, _inserted] = cache_.try_emplace(forward_signature);
             build_cache = &it->second;
             should_cache_after_build = !build_cache->valid;
@@ -1136,6 +1174,18 @@ namespace llaminar2
             {
                 LOG_DEBUG("[ForwardExecutionEngine] Experimental collective segmented GPU-graph replay enabled");
             }
+
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "decode_capture_policy",
+                1.0,
+                "decode",
+                input.device.toString(),
+                {{"context", host.computeAllPositionLogitsEnabled() ? "main_verifier" : "main_decode"},
+                 {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
+                 {"has_collectives", boolTag(has_collective_nodes)},
+                 {"collective_segmented", boolTag(capture_policy.collective_segmented_enabled)},
+                 {"collectives_graph_capturable", boolTag(capture_policy.collectives_graph_capturable)}});
 
             if (capture_policy.allow_segmented_capture && !forward_cache.gpu_stream)
             {

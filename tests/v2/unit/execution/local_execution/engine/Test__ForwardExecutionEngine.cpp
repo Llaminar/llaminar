@@ -19,6 +19,7 @@
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h" // MockDeviceContext
 
 using namespace llaminar2;
@@ -122,6 +123,7 @@ namespace
         std::vector<ComputeStageType> graph_stage_types;
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
+        bool mock_compute_all_position_logits = false;
         PrefillChunkMaintenanceState mock_maintenance_state{};
         bool mock_maintenance_state_configured = false;
         bool maintenance_should_fail = false;
@@ -226,6 +228,11 @@ namespace
             return mock_pp_copy;
         }
 
+        bool computeAllPositionLogitsEnabled() const override
+        {
+            return mock_compute_all_position_logits;
+        }
+
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(
             const PrefillChunkPlan &chunk) const override
         {
@@ -272,6 +279,23 @@ namespace
         input.position_ids = position_ids;
         input.position_offset = 0;
         return input;
+    }
+
+    double findForwardGraphCounterValue(const std::vector<PerfStatRecord> &records,
+                                        const std::string &name,
+                                        const PerfStatsCollector::Tags &tags)
+    {
+        for (const auto &record : records)
+        {
+            if (record.kind == PerfStatRecord::Kind::Counter &&
+                record.domain == "forward_graph" &&
+                record.name == name &&
+                record.tags == tags)
+            {
+                return record.value;
+            }
+        }
+        return 0.0;
     }
 
 } // namespace
@@ -1217,6 +1241,49 @@ TEST_F(Test__ForwardExecutionEngine, CacheHit_SecondCallSkipsBuild)
     // Both calls hit cache MISS because the first build fails (empty graph)
     // and the cache entry is never marked valid.
     EXPECT_EQ(host.build_forward_graph_calls, 2);
+}
+
+TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifierCacheLookupStats)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    auto engine = makeEngine();
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+    host.mock_compute_all_position_logits = true;
+
+    int tokens[] = {101, 102};
+    int positions[] = {32, 33};
+    auto input = makeTestInput(2, 1, DeviceId::cpu(), tokens, positions);
+    input.position_offset = 32;
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.execute(input, output, host));
+    EXPECT_TRUE(engine.execute(input, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags miss_tags = {
+        {"all_position_logits", "true"},
+        {"context", "main_verifier"},
+        {"decode_has_history", "true"},
+        {"result", "miss"},
+        {"seq_len", "2"}};
+    const PerfStatsCollector::Tags hit_tags = {
+        {"all_position_logits", "true"},
+        {"context", "main_verifier"},
+        {"decode_has_history", "true"},
+        {"result", "hit"},
+        {"seq_len", "2"}};
+
+    EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "forward_cache_lookup", miss_tags), 1.0);
+    EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "forward_cache_lookup", hit_tags), 1.0);
+
+    PerfStatsCollector::reset();
 }
 
 // =========================================================================
