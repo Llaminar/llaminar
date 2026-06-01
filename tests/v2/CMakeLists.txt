@@ -8592,6 +8592,21 @@ if(HAVE_ROCM)
     message(STATUS "V2 Tests: Added ROCm Quantised GEMM kernel integration tests")
     endif()
 
+    add_executable(v2_integration_rocm_quantised_gemm_small_m
+        integration/kernels/rocm/Test__ROCmQuantisedGemmSmallM.cpp
+    )
+    target_link_libraries(v2_integration_rocm_quantised_gemm_small_m
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmQuantisedGemmSmallM
+        COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
+        LABELS "V2;Integration;ROCm;GEMM;MTP;SmallM"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added focused ROCm small-M GEMM integration tests")
+
     # Unit Test: Native-VNNI Packing (CPU-only)
     # Validates packNativeVNNI() output for all 16 supported quantization formats.
     # Tests codebook_id, payload/scales/mins sizes, FP16 scale validity, dimension sweeps.

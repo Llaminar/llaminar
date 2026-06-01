@@ -2039,7 +2039,9 @@ namespace llaminar2
                     workspace_ = saved_workspace;
                 }
             };
-            std::unique_ptr<void, decltype(restore_workspace)> workspace_restore_guard(nullptr, restore_workspace);
+            std::unique_ptr<void, decltype(restore_workspace)> workspace_restore_guard(
+                (ws && ws != saved_workspace) ? static_cast<void *>(this) : nullptr,
+                restore_workspace);
 
             if (!A || !C)
             {
@@ -2131,6 +2133,195 @@ namespace llaminar2
             //
             // Handles optional bias in a single fused kernel launch.
             // =========================================================================
+            if (use_gpu_path && m > 1 && m <= 2)
+            {
+                ensureWeightsConverted();
+
+                int8_t *d_weights_vnni = impl_ ? impl_->d_weights_int8_vnni : nullptr;
+                float *d_scales_B = nullptr;
+                if (packed_)
+                {
+                    d_scales_B = packed_->d_scales;
+                }
+                else if (impl_)
+                {
+                    d_scales_B = impl_->d_scales_B;
+                }
+
+                if (!impl_ || (!impl_->has_native_vnni && !(d_weights_vnni && d_scales_B)))
+                {
+                    LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] M<=2 verifier path has no supported GEMV weights");
+                    return false;
+                }
+
+                const float *d_bias = nullptr;
+                if (bias)
+                {
+                    auto *bias_tensor = const_cast<TensorBase *>(bias);
+                    const auto target_device = DeviceId::rocm(rocm_device_id_);
+                    if (!bias_tensor->ensureOnDevice(target_device))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to upload small-M bias tensor to ROCm device");
+                        return false;
+                    }
+
+                    d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+                }
+
+                validateWorkspace();
+
+                if (d_weights_vnni &&
+                    !validatePointerDeviceOrLog(
+                        d_weights_vnni, rocm_device_id_, "d_weights_vnni", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                {
+                    return false;
+                }
+                if (d_scales_B && !validatePointerDeviceOrLog(
+                                      d_scales_B, rocm_device_id_, "d_scales_B", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                {
+                    return false;
+                }
+                if (!validatePointerDeviceOrLog(
+                        impl_->d_A_int8, rocm_device_id_, "workspace::QUANT_A", "ROCmQuantisedGemmKernel::multiply_tensor") ||
+                    !validatePointerDeviceOrLog(
+                        impl_->d_scales_A, rocm_device_id_, "workspace::SCALES_A", "ROCmQuantisedGemmKernel::multiply_tensor") ||
+                    !validatePointerDeviceOrLog(
+                        impl_->d_C_int32, rocm_device_id_, "workspace::ACC_INT32", "ROCmQuantisedGemmKernel::multiply_tensor"))
+                {
+                    return false;
+                }
+
+                const bool gemv_output_is_mapped = C_fp32->isMapped();
+                const bool gemv_output_needs_copyout = gemv_output_is_mapped || beta != 0.0f;
+
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M GEMV verifier path M="
+                          << m << " N=" << n << " K=" << k
+                          << (d_bias ? " +bias" : ""));
+
+                for (int row = 0; row < m; ++row)
+                {
+                    const float *d_input_row = d_input + static_cast<size_t>(row) * k;
+                    float *d_output_row = d_output + static_cast<size_t>(row) * n;
+                    float *d_gemv_output = gemv_output_needs_copyout ? impl_->d_C_fp32 : d_output_row;
+
+                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                            d_input_row,
+                            impl_->d_A_int8,
+                            impl_->d_scales_A_blockwise,
+                            1,
+                            k,
+                            rocm_device_id_,
+                            gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M blockwise activation quantization failed at row "
+                                  << row);
+                        return false;
+                    }
+
+                    if (impl_->has_native_vnni)
+                    {
+                        if (!rocmGemv_native_vnni_fp32(
+                                impl_->d_A_int8,
+                                impl_->d_weights_native_vnni,
+                                impl_->d_weights_native_scales,
+                                impl_->d_weights_native_mins,
+                                impl_->d_weights_native_emins,
+                                d_gemv_output,
+                                impl_->d_scales_A,
+                                impl_->d_scatter_partial,
+                                n, k,
+                                impl_->native_vnni_codebook_id,
+                                rocm_device_id_, gpu_stream_,
+                                impl_->d_scales_A_blockwise))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-VNNI GEMV failed at row "
+                                      << row);
+                            return false;
+                        }
+
+                        if (beta != 0.0f)
+                        {
+                            if (!rocmQuantGemm_applyFp32CombineEpilogue(
+                                    d_gemv_output,
+                                    d_gemv_output,
+                                    d_output_row,
+                                    d_bias,
+                                    1,
+                                    n,
+                                    alpha,
+                                    beta,
+                                    rocm_device_id_,
+                                    gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-VNNI beta epilogue failed at row "
+                                          << row);
+                                return false;
+                            }
+                        }
+                        else if (alpha != 1.0f || d_bias)
+                        {
+                            if (!rocmQuantGemm_applyFp32Epilogue(
+                                    d_gemv_output,
+                                    d_bias,
+                                    1,
+                                    n,
+                                    alpha,
+                                    rocm_device_id_,
+                                    gpu_stream_))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-VNNI epilogue failed at row "
+                                          << row);
+                                return false;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        const float *d_existing = (beta != 0.0f) ? d_output_row : nullptr;
+                        bool int8_decode_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
+                            impl_->d_A_int8, d_weights_vnni, d_gemv_output,
+                            impl_->d_scales_A_blockwise, d_scales_B,
+                            n, k,
+                            alpha, beta,
+                            d_existing, d_bias,
+                            rocm_device_id_, gpu_stream_);
+
+                        if (!int8_decode_ok)
+                        {
+                            int8_decode_ok = rocmGemv_int8_scatter_vnni_blockwise(
+                                impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A_blockwise, d_scales_B, d_bias,
+                                impl_->d_scatter_partial,
+                                n, k, alpha, beta, d_existing,
+                                rocm_device_id_, gpu_stream_);
+                        }
+
+                        if (!int8_decode_ok)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M INT8 GEMV failed at row "
+                                      << row);
+                            return false;
+                        }
+                    }
+
+                    if (gemv_output_needs_copyout)
+                    {
+                        const hipError_t copy_err = hipMemcpyAsync(
+                            d_output_row,
+                            impl_->d_C_fp32,
+                            static_cast<size_t>(n) * sizeof(float),
+                            hipMemcpyDeviceToDevice,
+                            static_cast<hipStream_t>(gpu_stream_));
+                        if (copy_err != hipSuccess)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M GEMV output copy failed at row "
+                                      << row << ": " << hipGetErrorString(copy_err));
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+
             if (use_gpu_path && m == 1)
             {
                 // Ensure weights are on device
@@ -2706,7 +2897,7 @@ namespace llaminar2
             const TensorBase *input,
             const std::vector<TensorProjectionDesc> &projections,
             int m, int k,
-            const IMPIContext * /*mpi_ctx*/,
+            const IMPIContext *mpi_ctx,
             DeviceWorkspaceManager *workspace)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM, static_cast<hipStream_t>(gpu_stream_));
@@ -2719,6 +2910,16 @@ namespace llaminar2
                 // Temporarily bind passed workspace for this call
                 workspace_ = ws;
             }
+            auto restore_workspace = [&](void *)
+            {
+                if (ws && ws != saved_workspace)
+                {
+                    workspace_ = saved_workspace;
+                }
+            };
+            std::unique_ptr<void, decltype(restore_workspace)> workspace_restore_guard(
+                (ws && ws != saved_workspace) ? static_cast<void *>(this) : nullptr,
+                restore_workspace);
 
             if (!input || projections.empty())
             {
@@ -2760,6 +2961,44 @@ namespace llaminar2
             {
                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Input has no GPU data");
                 return false;
+            }
+
+            if (m > 1 && m <= 2)
+            {
+                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M fused verifier path M="
+                          << m << " projections=" << projections.size());
+                for (const auto &proj : projections)
+                {
+                    if (!proj.kernel || !proj.output)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M projection has null kernel or output");
+                        return false;
+                    }
+
+                    proj.kernel->setGPUStream(gpu_stream_);
+                    if (!proj.kernel->multiply_tensor(
+                            input,
+                            proj.output,
+                            m,
+                            proj.n,
+                            k,
+                            true,
+                            1.0f,
+                            0.0f,
+                            proj.bias,
+                            mpi_ctx,
+                            -1,
+                            ws))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M projection failed for "
+                                  << (proj.name ? proj.name : "unnamed"));
+                        return false;
+                    }
+                }
+
+                if (ws && ws != saved_workspace)
+                    workspace_ = saved_workspace;
+                return true;
             }
 
             // Step 2: Validate and populate workspace pointers (shared across all projections)

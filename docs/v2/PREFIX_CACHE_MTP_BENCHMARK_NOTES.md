@@ -16,7 +16,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
-| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP decode and sidecar are segmented-graph captured with no manual stages | N/A | 7.27 | 0.40x decode, 0.64x overall | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-rowdecode-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sidecar-capture-retry-stats.json` | Captured two-token verifier GPU work still costs about 222 ms/call. Attention and sidecar graph launch are no longer dominant; small-M GEMM/GDN verifier kernels remain. |
+| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP decode and sidecar are segmented-graph captured with no manual stages | N/A | 11.84 | 0.65x decode, 0.64x overall | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-smallm-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-smallm-stats.json` | Small-M ROCm verifier GEMV reduced `verifier_forward` to about 131 ms/call, but MTP is still slower than baseline. Need a true two-row/batched verifier kernel path or fewer full verifier replays. |
 | SingleDevice | CUDA | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | N/A | Pending | Pending | Pending | Need first dense CUDA baseline/MTP graph-capture run. |
 | SingleDevice | ROCm | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and MoE MTP sidecar capture audit. |
 | SingleDevice | CUDA | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and CUDA availability check. |
@@ -55,6 +55,23 @@ Latest ROCm dense evidence:
   - Sidecar timing remains small: about 3.43 ms/call in decode.
   - Throughput is essentially unchanged at 7.10 decode tok/s because
     `verifier_forward` remains about 222.5 ms/call.
+- ROCm small-M verifier path: `/tmp/llaminar-mtp-bench/dense-rocm-mtp-smallm-bench.json`
+  and `/tmp/llaminar-mtp-bench/dense-rocm-mtp-smallm-stats.json`.
+  - Decode improved to 11.84 tok/s for the short `-n 8` benchmark.
+  - `verifier_forward`: 12 calls, 1575.95 ms total, about 131.33 ms/call.
+  - `sidecar_forward`: 12 calls, 40.23 ms total, about 3.35 ms/call.
+  - MTP counters: 16 draft steps, 12 accepted tokens, 4 rejected tokens,
+    4 rollbacks, 75% acceptance.
+  - This is the current best ROCm dense MTP evidence, but it is still below
+    the 18.25 tok/s no-MTP decode baseline.
+- Rejected shared-quant fused M=2 experiment:
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-bench.json` and
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-stats.json`.
+  - Correctness held in the focused small-M integration test, but decode
+    regressed to 10.81 tok/s and `verifier_forward` rose to about
+    181.20 ms/call.
+  - Do not reintroduce this shape without a lower-level kernel change; a true
+    batched/two-row GEMV path is likely needed instead.
 - Regression coverage:
   - `V2_Unit_MTPGraphConstruction` now includes
     `CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse`, which proves a
@@ -65,11 +82,15 @@ Latest ROCm dense evidence:
     real GPU sidecar path when CUDA/ROCm is visible and asserts one
     `plain_after_build` execution before segmented graph-capture reuse. The test
     skips only when no GPU backend is available to the test process.
+  - `V2_Integration_ROCmQuantisedGemmSmallM` covers the ROCm M=2 verifier GEMV
+    path and the fused Q/K/V M=2 routing path against CPU/separate-projection
+    references, so future verifier-kernel work has a fast hardware regression.
 
 Next graph-capture questions:
 
-- Can the two-token verifier use decode-specialized small-M GEMM/GDN kernels
-  inside the captured graph instead of prefill-style kernels?
+- Can the two-token verifier use a true batched/two-row decode GEMV/GDN kernel
+  inside the captured graph instead of serial M=1 row launches or prefill-style
+  kernels?
 - For LocalTP/LocalPP/MoE, can collective/manual stages be graph captured or made
   explicit hard boundaries without falling back silently?
 
