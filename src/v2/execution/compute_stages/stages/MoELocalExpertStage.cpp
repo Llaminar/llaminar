@@ -9,7 +9,6 @@
 #include "../../../execution/moe/MoEExpertOverlayProfiler.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../loaders/PreparedWeightStore.h"
-#include "../../../tensors/CoherenceState.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 
@@ -382,7 +381,7 @@ namespace llaminar2
         float *routing_indices = compact_routing_indices_->mutable_data();
         float *routing_weights = compact_routing_weights_->mutable_data();
         float *compact_output = compact_output_->mutable_data();
-        std::fill_n(routing_indices, input.live_row_count * static_cast<size_t>(params_.top_k), 0.0f);
+        std::fill_n(routing_indices, input.live_row_count * static_cast<size_t>(params_.top_k), -1.0f);
         std::fill_n(routing_weights, input.live_row_count * static_cast<size_t>(params_.top_k), 0.0f);
         std::fill_n(compact_output, input.live_row_count * static_cast<size_t>(params_.d_model), 0.0f);
 
@@ -512,12 +511,6 @@ namespace llaminar2
                 input.live_row_count, // output rows == input rows for local expert
                 std::vector<int>(unique_set.begin(), unique_set.end()),
                 compute_ms);
-        }
-
-        if (is_gpu)
-        {
-            // Mark output device-authoritative so that data() below triggers D2H.
-            compact_output_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         }
 
         const float *compact_result = compact_output_->data();

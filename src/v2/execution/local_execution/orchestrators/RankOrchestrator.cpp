@@ -55,6 +55,50 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        bool synchronizeGpuBackendsBeforeRankMmapRelease()
+        {
+            bool ok = true;
+            auto sync_backend = [&ok](const char *name, IBackend *backend)
+            {
+                if (!backend)
+                    return;
+
+                const int device_count = backend->deviceCount();
+                for (int device_idx = 0; device_idx < device_count; ++device_idx)
+                {
+                    if (debugEnv().vram_trace)
+                    {
+                        LOG_INFO("[VRAM_TRACE] rank_mmap_release.before_sync backend=" << name
+                                                                                       << " device=" << device_idx);
+                    }
+                    else
+                    {
+                        LOG_DEBUG("RankOrchestrator: synchronizing " << name << ":" << device_idx
+                                                                     << " before mmap DONTNEED");
+                    }
+
+                    if (!backend->synchronize(device_idx))
+                    {
+                        LOG_ERROR("RankOrchestrator: failed to synchronize " << name << ":"
+                                                                             << device_idx
+                                                                             << " before mmap DONTNEED");
+                        ok = false;
+                    }
+                    else if (debugEnv().vram_trace)
+                    {
+                        LOG_INFO("[VRAM_TRACE] rank_mmap_release.after_sync backend=" << name
+                                                                                      << " device=" << device_idx);
+                    }
+                }
+            };
+
+            sync_backend("CUDA", getCUDABackend());
+            sync_backend("ROCm", getROCmBackend());
+            return ok;
+        }
+    }
 
     // =========================================================================
     // Config Implementation
@@ -1721,6 +1765,23 @@ namespace llaminar2
                 if (auto wm = model_ctx_->weightManager())
                 {
                     wm->releaseHostResidentWeightData();
+                    if (!mmap_dontneed_advised_)
+                    {
+                        mmap_dontneed_advised_ = true;
+                        if (synchronizeGpuBackendsBeforeRankMmapRelease())
+                        {
+                            if (debugEnv().vram_trace)
+                                LOG_INFO("[VRAM_TRACE] rank_mmap_release.before_advise phase=after_first_prefill");
+                            const size_t advised_bytes = wm->adviseMmapDontneed();
+                            if (debugEnv().vram_trace)
+                                LOG_INFO("[VRAM_TRACE] rank_mmap_release.after_advise phase=after_first_prefill bytes="
+                                         << advised_bytes);
+                        }
+                        else
+                        {
+                            LOG_WARN("RankOrchestrator: skipping mmap DONTNEED after prefill because GPU synchronization failed");
+                        }
+                    }
                 }
             }
         }

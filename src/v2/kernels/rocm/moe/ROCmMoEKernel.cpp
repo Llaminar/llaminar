@@ -1386,6 +1386,9 @@ namespace llaminar2
         if (num_tokens <= 0)
             return;
 
+        if (!setMoEDevice(device_ordinal_, "gatherTokenBatch"))
+            return;
+
         if (!hipMoE_gather_tokens(hidden, batch_buffer, token_indices,
                                   num_tokens, d_model,
                                   device_ordinal_, getStream()))
@@ -1408,6 +1411,9 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SCATTER, static_cast<hipStream_t>(getStream()));
 
         if (num_tokens <= 0)
+            return;
+
+        if (!setMoEDevice(device_ordinal_, "scatterAddWeighted"))
             return;
 
         if (!hipMoE_scatter_add(output, expert_output, token_indices, weights,
@@ -1434,6 +1440,9 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SHARED_GATE, static_cast<hipStream_t>(getStream()));
 
         if (seq_len <= 0 || d_model <= 0)
+            return;
+
+        if (!setMoEDevice(device_ordinal_, "sharedExpertGate"))
             return;
 
         if (seq_len == 1)
@@ -1469,6 +1478,9 @@ namespace llaminar2
         if (count <= 0)
             return;
 
+        if (!setMoEDevice(device_ordinal_, "swiGLU"))
+            return;
+
         if (!hipMoE_swiglu(gate, up, count, device_ordinal_, getStream()))
         {
             LOG_ERROR("[ROCmMoEKernel::swiGLU] kernel launch failed");
@@ -1481,6 +1493,9 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_SCATTER, static_cast<hipStream_t>(getStream()));
 
         if (count <= 0)
+            return;
+
+        if (!setMoEDevice(device_ordinal_, "weightedAdd"))
             return;
 
         if (!hipMoE_weighted_add(output, input, weight, count, device_ordinal_, getStream()))
@@ -1497,6 +1512,9 @@ namespace llaminar2
     {
         // Already allocated with sufficient dimensions?
         if (d_histogram_ && max_layers_ >= num_layers && max_experts_ >= num_experts)
+            return;
+
+        if (!setMoEDevice(device_ordinal_, "allocateHistogramBuffers"))
             return;
 
         // Free old if dimensions grew
@@ -1574,6 +1592,9 @@ namespace llaminar2
             return;
         }
 
+        if (!setMoEDevice(device_ordinal_, "syncHistogramToHost"))
+            return;
+
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         const size_t offset = static_cast<size_t>(layer_idx) * max_experts_;
 
@@ -1607,6 +1628,9 @@ namespace llaminar2
             return;
         }
 
+        if (!setMoEDevice(device_ordinal_, "resetHistogramDevice"))
+            return;
+
         if (!hipMoE_histogram_reset(
                 reinterpret_cast<unsigned long long *>(d_histogram_),
                 layer_idx, num_experts,
@@ -1621,6 +1645,9 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (num_experts <= 0)
+            return;
+
+        if (!setMoEDevice(device_ordinal_, "updateExpertMaskDevice"))
             return;
 
         // Allocate or reallocate if needed
@@ -1663,6 +1690,9 @@ namespace llaminar2
         if (seq_len <= 0 || top_k <= 0)
             return;
 
+        if (!setMoEDevice(device_ordinal_, "applyExpertMaskDevice"))
+            return;
+
         if (!d_expert_mask_)
         {
             LOG_WARN("[ROCmMoEKernel::applyExpertMaskDevice] No expert mask uploaded");
@@ -1695,6 +1725,9 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
+            return false;
+
+        if (!setMoEDevice(device_ordinal_, "groupTokensByExpertDevice"))
             return false;
 
         const int total_slots = seq_len * top_k;
@@ -2029,6 +2062,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!setMoEDevice(device_ordinal_, "ensureRuntimeGateUpPointerArrays"))
+            return false;
+
         for (auto &entry : runtime_gateup_pointer_cache_)
         {
             if (entry.descriptor_table_id != descriptor_table_id || entry.top_k != top_k)
@@ -2106,6 +2142,9 @@ namespace llaminar2
         {
             return false;
         }
+
+        if (!setMoEDevice(device_ordinal_, "ensureRuntimeDownPointerArrays"))
+            return false;
 
         for (auto &entry : runtime_down_pointer_cache_)
         {
@@ -2533,6 +2572,9 @@ namespace llaminar2
 
     void ROCmMoEKernel::zeroBuffer(ITensor *tensor, size_t bytes)
     {
+        if (!setMoEDevice(device_ordinal_, "zeroBuffer"))
+            return;
+
         void *ptr = tensor->gpu_data_ptr();
         if (!ptr)
         {
@@ -2545,7 +2587,8 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::zeroBuffer] hipMemsetAsync failed: " << hipGetErrorString(err));
             return;
         }
-        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                             DeviceId::rocm(device_ordinal_));
     }
 
     void ROCmMoEKernel::gatherTokenBatchFromTensors(
@@ -2557,6 +2600,9 @@ namespace llaminar2
         if (num_tokens <= 0)
             return;
 
+        if (!setMoEDevice(device_ordinal_, "gatherTokenBatchFromTensors"))
+            return;
+
         const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
         float *b = static_cast<float *>(batch_buffer->gpu_data_ptr());
 
@@ -2565,10 +2611,6 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::gatherTokenBatchFromTensors] null device pointer");
             return;
         }
-
-        if (!setMoEDevice(device_ordinal_, "gatherTokenBatchFromTensors"))
-            return;
-
         // Upload host token indices to device staging buffer
         ensureStagingCapacity(num_tokens);
         if (!d_staging_indices_)
@@ -2586,7 +2628,8 @@ namespace llaminar2
         }
 
         gatherTokenBatch(h, b, d_staging_indices_, num_tokens, d_model);
-        batch_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        batch_buffer->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                   DeviceId::rocm(device_ordinal_));
     }
 
     void ROCmMoEKernel::scatterAddWeightedFromTensors(
@@ -2599,6 +2642,9 @@ namespace llaminar2
         if (num_tokens <= 0)
             return;
 
+        if (!setMoEDevice(device_ordinal_, "scatterAddWeightedFromTensors"))
+            return;
+
         float *o = static_cast<float *>(output->gpu_data_ptr());
         const float *e = static_cast<const float *>(expert_output->gpu_data_ptr());
 
@@ -2607,10 +2653,6 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::scatterAddWeightedFromTensors] null device pointer");
             return;
         }
-
-        if (!setMoEDevice(device_ordinal_, "scatterAddWeightedFromTensors"))
-            return;
-
         // Upload host indices + weights to device staging
         ensureStagingCapacity(num_tokens);
         if (!d_staging_indices_ || !d_staging_weights_)
@@ -2640,12 +2682,17 @@ namespace llaminar2
 
         scatterAddWeighted(o, e, d_staging_indices_, d_staging_weights_,
                            num_tokens, d_model);
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                             DeviceId::rocm(device_ordinal_));
     }
 
     void ROCmMoEKernel::sharedExpertGateFromTensors(
         ITensor *input, ITensor *gate_inp, ITensor *shared_output,
         int seq_len, int d_model)
     {
+        if (!setMoEDevice(device_ordinal_, "sharedExpertGateFromTensors"))
+            return;
+
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
         const float *gi = static_cast<const float *>(gate_inp->gpu_data_ptr());
         float *so = static_cast<float *>(shared_output->gpu_data_ptr());
@@ -2657,11 +2704,15 @@ namespace llaminar2
         }
 
         sharedExpertGate(in, gi, so, seq_len, d_model);
-        shared_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        shared_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                    DeviceId::rocm(device_ordinal_));
     }
 
     void ROCmMoEKernel::swiGLUFromTensors(ITensor *gate, ITensor *up, int count)
     {
+        if (!setMoEDevice(device_ordinal_, "swiGLUFromTensors"))
+            return;
+
         float *g = static_cast<float *>(gate->gpu_data_ptr());
         float *u = static_cast<float *>(up->gpu_data_ptr());
 
@@ -2672,12 +2723,16 @@ namespace llaminar2
         }
 
         swiGLU(g, u, count);
-        gate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        gate->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                           DeviceId::rocm(device_ordinal_));
     }
 
     void ROCmMoEKernel::weightedAddFromTensors(
         ITensor *output, ITensor *input, float weight, int count)
     {
+        if (!setMoEDevice(device_ordinal_, "weightedAddFromTensors"))
+            return;
+
         float *o = static_cast<float *>(output->gpu_data_ptr());
         const float *in = static_cast<const float *>(input->gpu_data_ptr());
 
@@ -2688,6 +2743,8 @@ namespace llaminar2
         }
 
         weightedAdd(o, in, weight, count);
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                             DeviceId::rocm(device_ordinal_));
     }
 
     int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable(
@@ -3713,6 +3770,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!setMoEDevice(device_ordinal_, "groupPrefillRoutes"))
+            return false;
+
         const float *d_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
         const float *d_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
         if (!d_indices || !d_weights)
@@ -3752,6 +3812,9 @@ namespace llaminar2
                                                                                                           << " d_model=" << d_model);
             return false;
         }
+
+        if (!setMoEDevice(device_ordinal_, "gatherPrefillExpertBatchFromRuntime"))
+            return false;
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         float *d_batch = static_cast<float *>(batch_buffer->gpu_data_ptr());
@@ -3795,6 +3858,9 @@ namespace llaminar2
             return false;
         }
 
+        if (!setMoEDevice(device_ordinal_, "scatterPrefillExpertResultsFromRuntime"))
+            return false;
+
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
         const float *d_expert_output = static_cast<const float *>(expert_results->gpu_data_ptr());
         if (!d_output || !d_expert_output)
@@ -3824,6 +3890,9 @@ namespace llaminar2
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
 
+        if (!setMoEDevice(device_ordinal_, "prepareExpertGroups"))
+            return false;
+
         const int total_slots = seq_len * top_k;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
 
@@ -3843,27 +3912,51 @@ namespace llaminar2
         if (total_slots > group_slots_cap_)
         {
             if (d_group_int_indices_)
-                hipFree(d_group_int_indices_);
+                (void)hipFree(d_group_int_indices_);
             if (d_group_token_indices_)
-                hipFree(d_group_token_indices_);
+                (void)hipFree(d_group_token_indices_);
             if (d_group_weights_)
-                hipFree(d_group_weights_);
-            hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
-            hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
-            hipMalloc(&d_group_weights_, total_slots * sizeof(float));
+                (void)hipFree(d_group_weights_);
+            hipError_t alloc_err = hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_weights_, total_slots * sizeof(float));
+            if (alloc_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] hipMalloc grouping buffers failed: "
+                          << hipGetErrorString(alloc_err));
+                d_group_int_indices_ = nullptr;
+                d_group_token_indices_ = nullptr;
+                d_group_weights_ = nullptr;
+                group_slots_cap_ = 0;
+                return false;
+            }
             group_slots_cap_ = total_slots;
         }
         if (num_experts > group_experts_cap_)
         {
             if (d_group_offsets_)
-                hipFree(d_group_offsets_);
+                (void)hipFree(d_group_offsets_);
             if (d_group_counts_)
-                hipFree(d_group_counts_);
+                (void)hipFree(d_group_counts_);
             if (d_group_max_tokens_)
-                hipFree(d_group_max_tokens_);
-            hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
-            hipMalloc(&d_group_counts_, num_experts * sizeof(int));
-            hipMalloc(&d_group_max_tokens_, sizeof(int));
+                (void)hipFree(d_group_max_tokens_);
+            hipError_t alloc_err = hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_counts_, num_experts * sizeof(int));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_max_tokens_, sizeof(int));
+            if (alloc_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] hipMalloc expert buffers failed: "
+                          << hipGetErrorString(alloc_err));
+                d_group_offsets_ = nullptr;
+                d_group_counts_ = nullptr;
+                d_group_max_tokens_ = nullptr;
+                group_experts_cap_ = 0;
+                return false;
+            }
             group_experts_cap_ = num_experts;
         }
 
@@ -3889,11 +3982,19 @@ namespace llaminar2
         // 5. D2H expert counts and offsets (small — num_experts ints each)
         host_expert_counts_.resize(num_experts);
         host_expert_offsets_.resize(num_experts);
-        hipMemcpyAsync(host_expert_counts_.data(), d_group_counts_,
-                       num_experts * sizeof(int), hipMemcpyDeviceToHost, stream);
-        hipMemcpyAsync(host_expert_offsets_.data(), d_group_offsets_,
-                       num_experts * sizeof(int), hipMemcpyDeviceToHost, stream);
-        hipStreamSynchronize(stream);
+        hipError_t copy_err = hipMemcpyAsync(host_expert_counts_.data(), d_group_counts_,
+                                             num_experts * sizeof(int), hipMemcpyDeviceToHost, stream);
+        if (copy_err == hipSuccess)
+            copy_err = hipMemcpyAsync(host_expert_offsets_.data(), d_group_offsets_,
+                                      num_experts * sizeof(int), hipMemcpyDeviceToHost, stream);
+        if (copy_err == hipSuccess)
+            copy_err = hipStreamSynchronize(stream);
+        if (copy_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] D2H grouping metadata failed: "
+                      << hipGetErrorString(copy_err));
+            return false;
+        }
 
         prepared_num_experts_ = num_experts;
         return true;
@@ -3914,6 +4015,9 @@ namespace llaminar2
         if (count <= 0)
             return;
 
+        if (!setMoEDevice(device_ordinal_, "gatherExpertBatch"))
+            return;
+
         const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
         float *b = static_cast<float *>(batch_buffer->gpu_data_ptr());
         int offset = host_expert_offsets_[expert_id];
@@ -3927,6 +4031,9 @@ namespace llaminar2
     {
         int count = getExpertTokenCount(expert_id);
         if (count <= 0)
+            return;
+
+        if (!setMoEDevice(device_ordinal_, "scatterExpertResults"))
             return;
 
         float *o = static_cast<float *>(output->gpu_data_ptr());
@@ -3948,8 +4055,10 @@ namespace llaminar2
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
             return false;
 
+        if (!setMoEDevice(device_ordinal_, "prepareExpertGroupsAsync"))
+            return false;
+
         const int total_slots = seq_len * top_k;
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
 
         // 1. Ensure routing tensors are on device
         routing_indices->ensureOnDevice(DeviceId::rocm(device_ordinal_));
@@ -3974,14 +4083,26 @@ namespace llaminar2
                 return false;
             }
             if (d_group_int_indices_)
-                hipFree(d_group_int_indices_);
+                (void)hipFree(d_group_int_indices_);
             if (d_group_token_indices_)
-                hipFree(d_group_token_indices_);
+                (void)hipFree(d_group_token_indices_);
             if (d_group_weights_)
-                hipFree(d_group_weights_);
-            hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
-            hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
-            hipMalloc(&d_group_weights_, total_slots * sizeof(float));
+                (void)hipFree(d_group_weights_);
+            hipError_t alloc_err = hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_weights_, total_slots * sizeof(float));
+            if (alloc_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] hipMalloc grouping buffers failed: "
+                          << hipGetErrorString(alloc_err));
+                d_group_int_indices_ = nullptr;
+                d_group_token_indices_ = nullptr;
+                d_group_weights_ = nullptr;
+                group_slots_cap_ = 0;
+                return false;
+            }
             group_slots_cap_ = total_slots;
         }
         if (num_experts > group_experts_cap_)
@@ -3994,14 +4115,26 @@ namespace llaminar2
                 return false;
             }
             if (d_group_offsets_)
-                hipFree(d_group_offsets_);
+                (void)hipFree(d_group_offsets_);
             if (d_group_counts_)
-                hipFree(d_group_counts_);
+                (void)hipFree(d_group_counts_);
             if (d_group_max_tokens_)
-                hipFree(d_group_max_tokens_);
-            hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
-            hipMalloc(&d_group_counts_, num_experts * sizeof(int));
-            hipMalloc(&d_group_max_tokens_, sizeof(int));
+                (void)hipFree(d_group_max_tokens_);
+            hipError_t alloc_err = hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_counts_, num_experts * sizeof(int));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_max_tokens_, sizeof(int));
+            if (alloc_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] hipMalloc expert buffers failed: "
+                          << hipGetErrorString(alloc_err));
+                d_group_offsets_ = nullptr;
+                d_group_counts_ = nullptr;
+                d_group_max_tokens_ = nullptr;
+                group_experts_cap_ = 0;
+                return false;
+            }
             group_experts_cap_ = num_experts;
         }
 
@@ -4042,6 +4175,9 @@ namespace llaminar2
 
     bool ROCmMoEKernel::ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate)
     {
+        if (!setMoEDevice(device_ordinal_, "ensureGroupedPrefillScratchCapacity"))
+            return false;
+
         const bool need_realloc = (total_slots > prefill_slots_cap_ ||
                                    d_model > prefill_d_model_cap_ ||
                                    intermediate > prefill_intermediate_cap_);
@@ -4148,6 +4284,9 @@ namespace llaminar2
             num_experts <= 0 || top_k <= 0)
             return false;
 
+        if (!setMoEDevice(device_ordinal_, "executeGroupedPrefillPipeline"))
+            return false;
+
         if (gateup_desc_table_id < 0 ||
             gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
         {
@@ -4203,7 +4342,13 @@ namespace llaminar2
 
         // Zero the output buffer (pre-zero requirement for scatter-add)
         hipStream_t stream = static_cast<hipStream_t>(getStream());
-        hipMemsetAsync(d_output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float), stream);
+        hipError_t memset_err = hipMemsetAsync(d_output, 0, static_cast<size_t>(seq_len) * d_model * sizeof(float), stream);
+        if (memset_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] output zero failed: "
+                      << hipGetErrorString(memset_err));
+            return false;
+        }
 
         // Call the fully-grouped pipeline (5 kernel launches, zero sync)
         const bool ok = rocmMoE_grouped_prefill_pipeline(
@@ -4239,6 +4384,8 @@ namespace llaminar2
             return false;
         }
 
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                             DeviceId::rocm(device_ordinal_));
         return true;
     }
 

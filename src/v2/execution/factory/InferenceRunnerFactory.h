@@ -82,6 +82,7 @@ namespace llaminar2
     class ILocalTPContext;
     class IRankOrchestrator;
     class PreparedWeightStore;
+    class MoEExpertOverlayRuntimePlan;
     struct GraphConfig;
     struct MoEExpertOverlayExecutionPlan;
     struct MoEExpertParallelPlan;
@@ -276,6 +277,12 @@ namespace llaminar2
         GraphConfig &graph_config,
         DomainTPContextMap &owned_domain_tp_contexts,
         const std::string &log_prefix = "[InferenceRunnerTest]");
+
+    DeviceId resolveMoEExpertOverlayExecutionDeviceForGraph(
+        GraphConfig &graph_config,
+        const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+        DeviceId requested_device,
+        const std::string &log_prefix = "[InferenceRunner]");
 
     /**
      * @brief Factory function to create a unified LOCAL PP runner

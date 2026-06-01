@@ -426,6 +426,22 @@ namespace
         }
     }
 
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, OverlayExecutionDeviceUsesContinuationPrimary)
+    {
+        GraphConfig graph_config;
+        graph_config.moe.expert_parallel_plan = makeActiveRocmLocalTPOverlayPlan();
+
+        const DeviceId effective_device = resolveMoEExpertOverlayExecutionDeviceForGraph(
+            graph_config,
+            nullptr,
+            DeviceId::cpu(),
+            "[InferenceRunnerFactoryTest]");
+
+        EXPECT_EQ(effective_device, DeviceId::rocm(0));
+        ASSERT_NE(graph_config.moe.expert_overlay_runtime_plan, nullptr);
+        EXPECT_EQ(graph_config.moe.expert_overlay_runtime_plan->continuationDevice(), DeviceId::rocm(0));
+    }
+
     // =============================================================================
     // Config Validation Tests
     // =============================================================================

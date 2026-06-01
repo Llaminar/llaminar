@@ -535,11 +535,29 @@ namespace llaminar2
             if (timeline_active && timeline_gpu_ctx)
                 stage_timeline_.recordStart(i, timeline_gpu_ctx, timeline_stream);
 
+            if (debugEnv().vram_trace && ctx->isGPU())
+            {
+                const DeviceId stage_device = node->device.is_valid() ? node->device : node->stage->device();
+                LOG_INFO("[VRAM_TRACE] stage.before index=" << i
+                                                            << " name=" << node->name
+                                                            << " type=" << computeStageTypeName(node->stage->type())
+                                                            << " device=" << stage_device.toString());
+            }
+
             if (!runStage(*node, ctx, policy, is_coll))
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << node->name);
                 notifyStageFailure(node->name, "stage execution returned false");
                 return false;
+            }
+
+            if (debugEnv().vram_trace && ctx->isGPU())
+            {
+                const DeviceId stage_device = node->device.is_valid() ? node->device : node->stage->device();
+                LOG_INFO("[VRAM_TRACE] stage.after index=" << i
+                                                           << " name=" << node->name
+                                                           << " type=" << computeStageTypeName(node->stage->type())
+                                                           << " device=" << stage_device.toString());
             }
 
             if (ctx->isGPU() && debugEnv().runtime_debug.sync_after_stage)

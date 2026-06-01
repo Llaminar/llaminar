@@ -125,6 +125,13 @@ namespace llaminar2
                             std::vector<ITensorGemm *> &up_out,
                             std::vector<ITensorGemm *> &down_out) const;
 
+        bool populateExpertEnginesForParticipant(const std::string &domain_name,
+                            DeviceId device, int participant_world_rank, int participant_index,
+                            int layer, int num_experts,
+                            std::vector<ITensorGemm *> &gate_out,
+                            std::vector<ITensorGemm *> &up_out,
+                            std::vector<ITensorGemm *> &down_out) const;
+
         /// Replace an existing engine (for dynamic rebalancing arrival).
         /// If no existing engine, equivalent to registerEngine.
         void replaceEngine(DeviceId device, int layer, int expert, WeightRole role,

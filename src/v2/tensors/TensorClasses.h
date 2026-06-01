@@ -1338,6 +1338,20 @@ namespace llaminar2
             release_raw_data();
         }
 
+        /**
+         * @brief Drop CUDA/HIP host registration before mmap pages are advised away.
+         *
+         * mmap-backed weights can be uploaded through TransferEngine, which may
+         * pin their host pages for DMA. MADV_DONTNEED on still-registered pages
+         * can leave the GPU runtime with stale host mappings, so mmap reclaim
+         * must unregister first even when the tensor's raw host data is retained.
+         */
+        virtual void releaseMmapHostRegistration()
+        {
+            if (is_mmap_data())
+                unpinHostMemory();
+        }
+
         // ===== Generic Type Conversion API =====
 
         /**

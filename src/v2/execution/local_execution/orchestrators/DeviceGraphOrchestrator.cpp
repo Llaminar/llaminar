@@ -146,6 +146,47 @@ namespace llaminar2
                    (best.token < 0 || candidate.token < best.token);
         }
 
+        bool synchronizeGpuBackendsBeforeMmapRelease()
+        {
+            bool ok = true;
+            auto sync_backend = [&ok](const char *name, IBackend *backend)
+            {
+                if (!backend)
+                    return;
+
+                const int device_count = backend->deviceCount();
+                for (int device_idx = 0; device_idx < device_count; ++device_idx)
+                {
+                    if (debugEnv().vram_trace)
+                    {
+                        LOG_INFO("[VRAM_TRACE] mmap_release.before_sync backend=" << name
+                                                                                  << " device=" << device_idx);
+                    }
+                    else
+                    {
+                        LOG_DEBUG("[DeviceGraphOrchestrator] Synchronizing " << name << ":" << device_idx
+                                                                             << " before mmap DONTNEED");
+                    }
+                    if (!backend->synchronize(device_idx))
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to synchronize " << name << ":"
+                                                                                     << device_idx
+                                                                                     << " before mmap DONTNEED");
+                        ok = false;
+                    }
+                    else if (debugEnv().vram_trace)
+                    {
+                        LOG_INFO("[VRAM_TRACE] mmap_release.after_sync backend=" << name
+                                                                                 << " device=" << device_idx);
+                    }
+                }
+            };
+
+            sync_backend("CUDA", getCUDABackend());
+            sync_backend("ROCm", getROCmBackend());
+            return ok;
+        }
+
         GreedyLogitCandidate sampleGreedyCandidateFromTensor(
             TensorBase *tensor,
             int row,
@@ -1769,14 +1810,28 @@ namespace llaminar2
 
     void DeviceGraphOrchestrator::onFirstGraphReady()
     {
-        // Release mmap physical pages now that all GEMM engines have packed
-        // their weight data into owned interleaved buffers. Doing this before
-        // execution starts (and before activation allocation) reduces peak RSS
-        // by the full mmap size (~21 GB for the 35B MoE model).
-        if (weight_manager_)
+        // Intentionally no-op for mmap reclaim. This callback fires when this
+        // participant-local graph has a workspace, which is too early for TP/MoE
+        // domains whose sibling participants may still be resolving captured
+        // transfers. Reclaim happens after the first successful prefill instead.
+    }
+
+    void DeviceGraphOrchestrator::adviseMmapDontneedAfterFirstPrefill()
+    {
+        if (mmap_dontneed_advised_ || !weight_manager_)
+            return;
+
+        mmap_dontneed_advised_ = true;
+        if (!synchronizeGpuBackendsBeforeMmapRelease())
         {
-            weight_manager_->adviseMmapDontneed();
+            LOG_WARN("[DeviceGraphOrchestrator] Skipping mmap DONTNEED after prefill because GPU synchronization failed");
+            return;
         }
+        if (debugEnv().vram_trace)
+            LOG_INFO("[VRAM_TRACE] mmap_release.before_advise phase=after_first_prefill");
+        const size_t advised_bytes = weight_manager_->adviseMmapDontneed();
+        if (debugEnv().vram_trace)
+            LOG_INFO("[VRAM_TRACE] mmap_release.after_advise phase=after_first_prefill bytes=" << advised_bytes);
     }
 
     bool DeviceGraphOrchestrator::executeAttention(
@@ -2885,6 +2940,7 @@ namespace llaminar2
         {
             host_resident_released_ = true;
             weight_manager_->releaseHostResidentWeightData();
+            adviseMmapDontneedAfterFirstPrefill();
         }
 
         // Update positions
@@ -3020,6 +3076,7 @@ namespace llaminar2
         {
             host_resident_released_ = true;
             weight_manager_->releaseHostResidentWeightData();
+            adviseMmapDontneedAfterFirstPrefill();
         }
 
         state_.positions[0] += seq_len;

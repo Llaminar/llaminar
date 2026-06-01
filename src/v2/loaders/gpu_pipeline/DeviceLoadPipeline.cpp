@@ -4,6 +4,7 @@
 #include "backends/IBackend.h"
 #include "utils/Logger.h"
 #include "utils/WeightLoadingProfiler.h"
+#include "utils/DebugEnv.h"
 
 #include <chrono>
 #include <cstring>
@@ -11,6 +12,57 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        const char *repackFormatName(RepackFormat format)
+        {
+            switch (format)
+            {
+            case RepackFormat::Q4_0:
+                return "Q4_0";
+            case RepackFormat::Q4_1:
+                return "Q4_1";
+            case RepackFormat::Q5_0:
+                return "Q5_0";
+            case RepackFormat::Q5_1:
+                return "Q5_1";
+            case RepackFormat::Q8_0:
+                return "Q8_0";
+            case RepackFormat::Q4_K:
+                return "Q4_K";
+            case RepackFormat::Q5_K:
+                return "Q5_K";
+            case RepackFormat::Q6_K:
+                return "Q6_K";
+            case RepackFormat::Q3_K:
+                return "Q3_K";
+            case RepackFormat::Q2_K:
+                return "Q2_K";
+            case RepackFormat::IQ4_NL:
+                return "IQ4_NL";
+            case RepackFormat::IQ4_XS:
+                return "IQ4_XS";
+            case RepackFormat::IQ3_S:
+                return "IQ3_S";
+            case RepackFormat::IQ3_XXS:
+                return "IQ3_XXS";
+            case RepackFormat::IQ2_S:
+                return "IQ2_S";
+            case RepackFormat::IQ2_XS:
+                return "IQ2_XS";
+            case RepackFormat::IQ2_XXS:
+                return "IQ2_XXS";
+            case RepackFormat::IQ1_S:
+                return "IQ1_S";
+            case RepackFormat::IQ1_M:
+                return "IQ1_M";
+            case RepackFormat::RAW_FP:
+                return "RAW_FP";
+            default:
+                return "UNKNOWN";
+            }
+        }
+    }
 
     DeviceLoadPipeline::DeviceLoadPipeline(IBackend &backend,
                                            int device_id,
@@ -119,6 +171,9 @@ namespace llaminar2
 
         const size_t max_staging = pool_.maxStagingSlotBytes();
         const bool profiling = WeightLoadingProfiler::isEnabled();
+        const auto &env = debugEnv();
+        const bool trace_weights = env.weight_lifecycle_trace;
+        const bool sync_after_repack_job = env.rocm.sync_after_kernel;
 
         // Precompute total planned bytes for progress reporting
         size_t total_planned_bytes = 0;
@@ -138,6 +193,17 @@ namespace llaminar2
         {
             const auto &job = jobs[job_idx];
             const int stream_idx = static_cast<int>(job_idx % static_cast<size_t>(num_streams_));
+            if (trace_weights)
+            {
+                LOG_INFO("[DeviceLoadPipeline] device=" << device_id_
+                                                        << " job=" << (job_idx + 1) << "/" << jobs.size()
+                                                        << " name=" << job.name
+                                                        << " format=" << repackFormatName(job.format)
+                                                        << " raw_bytes=" << job.raw_bytes
+                                                        << " N=" << job.N
+                                                        << " K=" << job.K
+                                                        << " stream_slot=" << stream_idx);
+            }
 
             if (job.raw_bytes == 0)
             {
@@ -280,6 +346,16 @@ namespace llaminar2
                 LOG_ERROR("DeviceLoadPipeline: recordEvent repack_done["
                           << stream_idx << "] failed");
                 return false;
+            }
+
+            if (sync_after_repack_job)
+            {
+                if (!backend_.synchronizeStream(repack_stream_, device_id_))
+                {
+                    LOG_ERROR("DeviceLoadPipeline: synchronizeStream repack failed after job '"
+                              << job.name << "' on device " << device_id_);
+                    return false;
+                }
             }
 
             ++num_processed_;

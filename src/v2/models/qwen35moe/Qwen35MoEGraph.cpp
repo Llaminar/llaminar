@@ -1099,14 +1099,58 @@ namespace llaminar2
                             {
                                 auto &registry = weight_mgr->expertGemmRegistry();
                                 local_params.expert_registry = &registry;
-                                (void)registry.populateExpertEnginesForDomain(
-                                    tier.domain,
-                                    target_device,
-                                    layer_idx,
-                                    config_.moe.num_experts,
-                                    local_params.prepared_gate_gemm,
-                                    local_params.prepared_up_gemm,
-                                    local_params.prepared_down_gemm);
+                                bool populated = false;
+                                auto has_active_prepared_engines = [&]() -> bool
+                                {
+                                    if (local_params.prepared_gate_gemm.size() !=
+                                            static_cast<size_t>(config_.moe.num_experts) ||
+                                        local_params.prepared_up_gemm.size() !=
+                                            static_cast<size_t>(config_.moe.num_experts) ||
+                                        local_params.prepared_down_gemm.size() !=
+                                            static_cast<size_t>(config_.moe.num_experts))
+                                    {
+                                        return false;
+                                    }
+
+                                    for (int expert = 0; expert < config_.moe.num_experts; ++expert)
+                                    {
+                                        if (!local_params.expert_mask[static_cast<size_t>(expert)])
+                                            continue;
+                                        if (!local_params.prepared_gate_gemm[static_cast<size_t>(expert)] ||
+                                            !local_params.prepared_up_gemm[static_cast<size_t>(expert)] ||
+                                            !local_params.prepared_down_gemm[static_cast<size_t>(expert)])
+                                        {
+                                            return false;
+                                        }
+                                        populated = true;
+                                    }
+                                    return populated;
+                                };
+                                if (const auto *participant = owner_map_lifetime->participantForId(target_participant))
+                                {
+                                    (void)registry.populateExpertEnginesForParticipant(
+                                        tier.domain,
+                                        target_device,
+                                        participant->world_rank_known ? participant->world_rank : -1,
+                                        participant->domain_participant_index,
+                                        layer_idx,
+                                        config_.moe.num_experts,
+                                        local_params.prepared_gate_gemm,
+                                        local_params.prepared_up_gemm,
+                                        local_params.prepared_down_gemm);
+                                    populated = has_active_prepared_engines();
+                                }
+                                if (!populated)
+                                {
+                                    (void)registry.populateExpertEnginesForDomain(
+                                        tier.domain,
+                                        target_device,
+                                        layer_idx,
+                                        config_.moe.num_experts,
+                                        local_params.prepared_gate_gemm,
+                                        local_params.prepared_up_gemm,
+                                        local_params.prepared_down_gemm);
+                                }
                             }
                         }
 
@@ -1156,6 +1200,7 @@ namespace llaminar2
                             return_params.outbound_rows_lifetime = outbound_lifetime;
                             return_params.inbound_rows_lifetime = inbound_lifetime;
                             return_params.dense_output = moe_output;
+                            return_params.dense_output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;
                             return_params.seq_len = total_tokens;
                             return_params.d_model = config_.d_model;
                             return_params.clear_output_before_scatter =

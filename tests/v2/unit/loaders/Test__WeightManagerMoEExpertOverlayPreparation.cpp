@@ -3,9 +3,15 @@
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/moe/MoEExpertParallelPlanner.h"
+#include "loaders/WeightManager.h"
+#include "mocks/MockModelLoader.h"
+#include "tensors/Tensors.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <memory>
+#include <random>
 #include <vector>
 
 namespace llaminar2::test
@@ -64,11 +70,11 @@ namespace
                        CollectiveBackendType::NCCL),
             domainWith("rocm_warm", ExpertDomainKind::LocalTP,
                        {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
-                       ExpertDomainComputeKind::TensorParallelExperts,
+                       ExpertDomainComputeKind::ReplicatedExperts,
                        CollectiveBackendType::RCCL),
             domainWith("cpu_cold", ExpertDomainKind::NodeLocalTP,
                        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
-                       ExpertDomainComputeKind::TensorParallelExperts,
+                       ExpertDomainComputeKind::ReplicatedExperts,
                        CollectiveBackendType::UPI),
         };
         plan.routed_tiers = {
@@ -92,6 +98,57 @@ namespace
         model.routed_quant_type = "Q4_0";
         model.shared_quant_type = "Q4_0";
         return model;
+    }
+
+    std::shared_ptr<Q4_0Tensor> createQ4_0WithData(const std::vector<size_t> &shape, uint32_t seed)
+    {
+        size_t total_elements = 1;
+        for (auto dim : shape)
+            total_elements *= dim;
+
+        const size_t cols = (shape.size() == 3) ? shape[0] : shape.back();
+        const size_t rows = total_elements / cols;
+        const size_t blocks_per_row = (cols + Q4_0Block::BLOCK_SIZE - 1) / Q4_0Block::BLOCK_SIZE;
+        const size_t total_blocks = rows * blocks_per_row;
+
+        std::mt19937 rng(seed);
+        std::normal_distribution<float> dist(0.0f, 0.1f);
+        std::vector<uint8_t> raw_data(total_blocks * sizeof(Q4_0Block));
+        auto *blocks = reinterpret_cast<Q4_0Block *>(raw_data.data());
+
+        for (size_t block_idx = 0; block_idx < total_blocks; ++block_idx)
+        {
+            float values[Q4_0Block::BLOCK_SIZE];
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < Q4_0Block::BLOCK_SIZE; ++i)
+            {
+                values[i] = dist(rng);
+                max_abs = std::max(max_abs, std::abs(values[i]));
+            }
+
+            const float scale = max_abs / 7.0f;
+            uint32_t bits = 0;
+            std::memcpy(&bits, &scale, sizeof(bits));
+            const uint32_t sign = (bits >> 31) & 0x1u;
+            const int32_t exp = static_cast<int32_t>((bits >> 23) & 0xffu) - 127 + 15;
+            const uint32_t mant = (bits >> 13) & 0x3ffu;
+            if (exp <= 0)
+                blocks[block_idx].d = static_cast<uint16_t>(sign << 15);
+            else if (exp >= 31)
+                blocks[block_idx].d = static_cast<uint16_t>((sign << 15) | 0x7c00u);
+            else
+                blocks[block_idx].d = static_cast<uint16_t>((sign << 15) | (static_cast<uint32_t>(exp) << 10) | mant);
+
+            const float inv_scale = scale > 0.0f ? 1.0f / scale : 0.0f;
+            for (size_t i = 0; i < Q4_0Block::BLOCK_SIZE / 2; ++i)
+            {
+                int q0 = std::clamp(static_cast<int>(std::round(values[2 * i] * inv_scale)) + 8, 0, 15);
+                int q1 = std::clamp(static_cast<int>(std::round(values[2 * i + 1] * inv_scale)) + 8, 0, 15);
+                blocks[block_idx].qs[i] = static_cast<uint8_t>((q1 << 4) | q0);
+            }
+        }
+
+        return std::make_shared<Q4_0Tensor>(shape, raw_data);
     }
 } // namespace
 
@@ -207,7 +264,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, SmallModelBudgetKeepsCudaPa
                    CollectiveBackendType::NCCL),
         domainWith("cpu_cold", ExpertDomainKind::NodeLocalTP,
                    {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
-                   ExpertDomainComputeKind::TensorParallelExperts,
+                   ExpertDomainComputeKind::ReplicatedExperts,
                    CollectiveBackendType::UPI),
     };
     capped.routed_tiers = {
@@ -252,7 +309,7 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, KeepsSameDeviceDomainsSepar
                    CollectiveBackendType::NCCL),
         domainWith("cpu_cold", ExpertDomainKind::NodeLocalTP,
                    {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
-                   ExpertDomainComputeKind::TensorParallelExperts,
+                   ExpertDomainComputeKind::ReplicatedExperts,
                    CollectiveBackendType::UPI),
     };
     plan->routed_tiers = {
@@ -294,6 +351,69 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, KeepsSameDeviceDomainsSepar
               (std::vector<int>{1}));
     EXPECT_EQ(prep.domainsForDeviceLayerRole(DeviceId::cuda(0), 0, Role::GATE),
               (std::vector<std::string>{"cuda_fast", "cuda_warm"}));
+}
+
+TEST(Test__WeightManagerMoEExpertOverlayPreparation, PreparesCpuFallbackExpertsIntoRegistry)
+{
+    auto loader = MockModelLoader::createMinimal();
+    const size_t d_model = 64;
+    const size_t intermediate = 32;
+    const size_t num_experts = 4;
+    loader->addTensor("blk.0.ffn_gate_exps.weight",
+                      createQ4_0WithData({d_model, intermediate, num_experts}, 101));
+    loader->addTensor("blk.0.ffn_up_exps.weight",
+                      createQ4_0WithData({d_model, intermediate, num_experts}, 102));
+    loader->addTensor("blk.0.ffn_down_exps.weight",
+                      createQ4_0WithData({intermediate, d_model, num_experts}, 103));
+
+    WeightManager manager(*loader);
+    ASSERT_NE(manager.getWeightForDevice("blk.0.ffn_gate_exps.weight"), nullptr);
+    ASSERT_NE(manager.getWeightForDevice("blk.0.ffn_up_exps.weight"), nullptr);
+    ASSERT_NE(manager.getWeightForDevice("blk.0.ffn_down_exps.weight"), nullptr);
+
+    auto plan = std::make_shared<MoEExpertParallelPlan>();
+    plan->enabled = true;
+    plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+    plan->continuation_domain = "cpu_cold";
+    plan->shared_expert_domain = "cpu_cold";
+    plan->residency_policy = ExpertResidencyPolicy::StaticById;
+    plan->domains = {
+        domainWith("cpu_cold", ExpertDomainKind::NodeLocalTP,
+                   {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
+                   ExpertDomainComputeKind::ReplicatedExperts,
+                   CollectiveBackendType::UPI),
+    };
+    plan->domains[0].world_ranks = {0, 1};
+    plan->routed_tiers = {
+        tier("cold", "cpu_cold", 0, true),
+    };
+    plan->placements = {
+        ExpertLayerPlacement{.layer = 0, .routed_expert_tier = {0, 0, 0, 0}},
+    };
+
+    auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime_plan));
+
+    std::vector<ITensorGemm *> gate;
+    std::vector<ITensorGemm *> up;
+    std::vector<ITensorGemm *> down;
+    EXPECT_TRUE(manager.expertGemmRegistry().populateExpertEnginesForParticipant(
+        "cpu_cold", DeviceId::cpu(), 0, 0, 0, static_cast<int>(num_experts), gate, up, down));
+    for (size_t expert = 0; expert < num_experts; ++expert)
+    {
+        EXPECT_NE(gate[expert], nullptr);
+        EXPECT_NE(up[expert], nullptr);
+        EXPECT_NE(down[expert], nullptr);
+    }
+
+    EXPECT_TRUE(manager.expertGemmRegistry().populateExpertEnginesForParticipant(
+        "cpu_cold", DeviceId::cpu(), 1, 1, 0, static_cast<int>(num_experts), gate, up, down));
+    for (size_t expert = 0; expert < num_experts; ++expert)
+    {
+        EXPECT_NE(gate[expert], nullptr);
+        EXPECT_NE(up[expert], nullptr);
+        EXPECT_NE(down[expert], nullptr);
+    }
 }
 
 } // namespace llaminar2::test

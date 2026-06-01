@@ -136,6 +136,46 @@ TEST(Test__ExpertGemmRegistry, ParticipantScopedEntriesOnSameDomainDeviceDoNotOv
     EXPECT_EQ(reg.size(), 3u);
 }
 
+TEST(Test__ExpertGemmRegistry, PopulateExpertEnginesForParticipantUsesOnlyThatParticipant)
+{
+    ExpertGemmRegistry reg;
+    std::vector<std::shared_ptr<MockGemm>> keepalive;
+    const DeviceId device = DeviceId::cpu();
+
+    for (int expert : {0, 2})
+    {
+        keepalive.push_back(std::make_shared<MockGemm>(100 + expert));
+        reg.registerEngineForParticipant("cpu_cold", device, 0, 0, 1, expert, Role::GATE,
+                                         keepalive.back().get(), keepalive.back());
+        keepalive.push_back(std::make_shared<MockGemm>(200 + expert));
+        reg.registerEngineForParticipant("cpu_cold", device, 0, 0, 1, expert, Role::UP,
+                                         keepalive.back().get(), keepalive.back());
+        keepalive.push_back(std::make_shared<MockGemm>(300 + expert));
+        reg.registerEngineForParticipant("cpu_cold", device, 0, 0, 1, expert, Role::DOWN,
+                                         keepalive.back().get(), keepalive.back());
+    }
+
+    auto rank1_gate = std::make_shared<MockGemm>(999);
+    reg.registerEngineForParticipant("cpu_cold", device, 1, 1, 1, 0, Role::GATE,
+                                     rank1_gate.get(), rank1_gate);
+
+    std::vector<ITensorGemm *> gate, up, down;
+    EXPECT_FALSE(reg.populateExpertEnginesForParticipant(
+        "cpu_cold", device, 0, 0, 1, 3, gate, up, down));
+    ASSERT_EQ(gate.size(), 3u);
+    EXPECT_EQ(gate[0], keepalive[0].get());
+    EXPECT_EQ(up[0], keepalive[1].get());
+    EXPECT_EQ(down[0], keepalive[2].get());
+    EXPECT_EQ(gate[1], nullptr);
+    EXPECT_EQ(gate[2], keepalive[3].get());
+
+    EXPECT_FALSE(reg.populateExpertEnginesForParticipant(
+        "cpu_cold", device, 1, 1, 1, 3, gate, up, down));
+    EXPECT_EQ(gate[0], rank1_gate.get());
+    EXPECT_EQ(up[0], nullptr);
+    EXPECT_EQ(gate[2], nullptr);
+}
+
 TEST(Test__ExpertGemmRegistry, MultipleLayers)
 {
     ExpertGemmRegistry reg;

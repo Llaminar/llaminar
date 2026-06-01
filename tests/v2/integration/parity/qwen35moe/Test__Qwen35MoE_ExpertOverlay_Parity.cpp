@@ -76,7 +76,7 @@ namespace
         domain.backend = CollectiveBackendType::RCCL;
         domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
         return domain;
     }
 
@@ -102,7 +102,7 @@ namespace
         domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
         domain.world_ranks = {0, 1};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
         return domain;
     }
 
@@ -566,8 +566,6 @@ protected:
 
     void runOverlayPrefillParityBody()
     {
-        GTEST_SKIP() << "Phase 10A graph-native overlay dispatch backend is not wired into real parity yet";
-
         const bool setup_ok = setupPipeline();
         ASSERT_TRUE(synchronizeRanksOk(setup_ok)) << "Pipeline setup failed";
 
@@ -598,8 +596,6 @@ protected:
 
     void runOverlayDecodeParityBody()
     {
-        GTEST_SKIP() << "Phase 10A graph-native overlay dispatch backend is not wired into real parity yet";
-
         const bool setup_ok = setupPipeline();
         ASSERT_TRUE(synchronizeRanksOk(setup_ok)) << "Pipeline setup failed";
 

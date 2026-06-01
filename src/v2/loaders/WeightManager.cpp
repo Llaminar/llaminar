@@ -10,6 +10,7 @@
 #include "../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "../execution/moe/MoEExpertWeightService.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
 #include "../utils/DebugEnv.h"
@@ -3665,6 +3666,40 @@ namespace llaminar2
         return std::to_string(bytes / (1024 * 1024)) + " MiB";
     }
 
+    struct MoEOverlayCpuPreparationGroup
+    {
+        std::string domain_name;
+        DeviceId device = DeviceId::cpu();
+        int participant_world_rank = -1;
+        int participant_index = -1;
+        int layer = -1;
+        std::vector<int> experts;
+    };
+
+    static bool sameMoEOverlayCpuPreparationGroup(
+        const MoEOverlayCpuPreparationGroup &group,
+        const MoEExpertOverlayPreparationRequest &request)
+    {
+        const int request_world_rank = request.participant_world_rank_known
+                                           ? request.participant_world_rank
+                                           : -1;
+        return group.domain_name == request.domain_name &&
+               group.device == request.device &&
+               group.participant_world_rank == request_world_rank &&
+               group.participant_index == request.participant_index &&
+               group.layer == request.layer;
+    }
+
+    static std::shared_ptr<ITensorGemm> ownerForExpertEngine(
+        const std::vector<std::shared_ptr<ITensorGemm>> &owners,
+        ITensorGemm *engine)
+    {
+        auto it = std::find_if(owners.begin(), owners.end(),
+                               [&](const auto &owner)
+                               { return owner.get() == engine; });
+        return it == owners.end() ? nullptr : *it;
+    }
+
     bool WeightManager::prepareMoEExpertOverlayWeights(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
         const FrozenModelWeightSet *frozen_weights,
@@ -3708,29 +3743,223 @@ namespace llaminar2
             }
         }
 
-        if (preparation_plan.empty() || !preparation_plan.hasAcceleratorRequests())
-            return true;
-
         bool ok = true;
-        for (const auto &device : preparation_plan.acceleratorDevices())
-        {
-            auto layer_role_filter = [&preparation_plan, device](const std::string &name) -> bool
-            {
-                int layer_idx = -1;
-                ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
-                if (!parseMoEExpertParentName(name, layer_idx, role))
-                    return false;
-                return preparation_plan.hasAnyRequestForDeviceLayerRole(device, layer_idx, role);
-            };
 
-            LOG_DEBUG("[WeightManager] Preparing MoE overlay experts for " << device.to_string());
-            const bool device_ok = packGemmWeightsViaPipeline(
-                device,
-                layer_role_filter,
-                nullptr,
-                true,
-                &preparation_plan);
-            ok = ok && device_ok;
+        // Accelerator H2D/repack must consume the mmap-backed expert parents
+        // before CPU fallback packing advises those pages DONTNEED.
+        if (!preparation_plan.empty() && preparation_plan.hasAcceleratorRequests())
+        {
+            for (const auto &device : preparation_plan.acceleratorDevices())
+            {
+                auto layer_role_filter = [&preparation_plan, device](const std::string &name) -> bool
+                {
+                    int layer_idx = -1;
+                    ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+                    if (!parseMoEExpertParentName(name, layer_idx, role))
+                        return false;
+                    return preparation_plan.hasAnyRequestForDeviceLayerRole(device, layer_idx, role);
+                };
+
+                LOG_DEBUG("[WeightManager] Preparing MoE overlay experts for " << device.to_string());
+                const bool device_ok = packGemmWeightsViaPipeline(
+                    device,
+                    layer_role_filter,
+                    nullptr,
+                    true,
+                    &preparation_plan);
+                ok = ok && device_ok;
+            }
+        }
+
+        if (preparation_plan.hasCpuRoutedAssignments())
+        {
+            std::vector<MoEOverlayCpuPreparationGroup> groups;
+            for (const auto &request : preparation_plan.requests())
+            {
+                if (!request.device.is_cpu() ||
+                    request.role != ExpertGemmRegistry::WeightRole::GATE)
+                {
+                    continue;
+                }
+
+                auto it = std::find_if(groups.begin(), groups.end(),
+                                       [&](const auto &group)
+                                       { return sameMoEOverlayCpuPreparationGroup(group, request); });
+                if (it == groups.end())
+                {
+                    MoEOverlayCpuPreparationGroup group;
+                    group.domain_name = request.domain_name;
+                    group.device = request.device;
+                    group.participant_world_rank = request.participant_world_rank_known
+                                                       ? request.participant_world_rank
+                                                       : -1;
+                    group.participant_index = request.participant_index;
+                    group.layer = request.layer;
+                    group.experts.push_back(request.expert_id);
+                    groups.push_back(std::move(group));
+                }
+                else if (std::find(it->experts.begin(), it->experts.end(), request.expert_id) == it->experts.end())
+                {
+                    it->experts.push_back(request.expert_id);
+                }
+            }
+
+            for (auto &group : groups)
+            {
+                std::sort(group.experts.begin(), group.experts.end());
+
+                std::shared_ptr<TensorBase> gate;
+                std::shared_ptr<TensorBase> up;
+                std::shared_ptr<TensorBase> down;
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto find_parent = [&](ExpertGemmRegistry::WeightRole role) -> std::shared_ptr<TensorBase>
+                    {
+                        auto it = cache_.find(moeParentNameForRole(group.layer, role));
+                        return it == cache_.end() ? nullptr : it->second;
+                    };
+                    gate = find_parent(ExpertGemmRegistry::WeightRole::GATE);
+                    up = find_parent(ExpertGemmRegistry::WeightRole::UP);
+                    down = find_parent(ExpertGemmRegistry::WeightRole::DOWN);
+                }
+
+                if (!gate || !up || !down)
+                {
+                    LOG_ERROR("[WeightManager] MoE overlay CPU fallback missing expert parents for domain "
+                              << group.domain_name << " layer " << group.layer);
+                    ok = false;
+                    continue;
+                }
+
+                const auto &gate_shape = gate->shape();
+                if (gate_shape.size() != 3 || gate_shape[0] == 0 || gate_shape[1] == 0 || gate_shape[2] == 0)
+                {
+                    LOG_ERROR("[WeightManager] MoE overlay CPU fallback has invalid gate parent shape for layer "
+                              << group.layer);
+                    ok = false;
+                    continue;
+                }
+
+                const int num_experts = static_cast<int>(gate_shape[2]);
+                std::vector<bool> expert_mask(static_cast<size_t>(num_experts), false);
+                bool group_valid = true;
+                for (int expert_id : group.experts)
+                {
+                    if (expert_id < 0 || expert_id >= num_experts)
+                    {
+                        LOG_ERROR("[WeightManager] MoE overlay CPU fallback request for invalid expert "
+                                  << expert_id << " in layer " << group.layer
+                                  << " (num_experts=" << num_experts << ")");
+                        group_valid = false;
+                        break;
+                    }
+                    expert_mask[static_cast<size_t>(expert_id)] = true;
+                }
+                if (!group_valid)
+                {
+                    ok = false;
+                    continue;
+                }
+
+                std::vector<std::shared_ptr<TensorBase>> gate_views;
+                std::vector<std::shared_ptr<TensorBase>> up_views;
+                std::vector<std::shared_ptr<TensorBase>> down_views;
+                std::vector<ITensorGemm *> gate_gemm;
+                std::vector<ITensorGemm *> up_gemm;
+                std::vector<ITensorGemm *> down_gemm;
+                std::vector<std::shared_ptr<ITensorGemm>> owned_kernels;
+                std::shared_ptr<void> gate_lifetime;
+                std::shared_ptr<void> up_lifetime;
+                std::shared_ptr<void> down_lifetime;
+
+                MoEWeightContext ctx{
+                    group.device,
+                    num_experts,
+                    static_cast<int>(gate_shape[1]),
+                    static_cast<int>(gate_shape[0]),
+                    0,
+                    num_experts,
+                    group.layer,
+                    expert_mask,
+                    gate.get(),
+                    up.get(),
+                    down.get(),
+                    gate_views,
+                    up_views,
+                    down_views,
+                    gate_gemm,
+                    up_gemm,
+                    down_gemm,
+                    owned_kernels,
+                    gate_lifetime,
+                    up_lifetime,
+                    down_lifetime};
+                ctx.advise_raw_pages_after_prepare = !preparation_plan.hasAcceleratorRequests();
+
+                if (!MoEExpertWeightService::extractExpertViews(ctx) ||
+                    !MoEExpertWeightService::prepareGemmEngines(ctx))
+                {
+                    LOG_ERROR("[WeightManager] Failed to prepare MoE overlay CPU fallback expert engines for domain "
+                              << group.domain_name << " layer " << group.layer
+                              << " participant=" << group.participant_index);
+                    ok = false;
+                    continue;
+                }
+
+                auto register_role = [&](int expert_id,
+                                         ExpertGemmRegistry::WeightRole role,
+                                         ITensorGemm *engine)
+                {
+                    if (!engine)
+                        return false;
+                    auto owner = ownerForExpertEngine(owned_kernels, engine);
+                    expert_gemm_registry_.registerEngineForParticipant(
+                        group.domain_name,
+                        group.device,
+                        group.participant_world_rank,
+                        group.participant_index,
+                        group.layer,
+                        expert_id,
+                        role,
+                        engine,
+                        owner);
+                    expert_gemm_registry_.registerEngineForDomain(
+                        group.domain_name,
+                        group.device,
+                        group.layer,
+                        expert_id,
+                        role,
+                        engine,
+                        std::move(owner));
+                    return true;
+                };
+
+                for (int expert_id : group.experts)
+                {
+                    const bool registered =
+                        register_role(expert_id, ExpertGemmRegistry::WeightRole::GATE, gate_gemm[static_cast<size_t>(expert_id)]) &&
+                        register_role(expert_id, ExpertGemmRegistry::WeightRole::UP, up_gemm[static_cast<size_t>(expert_id)]) &&
+                        register_role(expert_id, ExpertGemmRegistry::WeightRole::DOWN, down_gemm[static_cast<size_t>(expert_id)]);
+                    if (!registered)
+                    {
+                        LOG_ERROR("[WeightManager] Failed to register MoE overlay CPU fallback expert "
+                                  << expert_id << " for domain " << group.domain_name
+                                  << " layer " << group.layer);
+                        ok = false;
+                    }
+                }
+
+                for (const auto role : {ExpertGemmRegistry::WeightRole::GATE,
+                                        ExpertGemmRegistry::WeightRole::UP,
+                                        ExpertGemmRegistry::WeightRole::DOWN})
+                {
+                    const auto parent_name = moeParentNameForRole(group.layer, role);
+                    markPrepState(parent_name, DeviceId::cpu(), WeightPrepState::PACKED_HOST, true,
+                                  "MoE overlay CPU fallback expert engines packed");
+                    markPrepState(parent_name, DeviceId::cpu(), WeightPrepState::READY, true,
+                                  "MoE overlay CPU fallback expert engines ready");
+                }
+            }
         }
 
         return ok;
@@ -5215,6 +5444,41 @@ namespace llaminar2
         loader_.adviseMmapDontneed();
 
         return released_count;
+    }
+
+    size_t WeightManager::adviseMmapDontneed()
+    {
+        size_t mmap_tensors_unregistered = 0;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            std::unordered_set<TensorBase *> visited;
+
+            auto release_registration = [&](const std::shared_ptr<TensorBase> &tensor)
+            {
+                TensorBase *ptr = tensor.get();
+                if (!ptr || !visited.insert(ptr).second || !ptr->is_mmap_data())
+                    return;
+
+                ptr->releaseMmapHostRegistration();
+                ++mmap_tensors_unregistered;
+            };
+
+            for (const auto &[_, tensor] : cache_)
+                release_registration(tensor);
+            for (const auto &[_, tensor] : per_device_cache_)
+                release_registration(tensor);
+            for (const auto &[_, tensor] : decode_cache_)
+                release_registration(tensor);
+        }
+
+        if (mmap_tensors_unregistered > 0)
+        {
+            LOG_DEBUG("[WeightManager] Released host registrations for "
+                      << mmap_tensors_unregistered
+                      << " mmap-backed tensors before MADV_DONTNEED");
+        }
+
+        return loader_.adviseMmapDontneed();
     }
 
     size_t WeightManager::releaseMoEExpertHostWeightData()

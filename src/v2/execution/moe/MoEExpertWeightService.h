@@ -81,6 +81,10 @@ struct MoEWeightContext {
     std::optional<ExpertSlabRef> gate_slab_ref;
     std::optional<ExpertSlabRef> up_slab_ref;
     std::optional<ExpertSlabRef> down_slab_ref;
+
+    // Initial prep may share mmap-backed parent tensors across accelerator and
+    // CPU fallback tiers. Disable eager page advice until every consumer is done.
+    bool advise_raw_pages_after_prepare = true;
 };
 
 /// Weight lifecycle service for MoE expert GEMM engines.

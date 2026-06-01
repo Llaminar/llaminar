@@ -467,11 +467,13 @@ namespace llaminar2
             return true;
         }
 
-        // ROCm prefill MUST use grouped path — fail hard if conditions not met
-        if (params_.device_id.is_rocm() && params_.seq_len > 1)
+        // ROCm graph capture requires the fixed-topology grouped path. Ordinary
+        // stream execution can still run graph-native overlay subsets through the
+        // device-grouped gather/scatter path below.
+        if (params_.device_id.is_rocm() && params_.seq_len > 1 && isGraphCaptureActive())
         {
-            LOG_ERROR("[MoEExpertComputeStage] ROCm prefill (seq_len=" << params_.seq_len
-                                                                       << ") requires grouped prefill but conditions not met: "
+            LOG_ERROR("[MoEExpertComputeStage] ROCm graph-captured prefill (seq_len=" << params_.seq_len
+                                                                                      << ") requires fixed-topology grouped prefill but conditions not met: "
                                                                        << "moe_grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
                                                                        << ", fullOwnership=" << hasFullLocalExpertOwnership()
                                                                        << ", allEnabled=" << expertMaskAllEnabled()
@@ -555,13 +557,7 @@ namespace llaminar2
 
                 kernel->gatherExpertBatch(
                     params_.input, scratch_batch_.get(), expert_id, d_model);
-                if (scratch_batch_->needsUpload() &&
-                    !scratch_batch_->ensureOnDevice(params_.device_id, gpuStream()))
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] Failed to upload gathered CUDA expert batch for expert "
-                              << expert_id << " layer " << params_.layer_idx);
-                    return false;
-                }
+                markGpuTensorWritten(scratch_batch_.get(), params_.device_id, gpuStream());
 
                 ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
                 ITensorGemm *up_gemm = cached_up_gemm_[expert_id];
@@ -592,21 +588,24 @@ namespace llaminar2
 
                 kernel->scatterExpertResults(
                     params_.output, scratch_out_.get(), expert_id, d_model);
+                markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
             }
 
-            if (params_.output->needsUpload() &&
-                !params_.output->ensureOnDevice(params_.device_id, gpuStream()))
-            {
-                LOG_ERROR("[MoEExpertComputeStage] Failed to upload CUDA routed expert output for layer "
-                          << params_.layer_idx);
-                return false;
-            }
             if (!params_.output_registered_in_arena)
                 markStandaloneGpuOutputWritten(params_.output, params_.device_id, gpuStream());
 
             LOG_TRACE("[MoEExpertComputeStage] GPU prefill: " << seq_len << " tokens, "
                                                               << top_k << " experts per token");
             return true;
+        }
+
+        if (params_.device_id.is_rocm() && params_.seq_len > 1)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] ROCm prefill (seq_len=" << params_.seq_len
+                                                                       << ") requires fixed-topology grouped prefill or device expert grouping; "
+                                                                       << "prepareExpertGroups failed and CPU fallback is not allowed for ROCm overlay execution"
+                                                                       << ", layer=" << params_.layer_idx);
+            return false;
         }
 
         // =====================================================================
@@ -630,6 +629,8 @@ namespace llaminar2
             {
                 int expert_id = static_cast<int>(routing_idx_data[t * top_k + k]);
                 float weight = routing_wt_data[t * top_k + k];
+                if (expert_id < 0 || expert_id >= num_experts || weight == 0.0f)
+                    continue;
                 // With EP or dynamic mask, only accumulate tokens for local experts
                 bool is_local;
                 if (has_prefill_mask)
@@ -707,13 +708,8 @@ namespace llaminar2
             kernel->gatherTokenBatchFromTensors(
                 params_.input, scratch_batch_.get(),
                 token_indices.data(), num_tokens, d_model);
-            if (is_gpu && scratch_batch_->needsUpload() &&
-                !scratch_batch_->ensureOnDevice(params_.device_id, gpuStream()))
-            {
-                LOG_ERROR("[MoEExpertComputeStage] Failed to upload gathered expert batch for expert "
-                          << expert_id << " layer " << params_.layer_idx);
-                return false;
-            }
+            if (is_gpu)
+                markGpuTensorWritten(scratch_batch_.get(), params_.device_id, gpuStream());
 
             // Use cached GEMM engines (device-agnostic via ITensorGemm)
             ITensorGemm *gate_gemm = cached_gate_gemm_[expert_id];
@@ -754,17 +750,12 @@ namespace llaminar2
                 params_.output, scratch_out_.get(),
                 token_indices.data(), token_weights.data(),
                 num_tokens, d_model);
+            if (is_gpu)
+                markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
         }
 
         LOG_TRACE("[MoEExpertComputeStage] Processed " << seq_len << " tokens via GEMM kernels, "
                                                        << top_k << " experts per token");
-        if (is_gpu && params_.output->needsUpload() &&
-            !params_.output->ensureOnDevice(params_.device_id, gpuStream()))
-        {
-            LOG_ERROR("[MoEExpertComputeStage] Failed to upload routed expert output for layer "
-                      << params_.layer_idx);
-            return false;
-        }
         if (is_gpu && !params_.output_registered_in_arena)
             markStandaloneGpuOutputWritten(params_.output, params_.device_id, gpuStream());
         return true;
@@ -940,13 +931,7 @@ namespace llaminar2
 
             if (device_routed_done)
             {
-                if (params_.output->needsUpload() &&
-                    !params_.output->ensureOnDevice(params_.device_id, gpuStream()))
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] Failed to upload device-routed decode output for layer "
-                              << params_.layer_idx);
-                    return false;
-                }
+                markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
                 return true;
             }
 
@@ -1183,14 +1168,8 @@ namespace llaminar2
                     // GPU weighted accumulate: output += weight * scratch_out
                     kernel->weightedAddFromTensors(
                         params_.output, scratch_out_.get(), info.weight, d_model);
+                    markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
                 }
-            }
-            if (params_.output->needsUpload() &&
-                !params_.output->ensureOnDevice(params_.device_id, gpuStream()))
-            {
-                LOG_ERROR("[MoEExpertComputeStage] Failed to upload CUDA decode routed expert output for layer "
-                          << params_.layer_idx);
-                return false;
             }
         }
         else

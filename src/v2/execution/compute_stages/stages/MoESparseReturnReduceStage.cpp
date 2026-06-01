@@ -243,6 +243,19 @@ namespace llaminar2
         return reqs;
     }
 
+    StageBufferContract MoESparseReturnReduceStage::bufferContract() const
+    {
+        auto contract = StageBufferContract::build();
+        if (!params_.dense_output_buffer_id)
+            return contract;
+
+        if (params_.clear_output_before_scatter)
+            contract.addOutput(*params_.dense_output_buffer_id);
+        else
+            contract.addInOut(*params_.dense_output_buffer_id);
+        return contract;
+    }
+
     StageDumpInfo MoESparseReturnReduceStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;

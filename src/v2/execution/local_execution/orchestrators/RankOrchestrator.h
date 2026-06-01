@@ -870,6 +870,7 @@ namespace llaminar2
         /// Flag indicating if stats need re-aggregation
         mutable bool stats_dirty_ = true;
         bool host_resident_released_ = false; ///< Whether host-resident weight data has been released after first prefill
+        bool mmap_dontneed_advised_ = false;  ///< Whether mmap pages were advised away after first prefill
 
         /// Stage type → sharding mode map from the model's schema factory.
         /// Initialized at construction from SchemaFactoryRegistry::getStageShardingConfig().

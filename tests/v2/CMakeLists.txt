@@ -620,6 +620,24 @@ add_v2_test(V2_Unit_UnifiedPipelineMoECollection
     MPI_PROCS 1
 )
 
+# Test: MoE Expert Overlay Preparation - tier-aware preparation requests and CPU fallback packing
+add_executable(v2_unit_weight_manager_moe_expert_overlay_preparation
+    unit/loaders/Test__WeightManagerMoEExpertOverlayPreparation.cpp
+)
+target_include_directories(v2_unit_weight_manager_moe_expert_overlay_preparation PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+target_link_libraries(v2_unit_weight_manager_moe_expert_overlay_preparation
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_WeightManagerMoEExpertOverlayPreparation
+    COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
+    LABELS "V2;Unit;Loaders;MoE;ExpertParallel"
+    MPI_PROCS 1
+)
+
 # Test: MoE Expert Parallel Plan - same-layer expert overlay value validation
 add_executable(v2_unit_moe_expert_parallel_plan unit/execution/moe/Test__MoEExpertParallelPlan.cpp)
 target_link_libraries(v2_unit_moe_expert_parallel_plan
@@ -5106,7 +5124,7 @@ if(ZLIB_FOUND)
 
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_expert_overlay
         TEST_PREFIX V2_Integration_Parity_Qwen35MoEExpertOverlay
-        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;TensorParallelExperts;ModelLight"
+        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;ReplicatedExperts;ModelLight"
         MPI_PROCS 2
         TIMEOUT 600
     )

@@ -268,6 +268,18 @@ namespace llaminar2
                                                             std::vector<ITensorGemm *> &up_out,
                                                             std::vector<ITensorGemm *> &down_out) const
     {
+        return populateExpertEnginesForParticipant(
+            domain_name, device, -1, -1, layer, num_experts,
+            gate_out, up_out, down_out);
+    }
+
+    bool ExpertGemmRegistry::populateExpertEnginesForParticipant(const std::string &domain_name,
+                                                                 DeviceId device, int participant_world_rank, int participant_index,
+                                                                 int layer, int num_experts,
+                                                                 std::vector<ITensorGemm *> &gate_out,
+                                                                 std::vector<ITensorGemm *> &up_out,
+                                                                 std::vector<ITensorGemm *> &down_out) const
+    {
         if (num_experts < 0)
         {
             gate_out.clear();
@@ -285,15 +297,24 @@ namespace llaminar2
 
         for (int e = 0; e < num_experts; ++e)
         {
-            auto it_gate = engines_.find(Key{domain_name, device, layer, e, WeightRole::GATE});
+            Key gate_key{domain_name, device, layer, e, WeightRole::GATE};
+            gate_key.participant_world_rank = participant_world_rank;
+            gate_key.participant_index = participant_index;
+            auto it_gate = engines_.find(gate_key);
             if (it_gate != engines_.end())
                 gate_out[e] = it_gate->second.engine;
 
-            auto it_up = engines_.find(Key{domain_name, device, layer, e, WeightRole::UP});
+            Key up_key{domain_name, device, layer, e, WeightRole::UP};
+            up_key.participant_world_rank = participant_world_rank;
+            up_key.participant_index = participant_index;
+            auto it_up = engines_.find(up_key);
             if (it_up != engines_.end())
                 up_out[e] = it_up->second.engine;
 
-            auto it_down = engines_.find(Key{domain_name, device, layer, e, WeightRole::DOWN});
+            Key down_key{domain_name, device, layer, e, WeightRole::DOWN};
+            down_key.participant_world_rank = participant_world_rank;
+            down_key.participant_index = participant_index;
+            auto it_down = engines_.find(down_key);
             if (it_down != engines_.end())
                 down_out[e] = it_down->second.engine;
 

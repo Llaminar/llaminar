@@ -2296,10 +2296,16 @@ namespace llaminar2
         /**
          * @brief Called once after the first graph build + workspace allocation.
          *
-         * Releases mmap physical pages via madvise(MADV_DONTNEED) before
-         * execution allocates activation buffers, reducing peak RSS.
+         * Graph-ready is too early for mmap page reclaim on GPU/TP paths because
+         * participant-local graph materialization can still be resolving captured
+         * transfers. mmap reclaim is performed after first successful prefill.
          */
         void onFirstGraphReady() override;
+
+        /**
+         * @brief Advise mmap pages away after first successful prefill.
+         */
+        void adviseMmapDontneedAfterFirstPrefill();
 
         // =========================================================================
         // Phase-Aware Weight Access Members (Gap 3 - CPU Decode Participation)
@@ -2405,6 +2411,7 @@ namespace llaminar2
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;
         bool release_host_resident_after_forward_ = true;
+        bool mmap_dontneed_advised_ = false;
 
         /// Whether raw MoE expert tensors were released after eager graph-build packing.
         bool raw_expert_weights_released_after_graph_build_ = false;

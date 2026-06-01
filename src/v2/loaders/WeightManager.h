@@ -151,9 +151,9 @@ namespace llaminar2
             DeviceId device,
             bool include_expert_jobs = true);
 
-        /// Prepare only the routed experts assigned to accelerator overlay tiers.
-        /// CPU-assigned routed experts remain host-owned and are intentionally not
-        /// inserted into ExpertGemmRegistry.
+        /// Prepare routed experts assigned to overlay tiers. Accelerator tiers use
+        /// the GPU load pipeline; CPU fallback tiers are eagerly packed into CPU
+        /// expert GEMM engines and inserted into ExpertGemmRegistry.
         bool prepareMoEExpertOverlayWeights(
             const MoEExpertOverlayRuntimePlan &runtime_plan,
             const FrozenModelWeightSet *frozen_weights = nullptr,
@@ -307,7 +307,7 @@ namespace llaminar2
          *
          * @return Total bytes advised
          */
-        size_t adviseMmapDontneed() { return loader_.adviseMmapDontneed(); }
+        size_t adviseMmapDontneed() override;
 
         /**
          * @brief Get statistics about preloaded weights

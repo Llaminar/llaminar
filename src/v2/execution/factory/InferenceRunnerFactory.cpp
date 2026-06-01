@@ -318,6 +318,29 @@ namespace llaminar2
             return true;
         }
 
+        std::shared_ptr<MoEExpertOverlayRuntimePlan> ensureMoEExpertOverlayRuntimePlanForGraph(
+            GraphConfig &graph_config,
+            const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+            const std::string &log_prefix)
+        {
+            auto plan = graph_config.moe.expert_parallel_plan;
+            if (!plan || !plan->isTieredOverlay())
+                return nullptr;
+
+            if (graph_config.moe.expert_overlay_runtime_plan)
+                return graph_config.moe.expert_overlay_runtime_plan;
+
+            MoEExpertOverlayRuntimeResolverOptions options;
+            options.current_world_rank = overlayRankFor(
+                graph_config.moe.overlay_mpi_ctx,
+                runner_mpi_ctx);
+            auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan, options);
+            graph_config.moe.expert_overlay_runtime_plan = runtime_plan;
+            LOG_DEBUG(log_prefix << " resolved MoE overlay runtime plan: "
+                                 << runtime_plan->diagnostics());
+            return runtime_plan;
+        }
+
         // =====================================================================
         // Host RAM preflight check
         // =====================================================================
@@ -500,6 +523,34 @@ namespace llaminar2
             graph_config,
             owned_domain_tp_contexts,
             log_prefix);
+    }
+
+    DeviceId resolveMoEExpertOverlayExecutionDeviceForGraph(
+        GraphConfig &graph_config,
+        const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+        DeviceId requested_device,
+        const std::string &log_prefix)
+    {
+        auto runtime_plan = ensureMoEExpertOverlayRuntimePlanForGraph(
+            graph_config,
+            runner_mpi_ctx,
+            log_prefix);
+        if (!runtime_plan)
+            return requested_device;
+
+        const DeviceId continuation_device = runtime_plan->continuationDevice();
+        if (!continuation_device.is_valid())
+            return requested_device;
+
+        if (continuation_device != requested_device)
+        {
+            LOG_DEBUG(log_prefix << " using MoE overlay continuation device "
+                                 << continuation_device.to_string()
+                                 << " instead of requested root device "
+                                 << requested_device.to_string());
+        }
+
+        return continuation_device;
     }
 
     std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
@@ -1440,6 +1491,22 @@ namespace llaminar2
         {
             return nullptr;
         }
+
+        try
+        {
+            device = resolveMoEExpertOverlayExecutionDeviceForGraph(
+                graph_config,
+                mpi_ctx,
+                device,
+                "[InferenceRunner]");
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[InferenceRunner] Failed to resolve MoE overlay execution device: "
+                      << e.what());
+            return nullptr;
+        }
+
         // Apply sharding config + model dimensions in a single call
         // (must be after populateFromModelContext which sets n_heads/n_kv_heads/head_dim)
         if (weight_mgr)
@@ -2965,6 +3032,22 @@ namespace llaminar2
         {
             return nullptr;
         }
+
+        try
+        {
+            device = resolveMoEExpertOverlayExecutionDeviceForGraph(
+                graph_config,
+                overlay_runner_mpi_ctx,
+                device,
+                "[InferenceRunner] Testable");
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[InferenceRunner] Testable failed to resolve MoE overlay execution device: "
+                      << e.what());
+            return nullptr;
+        }
+
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.default_device = device;

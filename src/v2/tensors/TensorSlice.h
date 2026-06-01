@@ -287,6 +287,12 @@ namespace llaminar2
         bool is_view() const override { return true; } // TensorSlice is always a view/wrapper
         bool is_mmap_data() const override { return inner() ? inner()->is_mmap_data() : false; }
 
+        void releaseMmapHostRegistration() override
+        {
+            if (auto wrapped = inner())
+                wrapped->releaseMmapHostRegistration();
+        }
+
         // =======================================================================
         // GPU Coherence Methods (delegate to inner)
         // =======================================================================

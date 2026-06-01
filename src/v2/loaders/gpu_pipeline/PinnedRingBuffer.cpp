@@ -125,6 +125,11 @@ void PinnedRingBuffer::release()
     {
         if (backend_)
         {
+            if (!backend_->synchronize(device_id_))
+            {
+                LOG_WARN("PinnedRingBuffer: device synchronize failed before releasing pinned upload buffer on device "
+                         << device_id_);
+            }
             backend_->freePinned(pinned_base_, device_id_);
         }
         else

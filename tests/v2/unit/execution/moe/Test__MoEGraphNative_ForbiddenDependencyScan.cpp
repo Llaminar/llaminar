@@ -14,6 +14,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2::test
@@ -296,6 +297,229 @@ namespace llaminar2::test
                 out << failure << '\n';
             return out.str();
         }();
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ROCmTensorAwareMoEWrappersMarkDeviceOutputs)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
+        ASSERT_TRUE(fs::exists(path)) << path;
+        const std::string contents = readFile(path);
+        ASSERT_FALSE(contents.empty()) << path;
+
+        auto functionBody = [&](const std::string &start_marker,
+                                const std::string &next_marker) -> std::string
+        {
+            const size_t start = contents.find(start_marker);
+            EXPECT_NE(start, std::string::npos) << start_marker;
+            if (start == std::string::npos)
+                return {};
+            const size_t end = contents.find(next_marker, start + start_marker.size());
+            EXPECT_NE(end, std::string::npos) << next_marker;
+            if (end == std::string::npos)
+                return contents.substr(start);
+            return contents.substr(start, end - start);
+        };
+
+        const std::string scatter_body = functionBody(
+            "void ROCmMoEKernel::scatterAddWeightedFromTensors",
+            "void ROCmMoEKernel::sharedExpertGateFromTensors");
+        EXPECT_NE(scatter_body.find("output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE"),
+                  std::string::npos);
+
+        const std::string weighted_add_body = functionBody(
+            "void ROCmMoEKernel::weightedAddFromTensors",
+            "int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable");
+        EXPECT_NE(weighted_add_body.find("output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE"),
+                  std::string::npos);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ROCmMoEHelpersSelectTheirOwningDevice)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
+        ASSERT_TRUE(fs::exists(path)) << path;
+        const std::string contents = readFile(path);
+        ASSERT_FALSE(contents.empty()) << path;
+
+        auto functionBody = [&](const std::string &start_marker,
+                                const std::string &next_marker) -> std::string
+        {
+            const size_t start = contents.find(start_marker);
+            EXPECT_NE(start, std::string::npos) << start_marker;
+            if (start == std::string::npos)
+                return {};
+            const size_t end = contents.find(next_marker, start + start_marker.size());
+            EXPECT_NE(end, std::string::npos) << next_marker;
+            if (end == std::string::npos)
+                return contents.substr(start);
+            return contents.substr(start, end - start);
+        };
+
+        const std::vector<std::pair<std::string, std::string>> guarded_helpers = {
+            {"void ROCmMoEKernel::gatherTokenBatch", "void ROCmMoEKernel::scatterAddWeighted"},
+            {"void ROCmMoEKernel::scatterAddWeighted", "void ROCmMoEKernel::sharedExpertGate"},
+            {"void ROCmMoEKernel::sharedExpertGate", "void ROCmMoEKernel::swiGLU"},
+            {"void ROCmMoEKernel::swiGLU", "void ROCmMoEKernel::weightedAdd"},
+            {"void ROCmMoEKernel::weightedAdd", "void ROCmMoEKernel::allocateHistogramBuffers"},
+            {"bool ROCmMoEKernel::groupTokensByExpertDevice", "void ROCmMoEKernel::ensureStagingCapacity"},
+            {"void ROCmMoEKernel::zeroBuffer", "void ROCmMoEKernel::gatherTokenBatchFromTensors"},
+            {"void ROCmMoEKernel::gatherTokenBatchFromTensors", "void ROCmMoEKernel::scatterAddWeightedFromTensors"},
+            {"void ROCmMoEKernel::scatterAddWeightedFromTensors", "void ROCmMoEKernel::sharedExpertGateFromTensors"},
+            {"void ROCmMoEKernel::sharedExpertGateFromTensors", "void ROCmMoEKernel::swiGLUFromTensors"},
+            {"void ROCmMoEKernel::swiGLUFromTensors", "void ROCmMoEKernel::weightedAddFromTensors"},
+            {"void ROCmMoEKernel::weightedAddFromTensors", "int ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable"},
+            {"bool ROCmMoEKernel::groupPrefillRoutes", "bool ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime"},
+            {"bool ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime",
+             "bool ROCmMoEKernel::scatterPrefillExpertResultsFromRuntime"},
+            {"bool ROCmMoEKernel::scatterPrefillExpertResultsFromRuntime",
+             "bool ROCmMoEKernel::prepareExpertGroups"},
+            {"bool ROCmMoEKernel::prepareExpertGroups", "int ROCmMoEKernel::getExpertTokenCount"},
+            {"void ROCmMoEKernel::gatherExpertBatch", "void ROCmMoEKernel::scatterExpertResults"},
+            {"void ROCmMoEKernel::scatterExpertResults", "bool ROCmMoEKernel::prepareExpertGroupsAsync"},
+            {"bool ROCmMoEKernel::prepareExpertGroupsAsync",
+             "bool ROCmMoEKernel::ensureGroupedPrefillScratchCapacity"},
+            {"bool ROCmMoEKernel::ensureGroupedPrefillScratchCapacity",
+             "bool ROCmMoEKernel::executeGroupedPrefillPipeline"},
+            {"bool ROCmMoEKernel::executeGroupedPrefillPipeline", "} // namespace llaminar2"},
+        };
+
+        std::vector<std::string> failures;
+        for (const auto &[start_marker, next_marker] : guarded_helpers)
+        {
+            const std::string body = functionBody(start_marker, next_marker);
+            if (body.find("setMoEDevice(device_ordinal_") == std::string::npos)
+                failures.push_back(start_marker + " does not select device_ordinal_");
+        }
+
+        EXPECT_TRUE(failures.empty()) << [&]
+        {
+            std::ostringstream out;
+            for (const auto &failure : failures)
+                out << failure << '\n';
+            return out.str();
+        }();
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, LocalExpertCompactRoutingUsesInvalidPadding)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path local_path = root / "src/v2/execution/compute_stages/stages/MoELocalExpertStage.cpp";
+        const fs::path compute_path = root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        ASSERT_TRUE(fs::exists(local_path)) << local_path;
+        ASSERT_TRUE(fs::exists(compute_path)) << compute_path;
+        const std::string local_contents = readFile(local_path);
+        const std::string compute_contents = readFile(compute_path);
+        ASSERT_FALSE(local_contents.empty()) << local_path;
+        ASSERT_FALSE(compute_contents.empty()) << compute_path;
+
+        EXPECT_NE(local_contents.find("std::fill_n(routing_indices, input.live_row_count * static_cast<size_t>(params_.top_k), -1.0f)"),
+                  std::string::npos);
+        EXPECT_EQ(local_contents.find("compact_output_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE"),
+                  std::string::npos);
+        EXPECT_NE(compute_contents.find("expert_id < 0 || expert_id >= num_experts || weight == 0.0f"),
+                  std::string::npos);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, SparseReturnReduceDeclaresCombinedOutputCoherence)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path header_path = root / "src/v2/execution/compute_stages/stages/MoESparseReturnReduceStage.h";
+        const fs::path impl_path = root / "src/v2/execution/compute_stages/stages/MoESparseReturnReduceStage.cpp";
+        const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        ASSERT_TRUE(fs::exists(header_path)) << header_path;
+        ASSERT_TRUE(fs::exists(impl_path)) << impl_path;
+        ASSERT_TRUE(fs::exists(graph_path)) << graph_path;
+
+        const std::string header_contents = readFile(header_path);
+        const std::string impl_contents = readFile(impl_path);
+        const std::string graph_contents = readFile(graph_path);
+        ASSERT_FALSE(header_contents.empty()) << header_path;
+        ASSERT_FALSE(impl_contents.empty()) << impl_path;
+        ASSERT_FALSE(graph_contents.empty()) << graph_path;
+
+        EXPECT_NE(header_contents.find("std::optional<BufferId> dense_output_buffer_id;"),
+                  std::string::npos);
+        EXPECT_NE(header_contents.find("StageBufferContract bufferContract() const override;"),
+                  std::string::npos);
+        EXPECT_NE(impl_contents.find("StageBufferContract MoESparseReturnReduceStage::bufferContract() const"),
+                  std::string::npos);
+        EXPECT_NE(impl_contents.find("contract.addOutput(*params_.dense_output_buffer_id);"),
+                  std::string::npos);
+        EXPECT_NE(impl_contents.find("contract.addInOut(*params_.dense_output_buffer_id);"),
+                  std::string::npos);
+        EXPECT_NE(graph_contents.find("return_params.dense_output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;"),
+                  std::string::npos);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, WeightManagerUnpinsMmapWeightsBeforeMadvise)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path manager_path = root / "src/v2/loaders/WeightManager.cpp";
+        const fs::path tensor_path = root / "src/v2/tensors/TensorClasses.h";
+        const fs::path slice_path = root / "src/v2/tensors/TensorSlice.h";
+        ASSERT_TRUE(fs::exists(manager_path)) << manager_path;
+        ASSERT_TRUE(fs::exists(tensor_path)) << tensor_path;
+        ASSERT_TRUE(fs::exists(slice_path)) << slice_path;
+
+        const std::string manager_contents = readFile(manager_path);
+        const std::string tensor_contents = readFile(tensor_path);
+        const std::string slice_contents = readFile(slice_path);
+        ASSERT_FALSE(manager_contents.empty()) << manager_path;
+        ASSERT_FALSE(tensor_contents.empty()) << tensor_path;
+        ASSERT_FALSE(slice_contents.empty()) << slice_path;
+
+        const size_t function_start = manager_contents.find("size_t WeightManager::adviseMmapDontneed()");
+        ASSERT_NE(function_start, std::string::npos);
+        const size_t release_call = manager_contents.find("releaseMmapHostRegistration()", function_start);
+        const size_t madvise_call = manager_contents.find("return loader_.adviseMmapDontneed();", function_start);
+        ASSERT_NE(release_call, std::string::npos);
+        ASSERT_NE(madvise_call, std::string::npos);
+        EXPECT_LT(release_call, madvise_call);
+
+        EXPECT_NE(tensor_contents.find("virtual void releaseMmapHostRegistration()"), std::string::npos);
+        EXPECT_NE(tensor_contents.find("if (is_mmap_data())\n                unpinHostMemory();"), std::string::npos);
+        EXPECT_NE(slice_contents.find("void releaseMmapHostRegistration() override"), std::string::npos);
+        EXPECT_NE(slice_contents.find("wrapped->releaseMmapHostRegistration();"), std::string::npos);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MmapDontneedIsDeferredUntilAfterFirstPrefill)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path dgo_path = root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        const fs::path rank_path = root / "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp";
+        ASSERT_TRUE(fs::exists(dgo_path)) << dgo_path;
+        ASSERT_TRUE(fs::exists(rank_path)) << rank_path;
+
+        const std::string dgo_contents = readFile(dgo_path);
+        const std::string rank_contents = readFile(rank_path);
+        ASSERT_FALSE(dgo_contents.empty()) << dgo_path;
+        ASSERT_FALSE(rank_contents.empty()) << rank_path;
+
+        const size_t graph_ready_start = dgo_contents.find("void DeviceGraphOrchestrator::onFirstGraphReady()");
+        ASSERT_NE(graph_ready_start, std::string::npos);
+        const size_t graph_ready_end = dgo_contents.find("void DeviceGraphOrchestrator::adviseMmapDontneedAfterFirstPrefill()",
+                                                         graph_ready_start);
+        ASSERT_NE(graph_ready_end, std::string::npos);
+        const std::string graph_ready_body = dgo_contents.substr(graph_ready_start, graph_ready_end - graph_ready_start);
+        EXPECT_EQ(graph_ready_body.find("adviseMmapDontneed()"), std::string::npos);
+
+        const size_t dgo_prefill_start = dgo_contents.find("void DeviceGraphOrchestrator::adviseMmapDontneedAfterFirstPrefill()");
+        ASSERT_NE(dgo_prefill_start, std::string::npos);
+        const size_t dgo_prefill_sync = dgo_contents.find("synchronizeGpuBackendsBeforeMmapRelease()", dgo_prefill_start);
+        const size_t dgo_prefill_advise = dgo_contents.find("weight_manager_->adviseMmapDontneed()", dgo_prefill_start);
+        ASSERT_NE(dgo_prefill_sync, std::string::npos);
+        ASSERT_NE(dgo_prefill_advise, std::string::npos);
+        EXPECT_LT(dgo_prefill_sync, dgo_prefill_advise);
+
+        const size_t rank_release = rank_contents.find("releaseHostResidentWeightData();");
+        const size_t rank_sync = rank_contents.find("synchronizeGpuBackendsBeforeRankMmapRelease()", rank_release);
+        const size_t rank_advise = rank_contents.find("wm->adviseMmapDontneed()", rank_release);
+        ASSERT_NE(rank_release, std::string::npos);
+        ASSERT_NE(rank_sync, std::string::npos);
+        ASSERT_NE(rank_advise, std::string::npos);
+        EXPECT_LT(rank_release, rank_sync);
+        EXPECT_LT(rank_sync, rank_advise);
     }
 
 } // namespace llaminar2::test

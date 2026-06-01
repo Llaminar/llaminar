@@ -649,6 +649,7 @@ namespace llaminar2
         // by ~500 MB/layer instead of waiting for a bulk release at the end.
         // NOTE: Only safe for mmap-backed tensors. Expert-parallel sliced tensors
         // are heap-allocated copies — MADV_DONTNEED on heap memory corrupts malloc metadata.
+        if (ctx.advise_raw_pages_after_prepare)
         {
             size_t released = 0;
             if (ctx.gate_exps && ctx.gate_exps->is_mmap_data())
@@ -1722,6 +1723,7 @@ namespace llaminar2
                                             << ctx.device_id.to_string() << ")");
 
         // Release mmap pages for raw expert weights (now repacked on GPU).
+        if (ctx.advise_raw_pages_after_prepare)
         {
             size_t released = 0;
             if (ctx.gate_exps && ctx.gate_exps->is_mmap_data())
