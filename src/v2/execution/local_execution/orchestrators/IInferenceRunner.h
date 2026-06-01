@@ -76,6 +76,21 @@ namespace llaminar2
     };
 
     /**
+     * @brief Optional high-level decode-step result for orchestration-aware callers.
+     *
+     * Low-level runners expose forward() plus explicit sampling. Runners wrapped
+     * around IOrchestrationRunner can expose decodeStep() so benchmark mode
+     * measures MTP, rollback, and decode-boundary maintenance through the same
+     * path as normal generation.
+     */
+    struct DecodeStepOutput
+    {
+        std::vector<int32_t> tokens;
+        bool is_complete = false;
+        std::string error;
+    };
+
+    /**
      * @brief Execution path type
      */
     enum class ExecutionPath
@@ -304,6 +319,34 @@ namespace llaminar2
             (void)params;
             return -1;
         }
+
+        /**
+         * @brief Whether this runner can execute a full high-level decode step.
+         */
+        virtual bool supportsDecodeStep() const { return false; }
+
+        /**
+         * @brief Set sampling params consumed by decodeStepForBenchmark().
+         */
+        virtual void setDecodeSamplingParams(const SamplingParams & /*params*/) {}
+
+        /**
+         * @brief Limit how many tokens the next decode step may accept.
+         */
+        virtual void setDecodeStepTokenBudget(int /*max_tokens*/) {}
+
+        /**
+         * @brief Execute one high-level decode step.
+         */
+        virtual DecodeStepOutput decodeStepForBenchmark()
+        {
+            return DecodeStepOutput{{}, false, "decodeStepForBenchmark unsupported"};
+        }
+
+        /**
+         * @brief Apply decode-boundary maintenance after a successful step.
+         */
+        virtual bool maybeApplyDecodeBoundaryMaintenance() { return true; }
 
         /**
          * @brief Apply sparse logit penalties on device (GPU-side)

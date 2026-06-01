@@ -4080,7 +4080,9 @@ namespace llaminar2
             return result;
         }
 
-        const int complete_blocks = static_cast<int>(tokens.size()) / prefix_layout_.block_size;
+        const int complete_blocks =
+            (static_cast<int>(tokens.size()) + prefix_layout_.block_size - 1) /
+            prefix_layout_.block_size;
         uint64_t parent_hash = 0;
         for (int block = 0; block < complete_blocks; ++block)
         {
@@ -4096,6 +4098,21 @@ namespace llaminar2
             result.has_terminal_hidden = handle->has_terminal_hidden;
             result.has_terminal_logits = handle->has_terminal_logits;
             parent_hash = key.stableHash();
+        }
+
+        while (!result.blocks.empty() &&
+               prefix_layout_.includes_hybrid_state &&
+               !result.blocks.back().has_hybrid_state)
+        {
+            result.blocks.pop_back();
+            result.cached_tokens = result.blocks.empty()
+                                       ? 0
+                                       : result.blocks.back().key.token_start +
+                                             result.blocks.back().key.token_count;
+            result.has_terminal_hidden =
+                !result.blocks.empty() && result.blocks.back().has_terminal_hidden;
+            result.has_terminal_logits =
+                !result.blocks.empty() && result.blocks.back().has_terminal_logits;
         }
 
         prefix_cache_->recordRequestLookup(
@@ -4327,12 +4344,9 @@ namespace llaminar2
             return false;
         }
 
-        const int complete_blocks = prompt_token_count / prefix_layout_.block_size;
-        if (prefix_layout_.includes_hybrid_state && complete_blocks != 1)
-        {
-            LOG_DEBUG("[DeviceGraphOrchestrator] Hybrid prefix harvest currently requires one complete block");
-            return false;
-        }
+        const int complete_blocks =
+            (prompt_token_count + prefix_layout_.block_size - 1) /
+            prefix_layout_.block_size;
 
         uint64_t parent_hash = 0;
         for (int block = 0; block < complete_blocks; ++block)
@@ -4344,19 +4358,29 @@ namespace llaminar2
                 continue;
             }
 
-            if (!prefix_cache_->reserveRam(prefix_layout_.totalBytes()))
+            const bool terminal_block =
+                (key.token_start + key.token_count) == prompt_token_count;
+            PrefixPayloadLayout block_layout = prefix_layout_;
+            if (!terminal_block)
+            {
+                block_layout.includes_hybrid_state = false;
+                block_layout.includes_terminal_hidden = false;
+                block_layout.includes_terminal_logits = false;
+            }
+
+            if (!prefix_cache_->reserveRam(block_layout.totalBytes()))
             {
                 LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: RAM reserve rejected block_bytes="
-                          << prefix_layout_.totalBytes());
+                          << block_layout.totalBytes());
                 return false;
             }
 
-            PrefixBlockHandle handle = prefix_ram_backend_->allocate(key, prefix_layout_);
+            PrefixBlockHandle handle = prefix_ram_backend_->allocate(key, block_layout);
             if (!handle.valid())
             {
                 LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: RAM allocate rejected key="
                           << key.toHex()
-                          << " block_bytes=" << prefix_layout_.totalBytes());
+                          << " block_bytes=" << block_layout.totalBytes());
                 return false;
             }
 
@@ -4411,8 +4435,6 @@ namespace llaminar2
                 }
             }
 
-            const bool terminal_block =
-                (key.token_start + key.token_count) == prompt_token_count;
             if (ok && terminal_block && prefix_layout_.includes_hybrid_state)
             {
                 ok = exportHybridPrefixPayload(

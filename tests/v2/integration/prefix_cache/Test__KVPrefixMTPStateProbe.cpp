@@ -1407,7 +1407,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
     auto factory = createOrchestrationRunnerFactory();
     SamplingParams greedy;
     greedy.temperature = 0.0f;
-    const std::string prompt_text = "Paris is";
+    const std::string prompt_text = "The quick brown fox jumps over the lazy dog";
 
     auto make_config = [&](bool enable_mtp)
     {
@@ -1498,9 +1498,9 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
         config.prefix_cache.storage_mode = enable_prefix_cache
                                                ? PrefixCacheStorageMode::Ram
                                                : PrefixCacheStorageMode::Disabled;
-        config.prefix_cache.block_size = 2;
+        config.prefix_cache.block_size = 4;
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
-        config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
+        config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
         config.mtp.draft_tokens = 1;
         return config;
@@ -1559,6 +1559,8 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
     EXPECT_GE(after_second.prefix_cache_hits, 1u);
     EXPECT_GE(after_second.prefix_cache_matched_tokens, static_cast<uint64_t>(cached_prompt.size()));
     EXPECT_TRUE(after_second.prefix_request.hit);
+    EXPECT_EQ(after_second.prefix_request.matched_tokens,
+              static_cast<int>(cached_prompt.size()));
     EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
     EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
     EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);

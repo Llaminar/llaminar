@@ -24,10 +24,31 @@ namespace llaminar2
             return result;
         }
 
-        const int wanted_blocks = result.cached_tokens / block_size;
-        const int copy_blocks = std::min<int>(wanted_blocks, blocks.size());
-        result.blocks.insert(result.blocks.end(), blocks.begin(), blocks.begin() + copy_blocks);
-        result.cached_tokens = copy_blocks * block_size;
+        for (const auto &block : blocks)
+        {
+            const int block_end = block.key.token_start + block.key.token_count;
+            if (block.key.token_count <= 0 || block_end > result.cached_tokens)
+            {
+                break;
+            }
+            result.blocks.push_back(block);
+        }
+
+        result.cached_tokens = result.blocks.empty()
+                                   ? 0
+                                   : result.blocks.back().key.token_start +
+                                         result.blocks.back().key.token_count;
+
+        while (!result.blocks.empty() &&
+               result.blocks.back().layout.hybrid_state_bytes > 0 &&
+               !result.blocks.back().has_hybrid_state)
+        {
+            result.blocks.pop_back();
+            result.cached_tokens = result.blocks.empty()
+                                       ? 0
+                                       : result.blocks.back().key.token_start +
+                                             result.blocks.back().key.token_count;
+        }
 
         if (!result.blocks.empty() && result.cached_tokens == cached_tokens)
         {

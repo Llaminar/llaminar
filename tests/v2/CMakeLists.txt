@@ -5736,6 +5736,15 @@ add_v2_test(V2_Unit_PrefixCacheStateProbe
     MPI_PROCS 1
 )
 
+# Test: Prefix lookup snapshot clamping
+add_executable(v2_test_prefix_state_snapshot unit/prefix_cache/Test__PrefixStateSnapshot.cpp)
+target_link_libraries(v2_test_prefix_state_snapshot llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_PrefixStateSnapshot
+    COMMAND $<TARGET_FILE:v2_test_prefix_state_snapshot>
+    LABELS "V2;Unit;PrefixCache;StateSnapshot;Hybrid"
+    MPI_PROCS 1
+)
+
 # Test: Prefix cache participant coordination
 add_executable(v2_test_prefix_cache_coordinator unit/prefix_cache/Test__PrefixCacheCoordinator.cpp)
 target_link_libraries(v2_test_prefix_cache_coordinator llaminar2_core GTest::gtest GTest::gtest_main)

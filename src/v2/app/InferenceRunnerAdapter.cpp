@@ -5,6 +5,8 @@
 
 #include "app/InferenceRunnerAdapter.h"
 
+#include <utility>
+
 namespace llaminar2
 {
 
@@ -69,6 +71,39 @@ namespace llaminar2
     int InferenceRunnerAdapter::sampleOnDevice(const SamplingParams &params)
     {
         return orch_runner_->sampleOnDevice(params);
+    }
+
+    bool InferenceRunnerAdapter::supportsDecodeStep() const
+    {
+        return orch_runner_ != nullptr;
+    }
+
+    void InferenceRunnerAdapter::setDecodeSamplingParams(const SamplingParams &params)
+    {
+        if (orch_runner_)
+            orch_runner_->setSamplingParams(params);
+    }
+
+    void InferenceRunnerAdapter::setDecodeStepTokenBudget(int max_tokens)
+    {
+        if (orch_runner_)
+            orch_runner_->setDecodeStepTokenBudget(max_tokens);
+    }
+
+    DecodeStepOutput InferenceRunnerAdapter::decodeStepForBenchmark()
+    {
+        if (!orch_runner_)
+        {
+            return DecodeStepOutput{{}, false, "orchestration runner unavailable"};
+        }
+
+        GenerationResult result = orch_runner_->decodeStep();
+        return DecodeStepOutput{std::move(result.tokens), result.is_complete, std::move(result.error)};
+    }
+
+    bool InferenceRunnerAdapter::maybeApplyDecodeBoundaryMaintenance()
+    {
+        return orch_runner_ ? orch_runner_->maybeApplyMoERebalance() : false;
     }
 
     void InferenceRunnerAdapter::setSkipLogitsGatherDecode(bool skip)

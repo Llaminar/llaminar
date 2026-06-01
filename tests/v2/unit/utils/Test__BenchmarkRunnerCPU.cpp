@@ -157,6 +157,65 @@ namespace
         PrefixRuntimeStateSnapshot snapshot;
     };
 
+    class MockOrchestratedDecodeRunner : public MockCPUInferenceRunner
+    {
+    public:
+        bool supportsDecodeStep() const override { return true; }
+
+        void setDecodeSamplingParams(const SamplingParams &params) override
+        {
+            sampling_params_set_ = true;
+            last_temperature_ = params.temperature;
+        }
+
+        void setDecodeStepTokenBudget(int max_tokens) override
+        {
+            decode_step_budget_ = max_tokens;
+        }
+
+        DecodeStepOutput decodeStepForBenchmark() override
+        {
+            ++decode_step_calls_;
+            const int remaining = decode_step_budget_ > 0 ? decode_step_budget_ : 1;
+            const int accepted = std::min(remaining, 2);
+            DecodeStepOutput output;
+            output.tokens.reserve(static_cast<size_t>(accepted));
+            for (int i = 0; i < accepted; ++i)
+            {
+                output.tokens.push_back(10 + ((emitted_tokens_ + i) % 5));
+            }
+            emitted_tokens_ += accepted;
+            return output;
+        }
+
+        bool maybeApplyDecodeBoundaryMaintenance() override
+        {
+            ++maintenance_calls_;
+            return true;
+        }
+
+        int sampleGreedyOnDevice() override
+        {
+            ++sample_greedy_calls_;
+            return MockCPUInferenceRunner::sampleGreedyOnDevice();
+        }
+
+        int decodeStepCalls() const { return decode_step_calls_; }
+        int maintenanceCalls() const { return maintenance_calls_; }
+        int sampleGreedyCalls() const { return sample_greedy_calls_; }
+        bool samplingParamsSet() const { return sampling_params_set_; }
+        float lastTemperature() const { return last_temperature_; }
+
+    private:
+        int decode_step_budget_ = 0;
+        int decode_step_calls_ = 0;
+        int maintenance_calls_ = 0;
+        int sample_greedy_calls_ = 0;
+        int emitted_tokens_ = 0;
+        bool sampling_params_set_ = false;
+        float last_temperature_ = 1.0f;
+    };
+
     /**
      * @brief Helper to create a MockTokenizer with standard expectations.
      *
@@ -294,6 +353,32 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeSucceedsWithDeviceArgmax)
         << "GPU benchmark must succeed using device-side argmax";
     EXPECT_TRUE(result.decode_success)
         << "GPU decode phase must succeed";
+}
+
+TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
+{
+    auto runner = std::make_shared<MockOrchestratedDecodeRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_TRUE(result.decode_success);
+    EXPECT_EQ(result.decode_tokens, 3);
+    EXPECT_TRUE(runner->samplingParamsSet());
+    EXPECT_EQ(runner->lastTemperature(), 0.0f);
+    EXPECT_GT(runner->decodeStepCalls(), 0);
+    EXPECT_GT(runner->maintenanceCalls(), 0);
+    EXPECT_EQ(runner->sampleGreedyCalls(), 0)
+        << "BenchmarkRunner must not bypass orchestration decodeStep when it is available";
 }
 
 /**

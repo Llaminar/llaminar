@@ -386,6 +386,85 @@ namespace llaminar2
         // Track the end of the last forward() call for inter-step measurement
         auto last_forward_end = start;
 
+        if (runner_->supportsDecodeStep())
+        {
+            SamplingParams greedy_params;
+            greedy_params.temperature = 0.0f;
+            greedy_params.seed = 42;
+            runner_->setDecodeSamplingParams(greedy_params);
+
+            while (tokens_generated < n_tokens)
+            {
+                const int remaining = n_tokens - tokens_generated;
+                runner_->setDecodeStepTokenBudget(remaining);
+                DecodeStepOutput step = runner_->decodeStepForBenchmark();
+                runner_->setDecodeStepTokenBudget(0);
+
+                if (!synchronizeSuccess(step.error.empty(), "decode step"))
+                {
+                    auto end = std::chrono::high_resolution_clock::now();
+                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    return {false, time_ms, tokens_generated, generated_text};
+                }
+
+                int step_token_count = mpi_ctx_->rank() == 0
+                                           ? static_cast<int>(std::min<size_t>(
+                                                 step.tokens.size(),
+                                                 static_cast<size_t>(remaining)))
+                                           : 0;
+                if (mpi_ctx_->world_size() > 1)
+                    mpi_ctx_->broadcast_int32(&step_token_count, 1, 0);
+
+                if (step_token_count <= 0)
+                {
+                    auto end = std::chrono::high_resolution_clock::now();
+                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    if (step.is_complete)
+                        return {true, time_ms, tokens_generated, generated_text};
+                    LOG_ERROR("Benchmark decode step produced no tokens");
+                    return {false, time_ms, tokens_generated, generated_text};
+                }
+
+                int stop_reached = 0;
+                if (mpi_ctx_->rank() == 0)
+                {
+                    for (int j = 0; j < step_token_count; ++j)
+                    {
+                        const int32_t token = step.tokens[static_cast<size_t>(j)];
+                        if (!tokenizer_->is_stop_token(token))
+                        {
+                            generated_text += tokenizer_->decode_token(token);
+                        }
+                        else if (!ignore_stop_tokens)
+                        {
+                            stop_reached = 1;
+                            break;
+                        }
+                    }
+                }
+                if (mpi_ctx_->world_size() > 1)
+                    mpi_ctx_->broadcast_int32(&stop_reached, 1, 0);
+
+                tokens_generated += step_token_count;
+
+                if (stop_reached != 0)
+                    break;
+
+                const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
+                if (!synchronizeSuccess(maintenance_success, "decode maintenance"))
+                {
+                    auto end = std::chrono::high_resolution_clock::now();
+                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    return {false, time_ms, tokens_generated, generated_text};
+                }
+            }
+
+            const bool decode_success = synchronizeSuccess(true, "decode complete");
+            auto end = std::chrono::high_resolution_clock::now();
+            double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            return {decode_success, time_ms, tokens_generated, generated_text};
+        }
+
         for (int i = 0; i < n_tokens; ++i)
         {
             int next_token = -1;

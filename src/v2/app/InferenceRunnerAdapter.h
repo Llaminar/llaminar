@@ -42,6 +42,11 @@ namespace llaminar2
         // GPU-side sampling
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
+        bool supportsDecodeStep() const override;
+        void setDecodeSamplingParams(const SamplingParams &params) override;
+        void setDecodeStepTokenBudget(int max_tokens) override;
+        DecodeStepOutput decodeStepForBenchmark() override;
+        bool maybeApplyDecodeBoundaryMaintenance() override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;

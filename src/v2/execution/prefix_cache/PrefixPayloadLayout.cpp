@@ -100,10 +100,7 @@ namespace llaminar2
                mtp_kv_bytes == other.mtp_kv_bytes &&
                terminal_hidden_bytes == other.terminal_hidden_bytes &&
                terminal_logits_bytes == other.terminal_logits_bytes &&
-               includes_hybrid_state == other.includes_hybrid_state &&
-               includes_mtp_state == other.includes_mtp_state &&
-               includes_terminal_hidden == other.includes_terminal_hidden &&
-               includes_terminal_logits == other.includes_terminal_logits;
+               includes_mtp_state == other.includes_mtp_state;
     }
 
     PrefixPayloadLayout buildDensePrefixPayloadLayout(

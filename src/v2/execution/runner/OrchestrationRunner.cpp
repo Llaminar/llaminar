@@ -730,7 +730,7 @@ namespace llaminar2
                 prefix_request_summary_.partial_hit = matched_tokens > 0 && !full_hit;
                 prefix_request_summary_.matched_tokens = matched_tokens;
                 prefix_request_summary_.matched_blocks =
-                    coordination_block_size > 0 ? matched_tokens / coordination_block_size : 0;
+                    static_cast<int>(common_hit.blocks.size());
                 prefix_request_summary_.terminal_logits_restored = terminal_state_restored;
                 prefix_request_summary_.terminal_hidden_restored =
                     terminal_state_restored && common_hit.has_terminal_hidden;
