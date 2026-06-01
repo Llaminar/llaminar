@@ -115,8 +115,64 @@ TEST(Test__MoERebalanceController, Construction_DynamicMode)
     MoERebalanceController ctrl(cfg);
 
     EXPECT_EQ(ctrl.mode(), MoERebalanceMode::DYNAMIC);
+    EXPECT_EQ(ctrl.requestedMode(), MoERebalanceMode::DYNAMIC);
     EXPECT_NE(ctrl.histogram(), nullptr);
     EXPECT_FALSE(ctrl.shouldRebalance());
+    EXPECT_EQ(ctrl.rebalanceDecision().reason, MoERebalanceDecisionReason::WindowNotFull);
+}
+
+TEST(Test__MoERebalanceController, RebalanceDecisionReasonsAreStableStrings)
+{
+    EXPECT_STREQ(toString(MoERebalanceDecisionReason::ModeOff), "mode_off");
+    EXPECT_STREQ(toString(MoERebalanceDecisionReason::DynamicDisabledForDomain), "dynamic_disabled_for_domain");
+    EXPECT_STREQ(toString(MoERebalanceDecisionReason::SingleParticipantObserveOnly), "single_participant_observe_only");
+    EXPECT_STREQ(toString(MoERebalanceDecisionReason::WindowNotFull), "window_not_full");
+    EXPECT_STREQ(toString(MoERebalanceDecisionReason::Ready), "ready");
+}
+
+TEST(Test__MoERebalanceController, ObserveModeReportsDynamicDisabledReason)
+{
+    auto cfg = makeConfig(MoERebalanceMode::OBSERVE);
+    MoERebalanceController ctrl(cfg);
+
+    fillWindowBalanced(*ctrl.histogram(), 16, 2, 8, 2);
+
+    const auto decision = ctrl.rebalanceDecision();
+    EXPECT_FALSE(decision.ready);
+    EXPECT_EQ(decision.reason, MoERebalanceDecisionReason::DynamicDisabledForDomain);
+    EXPECT_FALSE(ctrl.shouldRebalance());
+}
+
+TEST(Test__MoERebalanceController, DynamicSingleParticipantDowngradesToObserveOnly)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/1,
+                          /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
+    for (int e = 0; e < 8; ++e)
+        cfg.initial_expert_to_socket[e] = 0;
+
+    MoERebalanceController ctrl(cfg);
+    const auto initial = ctrl.currentPlacement();
+
+    EXPECT_EQ(ctrl.requestedMode(), MoERebalanceMode::DYNAMIC);
+    EXPECT_EQ(ctrl.mode(), MoERebalanceMode::OBSERVE);
+    ASSERT_NE(ctrl.histogram(), nullptr);
+    EXPECT_EQ(ctrl.participantCount(), 1);
+
+    fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
+
+    const auto decision = ctrl.rebalanceDecision();
+    EXPECT_FALSE(decision.ready);
+    EXPECT_EQ(decision.reason, MoERebalanceDecisionReason::SingleParticipantObserveOnly);
+    EXPECT_FALSE(ctrl.shouldRebalance());
+
+    EXPECT_TRUE(ctrl.rebalance().empty());
+    ctrl.rebalanceLPT();
+    const auto replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+
+    EXPECT_EQ(ctrl.currentPlacement(), initial);
+    EXPECT_EQ(ctrl.placementEpoch(), 0u);
+    EXPECT_EQ(ctrl.totalRebalances(), 0);
+    EXPECT_EQ(replicas.num_replicated, 0);
 }
 
 TEST(Test__MoERebalanceController, ParticipantVocabularyAliasesLegacySocketState)

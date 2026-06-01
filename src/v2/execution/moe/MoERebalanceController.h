@@ -84,6 +84,23 @@ namespace llaminar2
         DYNAMIC  ///< Track histograms and dynamically rebalance
     };
 
+    enum class MoERebalanceDecisionReason
+    {
+        ModeOff,
+        DynamicDisabledForDomain,
+        SingleParticipantObserveOnly,
+        WindowNotFull,
+        Ready,
+    };
+
+    const char *toString(MoERebalanceDecisionReason reason);
+
+    struct MoERebalanceDecision
+    {
+        bool ready = false;
+        MoERebalanceDecisionReason reason = MoERebalanceDecisionReason::ModeOff;
+    };
+
     class MoERebalanceController
     {
     public:
@@ -109,6 +126,9 @@ namespace llaminar2
 
         /// Check if rebalancing should be attempted (window full + mode == DYNAMIC)
         bool shouldRebalance() const;
+
+        /// Check rebalance readiness with an explicit Phase 8 rollout reason.
+        MoERebalanceDecision rebalanceDecision() const;
 
         /// Propose and apply rebalance (swap-based, global placement).
         /// Returns the new expert_to_socket mapping.
@@ -136,6 +156,9 @@ namespace llaminar2
 
         /// Get the rebalance mode
         MoERebalanceMode mode() const { return config_.mode; }
+
+        /// Get the originally requested mode before domain safety downgrades.
+        MoERebalanceMode requestedMode() const { return requested_mode_; }
 
         /// Get the number of MoE layers
         int numLayers() const { return config_.num_layers; }
@@ -231,6 +254,7 @@ namespace llaminar2
         }
 
     private:
+        MoERebalanceMode requested_mode_ = MoERebalanceMode::OFF;
         Config config_;
         std::unique_ptr<DecodeExpertHistogram> histogram_;
         std::unique_ptr<SocketAwareRebalancer> rebalancer_;

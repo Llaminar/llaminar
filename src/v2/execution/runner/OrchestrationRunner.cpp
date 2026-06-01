@@ -2585,26 +2585,26 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
-        const std::vector<std::vector<std::vector<bool>>> &masks_by_socket)
+        const std::vector<std::vector<std::vector<bool>>> &masks_by_participant)
     {
         if (!runner_)
             return false;
         if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
         {
-            rank->applyMoEExpertMasksForAllDevices(masks_by_socket);
+            rank->applyMoEExpertMasksForAllDevices(masks_by_participant);
             return true;
         }
         return false;
     }
 
     void OrchestrationRunner::setExpertReplicaSet(
-        const ExpertReplicaSet &replicas, int socket_id)
+        const ExpertReplicaSet &replicas, int participant_id)
     {
         if (runner_)
         {
             if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
             {
-                dgo->setExpertReplicaSet(replicas, socket_id);
+                dgo->setExpertReplicaSetForParticipant(replicas, participant_id);
             }
             else if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
             {
@@ -2622,10 +2622,10 @@ namespace llaminar2
         if (log_histogram_summary)
             controller->logHistogramSummary();
 
-        std::vector<std::vector<std::vector<bool>>> gpu_cache_masks;
+        std::vector<std::vector<std::vector<bool>>> gpu_cache_masks_by_participant;
         const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
         if (gpu_cache_experts > 0)
-            gpu_cache_masks = controller->computeGpuCacheExpertMasks(gpu_cache_experts);
+            gpu_cache_masks_by_participant = controller->computeGpuCacheExpertMasks(gpu_cache_experts);
 
         const auto old_placement = controller->currentPlacement();
         const ExpertReplicaSet previous_replicas = controller->currentReplicas();
@@ -2637,7 +2637,7 @@ namespace llaminar2
         const int max_replicas = controller->maxReplicasPerSocket();
         if (max_replicas > 0)
         {
-            controller->proposeReplicas(max_replicas);
+            controller->proposeReplicasForParticipants(max_replicas);
             if (controller->hasReplicas())
             {
                 const auto &current_replicas = controller->currentReplicas();
@@ -2681,10 +2681,10 @@ namespace llaminar2
             controller->syncReplicaPlacement();
         }
 
-        if (controller->hasReplicas() && !replica_state_changed && gpu_cache_masks.empty())
+        if (controller->hasReplicas() && !replica_state_changed && gpu_cache_masks_by_participant.empty())
             return true;
 
-        if (new_placement.empty() && !controller->hasReplicas() && !replica_state_changed && gpu_cache_masks.empty())
+        if (new_placement.empty() && !controller->hasReplicas() && !replica_state_changed && gpu_cache_masks_by_participant.empty())
             return true;
 
         ReceivedWeightsMap received;
@@ -2700,25 +2700,25 @@ namespace llaminar2
                 received = transferExpertWeights(manifest, controller->numLayers());
         }
 
-        const int socket_id = mpi_ctx_ ? mpi_ctx_->local_rank() : 0;
-        if (!gpu_cache_masks.empty())
+        const int participant_id = mpi_ctx_ ? mpi_ctx_->local_rank() : 0;
+        if (!gpu_cache_masks_by_participant.empty())
         {
-            if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks))
+            if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks_by_participant))
             {
-                if (socket_id >= 0 && socket_id < static_cast<int>(gpu_cache_masks.size()))
-                    applyMoEExpertMasks(gpu_cache_masks[socket_id], received);
+                if (participant_id >= 0 && participant_id < static_cast<int>(gpu_cache_masks_by_participant.size()))
+                    applyMoEExpertMasks(gpu_cache_masks_by_participant[participant_id], received);
             }
         }
         else if (!applyMoEExpertMasksForAllLocalDevices(*controller))
         {
-            auto masks = controller->computeExpertMasks(socket_id);
+            auto masks = controller->computeExpertMasksForParticipant(participant_id);
             applyMoEExpertMasks(masks, received);
         }
 
         if (controller->hasReplicas())
-            setExpertReplicaSet(controller->currentReplicas(), socket_id);
+            setExpertReplicaSet(controller->currentReplicas(), participant_id);
         else if (had_replicas && replica_state_changed)
-            setExpertReplicaSet(controller->currentReplicas(), socket_id);
+            setExpertReplicaSet(controller->currentReplicas(), participant_id);
 
         if (config_.moe_rebalance.release_raw_expert_weights || debugEnv().moe_rebalance.release_raw_weights)
         {

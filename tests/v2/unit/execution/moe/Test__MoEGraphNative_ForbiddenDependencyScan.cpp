@@ -299,6 +299,47 @@ namespace llaminar2::test
         }();
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, RebalanceCallSitesUseParticipantVocabulary)
+    {
+        const fs::path root = findRepoRoot();
+        const std::vector<fs::path> callsite_paths = {
+            "src/v2/execution/runner/OrchestrationRunner.h",
+            "src/v2/execution/runner/OrchestrationRunner.cpp",
+            "src/v2/execution/local_execution/orchestrators/RankOrchestrator.h",
+            "src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp",
+            "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp",
+        };
+
+        const std::vector<std::string> forbidden_tokens = {
+            "masks_by_socket",
+            ".owner_socket\"",
+            "computeExpertMasks(socket",
+        };
+
+        std::vector<std::string> failures;
+        for (const auto &relative_path : callsite_paths)
+        {
+            const fs::path path = root / relative_path;
+            ASSERT_TRUE(fs::exists(path)) << path;
+            const std::string contents = readFile(path);
+            ASSERT_FALSE(contents.empty()) << path;
+
+            for (const auto &token : forbidden_tokens)
+            {
+                if (contents.find(token) != std::string::npos)
+                    failures.push_back(relative_path.generic_string() + " contains old rebalance vocabulary token " + token);
+            }
+        }
+
+        EXPECT_TRUE(failures.empty()) << [&]
+        {
+            std::ostringstream out;
+            for (const auto &failure : failures)
+                out << failure << '\n';
+            return out.str();
+        }();
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ROCmTensorAwareMoEWrappersMarkDeviceOutputs)
     {
         const fs::path root = findRepoRoot();

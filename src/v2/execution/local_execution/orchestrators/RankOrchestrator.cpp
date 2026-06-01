@@ -3722,21 +3722,21 @@ namespace llaminar2
         const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
         if (gpu_cache_experts > 0)
         {
-            auto masks_by_socket = controller.computeGpuCacheExpertMasks(gpu_cache_experts);
-            applyMoEExpertMasksForAllDevices(masks_by_socket);
+            auto masks_by_participant = controller.computeGpuCacheExpertMasks(gpu_cache_experts);
+            applyMoEExpertMasksForAllDevices(masks_by_participant);
             return;
         }
 
-        std::vector<std::vector<std::vector<bool>>> masks_by_socket;
-        masks_by_socket.reserve(device_runners_.size());
+        std::vector<std::vector<std::vector<bool>>> masks_by_participant;
+        masks_by_participant.reserve(device_runners_.size());
         for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
-            masks_by_socket.push_back(controller.computeExpertMasks(static_cast<int>(device_idx)));
+            masks_by_participant.push_back(controller.computeExpertMasksForParticipant(static_cast<int>(device_idx)));
 
-        applyMoEExpertMasksForAllDevices(masks_by_socket);
+        applyMoEExpertMasksForAllDevices(masks_by_participant);
     }
 
     void RankOrchestrator::applyMoEExpertMasksForAllDevices(
-        const std::vector<std::vector<std::vector<bool>>> &masks_by_socket)
+        const std::vector<std::vector<std::vector<bool>>> &masks_by_participant)
     {
         int applied = 0;
         std::vector<DeviceGraphOrchestrator *> local_dgos;
@@ -3770,20 +3770,20 @@ namespace llaminar2
         std::vector<ReceivedWeightsMap> received_by_device(device_runners_.size());
         for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
         {
-            if (device_idx < masks_by_socket.size() && local_dgos[device_idx])
-                received_by_device[device_idx] = collect_local_transfers(device_idx, masks_by_socket[device_idx]);
+            if (device_idx < masks_by_participant.size() && local_dgos[device_idx])
+                received_by_device[device_idx] = collect_local_transfers(device_idx, masks_by_participant[device_idx]);
         }
 
         for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
         {
-            if (device_idx >= masks_by_socket.size())
+            if (device_idx >= masks_by_participant.size())
                 continue;
 
             auto *dgo = local_dgos[device_idx];
             if (!dgo)
                 continue;
 
-            dgo->applyExpertMasks(masks_by_socket[device_idx], received_by_device[device_idx]);
+            dgo->applyExpertMasks(masks_by_participant[device_idx], received_by_device[device_idx]);
             ++applied;
         }
 
@@ -3793,15 +3793,15 @@ namespace llaminar2
             {
                 if (auto *rank = dynamic_cast<RankOrchestrator *>(runner.get()))
                 {
-                    rank->applyMoEExpertMasksForAllDevices(masks_by_socket);
+                    rank->applyMoEExpertMasksForAllDevices(masks_by_participant);
                     ++applied;
                     continue;
                 }
                 if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
                 {
-                    if (!masks_by_socket.empty())
+                    if (!masks_by_participant.empty())
                     {
-                        dgo->applyExpertMasks(masks_by_socket.front(), ReceivedWeightsMap{});
+                        dgo->applyExpertMasks(masks_by_participant.front(), ReceivedWeightsMap{});
                         ++applied;
                     }
                 }

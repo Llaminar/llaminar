@@ -843,8 +843,8 @@ namespace llaminar2
             if (!manifest.empty())
                 received = transferExpertWeights(manifest, moe_rebalance_controller_->numLayers());
 
-            const int socket_id = mpi_ctx_ ? mpi_ctx_->local_rank() : 0;
-            auto masks = moe_rebalance_controller_->computeExpertMasks(socket_id);
+            const int participant_id = mpi_ctx_ ? mpi_ctx_->local_rank() : 0;
+            auto masks = moe_rebalance_controller_->computeExpertMasksForParticipant(participant_id);
             applyExpertMasks(masks, received);
 
             if (forward_engine_)
@@ -3869,7 +3869,7 @@ namespace llaminar2
                 const auto &placement = controller->currentPlacement();
                 for (size_t expert = 0; expert < placement.size(); ++expert)
                 {
-                    material.moe.push_back({"controller.expert." + std::to_string(expert) + ".owner_socket",
+                    material.moe.push_back({"controller.expert." + std::to_string(expert) + ".owner_participant",
                                             std::to_string(placement[expert])});
                 }
 
@@ -3881,7 +3881,7 @@ namespace llaminar2
                     material.moe.push_back({prefix + ".enabled", replicas.is_replicated[expert] ? "1" : "0"});
                     if (expert < replicas.owner_socket.size())
                     {
-                        material.moe.push_back({prefix + ".owner_socket",
+                        material.moe.push_back({prefix + ".owner_participant",
                                                 std::to_string(replicas.owner_socket[expert])});
                     }
                 }
@@ -5436,8 +5436,8 @@ namespace llaminar2
         return result;
     }
 
-    void DeviceGraphOrchestrator::setExpertReplicaSet(
-        const ExpertReplicaSet &replicas, int socket_id)
+    void DeviceGraphOrchestrator::setExpertReplicaSetForParticipant(
+        const ExpertReplicaSet &replicas, int participant_id)
     {
         int count = 0;
         if (forward_engine_)
@@ -5449,14 +5449,21 @@ namespace llaminar2
                     auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
                     if (moe)
                     {
-                        moe->setReplicaSet(replicas, socket_id);
+                        moe->setReplicaSet(replicas, participant_id);
                         count++;
                     }
                 });
         }
 
         LOG_DEBUG("[DGO] Set expert replica info (" << replicas.num_replicated
-                                                    << " replicas) on " << count << " MoE stages (socket " << socket_id << ")");
+                                                    << " replicas) on " << count
+                                                    << " MoE stages (participant " << participant_id << ")");
+    }
+
+    void DeviceGraphOrchestrator::setExpertReplicaSet(
+        const ExpertReplicaSet &replicas, int socket_id)
+    {
+        setExpertReplicaSetForParticipant(replicas, socket_id);
     }
 
     size_t DeviceGraphOrchestrator::releaseRawExpertWeights()

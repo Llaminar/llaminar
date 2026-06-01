@@ -15,6 +15,23 @@
 
 namespace llaminar2
 {
+    const char *toString(MoERebalanceDecisionReason reason)
+    {
+        switch (reason)
+        {
+        case MoERebalanceDecisionReason::ModeOff:
+            return "mode_off";
+        case MoERebalanceDecisionReason::DynamicDisabledForDomain:
+            return "dynamic_disabled_for_domain";
+        case MoERebalanceDecisionReason::SingleParticipantObserveOnly:
+            return "single_participant_observe_only";
+        case MoERebalanceDecisionReason::WindowNotFull:
+            return "window_not_full";
+        case MoERebalanceDecisionReason::Ready:
+            return "ready";
+        }
+        return "unknown";
+    }
 
     // =========================================================================
     // ExpertReplicaSet — deterministic per-token dispatch
@@ -141,10 +158,17 @@ namespace llaminar2
     }
 
     MoERebalanceController::MoERebalanceController(Config config)
-        : config_(std::move(config)),
+        : requested_mode_(config.mode),
+          config_(std::move(config)),
           current_placement_(config_.initial_expert_to_socket),
           current_window_size_(config_.window_size)
     {
+        if (config_.mode == MoERebalanceMode::DYNAMIC && config_.sockets.size() < 2)
+        {
+            config_.mode = MoERebalanceMode::OBSERVE;
+            LOG_INFO("[MoERebalanceController] Dynamic rebalance downgraded to OBSERVE for single-participant domain");
+        }
+
         if (config_.mode == MoERebalanceMode::OFF)
             return;
 
@@ -175,7 +199,32 @@ namespace llaminar2
 
     bool MoERebalanceController::shouldRebalance() const
     {
-        return config_.mode == MoERebalanceMode::DYNAMIC && histogram_ && histogram_->windowFull();
+        return rebalanceDecision().ready;
+    }
+
+    MoERebalanceDecision MoERebalanceController::rebalanceDecision() const
+    {
+        if (requested_mode_ == MoERebalanceMode::OFF || config_.mode == MoERebalanceMode::OFF)
+        {
+            return {false, MoERebalanceDecisionReason::ModeOff};
+        }
+
+        if (requested_mode_ == MoERebalanceMode::DYNAMIC && config_.sockets.size() < 2)
+        {
+            return {false, MoERebalanceDecisionReason::SingleParticipantObserveOnly};
+        }
+
+        if (config_.mode != MoERebalanceMode::DYNAMIC)
+        {
+            return {false, MoERebalanceDecisionReason::DynamicDisabledForDomain};
+        }
+
+        if (!histogram_ || !histogram_->windowFull())
+        {
+            return {false, MoERebalanceDecisionReason::WindowNotFull};
+        }
+
+        return {true, MoERebalanceDecisionReason::Ready};
     }
 
     std::vector<int> MoERebalanceController::rebalance()
@@ -648,8 +697,15 @@ namespace llaminar2
             t << "Mode" << (config_.mode == MoERebalanceMode::OBSERVE ? "OBSERVE" : config_.mode == MoERebalanceMode::DYNAMIC ? "DYNAMIC"
                                                                                                                               : "OFF")
               << fort::endr;
+            if (requested_mode_ != config_.mode)
+            {
+                t << "Requested mode" << (requested_mode_ == MoERebalanceMode::OBSERVE ? "OBSERVE" : requested_mode_ == MoERebalanceMode::DYNAMIC ? "DYNAMIC"
+                                                                                                                                                   : "OFF")
+                  << fort::endr;
+            }
+            t << "Rebalance state" << toString(rebalanceDecision().reason) << fort::endr;
             t << "Experts" << config_.num_experts << fort::endr;
-            t << "Sockets" << config_.sockets.size() << fort::endr;
+            t << "Participants" << config_.sockets.size() << fort::endr;
             t << "Top-K" << config_.top_k << fort::endr;
             t << "Window size" << config_.window_size << fort::endr;
             if (config_.max_window_size > 0 && config_.window_growth_factor > 1.0f)

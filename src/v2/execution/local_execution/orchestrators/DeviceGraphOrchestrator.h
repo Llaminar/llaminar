@@ -836,6 +836,9 @@ namespace llaminar2
 
         /// Set expert replica info on all MoE stages for per-token dispatch.
         /// Call after applyExpertMasks() so GEMM engines are already prepared.
+        void setExpertReplicaSetForParticipant(const ExpertReplicaSet &replicas, int participant_id);
+
+        /// Compatibility wrapper for older socket-oriented call sites.
         void setExpertReplicaSet(const ExpertReplicaSet &replicas, int socket_id);
 
         /// Release raw expert weight data from all MoE stages after initial VNNI packing.

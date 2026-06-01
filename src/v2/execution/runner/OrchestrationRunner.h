@@ -222,10 +222,10 @@ namespace llaminar2
         /// Apply precomputed MoE masks to every local device runner when the
         /// underlying runner is a RankOrchestrator. Returns true if handled.
         bool applyMoEExpertMasksForAllLocalDevices(
-            const std::vector<std::vector<std::vector<bool>>> &masks_by_socket);
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant);
 
         /// Set expert replica info for per-token dynamic dispatch
-        void setExpertReplicaSet(const ExpertReplicaSet &replicas, int socket_id);
+        void setExpertReplicaSet(const ExpertReplicaSet &replicas, int participant_id);
 
         /// Apply one dynamic MoE rebalance cycle, including bounded hot replicas.
         bool applyMoERebalanceWithReplicas(bool log_histogram_summary = false);

@@ -740,7 +740,7 @@ namespace llaminar2
         MoERebalanceController *moeRebalanceController() const;
         void applyMoEExpertMasksForAllDevices(const MoERebalanceController &controller);
         void applyMoEExpertMasksForAllDevices(
-            const std::vector<std::vector<std::vector<bool>>> &masks_by_socket);
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant);
         void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
 
     private:
