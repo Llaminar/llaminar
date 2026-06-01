@@ -682,11 +682,7 @@ protected:
 TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, TopologySmoke)
 {
     if (!isRootParityRank())
-    {
-        // Rank 1 skips; topology validation belongs to rank 0 (rocm_hot owner).
-        GTEST_SKIP() << "TopologySmoke is rank-0 only; rank " << mpiRank()
-                     << " participates in MPI barriers but does not own topology assertions";
-    }
+        return;
 
     // The production graph-native path must NOT be overridden by the legacy env var.
     EXPECT_FALSE(isLegacyOverlayRuntimeEnabled())

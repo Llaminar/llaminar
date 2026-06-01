@@ -633,7 +633,7 @@ protected:
 TEST_F(Qwen35MoEExpertOverlay, OverlayPlanTopology_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold)
 {
     if (!isRootParityRank())
-        GTEST_SKIP() << "Rank " << mpiRank() << " participates in MPI setup/barriers only; rank 0 owns the topology assertion";
+        return;
 
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
     ASSERT_NE(overlay_plan_, nullptr);
@@ -654,7 +654,7 @@ TEST_F(Qwen35MoEExpertOverlay, OverlayPlanTopology_ROCm2TP_SharedHot_CPU2NodeLoc
 TEST_F(Qwen35MoEExpertOverlay, OverlayPlanTopology_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold)
 {
     if (!isRootParityRank())
-        GTEST_SKIP() << "Rank " << mpiRank() << " participates in MPI setup/barriers only; rank 0 owns the topology assertion";
+        return;
 
     ASSERT_TRUE(setupPipeline()) << "Pipeline setup failed";
     ASSERT_NE(overlay_plan_, nullptr);

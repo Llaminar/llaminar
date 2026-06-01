@@ -590,10 +590,7 @@ protected:
 TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, TopologySmoke)
 {
     if (!isRootParityRank())
-    {
-        GTEST_SKIP() << "TopologySmoke is rank-0 only; rank " << mpiRank()
-                     << " participates in MPI barriers but does not own topology assertions";
-    }
+        return;
 
     EXPECT_FALSE(isLegacyOverlayRuntimeEnabled())
         << kLegacyEnvVar << " must NOT be set for graph-native tests";
