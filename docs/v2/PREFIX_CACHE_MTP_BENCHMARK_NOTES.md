@@ -16,7 +16,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
-| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP decode and sidecar are segmented-graph captured with no manual stages | N/A | 11.84 | 0.65x decode, 0.64x overall | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-smallm-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-smallm-stats.json` | Small-M ROCm verifier GEMV reduced `verifier_forward` to about 131 ms/call, but MTP is still slower than baseline. Need a true two-row/batched verifier kernel path or fewer full verifier replays. |
+| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP decode and sidecar are segmented-graph captured with no manual stages | N/A | 11.94 | 0.65x decode, 0.64x overall | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stats.json` | Opt-in M=2 row-overlap reduced `verifier_forward` to about 129.8 ms/call, but MTP is still slower than baseline. Need a true two-row/batched verifier kernel path or fewer full verifier replays. |
 | SingleDevice | CUDA | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | N/A | Pending | Pending | Pending | Need first dense CUDA baseline/MTP graph-capture run. |
 | SingleDevice | ROCm | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and MoE MTP sidecar capture audit. |
 | SingleDevice | CUDA | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and CUDA availability check. |
@@ -79,6 +79,22 @@ Latest ROCm dense evidence:
     decode reached 11.77 tok/s and `verifier_forward` averaged about
     132.05 ms/call.
   - Keep this as an implementation option, not the next optimization axis.
+- Native-VNNI M=2 row-overlap experiment:
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-bench.json` and
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stats.json`.
+  - Enabling `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` completed the real Qwen3.6
+    ROCm benchmark without the earlier broad `LLAMINAR_ROCM_CONCURRENT_DECODE`
+    GPU fault.
+  - Decode reached 11.94 tok/s, with 16 draft steps, 12 accepted tokens,
+    4 rejected tokens, 4 rollbacks, and 75% acceptance.
+  - `verifier_forward`: 12 calls, 1557.33 ms total, about 129.78 ms/call.
+  - `sidecar_forward`: 12 calls, 40.64 ms total, about 3.39 ms/call.
+  - Checkpoint capture/restore is no longer the dominant cost in this slice:
+    `capture_live_prefix_state` averaged about 0.24 ms and
+    `restore_live_prefix_state` averaged about 0.32 ms.
+  - This is the current best ROCm dense MTP evidence, but it is still only
+    about 0.65x the no-MTP decode baseline, so the next optimization axis must
+    reduce verifier replay work rather than sidecar overhead.
 - Regression coverage:
   - `V2_Unit_MTPGraphConstruction` now includes
     `CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse`, which proves a
@@ -94,6 +110,9 @@ Latest ROCm dense evidence:
     references for both INT8-VNNI `Q8_0` and native-VNNI `Q4_K`, so future
     verifier-kernel work has a fast hardware regression for the dense Qwen3.6
     benchmark's quantization class.
+  - The same focused integration test covers the opt-in
+    `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` native-VNNI row-overlap path against
+    the CPU reference before it is used in real-model benchmark experiments.
 
 Next graph-capture questions:
 

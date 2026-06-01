@@ -8,11 +8,14 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "../../../utils/TestTensorFactory.h"
 
+#include <cstdlib>
 #include <cmath>
 #include <memory>
+#include <string>
 #include <vector>
 
 #ifdef HAVE_ROCM
@@ -29,6 +32,40 @@ namespace
     {
         INT8VNNI,
         NativeVNNI,
+    };
+
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old_value = std::getenv(name);
+            if (old_value)
+            {
+                had_old_value_ = true;
+                old_value_ = old_value;
+            }
+            setenv(name_.c_str(), value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_value_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        bool had_old_value_ = false;
+        std::string old_value_;
     };
 
     bool hasROCmDevice()
@@ -284,6 +321,25 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2MatchesReference)
     const int K = 1024;
     runDispatchM2MatchesReference(
         "Q4_K native-VNNI",
+        N,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.985f);
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, ConcurrentDispatchQ4KM2MatchesReference)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv concurrent_m2_rows("LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "1");
+
+    const int N = 896;
+    const int K = 1024;
+    runDispatchM2MatchesReference(
+        "Q4_K native-VNNI concurrent rows",
         N,
         K,
         PackedPath::NativeVNNI,

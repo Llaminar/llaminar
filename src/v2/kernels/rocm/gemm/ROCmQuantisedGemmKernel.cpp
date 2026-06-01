@@ -2198,6 +2198,135 @@ namespace llaminar2
                           << m << " N=" << n << " K=" << k
                           << (d_bias ? " +bias" : ""));
 
+#ifdef HAVE_ROCM
+                if (m == 2 && impl_->has_native_vnni &&
+                    !C_fp32->isMapped() && beta == 0.0f &&
+                    debugEnv().rocm.concurrent_m2_rows)
+                {
+                    if ((k % 32) != 0)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent native-VNNI M=2 requires K multiple of 32, got K="
+                                  << k);
+                        return false;
+                    }
+
+                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                            d_input,
+                            impl_->d_A_int8,
+                            impl_->d_scales_A_blockwise,
+                            m,
+                            k,
+                            rocm_device_id_,
+                            gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent small-M blockwise activation quantization failed");
+                        return false;
+                    }
+
+                    constexpr int SCATTER_KB_MAX = 64;
+                    const int scale_blocks_per_row = k / 32;
+                    auto &pool = getSharedPrefillPool(rocm_device_id_, m);
+                    const auto check_hip = [&](hipError_t err, const char *operation) -> bool
+                    {
+                        if (err == hipSuccess)
+                            return true;
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent small-M native-VNNI "
+                                  << operation << " failed: " << hipGetErrorString(err));
+                        return false;
+                    };
+
+                    if (!check_hip(
+                            hipEventRecord(pool.quant_ready,
+                                           static_cast<hipStream_t>(gpu_stream_)),
+                            "record quant-ready event"))
+                    {
+                        return false;
+                    }
+
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const int stream_idx = row % pool.count;
+                        const size_t partial_elements = static_cast<size_t>(SCATTER_KB_MAX) * n;
+                        if (!pool.ensureScatterPartial(stream_idx, partial_elements))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Failed to allocate concurrent native-VNNI scatter partial for row "
+                                      << row << " (" << (partial_elements * sizeof(float)) << " bytes)");
+                            return false;
+                        }
+
+                        if (!check_hip(
+                                hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0),
+                                "wait for quant-ready event"))
+                        {
+                            return false;
+                        }
+
+                        const int8_t *d_A_row = impl_->d_A_int8 + static_cast<size_t>(row) * k;
+                        const float *d_scale_row = impl_->d_scales_A + row;
+                        const float *d_scale_block_row = impl_->d_scales_A_blockwise + static_cast<size_t>(row) * scale_blocks_per_row;
+                        float *d_output_row = d_output + static_cast<size_t>(row) * n;
+
+                        if (!rocmGemv_native_vnni_fp32(
+                                d_A_row,
+                                impl_->d_weights_native_vnni,
+                                impl_->d_weights_native_scales,
+                                impl_->d_weights_native_mins,
+                                impl_->d_weights_native_emins,
+                                d_output_row,
+                                d_scale_row,
+                                pool.scatter_partial[stream_idx],
+                                n, k,
+                                impl_->native_vnni_codebook_id,
+                                rocm_device_id_, pool.streams[stream_idx],
+                                d_scale_block_row))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent small-M native-VNNI GEMV failed at row "
+                                      << row);
+                            return false;
+                        }
+
+                        if (alpha != 1.0f || d_bias)
+                        {
+                            if (!rocmQuantGemm_applyFp32Epilogue(
+                                    d_output_row,
+                                    d_bias,
+                                    1,
+                                    n,
+                                    alpha,
+                                    rocm_device_id_,
+                                    pool.streams[stream_idx]))
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Concurrent small-M native-VNNI epilogue failed at row "
+                                          << row);
+                                return false;
+                            }
+                        }
+
+                        if (!check_hip(
+                                hipEventRecord(pool.completion[stream_idx],
+                                               pool.streams[stream_idx]),
+                                "record row-completion event"))
+                        {
+                            return false;
+                        }
+                    }
+
+                    for (int row = 0; row < m; ++row)
+                    {
+                        if (!check_hip(
+                                hipStreamWaitEvent(
+                                    static_cast<hipStream_t>(gpu_stream_),
+                                    pool.completion[row % pool.count], 0),
+                                "wait for row-completion event"))
+                        {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                }
+#endif
+
                 for (int row = 0; row < m; ++row)
                 {
                     const float *d_input_row = d_input + static_cast<size_t>(row) * k;

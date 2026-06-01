@@ -2553,6 +2553,7 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
      * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
      * - `LLAMINAR_ROCM_NVNNI_Q8_DIRECT=1` - Force Q8_0 native-VNNI GEMV direct path (KB=1, no reduce kernel)
+     * - `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` - Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (default: off)
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=1` - Enable experimental multi-stream GDN decode projection GEMVs (default: off)
      * - `LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE=1` - Enable experimental shared-expert decode through MoE grouped FFN kernels (default: off)
      * - `LLAMINAR_ROCM_MOE_PARALLEL_DOWN_DECODE=0` - Disable parallel-expert grouped MoE decode down projection
@@ -2625,6 +2626,7 @@ namespace llaminar2
         int ratio_prefill_iq4_kb = 0;              ///< IQ4 codebook ratio prefill split-K override (0=use global/auto)
         bool concurrent_prefill = true;            ///< Multi-stream concurrent fused GEMM projections during prefill (LLAMINAR_ROCM_CONCURRENT_PREFILL, default ON)
         bool concurrent_decode = false;            ///< Enable multi-stream concurrent fused GEMV projections during decode (LLAMINAR_ROCM_CONCURRENT_DECODE)
+        bool concurrent_m2_rows = false;           ///< Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (LLAMINAR_ROCM_CONCURRENT_M2_ROWS)
         bool gdn_concurrent_decode = false;        ///< Enable multi-stream GDN decode projection GEMVs only (LLAMINAR_ROCM_GDN_CONCURRENT_DECODE)
         bool shared_expert_grouped_decode = false; ///< Enable shared-expert decode through grouped MoE FFN kernels (LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE)
         bool moe_grouped_decode = true;            ///< Enable grouped MoE decode down path when supported (LLAMINAR_ROCM_MOE_GROUPED_DECODE)
@@ -2706,6 +2708,7 @@ namespace llaminar2
             ratio_prefill_iq4_kb = 0;
             concurrent_prefill = true;
             concurrent_decode = false;
+            concurrent_m2_rows = false;
             gdn_concurrent_decode = false;
             shared_expert_grouped_decode = false;
             moe_grouped_decode = true;
@@ -3044,6 +3047,12 @@ namespace llaminar2
             if (concurrent_decode_env)
             {
                 concurrent_decode = (std::atoi(concurrent_decode_env) != 0);
+            }
+
+            const char *concurrent_m2_rows_env = std::getenv("LLAMINAR_ROCM_CONCURRENT_M2_ROWS");
+            if (concurrent_m2_rows_env)
+            {
+                concurrent_m2_rows = (std::atoi(concurrent_m2_rows_env) != 0);
             }
 
             const char *gdn_concurrent_decode_env = std::getenv("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
