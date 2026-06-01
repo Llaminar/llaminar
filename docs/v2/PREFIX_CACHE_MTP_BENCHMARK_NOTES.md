@@ -72,6 +72,13 @@ Latest ROCm dense evidence:
     181.20 ms/call.
   - Do not reintroduce this shape without a lower-level kernel change; a true
     batched/two-row GEMV path is likely needed instead.
+- Atomic native-VNNI reduction experiment:
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-smallm-atomicreduce-bench.json` and
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-smallm-atomicreduce-stats.json`.
+  - Enabling `LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE=1` was effectively neutral:
+    decode reached 11.77 tok/s and `verifier_forward` averaged about
+    132.05 ms/call.
+  - Keep this as an implementation option, not the next optimization axis.
 - Regression coverage:
   - `V2_Unit_MTPGraphConstruction` now includes
     `CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse`, which proves a
@@ -84,7 +91,9 @@ Latest ROCm dense evidence:
     skips only when no GPU backend is available to the test process.
   - `V2_Integration_ROCmQuantisedGemmSmallM` covers the ROCm M=2 verifier GEMV
     path and the fused Q/K/V M=2 routing path against CPU/separate-projection
-    references, so future verifier-kernel work has a fast hardware regression.
+    references for both INT8-VNNI `Q8_0` and native-VNNI `Q4_K`, so future
+    verifier-kernel work has a fast hardware regression for the dense Qwen3.6
+    benchmark's quantization class.
 
 Next graph-capture questions:
 
