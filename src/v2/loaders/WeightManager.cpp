@@ -7,6 +7,7 @@
 #include "WeightManager.h"
 #include "MmapRegion.h"
 #include "PreparedWeightStore.h"
+#include "GPUVramPreflight.h"
 #include "../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../execution/moe/MoEExpertOverlayRuntimePlan.h"
@@ -4584,8 +4585,10 @@ namespace llaminar2
                       << " planned_weights=" << formatMiB(planned_weight_bytes)
                       << " staging=" << formatMiB(staging_bytes)
                       << " safety_margin=" << formatMiB(safety_margin_bytes)
-                      << ". Mitigations: set LLAMINAR_WEIGHT_STREAMING=1, use a smaller model, "
-                      << "reduce context/KV cache pressure, or reduce resident experts.");
+                      << ". Mitigations: "
+                      << gpuPipelineVramPreflightMitigations(
+                             debugEnv().streaming.enabled,
+                             !moe_jobs.empty()));
             return false;
         }
 

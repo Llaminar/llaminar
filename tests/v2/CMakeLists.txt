@@ -621,6 +621,20 @@ add_v2_test(V2_Unit_UnifiedPipelineMoECollection
     MPI_PROCS 1
 )
 
+add_executable(v2_unit_gpu_vram_preflight
+    unit/loaders/Test__GPUVramPreflight.cpp
+)
+target_link_libraries(v2_unit_gpu_vram_preflight
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_GPUVramPreflight
+    COMMAND $<TARGET_FILE:v2_unit_gpu_vram_preflight>
+    LABELS "V2;Unit;Loaders;GpuPipeline;Diagnostics"
+    MPI_PROCS 1
+)
+
 # Test: MoE Expert Overlay Preparation - tier-aware preparation requests and CPU fallback packing
 add_executable(v2_unit_weight_manager_moe_expert_overlay_preparation
     unit/loaders/Test__WeightManagerMoEExpertOverlayPreparation.cpp
@@ -4315,6 +4329,24 @@ target_link_libraries(v2_perf_prefix_cache_mtp_benchmark
 add_v2_test(V2_Perf_PrefixCacheMTP
     COMMAND $<TARGET_FILE:v2_perf_prefix_cache_mtp_benchmark>
     LABELS "V2;Performance;Benchmark;PrefixCache;MTP;JSON;Smoke"
+    MPI_PROCS 1
+)
+
+# MoE graph-native overlay benchmark harness smoke.
+# Validates curated overlay configs and the analyzer script without requiring
+# large model files in the performance suite.
+add_executable(v2_perf_moe_graph_native_overlay
+    performance/moe/Perf__MoEGraphNativeOverlayHarness.cpp
+    performance/moe/Perf__MoEGraphNativeOverlayAnalysis.cpp
+)
+target_link_libraries(v2_perf_moe_graph_native_overlay
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Perf_MoEGraphNativeOverlay
+    COMMAND $<TARGET_FILE:v2_perf_moe_graph_native_overlay>
+    LABELS "V2;Performance;Benchmark;MoE;Overlay;ExpertParallel;GraphNative;Smoke"
     MPI_PROCS 1
 )
 

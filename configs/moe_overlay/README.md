@@ -33,7 +33,7 @@ The script uses `build_v2_release/llaminar2` by default, enables `LLAMINAR_PROFI
 
 ## Hardware And Model
 
-The curated configs assume a Qwen3.5 MoE model with 256 routed experts. All-GPU configs expect a CUDA rank and a ROCm rank. Mixed configs add one CPU fallback rank. The `benchmark.mpi_ranks` key in each YAML records the intended rank count for the sweep script and for reproducible reports.
+The curated configs assume a Qwen3.5 or Qwen3.6 MoE model with 256 routed experts. The focused ROCm config uses one MPI rank with two local ROCm participants in a `ReplicatedExperts` domain. The CUDA/ROCm all-GPU configs expect a CUDA rank and a ROCm rank. Mixed configs add one CPU fallback rank. The `benchmark.mpi_ranks` key in each YAML records the intended rank count for the sweep script and for reproducible reports.
 
 ## Expected Observations
 

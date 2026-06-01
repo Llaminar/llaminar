@@ -23,7 +23,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 | LocalTP | ROCm `rocm:0,rocm:1` | Qwen3.6 dense 27B Q4_K_S | 24.15 at `-c 64` | Not fully captured: verifier graphs detect collectives and disable segmented capture | RCCL collectives currently force non-captured verifier execution (`has_collectives=true`, `collectives_graph_capturable=false`) | 20.46 | 0.85x decode | `/tmp/llaminar-mtp-bench/dense-localtp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-c64-n4-stats.json` | Correct LocalTP MTP with 100% acceptance is present, but collectives prevent segmented graph capture. Need graph-safe RCCL/allreduce capture or explicit optimized manual collective boundaries before speedup claims. |
 | LocalPP | ROCm `stage0=rocm:0, stage1=rocm:1` | Qwen3.6 dense 27B Q4_K_S | 20.47 at `-c 64` | Blocked: MTP is a hard fail before prefill on PP topologies | PP activation transfers are present in the baseline path, but MTP graph capture is not attempted | Blocked | N/A | `/tmp/llaminar-mtp-bench/dense-localpp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localpp-rocm-mtp-gpugraphs-c64-n4-hardfail.json` | PP MTP shifted-prefill and verifier execution are not implemented. The previous late stage-1 shifted-cache failure is now a prefill hard-fail with an explicit unsupported-topology message. |
 | NodeLocalTP | CPU sockets | Qwen3.6 dense 27B Q4_K_S | Pending | N/A for GPU graphs | Host/MPI coordination only | Pending | Pending | Pending | Needed for correctness/speed evidence, but not GPU graph-capture gating. |
-| Expert overlay EP | 2x ROCm | Qwen3.6 MoE 35B | Pending | Pending | Sparse dispatch/return graph capture required where ROCm supports it | Pending | Pending | Pending | Need graph-native sparse collectives and MoE MTP sidecar lockstep. |
+| Expert overlay EP | 2x ROCm | Qwen3.6 MoE 35B | Blocked before inference | Blocked before graph-capture measurement | Sparse dispatch/return graph capture required where ROCm supports it, but the current run blocks during resident expert preparation first | Blocked | N/A | `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-replicated-streaming-hardfail.txt` | Added `configs/moe_overlay/rocm2_replicated_static.yaml` and harness coverage for a one-rank LocalTP `ReplicatedExperts` ROCm domain. Real Qwen3.6 MoE reaches graph config, but both ROCm devices fail resident expert VRAM preflight by the safety-margin check. `LLAMINAR_WEIGHT_STREAMING=1` is already enabled in the confirming run, but resident MoE expert streaming is not active for this GPU pipeline path. |
 | Expert overlay EP | 2x ROCm plus 2x CPU dual-socket | Qwen3.6 MoE 35B | Pending | Pending | Heterogeneous sparse collectives must be graph-aware with hard fail for unsupported legs | Pending | Pending | Pending | Need host-staged sparse return path through `TransferEngine`, then graph capture where possible. |
 
 Latest ROCm dense evidence:
@@ -258,6 +258,33 @@ Latest LocalPP ROCm dense evidence:
   - LocalPP MTP remains unimplemented; the next work is a proper PP-aware MTP
     shifted-prefill and verifier path, then graph-capture/manual-boundary
     analysis for PP activation transfers.
+
+Latest Expert overlay 2x ROCm MoE evidence:
+
+- Config and harness coverage:
+  `configs/moe_overlay/rocm2_replicated_static.yaml` is a one-rank LocalTP
+  `ReplicatedExperts` overlay domain over `rocm:0,rocm:1`, with all 256
+  routed experts in a single ROCm tier and no fallback.
+  `V2_Perf_MoEGraphNativeOverlay` now validates this config alongside the
+  existing graph-native overlay benchmark configs.
+- Real Qwen3.6 MoE smoke:
+  `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-replicated-streaming-hardfail.txt`.
+  - Model: `/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf`.
+  - Domain: `configs/moe_overlay/rocm2_replicated_static.yaml`,
+    `--mpi-procs 1`, `-c 64`, deterministic prompt, `-n 1`.
+  - The run reaches Qwen3.6 MoE graph config and excludes one trailing
+    nextn/MTP block from the main graph: 41 layers to 40 layers.
+  - Initialization hard-fails before inference during resident expert GPU
+    preparation. ROCm:0 reports required 7386 MiB versus 7274 MiB available
+    after the safety margin; ROCm:1 reports required 7386 MiB versus
+    7356 MiB available after the safety margin.
+  - Confirming with `LLAMINAR_WEIGHT_STREAMING=1` produces the corrected
+    diagnostic: streaming is already enabled, but resident MoE expert
+    streaming is not active for this GPU pipeline path.
+  - No benchmark JSON is written because the failure occurs before benchmark
+    execution. The next 2x ROCm EP slice must either reduce resident expert
+    budget for this config or implement resident MoE expert streaming before
+    MTP graph-capture evidence can be collected.
 
 Latest ROCm MoE evidence:
 
