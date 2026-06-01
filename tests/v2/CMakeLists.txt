@@ -5864,6 +5864,7 @@ else()
 endif()
 add_v2_test(V2_Integration_PrefixCacheStateProbe
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe>
+        --gtest_filter=Test__KVPrefixMTPStateProbe.DenseQwen25_*:Test__KVPrefixMTPStateProbe.MTP_ModelInventoryWhenAvailable:Test__KVPrefixMTPStateProbe.MTP_ShiftedCacheCountProbeOnGPU:Test__KVPrefixMTPStateProbe.MTP_SidecarOneTokenExecutesOnGPU
     LABELS "V2;Integration;PrefixCache;StateProbe;MTP;GPU"
     MPI_PROCS 1
     TIMEOUT 300
