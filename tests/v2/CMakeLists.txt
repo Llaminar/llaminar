@@ -4999,6 +4999,78 @@ if(ZLIB_FOUND)
     message(STATUS "V2: Qwen3.5 NodeLocalPP parity tests enabled (requires mpirun -np 2+)")
 
     # =========================================================================
+    # Qwen3.6 Dense Prefix Cache / MTP PyTorch Parity Matrix
+    # =========================================================================
+    # Dense Qwen3.6 GGUFs are encoded as qwen35 with trailing nextn MTP sidecar
+    # tensors, so this matrix uses the Qwen3.5 PyTorch reference generator.
+    # The harness regenerates metadata-only PyTorch references when absent.
+    # =========================================================================
+
+    add_executable(v2_integration_parity_qwen36_single_device_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36_SingleDevice_PrefixMTP_Parity.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36_single_device_prefix_mtp
+        llaminar2_core GTest::gtest
+    )
+    target_include_directories(v2_integration_parity_qwen36_single_device_prefix_mtp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36_single_device_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36_SingleDevice
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
+
+    add_executable(v2_integration_parity_qwen36_local_tp_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36_LocalTP_PrefixMTP_Parity.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36_local_tp_prefix_mtp
+        llaminar2_core GTest::gtest
+    )
+    target_include_directories(v2_integration_parity_qwen36_local_tp_prefix_mtp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36_local_tp_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36_LocalTP
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;LocalTP;RCCL;PyTorch"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
+
+    add_executable(v2_integration_parity_qwen36_local_pp_prefix
+        integration/parity/qwen36/Test__Qwen36_LocalPP_Prefix_Parity.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36_local_pp_prefix
+        llaminar2_core GTest::gtest
+    )
+    target_include_directories(v2_integration_parity_qwen36_local_pp_prefix PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36_local_pp_prefix
+        TEST_PREFIX V2_Integration_Parity_Qwen36_LocalPP
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;RealModel;ROCm;GPU;LocalPP;PyTorch"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
+
+    add_executable(v2_integration_parity_qwen36_node_local_tp_prefix
+        integration/parity/qwen36/Test__Qwen36_NodeLocalTP_Prefix_Parity.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36_node_local_tp_prefix
+        llaminar2_core GTest::gtest
+    )
+    target_include_directories(v2_integration_parity_qwen36_node_local_tp_prefix PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36_node_local_tp_prefix
+        TEST_PREFIX V2_Integration_Parity_Qwen36_NodeLocalTP
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;RealModel;CPU;NodeLocalTP;MPI;PyTorch"
+        MPI_PROCS 2
+        TIMEOUT 2400
+    )
+
+    # =========================================================================
     # Test: Qwen3.5 MoE Parity (Mixture-of-Experts variant)
     #
     # Parity tests for Qwen3.5 MoE (35B-A3B) which replaces dense SwiGLU FFN

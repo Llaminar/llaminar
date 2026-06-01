@@ -1,0 +1,60 @@
+#include "Qwen36DenseParityTestBase.h"
+
+#include "backends/GPUDeviceContextPool.h"
+#include "collective/BackendRouter.h"
+
+#include <unistd.h>
+
+using namespace llaminar2;
+using namespace llaminar2::test::parity::qwen36;
+
+namespace
+{
+    DensePrefixRestoreParityCase singleDeviceCase()
+    {
+        return qwen36DensePrefixParityCase(
+            "Qwen3.6 dense SingleDevice parity",
+            DensePrefixParityTopology::SingleDevice);
+    }
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, PrefixRestoreFullHit)
+{
+    runDensePrefixRestoreParity(singleDeviceCase(), PrefixRestoreParityMode::FullHit);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, PrefixRestorePartialHit)
+{
+    runDensePrefixRestoreParity(singleDeviceCase(), PrefixRestoreParityMode::PartialHit);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, SplitPrefillMatchesPyTorchDecodeTokens)
+{
+    runDenseSplitPrefillParity(singleDeviceCase(), 4);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
+{
+    runDenseMTPParity(singleDeviceCase(), false);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, PrefixCacheMTPRestore)
+{
+    runDenseMTPParity(singleDeviceCase(), true);
+}
+
+int main(int argc, char **argv)
+{
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    ::testing::InitGoogleTest(&argc, argv);
+    int result = RUN_ALL_TESTS();
+
+    GlobalBackendRouter::shutdown();
+    GPUDeviceContextPool::instance().shutdown();
+
+    MPI_Finalize();
+    std::cout.flush();
+    std::cerr.flush();
+    _exit(result);
+}
