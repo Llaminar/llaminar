@@ -454,11 +454,17 @@ namespace llaminar2::test
         ASSERT_FALSE(local_contents.empty()) << local_path;
         ASSERT_FALSE(compute_contents.empty()) << compute_path;
 
-        EXPECT_NE(local_contents.find("std::fill_n(routing_indices, input.live_row_count * static_cast<size_t>(params_.top_k), -1.0f)"),
+        EXPECT_NE(local_contents.find("constexpr int kCompactTopK = 1;"),
+                  std::string::npos);
+        EXPECT_NE(local_contents.find("std::fill_n(routing_indices, active_routes.size() * static_cast<size_t>(kCompactTopK), -1.0f)"),
+                  std::string::npos);
+        EXPECT_NE(local_contents.find("compute_params.top_k = kCompactTopK;"),
                   std::string::npos);
         EXPECT_EQ(local_contents.find("compact_output_->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE"),
                   std::string::npos);
-        EXPECT_NE(compute_contents.find("expert_id < 0 || expert_id >= num_experts || weight == 0.0f"),
+        EXPECT_NE(compute_contents.find("expert_id < 0 || expert_id >= num_experts"),
+                  std::string::npos);
+        EXPECT_NE(compute_contents.find("if (weight == 0.0f)"),
                   std::string::npos);
     }
 
@@ -489,7 +495,7 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(impl_contents.find("contract.addInOut(*params_.dense_output_buffer_id);"),
                   std::string::npos);
-        EXPECT_NE(graph_contents.find("return_params.dense_output_buffer_id = BufferId::MOE_COMBINED_OUTPUT;"),
+        EXPECT_NE(graph_contents.find("return_params.dense_output_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);"),
                   std::string::npos);
     }
 
@@ -648,6 +654,58 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(ffn_body.find("route_params.decode_histogram = mtp_sidecar_context ? nullptr : config_.moe.decode_histogram"),
                   std::string::npos);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, SharedExpertGatePublishesGpuWritesWithStageStreamEvent)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path stage_path = root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        ASSERT_TRUE(fs::exists(stage_path)) << stage_path;
+
+        const std::string contents = readFile(stage_path);
+        ASSERT_FALSE(contents.empty()) << stage_path;
+
+        const size_t execute_start = contents.find("bool SharedExpertGateStage::execute(");
+        ASSERT_NE(execute_start, std::string::npos);
+        const size_t execute_end = contents.find("IMoEKernel *SharedExpertGateStage::ensureMoEKernel()",
+                                                 execute_start);
+        ASSERT_NE(execute_end, std::string::npos);
+        const std::string execute_body = contents.substr(execute_start, execute_end - execute_start);
+
+        const size_t gate_call = execute_body.find("kernel->sharedExpertGateFromTensors(");
+        const size_t publish = execute_body.find("markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream())");
+        const size_t upload_fallback = execute_body.find("params_.shared_output->needsUpload()");
+        ASSERT_NE(gate_call, std::string::npos);
+        ASSERT_NE(publish, std::string::npos);
+        ASSERT_NE(upload_fallback, std::string::npos);
+        EXPECT_LT(gate_call, publish);
+        EXPECT_LT(publish, upload_fallback);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, SharedExpertGroupedDecodePublishesOutputBeforeReturning)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path stage_path = root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        ASSERT_TRUE(fs::exists(stage_path)) << stage_path;
+
+        const std::string contents = readFile(stage_path);
+        ASSERT_FALSE(contents.empty()) << stage_path;
+
+        const size_t execute_start = contents.find("bool SharedExpertFFNStage::execute(");
+        ASSERT_NE(execute_start, std::string::npos);
+        const size_t execute_end = contents.find("IMoEKernel *SharedExpertFFNStage::ensureMoEKernel()",
+                                                 execute_start);
+        ASSERT_NE(execute_end, std::string::npos);
+        const std::string execute_body = contents.substr(execute_start, execute_end - execute_start);
+
+        const size_t grouped_decode = execute_body.find("if (tryGroupedDecode(kernel, d_model, intermediate))");
+        ASSERT_NE(grouped_decode, std::string::npos);
+        const size_t publish = execute_body.find("markGpuTensorWritten(params_.output, params_.device_id, gpuStream())",
+                                                 grouped_decode);
+        const size_t return_true = execute_body.find("return true;", grouped_decode);
+        ASSERT_NE(publish, std::string::npos);
+        ASSERT_NE(return_true, std::string::npos);
+        EXPECT_LT(publish, return_true);
     }
 
 } // namespace llaminar2::test

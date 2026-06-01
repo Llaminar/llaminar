@@ -2421,7 +2421,10 @@ namespace llaminar2
 
         IMoEKernel *kernel = ensureMoEKernel();
         if (tryGroupedDecode(kernel, d_model, intermediate))
+        {
+            markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
             return true;
+        }
 
         // Gate+Up projections via fused multi-projection (quantizes input once)
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
@@ -2648,6 +2651,7 @@ namespace llaminar2
         kernel->sharedExpertGateFromTensors(
             params_.input, params_.gate_inp, params_.shared_output,
             seq_len, d_model);
+        markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream());
 
         if (params_.device_id.is_gpu() && params_.shared_output->needsUpload())
         {
