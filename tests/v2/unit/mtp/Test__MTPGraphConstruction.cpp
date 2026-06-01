@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "backends/ComputeBackend.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "collective/IGlobalTPContext.h"
 #include "collective/ITPContext.h"
 #include "config/TensorParallelConfig.h"
@@ -18,12 +19,18 @@
 #include "models/qwen35/Qwen35Graph.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "tensors/TensorSlice.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/TestTensorFactory.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
+#include <optional>
+#include <string>
 #include <vector>
 
 using namespace llaminar2;
@@ -31,6 +38,52 @@ using namespace llaminar2::test;
 
 namespace
 {
+    class ScopedDebugEnv
+    {
+    public:
+        explicit ScopedDebugEnv(std::initializer_list<std::pair<const char *, const char *>> values)
+        {
+            for (const auto &[name, value] : values)
+            {
+                Entry entry;
+                entry.name = name;
+                if (const char *old_value = std::getenv(name))
+                {
+                    entry.had_value = true;
+                    entry.old_value = old_value;
+                }
+                entries_.push_back(entry);
+                ::setenv(name, value, 1);
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedDebugEnv()
+        {
+            for (const auto &entry : entries_)
+            {
+                if (entry.had_value)
+                    ::setenv(entry.name.c_str(), entry.old_value.c_str(), 1);
+                else
+                    ::unsetenv(entry.name.c_str());
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ScopedDebugEnv(const ScopedDebugEnv &) = delete;
+        ScopedDebugEnv &operator=(const ScopedDebugEnv &) = delete;
+
+    private:
+        struct Entry
+        {
+            std::string name;
+            bool had_value = false;
+            std::string old_value;
+        };
+
+        std::vector<Entry> entries_;
+    };
+
     class GraphConstructionTPContext : public ITPContext
     {
     public:
@@ -673,6 +726,35 @@ namespace
         return max_tokens;
     }
 
+    std::optional<DeviceId> firstAvailableGraphCaptureGPU()
+    {
+        auto &pool = GPUDeviceContextPool::instance();
+        if (pool.hasAMDSupport())
+            return DeviceId::rocm(0);
+        if (pool.hasNvidiaSupport())
+            return DeviceId::cuda(0);
+        return std::nullopt;
+    }
+
+    const PerfStatRecord *findMTPRecord(
+        const std::vector<PerfStatRecord> &records,
+        PerfStatRecord::Kind kind,
+        const std::string &name,
+        const PerfStatsCollector::Tags &tags)
+    {
+        for (const auto &record : records)
+        {
+            if (record.kind == kind &&
+                record.domain == "mtp" &&
+                record.name == name &&
+                record.tags == tags)
+            {
+                return &record;
+            }
+        }
+        return nullptr;
+    }
+
     void prepareDenseForwardWeights(
         const DeviceGraphOrchestrator &orchestrator,
         QwenStandardGraph &graph_builder,
@@ -749,11 +831,12 @@ namespace
     }
 
     std::unique_ptr<FrozenModelWeightSet> makeTinyQwen35MTPFrozenWeightSet(
-        const TinyQwen35MTPForwardFixture &fixture)
+        const TinyQwen35MTPForwardFixture &fixture,
+        DeviceId resident_device = DeviceId::cpu())
     {
         InferenceStrategy strategy;
         strategy.mode = WeightInferenceMode::SingleDevice;
-        strategy.devices.push_back(DeviceId::cpu());
+        strategy.devices.push_back(resident_device);
 
         ModelWeightSetBuilder builder(strategy);
         auto add = [&](const std::string &name, TensorBase *tensor, WeightRole role)
@@ -764,7 +847,7 @@ namespace
             binding.identity.layer = inferWeightLayer(name);
             binding.identity.logical_id = stableWeightLogicalId(name);
             binding.residency.home_device = DeviceId::cpu();
-            binding.residency.resident_device = DeviceId::cpu();
+            binding.residency.resident_device = resident_device;
             binding.tensor = tensor;
             binding.immutable = true;
             builder.addBinding(std::move(binding));
@@ -776,7 +859,7 @@ namespace
             binding.identity.role = role;
             binding.identity.logical_id = stableWeightLogicalId(name);
             binding.residency.home_device = DeviceId::cpu();
-            binding.residency.resident_device = DeviceId::cpu();
+            binding.residency.resident_device = resident_device;
             binding.tensor = tensor;
             binding.immutable = true;
             builder.addBinding(std::move(binding));
@@ -876,9 +959,10 @@ namespace
         return frozen;
     }
 
-    void prepareFrozenGemmWeightsForCPU(
+    void prepareFrozenGemmWeightsForDevice(
         const FrozenModelWeightSet &frozen,
-        PreparedWeightStore &store)
+        PreparedWeightStore &store,
+        DeviceId device)
     {
         for (const auto &source_binding : frozen.bindings())
         {
@@ -891,9 +975,18 @@ namespace
 
             WeightBinding binding = source_binding;
             binding.residency.home_device = DeviceId::cpu();
-            binding.residency.resident_device = DeviceId::cpu();
+            binding.residency.resident_device = device;
+            if (device.is_gpu())
+                ASSERT_TRUE(binding.tensor->ensureOnDevice(device));
             store.prepareGemm(binding);
         }
+    }
+
+    void prepareFrozenGemmWeightsForCPU(
+        const FrozenModelWeightSet &frozen,
+        PreparedWeightStore &store)
+    {
+        prepareFrozenGemmWeightsForDevice(frozen, store, DeviceId::cpu());
     }
 
     void expectSingleTokenKVPayloadNonZero(IKVCache &kv_cache)
@@ -1468,6 +1561,148 @@ TEST(Test__MTPGraphConstruction, Qwen35PrefillPopulatesRealShiftedMTPKVPayload)
     };
     EXPECT_GT(payload_abs_sum(mtp.kvKData(), mtp.layout.bytes_per_fa_layer_k), 0.0f);
     EXPECT_GT(payload_abs_sum(mtp.kvVData(), mtp.layout.bytes_per_fa_layer_v), 0.0f);
+}
+
+TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    float *terminal_hidden = hidden->mutable_data();
+    ASSERT_NE(terminal_hidden, nullptr);
+    for (int i = 0; i < fixture.config.d_model; ++i)
+        terminal_hidden[i] = 0.01f * static_cast<float>((i % 19) + 1);
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/3));
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/4));
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto plain_after_build_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}};
+    const auto plain_reuse_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}};
+
+    const PerfStatRecord *plain_after_build = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_capture_path",
+        plain_after_build_tags);
+    ASSERT_NE(plain_after_build, nullptr);
+    EXPECT_DOUBLE_EQ(plain_after_build->value, 1.0);
+
+    const PerfStatRecord *plain_reuse = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_capture_path",
+        plain_reuse_tags);
+    ASSERT_NE(plain_reuse, nullptr);
+    EXPECT_DOUBLE_EQ(plain_reuse->value, 1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCapture)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    const auto device = firstAvailableGraphCaptureGPU();
+    if (!device.has_value())
+        GTEST_SKIP() << "No GPU backend available for MTP sidecar graph-capture regression";
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.default_device = *device;
+
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        *device));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    float *terminal_hidden = hidden->mutable_data();
+    ASSERT_NE(terminal_hidden, nullptr);
+    for (int i = 0; i < fixture.config.d_model; ++i)
+        terminal_hidden[i] = 0.01f * static_cast<float>((i % 23) + 1);
+    hidden->mark_host_dirty();
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture, *device);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForDevice(*orchestrator.frozenWeightSet(), store, *device);
+    graph_builder->setPreparedWeightStore(&store);
+
+    for (int step = 0; step < 4; ++step)
+    {
+        ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/3 + step))
+            << "MTP sidecar failed at step " << step;
+    }
+
+    const float *logits = orchestrator.mtpLogits();
+    ASSERT_NE(logits, nullptr);
+    float abs_sum = 0.0f;
+    for (int i = 0; i < fixture.config.vocab_size; ++i)
+    {
+        ASSERT_TRUE(std::isfinite(logits[i])) << "non-finite MTP logit at " << i;
+        abs_sum += std::abs(logits[i]);
+    }
+    EXPECT_GT(abs_sum, 0.0f);
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto plain_tags = PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}};
+    const auto segmented_tags = PerfStatsCollector::Tags{{"depth", "0"}, {"path", "segmented"}};
+
+    const PerfStatRecord *plain_path = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_capture_path",
+        plain_tags);
+    ASSERT_NE(plain_path, nullptr);
+    EXPECT_DOUBLE_EQ(plain_path->value, 1.0);
+
+    const PerfStatRecord *segmented_path = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_capture_path",
+        segmented_tags);
+    ASSERT_NE(segmented_path, nullptr);
+    EXPECT_GE(segmented_path->value, 3.0);
+
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__MTPGraphConstruction, GlobalTPMTPSamplingAllgathersShardCandidates)

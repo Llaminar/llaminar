@@ -55,6 +55,16 @@ Latest ROCm dense evidence:
   - Sidecar timing remains small: about 3.43 ms/call in decode.
   - Throughput is essentially unchanged at 7.10 decode tok/s because
     `verifier_forward` remains about 222.5 ms/call.
+- Regression coverage:
+  - `V2_Unit_MTPGraphConstruction` now includes
+    `CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse`, which proves a
+    freshly built MTP sidecar graph records the first execution as
+    `plain_after_build` before reuse.
+  - The same suite includes
+    `GPUSidecarGraphCacheRunsPlainBeforeSegmentedCapture`, which runs the tiny
+    real GPU sidecar path when CUDA/ROCm is visible and asserts one
+    `plain_after_build` execution before segmented graph-capture reuse. The test
+    skips only when no GPU backend is available to the test process.
 
 Next graph-capture questions:
 
