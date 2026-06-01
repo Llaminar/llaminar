@@ -830,6 +830,10 @@ namespace llaminar2
         void applyExpertMasks(
             const std::vector<std::vector<bool>> &masks,
             const ReceivedWeightsMap &received_weights = {});
+        void applyExpertMasksForDomain(
+            const std::string &domain_id,
+            const std::vector<std::vector<bool>> &masks,
+            const ReceivedWeightsMap &received_weights = {});
 
         /// Non-destructively collect packed expert weights for experts requested
         /// by masks. Used for intra-rank migration between composed TP domains

@@ -2565,13 +2565,14 @@ namespace llaminar2
 
     void OrchestrationRunner::applyMoEExpertMasks(
         const std::vector<std::vector<bool>> &masks,
-        const ReceivedWeightsMap &received)
+        const ReceivedWeightsMap &received,
+        const std::string &domain_id)
     {
         if (runner_)
         {
             if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner_.get()))
             {
-                dgo->applyExpertMasks(masks, received);
+                dgo->applyExpertMasksForDomain(domain_id, masks, received);
             }
         }
     }
@@ -2590,13 +2591,14 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
-        const std::vector<std::vector<std::vector<bool>>> &masks_by_participant)
+        const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
+        const std::string &domain_id)
     {
         if (!runner_)
             return false;
         if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
         {
-            rank->applyMoEExpertMasksForAllDevices(masks_by_participant);
+            rank->applyMoEExpertMasksForAllDevices(masks_by_participant, domain_id);
             return true;
         }
         return false;
@@ -2708,16 +2710,16 @@ namespace llaminar2
         const int participant_id = mpi_ctx_ ? mpi_ctx_->local_rank() : 0;
         if (!gpu_cache_masks_by_participant.empty())
         {
-            if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks_by_participant))
+            if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks_by_participant, controller->domainId()))
             {
                 if (participant_id >= 0 && participant_id < static_cast<int>(gpu_cache_masks_by_participant.size()))
-                    applyMoEExpertMasks(gpu_cache_masks_by_participant[participant_id], received);
+                    applyMoEExpertMasks(gpu_cache_masks_by_participant[participant_id], received, controller->domainId());
             }
         }
         else if (!applyMoEExpertMasksForAllLocalDevices(*controller))
         {
             auto masks = controller->computeExpertMasksForParticipant(participant_id);
-            applyMoEExpertMasks(masks, received);
+            applyMoEExpertMasks(masks, received, controller->domainId());
         }
 
         if (controller->hasReplicas())

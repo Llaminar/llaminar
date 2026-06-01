@@ -3739,7 +3739,7 @@ namespace llaminar2
         if (gpu_cache_experts > 0)
         {
             auto masks_by_participant = controller.computeGpuCacheExpertMasks(gpu_cache_experts);
-            applyMoEExpertMasksForAllDevices(masks_by_participant);
+            applyMoEExpertMasksForAllDevices(masks_by_participant, controller.domainId());
             return;
         }
 
@@ -3748,11 +3748,12 @@ namespace llaminar2
         for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
             masks_by_participant.push_back(controller.computeExpertMasksForParticipant(static_cast<int>(device_idx)));
 
-        applyMoEExpertMasksForAllDevices(masks_by_participant);
+        applyMoEExpertMasksForAllDevices(masks_by_participant, controller.domainId());
     }
 
     void RankOrchestrator::applyMoEExpertMasksForAllDevices(
-        const std::vector<std::vector<std::vector<bool>>> &masks_by_participant)
+        const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
+        const std::string &domain_id)
     {
         int applied = 0;
         std::vector<DeviceGraphOrchestrator *> local_dgos;
@@ -3799,7 +3800,7 @@ namespace llaminar2
             if (!dgo)
                 continue;
 
-            dgo->applyExpertMasks(masks_by_participant[device_idx], received_by_device[device_idx]);
+            dgo->applyExpertMasksForDomain(domain_id, masks_by_participant[device_idx], received_by_device[device_idx]);
             ++applied;
         }
 
@@ -3809,7 +3810,7 @@ namespace llaminar2
             {
                 if (auto *rank = dynamic_cast<RankOrchestrator *>(runner.get()))
                 {
-                    rank->applyMoEExpertMasksForAllDevices(masks_by_participant);
+                    rank->applyMoEExpertMasksForAllDevices(masks_by_participant, domain_id);
                     ++applied;
                     continue;
                 }
@@ -3817,7 +3818,7 @@ namespace llaminar2
                 {
                     if (!masks_by_participant.empty())
                     {
-                        dgo->applyExpertMasks(masks_by_participant.front(), ReceivedWeightsMap{});
+                        dgo->applyExpertMasksForDomain(domain_id, masks_by_participant.front(), ReceivedWeightsMap{});
                         ++applied;
                     }
                 }

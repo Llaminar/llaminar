@@ -113,6 +113,30 @@ namespace llaminar2
             return false;
         }
 
+        void validateMoERebalanceDomain(
+            const DeviceGraphOrchestrator &orchestrator,
+            const std::string &domain_id,
+            const char *operation)
+        {
+            if (domain_id.empty())
+                return;
+
+            const auto *controller = orchestrator.moeRebalanceController();
+            if (!controller)
+            {
+                throw std::runtime_error(
+                    std::string(operation) + " rejected for MoE rebalance domain '" +
+                    domain_id + "': runner has no domain controller");
+            }
+
+            if (controller->domainId() != domain_id)
+            {
+                throw std::runtime_error(
+                    std::string(operation) + " rejected for MoE rebalance domain '" +
+                    domain_id + "': runner owns domain '" + controller->domainId() + "'");
+            }
+        }
+
         struct GreedyLogitCandidate
         {
             float value = 0.0f;
@@ -5315,7 +5339,16 @@ namespace llaminar2
         const std::vector<std::vector<bool>> &masks,
         const ReceivedWeightsMap &received_weights)
     {
+        applyExpertMasksForDomain({}, masks, received_weights);
+    }
+
+    void DeviceGraphOrchestrator::applyExpertMasksForDomain(
+        const std::string &domain_id,
+        const std::vector<std::vector<bool>> &masks,
+        const ReceivedWeightsMap &received_weights)
+    {
         auto t_start = std::chrono::high_resolution_clock::now();
+        validateMoERebalanceDomain(*this, domain_id, "applyExpertMasks");
 
         // Lazily initialize payload provider on first mask application
         if (!expert_payload_provider_)
@@ -5456,6 +5489,8 @@ namespace llaminar2
     void DeviceGraphOrchestrator::setExpertReplicaSetForParticipant(
         const ExpertReplicaSet &replicas, int participant_id)
     {
+        validateMoERebalanceDomain(*this, replicas.domain_id, "setExpertReplicaSetForParticipant");
+
         int count = 0;
         if (forward_engine_)
         {

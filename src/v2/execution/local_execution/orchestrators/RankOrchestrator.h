@@ -743,7 +743,8 @@ namespace llaminar2
             const std::string &domain_id) const override;
         void applyMoEExpertMasksForAllDevices(const MoERebalanceController &controller);
         void applyMoEExpertMasksForAllDevices(
-            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant);
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
+            const std::string &domain_id = {});
         void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
 
     private:

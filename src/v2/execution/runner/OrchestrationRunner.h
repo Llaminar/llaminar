@@ -216,7 +216,8 @@ namespace llaminar2
         /// Apply rebalanced expert masks to DGO's cached MoEExpertComputeStages
         void applyMoEExpertMasks(
             const std::vector<std::vector<bool>> &masks,
-            const ReceivedWeightsMap &received = {});
+            const ReceivedWeightsMap &received = {},
+            const std::string &domain_id = {});
 
         /// Apply MoE masks to every local device runner when the underlying
         /// runner is a RankOrchestrator. Returns true if handled.
@@ -225,7 +226,8 @@ namespace llaminar2
         /// Apply precomputed MoE masks to every local device runner when the
         /// underlying runner is a RankOrchestrator. Returns true if handled.
         bool applyMoEExpertMasksForAllLocalDevices(
-            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant);
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
+            const std::string &domain_id = {});
 
         /// Set expert replica info for per-token dynamic dispatch
         void setExpertReplicaSet(const ExpertReplicaSet &replicas, int participant_id);

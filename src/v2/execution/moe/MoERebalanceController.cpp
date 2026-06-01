@@ -121,7 +121,8 @@ namespace llaminar2
 
     bool ExpertReplicaSet::sameReplicaPlacement(const ExpertReplicaSet &other) const
     {
-        return num_replicated == other.num_replicated &&
+        return domain_id == other.domain_id &&
+               num_replicated == other.num_replicated &&
                num_sockets == other.num_sockets &&
                is_replicated == other.is_replicated &&
                owner_socket == other.owner_socket;
@@ -130,6 +131,7 @@ namespace llaminar2
     ExpertReplicaSet ExpertReplicaSet::arrivalsSince(const ExpertReplicaSet &previous) const
     {
         ExpertReplicaSet arrivals;
+        arrivals.domain_id = domain_id;
         arrivals.is_replicated.assign(is_replicated.size(), false);
         arrivals.owner_socket = owner_socket;
         arrivals.num_sockets = num_sockets;
@@ -163,6 +165,8 @@ namespace llaminar2
           current_placement_(config_.initial_expert_to_socket),
           current_window_size_(config_.window_size)
     {
+        current_replicas_.domain_id = config_.domain_id;
+
         if (config_.mode == MoERebalanceMode::DYNAMIC && config_.sockets.size() < 2)
         {
             config_.mode = MoERebalanceMode::OBSERVE;
@@ -591,6 +595,7 @@ namespace llaminar2
     ExpertReplicaSet MoERebalanceController::proposeReplicas(int max_replicas_per_socket)
     {
         ExpertReplicaSet result;
+        result.domain_id = config_.domain_id;
         result.is_replicated.resize(config_.num_experts, false);
         result.owner_socket = current_placement_;
         result.num_replicated = 0;

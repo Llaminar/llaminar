@@ -198,6 +198,29 @@ TEST(Test__MoERebalanceController, ParticipantVocabularyAliasesLegacySocketState
     EXPECT_TRUE(participant_replicas.sameReplicaPlacement(legacy_replicas));
 }
 
+TEST(Test__MoERebalanceController, ReplicaSetsCarryDomainId)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
+                          /*num_layers=*/2, /*top_k=*/2, /*window_size=*/16);
+    cfg.domain_id = "expert_hot";
+    MoERebalanceController ctrl(cfg);
+
+    fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
+    const auto replicas = ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+    ASSERT_GT(replicas.num_replicated, 0);
+    EXPECT_EQ(replicas.domain_id, "expert_hot");
+
+    const auto arrivals = replicas.arrivalsSince(ExpertReplicaSet{});
+    EXPECT_EQ(arrivals.domain_id, "expert_hot");
+
+    auto same_domain = replicas;
+    EXPECT_TRUE(replicas.sameReplicaPlacement(same_domain));
+
+    auto other_domain = replicas;
+    other_domain.domain_id = "expert_cold";
+    EXPECT_FALSE(replicas.sameReplicaPlacement(other_domain));
+}
+
 TEST(Test__MoERebalanceController, ShouldRebalance_WindowNotFull)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);

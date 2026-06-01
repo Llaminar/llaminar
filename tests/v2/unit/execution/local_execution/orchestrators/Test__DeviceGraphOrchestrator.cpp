@@ -31,6 +31,7 @@
 #include "tensors/TensorFactory.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -1052,6 +1053,36 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped
     EXPECT_EQ(controllers.front(), controller_ptr);
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("single_cpu_moe"), controller_ptr);
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("other_domain"), nullptr);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceDomainMismatchFailsBeforeMutation)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+
+    auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::OBSERVE);
+    controller_config.domain_id = "single_cpu_moe";
+    orchestrator->setMoERebalanceController(
+        std::make_unique<MoERebalanceController>(controller_config));
+
+    ASSERT_EQ(orchestrator->expertPayloadProvider(), nullptr);
+
+    const std::vector<std::vector<bool>> masks = {
+        std::vector<bool>(static_cast<size_t>(controller_config.num_experts), true)};
+    EXPECT_THROW(
+        orchestrator->applyExpertMasksForDomain("other_domain", masks, ReceivedWeightsMap{}),
+        std::runtime_error);
+    EXPECT_EQ(orchestrator->expertPayloadProvider(), nullptr)
+        << "domain validation must happen before payload-provider initialization or mask mutation";
+
+    ExpertReplicaSet replicas;
+    replicas.domain_id = "other_domain";
+    EXPECT_THROW(
+        orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0),
+        std::runtime_error);
+
+    replicas.domain_id = "single_cpu_moe";
+    EXPECT_NO_THROW(
+        orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0));
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateDefaultsSafeWithoutMoE)

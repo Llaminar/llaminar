@@ -29,6 +29,7 @@ namespace llaminar2
     /// per-token dynamic dispatch decides which socket computes each one.
     struct ExpertReplicaSet
     {
+        std::string domain_id;          ///< ExpertParallel domain this replica set belongs to.
         std::vector<bool> is_replicated; ///< [num_experts] true if on both sockets
         std::vector<int> owner_socket;   ///< [num_experts] primary owner socket
         int num_replicated = 0;          ///< Count of replicated experts
