@@ -186,6 +186,45 @@ namespace
         return d_output.toHost();
     }
 
+    /// @brief Runs one in-place short-conv decode step and returns output plus exported GPU state.
+    std::pair<std::vector<float>, std::vector<float>> runInPlaceConvDecodeAndExportState(
+        llaminar2::IHybridKVCache *cache, int layer, const std::vector<float> &input)
+    {
+        auto *state = cache->getGDNState(layer);
+        if (!state || !state->conv_kernel || state->conv_kernel_size <= 1 || state->conv_state.empty())
+            throw std::runtime_error("invalid GDN convolution state in ROCm hybrid KV cache test");
+
+        const int kernel_size = state->conv_kernel_size;
+        const int state_len = kernel_size - 1;
+        const int channels = static_cast<int>(input.size());
+        if (state->conv_state.size() != static_cast<size_t>(channels * state_len))
+            throw std::runtime_error("in-place short-conv test input does not match cache state shape");
+
+        std::vector<float> weight(static_cast<size_t>(channels) * static_cast<size_t>(kernel_size), 0.0f);
+        for (int c = 0; c < channels; ++c)
+            weight[static_cast<size_t>(c) * kernel_size + state_len] = 2.0f;
+
+        HipFloatBuffer d_input_output(input);
+        HipFloatBuffer d_weight(weight);
+
+        state->conv_kernel->setGPUStream(nullptr);
+        if (!state->conv_kernel->allocateGPUScratch(channels))
+            throw std::runtime_error("failed to allocate in-place short-conv scratch");
+        if (!state->conv_kernel->forward(
+                d_input_output.ptr, d_weight.ptr, nullptr,
+                d_input_output.ptr, state->conv_state.data(),
+                /*seq_len=*/1, channels, kernel_size,
+                /*apply_silu=*/false))
+            throw std::runtime_error("in-place short-conv decode failed");
+        if (hipDeviceSynchronize() != hipSuccess)
+            throw std::runtime_error("in-place short-conv decode did not synchronize successfully");
+
+        std::vector<float> exported_state(state->conv_state.size());
+        if (!state->conv_kernel->exportState(exported_state.data(), nullptr, nullptr))
+            throw std::runtime_error("failed to export in-place short-conv GPU state");
+        return {d_input_output.toHost(), exported_state};
+    }
+
     /// @brief Runs one ROCm GDN recurrence decode step and returns the host output.
     std::vector<float> runRecurrenceDecode(llaminar2::IHybridKVCache *cache, int layer, float seed)
     {
@@ -306,6 +345,42 @@ TEST(Test__ROCmHybridKVCacheReset, ClearLayerResetsGDNGPUKernelState)
     auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 4.5f);
     auto fresh_rec = runRecurrenceDecode(fresh.hybrid, /*layer=*/0, 4.5f);
     expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after clear_layer vs fresh");
+}
+
+TEST(Test__ROCmHybridKVCacheReset, InPlaceShortConvDecodeStoresRawProjectionInGPUState)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    auto cache = createHybridCache();
+    auto *state = cache.hybrid->getGDNState(0);
+    ASSERT_NE(state, nullptr);
+    ASSERT_EQ(state->conv_kernel_size, 3);
+
+    const int state_len = state->conv_kernel_size - 1;
+    ASSERT_GT(state_len, 0);
+    ASSERT_EQ(state->conv_state.size() % static_cast<size_t>(state_len), 0u);
+    const int channels = static_cast<int>(state->conv_state.size() / static_cast<size_t>(state_len));
+    ASSERT_GT(channels, 0);
+
+    std::vector<float> input(static_cast<size_t>(channels));
+    for (int c = 0; c < channels; ++c)
+        input[static_cast<size_t>(c)] = 0.25f * static_cast<float>(c + 1);
+
+    const auto [output, exported_state] =
+        runInPlaceConvDecodeAndExportState(cache.hybrid, /*layer=*/0, input);
+
+    ASSERT_EQ(output.size(), input.size());
+    ASSERT_EQ(exported_state.size(), input.size() * static_cast<size_t>(state_len));
+    for (size_t c = 0; c < input.size(); ++c)
+    {
+        EXPECT_FLOAT_EQ(output[c], 2.0f * input[c])
+            << "in-place decode output for channel " << c;
+        EXPECT_FLOAT_EQ(exported_state[c * static_cast<size_t>(state_len)], 0.0f)
+            << "history slot 0 for channel " << c;
+        EXPECT_FLOAT_EQ(exported_state[c * static_cast<size_t>(state_len) + static_cast<size_t>(state_len - 1)], input[c])
+            << "decode must store the raw QKV projection, not the in-place output, for channel " << c;
+    }
 }
 
 TEST(Test__ROCmHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostAndGPUStateAndPreservesKernels)

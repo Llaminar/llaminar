@@ -156,7 +156,7 @@ namespace
     {
         OrchestrationConfig config = makeSingleGpuPrefixCacheConfig(device_spec);
         config.prefix_cache.storage_mode = PrefixCacheStorageMode::Tiered;
-        config.prefix_cache.ram_budget_bytes = 1ull * 1024ull * 1024ull;
+        config.prefix_cache.ram_budget_bytes = 640ull * 1024ull;
         config.prefix_cache.device_budget_bytes = 0;
         config.prefix_cache.disk_budget_bytes = 32ull * 1024ull * 1024ull;
         config.prefix_cache.disk_dir = disk_dir.string();
@@ -169,7 +169,7 @@ namespace
     {
         OrchestrationConfig config = makeSingleGpuPrefixCacheConfig(device_spec);
         config.prefix_cache.storage_mode = PrefixCacheStorageMode::Tiered;
-        config.prefix_cache.ram_budget_bytes = 1ull * 1024ull * 1024ull;
+        config.prefix_cache.ram_budget_bytes = 640ull * 1024ull;
         config.prefix_cache.device_budget_bytes = 32ull * 1024ull * 1024ull;
         config.prefix_cache.disk_budget_bytes = 32ull * 1024ull * 1024ull;
         config.prefix_cache.disk_dir = disk_dir.string();

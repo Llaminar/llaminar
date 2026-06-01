@@ -9,6 +9,20 @@ The central design decision is that both features use the same state contract. F
 
 The phases below are ordered to keep correctness ahead of performance. Each phase includes goal, implementation details, files, tests, and exit criteria inline.
 
+## Current Phase Audit Status
+
+This section is updated as phases are proven against the current worktree. A phase is marked complete only when its exit criteria have direct evidence from code plus focused tests. Synthetic/unit evidence is acceptable for CPU-side contracts; GPU, parity, and benchmark claims require focused integration, real-model parity, or benchmark evidence.
+
+| Phase | Status | Current Evidence | Remaining Gate |
+|-------|--------|------------------|----------------|
+| Phase 1: Config, Feature Gates, And Fingerprints | Complete | `Test__PrefixMTPConfig` verifies disabled defaults, CLI/YAML parsing, invalid enum rejection, config propagation into `RuntimeConfig`/`RankExecutionPlan`/`GraphConfig`, and explanation output for dry-run/placement-style reporting. `Test__PrefixCacheFingerprint` verifies deterministic named-part fingerprints, field sensitivity, MoE bypass policy, rebalance epoch key changes, and histogram exclusion. Direct focused binaries passed on 2026-06-01: `v2_test_prefix_mtp_config`, `v2_test_prefix_cache_fingerprint`. | None. |
+| Phase 2: IKVCache Logical Snapshot Contract | Complete | CPU logical block export/import/truncate is implemented and covered by `Test__IKVCacheLogicalBlockIO`. CUDA and ROCm logical export/import are covered by focused integration tests. Focused CTest passed on 2026-06-01: `V2_Unit_IKVCacheLogicalBlockIO`, `V2_Integration_CUDARingKVCache_LogicalBlockIO`, `V2_Integration_ROCmRingKVCache_LogicalBlockIO`. | None. |
+| Phase 3: Prefix Store, Payload Layout, And Arena Staging | Complete | Prefix hash/key, RAM backend, LRU/cache stats, disk checksum round-trip, disk hydration/failure handling, and arena staging ids are implemented. Direct focused binaries passed on 2026-06-01: `v2_test_prefix_block_hash`, `v2_test_prefix_cache_key`, `v2_test_ram_prefix_storage_backend`, `v2_test_prefix_state_cache_lru`, `v2_test_disk_prefix_storage_backend`, `v2_test_prefix_arena_staging`. | None for the listed Phase 3 unit gates. Device-hot remains a later GPU integration/benchmark tier gate. |
+| Phase 4: Dense Prefix Cache End To End | Complete | Dense prefix request control flow, terminal-logit full hits, final-block recompute, MTP-hidden boundary recompute, suffix chunk scheduling, and logical summary counters are covered by `V2_Unit_PrefixCachePrefillFlow`. Dense real-runner prefix reuse, GPU device-hot promotion, disk hydration, GPU cache flag preservation, and MTP probe scaffolding are covered by `V2_Integration_PrefixCacheStateProbe`. Real-model CPU prefix, partial-prefix, and split-prefill smoke parity are covered by `V2_Integration_Parity_PrefixCacheMTP_Qwen35CPUPrefixSmoke`, `V2_Integration_Parity_PrefixCacheMTP_Qwen35CPUPartialPrefixSmoke`, and `V2_Integration_Parity_PrefixCacheMTP_Qwen35CPUSplitPrefillSmoke`. Focused CTest passed on 2026-06-01. | None for dense RAM/device-hot/disk prefix-cache gates. Hybrid, MTP, TP, and MoE behavior remain later-phase gates. |
+| Phase 5 and later | Not yet audited complete | Implementation and tests exist for multiple later phases, but they have not yet been accepted by this phase-by-phase audit. | Continue from Phase 5 MTP loading, sidecar graph, shifted cache, and real-model parity gates. |
+
+Note: CTest wraps these unit and integration binaries in `mpirun -np 1` in the current build. Inside the filesystem sandbox, PMIx socket setup can fail before test assertions. The CTest evidence above was collected by running the same focused CTest commands outside the sandbox; direct focused binaries were used only as the first debugging step where noted.
+
 ## Guiding Constraints
 
 - Graphs remain per-device and symmetric. Do not introduce nested multi-device subgraphs for prefix caching or MTP.

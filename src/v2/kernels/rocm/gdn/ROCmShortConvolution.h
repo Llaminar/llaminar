@@ -129,17 +129,17 @@ namespace llaminar2
             float *effective_state = gpu_state_;
             float *effective_output = output;
 
-            // Prefill is parallel over time. When QKV is processed in-place,
-            // writing output[t] can clobber input values that another timestep
-            // still needs for its causal window. Decode has only one timestep,
-            // so it remains safe to write directly in-place.
-            const bool needs_scratch = (seq_len > 1 && input == output);
+            // GDN QKV short-conv is commonly in-place. Prefill needs scratch
+            // so one timestep cannot clobber another; decode also needs it so
+            // the history update stores the raw projection, not the convolved
+            // output row.
+            const bool needs_scratch = (input == output);
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
                 if (!scratchPointer() || scratchCapacity() < required_scratch_size)
                 {
-                    LOG_ERROR("[ROCmShortConvolution] In-place prefill scratch was not preallocated: need "
+                    LOG_ERROR("[ROCmShortConvolution] In-place short-conv scratch was not preallocated: need "
                               << required_scratch_size << " floats, have " << scratchCapacity());
                     return false;
                 }
@@ -181,13 +181,13 @@ namespace llaminar2
             }
 
             float *effective_output = output;
-            const bool needs_scratch = (seq_len > 1 && input == output);
+            const bool needs_scratch = (input == output);
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
                 if (!scratchPointer() || scratchCapacity() < required_scratch_size)
                 {
-                    LOG_ERROR("[ROCmShortConvolution] In-place prefill scratch was not preallocated: need "
+                    LOG_ERROR("[ROCmShortConvolution] In-place short-conv scratch was not preallocated: need "
                               << required_scratch_size << " floats, have " << scratchCapacity());
                     return false;
                 }

@@ -90,6 +90,11 @@ Examples:
         action="store_true",
         help="Verbose logging",
     )
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Write metadata.txt with prompt/decode tokens without saving .npy snapshots",
+    )
 
     args = parser.parse_args()
 
@@ -101,6 +106,7 @@ Examples:
     print(f"  Prompt: '{args.prompt}'")
     print(f"  Output: {args.output}")
     print(f"  Decode steps: {args.decode_steps}")
+    print(f"  Metadata only: {args.metadata_only}")
 
     # Create and load model via registry
     print("\nLoading model...")
@@ -114,6 +120,7 @@ Examples:
         args.decode_steps,
         args.output,
         verbose=args.verbose,
+        save_snapshots=not args.metadata_only,
     )
 
     # Write metadata

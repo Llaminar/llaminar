@@ -59,8 +59,6 @@ namespace llaminar2
             return reqs;
 
         const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
-        if (max_seq_len <= 1)
-            return reqs;
 
         const size_t bytes = static_cast<size_t>(max_seq_len) *
                              static_cast<size_t>(params_.channels) * sizeof(float);

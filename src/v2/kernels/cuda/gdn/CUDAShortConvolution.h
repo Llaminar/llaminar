@@ -143,16 +143,17 @@ namespace llaminar2
             float *effective_state = gpu_state_;
             float *effective_output = output;
 
-            // Prefill runs one thread per timestep/channel. In-place output can
-            // overwrite an input timestep before another thread reads it, so use
-            // persistent scratch only for the in-place prefill case.
-            const bool needs_scratch = (seq_len > 1 && input == output);
+            // GDN QKV short-conv is commonly in-place. Prefill needs scratch
+            // so one timestep cannot clobber another; decode also needs it so
+            // the history update stores the raw projection, not the convolved
+            // output row.
+            const bool needs_scratch = (input == output);
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
                 if (!scratchPointer() || scratchCapacity() < required_scratch_size)
                 {
-                    LOG_ERROR("[CUDAShortConvolution] In-place prefill scratch was not preallocated: need "
+                    LOG_ERROR("[CUDAShortConvolution] In-place short-conv scratch was not preallocated: need "
                               << required_scratch_size << " floats, have " << scratchCapacity());
                     return false;
                 }
@@ -204,13 +205,13 @@ namespace llaminar2
             float *effective_state = gpu_state_;
             float *effective_output = output;
 
-            const bool needs_scratch = (seq_len > 1 && input == output);
+            const bool needs_scratch = (input == output);
             if (needs_scratch)
             {
                 const int required_scratch_size = seq_len * channels;
                 if (!scratchPointer() || scratchCapacity() < required_scratch_size)
                 {
-                    LOG_ERROR("[CUDAShortConvolution] In-place prefill scratch was not preallocated: need "
+                    LOG_ERROR("[CUDAShortConvolution] In-place short-conv scratch was not preallocated: need "
                               << required_scratch_size << " floats, have " << scratchCapacity());
                     return false;
                 }

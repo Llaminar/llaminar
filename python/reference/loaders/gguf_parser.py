@@ -68,6 +68,7 @@ class GGUFTensorType(IntEnum):
     IQ2_S = 22
     IQ4_XS = 23
     IQ1_M = 29
+    BF16 = 30
 
 
 class GGUFTensorInfo:
@@ -95,7 +96,7 @@ class GGUFTensorInfo:
     @property
     def is_quantized(self) -> bool:
         """Check if tensor uses quantized format"""
-        return self.type not in (GGUFTensorType.F32, GGUFTensorType.F16)
+        return self.type not in (GGUFTensorType.F32, GGUFTensorType.F16, GGUFTensorType.BF16)
     
     def __repr__(self) -> str:
         return f"GGUFTensorInfo(name={self.name}, shape={self.shape}, type={self.type.name})"
@@ -369,13 +370,20 @@ class GGUFParser:
         # Type size lookup table (bytes per element or block)
         if tensor_type == GGUFTensorType.F32:
             return n_elements * 4
-        elif tensor_type == GGUFTensorType.F16:
+        elif tensor_type in (GGUFTensorType.F16, GGUFTensorType.BF16):
             return n_elements * 2
         elif tensor_type == GGUFTensorType.Q4_0:
             # Q4_0: 32 elements per block, 18 bytes per block (2 scale + 16 data)
             block_size = 32
             n_blocks = (n_elements + block_size - 1) // block_size
             return n_blocks * 18
+        elif tensor_type == GGUFTensorType.Q2_K:
+            # Q2_K: 256 elements per row super-block, 84 bytes per block.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 84
         elif tensor_type == GGUFTensorType.Q8_0:
             # Q8_0: 32 elements per block, 34 bytes per block (2 scale + 32 data)
             block_size = 32
@@ -414,6 +422,13 @@ class GGUFParser:
             rows = n_elements // cols if cols else 0
             n_blocks = rows * ((cols + block_size - 1) // block_size)
             return n_blocks * 110
+        elif tensor_type == GGUFTensorType.IQ2_S:
+            # IQ2_S: 256 elements per row super-block, 82 bytes per block.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 82
         elif tensor_type == GGUFTensorType.IQ3_XXS:
             # IQ3_XXS: 256 elements per row super-block, 98 bytes per block.
             # Use the fastest-varying dimension so row padding is accounted for.
@@ -422,6 +437,13 @@ class GGUFParser:
             rows = n_elements // cols if cols else 0
             n_blocks = rows * ((cols + block_size - 1) // block_size)
             return n_blocks * 98
+        elif tensor_type == GGUFTensorType.IQ4_XS:
+            # IQ4_XS: 256 elements per row super-block, 136 bytes per block.
+            block_size = 256
+            cols = tensor_info.shape[-1] if tensor_info.shape else n_elements
+            rows = n_elements // cols if cols else 0
+            n_blocks = rows * ((cols + block_size - 1) // block_size)
+            return n_blocks * 136
         else:
             # For other types, estimate conservatively
             # Most quantized types use 2-8 bits per value

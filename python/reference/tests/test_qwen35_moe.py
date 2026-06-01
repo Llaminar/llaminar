@@ -15,6 +15,9 @@ Unit tests (no model files required):
 import pytest
 import torch
 import numpy as np
+import subprocess
+import sys
+from pathlib import Path
 
 from python.reference.loaders.gguf_loader import GGUFLoader
 from python.reference.loaders.tensor_name_mapper import (
@@ -54,6 +57,32 @@ def _make_loader():
 def _forward_reorder(tensor, dim, num_k, num_v_per_k, head_dim):
     """Simulate the converter's forward V-head reorder (grouped→tiled)."""
     return GGUFLoader._reorder_v_heads(tensor, dim, num_k, num_v_per_k, head_dim)
+
+
+def test_moe_snapshot_generator_help_exposes_metadata_only():
+    """MoE parity can refresh token metadata without writing full snapshot payloads."""
+    script = Path(__file__).resolve().parents[1] / "generate_qwen35_moe_pipeline_snapshots.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "--metadata-only" in result.stdout
+
+
+def test_bf16_gguf_tensor_type_dequantizes_to_fp32():
+    """Qwen3.6 MoE GGUFs may contain BF16 tensors in an otherwise IQ file."""
+    from python.reference.loaders.gguf_parser import GGUFTensorType
+    from python.reference.loaders import dequantize
+
+    raw_bf16 = np.array([0x3F80, 0xBF80, 0x4000], dtype="<u2").tobytes()
+    out = dequantize.dequantize(raw_bf16, GGUFTensorType(30), (3,))
+
+    assert GGUFTensorType(30) == GGUFTensorType.BF16
+    assert out.dtype == np.float32
+    np.testing.assert_allclose(out, np.array([1.0, -1.0, 2.0], dtype=np.float32))
 
 
 # ---------------------------------------------------------------------------

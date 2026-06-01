@@ -24,8 +24,11 @@ from python.reference.loaders.dequantize import (
     dequantize_q4_1,
     dequantize_q5_0,
     dequantize_q6_k,
+    dequantize_q2_k,
+    dequantize_iq2_s,
     dequantize_iq3_s,
     dequantize_iq3_xxs,
+    dequantize_iq4_xs,
     dequantize_q8_0,
     dequantize_f16,
     dequantize_f32,
@@ -289,6 +292,63 @@ class TestIQ3SDequantization(unittest.TestCase):
         self.assertTrue(np.allclose(result[256:300], 2.0))
         self.assertTrue(np.allclose(result[300:556], 3.0))
         self.assertTrue(np.allclose(result[556:600], 4.0))
+
+
+class TestQwen36MoEQuantizationFormats(unittest.TestCase):
+    """Test the GGUF formats used by the Qwen3.6 MoE IQ model."""
+
+    def test_q2_k_zero_block(self):
+        result = dequantize_q2_k(bytes(84), (256,))
+
+        self.assertEqual(result.shape, (256,))
+        self.assertTrue(np.all(np.isfinite(result)))
+        self.assertTrue(np.allclose(result, 0.0))
+
+    def test_iq2_s_zero_block(self):
+        result = dequantize_iq2_s(bytes(82), (256,))
+
+        self.assertEqual(result.shape, (256,))
+        self.assertTrue(np.all(np.isfinite(result)))
+        self.assertTrue(np.allclose(result, 0.0))
+
+    def test_iq4_xs_zero_block(self):
+        result = dequantize_iq4_xs(bytes(136), (256,))
+
+        self.assertEqual(result.shape, (256,))
+        self.assertTrue(np.all(np.isfinite(result)))
+        self.assertTrue(np.allclose(result, 0.0))
+
+    def test_row_padding_dispatch_for_qwen36_moe_formats(self):
+        cases = [
+            (GGUFTensorType.Q2_K, 84),
+            (GGUFTensorType.IQ2_S, 82),
+            (GGUFTensorType.IQ4_XS, 136),
+        ]
+
+        for tensor_type, block_bytes in cases:
+            with self.subTest(tensor_type=tensor_type.name):
+                data = bytes(block_bytes * 4)
+                result = dequantize(data, tensor_type, (2, 300))
+
+                self.assertEqual(result.shape, (2, 300))
+                self.assertTrue(np.all(np.isfinite(result)))
+                self.assertTrue(np.allclose(result, 0.0))
+
+    def test_quantization_info_for_qwen36_moe_formats(self):
+        expected = {
+            GGUFTensorType.Q2_K: (84, 2.625),
+            GGUFTensorType.IQ2_S: (82, 2.5625),
+            GGUFTensorType.IQ4_XS: (136, 4.25),
+        }
+
+        for tensor_type, (block_bytes, bits_per_weight) in expected.items():
+            with self.subTest(tensor_type=tensor_type.name):
+                info = get_quantization_info(tensor_type)
+
+                self.assertEqual(info["block_size"], 256)
+                self.assertEqual(info["block_bytes"], block_bytes)
+                self.assertEqual(info["bits_per_weight"], bits_per_weight)
+                self.assertIn(tensor_type.name, info["name"])
 
 
 class TestIQ3XXSDequantization(unittest.TestCase):

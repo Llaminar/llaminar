@@ -200,3 +200,38 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     EXPECT_EQ(graph_config.mtp.draft_tokens, 2);
     EXPECT_EQ(graph_config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
 }
+
+TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings)
+{
+    OrchestrationConfig config;
+    config.prefix_cache.enabled = true;
+    config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+    config.prefix_cache.block_size = 24;
+    config.prefix_cache.ram_budget_bytes = 99;
+    config.prefix_cache.device_budget_bytes = 77;
+    config.prefix_cache.disk_budget_bytes = 55;
+    config.prefix_cache.disk_dir = "/tmp/unit-prefix";
+    config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Always;
+    config.prefix_cache.moe_policy = PrefixCacheMoEPolicy::InvalidateOnRebalance;
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 2;
+    config.mtp.verify_mode = MTPVerifyMode::Greedy;
+    config.mtp.require_terminal_hidden_for_full_hit = false;
+
+    const std::string explanation = config.toString();
+
+    EXPECT_NE(explanation.find("prefix_cache:"), std::string::npos);
+    EXPECT_NE(explanation.find("enabled: true"), std::string::npos);
+    EXPECT_NE(explanation.find("storage: ram"), std::string::npos);
+    EXPECT_NE(explanation.find("block_size: 24"), std::string::npos);
+    EXPECT_NE(explanation.find("ram_budget_bytes: 99"), std::string::npos);
+    EXPECT_NE(explanation.find("device_budget_bytes: 77"), std::string::npos);
+    EXPECT_NE(explanation.find("disk_budget_bytes: 55"), std::string::npos);
+    EXPECT_NE(explanation.find("disk_dir: /tmp/unit-prefix"), std::string::npos);
+    EXPECT_NE(explanation.find("terminal_state: always"), std::string::npos);
+    EXPECT_NE(explanation.find("moe_policy: invalidate-on-rebalance"), std::string::npos);
+    EXPECT_NE(explanation.find("mtp:"), std::string::npos);
+    EXPECT_NE(explanation.find("draft_tokens: 2"), std::string::npos);
+    EXPECT_NE(explanation.find("verify_mode: greedy"), std::string::npos);
+    EXPECT_NE(explanation.find("require_terminal_hidden_for_full_hit: false"), std::string::npos);
+}

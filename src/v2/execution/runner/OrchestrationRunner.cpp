@@ -729,8 +729,12 @@ namespace llaminar2
                 prefix_request_summary_.hit = matched_tokens > 0 && full_hit;
                 prefix_request_summary_.partial_hit = matched_tokens > 0 && !full_hit;
                 prefix_request_summary_.matched_tokens = matched_tokens;
+                const int summary_block_size =
+                    common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
                 prefix_request_summary_.matched_blocks =
-                    static_cast<int>(common_hit.blocks.size());
+                    !common_hit.blocks.empty()
+                        ? static_cast<int>(common_hit.blocks.size())
+                        : (summary_block_size > 0 ? matched_tokens / summary_block_size : 0);
                 prefix_request_summary_.terminal_logits_restored = terminal_state_restored;
                 prefix_request_summary_.terminal_hidden_restored =
                     terminal_state_restored && common_hit.has_terminal_hidden;
