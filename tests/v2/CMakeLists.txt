@@ -5235,7 +5235,7 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold
         TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_RocmHotCpuCold
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;ROCm;CPU;MPI;Profiler"
+        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;ROCm;CPU;MPI"
         MPI_PROCS 2
         TIMEOUT 1200
     )
@@ -5256,7 +5256,7 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm
         TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_CudaHotRocmWarm
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;MPI;Profiler"
+        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;MPI"
         MPI_PROCS 2
         TIMEOUT 1200
     )
@@ -5277,7 +5277,7 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
         TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_CudaHotRocmWarmCpuCold
-        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;CPU;MPI;Profiler"
+        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;CPU;MPI"
         MPI_PROCS 3
         TIMEOUT 1800
     )
