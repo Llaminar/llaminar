@@ -1086,6 +1086,37 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("other_domain"), nullptr);
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIncludesRoutedOverlayDomains)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+
+    auto base_config = makeMaintenanceMoEConfig(MoERebalanceMode::OBSERVE);
+    base_config.domain_id = "single_cpu_moe";
+    auto base_controller = std::make_unique<MoERebalanceController>(base_config);
+    auto *base_ptr = base_controller.get();
+    orchestrator->setMoERebalanceController(std::move(base_controller));
+
+    auto overlay_config = makeMaintenanceMoEConfig(MoERebalanceMode::OBSERVE);
+    overlay_config.domain_id = "overlay_routed_cpu_cold";
+    auto overlay_controller = std::make_unique<MoERebalanceController>(overlay_config);
+    auto *overlay_ptr = overlay_controller.get();
+    orchestrator->addMoERebalanceController(std::move(overlay_controller));
+
+    auto controllers = orchestrator->moeRebalanceControllers();
+    ASSERT_EQ(controllers.size(), 2u);
+    EXPECT_EQ(controllers[0], base_ptr)
+        << "legacy first-controller access should remain stable";
+    EXPECT_EQ(controllers[1], overlay_ptr);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("single_cpu_moe"), base_ptr);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("overlay_routed_cpu_cold"), overlay_ptr);
+
+    ExpertReplicaSet replicas;
+    replicas.domain_id = "overlay_routed_cpu_cold";
+    EXPECT_NO_THROW(
+        orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0))
+        << "domain validation must accept non-primary routed overlay controllers";
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesGlobalTPDomainIndex)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);

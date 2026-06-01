@@ -73,6 +73,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
@@ -81,6 +82,7 @@ namespace llaminar2
     class ITPContext;
     class ILocalTPContext;
     class IRankOrchestrator;
+    class MoERebalanceController;
     class PreparedWeightStore;
     class MoEExpertOverlayRuntimePlan;
     struct GraphConfig;
@@ -283,6 +285,11 @@ namespace llaminar2
         const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
         DeviceId requested_device,
         const std::string &log_prefix = "[InferenceRunner]");
+
+    std::vector<std::unique_ptr<MoERebalanceController>> createMoERebalanceControllersForGraph(
+        const GraphConfig &graph_config,
+        const ILocalTPContext *local_tp_ctx,
+        const ITPContext *tp_ctx);
 
     /**
      * @brief Factory function to create a unified LOCAL PP runner

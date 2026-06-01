@@ -184,6 +184,95 @@ namespace llaminar2
             return "single";
         }
 
+        std::vector<int> initialExpertPlacementForParticipants(
+            int num_experts,
+            int participant_count)
+        {
+            const int safe_participant_count = std::max(1, participant_count);
+            std::vector<int> initial_placement(static_cast<size_t>(std::max(0, num_experts)), 0);
+            const int experts_per_participant =
+                std::max(1, num_experts / safe_participant_count);
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                initial_placement[static_cast<size_t>(expert)] =
+                    std::min(expert / experts_per_participant, safe_participant_count - 1);
+            }
+            return initial_placement;
+        }
+
+        std::unique_ptr<MoERebalanceController> createMoERebalanceControllerForDomain(
+            const GraphConfig &graph_config,
+            const MoERebalanceRuntimeConfig &rebalance_config,
+            MoERebalanceMode mode,
+            std::string domain_id,
+            std::vector<DeviceId> participants,
+            int max_replicas)
+        {
+            if (participants.empty())
+                participants.push_back(DeviceId::cpu());
+
+            MoERebalanceController::Config ctrl_config;
+            ctrl_config.domain_id = std::move(domain_id);
+            ctrl_config.mode = mode;
+            ctrl_config.num_layers = graph_config.n_layers;
+            ctrl_config.num_experts = graph_config.moe.num_experts;
+            ctrl_config.top_k = graph_config.moe.top_k;
+            ctrl_config.window_size = rebalance_config.window_size;
+            ctrl_config.max_window_size = rebalance_config.max_window_size;
+            ctrl_config.window_growth_factor = rebalance_config.window_growth_factor;
+            ctrl_config.max_replicas = max_replicas;
+            ctrl_config.sockets = std::move(participants);
+            ctrl_config.initial_expert_to_socket = initialExpertPlacementForParticipants(
+                graph_config.moe.num_experts,
+                static_cast<int>(ctrl_config.sockets.size()));
+            ctrl_config.rebalance_config = SocketRebalanceConfig{};
+
+            return std::make_unique<MoERebalanceController>(std::move(ctrl_config));
+        }
+
+        std::vector<DeviceId> baseMoERebalanceParticipants(
+            const ILocalTPContext *local_tp_ctx,
+            const ITPContext *tp_ctx,
+            int fallback_world_size)
+        {
+            std::vector<DeviceId> participants;
+            if (local_tp_ctx && local_tp_ctx->degree() > 1)
+            {
+                for (const auto &device : local_tp_ctx->devices())
+                    participants.push_back(device.toLocalDeviceId());
+                return participants;
+            }
+
+            if (const auto *global_tp_ctx = dynamic_cast<const IGlobalTPContext *>(tp_ctx))
+            {
+                if (global_tp_ctx->degree() > 1)
+                {
+                    for (int participant = 0; participant < global_tp_ctx->degree(); ++participant)
+                        participants.push_back(DeviceId(DeviceType::CPU, participant));
+                    return participants;
+                }
+            }
+
+            for (int participant = 0; participant < std::max(1, fallback_world_size); ++participant)
+                participants.push_back(DeviceId(DeviceType::CPU, participant));
+            return participants;
+        }
+
+        std::vector<DeviceId> overlayRebalanceParticipants(
+            const MoEOverlayRuntimeDomain &domain)
+        {
+            std::vector<DeviceId> participants;
+            participants.reserve(domain.participants.size());
+            for (const auto &participant : domain.participants)
+            {
+                if (participant.local_device.is_valid())
+                    participants.push_back(participant.local_device);
+                else
+                    participants.push_back(participant.address.toLocalDeviceId());
+            }
+            return participants;
+        }
+
         std::vector<std::string> denseMoEDomainNames(const MoEExpertParallelPlan &plan)
         {
             std::vector<std::string> names;
@@ -587,6 +676,70 @@ namespace llaminar2
         }
 
         return continuation_device;
+    }
+
+    static MoERebalanceMode toControllerRebalanceMode(MoERebalanceRuntimeMode mode);
+
+    std::vector<std::unique_ptr<MoERebalanceController>> createMoERebalanceControllersForGraph(
+        const GraphConfig &graph_config,
+        const ILocalTPContext *local_tp_ctx,
+        const ITPContext *tp_ctx)
+    {
+        std::vector<std::unique_ptr<MoERebalanceController>> controllers;
+
+        const auto rebalance_config = graph_config.moe.rebalance_config;
+        const MoERebalanceMode mode = toControllerRebalanceMode(rebalance_config.mode);
+        if (mode == MoERebalanceMode::OFF || !graph_config.moe.enabled())
+            return controllers;
+
+        int fallback_world_size = 1;
+        if (local_tp_ctx && local_tp_ctx->degree() > 1)
+            fallback_world_size = local_tp_ctx->degree();
+        else if (const auto *global_tp_ctx = dynamic_cast<const IGlobalTPContext *>(tp_ctx))
+            fallback_world_size = std::max(1, global_tp_ctx->degree());
+
+        int effective_replicas = graph_config.moe.hot_expert_cache.resolveCap(
+            graph_config.moe.num_experts,
+            mode == MoERebalanceMode::DYNAMIC);
+        const auto &env = debugEnv();
+        if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
+            effective_replicas = std::max(0, env.moe_rebalance.max_replicas);
+
+        std::unordered_set<std::string> domain_ids;
+        auto add_controller = [&](std::string domain_id,
+                                  std::vector<DeviceId> participants,
+                                  int max_replicas)
+        {
+            if (domain_id.empty() || !domain_ids.insert(domain_id).second)
+                return;
+            controllers.push_back(createMoERebalanceControllerForDomain(
+                graph_config,
+                rebalance_config,
+                mode,
+                std::move(domain_id),
+                std::move(participants),
+                max_replicas));
+        };
+
+        add_controller(
+            moeRebalanceDomainIdForTP(local_tp_ctx, tp_ctx),
+            baseMoERebalanceParticipants(local_tp_ctx, tp_ctx, fallback_world_size),
+            effective_replicas);
+
+        if (graph_config.moe.expert_overlay_runtime_plan)
+        {
+            for (const auto &domain : graph_config.moe.expert_overlay_runtime_plan->domains())
+            {
+                if (!domain.routed_rebalance_controller_eligible)
+                    continue;
+                add_controller(
+                    domain.rebalance_domain_id,
+                    overlayRebalanceParticipants(domain),
+                    /*max_replicas=*/0);
+            }
+        }
+
+        return controllers;
     }
 
     std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
@@ -1751,70 +1904,25 @@ namespace llaminar2
         // =====================================================================
         // Must be set BEFORE graph builder creation so the histogram pointer
         // propagates into MoEExpertComputeStage params during graph construction.
-        std::unique_ptr<MoERebalanceController> moe_controller;
+        auto moe_controllers = createMoERebalanceControllersForGraph(
+            graph_config,
+            local_tp_ctx,
+            graph_config.tp_ctx);
+        if (!moe_controllers.empty())
         {
+            graph_config.moe.decode_histogram = moe_controllers.front()->histogram();
+            graph_config.moe.rebalance_mode = moe_controllers.front()->mode();
+
             const auto rebalance_config = graph_config.moe.rebalance_config;
-            const MoERebalanceMode mode = toControllerRebalanceMode(rebalance_config.mode);
-            if (mode != MoERebalanceMode::OFF && graph_config.moe.enabled())
+            for (const auto &controller : moe_controllers)
             {
-                {
-                    int world_size = mpi_ctx ? mpi_ctx->world_size() : 1;
-                    std::vector<DeviceId> sockets;
-                    if (local_tp_ctx && local_tp_ctx->degree() > 1)
-                    {
-                        for (const auto &device : local_tp_ctx->devices())
-                            sockets.push_back(device.toLocalDeviceId());
-                        world_size = local_tp_ctx->degree();
-                    }
-                    else if (const auto *global_tp_ctx =
-                                 dynamic_cast<const IGlobalTPContext *>(graph_config.tp_ctx))
-                    {
-                        world_size = global_tp_ctx->degree();
-                        for (int participant = 0; participant < world_size; ++participant)
-                            sockets.push_back(DeviceId(DeviceType::CPU, participant));
-                    }
-                    else
-                    {
-                        for (int s = 0; s < world_size; ++s)
-                            sockets.push_back(DeviceId(DeviceType::CPU, s));
-                    }
-
-                    std::vector<int> initial_placement(graph_config.moe.num_experts);
-                    int experts_per_socket = graph_config.moe.num_experts / std::max(1, world_size);
-                    for (int e = 0; e < graph_config.moe.num_experts; ++e)
-                        initial_placement[e] = std::min(e / std::max(1, experts_per_socket), world_size - 1);
-
-                    MoERebalanceController::Config ctrl_config;
-                    ctrl_config.domain_id = moeRebalanceDomainIdForTP(local_tp_ctx, graph_config.tp_ctx);
-                    ctrl_config.mode = mode;
-                    ctrl_config.num_layers = graph_config.n_layers;
-                    ctrl_config.num_experts = graph_config.moe.num_experts;
-                    ctrl_config.top_k = graph_config.moe.top_k;
-                    ctrl_config.window_size = rebalance_config.window_size;
-                    ctrl_config.max_window_size = rebalance_config.max_window_size;
-                    ctrl_config.window_growth_factor = rebalance_config.window_growth_factor;
-                    int effective_replicas = graph_config.moe.hot_expert_cache.resolveCap(
-                        graph_config.moe.num_experts,
-                        mode == MoERebalanceMode::DYNAMIC);
-                    const auto &env = debugEnv();
-                    if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
-                        effective_replicas = std::max(0, env.moe_rebalance.max_replicas);
-                    ctrl_config.max_replicas = effective_replicas;
-                    ctrl_config.sockets = std::move(sockets);
-                    ctrl_config.initial_expert_to_socket = std::move(initial_placement);
-
-                    moe_controller = std::make_unique<MoERebalanceController>(std::move(ctrl_config));
-                    graph_config.moe.decode_histogram = moe_controller->histogram();
-                    graph_config.moe.rebalance_mode = moe_controller->mode();
-
-                    LOG_DEBUG("[InferenceRunner] MoE rebalance controller: mode="
-                              << moeRebalanceRuntimeModeToString(rebalance_config.mode)
-                              << " max_replicas=" << effective_replicas
-                              << " domain=" << ctrl_config.domain_id
-                              << " hot_cache=" << graph_config.moe.hot_expert_cache.toString()
-                              << " window=" << rebalance_config.window_size
-                              << " experts=" << graph_config.moe.num_experts);
-                }
+                LOG_DEBUG("[InferenceRunner] MoE rebalance controller: mode="
+                          << moeRebalanceRuntimeModeToString(rebalance_config.mode)
+                          << " max_replicas=" << controller->maxReplicasPerSocket()
+                          << " domain=" << controller->domainId()
+                          << " hot_cache=" << graph_config.moe.hot_expert_cache.toString()
+                          << " window=" << rebalance_config.window_size
+                          << " experts=" << graph_config.moe.num_experts);
             }
         }
 
@@ -1850,10 +1958,8 @@ namespace llaminar2
         }
 
         // Transfer MoE rebalance controller ownership to orchestrator
-        if (moe_controller)
-        {
-            orchestrator->setMoERebalanceController(std::move(moe_controller));
-        }
+        for (auto &controller : moe_controllers)
+            orchestrator->addMoERebalanceController(std::move(controller));
 
         // Transfer GlobalTPContext ownership to orchestrator
         if (global_tp_ctx)
@@ -3186,6 +3292,16 @@ namespace llaminar2
                   << ", n_kv_heads=" << graph_config.n_kv_heads
                   << ", d_ff=" << graph_config.d_ff);
 
+        auto moe_controllers = createMoERebalanceControllersForGraph(
+            graph_config,
+            local_tp_ctx,
+            graph_config.tp_ctx);
+        if (!moe_controllers.empty())
+        {
+            graph_config.moe.decode_histogram = moe_controllers.front()->histogram();
+            graph_config.moe.rebalance_mode = moe_controllers.front()->mode();
+        }
+
         // Create Dependencies struct
         DeviceGraphOrchestrator::Dependencies deps;
         deps.model_ctx = model_ctx;
@@ -3203,6 +3319,9 @@ namespace llaminar2
         // Create DeviceGraphOrchestrator with injected dependencies
         auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
             std::move(deps));
+
+        for (auto &controller : moe_controllers)
+            orchestrator->addMoERebalanceController(std::move(controller));
 
         // Initialize graph cache
         orchestrator->initializeGraphCache(graph_config.n_layers);

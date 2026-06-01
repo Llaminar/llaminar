@@ -16,6 +16,7 @@
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/orchestrators/IRankOrchestrator.h"
+#include "execution/moe/MoERebalanceController.h"
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/moe/MoEExpertParallelPlanner.h"
 #include "collective/ILocalTPContext.h"
@@ -440,6 +441,32 @@ namespace
         EXPECT_EQ(effective_device, DeviceId::rocm(0));
         ASSERT_NE(graph_config.moe.expert_overlay_runtime_plan, nullptr);
         EXPECT_EQ(graph_config.moe.expert_overlay_runtime_plan->continuationDevice(), DeviceId::rocm(0));
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, RebalanceControllersIncludeRoutedOverlayDomains)
+    {
+        GraphConfig graph_config;
+        graph_config.n_layers = kMoELayers;
+        graph_config.moe.num_experts = kMoEExperts;
+        graph_config.moe.top_k = 2;
+        graph_config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::Observe;
+        graph_config.moe.rebalance_config.window_size = 32;
+        graph_config.moe.expert_overlay_runtime_plan =
+            resolveMoEExpertOverlayRuntimePlan(makeRequestedOverlayPlan());
+
+        auto controllers = createMoERebalanceControllersForGraph(
+            graph_config,
+            nullptr,
+            nullptr);
+
+        ASSERT_EQ(controllers.size(), 3u);
+        EXPECT_EQ(controllers[0]->domainId(), "single");
+        EXPECT_EQ(controllers[1]->domainId(), "overlay_routed_gpu_hot");
+        EXPECT_EQ(controllers[2]->domainId(), "overlay_routed_cpu_cold");
+        EXPECT_EQ(controllers[1]->participantCount(), 1);
+        EXPECT_EQ(controllers[2]->participantCount(), 1);
+        EXPECT_EQ(controllers[1]->mode(), MoERebalanceMode::OBSERVE);
+        EXPECT_EQ(controllers[2]->mode(), MoERebalanceMode::OBSERVE);
     }
 
     // =============================================================================

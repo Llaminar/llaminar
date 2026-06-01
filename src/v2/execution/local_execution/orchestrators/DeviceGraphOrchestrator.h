@@ -793,6 +793,7 @@ namespace llaminar2
 
         /// Set MoE rebalance controller (ownership transfer)
         void setMoERebalanceController(std::unique_ptr<MoERebalanceController> controller);
+        void addMoERebalanceController(std::unique_ptr<MoERebalanceController> controller);
 
         /// Initialize expert weight payload provider for metadata-based host retention.
         /// Creates the provider, wires it to all cached MoE stages and the WeightManager.
@@ -818,7 +819,10 @@ namespace llaminar2
         ExpertWeightPayloadProvider *expertPayloadProvider() const { return expert_payload_provider_.get(); }
 
         /// Get MoE rebalance controller (for post-decode logging)
-        MoERebalanceController *moeRebalanceController() const { return moe_rebalance_controller_.get(); }
+        MoERebalanceController *moeRebalanceController() const
+        {
+            return moe_rebalance_controller_ ? moe_rebalance_controller_.get() : nullptr;
+        }
         std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
         MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const override;
@@ -2431,8 +2435,11 @@ namespace llaminar2
         // MoE Expert Rebalance Controller
         // =========================================================================
 
-        /// Optional MoE expert rebalance controller (owned)
+        /// Optional primary MoE expert rebalance controller (owned)
         std::unique_ptr<MoERebalanceController> moe_rebalance_controller_;
+
+        /// Additional routed overlay-domain rebalance controllers (owned).
+        std::vector<std::unique_ptr<MoERebalanceController>> moe_rebalance_extra_controllers_;
 
         /// Optional expert weight payload provider for metadata-based host retention (owned)
         std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;

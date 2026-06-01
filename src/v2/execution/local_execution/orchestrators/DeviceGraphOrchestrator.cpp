@@ -121,19 +121,12 @@ namespace llaminar2
             if (domain_id.empty())
                 return;
 
-            const auto *controller = orchestrator.moeRebalanceController();
+            const auto *controller = orchestrator.moeRebalanceControllerForDomain(domain_id);
             if (!controller)
             {
                 throw std::runtime_error(
                     std::string(operation) + " rejected for MoE rebalance domain '" +
                     domain_id + "': runner has no domain controller");
-            }
-
-            if (controller->domainId() != domain_id)
-            {
-                throw std::runtime_error(
-                    std::string(operation) + " rejected for MoE rebalance domain '" +
-                    domain_id + "': runner owns domain '" + controller->domainId() + "'");
             }
         }
 
@@ -5107,24 +5100,47 @@ namespace llaminar2
     void DeviceGraphOrchestrator::setMoERebalanceController(
         std::unique_ptr<MoERebalanceController> controller)
     {
+        moe_rebalance_extra_controllers_.clear();
         moe_rebalance_controller_ = std::move(controller);
+    }
+
+    void DeviceGraphOrchestrator::addMoERebalanceController(
+        std::unique_ptr<MoERebalanceController> controller)
+    {
+        if (!controller)
+            return;
+        if (!moe_rebalance_controller_)
+        {
+            moe_rebalance_controller_ = std::move(controller);
+            return;
+        }
+        moe_rebalance_extra_controllers_.push_back(std::move(controller));
     }
 
     std::vector<MoERebalanceController *> DeviceGraphOrchestrator::moeRebalanceControllers() const
     {
-        if (!moe_rebalance_controller_)
-            return {};
-        return {moe_rebalance_controller_.get()};
+        std::vector<MoERebalanceController *> controllers;
+        if (moe_rebalance_controller_)
+            controllers.push_back(moe_rebalance_controller_.get());
+        for (const auto &controller : moe_rebalance_extra_controllers_)
+        {
+            if (controller)
+                controllers.push_back(controller.get());
+        }
+        return controllers;
     }
 
     MoERebalanceController *DeviceGraphOrchestrator::moeRebalanceControllerForDomain(
         const std::string &domain_id) const
     {
-        if (!moe_rebalance_controller_)
-            return nullptr;
-        return moe_rebalance_controller_->domainId() == domain_id
-                   ? moe_rebalance_controller_.get()
-                   : nullptr;
+        if (moe_rebalance_controller_ && moe_rebalance_controller_->domainId() == domain_id)
+            return moe_rebalance_controller_.get();
+        for (const auto &controller : moe_rebalance_extra_controllers_)
+        {
+            if (controller && controller->domainId() == domain_id)
+                return controller.get();
+        }
+        return nullptr;
     }
 
     int DeviceGraphOrchestrator::moeRebalanceParticipantId() const

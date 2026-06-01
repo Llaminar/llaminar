@@ -641,9 +641,10 @@ namespace llaminar2
         /**
          * @brief Enumerate MoE rebalance controllers owned by this runner.
          *
-         * Single-device runners return zero or one controller. Composite runners
-         * return every local domain controller so callers can avoid treating the
-         * first available device controller as the multi-domain API.
+         * Single-device runners may own a primary controller plus routed-overlay
+         * domain controllers. Composite runners return every local domain
+         * controller so callers can avoid treating the first available device
+         * controller as the multi-domain API.
          */
         virtual std::vector<MoERebalanceController *> moeRebalanceControllers() const { return {}; }
 
