@@ -23,6 +23,16 @@ TEST(Qwen36NodeLocalTPPrefixParity, PrefixRestoreFullHit)
     runDensePrefixRestoreParity(nodeLocalTPCase(), PrefixRestoreParityMode::FullHit);
 }
 
+TEST(Qwen36NodeLocalTPPrefixParity, MTPGreedyMatchesPyTorchDecodeTokens)
+{
+    runDenseMTPParity(nodeLocalTPCase(), false);
+}
+
+TEST(Qwen36NodeLocalTPPrefixParity, PrefixCacheMTPRestore)
+{
+    runDenseMTPParity(nodeLocalTPCase(), true);
+}
+
 int main(int argc, char **argv)
 {
     int provided;

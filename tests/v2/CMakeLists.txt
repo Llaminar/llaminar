@@ -5080,7 +5080,7 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36_node_local_tp_prefix
         TEST_PREFIX V2_Integration_Parity_Qwen36_NodeLocalTP
-        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;RealModel;CPU;NodeLocalTP;MPI;PyTorch"
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CPU;NodeLocalTP;MPI;PyTorch"
         MPI_PROCS 2
         TIMEOUT 2400
     )
