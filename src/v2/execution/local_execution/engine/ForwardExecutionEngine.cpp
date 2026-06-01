@@ -942,7 +942,10 @@ namespace llaminar2
 
         void *replay_stream = forward_cache.segment_cache.capture_stream;
 
-        const bool decode_capture_allowed = is_decode && input.seq_len == 1;
+        const bool decode_capture_allowed =
+            is_decode &&
+            input.batch_size <= 1 &&
+            input.seq_len <= std::max(1, config_.cache_config.decode_seq_len);
 
         if (decode_capture_allowed && input.device.is_gpu())
         {
@@ -1095,11 +1098,11 @@ namespace llaminar2
         bool success;
         const bool has_collective_nodes = !forward_cache.collective_nodes.empty();
 
-        // Graph capture (segmented/monolithic) is only beneficial for decode
-        // graphs (seq_len=1) where the same fixed-shape graph replays thousands
-        // of times. For prefill (seq_len>1), graph capture adds ~550ms one-shot
-        // overhead (HIP graph capture + instantiation) that is never amortized
-        // because prefill shapes change per prompt. Use executeFastDecode directly.
+        // Graph capture (segmented/monolithic) is beneficial for decode graphs
+        // whose shape is stable across steps. This includes one-token decode and
+        // the fixed short-continuation verifier used by greedy MTP. Prompt prefill
+        // remains outside this path because prompt shapes vary and capture setup
+        // is not amortized.
         bool used_segmented_capture = false;
 
         auto exec_t0 = std::chrono::high_resolution_clock::now();

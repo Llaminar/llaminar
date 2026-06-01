@@ -11,6 +11,7 @@
 #include "kernels/IKVCache.h"
 #include "../../../memory/BufferId.h"
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -19,7 +20,6 @@ namespace llaminar2
 {
     // Forward declarations
     class ITensorAttention;
-    class FP32Tensor;
     class TurboQuantContext;
 
     /**
@@ -155,7 +155,8 @@ namespace llaminar2
                 cached_kernel_->setGPUStream(gpuStream());
                 int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
                 kv_len += seq_len; // This step will append seq_len tokens
-                cached_kernel_->setDynamicAttnParams(kv_len, pos_offset);
+                const int logical_pos_offset = std::max(0, kv_len - seq_len);
+                cached_kernel_->setDynamicAttnParams(kv_len, logical_pos_offset);
 
                 // TQ dequant: update pinned host params for captured H2D.
                 // setDynamicDequantParams computes ring_pos, out_offset, rope_position
@@ -210,11 +211,6 @@ namespace llaminar2
         /// Cached attention kernel for workspace binding
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
-
-        /// Persistent additive mask for multi-token decode/continuation.
-        /// Kept on the stage so GPU kernels never see a mask tensor whose
-        /// device allocation is freed before stream work completes.
-        std::unique_ptr<FP32Tensor> decode_mask_storage_;
 
         /// Debug-only FP32 copies of the effective K/V tensors passed to the
         /// attention kernel. Populated only when

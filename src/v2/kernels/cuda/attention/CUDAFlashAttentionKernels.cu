@@ -525,7 +525,7 @@ namespace
             const int actual_tile_kv_len = kv_end_tile - kv_start;
 
             // Early exit for causal
-            if (causal && kv_start > (q_block_start + tile_q - 1) + position_offset)
+            if (causal && kv_start > (q_block_start + tile_q - 1) + position_offset_runtime)
             {
                 continue;
             }

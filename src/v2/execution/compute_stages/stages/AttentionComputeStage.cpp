@@ -19,7 +19,6 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include <algorithm>
-#include <limits>
 #include <fstream>
 #include <filesystem>
 
@@ -548,63 +547,19 @@ namespace llaminar2
         // Get device index using proper ordinal for GPU devices (0-based), not legacy index
         int device_idx = params_.device_id.toKernelDeviceIndex();
 
-        // Build proper causal mask for decode mode.
-        // Single-token decode can attend to the whole cache, so nullptr is enough.
-        // Multi-token continuation must mask future tokens inside the submitted
-        // chunk; otherwise verifier row 0 can see row 1's draft token.
+        // Decode continuations use the kernel's causal position offset instead
+        // of a materialized additive mask. A per-step mask tensor changes shape
+        // as KV length grows and would require H2D upload during graph capture.
         ITensor *mask_to_use = params_.workspace_mask;
 
         if (params_.causal && is_decode_mode)
         {
-            if (params_.seq_len > 1)
-            {
-                const int base_pos = (params_.position_offset > 0)
-                                         ? params_.position_offset
-                                         : (effective_kv_len - params_.seq_len);
-
-                const size_t mask_rows = static_cast<size_t>(params_.seq_len);
-                const size_t mask_cols = static_cast<size_t>(effective_kv_len);
-                const std::vector<size_t> mask_shape{mask_rows, mask_cols};
-                if (!decode_mask_storage_ || decode_mask_storage_->shape() != mask_shape)
-                {
-                    decode_mask_storage_ = std::make_unique<FP32Tensor>(mask_shape, DeviceId::cpu());
-                }
-
-                float *mask_data = decode_mask_storage_->mutable_data();
-
-                for (int q = 0; q < params_.seq_len; ++q)
-                {
-                    const int q_pos = base_pos + q;
-                    for (int k = 0; k < effective_kv_len; ++k)
-                    {
-                        mask_data[q * effective_kv_len + k] = (k <= q_pos)
-                                                                  ? 0.0f
-                                                                  : -std::numeric_limits<float>::infinity();
-                    }
-                }
-
-                if (params_.device_id.is_gpu() &&
-                    !decode_mask_storage_->ensureOnDevice(params_.device_id, gpuStream()))
-                {
-                    LOG_ERROR("[AttentionComputeStage] Failed to upload multi-token decode mask to "
-                              << params_.device_id.to_string());
-                    return false;
-                }
-
-                mask_to_use = decode_mask_storage_.get();
-            }
-            else
-            {
-                // Single-token decode: mask is all-zeros, equivalent to
-                // nullptr + causal=false (attend to all cached positions).
-                mask_to_use = nullptr;
-            }
+            mask_to_use = nullptr;
         }
 
-        // Dispatch to kernel's compute method
-        // IMPORTANT: For decode with explicit mask, we pass causal=false to avoid
-        // double-masking (kernel would apply "n > m" on top of our mask)
-        const bool kernel_causal = params_.causal && !is_decode_mode;
+        // Dispatch to kernel's compute method. Decode kernels get the logical
+        // query start through setDynamicAttnParams()/kv_len-seq_len fallback.
+        const bool kernel_causal = params_.causal;
 
         // Device-agnostic unified path using compute_tensor()
         // The kernel factory creates the appropriate kernel (CPU or GPU) based on dev_type,

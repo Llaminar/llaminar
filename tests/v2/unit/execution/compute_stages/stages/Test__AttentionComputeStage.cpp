@@ -467,7 +467,7 @@ namespace
         }
 
         EXPECT_LT(max_diff, 2e-5f)
-            << "Explicit continuation mask must match one-shot causal attention "
+            << "Continuation causal position offset must match one-shot causal attention "
                "for suffix rows";
     }
 

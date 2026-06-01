@@ -2903,16 +2903,24 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Gap 4: Automatic phase transition based on sequence length
+        // Gap 4: Automatic phase transition based on live request position.
         // =====================================================================
-        // - seq_len > 1: PREFILL phase (processing prompt, compute-bound)
-        // - seq_len == 1: DECODE phase (generating tokens, bandwidth-bound)
-        //
-        // This affects weight selection via getPhaseAwareWeight():
-        // - PREFILL: Full weights on GPU (compute-bound - all weights needed)
-        // - DECODE: May use CPU decode shards for parallel execution
+        // Short multi-token continuations are used by greedy MTP verification:
+        // they extend an existing KV/GDN history and must use decode semantics
+        // even though seq_len > 1. Treat only position-zero multi-token input as
+        // prompt prefill.
         // =====================================================================
-        InferencePhase new_phase = (seq_len > 1) ? InferencePhase::PREFILL : InferencePhase::DECODE;
+        const int decode_max_seq_len = std::max(1, cache_config_.decode_seq_len);
+        const bool is_single_token_decode = (seq_len == 1 && batch_size <= 1);
+        const bool is_short_continuation_decode =
+            batch_size <= 1 &&
+            seq_len > 1 &&
+            seq_len <= decode_max_seq_len &&
+            state_.positions[0] > 0;
+        const InferencePhase new_phase =
+            (is_single_token_decode || is_short_continuation_decode)
+                ? InferencePhase::DECODE
+                : InferencePhase::PREFILL;
         transitionToPhase(new_phase);
 
         // Build position IDs (per-batch offsets for variable-length sequences)

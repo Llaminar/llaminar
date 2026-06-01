@@ -394,8 +394,8 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, ShortContinuationDecodeShapeCachesF
     engine.execute(verifier2.input, output, host);
     EXPECT_EQ(host.build_calls, 1)
         << "Two-token verifier continuations should reuse the decode graph cache";
-    EXPECT_EQ(host.build_decode_policy_calls, 0)
-        << "Dynamic multi-token decode masks are not graph-capturable yet";
+    EXPECT_GT(host.build_decode_policy_calls, 0)
+        << "Fixed two-token verifier continuations should be eligible for decode graph capture";
 }
 
 TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryDoesNotUseDecodeCache)

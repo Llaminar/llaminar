@@ -689,8 +689,10 @@ namespace llaminar2
                 }
                 if (h_attn_params_)
                 {
+                    const int dynamic_position_offset =
+                        (causal && kv_len > seq_len) ? (kv_len - seq_len) : 0;
                     h_attn_params_->kv_len = kv_len;
-                    h_attn_params_->position_offset = 0;
+                    h_attn_params_->position_offset = dynamic_position_offset;
                     h_attn_params_->mask_stride = kv_len;
 
                     void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
