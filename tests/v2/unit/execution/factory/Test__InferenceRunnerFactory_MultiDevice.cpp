@@ -20,6 +20,7 @@
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/moe/MoEExpertParallelPlanner.h"
 #include "collective/ILocalTPContext.h"
+#include "collective/IGlobalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "models/GraphTypes.h"
 #include "mocks/MockModelContext.h"
@@ -143,6 +144,37 @@ namespace
         std::vector<GlobalDeviceAddress> devices_;
         std::vector<float> weights_;
         CollectiveBackendType backend_ = CollectiveBackendType::HOST;
+    };
+
+    class FakeGlobalTPContext : public IGlobalTPContext
+    {
+    public:
+        FakeGlobalTPContext(int domain_id, int my_index, int degree)
+            : domain_id_(domain_id), my_index_(my_index), degree_(degree)
+        {
+            for (int rank = 0; rank < degree_; ++rank)
+                world_ranks_.push_back(rank);
+        }
+
+        int degree() const override { return degree_; }
+        int myIndex() const override { return my_index_; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::MPI; }
+        MPI_Comm communicator() const override { return MPI_COMM_SELF; }
+        int domainId() const override { return domain_id_; }
+        const std::vector<int> &worldRanks() const override { return world_ranks_; }
+        GlobalDeviceAddress localDevice() const override { return GlobalDeviceAddress::cpu(my_index_); }
+        void barrier() const override {}
+        bool allreduce(TensorBase *) override { return false; }
+        bool broadcast(TensorBase *, int = 0) override { return false; }
+        bool allgather(const TensorBase *, TensorBase *) override { return false; }
+        bool send(const TensorBase *, int) override { return false; }
+        bool recv(TensorBase *, int) override { return false; }
+
+    private:
+        int domain_id_ = 0;
+        int my_index_ = 0;
+        int degree_ = 1;
+        std::vector<int> world_ranks_;
     };
 
     constexpr int kMoELayers = 3;
@@ -467,6 +499,42 @@ namespace
         EXPECT_EQ(controllers[2]->participantCount(), 1);
         EXPECT_EQ(controllers[1]->mode(), MoERebalanceMode::OBSERVE);
         EXPECT_EQ(controllers[2]->mode(), MoERebalanceMode::OBSERVE);
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, GlobalTPRebalanceControllerPreservesCpuDomain)
+    {
+        GraphConfig graph_config;
+        graph_config.n_layers = kMoELayers;
+        graph_config.moe.num_experts = kMoEExperts;
+        graph_config.moe.top_k = 2;
+        graph_config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::Dynamic;
+        graph_config.moe.rebalance_config.window_size = 32;
+
+        FakeGlobalTPContext global_tp(/*domain_id=*/17, /*my_index=*/1, /*degree=*/2);
+        auto controllers = createMoERebalanceControllersForGraph(
+            graph_config,
+            nullptr,
+            &global_tp);
+
+        ASSERT_EQ(controllers.size(), 1u);
+        const auto &controller = *controllers.front();
+        EXPECT_EQ(controller.domainId(), "global_tp_domain_17");
+        EXPECT_EQ(controller.participantCount(), 2);
+        ASSERT_EQ(controller.participantDevices().size(), 2u);
+        EXPECT_EQ(controller.participantDevices()[0], DeviceId(DeviceType::CPU, 0));
+        EXPECT_EQ(controller.participantDevices()[1], DeviceId(DeviceType::CPU, 1));
+        EXPECT_EQ(controller.mode(), MoERebalanceMode::DYNAMIC);
+
+        auto rank0_masks = controller.computeExpertMasksForParticipant(0);
+        auto rank1_masks = controller.computeExpertMasksForParticipant(1);
+        ASSERT_EQ(rank0_masks.size(), static_cast<size_t>(kMoELayers));
+        ASSERT_EQ(rank1_masks.size(), static_cast<size_t>(kMoELayers));
+        EXPECT_TRUE(rank0_masks[0][0]);
+        EXPECT_TRUE(rank0_masks[0][2]);
+        EXPECT_FALSE(rank0_masks[0][3]);
+        EXPECT_FALSE(rank1_masks[0][2]);
+        EXPECT_TRUE(rank1_masks[0][3]);
+        EXPECT_TRUE(rank1_masks[0][5]);
     }
 
     // =============================================================================
