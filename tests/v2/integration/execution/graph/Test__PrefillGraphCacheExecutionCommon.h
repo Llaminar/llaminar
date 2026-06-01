@@ -493,11 +493,57 @@ namespace
         int prefillGraphParticipantId() const override { return participant_id; }
         uint64_t prefillGraphTopologySignature() const override { return topology_signature; }
 
+        PrefillChunkMaintenanceState prefillChunkMaintenanceState(
+            const PrefillChunkPlan &chunk) const override
+        {
+            PrefillChunkMaintenanceState state;
+            state.chunk_index = chunk.chunk_index;
+            state.histograms_merged = true;
+            state.manual_boundaries_complete = true;
+            state.participants_at_same_boundary = true;
+            state.rebalance_requested = rebalance_requested_on_boundary_;
+            return state;
+        }
+
+        bool onPrefillChunkMaintenance(
+            const PrefillChunkPlan &chunk,
+            const PrefillChunkMaintenanceDecision &decision) override
+        {
+            ++maintenance_calls;
+            last_maintenance_chunk = chunk;
+            last_maintenance_decision = decision;
+            if (!decision.ok)
+                return false;
+            if (bump_epoch_on_maintenance_)
+                ++placement_epoch;
+            if (topology_delta_on_maintenance_ != 0)
+                topology_signature += topology_delta_on_maintenance_;
+            if (engine_to_clear_on_maintenance_)
+                engine_to_clear_on_maintenance_->clearCache();
+            return true;
+        }
+
         /// @brief Enable the row-select replay-param consumer for padded bucket tests.
         void setUseRowSelectProbe(bool enabled) { use_row_select_probe_ = enabled; }
 
         /// @brief Enable the real GPU KV append replay-param consumer.
         void setUseKVAppendProbe(bool enabled) { use_kv_append_probe_ = enabled; }
+
+        /// @brief Make chunk maintenance emulate a placement-changing rebalance.
+        void setPlacementChangingMaintenance(
+            ForwardExecutionEngine *engine,
+            bool bump_epoch,
+            uint64_t topology_delta)
+        {
+            engine_to_clear_on_maintenance_ = engine;
+            bump_epoch_on_maintenance_ = bump_epoch;
+            topology_delta_on_maintenance_ = topology_delta;
+        }
+
+        void setRebalanceRequestedOnBoundary(bool requested)
+        {
+            rebalance_requested_on_boundary_ = requested;
+        }
 
         /// @brief Return the tensor exposed as logits/hidden by the synthetic graph.
         FP32Tensor *outputTensor() const { return output_tensor_; }
@@ -529,12 +575,19 @@ namespace
         int participant_id = 0;
         uint64_t placement_epoch = 0;
         uint64_t topology_signature = 0;
+        int maintenance_calls = 0;
+        PrefillChunkPlan last_maintenance_chunk{};
+        PrefillChunkMaintenanceDecision last_maintenance_decision{};
 
     private:
         DeviceId device_;
         IDeviceContext *ctx_ = nullptr;
         bool use_row_select_probe_ = false; ///< Whether to append HiddenStateRowSelectStage after residual add.
         bool use_kv_append_probe_ = false;  ///< Whether to append real GPU KVCacheAppendStage after residual add.
+        bool rebalance_requested_on_boundary_ = false;
+        bool bump_epoch_on_maintenance_ = false;
+        uint64_t topology_delta_on_maintenance_ = 0;
+        ForwardExecutionEngine *engine_to_clear_on_maintenance_ = nullptr;
         std::vector<std::unique_ptr<FP32Tensor>> tensors_;
         std::unique_ptr<IKVCache> kv_cache_;
         FP32Tensor *output_tensor_ = nullptr;
@@ -762,6 +815,171 @@ namespace
             << "Normal build, warmup, and capture recording execute the stage directly.";
         EXPECT_GE(host_->stage()->replayCallbackCount(), 2)
             << "Capture launch and Ready replay both run post-graph callbacks.";
+    }
+
+    TEST_F(PrefillGraphCacheExecutionTest, ChunkScheduleFixedPlacementReachesCapturedReplay)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        host_->domain_id = "overlay_fixed_rocm_hot";
+        host_->participant_id = 4;
+        host_->placement_epoch = 7;
+        host_->topology_signature = 0x4400u;
+
+        const int chunk_count = 4;
+        auto tokens = makeSequentialInts(chunk_count * kExactBucketSeqLen, 9000);
+        ForwardInput input;
+        input.token_ids = tokens.data();
+        input.batch_size = 1;
+        input.seq_len = static_cast<int>(tokens.size());
+        input.real_seq_len = static_cast<int>(tokens.size());
+        input.device = device_;
+
+        PrefillChunkSchedulerPolicy policy;
+        policy.bucket_sizes = debugEnv().execution.prefill_graph_bucket_sizes;
+        policy.fixed_chunk_real_tokens = kExactBucketSeqLen;
+        policy.real_token_count = static_cast<int>(tokens.size());
+
+        auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+            input,
+            policy,
+            kPadTokenId,
+            /*allow_padded_execution=*/false);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), static_cast<size_t>(chunk_count));
+
+        ForwardOutput output;
+        ASSERT_TRUE(engine_->runPrefillChunkSchedule(input, schedule, output, *host_));
+
+        EXPECT_EQ(host_->build_calls, 1)
+            << "Fixed placement should reuse one bucketed forward graph across chunks.";
+        EXPECT_EQ(host_->maintenance_calls, 0);
+        expectProbeOutputMatches(*host_, kExactBucketSeqLen);
+
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
+        const auto key = prefillGraphKey(
+            device_,
+            kExactBucketSeqLen,
+            host_->domain_id,
+            host_->participant_id,
+            host_->placement_epoch,
+            host_->topology_signature);
+        auto snapshot = engine_->prefillGraphCacheSnapshot(signature, key);
+        ASSERT_TRUE(snapshot.has_value());
+        EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(snapshot->warmup_count, 1u);
+        EXPECT_EQ(snapshot->capture_count, 1u);
+        EXPECT_EQ(snapshot->replay_count, 2)
+            << "Chunk 2 launches after capture and chunk 3 replays the captured graph.";
+        EXPECT_TRUE(snapshot->observation_valid);
+        EXPECT_EQ(snapshot->chunk_index, 3);
+        EXPECT_EQ(snapshot->real_token_start, 3 * kExactBucketSeqLen);
+        EXPECT_EQ(snapshot->real_token_count, kExactBucketSeqLen);
+        EXPECT_EQ(snapshot->domain_id, "overlay_fixed_rocm_hot");
+        EXPECT_EQ(snapshot->participant_id, 4);
+        EXPECT_EQ(snapshot->placement_epoch, 7u);
+        EXPECT_EQ(snapshot->topology_signature, 0x4400u);
+        EXPECT_EQ(snapshot->capture_phase, "replay");
+        EXPECT_EQ(snapshot->recapture_reason, "none");
+    }
+
+    TEST_F(PrefillGraphCacheExecutionTest, ChunkScheduleForcedRebalanceRecapturesNewPlacementEpoch)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64"},
+            {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+            {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+            {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+            {"LLAMINAR_VALIDATE_INPUTS", "0"},
+            {"LLAMINAR_FAIL_ON_ZERO", "0"},
+        });
+
+        host_->domain_id = "overlay_forced_rebalance";
+        host_->participant_id = 5;
+        host_->placement_epoch = 11;
+        host_->topology_signature = 0x5500u;
+        host_->setPlacementChangingMaintenance(
+            engine_.get(),
+            /*bump_epoch=*/true,
+            /*topology_delta=*/0x10u);
+
+        const int chunk_count = 9;
+        auto tokens = makeSequentialInts(chunk_count * kExactBucketSeqLen, 11000);
+        ForwardInput input;
+        input.token_ids = tokens.data();
+        input.batch_size = 1;
+        input.seq_len = static_cast<int>(tokens.size());
+        input.real_seq_len = static_cast<int>(tokens.size());
+        input.device = device_;
+
+        PrefillChunkSchedulerPolicy policy;
+        policy.bucket_sizes = debugEnv().execution.prefill_graph_bucket_sizes;
+        policy.fixed_chunk_real_tokens = kExactBucketSeqLen;
+        policy.max_rebalance_interval_tokens = 5 * kExactBucketSeqLen;
+        policy.real_token_count = static_cast<int>(tokens.size());
+
+        auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+            input,
+            policy,
+            kPadTokenId,
+            /*allow_padded_execution=*/false);
+        ASSERT_TRUE(schedule) << schedule.error;
+        ASSERT_EQ(schedule.chunks.size(), static_cast<size_t>(chunk_count));
+        ASSERT_TRUE(schedule.chunks[4].rebalance_required_after);
+        for (size_t i = 0; i < schedule.chunks.size(); ++i)
+        {
+            if (i != 4)
+                EXPECT_FALSE(schedule.chunks[i].rebalance_required_after) << "chunk=" << i;
+        }
+
+        ForwardOutput output;
+        ASSERT_TRUE(engine_->runPrefillChunkSchedule(input, schedule, output, *host_));
+
+        EXPECT_EQ(host_->build_calls, 2)
+            << "The forced placement boundary should clear the old bucket graph and rebuild once.";
+        EXPECT_EQ(host_->maintenance_calls, 1);
+        EXPECT_EQ(host_->last_maintenance_chunk.chunk_index, 4);
+        EXPECT_TRUE(host_->last_maintenance_decision.required);
+        EXPECT_EQ(host_->placement_epoch, 12u);
+        EXPECT_EQ(host_->topology_signature, 0x5510u);
+        expectProbeOutputMatches(*host_, kExactBucketSeqLen);
+
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
+        const auto new_key = prefillGraphKey(
+            device_,
+            kExactBucketSeqLen,
+            host_->domain_id,
+            host_->participant_id,
+            host_->placement_epoch,
+            host_->topology_signature);
+        auto snapshot = engine_->prefillGraphCacheSnapshot(signature, new_key);
+        ASSERT_TRUE(snapshot.has_value());
+        EXPECT_EQ(snapshot->phase, PrefillGraphPhase::Ready);
+        EXPECT_EQ(snapshot->warmup_count, 1u);
+        EXPECT_EQ(snapshot->capture_count, 1u);
+        EXPECT_EQ(snapshot->replay_count, 2)
+            << "The post-rebalance graph should capture on chunk 7 and replay on chunk 8.";
+        EXPECT_TRUE(snapshot->observation_valid);
+        EXPECT_EQ(snapshot->chunk_index, 8);
+        EXPECT_EQ(snapshot->real_token_start, 8 * kExactBucketSeqLen);
+        EXPECT_EQ(snapshot->real_token_count, kExactBucketSeqLen);
+        EXPECT_EQ(snapshot->domain_id, "overlay_forced_rebalance");
+        EXPECT_EQ(snapshot->participant_id, 5);
+        EXPECT_EQ(snapshot->placement_epoch, 12u);
+        EXPECT_EQ(snapshot->topology_signature, 0x5510u);
+        EXPECT_EQ(snapshot->capture_phase, "replay");
+        EXPECT_EQ(snapshot->recapture_reason, "none");
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, PaddedSafeBucketReplaysAcrossDifferentRealLengths)

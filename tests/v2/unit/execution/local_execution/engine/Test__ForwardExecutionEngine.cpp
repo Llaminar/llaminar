@@ -127,6 +127,12 @@ namespace
         PrefillChunkMaintenanceState mock_maintenance_state{};
         bool mock_maintenance_state_configured = false;
         bool maintenance_should_fail = false;
+        ForwardExecutionEngine *engine_to_clear_on_maintenance = nullptr;
+        bool bump_epoch_on_maintenance = false;
+        uint64_t placement_epoch = 0;
+        std::string prefill_domain_id = "single";
+        int prefill_participant_id = 0;
+        uint64_t prefill_topology_signature = 0;
 
         // ----- IForwardExecutionHost Interface -----
 
@@ -233,6 +239,26 @@ namespace
             return mock_compute_all_position_logits;
         }
 
+        uint64_t moePlacementEpoch() const override
+        {
+            return placement_epoch;
+        }
+
+        std::string prefillGraphDomainId() const override
+        {
+            return prefill_domain_id;
+        }
+
+        int prefillGraphParticipantId() const override
+        {
+            return prefill_participant_id;
+        }
+
+        uint64_t prefillGraphTopologySignature() const override
+        {
+            return prefill_topology_signature;
+        }
+
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(
             const PrefillChunkPlan &chunk) const override
         {
@@ -251,7 +277,13 @@ namespace
             prefill_chunk_maintenance_calls++;
             last_maintenance_chunk = chunk;
             last_maintenance_decision = decision;
-            return !maintenance_should_fail;
+            if (maintenance_should_fail)
+                return false;
+            if (bump_epoch_on_maintenance)
+                ++placement_epoch;
+            if (engine_to_clear_on_maintenance)
+                engine_to_clear_on_maintenance->clearCache();
+            return true;
         }
 
     private:
@@ -781,6 +813,61 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_ExecutesChunksInOrd
     EXPECT_EQ(host.forward_token_batches[1], (std::vector<int>{14, 15, 16, 17}));
     EXPECT_EQ(host.last_maintenance_chunk.chunk_index, 1);
     EXPECT_TRUE(host.last_maintenance_decision.required);
+}
+
+TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_PlacementChangingMaintenanceClearsCachedBucketGraph)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.prefill_domain_id = "overlay_routed_cuda_hot";
+    host.prefill_participant_id = 3;
+    host.prefill_topology_signature = 0x1234u;
+    host.bump_epoch_on_maintenance = true;
+    host.engine_to_clear_on_maintenance = &engine;
+
+    const std::vector<int> tokens = {10, 11, 12, 13, 14, 15, 16, 17};
+    auto input = makeTestInput(static_cast<int>(tokens.size()), 1, DeviceId::cuda(0), tokens.data(), nullptr);
+
+    PrefillChunkSchedulerPolicy policy;
+    policy.bucket_sizes = {4};
+    policy.fixed_chunk_real_tokens = 4;
+    policy.max_rebalance_interval_tokens = 4;
+    policy.real_token_count = static_cast<int>(tokens.size());
+
+    auto schedule = ForwardExecutionEngine::preparePrefillChunkRuntimeSchedule(
+        input,
+        policy,
+        /*pad_token_id=*/0,
+        /*allow_padded_execution=*/false);
+    ASSERT_TRUE(schedule) << schedule.error;
+    ASSERT_EQ(schedule.chunks.size(), 2u);
+    ASSERT_TRUE(schedule.chunks[0].rebalance_required_after);
+    ASSERT_TRUE(schedule.chunks[1].rebalance_required_after);
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.runPrefillChunkSchedule(input, schedule, output, host));
+
+    EXPECT_EQ(host.build_forward_graph_calls, 2)
+        << "Placement-changing maintenance must clear the outer bucket graph so the next chunk rebuilds "
+           "under the new epoch/topology rather than replaying stale stage placement.";
+    EXPECT_EQ(host.prefill_chunk_maintenance_calls, 2);
+    EXPECT_EQ(host.placement_epoch, 2u);
+    EXPECT_TRUE(engine.cacheEmpty())
+        << "The final required maintenance also clears the cache for the next request.";
+    EXPECT_EQ(host.forward_token_offsets, (std::vector<int>{0, 4}));
+    EXPECT_EQ(host.forward_real_seq_lens, (std::vector<int>{4, 4}));
 }
 
 TEST_F(Test__ForwardExecutionEngine, RunPrefillChunkSchedule_StopsOnMaintenanceFailure)

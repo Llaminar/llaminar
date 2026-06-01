@@ -184,12 +184,20 @@ Latest ROCm dense evidence:
   - `V2_Unit_DeviceGraphOrchestrator` now proves prefill graph observations use
     the same MoE domain id and domain-local participant id as the rebalance
     controller path.
+  - `V2_Unit_ForwardExecutionEngine` also proves placement-changing
+    chunk-boundary maintenance clears the outer bucketed forward graph cache so
+    the next chunk rebuilds under the new placement epoch instead of replaying
+    stale stage placement.
   - `V2_Integration_PrefillGraphCacheExecution_CUDA` and
     `V2_Integration_PrefillGraphCacheExecution_ROCm` now assert structured
     prefill graph snapshot/perf observability for chunk id, bucket length,
     real-token range, domain id, participant id, placement epoch, topology
     signature, capture/replay phase, and recapture reason while preserving
     padded-bucket graph reuse across changing real-token lengths.
+  - The same focused CUDA/ROCm integration suites now include fixed-placement
+    chunk schedules that reach captured replay and forced chunk-boundary
+    rebalance schedules that clear placement-sensitive cache state, rebuild,
+    recapture, and replay under the new placement epoch.
 
 Next graph-capture questions:
 
