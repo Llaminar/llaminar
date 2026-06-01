@@ -571,6 +571,7 @@ namespace llaminar2
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();
+        ready_sampled_token_.reset();
         last_token_ = prompt_tokens.back();
 
         // Broadcast to worker ranks so they prefill with the same tokens
@@ -639,6 +640,7 @@ namespace llaminar2
 
                 runner_->clear_cache();
                 prefill_logits_ready_ = false;
+                ready_sampled_token_.reset();
 
                 auto make_common_hit = [&]()
                 {
@@ -873,7 +875,9 @@ namespace llaminar2
             "decode");
 
         const bool use_ready_logits = prefill_logits_ready_;
+        const std::optional<int32_t> ready_sampled_token = ready_sampled_token_;
         prefill_logits_ready_ = false;
+        ready_sampled_token_.reset();
 
         auto fail_after_checkpoint = [&](const std::string &message) -> GenerationResult
         {
@@ -894,6 +898,7 @@ namespace llaminar2
             PerfStatsCollector::addCounter("mtp", "decode_step_failures", 1.0, "decode",
                                            std::string{}, {{"reason", message}});
             prefill_logits_ready_ = use_ready_logits;
+            ready_sampled_token_ = ready_sampled_token;
             result.error = message;
             return result;
         };
@@ -915,29 +920,37 @@ namespace llaminar2
         }
 
         int32_t first_token = -1;
+        if (use_ready_logits && ready_sampled_token.has_value())
         {
-            PerfStatsCollector::ScopedTimer timer("mtp", "sample_first_token_device", "decode");
-            first_token = runner_->sampleGreedyOnDevice();
-        }
-        if (first_token < 0)
-        {
-            PerfStatsCollector::addCounter("mtp", "first_token_host_sampling_fallbacks", 1.0, "decode");
-            const float *main_logits = runner_->logits();
-            if (!main_logits)
-            {
-                return fail_after_checkpoint("No logits available for MTP first draft token");
-            }
-            {
-                PerfStatsCollector::ScopedTimer timer("mtp", "sample_first_token_host", "decode");
-                first_token = sampler_.sample(
-                    main_logits,
-                    static_cast<size_t>(vocab),
-                    active_sampling_params_);
-            }
+            first_token = *ready_sampled_token;
+            PerfStatsCollector::addCounter("mtp", "first_token_ready_cache_hits", 1.0, "decode");
         }
         else
         {
-            PerfStatsCollector::addCounter("mtp", "first_token_device_samples", 1.0, "decode");
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "sample_first_token_device", "decode");
+                first_token = runner_->sampleGreedyOnDevice();
+            }
+            if (first_token < 0)
+            {
+                PerfStatsCollector::addCounter("mtp", "first_token_host_sampling_fallbacks", 1.0, "decode");
+                const float *main_logits = runner_->logits();
+                if (!main_logits)
+                {
+                    return fail_after_checkpoint("No logits available for MTP first draft token");
+                }
+                {
+                    PerfStatsCollector::ScopedTimer timer("mtp", "sample_first_token_host", "decode");
+                    first_token = sampler_.sample(
+                        main_logits,
+                        static_cast<size_t>(vocab),
+                        active_sampling_params_);
+                }
+            }
+            else
+            {
+                PerfStatsCollector::addCounter("mtp", "first_token_device_samples", 1.0, "decode");
+            }
         }
 
         bool sidecar_ok = false;
@@ -1049,6 +1062,7 @@ namespace llaminar2
         accepted_tokens.push_back(first_token);
         accepted_tokens.push_back(accepted_second_draft ? mtp_token : verified_next);
 
+        const size_t original_accepted_count = accepted_tokens.size();
         if (decode_step_token_budget_ > 0 &&
             accepted_tokens.size() > static_cast<size_t>(decode_step_token_budget_))
         {
@@ -1065,6 +1079,76 @@ namespace llaminar2
             }
         }
 
+        const bool speculative_token_was_attempted = original_accepted_count >= 2;
+        const bool speculative_token_is_output = accepted_tokens.size() >= 2;
+        const bool accepted_speculative_token =
+            accepted_second_draft && speculative_token_was_attempted && speculative_token_is_output;
+        const bool rejected_speculative_token =
+            !accepted_second_draft && speculative_token_was_attempted && speculative_token_is_output;
+        const bool verifier_state_matches_output =
+            accepted_speculative_token && accepted_tokens.size() == draft_tokens.size();
+
+        if (rejected_speculative_token)
+        {
+            ++mtp_stats_.rejected_tokens;
+            PerfStatsCollector::addCounter("mtp", "rejected_tokens", 1.0, "decode");
+        }
+        if (accepted_speculative_token)
+        {
+            ++mtp_stats_.accepted_tokens;
+            PerfStatsCollector::addCounter("mtp", "accepted_tokens", 1.0, "decode");
+            PerfStatsCollector::addCounter("mtp", "accepted_second_draft_tokens", 1.0, "decode");
+        }
+        PerfStatsCollector::addCounter("mtp", "output_tokens", static_cast<double>(accepted_tokens.size()), "decode");
+
+        if (verifier_state_matches_output)
+        {
+            int32_t next_ready_token = -1;
+            const int terminal_row = static_cast<int>(draft_tokens.size()) - 1;
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_terminal_token_device", "decode");
+                next_ready_token = runner_->sampleGreedyFromAllPositionLogitsOnDevice(terminal_row);
+            }
+            if (next_ready_token < 0)
+            {
+                PerfStatsCollector::addCounter("mtp", "verifier_terminal_token_host_sampling_fallbacks", 1.0, "decode");
+                const float *all_logits = runner_->getAllPositionLogits();
+                if (!all_logits)
+                {
+                    return fail_after_checkpoint("All-position terminal logits unavailable after accepted MTP verification");
+                }
+                const float *terminal_logits =
+                    all_logits + static_cast<size_t>(terminal_row) * static_cast<size_t>(vocab);
+                {
+                    PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_terminal_token_host", "decode");
+                    next_ready_token = sampler_.sample(
+                        terminal_logits,
+                        static_cast<size_t>(vocab),
+                        active_sampling_params_);
+                }
+            }
+            else
+            {
+                PerfStatsCollector::addCounter("mtp", "verifier_terminal_token_device_samples", 1.0, "decode");
+            }
+
+            PerfStatsCollector::addCounter("mtp", "verifier_state_commits", 1.0, "decode");
+            prefill_logits_ready_ = true;
+            ready_sampled_token_ = next_ready_token;
+
+            for (int32_t token : accepted_tokens)
+            {
+                sampler_.record_token(token);
+                result.tokens.push_back(token);
+            }
+            if (!accepted_tokens.empty())
+            {
+                last_token_ = accepted_tokens.back();
+            }
+
+            return result;
+        }
+
         bool restored = false;
         {
             PerfStatsCollector::ScopedTimer timer("mtp", "restore_live_prefix_state", "decode");
@@ -1077,15 +1161,6 @@ namespace llaminar2
         }
         ++mtp_stats_.rollbacks;
         PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
-        if (!accepted_second_draft && accepted_tokens.size() >= 2)
-        {
-            ++mtp_stats_.rejected_tokens;
-            PerfStatsCollector::addCounter("mtp", "rejected_tokens", 1.0, "decode");
-        }
-        else if (accepted_tokens.size() >= 2)
-        {
-            PerfStatsCollector::addCounter("mtp", "accepted_second_draft_tokens", 1.0, "decode");
-        }
 
         std::vector<int32_t> replay_tokens;
         replay_tokens.reserve((use_ready_logits ? 0 : 1) + accepted_tokens.size());
@@ -1115,8 +1190,6 @@ namespace llaminar2
             sampler_.record_token(token);
             result.tokens.push_back(token);
         }
-        mtp_stats_.accepted_tokens += static_cast<uint64_t>(accepted_tokens.size());
-        PerfStatsCollector::addCounter("mtp", "accepted_tokens", static_cast<double>(accepted_tokens.size()), "decode");
         if (!accepted_tokens.empty())
         {
             last_token_ = accepted_tokens.back();
@@ -1150,17 +1223,31 @@ namespace llaminar2
             recordMTPBypass(mtp_bypass_reason);
         }
 
+        std::optional<int32_t> ready_token_for_decode;
         if (prefill_logits_ready_)
         {
             // First decode step after prefill: sample from the already-computed
             // prefill logits instead of re-feeding the last prompt token.
             // This avoids processing the last token twice (which corrupts GDN
             // recurrence state and creates duplicate KV cache entries).
+            if (ready_sampled_token_.has_value())
+            {
+                if (!active_sampling_params_.is_greedy() ||
+                    active_sampling_params_.has_penalties())
+                {
+                    result.error =
+                        "Ready MTP verifier token is only valid for greedy decode without penalties";
+                    return result;
+                }
+                ready_token_for_decode = ready_sampled_token_;
+                ready_sampled_token_.reset();
+            }
             prefill_logits_ready_ = false;
             LOG_TRACE("[decodeStep] Using prefill logits (skipping forward)");
         }
         else
         {
+            ready_sampled_token_.reset();
             LOG_TRACE("[decodeStep] Running forward with last_token_=" << last_token_);
             // Run single-token forward with last token
             if (!runner_->forward(&last_token_, 1))
@@ -1176,7 +1263,12 @@ namespace llaminar2
         // This avoids the full ~600KB D2H transfer of logits.
         int token = -1;
 
-        if (active_sampling_params_.has_penalties())
+        if (ready_token_for_decode.has_value())
+        {
+            token = *ready_token_for_decode;
+            PerfStatsCollector::addCounter("mtp", "ready_token_direct_emits", 1.0, "decode");
+        }
+        else if (active_sampling_params_.has_penalties())
         {
             // Compute sparse penalty map on CPU (presence + frequency + DRY)
             int vocab = vocabSize();
@@ -1434,6 +1526,7 @@ namespace llaminar2
         ::malloc_trim(0);
 #endif
         prefill_logits_ready_ = false;
+        ready_sampled_token_.reset();
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();

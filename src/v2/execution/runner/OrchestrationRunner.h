@@ -38,6 +38,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <optional>
 #include <utility>
 
 namespace llaminar2
@@ -487,6 +488,7 @@ namespace llaminar2
         ToolCallFormat tool_call_format_{ToolCallFormat::HERMES_2_PRO}; // Model-specific tool call format
         int32_t last_token_{0};                                         // Last token for decode step
         bool prefill_logits_ready_{false};                              // True when terminal logits already predict the next decode token
+        std::optional<int32_t> ready_sampled_token_;                    // Greedy token sampled from already-ready terminal logits
         int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited
         bool mpi_coordinated_mode_{false};                              // When true, rank 0 broadcasts commands for worker loop
         std::shared_ptr<ITokenizer> tokenizer_;

@@ -746,7 +746,7 @@ namespace
         EXPECT_EQ(step2.tokens[0], MockInferenceRunner::DECODE_ARGMAX_TOKEN);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeAcceptsGreedyDraftAndReplaysFromPrefillCheckpoint)
+    TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeAcceptsGreedyDraftAndCommitsVerifierState)
     {
         auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
 
@@ -760,8 +760,7 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
-        EXPECT_EQ(mock->restoreCount(), 1);
-        EXPECT_TRUE(mock->lastRestoredSnapshot().logical_checkpoint);
+        EXPECT_EQ(mock->restoreCount(), 0);
         EXPECT_GE(mock->setAllPositionCount(), 2);
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
@@ -771,7 +770,9 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+        EXPECT_EQ(probe.mtp_rollbacks, 0u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPDecodeRecordsStructuredPerfStats)
@@ -816,12 +817,22 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "verifier_forward");
             ASSERT_NE(verifier_timer, nullptr);
             EXPECT_EQ(verifier_timer->count, 1u);
+
+            const PerfStatRecord *accepted =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "accepted_tokens");
+            ASSERT_NE(accepted, nullptr);
+            EXPECT_DOUBLE_EQ(accepted->value, 1.0);
+
+            const PerfStatRecord *commits =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "verifier_state_commits");
+            ASSERT_NE(commits, nullptr);
+            EXPECT_DOUBLE_EQ(commits->value, 1.0);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPSecondDecodeUsesReplayTerminalLogitsWithoutRefeedingPreviousToken)
+    TEST_F(Test__PrefillDecodeTransition, MTPSecondDecodeUsesVerifierTerminalTokenWithoutRefeedingPreviousToken)
     {
         auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
 
@@ -841,10 +852,50 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 2);
         EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::DECODE_ARGMAX_TOKEN);
-        EXPECT_EQ(mock->restoreCount(), 2);
+        EXPECT_EQ(mock->restoreCount(), 0);
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPReadyVerifierTokenCanBeConsumedByGreedyBypass)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+        ASSERT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+        mock->setMTPUnsupportedReason("temporary topology bypass");
+
+        GenerationResult step2 = runner->decodeStep();
+        ASSERT_TRUE(step2.success()) << step2.error;
+        EXPECT_THAT(step2.tokens, ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->forwardCallCount(), 2);
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPReadyVerifierTokenHardFailsIfSamplingChangesBeforeConsume)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success());
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        runner->setSamplingParams(sampling);
+
+        GenerationResult step2 = runner->decodeStep();
+        EXPECT_FALSE(step2.success());
+        EXPECT_NE(step2.error.find("Ready MTP verifier token"), std::string::npos);
+        EXPECT_EQ(mock->restoreCount(), 0);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeForcedRejectReplaysVerifiedToken)
@@ -869,7 +920,9 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPForcedRejectRestoresHybridPayloadSnapshot)
@@ -1026,13 +1079,13 @@ namespace
         EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_GE(mock->sampleMainLogitsCount(), 1);
         EXPECT_EQ(mock->sampleMTPLogitsCount(), 1);
-        EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 1);
+        EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 2);
 
         auto probe = runner->prefixStateProbe();
         EXPECT_FALSE(probe.mtp_bypassed);
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
-        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
-        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 0u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, GlobalTPMTPDecodeRunsThroughGlobalOrchestratorCoordination)
@@ -1076,16 +1129,16 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(child_ptr->forwardMTPCount(), 1);
         EXPECT_EQ(child_ptr->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
-        EXPECT_EQ(child_ptr->restoreCount(), 1);
+        EXPECT_EQ(child_ptr->restoreCount(), 0);
 
         auto probe = runner->prefixStateProbe();
         EXPECT_FALSE(probe.mtp_bypassed);
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
-        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
-        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 0u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, LocalTPMTPDecodeRunsEveryParticipantAndRecordsOneRollback)
+    TEST_F(Test__PrefillDecodeTransition, LocalTPMTPDecodeRunsEveryParticipantAndCommitsVerifierState)
     {
         auto harness = createLocalTPRunner(/*mtp_accept=*/true);
 
@@ -1102,8 +1155,8 @@ namespace
         EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
         EXPECT_EQ(harness.child0->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_EQ(harness.child1->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
-        EXPECT_EQ(harness.child0->restoreCount(), 1);
-        EXPECT_EQ(harness.child1->restoreCount(), 1);
+        EXPECT_EQ(harness.child0->restoreCount(), 0);
+        EXPECT_EQ(harness.child1->restoreCount(), 0);
         EXPECT_GE(harness.child0->setAllPositionCount(), 2);
         EXPECT_GE(harness.child1->setAllPositionCount(), 2);
         EXPECT_THAT(harness.child0->lastForwardTokens(),
@@ -1117,9 +1170,9 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
-        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
-        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 0u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, LocalTPMTPForcedRejectCountsOnceAcrossParticipants)
@@ -1150,7 +1203,7 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
-        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
         EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
@@ -1183,9 +1236,9 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
-        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
-        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 0u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, LocalTPMTPColumnParallelRejectsUsingGatheredVerifierLogits)
@@ -1214,7 +1267,7 @@ namespace
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
-        EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
         EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
@@ -1368,7 +1421,8 @@ namespace
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
-        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
         EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
 
@@ -1390,7 +1444,8 @@ namespace
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
-        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
         EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
 
