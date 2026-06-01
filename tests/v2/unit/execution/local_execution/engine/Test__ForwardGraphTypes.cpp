@@ -9,9 +9,55 @@
 #include <gtest/gtest.h>
 #include <unordered_map>
 
+#include "execution/compute_stages/IComputeStage.h"
+#include "execution/local_execution/graph/ComputeGraph.h"
+#include "execution/local_execution/graph/DeviceGraphCaptureController.h"
+#include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 
 using namespace llaminar2;
+
+namespace
+{
+    class FakeSegmentStage final : public IComputeStage
+    {
+    public:
+        FakeSegmentStage(bool capturable,
+                         bool manual_boundary = false,
+                         ComputeStageType stage_type = ComputeStageType::COPY)
+            : IComputeStage(DeviceId::cpu()),
+              capturable_(capturable),
+              manual_boundary_(manual_boundary),
+              stage_type_(stage_type)
+        {
+        }
+
+        bool execute(IDeviceContext *) override { return true; }
+        ComputeStageType type() const override { return stage_type_; }
+        std::string name() const override { return "fake_segment_stage"; }
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+        bool isGraphCapturable() const override { return capturable_; }
+        bool isManualGraphBoundary() const override { return manual_boundary_; }
+        StageDumpInfo buildDumpInfoImpl() const override { return {}; }
+
+    private:
+        bool capturable_ = true;
+        bool manual_boundary_ = false;
+        ComputeStageType stage_type_ = ComputeStageType::COPY;
+    };
+
+    void addFakeSegmentStage(ComputeGraph &graph,
+                             const std::string &name,
+                             bool capturable,
+                             bool manual_boundary = false,
+                             ComputeStageType stage_type = ComputeStageType::COPY)
+    {
+        graph.addNode(
+            name,
+            std::make_unique<FakeSegmentStage>(capturable, manual_boundary, stage_type),
+            DeviceId::cpu());
+    }
+}
 
 // =========================================================================
 // ForwardGraphSignature
@@ -306,4 +352,80 @@ TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)
     cache.invalidate();
 
     EXPECT_EQ(cache.segment_cache.capture_stream, nullptr);
+}
+
+TEST(Test__GraphSegmentCache, NamedSparseBoundarySplitsCapturedSegments)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "before", true);
+    addFakeSegmentStage(graph, "sparse_dispatch", true, true);
+    addFakeSegmentStage(graph, "after", true);
+    graph.addDependency("sparse_dispatch", "before");
+    graph.addDependency("after", "sparse_dispatch");
+
+    std::unordered_set<std::string> collective_nodes = {"sparse_dispatch"};
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildWarmupSegments(
+        graph,
+        cache,
+        &collective_nodes,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/false);
+
+    ASSERT_EQ(cache.segments.size(), 3u);
+    EXPECT_TRUE(cache.segments[0].capturable);
+    EXPECT_EQ(cache.segments[0].stage_names, std::vector<std::string>({"before"}));
+    EXPECT_FALSE(cache.segments[1].capturable);
+    EXPECT_EQ(cache.segments[1].stage_names, std::vector<std::string>({"sparse_dispatch"}));
+    EXPECT_TRUE(cache.segments[2].capturable);
+    EXPECT_EQ(cache.segments[2].stage_names, std::vector<std::string>({"after"}));
+}
+
+TEST(Test__GraphSegmentCache, NonCapturableManualBoundarySplitsCapturedSegmentsWithoutNameSet)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "before", true);
+    addFakeSegmentStage(graph, "sparse_return", false, true);
+    addFakeSegmentStage(graph, "after", true);
+    graph.addDependency("sparse_return", "before");
+    graph.addDependency("after", "sparse_return");
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildWarmupSegments(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false);
+
+    ASSERT_EQ(cache.segments.size(), 3u);
+    EXPECT_TRUE(cache.segments[0].capturable);
+    EXPECT_EQ(cache.segments[0].stage_names, std::vector<std::string>({"before"}));
+    EXPECT_FALSE(cache.segments[1].capturable);
+    EXPECT_EQ(cache.segments[1].stage_names, std::vector<std::string>({"sparse_return"}));
+    EXPECT_TRUE(cache.segments[2].capturable);
+    EXPECT_EQ(cache.segments[2].stage_names, std::vector<std::string>({"after"}));
+}
+
+TEST(Test__GraphSegmentCache, GraphSafeNamedCollectivesRequireExplicitCapturePermission)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "before", true);
+    addFakeSegmentStage(graph, "graph_safe_collective", true, true);
+    addFakeSegmentStage(graph, "after", true);
+    graph.addDependency("graph_safe_collective", "before");
+    graph.addDependency("after", "graph_safe_collective");
+
+    std::unordered_set<std::string> collective_nodes = {"graph_safe_collective"};
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildWarmupSegments(
+        graph,
+        cache,
+        &collective_nodes,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/true);
+
+    ASSERT_EQ(cache.segments.size(), 1u);
+    EXPECT_TRUE(cache.segments[0].capturable);
+    EXPECT_EQ(cache.segments[0].stage_names,
+              std::vector<std::string>({"before", "graph_safe_collective", "after"}));
 }
