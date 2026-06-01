@@ -1682,6 +1682,7 @@ namespace llaminar2
         {
             auto sync_t0 = std::chrono::high_resolution_clock::now();
             gpu_ctx->synchronizeStream(capture_stream);
+            auto sync_capture_t1 = std::chrono::high_resolution_clock::now();
             gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
             auto sync_t1 = std::chrono::high_resolution_clock::now();
             if (profiling)
@@ -1691,6 +1692,24 @@ namespace llaminar2
             }
             if (PerfStatsCollector::isEnabled())
             {
+                auto capture_tags = replayCacheTags(segment_cache);
+                capture_tags.emplace("stream", "capture");
+                auto default_tags = replayCacheTags(segment_cache);
+                default_tags.emplace("stream", "default");
+                PerfStatsCollector::recordTimingNs(
+                    "forward_graph",
+                    "segmented_replay_stream_sync",
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_capture_t1 - sync_t0).count()),
+                    "decode",
+                    device_name,
+                    std::move(capture_tags));
+                PerfStatsCollector::recordTimingNs(
+                    "forward_graph",
+                    "segmented_replay_stream_sync",
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_capture_t1).count()),
+                    "decode",
+                    device_name,
+                    std::move(default_tags));
                 PerfStatsCollector::recordTimingNs(
                     "forward_graph",
                     "segmented_replay_final_sync",

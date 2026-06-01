@@ -19,6 +19,7 @@
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
 #include "utils/PerfStatsCollector.h"
+#include "../../../../mocks/MockComputeStage.h"
 
 using namespace llaminar2;
 
@@ -693,6 +694,66 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
         {"stage_count", "3"}};
     EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
     EXPECT_EQ(findTimerCount(records, "segmented_replay_post_launch", expected_tags), 1u);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "main_verifier";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"verifier_graph"};
+    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*current_step=*/3,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags capture_tags = {
+        {"context", "main_verifier"},
+        {"segment_count", "1"},
+        {"stage_count", "1"},
+        {"stream", "capture"},
+        {"type", "capturable"}};
+    const PerfStatsCollector::Tags default_tags = {
+        {"context", "main_verifier"},
+        {"segment_count", "1"},
+        {"stage_count", "1"},
+        {"stream", "default"},
+        {"type", "capturable"}};
+    const PerfStatsCollector::Tags aggregate_tags = {
+        {"context", "main_verifier"},
+        {"segment_count", "1"},
+        {"stage_count", "1"},
+        {"type", "capturable"}};
+
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", capture_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", default_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", aggregate_tags), 1u);
 
     PerfStatsCollector::reset();
 }
