@@ -21,6 +21,7 @@ namespace llaminar2
     {
         std::string phase = "unknown";
         int layer = -1;
+        int tier_index = -1;
         std::string domain = "unknown";
         std::string domain_kind = "unknown";
         std::string backend = "unknown";
@@ -78,6 +79,7 @@ namespace llaminar2
         // Graph-native stage profiling (Phase 14)
         static void recordGraphNativeSparseDispatch(
             int layer,
+            int tier_index,
             const std::string &domain_key,
             int source_participant,
             int target_participant,
@@ -90,6 +92,7 @@ namespace llaminar2
 
         static void recordGraphNativeLocalExpert(
             int layer,
+            int tier_index,
             const std::string &device_key,
             bool is_cpu,
             size_t input_rows,
@@ -99,6 +102,7 @@ namespace llaminar2
 
         static void recordGraphNativeReturnReduce(
             int layer,
+            int tier_index,
             const std::string &domain_key,
             int source_participant,
             int target_participant,

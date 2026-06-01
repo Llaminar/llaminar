@@ -312,10 +312,11 @@ protected:
         if (isTopologySmokeTest())
             return;
 
-        if (isProfilerTest() && !MoEExpertOverlayProfiler::isEnabled())
+        if (isProfilerTest())
         {
-            GTEST_SKIP() << "Set LLAMINAR_PROFILING=1 at process startup to test "
-                            "mixed-tier graph-native profiler rows";
+            ASSERT_TRUE(MoEExpertOverlayProfiler::isEnabled())
+                << "Profiler parity tests must run with LLAMINAR_PROFILING=1; "
+                   "CTest discovery should inject and mpirun-forward it.";
         }
 
         Base::SetUp();
@@ -773,11 +774,9 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold, ProfilerCpuFallbackRows)
         FAIL() << kLegacyEnvVar << " must NOT be set for graph-native profiler test.";
     }
 
-    if (!MoEExpertOverlayProfiler::isEnabled())
-    {
-        GTEST_SKIP() << "Set LLAMINAR_PROFILING=1 at process startup to test "
-                        "mixed-tier graph-native profiler rows";
-    }
+    ASSERT_TRUE(MoEExpertOverlayProfiler::isEnabled())
+        << "Profiler parity tests must run with LLAMINAR_PROFILING=1; "
+           "CTest discovery should inject and mpirun-forward it.";
 
     const bool hardware_and_model_ok = collectivelyCheckHardwareAndModel();
     if (!hardware_and_model_ok)

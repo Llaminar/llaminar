@@ -53,6 +53,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Pop
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         /*layer=*/3,
+        /*tier_index=*/0,
         /*domain_key=*/"layer3/tier0/dispatch",
         /*source_participant=*/0,
         /*target_participant=*/1,
@@ -67,6 +68,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Pop
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0].phase, "gn_sparse_dispatch");
     EXPECT_EQ(rows[0].layer, 3);
+    EXPECT_EQ(rows[0].tier_index, 0);
     EXPECT_EQ(rows[0].selected_rows, 16u);
     EXPECT_EQ(rows[0].inbound_rows, 12u);
     EXPECT_EQ(rows[0].routed_entries, 32u);
@@ -80,7 +82,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Pop
 TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_DenseBytesAvoided_IsPositive)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, "key", 0, 0, 8, 16, 6, /*compact=*/1024, /*dense=*/4096, 0.0);
+        0, 1, "key", 0, 0, 8, 16, 6, /*compact=*/1024, /*dense=*/4096, 0.0);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_FALSE(rows.empty());
@@ -92,11 +94,23 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_Den
 {
     // compact >= dense — dense_bytes_avoided must be 0 (no underflow)
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, "key", 0, 0, 8, 16, 6, /*compact=*/8192, /*dense=*/4096, 0.0);
+        0, 1, "key", 0, 0, 8, 16, 6, /*compact=*/8192, /*dense=*/4096, 0.0);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_FALSE(rows.empty());
     EXPECT_EQ(rows[0].dense_bytes_avoided, 0u);
+}
+
+TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeSparseDispatch_TierIndexSeparatesRows)
+{
+    MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
+        0, 0, "domain", 0, 1, 4, 8, 4, 512, 2048, 0.0);
+    MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
+        0, 1, "domain", 0, 1, 6, 12, 6, 768, 2048, 0.0);
+
+    const auto rows = MoEExpertOverlayProfiler::rows();
+    ASSERT_EQ(rows.size(), 2u);
+    EXPECT_NE(rows[0].tier_index, rows[1].tier_index);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -106,6 +120,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_Popula
 {
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         /*layer=*/5,
+        /*tier_index=*/2,
         /*device_key=*/"cpu:0",
         /*is_cpu=*/true,
         /*input_rows=*/20,
@@ -117,6 +132,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_Popula
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0].phase, "gn_local_expert");
     EXPECT_EQ(rows[0].layer, 5);
+    EXPECT_EQ(rows[0].tier_index, 2);
     EXPECT_EQ(rows[0].domain_kind, "CPU");
     EXPECT_EQ(rows[0].selected_rows, 20u);
     EXPECT_EQ(rows[0].cpu_fallback_rows, 20u);
@@ -129,7 +145,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_Popula
 TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeLocalExpert_GpuFlag)
 {
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        2, "cuda:0", /*is_cpu=*/false, 8, 8, {1, 3}, 0.5);
+        2, 0, "cuda:0", /*is_cpu=*/false, 8, 8, {1, 3}, 0.5);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_EQ(rows.size(), 1u);
@@ -143,6 +159,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_Popul
 {
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         /*layer=*/7,
+        /*tier_index=*/3,
         /*domain_key=*/"layer7/tier0/return",
         /*source_participant=*/1,
         /*target_participant=*/0,
@@ -158,6 +175,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_Popul
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(rows[0].phase, "gn_return_reduce");
     EXPECT_EQ(rows[0].layer, 7);
+    EXPECT_EQ(rows[0].tier_index, 3);
     EXPECT_EQ(rows[0].selected_rows, 16u); // inbound_rows
     EXPECT_EQ(rows[0].inbound_rows, 16u);
     EXPECT_EQ(rows[0].routed_entries, 12u); // outbound_rows
@@ -173,7 +191,7 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_Popul
 TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_ScatterAndBroadcastTimed)
 {
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, "k", 0, 1, 8, 8, 512, 2048, 0.5, 0.25, 0.1);
+        0, 1, "k", 0, 1, 8, 8, 512, 2048, 0.5, 0.25, 0.1);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     ASSERT_FALSE(rows.empty());
@@ -187,11 +205,11 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, RecordGraphNativeReturnReduce_Scatt
 TEST_F(Test__MoEGraphNativeProfilingMetrics, AllThreePhases_AllPresent)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.1);
+        0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.1);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, "cpu:0", true, 6, 6, {0, 1}, 1.0);
+        0, 1, "cpu:0", true, 6, 6, {0, 1}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, "k", 1, 0, 6, 8, 512, 2048, 0.2, 0.1, 0.0);
+        0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.2, 0.1, 0.0);
 
     const auto rows = MoEExpertOverlayProfiler::rows();
     EXPECT_EQ(rows.size(), 3u);
@@ -203,17 +221,18 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, AllThreePhases_AllPresent)
 TEST_F(Test__MoEGraphNativeProfilingMetrics, CsvIncludesGraphNativePhases)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
+        0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, "cpu:0", true, 6, 6, {0}, 1.0);
+        0, 1, "cpu:0", true, 6, 6, {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
+        0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
     const std::string csv = MoEExpertOverlayProfiler::csvString();
     EXPECT_NE(csv.find("gn_sparse_dispatch"), std::string::npos);
     EXPECT_NE(csv.find("gn_local_expert"), std::string::npos);
     EXPECT_NE(csv.find("gn_return_reduce"), std::string::npos);
     // New CSV columns must be present in header
+    EXPECT_NE(csv.find("tier_index"), std::string::npos);
     EXPECT_NE(csv.find("dense_bytes_avoided"), std::string::npos);
     EXPECT_NE(csv.find("inbound_rows"), std::string::npos);
     EXPECT_NE(csv.find("compact_dispatch_bytes"), std::string::npos);
@@ -227,11 +246,11 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, CsvIncludesGraphNativePhases)
 TEST_F(Test__MoEGraphNativeProfilingMetrics, SummaryIncludesGraphNativePhases)
 {
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
+        0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, "cpu:0", true, 6, 6, {0}, 1.0);
+        0, 1, "cpu:0", true, 6, 6, {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
+        0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
     // renderSummary should not throw; output should contain the phases
     EXPECT_NO_THROW(MoEExpertOverlayProfiler::renderSummary());
@@ -242,11 +261,11 @@ TEST_F(Test__MoEGraphNativeProfilingMetrics, WhenProfilingDisabled_NoRowsRecorde
     mutableDebugEnv().profile.enabled = false;
 
     MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
-        0, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
+        0, 1, "k", 0, 1, 8, 16, 6, 1024, 4096, 0.0);
     MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
-        0, "cpu:0", true, 6, 6, {0}, 1.0);
+        0, 1, "cpu:0", true, 6, 6, {0}, 1.0);
     MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
-        0, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
+        0, 1, "k", 1, 0, 6, 8, 512, 2048, 0.0, 0.0, 0.0);
 
     EXPECT_TRUE(MoEExpertOverlayProfiler::rows().empty());
 }

@@ -696,6 +696,21 @@ add_v2_test(V2_Unit_MoEOverlayCollectiveWorkspace
     MPI_PROCS 1
 )
 
+# Test: MoE graph-native profiler rows and machine-readable metrics
+add_executable(v2_unit_moe_graph_native_profiling_metrics
+    unit/execution/moe/Test__MoEGraphNativeProfilingMetrics.cpp
+)
+target_link_libraries(v2_unit_moe_graph_native_profiling_metrics
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEGraphNativeProfilingMetrics
+    COMMAND $<TARGET_FILE:v2_unit_moe_graph_native_profiling_metrics>
+    LABELS "V2;Unit;Execution;MoE;GraphNative;Profiler;SparseCollective"
+    MPI_PROCS 1
+)
+
 # Test: Tensor Host Release Lifecycle (CPU-only tensor release guard regression)
 # Regression tests for the bug where releaseAllHostWeightData() released CPU-only
 # tensors that were never uploaded to GPU, causing null data access in graph stages.
@@ -5202,6 +5217,72 @@ if(ZLIB_FOUND)
     )
 
     message(STATUS "V2: Qwen3.5 MoE ExpertOverlay parity tests enabled (requires mpirun -np 2+)")
+
+    # ---- Graph-native Expert Overlay parity (sparse collective tiers) ----
+    add_executable(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold
+        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_RocmHotCpuCold_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold
+        llaminar2_core
+        v2_test_utils
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_rocm_hot_cpu_cold
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_RocmHotCpuCold
+        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;ROCm;CPU;MPI;Profiler"
+        MPI_PROCS 2
+        TIMEOUT 1200
+    )
+
+    add_executable(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm
+        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarm_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm
+        llaminar2_core
+        v2_test_utils
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_CudaHotRocmWarm
+        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;MPI;Profiler"
+        MPI_PROCS 2
+        TIMEOUT 1200
+    )
+
+    add_executable(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
+        integration/parity/qwen35moe/Test__Qwen35MoE_GraphNative_CudaHotRocmWarmCpuCold_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
+        llaminar2_core
+        v2_test_utils
+        GTest::gtest
+        ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen35moe_graphnative_cuda_hot_rocm_warm_cpu_cold
+        TEST_PREFIX V2_Integration_Parity_Qwen35MoEGraphNative_CudaHotRocmWarmCpuCold
+        LABELS "V2;Integration;Parity;Qwen35MoE;GraphNative;ExpertOverlay;SparseCollectives;CUDA;ROCm;CPU;MPI;Profiler"
+        MPI_PROCS 3
+        TIMEOUT 1800
+    )
+
+    message(STATUS "V2: Qwen3.5 MoE GraphNative parity tests enabled")
 
     # ---- NodeLocalTP MoE Parity (Cross-Socket CPU TP with Expert Parallelism) ----
     #

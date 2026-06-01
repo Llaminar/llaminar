@@ -138,8 +138,16 @@ foreach(_full_name IN LISTS _all_tests)
     string(REPLACE "/" "_" _sanitized "${_sanitized}")
     set(_ctest_name "${TEST_PREFIX}_${_sanitized}")
 
+    set(_test_mpi_cmd ${_mpi_cmd})
+    if("${_full_name}" MATCHES "Profiler")
+        # OpenMPI does not always forward CTest-set environment variables to
+        # launched ranks unless they are explicitly exported. Keep profiler
+        # parity tests self-contained in CTest instead of requiring opt-in env.
+        list(APPEND _test_mpi_cmd "-x" "LLAMINAR_PROFILING=1")
+    endif()
+
     # Build the full command: mpirun ... <binary> --gtest_filter=<full_name>
-    set(_cmd ${_mpi_cmd} "${TEST_EXECUTABLE}" "--gtest_filter=${_full_name}")
+    set(_cmd ${_test_mpi_cmd} "${TEST_EXECUTABLE}" "--gtest_filter=${_full_name}")
 
     # Convert command list to space-separated string for add_test
     # We need to properly quote each argument
@@ -154,8 +162,13 @@ foreach(_full_name IN LISTS _all_tests)
 
     string(APPEND _output "add_test(\"${_ctest_name}\" ${_cmd_str})\n")
 
+    set(_test_env_vars ${_env_vars})
+    if("${_full_name}" MATCHES "Profiler")
+        list(APPEND _test_env_vars "LLAMINAR_PROFILING=1")
+    endif()
+
     # Escape semicolons in env vars for set_tests_properties
-    string(REPLACE ";" "\\;" _env_escaped "${_env_vars}")
+    string(REPLACE ";" "\\;" _env_escaped "${_test_env_vars}")
 
     string(APPEND _output "set_tests_properties(\"${_ctest_name}\" PROPERTIES\n")
     string(APPEND _output "    FIXTURES_REQUIRED \"V2_Models\"\n")

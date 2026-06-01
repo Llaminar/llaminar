@@ -296,6 +296,7 @@ namespace llaminar2
                                                 .count();
             MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
                 params_.key.layer_idx,
+                runtime_key.tier_idx,
                 runtime_key.toString(),
                 params_.source_participant,
                 params_.target_participant,

@@ -506,6 +506,7 @@ namespace llaminar2
                 unique_set.insert(input.expert_ids_host[e]);
             MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
                 params_.layer_idx,
+                input.key.tier_idx,
                 params_.device_id.to_string(),
                 params_.device_id.is_cpu(),
                 input.live_row_count,

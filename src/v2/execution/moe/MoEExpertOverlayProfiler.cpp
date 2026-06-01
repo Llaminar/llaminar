@@ -44,7 +44,8 @@ namespace llaminar2
 
         bool sameKey(const MoEExpertOverlayProfileRow &lhs, const MoEExpertOverlayProfileRow &rhs)
         {
-            return lhs.phase == rhs.phase && lhs.layer == rhs.layer && lhs.domain == rhs.domain;
+            return lhs.phase == rhs.phase && lhs.layer == rhs.layer &&
+                   lhs.tier_index == rhs.tier_index && lhs.domain == rhs.domain;
         }
 
         void mergeTextField(std::string &target, const std::string &value)
@@ -223,7 +224,7 @@ namespace llaminar2
         fort::utf8_table table;
         table.set_border_style(FT_DOUBLE2_STYLE);
         table << fort::header
-              << "Phase" << "Layer" << "Domain" << "Kind" << "Backend"
+              << "Phase" << "Layer" << "Tier" << "Domain" << "Kind" << "Backend"
               << "Assigned" << "Resident" << "Routed" << "Rows" << "Bytes"
               << "Compute ms" << "Local reduce ms" << "Final reduce ms"
               << "Participants" << "Transport" << "Accumulation"
@@ -235,6 +236,7 @@ namespace llaminar2
         {
             table << row.phase
                   << row.layer
+                  << row.tier_index
                   << row.domain
                   << row.domain_kind
                   << row.backend
@@ -270,7 +272,7 @@ namespace llaminar2
     {
         const auto snapshot = rows();
         std::ostringstream out;
-        out << "phase,layer,domain,domain_kind,backend,assigned_experts,resident_experts,"
+        out << "phase,layer,tier_index,domain,domain_kind,backend,assigned_experts,resident_experts,"
             << "routed_entries,selected_rows,transfer_bytes,outbound_bytes,return_bytes,"
             << "compute_ms,domain_reduce_ms,cross_domain_reduce_ms,participant_count,"
             << "executed_experts,transport_mode,final_reduce_mode,accumulation_path,"
@@ -281,6 +283,7 @@ namespace llaminar2
         {
             out << csvEscape(row.phase) << ','
                 << row.layer << ','
+                << row.tier_index << ','
                 << csvEscape(row.domain) << ','
                 << csvEscape(row.domain_kind) << ','
                 << csvEscape(row.backend) << ','
@@ -438,6 +441,7 @@ namespace llaminar2
 
     void MoEExpertOverlayProfiler::recordGraphNativeSparseDispatch(
         int layer,
+        int tier_index,
         const std::string &domain_key,
         int source_participant,
         int target_participant,
@@ -454,6 +458,7 @@ namespace llaminar2
         MoEExpertOverlayProfileRow row;
         row.phase = "gn_sparse_dispatch";
         row.layer = layer;
+        row.tier_index = tier_index;
         row.domain = domain_key.empty() ? "unknown" : domain_key;
         row.participant_count = 2;
         row.selected_rows = outbound_rows;
@@ -473,6 +478,7 @@ namespace llaminar2
 
     void MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
         int layer,
+        int tier_index,
         const std::string &device_key,
         bool is_cpu,
         size_t input_rows,
@@ -486,6 +492,7 @@ namespace llaminar2
         MoEExpertOverlayProfileRow row;
         row.phase = "gn_local_expert";
         row.layer = layer;
+        row.tier_index = tier_index;
         row.domain = device_key.empty() ? "unknown" : device_key;
         row.domain_kind = is_cpu ? "CPU" : "GPU";
         row.selected_rows = input_rows;
@@ -503,6 +510,7 @@ namespace llaminar2
 
     void MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
         int layer,
+        int tier_index,
         const std::string &domain_key,
         int source_participant,
         int target_participant,
@@ -520,6 +528,7 @@ namespace llaminar2
         MoEExpertOverlayProfileRow row;
         row.phase = "gn_return_reduce";
         row.layer = layer;
+        row.tier_index = tier_index;
         row.domain = domain_key.empty() ? "unknown" : domain_key;
         row.participant_count = 2;
         row.selected_rows = inbound_rows;

@@ -215,6 +215,7 @@ namespace llaminar2
             const size_t dense_bytes = denseMoEOverlayReturnBytes(params_.seq_len, params_.d_model);
             MoEExpertOverlayProfiler::recordGraphNativeReturnReduce(
                 params_.key.layer_idx,
+                runtime_key.tier_idx,
                 runtime_key.toString(),
                 params_.source_participant,
                 params_.target_participant,

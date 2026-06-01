@@ -226,25 +226,6 @@ namespace
         return info && std::string(info->name()) == "ProfilerAllGpuNoFallbackRows";
     }
 
-    std::optional<int> profilerTierIndex(const MoEExpertOverlayProfileRow &row)
-    {
-        std::vector<std::string> parts;
-        std::stringstream stream(row.domain);
-        std::string part;
-        while (std::getline(stream, part, ':'))
-            parts.push_back(part);
-        if (parts.size() < 4)
-            return std::nullopt;
-        try
-        {
-            return std::stoi(parts[3]);
-        }
-        catch (...)
-        {
-            return std::nullopt;
-        }
-    }
-
     TestConfig makeGraphNativeTestConfig()
     {
         TestConfig config;
@@ -311,10 +292,11 @@ protected:
         if (isTopologySmokeTest())
             return;
 
-        if (isProfilerTest() && !MoEExpertOverlayProfiler::isEnabled())
+        if (isProfilerTest())
         {
-            GTEST_SKIP() << "Set LLAMINAR_PROFILING=1 at process startup to test "
-                            "all-GPU graph-native profiler rows";
+            ASSERT_TRUE(MoEExpertOverlayProfiler::isEnabled())
+                << "Profiler parity tests must run with LLAMINAR_PROFILING=1; "
+                   "CTest discovery should inject and mpirun-forward it.";
         }
 
         Base::SetUp();
@@ -757,11 +739,9 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, ProfilerAllGpuNoFallbackRows)
         FAIL() << kLegacyEnvVar << " must NOT be set for graph-native profiler test.";
     }
 
-    if (!MoEExpertOverlayProfiler::isEnabled())
-    {
-        GTEST_SKIP() << "Set LLAMINAR_PROFILING=1 at process startup to test "
-                        "all-GPU graph-native profiler rows";
-    }
+    ASSERT_TRUE(MoEExpertOverlayProfiler::isEnabled())
+        << "Profiler parity tests must run with LLAMINAR_PROFILING=1; "
+           "CTest discovery should inject and mpirun-forward it.";
 
     const bool hardware_and_model_ok = collectivelyCheckHardwareAndModel();
     if (!hardware_and_model_ok)
@@ -832,8 +812,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarm, ProfilerAllGpuNoFallbackRows)
     {
         if (row.phase != "gn_sparse_dispatch")
             continue;
-        const auto tier_index = profilerTierIndex(row);
-        if (!tier_index || *tier_index != kRocmWarmTierIndex)
+        if (row.tier_index != kRocmWarmTierIndex)
             continue;
 
         auto &aggregate = warm_dispatch[row.domain];

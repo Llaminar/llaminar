@@ -17,7 +17,8 @@
  *   - cpu_cold is ExpertDomainKind::SingleDevice CPU on rank 1 (not NodeLocalTP cross-socket).
  *   - Parity bodies are NOT unconditionally skipped — Phase 14 graph-native is implemented.
  *   - Asserts LLAMINAR_MOE_LEGACY_OVERLAY_DOMAIN_RUNTIME is NOT set.
- *   - Verifies MoEExpertOverlayProfiler cpu_fallback_rows > 0 when LLAMINAR_PROFILING=1.
+ *   - Verifies MoEExpertOverlayProfiler cpu_fallback_rows > 0 in the
+ *     profiler parity case. CTest discovery injects LLAMINAR_PROFILING=1.
  *
  * NOTE on multi-rank CPU sidecar: The cpu_cold domain is specified on world rank 1.
  * If OrchestrationRunner does not yet fully drive a participant-graph on rank 1
@@ -791,7 +792,7 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, DecodeParity)
  *        after a forward pass when the cold tier has expert assignments.
  *
  * Hardware-gated: skips when ROCm is absent or model file is missing.
- * Profiling-gated: skips unless LLAMINAR_PROFILING=1 is set at process startup.
+ * CTest discovery injects LLAMINAR_PROFILING=1 for this profiler parity case.
  *
  * This test validates the Phase 14 graph-native profiler metric end-to-end:
  *   - gn_sparse_dispatch row: compact_dispatch_bytes > 0 for cold-tier rows
@@ -809,13 +810,11 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, ProfilerCpuFallbackRows)
         FAIL() << kLegacyEnvVar << " must NOT be set for graph-native profiler test.";
     }
 
-    // Skip if profiling is not enabled at startup (env-var caching means we cannot
-    // enable it post-initialization)
-    if (!MoEExpertOverlayProfiler::isEnabled())
-    {
-        GTEST_SKIP() << "Set LLAMINAR_PROFILING=1 at process startup to test "
-                        "graph-native cpu_fallback_rows profiler rows";
-    }
+    // Profiling must be enabled at process startup because DebugEnv caches env
+    // values. CTest discovery injects and mpirun-forwards this for profiler cases.
+    ASSERT_TRUE(MoEExpertOverlayProfiler::isEnabled())
+        << "Profiler parity tests must run with LLAMINAR_PROFILING=1; "
+           "CTest discovery should inject and mpirun-forward it.";
 
     const bool hardware_and_model_ok = collectivelyCheckHardwareAndModel();
     if (!hardware_and_model_ok)
