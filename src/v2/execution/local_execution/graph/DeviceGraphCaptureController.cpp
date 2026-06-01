@@ -24,11 +24,20 @@ namespace llaminar2
             return segment.capturable ? "capturable" : "manual";
         }
 
-        PerfStatsCollector::Tags replaySegmentTags(const DeviceGraphExecutor::GraphSegment &segment)
+        void addContextTag(PerfStatsCollector::Tags &tags, const std::string &perf_context)
         {
-            return {
+            if (!perf_context.empty())
+                tags.emplace("context", perf_context);
+        }
+
+        PerfStatsCollector::Tags replaySegmentTags(const DeviceGraphExecutor::GraphSegment &segment,
+                                                   const std::string &perf_context)
+        {
+            PerfStatsCollector::Tags tags{
                 {"type", segmentTypeName(segment)},
                 {"stage_count", std::to_string(segment.stage_names.size())}};
+            addContextTag(tags, perf_context);
+            return tags;
         }
 
         PerfStatsCollector::Tags replayCacheTags(const DeviceGraphExecutor::GraphSegmentCache &cache)
@@ -51,10 +60,12 @@ namespace llaminar2
             else if (has_manual)
                 type = "manual";
 
-            return {
+            PerfStatsCollector::Tags tags{
                 {"type", type},
                 {"segment_count", std::to_string(cache.segments.size())},
                 {"stage_count", std::to_string(stage_count)}};
+            addContextTag(tags, cache.perf_context);
+            return tags;
         }
     }
 
@@ -610,6 +621,7 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         void *capture_stream,
         bool needs_segment_sync,
+        const std::string &perf_context,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         if (!gpu_ctx)
@@ -647,7 +659,7 @@ namespace llaminar2
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count()),
                 "decode",
                 {},
-                replaySegmentTags(segment));
+                replaySegmentTags(segment, perf_context));
         }
 
         // Time post-launch callbacks (markOutputsDirty + onGraphReplayed)
@@ -668,7 +680,7 @@ namespace llaminar2
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(post_t1 - post_t0).count()),
                 "decode",
                 {},
-                replaySegmentTags(segment));
+                replaySegmentTags(segment, perf_context));
         }
 
         if (needs_segment_sync)
@@ -1169,6 +1181,7 @@ namespace llaminar2
         bool verify_mode,
         bool recapture_mode,
         int segment_index,
+        const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
@@ -1231,6 +1244,7 @@ namespace llaminar2
             gpu_ctx,
             capture_stream,
             needs_segment_sync,
+            perf_context,
             post_launch_cb);
         result.success = launch_ok;
         result.launch_failure_fallback = !launch_ok;
@@ -1249,6 +1263,7 @@ namespace llaminar2
         bool recapture_mode,
         uint64_t current_step,
         int segment_index,
+        const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
         const std::function<bool(ComputeNode &)> &execute_node_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
@@ -1267,6 +1282,7 @@ namespace llaminar2
                 verify_mode,
                 recapture_mode,
                 segment_index,
+                perf_context,
                 cohere_inputs_cb,
                 post_launch_cb);
             result.success = capturable_result.success;
@@ -1585,7 +1601,7 @@ namespace llaminar2
         for (auto &seg : segment_cache.segments)
         {
             const char *seg_type = segmentTypeName(seg);
-            const auto seg_tags = replaySegmentTags(seg);
+            const auto seg_tags = replaySegmentTags(seg, segment_cache.perf_context);
             if (trace_replay)
             {
                 const char *seg_display_type = seg.capturable ? "GRAPH" : "MANUAL";
@@ -1621,6 +1637,7 @@ namespace llaminar2
                 recapture_mode,
                 current_step,
                 seg_idx,
+                segment_cache.perf_context,
                 hooks.cohere_inputs,
                 hooks.execute_node,
                 hooks.post_launch);

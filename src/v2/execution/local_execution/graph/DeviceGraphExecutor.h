@@ -398,6 +398,7 @@ namespace llaminar2
             bool needs_capture = false;               ///< True after warmup, before capture
             int consecutive_failures = 0;             ///< Segment-level failure counter
             uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
+            std::string perf_context;                 ///< Optional structured stats tag for the replay caller
             void *capture_stream = nullptr;           ///< Locally-created blocking stream for capture/replay
             void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
@@ -417,6 +418,7 @@ namespace llaminar2
                   needs_capture(other.needs_capture),
                   consecutive_failures(other.consecutive_failures),
                   decode_step(other.decode_step),
+                  perf_context(std::move(other.perf_context)),
                   capture_stream(other.capture_stream),
                   sync_event(other.sync_event),
                   gpu_ctx_ref(other.gpu_ctx_ref)
@@ -436,6 +438,7 @@ namespace llaminar2
                     needs_capture = other.needs_capture;
                     consecutive_failures = other.consecutive_failures;
                     decode_step = other.decode_step;
+                    perf_context = std::move(other.perf_context);
                     capture_stream = other.capture_stream;
                     sync_event = other.sync_event;
                     gpu_ctx_ref = other.gpu_ctx_ref;

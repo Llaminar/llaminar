@@ -646,6 +646,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
         &gpu_ctx,
         &capture_stream,
         /*needs_segment_sync=*/true,
+        /*perf_context=*/"",
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
@@ -656,6 +657,38 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags expected_tags = {
+        {"type", "capturable"},
+        {"stage_count", "3"}};
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_post_launch", expected_tags), 1u);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    DeviceGraphExecutor::GraphSegment segment;
+    segment.capturable = true;
+    segment.stage_names = {"embedding", "attention", "lm_head"};
+    segment.capture = std::make_unique<FakeReplayGraphCapture>();
+
+    FakeReplayGPUContext gpu_ctx;
+    int capture_stream = 0;
+
+    ASSERT_TRUE(DeviceGraphCaptureController::executeCapturedReplaySegmentNormal(
+        segment,
+        &gpu_ctx,
+        &capture_stream,
+        /*needs_segment_sync=*/false,
+        /*perf_context=*/"main_verifier",
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}));
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags expected_tags = {
+        {"context", "main_verifier"},
         {"type", "capturable"},
         {"stage_count", "3"}};
     EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);

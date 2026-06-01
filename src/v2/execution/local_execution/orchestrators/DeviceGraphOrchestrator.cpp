@@ -3664,6 +3664,8 @@ namespace llaminar2
                 ensureDeviceWorkspaceAllocated(*sidecar_cache.graph);
                 auto &pool = GPUDeviceContextPool::instance();
                 IWorkerGPUContext &gpu_ctx = pool.getContext(state_.device_id);
+                sidecar_cache.segment_cache.perf_context =
+                    (phase == "prefill") ? "mtp_shifted_prefill" : "mtp_decode_sidecar";
                 const auto capture_policy = buildDecodeCapturePolicy(
                     !collective_nodes.empty(),
                     ctx,

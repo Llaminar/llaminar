@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <unordered_set>
 
 namespace llaminar2
@@ -215,6 +216,7 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             void *capture_stream,
             bool needs_segment_sync,
+            const std::string &perf_context,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -284,6 +286,7 @@ namespace llaminar2
             bool verify_mode,
             bool recapture_mode,
             int segment_index,
+            const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
@@ -302,6 +305,7 @@ namespace llaminar2
             bool recapture_mode,
             uint64_t current_step,
             int segment_index,
+            const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);

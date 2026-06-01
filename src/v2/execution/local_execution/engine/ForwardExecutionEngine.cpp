@@ -1149,6 +1149,8 @@ namespace llaminar2
                 }
             }
 
+            forward_cache.segment_cache.perf_context =
+                host.computeAllPositionLogitsEnabled() ? "main_verifier" : "main_decode";
             success = executor_.executeDecodeWithCapturePolicy(
                 *forward_cache.graph,
                 ctx,
