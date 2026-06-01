@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <future>
 #include <unordered_map>
 
 #include "execution/compute_stages/IComputeStage.h"
@@ -15,6 +16,8 @@
 #include "execution/local_execution/graph/DeviceGraphCaptureController.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
+#include "backends/IGPUGraphCapture.h"
+#include "backends/IWorkerGPUContext.h"
 #include "utils/PerfStatsCollector.h"
 
 using namespace llaminar2;
@@ -46,6 +49,84 @@ namespace
         bool capturable_ = true;
         bool manual_boundary_ = false;
         ComputeStageType stage_type_ = ComputeStageType::COPY;
+    };
+
+    class FakeReplayGraphCapture final : public IGPUGraphCapture
+    {
+    public:
+        bool beginCapture() override { return true; }
+        bool endCapture() override { return true; }
+        bool instantiate() override
+        {
+            executable_ = true;
+            return true;
+        }
+        bool launch() override
+        {
+            ++launch_calls_;
+            return executable_;
+        }
+        GraphUpdateResult tryUpdate() override { return GraphUpdateResult::Success; }
+        bool hasExecutable() const override { return executable_; }
+        size_t nodeCount() const override { return 1; }
+        void reset() override { executable_ = false; }
+        const char *backendName() const override { return "FakeReplay"; }
+
+        int launch_calls_ = 0;
+
+    private:
+        bool executable_ = true;
+    };
+
+    class FakeReplayGPUContext final : public IWorkerGPUContext
+    {
+    public:
+        int deviceOrdinal() const override { return 0; }
+        std::string deviceName() const override { return "FakeReplayGPU"; }
+        bool isInitialized() const override { return true; }
+
+        void submitAndWait(std::function<void()> work) override { work(); }
+        std::future<void> submitAsync(std::function<void()> work) override
+        {
+            work();
+            std::promise<void> done;
+            done.set_value();
+            return done.get_future();
+        }
+
+        void *defaultStream() override { return &default_stream_; }
+        void *createStream() override { return &capture_stream_; }
+        void destroyStream(void *) override {}
+
+        void *createEvent() override { return nullptr; }
+        void destroyEvent(void *) override {}
+        void recordEvent(void *, void *) override {}
+        void waitEvent(void *, void *) override {}
+        void synchronizeEvent(void *) override {}
+        float eventElapsedTime(void *, void *) override { return 0.0f; }
+        void *blasHandle() override { return nullptr; }
+        void *blasLtHandle() override { return nullptr; }
+        void setCollectiveComm(void *) override {}
+        void *collectiveComm() const override { return nullptr; }
+        void synchronize() override {}
+        void synchronizeStream(void *) override { ++synchronize_stream_calls_; }
+        void insertStreamDependency(void *, void *) override {}
+
+        std::unique_ptr<IGPUGraphCapture> createGraphCapture() override
+        {
+            return std::make_unique<FakeReplayGraphCapture>();
+        }
+
+        std::unique_ptr<IGPUGraphCapture> createGraphCapture(void *) override
+        {
+            return std::make_unique<FakeReplayGraphCapture>();
+        }
+
+        int synchronize_stream_calls_ = 0;
+
+    private:
+        int default_stream_ = 0;
+        int capture_stream_ = 0;
     };
 
     void addFakeSegmentStage(ComputeGraph &graph,
@@ -111,6 +192,23 @@ namespace
             }
         }
         return -1.0;
+    }
+
+    uint64_t findTimerCount(const std::vector<PerfStatRecord> &records,
+                            const std::string &name,
+                            const PerfStatsCollector::Tags &tags)
+    {
+        for (const auto &record : records)
+        {
+            if (record.kind == PerfStatRecord::Kind::Timer &&
+                record.domain == "forward_graph" &&
+                record.name == name &&
+                record.tags == tags)
+            {
+                return record.count;
+            }
+        }
+        return 0;
     }
 }
 
@@ -525,6 +623,43 @@ TEST(Test__GraphSegmentCache, SegmentedPlanPublishesPerfStats)
             "segmented_plan_stage_types",
             {{"segment_type", "capturable"}, {"stage_type", "GEMM"}}),
         1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    DeviceGraphExecutor::GraphSegment segment;
+    segment.capturable = true;
+    segment.stage_names = {"gemm", "gdn_projection", "lm_head"};
+    segment.capture = std::make_unique<FakeReplayGraphCapture>();
+
+    FakeReplayGPUContext gpu_ctx;
+    bool post_launch_called = false;
+    int capture_stream = 0;
+
+    ASSERT_TRUE(DeviceGraphCaptureController::executeCapturedReplaySegmentNormal(
+        segment,
+        &gpu_ctx,
+        &capture_stream,
+        /*needs_segment_sync=*/true,
+        [&](DeviceGraphExecutor::GraphSegment &, void *)
+        {
+            post_launch_called = true;
+        }));
+
+    EXPECT_TRUE(post_launch_called);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 1);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags expected_tags = {
+        {"type", "capturable"},
+        {"stage_count", "3"}};
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_post_launch", expected_tags), 1u);
 
     PerfStatsCollector::reset();
 }

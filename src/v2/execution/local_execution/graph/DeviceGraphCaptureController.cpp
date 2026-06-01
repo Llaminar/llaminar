@@ -17,6 +17,47 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        const char *segmentTypeName(const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            return segment.capturable ? "capturable" : "manual";
+        }
+
+        PerfStatsCollector::Tags replaySegmentTags(const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            return {
+                {"type", segmentTypeName(segment)},
+                {"stage_count", std::to_string(segment.stage_names.size())}};
+        }
+
+        PerfStatsCollector::Tags replayCacheTags(const DeviceGraphExecutor::GraphSegmentCache &cache)
+        {
+            size_t stage_count = 0;
+            bool has_capturable = false;
+            bool has_manual = false;
+            for (const auto &segment : cache.segments)
+            {
+                stage_count += segment.stage_names.size();
+                has_capturable = has_capturable || segment.capturable;
+                has_manual = has_manual || !segment.capturable;
+            }
+
+            const char *type = "empty";
+            if (has_capturable && has_manual)
+                type = "mixed";
+            else if (has_capturable)
+                type = "capturable";
+            else if (has_manual)
+                type = "manual";
+
+            return {
+                {"type", type},
+                {"segment_count", std::to_string(cache.segments.size())},
+                {"stage_count", std::to_string(stage_count)}};
+        }
+    }
+
 
     DeviceGraphCaptureController::Transition DeviceGraphCaptureController::beginStep(
         bool initialized,
@@ -604,7 +645,9 @@ namespace llaminar2
                 "forward_graph",
                 "segmented_replay_graph_launch",
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count()),
-                "decode");
+                "decode",
+                {},
+                replaySegmentTags(segment));
         }
 
         // Time post-launch callbacks (markOutputsDirty + onGraphReplayed)
@@ -623,7 +666,9 @@ namespace llaminar2
                 "forward_graph",
                 "segmented_replay_post_launch",
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(post_t1 - post_t0).count()),
-                "decode");
+                "decode",
+                {},
+                replaySegmentTags(segment));
         }
 
         if (needs_segment_sync)
@@ -1533,12 +1578,14 @@ namespace llaminar2
             "forward_graph",
             "segmented_replay_total",
             "decode",
-            device_name);
+            device_name,
+            replayCacheTags(segment_cache));
 
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
         {
-            const char *seg_type = seg.capturable ? "capturable" : "manual";
+            const char *seg_type = segmentTypeName(seg);
+            const auto seg_tags = replaySegmentTags(seg);
             if (trace_replay)
             {
                 const char *seg_display_type = seg.capturable ? "GRAPH" : "MANUAL";
@@ -1557,7 +1604,7 @@ namespace llaminar2
                 1.0,
                 "decode",
                 device_name,
-                {{"type", seg_type}});
+                seg_tags);
 
             const auto segment_t0 = std::chrono::high_resolution_clock::now();
             // Segment execution picks capturable or manual behavior based on
@@ -1586,8 +1633,7 @@ namespace llaminar2
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(segment_t1 - segment_t0).count()),
                     "decode",
                     device_name,
-                    {{"type", seg_type},
-                     {"stage_count", std::to_string(seg.stage_names.size())}});
+                    seg_tags);
             }
 
             if (!replay_result.success)
@@ -1633,7 +1679,8 @@ namespace llaminar2
                     "segmented_replay_final_sync",
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()),
                     "decode",
-                    device_name);
+                    device_name,
+                    replayCacheTags(segment_cache));
             }
         }
         if (trace_replay)
