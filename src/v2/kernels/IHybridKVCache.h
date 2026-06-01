@@ -37,6 +37,11 @@ namespace llaminar2
         int seq_idx = 0;
         int logical_token_count = 0;
         void *stream = nullptr;
+        // Prefix-cache persistence needs completed payloads on return; live rollback
+        // checkpoints can use stream ordering and avoid a host-side sync.
+        bool synchronize = true;
+        bool include_host_state = true;
+        bool include_device_state = true;
     };
 
     /**

@@ -497,6 +497,61 @@ TEST(Test__ROCmHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostAndGPUS
     expectNearVector(actual_rec, expected_rec, 1e-4f, "recurrence output after hybrid prefix import");
 }
 
+TEST(Test__ROCmHybridKVCacheReset, AsyncDeviceOnlyHybridPrefixStateRoundTripRestoresAfterExplicitStreamSync)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "ROCm not available";
+
+    auto cache = createHybridCache();
+    auto *state0 = cache.hybrid->getGDNState(0);
+    ASSERT_NE(state0, nullptr);
+    ASSERT_NE(state0->conv_kernel, nullptr);
+    ASSERT_NE(state0->rec_kernel, nullptr);
+
+    state0->recurrence_state[0] = 30.0f;
+    state0->conv_state[0] = 31.0f;
+    mutateGDNState(cache.hybrid, /*layer=*/0);
+
+    const auto metadata = cache.hybrid->hybridPrefixStateMetadata();
+    ASSERT_GT(metadata.host_bytes, 0u);
+    ASSERT_GT(metadata.device_bytes, 0u);
+    ASSERT_EQ(metadata.device_bytes % sizeof(float), 0u);
+
+    HipFloatBuffer device_payload(metadata.device_bytes / sizeof(float));
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    llaminar2::HybridPrefixStateDescriptor desc;
+    desc.seq_idx = 0;
+    desc.logical_token_count = 4;
+    desc.stream = stream;
+    desc.synchronize = false;
+    desc.include_host_state = false;
+    desc.include_device_state = true;
+    ASSERT_TRUE(cache.hybrid->exportHybridPrefixState(
+        desc,
+        nullptr,
+        device_payload.ptr));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    const auto expected_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
+    const auto expected_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
+
+    cache.owner->clear();
+    ASSERT_TRUE(cache.hybrid->importHybridPrefixState(
+        desc,
+        nullptr,
+        device_payload.ptr));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+
+    const auto actual_conv = runConvDecode(cache.hybrid, /*layer=*/0, 6.0f);
+    const auto actual_rec = runRecurrenceDecode(cache.hybrid, /*layer=*/0, 6.5f);
+    expectNearVector(actual_conv, expected_conv, 1e-5f, "async conv output after hybrid prefix import");
+    expectNearVector(actual_rec, expected_rec, 1e-4f, "async recurrence output after hybrid prefix import");
+}
+
 TEST(Test__ROCmHybridKVCacheReset, ClearLayerResetsCompressedFullAttentionEntry)
 {
     if (!hasROCm())

@@ -568,7 +568,8 @@ namespace llaminar2
             const IKVCache &cache,
             int seq_idx,
             int logical_token_count,
-            PrefixBlockHandle *handle)
+            PrefixBlockHandle *handle,
+            bool synchronize = true)
         {
             if (!handle || !handle->layout.includes_hybrid_state)
             {
@@ -585,6 +586,9 @@ namespace llaminar2
             HybridPrefixStateDescriptor desc;
             desc.seq_idx = seq_idx;
             desc.logical_token_count = logical_token_count;
+            desc.synchronize = synchronize;
+            desc.include_host_state = handle->layout.hybrid_host_state_bytes > 0;
+            desc.include_device_state = handle->layout.hybrid_device_state_bytes > 0;
             if (!hybrid->exportHybridPrefixState(
                     desc,
                     hybridPayloadHostPtr(*handle),
@@ -599,7 +603,8 @@ namespace llaminar2
         bool importHybridPrefixPayload(
             IKVCache &cache,
             const PrefixBlockHandle &handle,
-            int seq_idx)
+            int seq_idx,
+            bool synchronize = true)
         {
             if (!handle.layout.includes_hybrid_state)
             {
@@ -616,6 +621,9 @@ namespace llaminar2
             HybridPrefixStateDescriptor desc;
             desc.seq_idx = seq_idx;
             desc.logical_token_count = handle.key.token_start + handle.key.token_count;
+            desc.synchronize = synchronize;
+            desc.include_host_state = handle.layout.hybrid_host_state_bytes > 0;
+            desc.include_device_state = handle.layout.hybrid_device_state_bytes > 0;
             return hybrid->importHybridPrefixState(
                 desc,
                 hybridPayloadHostPtr(handle),
@@ -685,6 +693,19 @@ namespace llaminar2
             hybrid_layout.bytes_per_mtp_layer_v = 0;
             hybrid_layout.mtp_kv_bytes = 0;
             hybrid_layout.includes_mtp_state = false;
+            return hybrid_layout;
+        }
+
+        PrefixPayloadLayout liveHybridCheckpointLayout(const PrefixPayloadLayout &layout,
+                                                       bool device_only)
+        {
+            PrefixPayloadLayout hybrid_layout = hybridOnlyCheckpointLayout(layout);
+            if (device_only && hybrid_layout.hybrid_device_state_bytes > 0)
+            {
+                hybrid_layout.hybrid_host_state_bytes = 0;
+                hybrid_layout.hybrid_state_bytes = hybrid_layout.hybrid_device_state_bytes;
+            }
+            hybrid_layout.includes_hybrid_state = hybrid_layout.hybrid_state_bytes > 0;
             return hybrid_layout;
         }
     }
@@ -5023,23 +5044,73 @@ namespace llaminar2
         snapshot.cached_tokens = cached_tokens;
         snapshot.mtp_cached_tokens.assign(state_.mtp_kv_caches.size(), -1);
 
-        if (liveCheckpointHasHybridState(*state_.kv_cache, state_.device_id, cached_tokens))
+        PrefixPayloadLayout main_layout;
+        if (cached_tokens > 0)
         {
-            PrefixPayloadLayout layout = buildDensePrefixPayloadLayout(
+            PerfStatsCollector::ScopedTimer timer("mtp",
+                                                  "live_prefix_checkpoint_layout",
+                                                  "decode",
+                                                  state_.device_id.toString(),
+                                                  {{"cache", "main"}});
+            main_layout = buildDensePrefixPayloadLayout(
                 *state_.kv_cache,
                 state_.device_id,
                 cached_tokens);
+        }
 
+        if (main_layout.includes_hybrid_state && main_layout.hybrid_state_bytes > 0)
+        {
             PrefixBlockHandle handle;
             handle.key.fingerprint = prefix_fingerprint_ != 0 ? prefix_fingerprint_ : 1;
             handle.key.block_index = 0;
             handle.key.token_start = 0;
             handle.key.token_count = cached_tokens;
-            handle.layout = hybridOnlyCheckpointLayout(layout);
+            const bool device_only_checkpoint =
+                state_.device_id.is_gpu() && main_layout.hybrid_device_state_bytes > 0;
+            handle.layout = liveHybridCheckpointLayout(main_layout, device_only_checkpoint);
             handle.total_bytes = handle.layout.totalBytes();
-            if (!ensureLiveHybridCheckpointStorage(handle))
-                return {};
-            if (!exportHybridPrefixPayload(*state_.kv_cache, seq_idx, cached_tokens, &handle))
+            PerfStatsCollector::addCounter("mtp",
+                                           "live_prefix_checkpoint_hybrid_host_bytes",
+                                           static_cast<double>(handle.layout.hybrid_host_state_bytes),
+                                           "decode",
+                                           state_.device_id.toString());
+            PerfStatsCollector::addCounter("mtp",
+                                           "live_prefix_checkpoint_hybrid_device_bytes",
+                                           static_cast<double>(handle.layout.hybrid_device_state_bytes),
+                                           "decode",
+                                           state_.device_id.toString());
+            if (device_only_checkpoint)
+            {
+                PerfStatsCollector::addCounter("mtp",
+                                               "live_prefix_checkpoint_hybrid_device_only_captures",
+                                               1.0,
+                                               "decode",
+                                               state_.device_id.toString());
+            }
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp",
+                                                      "live_prefix_checkpoint_hybrid_storage",
+                                                      "decode",
+                                                      state_.device_id.toString());
+                if (!ensureLiveHybridCheckpointStorage(handle))
+                    return {};
+            }
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp",
+                                                      "live_prefix_checkpoint_hybrid_export",
+                                                      "decode",
+                                                      state_.device_id.toString());
+                if (!exportHybridPrefixPayload(
+                        *state_.kv_cache,
+                        seq_idx,
+                        cached_tokens,
+                        &handle,
+                        /*synchronize=*/false))
+                {
+                    return {};
+                }
+            }
+            if (!handle.has_hybrid_state)
             {
                 return {};
             }
@@ -5061,7 +5132,19 @@ namespace llaminar2
             {
                 return {};
             }
-            if (liveCheckpointHasHybridState(*cache, state_.device_id, mtp_cached_tokens))
+            bool mtp_has_hybrid_state = false;
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp",
+                                                      "live_prefix_checkpoint_layout",
+                                                      "decode",
+                                                      state_.device_id.toString(),
+                                                      {{"cache", "mtp"}});
+                mtp_has_hybrid_state = liveCheckpointHasHybridState(
+                    *cache,
+                    state_.device_id,
+                    mtp_cached_tokens);
+            }
+            if (mtp_has_hybrid_state)
             {
                 PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_payload_required", 1.0, "decode",
                                                state_.device_id.toString(),
@@ -5118,7 +5201,8 @@ namespace llaminar2
                 hybrid_handle = &snapshot.blocks.front();
                 if (!hybrid_handle->layout.includes_hybrid_state ||
                     !hybrid_handle->has_hybrid_state ||
-                    !hybrid_handle->hybrid_payload ||
+                    (hybrid_handle->layout.hybrid_host_state_bytes > 0 && !hybrid_handle->hybrid_payload) ||
+                    (hybrid_handle->layout.hybrid_device_state_bytes > 0 && !hybridPayloadDevicePtr(*hybrid_handle)) ||
                     hybrid_handle->key.token_start != 0 ||
                     hybrid_handle->key.token_count != snapshot.cached_tokens)
                 {
@@ -5138,10 +5222,20 @@ namespace llaminar2
             {
                 resetHybridPrefixPayloadState(*state_.kv_cache);
             }
-            else if (hybrid_handle &&
-                     !importHybridPrefixPayload(*state_.kv_cache, *hybrid_handle, seq_idx))
+            else if (hybrid_handle)
             {
-                return fail("logical checkpoint hybrid payload import failed");
+                PerfStatsCollector::ScopedTimer timer("mtp",
+                                                      "restore_live_prefix_checkpoint_hybrid_import",
+                                                      "decode",
+                                                      state_.device_id.toString());
+                if (!importHybridPrefixPayload(
+                        *state_.kv_cache,
+                        *hybrid_handle,
+                        seq_idx,
+                        /*synchronize=*/false))
+                {
+                    return fail("logical checkpoint hybrid payload import failed");
+                }
             }
 
             for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)

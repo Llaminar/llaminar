@@ -458,6 +458,14 @@ namespace llaminar2::test
         EXPECT_FALSE(metadata.has_device_kernel_state);
     }
 
+    TEST_F(Test__CPUHybridKVCache, HybridPrefixStateDescriptorDefaultsToSynchronousCompletion)
+    {
+        HybridPrefixStateDescriptor desc;
+        EXPECT_TRUE(desc.synchronize);
+        EXPECT_TRUE(desc.include_host_state);
+        EXPECT_TRUE(desc.include_device_state);
+    }
+
     TEST_F(Test__CPUHybridKVCache, PrefixPayloadLayoutCountsFALayersAndHybridState)
     {
         auto cache = createCache();

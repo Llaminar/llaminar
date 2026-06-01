@@ -438,15 +438,22 @@ namespace llaminar2
                 return false;
 
             HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
-            if ((metadata.host_bytes > 0 && !dst_host) ||
-                (metadata.device_bytes > 0 && !dst_device))
+            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
+            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
+            if ((needs_host && !dst_host) ||
+                (needs_device && !dst_device))
             {
                 return false;
             }
 
-            auto *host_cursor = reinterpret_cast<uint8_t *>(dst_host);
-            auto *device_cursor = reinterpret_cast<uint8_t *>(dst_device);
-            return exportHybridStatePayload(host_cursor, device_cursor, desc.stream);
+            auto *host_cursor = needs_host ? reinterpret_cast<uint8_t *>(dst_host) : nullptr;
+            auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
+            return exportHybridStatePayload(
+                host_cursor,
+                device_cursor,
+                desc.stream,
+                desc.include_host_state,
+                desc.include_device_state);
         }
 
         bool importHybridPrefixState(
@@ -458,15 +465,22 @@ namespace llaminar2
                 return false;
 
             HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
-            if ((metadata.host_bytes > 0 && !src_host) ||
-                (metadata.device_bytes > 0 && !src_device))
+            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
+            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
+            if ((needs_host && !src_host) ||
+                (needs_device && !src_device))
             {
                 return false;
             }
 
-            const auto *host_cursor = reinterpret_cast<const uint8_t *>(src_host);
-            const auto *device_cursor = reinterpret_cast<const uint8_t *>(src_device);
-            return importHybridStatePayload(host_cursor, device_cursor, desc.stream);
+            const auto *host_cursor = needs_host ? reinterpret_cast<const uint8_t *>(src_host) : nullptr;
+            const auto *device_cursor = needs_device ? reinterpret_cast<const uint8_t *>(src_device) : nullptr;
+            return importHybridStatePayload(
+                host_cursor,
+                device_cursor,
+                desc.stream,
+                desc.include_host_state,
+                desc.include_device_state);
         }
 
         /// Access the layer map
@@ -517,7 +531,9 @@ namespace llaminar2
         bool exportHybridStatePayload(
             uint8_t *&host_cursor,
             uint8_t *&device_cursor,
-            void *stream) const
+            void *stream,
+            bool include_host_state = true,
+            bool include_device_state = true) const
         {
             for (int layer = 0; layer < total_layers_; ++layer)
             {
@@ -527,18 +543,18 @@ namespace llaminar2
 
                 const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
                 const size_t conv_bytes = state->conv_state.size() * sizeof(float);
-                if (recurrence_bytes > 0)
+                if (include_host_state && recurrence_bytes > 0)
                 {
                     std::memcpy(host_cursor, state->recurrence_state.data(), recurrence_bytes);
                     host_cursor += recurrence_bytes;
                 }
-                if (conv_bytes > 0)
+                if (include_host_state && conv_bytes > 0)
                 {
                     std::memcpy(host_cursor, state->conv_state.data(), conv_bytes);
                     host_cursor += conv_bytes;
                 }
 
-                if (state->conv_kernel)
+                if (include_device_state && state->conv_kernel)
                 {
                     const size_t bytes = state->conv_kernel->stateBytes();
                     if (bytes > 0)
@@ -548,7 +564,7 @@ namespace llaminar2
                         device_cursor += bytes;
                     }
                 }
-                if (state->rec_kernel)
+                if (include_device_state && state->rec_kernel)
                 {
                     const size_t bytes = state->rec_kernel->stateBytes();
                     if (bytes > 0)
@@ -565,7 +581,9 @@ namespace llaminar2
         bool importHybridStatePayload(
             const uint8_t *&host_cursor,
             const uint8_t *&device_cursor,
-            void *stream)
+            void *stream,
+            bool include_host_state = true,
+            bool include_device_state = true)
         {
             for (int layer = 0; layer < total_layers_; ++layer)
             {
@@ -575,18 +593,18 @@ namespace llaminar2
 
                 const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
                 const size_t conv_bytes = state->conv_state.size() * sizeof(float);
-                if (recurrence_bytes > 0)
+                if (include_host_state && recurrence_bytes > 0)
                 {
                     std::memcpy(state->recurrence_state.data(), host_cursor, recurrence_bytes);
                     host_cursor += recurrence_bytes;
                 }
-                if (conv_bytes > 0)
+                if (include_host_state && conv_bytes > 0)
                 {
                     std::memcpy(state->conv_state.data(), host_cursor, conv_bytes);
                     host_cursor += conv_bytes;
                 }
 
-                if (state->conv_kernel)
+                if (include_device_state && state->conv_kernel)
                 {
                     const size_t bytes = state->conv_kernel->stateBytes();
                     if (bytes > 0)
@@ -596,7 +614,7 @@ namespace llaminar2
                         device_cursor += bytes;
                     }
                 }
-                if (state->rec_kernel)
+                if (include_device_state && state->rec_kernel)
                 {
                     const size_t bytes = state->rec_kernel->stateBytes();
                     if (bytes > 0)
