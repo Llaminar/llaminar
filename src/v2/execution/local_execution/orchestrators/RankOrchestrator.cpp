@@ -2782,7 +2782,11 @@ namespace llaminar2
             }
         };
 
-        query_runners(device_runners_, last_device_prefix_hits_, /*fingerprint_must_match=*/true);
+        // Local TP participants own sharded payload slices, so their local
+        // fingerprints can legitimately differ. Each child lookup has already
+        // validated its own fingerprint; the rank aggregate only clamps to the
+        // common restorable token count.
+        query_runners(device_runners_, last_device_prefix_hits_, /*fingerprint_must_match=*/false);
         query_runners(pp_stage_runners_, last_pp_prefix_hits_, /*fingerprint_must_match=*/false);
 
         if (participants.empty())

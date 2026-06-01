@@ -2,6 +2,7 @@
 
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
+#include "utils/Logger.h"
 
 #include <unistd.h>
 
@@ -32,6 +33,7 @@ int main(int argc, char **argv)
 {
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    initializeLogging();
     ::testing::InitGoogleTest(&argc, argv);
     int result = RUN_ALL_TESTS();
 

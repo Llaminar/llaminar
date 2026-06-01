@@ -1296,6 +1296,60 @@ TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
     EXPECT_EQ(runner1_ptr->populated_prefix_tokens(), std::vector<int>({2}));
 }
 
+TEST_F(Test__RankOrchestrator, PrefixLookupAllowsParticipantLocalFingerprintsForLocalTPSlices)
+{
+    PrefixLookupResult shard0_hit = makePrefixHit(/*cached_tokens=*/4,
+                                                  /*terminal_logits=*/true,
+                                                  /*supported=*/true,
+                                                  /*include_blocks=*/true,
+                                                  /*include_mtp_state=*/true);
+    shard0_hit.fingerprint_key = 0x1000;
+
+    PrefixLookupResult shard1_hit = makePrefixHit(/*cached_tokens=*/4,
+                                                  /*terminal_logits=*/true,
+                                                  /*supported=*/true,
+                                                  /*include_blocks=*/true,
+                                                  /*include_mtp_state=*/true);
+    shard1_hit.fingerprint_key = 0x2000;
+
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_prefix_lookup_result(std::move(shard0_hit));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_prefix_lookup_result(std::move(shard1_hit));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2, 3, 4});
+    EXPECT_TRUE(hit.cache_enabled);
+    EXPECT_TRUE(hit.supported);
+    EXPECT_EQ(hit.cached_tokens, 4);
+    EXPECT_EQ(hit.fingerprint_key, 0u)
+        << "Rank-level fingerprints remain participant-local for sharded TP payloads";
+    EXPECT_TRUE(hit.has_terminal_logits);
+    EXPECT_TRUE(hit.has_terminal_hidden);
+    ASSERT_EQ(hit.blocks.size(), 2u);
+    EXPECT_NE(hit.blocks.back().mtp_payload, nullptr);
+
+    ASSERT_TRUE(orchestrator->populatePrefix(hit));
+    EXPECT_EQ(runner0_ptr->populated_prefix_tokens(), std::vector<int>({4}));
+    EXPECT_EQ(runner1_ptr->populated_prefix_tokens(), std::vector<int>({4}));
+
+    ASSERT_TRUE(orchestrator->restorePrefixTerminalState(hit));
+    EXPECT_EQ(runner0_ptr->terminal_restored_tokens(), std::vector<int>({4}));
+    EXPECT_EQ(runner1_ptr->terminal_restored_tokens(), std::vector<int>({4}));
+}
+
 TEST_F(Test__RankOrchestrator, PrefixLookupAllowsTerminalLogitsOnOnlyOwningPPStage)
 {
     auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();

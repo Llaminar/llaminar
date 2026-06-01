@@ -51,6 +51,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <initializer_list>
@@ -81,6 +82,12 @@ namespace llaminar2
                                      << " used_mib=" << (used_bytes / (1024 * 1024))
                                      << " free_mib=" << (free_bytes / (1024 * 1024))
                                      << " total_mib=" << (total_bytes / (1024 * 1024)));
+        }
+
+        bool prefixCacheTraceEnabled()
+        {
+            const char *value = std::getenv("LLAMINAR_PREFIX_CACHE_TRACE");
+            return value && value[0] != '\0' && value[0] != '0';
         }
 
         std::string lowerASCII(std::string value)
@@ -4110,9 +4117,34 @@ namespace llaminar2
             auto handle = prefix_cache_->find(key);
             if (!handle || !handle->layout.compatiblePayloadShape(prefix_layout_))
             {
+                if (prefixCacheTraceEnabled())
+                {
+                    LOG_INFO("[PREFIX_TRACE] lookup miss device=" << state_.device_id.toString()
+                                                                  << " block=" << block
+                                                                  << " key=" << key.toHex()
+                                                                  << " fingerprint="
+                                                                  << prefixHashHex(prefix_fingerprint_)
+                                                                  << " handle="
+                                                                  << (handle ? "present" : "absent")
+                                                                  << " shape_compatible="
+                                                                  << (handle && handle->layout.compatiblePayloadShape(prefix_layout_) ? "yes" : "no"));
+                }
                 break;
             }
 
+            if (prefixCacheTraceEnabled())
+            {
+                LOG_INFO("[PREFIX_TRACE] lookup hit device=" << state_.device_id.toString()
+                                                             << " block=" << block
+                                                             << " key=" << key.toHex()
+                                                             << " token_count=" << handle->key.token_count
+                                                             << " terminal_logits="
+                                                             << (handle->has_terminal_logits ? "yes" : "no")
+                                                             << " terminal_hidden="
+                                                             << (handle->has_terminal_hidden ? "yes" : "no")
+                                                             << " mtp_state="
+                                                             << (handle->layout.includes_mtp_state ? "yes" : "no"));
+            }
             result.blocks.push_back(*handle);
             result.cached_tokens += handle->key.token_count;
             result.has_terminal_hidden = handle->has_terminal_hidden;
@@ -4139,6 +4171,19 @@ namespace llaminar2
             static_cast<int>(tokens.size()),
             result.cached_tokens,
             static_cast<int>(result.blocks.size()));
+
+        if (prefixCacheTraceEnabled())
+        {
+            LOG_INFO("[PREFIX_TRACE] lookup result device=" << state_.device_id.toString()
+                                                            << " cached_tokens=" << result.cached_tokens
+                                                            << " blocks=" << result.blocks.size()
+                                                            << " terminal_logits="
+                                                            << (result.has_terminal_logits ? "yes" : "no")
+                                                            << " terminal_hidden="
+                                                            << (result.has_terminal_hidden ? "yes" : "no")
+                                                            << " fingerprint="
+                                                            << prefixHashHex(prefix_fingerprint_));
+        }
 
         return result;
     }
@@ -4375,6 +4420,12 @@ namespace llaminar2
             parent_hash = key.stableHash();
             if (prefix_cache_->contains(key))
             {
+                if (prefixCacheTraceEnabled())
+                {
+                    LOG_INFO("[PREFIX_TRACE] harvest skip-existing device=" << state_.device_id.toString()
+                                                                            << " block=" << block
+                                                                            << " key=" << key.toHex());
+                }
                 continue;
             }
 
@@ -4535,8 +4586,40 @@ namespace llaminar2
                     LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: cache insert rejected key="
                               << key.toHex());
                 }
+                if (prefixCacheTraceEnabled())
+                {
+                    LOG_INFO("[PREFIX_TRACE] harvest failed device=" << state_.device_id.toString()
+                                                                     << " block=" << block
+                                                                     << " key=" << key.toHex()
+                                                                     << " ok_before_insert="
+                                                                     << (ok ? "yes" : "no")
+                                                                     << " terminal_block="
+                                                                     << (terminal_block ? "yes" : "no")
+                                                                     << " terminal_logits="
+                                                                     << (handle.has_terminal_logits ? "yes" : "no")
+                                                                     << " terminal_hidden="
+                                                                     << (handle.has_terminal_hidden ? "yes" : "no")
+                                                                     << " mtp_state="
+                                                                     << (handle.layout.includes_mtp_state ? "yes" : "no")
+                                                                     << " total_bytes=" << handle.total_bytes);
+                }
                 prefix_ram_backend_->release(handle);
                 return false;
+            }
+
+            if (prefixCacheTraceEnabled())
+            {
+                LOG_INFO("[PREFIX_TRACE] harvest insert device=" << state_.device_id.toString()
+                                                                 << " block=" << block
+                                                                 << " key=" << key.toHex()
+                                                                 << " token_count=" << key.token_count
+                                                                 << " terminal_logits="
+                                                                 << (handle.has_terminal_logits ? "yes" : "no")
+                                                                 << " terminal_hidden="
+                                                                 << (handle.has_terminal_hidden ? "yes" : "no")
+                                                                 << " mtp_state="
+                                                                 << (handle.layout.includes_mtp_state ? "yes" : "no")
+                                                                 << " total_bytes=" << handle.total_bytes);
             }
         }
 
