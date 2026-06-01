@@ -149,6 +149,14 @@ namespace llaminar2
         };
     }
 
+    static double mtpTokenAcceptanceRate(uint64_t accepted_tokens, uint64_t rejected_tokens)
+    {
+        const uint64_t attempted_tokens = accepted_tokens + rejected_tokens;
+        return attempted_tokens > 0
+                   ? static_cast<double>(accepted_tokens) / static_cast<double>(attempted_tokens)
+                   : 0.0;
+    }
+
     std::string benchmarkResultToJsonString(
         const BenchmarkResult &result,
         const OrchestrationConfig *config)
@@ -223,10 +231,9 @@ namespace llaminar2
                       {"bypasses", state.mtp_bypasses},
                       {"verifier_runs", state.mtp_verifier_runs},
                       {"verifier_token_count", state.mtp_verifier_token_count},
-                      {"acceptance_rate", state.mtp_draft_steps > 0
-                                              ? static_cast<double>(state.mtp_accepted_tokens) /
-                                                    static_cast<double>(state.mtp_draft_steps)
-                                              : 0.0},
+                      {"acceptance_rate", mtpTokenAcceptanceRate(
+                                              state.mtp_accepted_tokens,
+                                              state.mtp_rejected_tokens)},
                       {"request", mtpRequestToJson(state.mtp_request)}}},
             {"prefill_chunks", {{"schedules", state.prefill_chunk_schedules},
                                  {"successful_schedules", state.prefill_chunk_successful_schedules},

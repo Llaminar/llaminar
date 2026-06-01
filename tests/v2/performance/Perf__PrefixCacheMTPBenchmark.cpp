@@ -181,3 +181,29 @@ TEST(Perf__PrefixCacheMTPBenchmark, DisabledPathsRemainExplicitlyZero)
     EXPECT_FALSE(doc.at("config").at("prefix_cache_enabled").get<bool>());
     EXPECT_FALSE(doc.at("config").at("mtp_enabled").get<bool>());
 }
+
+TEST(Perf__PrefixCacheMTPBenchmark, MTPAcceptanceRateUsesAttemptedDraftTokens)
+{
+    BenchmarkResult result = makeSuccessfulResult();
+    auto &state = result.prefix_state;
+    state.mtp_config_enabled = true;
+    state.mtp_draft_steps = 3;
+    state.mtp_accepted_tokens = 6;
+    state.mtp_rejected_tokens = 2;
+    state.mtp_rollbacks = 2;
+    state.mtp_verifier_runs = 3;
+    state.mtp_verifier_token_count = 8;
+
+    OrchestrationConfig config;
+    config.benchmark_mode = true;
+    config.n_predict = 8;
+    config.mtp.enabled = true;
+
+    const auto doc = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
+    const auto &mtp = doc.at("mtp");
+
+    EXPECT_EQ(mtp.at("draft_steps"), 3);
+    EXPECT_EQ(mtp.at("accepted_tokens"), 6);
+    EXPECT_EQ(mtp.at("rejected_tokens"), 2);
+    EXPECT_DOUBLE_EQ(mtp.at("acceptance_rate").get<double>(), 0.75);
+}
