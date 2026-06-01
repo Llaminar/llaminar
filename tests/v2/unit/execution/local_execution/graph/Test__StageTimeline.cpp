@@ -20,9 +20,12 @@
 #include "execution/compute_stages/IComputeStage.h"
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
+#include "utils/DebugEnv.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <memory>
+#include <optional>
 #include <vector>
 
 using namespace llaminar2;
@@ -118,6 +121,40 @@ namespace
         int fake_stream_ = 0;
     };
 
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+                old_value_ = std::string(old);
+
+            if (value)
+                setenv(name, value, 1);
+            else
+                unsetenv(name);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnv()
+        {
+            if (old_value_.has_value())
+                setenv(name_.c_str(), old_value_->c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> old_value_;
+    };
+
 } // namespace
 
 // =============================================================================
@@ -134,6 +171,42 @@ protected:
 
     std::unique_ptr<TimelineMockGPUContext> gpu_ctx_;
 };
+
+TEST_F(Test__StageTimeline, DebugEnv_GpuStageTimingDefaultsOff)
+{
+    ScopedEnv timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", nullptr);
+
+    EXPECT_FALSE(debugEnv().gpu_stage_timing);
+    EXPECT_FALSE(debugEnv().gpu_stage_timing_detail);
+}
+
+TEST_F(Test__StageTimeline, DebugEnv_GpuStageTimingEnvEnablesTiming)
+{
+    ScopedEnv detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", nullptr);
+    ScopedEnv timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+
+    EXPECT_TRUE(debugEnv().gpu_stage_timing);
+    EXPECT_FALSE(debugEnv().gpu_stage_timing_detail);
+}
+
+TEST_F(Test__StageTimeline, DebugEnv_GpuStageTimingDetailEnablesTiming)
+{
+    ScopedEnv timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", "1");
+
+    EXPECT_TRUE(debugEnv().gpu_stage_timing);
+    EXPECT_TRUE(debugEnv().gpu_stage_timing_detail);
+}
+
+TEST_F(Test__StageTimeline, DebugEnv_GpuStageTimingZeroDisablesTiming)
+{
+    ScopedEnv detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", nullptr);
+    ScopedEnv timing("LLAMINAR_GPU_STAGE_TIMING", "0");
+
+    EXPECT_FALSE(debugEnv().gpu_stage_timing);
+    EXPECT_FALSE(debugEnv().gpu_stage_timing_detail);
+}
 
 // =============================================================================
 // Basic functionality

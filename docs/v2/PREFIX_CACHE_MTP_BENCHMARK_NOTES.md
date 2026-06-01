@@ -16,7 +16,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
-| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP decode and sidecar are segmented-graph captured with no manual stages | N/A | 11.94 | 0.65x decode, 0.64x overall | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stats.json` | Opt-in M=2 row-overlap reduced `verifier_forward` to about 129.8 ms/call, but MTP is still slower than baseline. Need a true two-row/batched verifier kernel path or fewer full verifier replays. |
+| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP decode and sidecar are segmented-graph captured with no manual stages | N/A | 14.81 | 0.81x decode, diagnostic `-n 4` run | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-stats.json` | Opt-in M=2 row-overlap plus perfect-acceptance short run reached 14.81 tok/s, but MTP is still slower than baseline. Verifier GPU time is led by GEMM, GDN projection, and fused gate/up, with additional wall/GPU gap; need a true two-row/batched verifier kernel path and lower verifier replay overhead. |
 | SingleDevice | CUDA | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | N/A | Pending | Pending | Pending | Need first dense CUDA baseline/MTP graph-capture run. |
 | SingleDevice | ROCm | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and MoE MTP sidecar capture audit. |
 | SingleDevice | CUDA | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and CUDA availability check. |
@@ -95,6 +95,27 @@ Latest ROCm dense evidence:
   - This is the current best ROCm dense MTP evidence, but it is still only
     about 0.65x the no-MTP decode baseline, so the next optimization axis must
     reduce verifier replay work rather than sidecar overhead.
+- Stage-GPU diagnostic run:
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-bench.json` and
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-stats.json`.
+  - Short `-n 4` benchmark with `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` reached
+    14.81 decode tok/s with 100% MTP acceptance, 8 draft steps, 8 accepted
+    tokens, 0 rejected tokens, and 0 rollbacks.
+  - `verifier_forward`: 6 measured calls, 786.68 ms total, about
+    131.11 ms/call.
+  - Main verifier GPU stage timing averaged about 72.02 ms per verifier graph:
+    GEMM 31.34 ms, GDN projection 18.76 ms, fused gate/up 11.65 ms, fused QKV
+    2.65 ms, and LM head 1.47 ms.
+  - The verifier wall/GPU gap remains large: about 129.50 ms wall versus
+    72.02 ms GPU per measured verifier iteration, so the next slice should
+    separate graph replay synchronization overhead from true kernel time.
+- Stage-timing-off comparison:
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-notiming-bench.json`.
+  - Disabling `LLAMINAR_GPU_STAGE_TIMING` and structured perf export improved
+    the comparable `-n 8` MTP run from 11.94 tok/s to 12.32 tok/s.
+  - This recovers only a small part of the deficit, so profiling overhead is
+    not the main blocker. It did expose that GPU stage timing must remain
+    opt-in outside explicit profiling runs.
 - Regression coverage:
   - `V2_Unit_MTPGraphConstruction` now includes
     `CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse`, which proves a

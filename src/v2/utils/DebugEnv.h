@@ -3315,7 +3315,7 @@ namespace llaminar2
         bool tp_timing = false;                    ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
         bool skip_allreduce = false;               ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
         bool tp_collective_contract_trace = false; ///< Trace LocalTP collective context identity and sequence contract (env: LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE)
-        bool gpu_stage_timing = true;              ///< GPU event-based per-stage timing (env: LLAMINAR_GPU_STAGE_TIMING)
+        bool gpu_stage_timing = false;             ///< GPU event-based per-stage timing (env: LLAMINAR_GPU_STAGE_TIMING)
         bool gpu_stage_timing_detail = false;      ///< Print per-stage detail (env: LLAMINAR_GPU_STAGE_TIMING_DETAIL)
         bool coherence_audit = false;              ///< Per-tensor coherence audit log (env: LLAMINAR_COHERENCE_AUDIT)
 
@@ -3419,8 +3419,7 @@ namespace llaminar2
             skip_allreduce = skip_ar && std::string(skip_ar) == "1";
             tp_collective_contract_trace = isTruthyEnvValue(std::getenv("LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE"));
             const char *stl_env = std::getenv("LLAMINAR_GPU_STAGE_TIMING");
-            if (stl_env && std::string(stl_env) == "0")
-                gpu_stage_timing = false;
+            gpu_stage_timing = isTruthyEnvValue(stl_env);
             const char *stl_detail = std::getenv("LLAMINAR_GPU_STAGE_TIMING_DETAIL");
             gpu_stage_timing_detail = stl_detail && std::string(stl_detail) == "1";
             if (gpu_stage_timing_detail)
@@ -3481,10 +3480,8 @@ namespace llaminar2
             const char *skip_ar = std::getenv("LLAMINAR_SKIP_ALLREDUCE");
             skip_allreduce = skip_ar && std::string(skip_ar) == "1";
             tp_collective_contract_trace = isTruthyEnvValue(std::getenv("LLAMINAR_TP_COLLECTIVE_CONTRACT_TRACE"));
-            gpu_stage_timing = true; // default on
             const char *stl_env = std::getenv("LLAMINAR_GPU_STAGE_TIMING");
-            if (stl_env && std::string(stl_env) == "0")
-                gpu_stage_timing = false;
+            gpu_stage_timing = isTruthyEnvValue(stl_env);
             const char *stl_detail = std::getenv("LLAMINAR_GPU_STAGE_TIMING_DETAIL");
             gpu_stage_timing_detail = stl_detail && std::string(stl_detail) == "1";
             if (gpu_stage_timing_detail)
