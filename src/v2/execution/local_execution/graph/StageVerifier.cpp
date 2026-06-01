@@ -21,6 +21,22 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        bool fp32BufferIsAllZero(const float *data, size_t numel)
+        {
+            if (!data || numel == 0)
+                return false;
+
+            for (size_t i = 0; i < numel; ++i)
+            {
+                if (data[i] != 0.0f)
+                    return false;
+            }
+
+            return true;
+        }
+    } // namespace
 
     void verifyStageEntry(const ComputeNode &node, int layer_idx)
     {
@@ -349,6 +365,9 @@ namespace llaminar2
                         }
                     }
                 }
+
+                if (appears_zero)
+                    appears_zero = fp32BufferIsAllZero(fp32_data, numel);
 
                 if (appears_zero && !zero_output_allowed)
                 {

@@ -76,6 +76,28 @@ TEST(Test__Q2_KTensor, ViewWithOffset)
     EXPECT_EQ(view->shape()[1], 1024);
 }
 
+TEST(Test__Q2_KTensor, ExpertViewCreationFrom3DParent)
+{
+    const size_t cols = 512;
+    const size_t rows_per_expert = 4;
+    const size_t num_experts = 3;
+    auto parent = createTestTensor(rows_per_expert * num_experts, cols);
+    auto parent_3d = std::make_shared<Q2_KTensor>(
+        std::vector<size_t>{cols, rows_per_expert, num_experts},
+        std::vector<uint8_t>(
+            reinterpret_cast<const uint8_t *>(parent->typed_data()),
+            reinterpret_cast<const uint8_t *>(parent->typed_data()) + parent->size_bytes()));
+
+    for (size_t expert = 0; expert < num_experts; ++expert)
+    {
+        const size_t element_offset = expert * rows_per_expert * cols;
+        auto view = parent_3d->create_view({rows_per_expert, cols}, element_offset);
+        ASSERT_NE(view, nullptr) << "expert " << expert;
+        EXPECT_EQ(view->shape(), (std::vector<size_t>{rows_per_expert, cols}));
+        EXPECT_NE(view->raw_data(), nullptr);
+    }
+}
+
 TEST(Test__Q2_KTensor, KDimensionMustMatch)
 {
     auto parent = createTestTensor(128, 512);
@@ -210,8 +232,6 @@ TEST(Test__Q2_KTensor, SuperBlockAlignment)
 }
 
 // --- 3D Parent → 2D View regression tests ---
-// NOTE: Q2_KTensor::create_view does not yet support 3D parents.
-// These tests verify the rejection and will be updated when 3D support is added.
 
 TEST(Test__Q2_KTensor, View3DParentBasicSlice)
 {
@@ -222,10 +242,9 @@ TEST(Test__Q2_KTensor, View3DParentBasicSlice)
     std::vector<uint8_t> raw(total_blocks * sizeof(Q2_KBlock));
     auto tensor_3d = std::make_shared<Q2_KTensor>(std::vector<size_t>{K, R, N}, raw);
 
-    // Q2_K doesn't support 3D parents yet - should throw
-    EXPECT_THROW(
-        tensor_3d->create_view({R, K}, 0),
-        std::invalid_argument);
+    auto view = tensor_3d->create_view({R, K}, 0);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->shape(), (std::vector<size_t>{R, K}));
 }
 
 TEST(Test__Q2_KTensor, View3DParentWithOffset)
@@ -236,10 +255,13 @@ TEST(Test__Q2_KTensor, View3DParentWithOffset)
     std::vector<uint8_t> raw(total_blocks * sizeof(Q2_KBlock));
     auto tensor_3d = std::make_shared<Q2_KTensor>(std::vector<size_t>{K, R, N}, raw);
 
-    // Q2_K doesn't support 3D parents yet - should throw
-    EXPECT_THROW(
-        tensor_3d->create_view({R, K}, 2 * R * K),
-        std::invalid_argument);
+    const size_t expert = 2;
+    auto view = tensor_3d->create_view({R, K}, expert * R * K);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->shape(), (std::vector<size_t>{R, K}));
+    const auto *parent_raw = static_cast<const uint8_t *>(tensor_3d->raw_data());
+    EXPECT_EQ(view->raw_data(),
+              parent_raw + expert * R * blocks_per_row * sizeof(Q2_KBlock));
 }
 
 TEST(Test__Q2_KTensor, View3DParentBoundsCheck)
@@ -250,8 +272,7 @@ TEST(Test__Q2_KTensor, View3DParentBoundsCheck)
     std::vector<uint8_t> raw(total_blocks * sizeof(Q2_KBlock));
     auto tensor_3d = std::make_shared<Q2_KTensor>(std::vector<size_t>{K, R, N}, raw);
 
-    // Q2_K doesn't support 3D parents yet - should throw
     EXPECT_THROW(
         tensor_3d->create_view({R, K}, (N * R - R + 1) * K),
-        std::invalid_argument);
+        std::out_of_range);
 }

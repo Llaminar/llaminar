@@ -548,7 +548,13 @@ namespace llaminar2
         const std::string attention_terminal = attention.terminalNode();
         graph.merge(std::move(attention), prefix + "fc");
 
-        const int ffn_layer_idx = std::max(0, config_.n_layers - 1);
+        // NextN/MTP sidecars are represented as graph fragments, but their
+        // FFN/MoE stages still need the source layer identity for prepared
+        // shared-expert refs, expert registries, runtime-table routing, and
+        // snapshot naming. Attention keeps its MTP-local KV layer above.
+        const int ffn_layer_idx = weights.source_layer_index >= 0
+                                      ? weights.source_layer_index
+                                      : std::max(0, config_.n_layers - 1);
         ComputeGraph ffn = buildFFNGraph(
             weights.fa_block,
             mtp_buffers,

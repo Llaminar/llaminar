@@ -77,6 +77,8 @@ namespace llaminar2::test
     {
         MoERuntimeTable table(DeviceId::cpu(), 3, 4, 2);
 
+        EXPECT_EQ(table.layerCount(), 3);
+
         auto *layer0 = table.deviceLayerState(0);
         auto *layer1 = table.deviceLayerState(1);
         auto *layer2 = table.deviceLayerState(2);

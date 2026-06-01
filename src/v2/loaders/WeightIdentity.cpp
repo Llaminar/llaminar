@@ -113,6 +113,8 @@ namespace llaminar2
         if (name.find("ffn_gate_exps.weight") != std::string::npos) return WeightRole::MoEExpertGate;
         if (name.find("ffn_up_exps.weight") != std::string::npos) return WeightRole::MoEExpertUp;
         if (name.find("ffn_down_exps.weight") != std::string::npos) return WeightRole::MoEExpertDown;
+        if (name.find("ffn_gate_inp.weight") != std::string::npos) return WeightRole::MoERouter;
+        if (name.find("ffn_gate_inp_shexp.weight") != std::string::npos) return WeightRole::SharedExpertGate;
         if (name.find("ffn_gate_shexp.weight") != std::string::npos) return WeightRole::SharedExpertGate;
         if (name.find("ffn_up_shexp.weight") != std::string::npos) return WeightRole::SharedExpertUp;
         if (name.find("ffn_down_shexp.weight") != std::string::npos) return WeightRole::SharedExpertDown;

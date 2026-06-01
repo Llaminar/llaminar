@@ -6138,6 +6138,15 @@ add_v2_test(V2_Unit_GraphValidator
     MPI_PROCS 1
 )
 
+# Test: StageVerifier (stage output validation regressions)
+add_executable(v2_test_stage_verifier unit/execution/local_execution/graph/Test__StageVerifier.cpp)
+target_link_libraries(v2_test_stage_verifier llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_StageVerifier
+    COMMAND $<TARGET_FILE:v2_test_stage_verifier>
+    LABELS "V2;Unit;Execution;Validation;StageVerifier"
+    MPI_PROCS 1
+)
+
 # Test: StageOutputManifest (getDeclaredOutputs for stage output contracts)
 # Tests that stages correctly declare their output buffers with producer contracts.
 # Part of Buffer Contract Validation System - Phase 3: Stage Output Manifest

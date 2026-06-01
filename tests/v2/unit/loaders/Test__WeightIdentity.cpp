@@ -23,6 +23,9 @@ TEST(Test__WeightIdentity, InfersCommonWeightRoles)
     EXPECT_EQ(inferWeightRole("blk.3.attn_qkv.weight"), WeightRole::FusedQKV);
     EXPECT_EQ(inferWeightRole("blk.3.attn_output.weight"), WeightRole::AttentionWO);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_exps.weight"), WeightRole::MoEExpertGate);
+    EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp.weight"), WeightRole::MoERouter);
+    EXPECT_EQ(inferWeightRole("blk.40.ffn_gate_inp.weight"), WeightRole::MoERouter);
+    EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp_shexp.weight"), WeightRole::SharedExpertGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_shexp.weight"), WeightRole::SharedExpertGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_up_shexp.weight"), WeightRole::SharedExpertUp);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_down_shexp.weight"), WeightRole::SharedExpertDown);

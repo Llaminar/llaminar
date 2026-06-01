@@ -580,4 +580,74 @@ namespace llaminar2::test
         EXPECT_LT(rank_sync, rank_advise);
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DGOHostReleaseWaitsForMTPShiftedPrefill)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path dgo_path = root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        ASSERT_TRUE(fs::exists(dgo_path)) << dgo_path;
+
+        const std::string dgo_contents = readFile(dgo_path);
+        ASSERT_FALSE(dgo_contents.empty()) << dgo_path;
+
+        const size_t forward_start = dgo_contents.find("const float *DeviceGraphOrchestrator::forward(");
+        ASSERT_NE(forward_start, std::string::npos);
+        const size_t forward_end = dgo_contents.find("bool DeviceGraphOrchestrator::supportsPrefillChunkSchedule",
+                                                     forward_start);
+        ASSERT_NE(forward_end, std::string::npos);
+        const std::string forward_body = dgo_contents.substr(forward_start, forward_end - forward_start);
+
+        const size_t forward_mtp = forward_body.find("populateMTPShiftedCacheFromPrefill(tokens, seq_len, batch_size");
+        const size_t forward_terminal = forward_body.find("refreshMTPTerminalHiddenState(seq_len, batch_size)");
+        const size_t forward_release = forward_body.find("releaseHostResidentWeightData();");
+        ASSERT_NE(forward_mtp, std::string::npos);
+        ASSERT_NE(forward_terminal, std::string::npos);
+        ASSERT_NE(forward_release, std::string::npos);
+        EXPECT_LT(forward_mtp, forward_release);
+        EXPECT_LT(forward_terminal, forward_release);
+
+        const size_t chunk_start = dgo_contents.find("bool DeviceGraphOrchestrator::forwardPrefillChunkSchedule(");
+        ASSERT_NE(chunk_start, std::string::npos);
+        const size_t chunk_end = dgo_contents.find("bool DeviceGraphOrchestrator::ensureMTPTerminalHiddenBuffer",
+                                                   chunk_start);
+        ASSERT_NE(chunk_end, std::string::npos);
+        const std::string chunk_body = dgo_contents.substr(chunk_start, chunk_end - chunk_start);
+
+        const size_t chunk_mtp = chunk_body.find("populateMTPShiftedCacheFromPrefill(tokens, seq_len, 1");
+        const size_t chunk_terminal = chunk_body.find("refreshMTPTerminalHiddenState(terminal_seq_len, 1)");
+        const size_t chunk_release = chunk_body.find("releaseHostResidentWeightData();");
+        ASSERT_NE(chunk_mtp, std::string::npos);
+        ASSERT_NE(chunk_terminal, std::string::npos);
+        ASSERT_NE(chunk_release, std::string::npos);
+        EXPECT_LT(chunk_mtp, chunk_release);
+        EXPECT_LT(chunk_terminal, chunk_release);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MTPSidecarMoERuntimeTableIsSeparateFromMainHistogram)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        ASSERT_TRUE(fs::exists(graph_path)) << graph_path;
+
+        const std::string contents = readFile(graph_path);
+        ASSERT_FALSE(contents.empty()) << graph_path;
+
+        const size_t ffn_start = contents.find("ComputeGraph Qwen35MoEGraph::buildFFNGraph(");
+        ASSERT_NE(ffn_start, std::string::npos);
+        const size_t ffn_end = contents.find("// =====================================================================",
+                                             contents.find("Stage 3: MoE Expert Compute", ffn_start));
+        ASSERT_NE(ffn_end, std::string::npos);
+        const std::string ffn_body = contents.substr(ffn_start, ffn_end - ffn_start);
+
+        EXPECT_NE(ffn_body.find("use_mtp_runtime_table = mtp_sidecar_context && layer_idx >= config_.n_layers"),
+                  std::string::npos);
+        EXPECT_NE(ffn_body.find("std::max(config_.n_layers, layer_idx + 1)"),
+                  std::string::npos);
+        EXPECT_NE(ffn_body.find("\"mtp_depth\" + std::to_string(mtp_depth_idx)"),
+                  std::string::npos);
+        EXPECT_NE(ffn_body.find("register_runtime_histogram = !use_mtp_runtime_table"),
+                  std::string::npos);
+        EXPECT_NE(ffn_body.find("route_params.decode_histogram = mtp_sidecar_context ? nullptr : config_.moe.decode_histogram"),
+                  std::string::npos);
+    }
+
 } // namespace llaminar2::test

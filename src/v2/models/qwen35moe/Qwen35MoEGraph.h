@@ -90,7 +90,9 @@ namespace llaminar2
 
         IMoERuntimeTable *moeRuntimeTableForDevice(DeviceId device,
                                                    int prefill_token_capacity = 0,
-                                                   const std::string &key_suffix = {});
+                                                   const std::string &key_suffix = {},
+                                                   int num_layers_override = -1,
+                                                   bool register_decode_histogram = true);
 
         std::unordered_map<std::string, std::unique_ptr<MoERuntimeTable>> moe_runtime_tables_;
         bool mtp_graph_context_active_ = false;

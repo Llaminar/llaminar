@@ -980,7 +980,7 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
     ASSERT_NE(graph.getNode("layer0_kv_append"), nullptr);
     ASSERT_NE(graph.getNode("layer0_attention"), nullptr);
-    ASSERT_NE(graph.getNode("layer1_ffn_residual"), nullptr);
+    ASSERT_NE(graph.getNode("layer64_ffn_residual"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_final_norm"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_lm_head"), nullptr);
 
@@ -1013,7 +1013,7 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_TRUE(contractWrites(attention_contract, BufferId::MTP_ATTN_OUTPUT));
     EXPECT_FALSE(contractWrites(attention_contract, BufferId::ATTN_OUTPUT));
 
-    const auto down_contract = graph.getNode("layer1_down_proj")->stage->bufferContract();
+    const auto down_contract = graph.getNode("layer64_down_proj")->stage->bufferContract();
     EXPECT_TRUE(contractReads(down_contract, BufferId::MTP_UP_PROJ));
     EXPECT_TRUE(contractReads(down_contract, BufferId::MTP_GATE_PROJ));
     EXPECT_TRUE(contractWrites(down_contract, BufferId::MTP_ATTN_PROJ));
@@ -1022,7 +1022,7 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_TRUE(hasDependency(graph, "mtp0_concat", "mtp0_norm_hidden"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_concat", "mtp0_norm_embedding"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_fc", "mtp0_concat"));
-    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer1_ffn_residual"));
+    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer64_ffn_residual"));
     EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head", "mtp0_final_norm"));
 }
 
@@ -1056,11 +1056,11 @@ TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWei
     EXPECT_EQ(wo_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
     EXPECT_TRUE(hasDependency(graph, "layer0_wo_allreduce", "layer0_wo_proj"));
 
-    auto *down_allreduce = graph.getNode("layer1_down_allreduce");
+    auto *down_allreduce = graph.getNode("layer64_down_allreduce");
     ASSERT_NE(down_allreduce, nullptr);
     EXPECT_EQ(down_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
-    EXPECT_TRUE(hasDependency(graph, "layer1_down_allreduce", "layer1_down_proj"));
-    EXPECT_TRUE(hasDependency(graph, "layer1_ffn_residual", "layer1_down_allreduce"));
+    EXPECT_TRUE(hasDependency(graph, "layer64_down_allreduce", "layer64_down_proj"));
+    EXPECT_TRUE(hasDependency(graph, "layer64_ffn_residual", "layer64_down_allreduce"));
 }
 
 TEST(Test__MTPGraphConstruction, DenseSidecarAllreducesVocabParallelEmbedding)
@@ -1192,18 +1192,18 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
 
     ASSERT_GT(graph.size(), 0u);
     EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head");
-    ASSERT_NE(graph.getNode("layer1_moe_routing"), nullptr);
-    ASSERT_NE(graph.getNode("layer1_moe_expert_ffn"), nullptr);
-    ASSERT_NE(graph.getNode("layer1_moe_combine"), nullptr);
-    ASSERT_NE(graph.getNode("layer1_ffn_residual"), nullptr);
+    ASSERT_NE(graph.getNode("layer64_moe_routing"), nullptr);
+    ASSERT_NE(graph.getNode("layer64_moe_expert_ffn"), nullptr);
+    ASSERT_NE(graph.getNode("layer64_moe_combine"), nullptr);
+    ASSERT_NE(graph.getNode("layer64_ffn_residual"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_final_norm"), nullptr);
 
-    EXPECT_EQ(graph.getNode("layer1_moe_routing")->stage->type(), ComputeStageType::MOE_ROUTER);
-    EXPECT_EQ(graph.getNode("layer1_moe_expert_ffn")->stage->type(), ComputeStageType::MOE_EXPERT_FFN);
-    EXPECT_TRUE(hasDependency(graph, "layer1_moe_expert_ffn", "layer1_moe_routing"));
-    EXPECT_TRUE(hasDependency(graph, "layer1_moe_combine", "layer1_moe_expert_ffn"));
-    EXPECT_TRUE(hasDependency(graph, "layer1_ffn_residual", "layer1_moe_combine"));
-    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer1_ffn_residual"));
+    EXPECT_EQ(graph.getNode("layer64_moe_routing")->stage->type(), ComputeStageType::MOE_ROUTER);
+    EXPECT_EQ(graph.getNode("layer64_moe_expert_ffn")->stage->type(), ComputeStageType::MOE_EXPERT_FFN);
+    EXPECT_TRUE(hasDependency(graph, "layer64_moe_expert_ffn", "layer64_moe_routing"));
+    EXPECT_TRUE(hasDependency(graph, "layer64_moe_combine", "layer64_moe_expert_ffn"));
+    EXPECT_TRUE(hasDependency(graph, "layer64_ffn_residual", "layer64_moe_combine"));
+    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer64_ffn_residual"));
 }
 
 TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespace)
@@ -1214,7 +1214,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     fixture.config.moe.intermediate_size = 32;
     fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
     fixture.config.moe.has_shared_expert = false;
-    fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(1);
+    fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(64);
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
     auto frozen = makeMoEMTPFrozenWeightSet(fixture);
@@ -1245,8 +1245,8 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     EXPECT_EQ(return_key.key_namespace, MoEOverlayCollectiveNamespace::MTP);
     EXPECT_EQ(dispatch_key.mtp_depth, 0);
     EXPECT_EQ(return_key.mtp_depth, 0);
-    EXPECT_EQ(dispatch_key.layer_idx, 1);
-    EXPECT_EQ(return_key.layer_idx, 1);
+    EXPECT_EQ(dispatch_key.layer_idx, 64);
+    EXPECT_EQ(return_key.layer_idx, 64);
     EXPECT_EQ(dispatch_key.direction, MoEOverlayCollectiveDirection::Dispatch);
     EXPECT_EQ(return_key.direction, MoEOverlayCollectiveDirection::ReturnReduce);
 
@@ -1286,7 +1286,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     ComputeGraph main_graph = graph_builder.buildFFNGraph(
         main_layer,
         main_buffers,
-        1,
+        64,
         1,
         1,
         DeviceId::cpu());
@@ -1363,7 +1363,7 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     fixture.config.moe.intermediate_size = 32;
     fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
     fixture.config.moe.has_shared_expert = false;
-    fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(1);
+    fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(64);
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
     auto frozen = makeMoEMTPFrozenWeightSet(fixture);

@@ -107,26 +107,43 @@ namespace llaminar2
         const std::vector<size_t> &new_shape,
         size_t offset)
     {
-        if (shape_.size() != 2 || new_shape.size() != 2)
+        if (new_shape.size() != 2)
         {
             throw std::invalid_argument("Q2_KTensor::create_view: only 2D views supported");
         }
-        if (new_shape[1] != shape_[1])
+
+        size_t K = 0;
+        size_t total_rows = 0;
+        if (shape_.size() == 2)
+        {
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("Q2_KTensor::create_view: parent must be 2D or 3D");
+        }
+
+        if (new_shape[1] != K)
         {
             throw std::invalid_argument("Q2_KTensor::create_view: K dimension must match parent");
         }
-        if (offset % shape_[1] != 0)
+        if (offset % K != 0)
         {
             throw std::invalid_argument("Q2_KTensor::create_view: offset must be row-aligned");
         }
-        if (offset + new_shape[0] * new_shape[1] > shape_[0] * shape_[1])
+        const size_t first_row = offset / K;
+        if (first_row + new_shape[0] > total_rows)
         {
             throw std::out_of_range("Q2_KTensor::create_view: view exceeds parent bounds");
         }
 
-        const size_t cols = shape_[1];
-        const size_t blocks_per_row = (cols + Q2_KBlock::BLOCK_SIZE - 1) / Q2_KBlock::BLOCK_SIZE;
-        const size_t first_row = offset / cols;
+        const size_t blocks_per_row = (K + Q2_KBlock::BLOCK_SIZE - 1) / Q2_KBlock::BLOCK_SIZE;
         const size_t block_offset = first_row * blocks_per_row;
         const size_t byte_offset = block_offset * sizeof(Q2_KBlock);
 

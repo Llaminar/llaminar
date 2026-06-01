@@ -2950,16 +2950,6 @@ namespace llaminar2
             return nullptr;
         }
 
-        // After first prefill, release host-resident weight data.
-        // GPU kernels (e.g., embedding) have now uploaded their own device copies,
-        // so the host data is no longer needed.
-        if (release_host_resident_after_forward_ && !host_resident_released_ && seq_len > 1 && weight_manager_)
-        {
-            host_resident_released_ = true;
-            weight_manager_->releaseHostResidentWeightData();
-            adviseMmapDontneedAfterFirstPrefill();
-        }
-
         // Update positions
         for (int b = 0; b < batch_size; ++b)
         {
@@ -2978,6 +2968,16 @@ namespace llaminar2
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to refresh MTP terminal hidden state");
             return nullptr;
+        }
+
+        // After first prefill, release host-resident weight data. Keep the host
+        // bytes alive until MTP shifted-prefill has materialized its sidecar
+        // weights through normal stage-contract coherence.
+        if (release_host_resident_after_forward_ && !host_resident_released_ && seq_len > 1 && weight_manager_)
+        {
+            host_resident_released_ = true;
+            weight_manager_->releaseHostResidentWeightData();
+            adviseMmapDontneedAfterFirstPrefill();
         }
 
         LOG_TRACE("[FORWARD_TRACE] seq_len=" << seq_len
@@ -3089,13 +3089,6 @@ namespace llaminar2
             return false;
         }
 
-        if (release_host_resident_after_forward_ && !host_resident_released_ && weight_manager_)
-        {
-            host_resident_released_ = true;
-            weight_manager_->releaseHostResidentWeightData();
-            adviseMmapDontneedAfterFirstPrefill();
-        }
-
         state_.positions[0] += seq_len;
         state_.sequence_lengths[0] += seq_len;
 
@@ -3112,6 +3105,16 @@ namespace llaminar2
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to refresh MTP terminal hidden state after chunk schedule");
             return false;
+        }
+
+        // Chunked prefill has the same sidecar ordering requirement as the
+        // monolithic path: shifted MTP cache population must see unreleased
+        // sidecar weights so coherence can upload them normally.
+        if (release_host_resident_after_forward_ && !host_resident_released_ && weight_manager_)
+        {
+            host_resident_released_ = true;
+            weight_manager_->releaseHostResidentWeightData();
+            adviseMmapDontneedAfterFirstPrefill();
         }
 
         LOG_TRACE("[FORWARD_TRACE] chunk_schedule seq_len=" << seq_len

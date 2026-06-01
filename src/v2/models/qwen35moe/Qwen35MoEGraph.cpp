@@ -487,14 +487,16 @@ namespace llaminar2
             appendMoEPlacementFingerprintFields(
                 material.moe,
                 *table,
-                config_.n_layers,
+                table->layerCount(),
                 "runtime_table." + key);
         }
     }
 
     IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(DeviceId device,
                                                                int prefill_token_capacity,
-                                                               const std::string &key_suffix)
+                                                               const std::string &key_suffix,
+                                                               int num_layers_override,
+                                                               bool register_decode_histogram)
     {
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         (void)device;
@@ -508,7 +510,8 @@ namespace llaminar2
         // so CUDA and ROCm are both valid here. Gating on is_rocm() previously
         // left CUDA without a runtime table, which forced every MoE routing/expert
         // decode stage into a non-capturable manual graph segment.
-        if (!device.is_gpu() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || config_.n_layers <= 0)
+        const int table_layers = num_layers_override > 0 ? num_layers_override : config_.n_layers;
+        if (!device.is_gpu() || config_.moe.num_experts <= 0 || config_.moe.top_k <= 0 || table_layers <= 0)
             return nullptr;
 
         const std::string key = key_suffix.empty()
@@ -524,7 +527,7 @@ namespace llaminar2
 
         DeviceMoERuntimeTable::Config table_config;
         table_config.device_id = device;
-        table_config.num_layers = config_.n_layers;
+        table_config.num_layers = table_layers;
         table_config.num_experts = config_.moe.num_experts;
         table_config.top_k = config_.moe.top_k;
         table_config.mirror_to_device = true;
@@ -532,7 +535,7 @@ namespace llaminar2
 
         auto table = std::make_unique<MoERuntimeTable>(table_config);
         IMoERuntimeTable *ptr = table.get();
-        if (config_.moe.decode_histogram)
+        if (register_decode_histogram && config_.moe.decode_histogram)
         {
             auto *histogram = config_.moe.decode_histogram;
             histogram->registerRuntimeHistogramSync([ptr, histogram]()
@@ -652,9 +655,22 @@ namespace llaminar2
 
         IMoERuntimeTable *moe_runtime_table = nullptr;
         const auto &rocm_env = debugEnv().rocm;
+        const bool use_mtp_runtime_table = mtp_sidecar_context && layer_idx >= config_.n_layers;
+        const int runtime_table_layers = use_mtp_runtime_table
+                                             ? std::max(config_.n_layers, layer_idx + 1)
+                                             : config_.n_layers;
+        const std::string runtime_table_suffix = use_mtp_runtime_table
+                                                     ? "mtp_depth" + std::to_string(mtp_depth_idx)
+                                                     : std::string{};
+        const bool register_runtime_histogram = !use_mtp_runtime_table;
         if (total_tokens == 1 && rocm_env.moe_grouped_decode && rocm_env.moe_device_routed_decode)
         {
-            moe_runtime_table = moeRuntimeTableForDevice(device);
+            moe_runtime_table = moeRuntimeTableForDevice(
+                device,
+                0,
+                runtime_table_suffix,
+                runtime_table_layers,
+                register_runtime_histogram);
         }
         else if (total_tokens > 1 && rocm_env.moe_grouped_prefill)
         {
@@ -662,7 +678,12 @@ namespace llaminar2
             // directly and does not read DeviceMoELayerRuntime prefill scratch.
             // Keep the mirrored table available for decode/histogram users, but
             // avoid preallocating per-layer prefill route buffers here.
-            moe_runtime_table = moeRuntimeTableForDevice(device);
+            moe_runtime_table = moeRuntimeTableForDevice(
+                device,
+                0,
+                runtime_table_suffix,
+                runtime_table_layers,
+                register_runtime_histogram);
         }
 
         // =====================================================================
@@ -705,7 +726,7 @@ namespace llaminar2
             route_params.top_k = config_.moe.top_k;
             route_params.norm_topk_prob = config_.moe.norm_topk_prob;
             route_params.layer_idx = layer_idx;
-            route_params.decode_histogram = config_.moe.decode_histogram;
+            route_params.decode_histogram = mtp_sidecar_context ? nullptr : config_.moe.decode_histogram;
             route_params.moe_runtime_table = moe_runtime_table;
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;

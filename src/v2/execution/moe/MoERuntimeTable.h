@@ -133,6 +133,7 @@ namespace llaminar2
         virtual ~IMoERuntimeTable() = default;
 
         virtual DeviceMoELayerRuntime *deviceLayerState(int layer_idx) = 0;
+        virtual int layerCount() const = 0;
         virtual const DeviceMoELayerRuntime &hostLayerState(int layer_idx) const = 0;
         virtual bool prepareInactiveBank(int layer_idx, const MoEPlacementUpdate &update) = 0;
         virtual bool flipActiveBank(int layer_idx, uint32_t epoch, void *stream) = 0;
@@ -185,7 +186,7 @@ namespace llaminar2
         void ensurePrefillRouteScratchCapacity(int token_capacity, void *stream = nullptr);
 
         const DeviceId &deviceId() const noexcept { return device_id_; }
-        int layerCount() const noexcept { return num_layers_; }
+        int layerCount() const noexcept override { return num_layers_; }
         int expertCount() const noexcept { return num_experts_; }
         int topK() const noexcept { return top_k_; }
         bool isMirroredToDevice() const noexcept { return mirror_to_device_; }
