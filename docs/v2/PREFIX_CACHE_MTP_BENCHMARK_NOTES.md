@@ -18,7 +18,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
 | SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Dense MTP verifier and sidecar reach segmented-graph replay with no manual stages in longer decode runs | N/A | 14.81 | 0.81x decode, diagnostic `-n 4` run | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-stagegpu-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-forward-cache-n8-release-stats.json` | Opt-in M=2 row-overlap plus perfect-acceptance short run reached 14.81 tok/s, but MTP is still slower than baseline. Main verifier replay is graph captured, yet replay final sync is about 112 ms/call on the `-n 8` run; need true two-row/batched verifier kernels and lower captured verifier GPU/sync time. |
 | SingleDevice | CUDA | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | N/A | Pending | Pending | Pending | CUDA:0 is visible but the default 4096-context dense 27B run does not fit: memory planner reports 26.7 GB required vs 23.3 GB available. Need an explicitly marked lower-context CUDA run, a smaller quant, or a larger CUDA device before filling this row. |
-| SingleDevice | ROCm | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and MoE MTP sidecar capture audit. |
+| SingleDevice | ROCm | Qwen3.6 MoE 35B | 21.23 | Partial: MTP GPU graphs now survive rollback/restore through the `-n 4` crash reproducer, but replay state is reset after each live-state rewind | N/A | 10.89 | 0.51x decode | `/tmp/llaminar-mtp-bench/moe-rocm-baseline-n4.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n3-fixed.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n4-fixed.json` | Crash fixed by resetting captured forward and MTP sidecar replay state after live prefix restore/truncate. MTP remains slower than baseline with 0% acceptance on this prompt; need sidecar/verifier acceptance and replay-cost work before claiming speedup. |
 | SingleDevice | CUDA | Qwen3.6 MoE 35B | Pending | Pending | N/A | Pending | Pending | Pending | Need single-device MoE parity/perf run and CUDA availability check. |
 | LocalTP | ROCm | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | Target graph-capturable RCCL/allreduce segments where supported | Pending | Pending | Pending | Need TP-compatible dense MTP sidecar and verifier collectives in identical order. |
 | LocalPP | ROCm | Qwen3.6 dense 27B Q4_K_S | Pending | Pending | PP activation transfers must be graph-capturable or explicit manual boundaries | Pending | Pending | Pending | Need local PP MTP verifier path and full graph-capture audit. |
@@ -150,6 +150,41 @@ Latest ROCm dense evidence:
   - This rules out a stray default-stream wait as the verifier blocker. The
     captured verifier graph's GPU work and graph-completion semantics are the
     optimization target.
+
+Latest ROCm MoE evidence:
+
+- Baseline: `/tmp/llaminar-mtp-bench/moe-rocm-baseline-n4.json`.
+  - Model: `/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf`.
+  - Device/context: `rocm:0`, `-c 96`, deterministic 9-token prompt,
+    `-n 4`, prefix disabled, MTP disabled.
+  - Prefill 138.43 ms, 65.01 tok/s.
+  - Decode 188.39 ms for 4 tokens, 21.23 tok/s.
+- MTP graph-capture crash reproducer before the fix:
+  - Same MoE model on `rocm:0` with `LLAMINAR_GPU_GRAPHS=1 --mtp
+    --mtp-draft-tokens 1`.
+  - `-n 1` and `-n 2` completed, while `-n 3` hit an HSA memory access fault
+    after rollback restored live KV/MTP state and a previously captured HIP
+    graph could replay against stale request-local state.
+- Fixed MTP graph run:
+  `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n3-fixed.json`.
+  - `-c 64`, deterministic 9-token prompt, `-n 3`.
+  - Prefill 164.98 ms, 54.55 tok/s.
+  - Decode 351.66 ms for 3 tokens, 8.53 tok/s.
+  - MTP counters: 8 draft steps, 0 accepted tokens, 4 rejected tokens,
+    8 rollbacks, 8 verifier runs, 16 verifier tokens.
+- Fixed MTP graph run:
+  `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n4-fixed.json`.
+  - `-c 64`, deterministic 9-token prompt, `-n 4`.
+  - Prefill 174.64 ms, 51.53 tok/s.
+  - Decode 367.46 ms for 4 tokens, 10.89 tok/s.
+  - MTP counters: 8 draft steps, 0 accepted tokens, 8 rejected tokens,
+    8 rollbacks, 8 verifier runs, 16 verifier tokens.
+  - The crash fix preserves cached `ComputeGraph` objects but resets captured
+    forward and MTP sidecar replay handles after live prefix restore/truncate,
+    forcing a fresh warm/capture cycle across rollback boundaries.
+  - This is a correctness and graph-capture stability improvement, not a
+    speedup. Current best MoE MTP throughput is only about 0.51x the baseline
+    decode throughput and has 0% acceptance on this prompt.
 - Regression coverage:
   - `V2_Unit_MTPGraphConstruction` now includes
     `CPUSidecarGraphCacheRecordsPlainAfterBuildThenPlainReuse`, which proves a
@@ -176,6 +211,10 @@ Latest ROCm dense evidence:
     `AllPositionShortContinuationPublishesVerifierCacheLookupStats`, which
     locks in cache hit/miss stats for the all-position two-token verifier
     shape used by greedy MTP.
+  - `V2_Unit_ForwardExecutionEngine` includes
+    `ResetCapturedReplayStatePreservesCachedGraphs`, which locks in the
+    rollback crash fix: live-state restore/truncate can drop captured GPU
+    replay state without discarding the cached `ComputeGraph`.
   - `V2_Unit_ForwardGraphTypes` also includes
     `ReplayPhasePerfStatsSplitFinalStreamSync`, which locks in per-stream final
     sync timers for graph replay diagnostics.

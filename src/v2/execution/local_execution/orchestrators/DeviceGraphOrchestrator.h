@@ -2258,6 +2258,11 @@ namespace llaminar2
             int position_id = 0;
             bool valid = false;
 
+            void resetReplayState()
+            {
+                segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+            }
+
             void invalidate()
             {
                 graph.reset();

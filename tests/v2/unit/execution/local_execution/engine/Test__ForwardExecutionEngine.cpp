@@ -1195,6 +1195,31 @@ TEST_F(Test__ForwardExecutionEngine, InvalidateAllOnEmpty)
     EXPECT_TRUE(engine.cacheEmpty());
 }
 
+TEST_F(Test__ForwardExecutionEngine, ResetCapturedReplayStatePreservesCachedGraphs)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    int token = 42;
+    int pos = 7;
+    auto input = makeTestInput(1, 1, DeviceId::cpu(), &token, &pos);
+    ForwardOutput output{};
+
+    ASSERT_TRUE(engine.execute(input, output, host));
+    ASSERT_FALSE(engine.cacheEmpty());
+    ASSERT_EQ(host.build_forward_graph_calls, 1);
+
+    engine.resetCapturedReplayState();
+    EXPECT_FALSE(engine.cacheEmpty());
+
+    token = 43;
+    pos = 8;
+    ASSERT_TRUE(engine.execute(input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 1)
+        << "Replay reset must preserve the cached ComputeGraph and avoid a rebuild";
+}
+
 // =========================================================================
 // execute() — Cache MISS path
 // =========================================================================

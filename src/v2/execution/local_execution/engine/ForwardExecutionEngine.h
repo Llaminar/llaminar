@@ -348,6 +348,16 @@ namespace llaminar2
         void clearCache();
 
         /**
+         * @brief Drop captured GPU replay state while keeping cached ComputeGraphs.
+         *
+         * Live checkpoint restore rewinds KV/GDN/MTP state within an active request.
+         * Cached graph objects and stable buffers are still usable, but replaying a
+         * previously captured HIP/CUDA graph across that restore boundary can encode
+         * stale runtime state. The next execution will warm up/capture again.
+         */
+        void resetCapturedReplayState();
+
+        /**
          * @brief Reset request/replay state without discarding cached forward graphs.
          *
          * Used at request/session boundaries after the orchestrator clears KV and

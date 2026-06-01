@@ -5295,6 +5295,13 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)
     {
+        auto reset_captured_replay_state = [this]()
+        {
+            if (forward_engine_)
+                forward_engine_->resetCapturedReplayState();
+            mtp_sidecar_depth0_cache_.resetReplayState();
+        };
+
         auto fail = [](const std::string &reason) -> bool
         {
             LOG_ERROR("[DeviceGraphOrchestrator] restoreLivePrefixState failed: " << reason);
@@ -5393,6 +5400,7 @@ namespace llaminar2
 
             state_.positions[seq_idx] = snapshot.cached_tokens;
             state_.sequence_lengths[seq_idx] = snapshot.cached_tokens;
+            reset_captured_replay_state();
             return true;
         }
 
@@ -5523,6 +5531,7 @@ namespace llaminar2
 
         state_.positions[seq_idx] = snapshot.cached_tokens;
         state_.sequence_lengths[seq_idx] = snapshot.cached_tokens;
+        reset_captured_replay_state();
         return true;
     }
 
@@ -5554,6 +5563,9 @@ namespace llaminar2
         }
         state_.positions[seq_idx] = cached_tokens;
         state_.sequence_lengths[seq_idx] = cached_tokens;
+        if (forward_engine_)
+            forward_engine_->resetCapturedReplayState();
+        mtp_sidecar_depth0_cache_.resetReplayState();
         return true;
     }
 

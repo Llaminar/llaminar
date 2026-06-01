@@ -590,6 +590,14 @@ namespace llaminar2
         cache_.clear();
     }
 
+    void ForwardExecutionEngine::resetCapturedReplayState()
+    {
+        for (auto &entry : cache_)
+        {
+            entry.second.resetReplayState();
+        }
+    }
+
     void ForwardExecutionEngine::touchBucketedPrefillForwardCache(
         const ForwardGraphSignature &signature,
         ForwardGraphCache &cache)
