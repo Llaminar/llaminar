@@ -1126,7 +1126,7 @@ Graph capture:
 - LOCAL TP child miss clamps all children to common min prefix length.
 - GLOBAL TP rank miss clamps all ranks via MPI min reduction.
 - PP stage miss clamps the full pipeline to common min prefix length.
-- Large Qwen3.6 MoE tests are opt-in/model-gated.
+- Large Qwen3.6 MoE parity tests are normal parity-suite entries. They may skip only for missing model files, metadata fixtures, required hardware, or MPI topology.
 
 ### Exit Criteria
 
@@ -1238,7 +1238,7 @@ Rollout controls:
 - Enable MTP on MoE/ExpertParallel runners only after Phase 12 and Phase 13 MoE parity pass.
 - Enable ExpertParallel graph-captured sparse overlay paths only after Phase 12 segmented-capture tests and Phase 14 benchmarks pass.
 - Keep stochastic speculative sampling deferred until greedy correctness and acceptance telemetry are stable.
-- Keep every large-model parity and benchmark test model-gated or opt-in.
+- Keep every large-model parity test registered in the parity suite, with explicit prerequisite skips for missing model files, metadata fixtures, required hardware, or MPI topology. Large-model benchmarks remain opt-in.
 
 ### Files
 
