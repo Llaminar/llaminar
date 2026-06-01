@@ -141,6 +141,9 @@ namespace llaminar2
         /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
         virtual bool isMoeRebalancingActive() const { return false; }
 
+        /** Whether the current forward graph must materialize logits for every input row. */
+        virtual bool computeAllPositionLogitsEnabled() const { return false; }
+
         /** Domain placement epoch for MoE-sensitive prefill graph-cache keys. */
         virtual uint64_t moePlacementEpoch() const { return 0; }
 

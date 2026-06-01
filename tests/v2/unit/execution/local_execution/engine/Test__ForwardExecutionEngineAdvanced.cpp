@@ -65,6 +65,7 @@ namespace
 
         // ----- Configurable Behavior -----
         bool build_should_fail = false;
+        bool all_position_logits = false;
         int graph_node_count = 3; // Stages in built graph (0 = empty)
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
@@ -164,6 +165,11 @@ namespace
             return mock_pp_copy;
         }
 
+        bool computeAllPositionLogitsEnabled() const override
+        {
+            return all_position_logits;
+        }
+
     private:
         IDeviceContext *ctx_;
     };
@@ -177,18 +183,21 @@ namespace
         std::vector<int> positions;
         ForwardInput input;
 
-        TestInput(int seq_len, int batch_size = 1, DeviceId device = DeviceId::cpu())
+        TestInput(int seq_len,
+                  int batch_size = 1,
+                  DeviceId device = DeviceId::cpu(),
+                  int position_offset = 0)
             : tokens(seq_len * batch_size, 42), positions(seq_len * batch_size)
         {
             for (int i = 0; i < seq_len * batch_size; ++i)
-                positions[i] = i % seq_len;
+                positions[i] = position_offset + (i % seq_len);
 
             input.seq_len = seq_len;
             input.batch_size = batch_size;
             input.device = device;
             input.token_ids = tokens.data();
             input.position_ids = positions.data();
-            input.position_offset = 0;
+            input.position_offset = position_offset;
         }
     };
 
@@ -365,6 +374,71 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, SameDecodeShape_CacheHitOnSecondCal
     EXPECT_EQ(host.build_calls, 1) << "Second decode with same shape should hit cache";
     EXPECT_EQ(host.ensure_workspace_calls, 2)
         << "Cache hits must rebind workspace in case another cached bucket replaced it";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, ShortContinuationDecodeShapeCachesForMTPVerifier)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    TrackingHost host(&gpu_ctx);
+    host.graph_node_count = 3;
+
+    ForwardOutput output{};
+
+    TestInput verifier1(2, 1, DeviceId::cuda(0), /*position_offset=*/128);
+    engine.execute(verifier1.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+    EXPECT_FALSE(engine.cacheEmpty());
+
+    TestInput verifier2(2, 1, DeviceId::cuda(0), /*position_offset=*/130);
+    engine.execute(verifier2.input, output, host);
+    EXPECT_EQ(host.build_calls, 1)
+        << "Two-token verifier continuations should reuse the decode graph cache";
+    EXPECT_EQ(host.build_decode_policy_calls, 0)
+        << "Dynamic multi-token decode masks are not graph-capturable yet";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryDoesNotUseDecodeCache)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+
+    ForwardOutput output{};
+
+    TestInput prompt1(2);
+    engine.execute(prompt1.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+
+    TestInput prompt2(2);
+    engine.execute(prompt2.input, output, host);
+    EXPECT_EQ(host.build_calls, 2)
+        << "A two-token prompt at position zero is prefill, not verifier decode";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, AllPositionVerifierLogitsUseSeparateDecodeCacheKey)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+
+    ForwardOutput output{};
+
+    TestInput terminal_only(2, 1, DeviceId::cpu(), /*position_offset=*/128);
+    host.all_position_logits = false;
+    engine.execute(terminal_only.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+
+    TestInput all_positions1(2, 1, DeviceId::cpu(), /*position_offset=*/130);
+    host.all_position_logits = true;
+    engine.execute(all_positions1.input, output, host);
+    EXPECT_EQ(host.build_calls, 2)
+        << "Verifier all-position logits need a graph with a different LM-head contract";
+
+    TestInput all_positions2(2, 1, DeviceId::cpu(), /*position_offset=*/132);
+    engine.execute(all_positions2.input, output, host);
+    EXPECT_EQ(host.build_calls, 2)
+        << "The all-position verifier graph should then hit its own cache entry";
 }
 
 TEST_F(Test__ForwardExecutionEngineAdvanced, ResetSessionReplayState_PreservesCachedGraphAndResetsStages)

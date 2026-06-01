@@ -2147,6 +2147,9 @@ namespace llaminar2
         /** Resolve PP copy info for cache-miss builds. */
         PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const override;
 
+        /** Whether forward graph construction should emit all-position logits. */
+        bool computeAllPositionLogitsEnabled() const override { return compute_all_position_logits_; }
+
         /** Report host-side safety state for chunk-boundary maintenance. */
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(
             const PrefillChunkPlan &chunk) const override;

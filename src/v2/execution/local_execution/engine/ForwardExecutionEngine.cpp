@@ -22,6 +22,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 
+#include <algorithm>
 #include <cstring>
 #include <iomanip>
 #include <limits>
@@ -188,6 +189,8 @@ namespace llaminar2
                 return lhs.device < rhs.device;
             if (lhs.seq_len != rhs.seq_len)
                 return lhs.seq_len < rhs.seq_len;
+            if (lhs.all_position_logits != rhs.all_position_logits)
+                return lhs.all_position_logits < rhs.all_position_logits;
             return lhs.batch_size < rhs.batch_size;
         }
     }
@@ -543,10 +546,20 @@ namespace llaminar2
     {
         auto start = std::chrono::high_resolution_clock::now();
 
-        // Classify the execution path
-        const bool is_decode = (input.seq_len == 1 && input.batch_size <= 1);
         const int first_position = input.position_ids ? input.position_ids[0] : input.position_offset;
+        // Classify the execution path. Greedy MTP verifies short multi-token
+        // continuations against an existing KV/GDN history; those must use the
+        // decode graph path rather than the prompt-prefill path.
+        const int decode_max_seq_len = std::max(1, config_.cache_config.decode_seq_len);
+        const bool is_single_token_decode = (input.seq_len == 1 && input.batch_size <= 1);
+        const bool is_short_continuation_decode =
+            input.batch_size <= 1 &&
+            input.seq_len > 1 &&
+            input.seq_len <= decode_max_seq_len &&
+            first_position > 0;
+        const bool is_decode = is_single_token_decode || is_short_continuation_decode;
         const bool decode_has_history = is_decode && first_position > 0;
+        const bool all_position_logits = host.computeAllPositionLogitsEnabled();
         const bool has_unified_pp = config_.has_unified_pp;
         const bool is_standard_path = !has_unified_pp && !config_.pp_stage_config.has_value();
         const bool is_partial_pp_path = !has_unified_pp && config_.pp_stage_config.has_value();
@@ -702,6 +715,7 @@ namespace llaminar2
                 effective_input.device,
                 is_decode,
                 decode_has_history,
+                all_position_logits,
                 is_standard_path,
                 config_.pp_stage_config.has_value(),
                 pp_first_layer,
@@ -928,7 +942,9 @@ namespace llaminar2
 
         void *replay_stream = forward_cache.segment_cache.capture_stream;
 
-        if (is_decode && input.device.is_gpu())
+        const bool decode_capture_allowed = is_decode && input.seq_len == 1;
+
+        if (decode_capture_allowed && input.device.is_gpu())
         {
             IDeviceContext *stream_ctx = host.getDeviceContext(input.device);
             if (stream_ctx && stream_ctx->deviceId().is_gpu())
@@ -1105,10 +1121,14 @@ namespace llaminar2
         }
         else
         {
-            const auto capture_policy = host.buildDecodeCapturePolicy(
-                has_collective_nodes,
-                ctx,
-                forward_cache.segment_cache.consecutive_failures);
+            DeviceGraphExecutor::DecodeCapturePolicy capture_policy;
+            if (decode_capture_allowed)
+            {
+                capture_policy = host.buildDecodeCapturePolicy(
+                    has_collective_nodes,
+                    ctx,
+                    forward_cache.segment_cache.consecutive_failures);
+            }
             if (capture_policy.collective_segmented_enabled)
             {
                 LOG_DEBUG("[ForwardExecutionEngine] Experimental collective segmented GPU-graph replay enabled");

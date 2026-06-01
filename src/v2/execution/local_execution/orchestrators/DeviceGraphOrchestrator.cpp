@@ -1989,7 +1989,7 @@ namespace llaminar2
         // Graph Caching for Decode Mode (Phase 10)
         // =============================================================================
         if (cache_config_.enabled && cache_config_.cache_attention &&
-            seq_len == cache_config_.decode_seq_len &&
+            seq_len <= std::max(1, cache_config_.decode_seq_len) &&
             layer_idx >= 0 && static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
         {
             auto &cache = layer_graph_cache_[layer_idx];
@@ -2123,7 +2123,7 @@ namespace llaminar2
         // Graph Caching for Decode Mode (Phase 10)
         // =============================================================================
         if (cache_config_.enabled && cache_config_.cache_ffn &&
-            seq_len == cache_config_.decode_seq_len &&
+            seq_len <= std::max(1, cache_config_.decode_seq_len) &&
             layer_idx >= 0 && static_cast<size_t>(layer_idx) < layer_graph_cache_.size())
         {
             auto &cache = layer_graph_cache_[layer_idx];

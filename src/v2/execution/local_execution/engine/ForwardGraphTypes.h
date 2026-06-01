@@ -64,7 +64,7 @@ namespace llaminar2
     struct GraphCacheConfig
     {
         bool enabled = true;         ///< Enable graph caching (Phase 10)
-        int decode_seq_len = 1;      ///< Sequence length that triggers decode caching
+        int decode_seq_len = 2;      ///< Max continuation length that can use decode caching.
         bool cache_attention = true; ///< Cache attention graphs
         bool cache_ffn = true;       ///< Cache FFN graphs
     };
@@ -81,7 +81,8 @@ namespace llaminar2
         int batch_size = 0;
         DeviceId device = DeviceId::cpu();
         bool decode = false;
-        bool decode_has_history = false; ///< True for seq_len=1 calls that already have KV/GDN history.
+        bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
+        bool all_position_logits = false;
         bool standard_path = true;
         bool pp_stage_enabled = false;
         int pp_first_layer = -1;
@@ -98,6 +99,7 @@ namespace llaminar2
                    device == other.device &&
                    decode == other.decode &&
                    decode_has_history == other.decode_has_history &&
+                   all_position_logits == other.all_position_logits &&
                    standard_path == other.standard_path &&
                    pp_stage_enabled == other.pp_stage_enabled &&
                    pp_first_layer == other.pp_first_layer &&
@@ -118,6 +120,7 @@ namespace llaminar2
             h ^= (std::hash<DeviceId>{}(sig.device) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode_has_history) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.pp_first_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));

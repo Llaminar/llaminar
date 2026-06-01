@@ -55,6 +55,15 @@ TEST(Test__ForwardGraphSignature, DifferentDecodeNotEqual)
     EXPECT_NE(a, b);
 }
 
+TEST(Test__ForwardGraphSignature, DifferentAllPositionLogitsNotEqual)
+{
+    ForwardGraphSignature terminal_only{.seq_len = 2, .batch_size = 1, .decode = true,
+                                        .all_position_logits = false};
+    ForwardGraphSignature all_positions{.seq_len = 2, .batch_size = 1, .decode = true,
+                                        .all_position_logits = true};
+    EXPECT_NE(terminal_only, all_positions);
+}
+
 TEST(Test__ForwardGraphSignature, DifferentPPFieldsNotEqual)
 {
     ForwardGraphSignature a{.pp_stage_enabled = true, .pp_first_layer = 0, .pp_last_layer = 13};
@@ -168,7 +177,7 @@ TEST(Test__GraphCacheConfig, Defaults)
 {
     GraphCacheConfig config;
     EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.decode_seq_len, 1);
+    EXPECT_EQ(config.decode_seq_len, 2);
     EXPECT_TRUE(config.cache_attention);
     EXPECT_TRUE(config.cache_ffn);
 }
