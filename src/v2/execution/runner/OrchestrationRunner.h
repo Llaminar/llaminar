@@ -436,6 +436,7 @@ namespace llaminar2
         void printStartupBanner();
 
         bool shouldUseMTPDecode() const;
+        std::string mtpDecodeHardFailureReason() const;
         std::string mtpDecodeBypassReason() const;
         void recordMTPBypass(const std::string &reason);
         GenerationResult decodeStepMTP();

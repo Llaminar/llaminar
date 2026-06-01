@@ -789,7 +789,23 @@ namespace llaminar2
     bool OrchestrationRunner::shouldUseMTPDecode() const
     {
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
-        return mtp.enabled && mtpDecodeBypassReason().empty();
+        return mtp.enabled &&
+               mtpDecodeHardFailureReason().empty() &&
+               mtpDecodeBypassReason().empty();
+    }
+
+    std::string OrchestrationRunner::mtpDecodeHardFailureReason() const
+    {
+        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        if (!mtp.enabled || !runner_)
+            return {};
+
+        if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
+        {
+            return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_DECODE; use LLAMINAR_ROCM_CONCURRENT_M2_ROWS for M=2 verifier experiments";
+        }
+
+        return {};
     }
 
     std::string OrchestrationRunner::mtpDecodeBypassReason() const
@@ -1215,6 +1231,13 @@ namespace llaminar2
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
         if (mtp.enabled)
         {
+            const std::string mtp_hard_failure = mtpDecodeHardFailureReason();
+            if (!mtp_hard_failure.empty())
+            {
+                result.error = mtp_hard_failure;
+                return result;
+            }
+
             const std::string mtp_bypass_reason = mtpDecodeBypassReason();
             if (mtp_bypass_reason.empty())
             {

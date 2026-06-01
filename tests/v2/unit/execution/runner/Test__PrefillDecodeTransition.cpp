@@ -30,6 +30,7 @@
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../mocks/MockModelContext.h"
 #include "../../../mocks/MockMPIContext.h"
@@ -61,6 +62,7 @@ namespace
                 old_value_ = old;
             }
             setenv(name, value, 1);
+            mutableDebugEnv().reload();
         }
 
         ~ScopedEnv()
@@ -69,6 +71,7 @@ namespace
                 setenv(name_.c_str(), old_value_.c_str(), 1);
             else
                 unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
         }
 
     private:
@@ -223,6 +226,11 @@ namespace
             return mtp_unsupported_reason_;
         }
 
+        DeviceId primaryDeviceId() const override
+        {
+            return primary_device_;
+        }
+
         bool supportsMTPTokenCoordination() const override
         {
             return supports_mtp_token_coordination_;
@@ -305,6 +313,10 @@ namespace
         void setMTPUnsupportedReason(std::string reason)
         {
             mtp_unsupported_reason_ = std::move(reason);
+        }
+        void setPrimaryDevice(DeviceId device)
+        {
+            primary_device_ = device;
         }
         void enableColumnParallelShard(int vocab_start, int vocab_local)
         {
@@ -481,6 +493,7 @@ namespace
         bool supports_mtp_token_coordination_{false};
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
+        DeviceId primary_device_{DeviceId::cpu()};
         int vocab_start_{0};
         int vocab_local_{VOCAB_SIZE};
         std::string mtp_unsupported_reason_;
@@ -528,7 +541,8 @@ namespace
                                                                              std::string mtp_unsupported_reason = {},
                                                                              std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
                                                                              bool mtp_token_coordination = false,
-                                                                             bool hide_local_logits = false)
+                                                                             bool hide_local_logits = false,
+                                                                             DeviceId primary_device = DeviceId::cpu())
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -537,13 +551,19 @@ namespace
                 mock_ptr->enableMTP(mtp_accept);
             }
             mock_ptr->setMTPUnsupportedReason(std::move(mtp_unsupported_reason));
+            mock_ptr->setPrimaryDevice(primary_device);
             if (mtp_token_coordination)
             {
                 mock_ptr->enableMTPTokenCoordination(hide_local_logits);
             }
 
             OrchestrationConfig config;
-            config.device_for_this_rank = GlobalDeviceAddress::cpu();
+            if (primary_device.is_rocm())
+                config.device_for_this_rank = GlobalDeviceAddress::rocm(primary_device.ordinal);
+            else if (primary_device.is_cuda())
+                config.device_for_this_rank = GlobalDeviceAddress::cuda(primary_device.ordinal);
+            else
+                config.device_for_this_rank = GlobalDeviceAddress::cpu();
             config.mtp.enabled = mtp_enabled;
             config.mtp.draft_tokens = 1;
             config.mtp.verify_mode = MTPVerifyMode::Greedy;
@@ -830,6 +850,53 @@ namespace
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, ROCmMTPHardFailsWithBroadConcurrentDecodeFlag)
+    {
+        ScopedEnv broad_concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE", "1");
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::rocm(0));
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        EXPECT_FALSE(step1.success());
+        EXPECT_NE(step1.error.find("LLAMINAR_ROCM_CONCURRENT_DECODE"), std::string::npos);
+        EXPECT_NE(step1.error.find("LLAMINAR_ROCM_CONCURRENT_M2_ROWS"), std::string::npos);
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+        EXPECT_EQ(mock->forwardCallCount(), 1);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, ROCmMTPAllowsNarrowM2RowOverlapFlag)
+    {
+        ScopedEnv broad_concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE", "0");
+        ScopedEnv m2_rows("LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "1");
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::rocm(0));
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSecondDecodeUsesVerifierTerminalTokenWithoutRefeedingPreviousToken)
