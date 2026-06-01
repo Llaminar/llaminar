@@ -85,6 +85,7 @@ namespace llaminar2
             chunk_input.bucket_seq_len = plan.chunk.bucket_seq_len;
             chunk_input.token_offset = plan.chunk.token_offset;
             chunk_input.position_offset = plan.chunk.token_offset;
+            chunk_input.prefill_chunk_index = plan.chunk_index;
             return chunk_input;
         }
 
@@ -161,6 +162,105 @@ namespace llaminar2
         std::string boolTag(bool value)
         {
             return value ? "true" : "false";
+        }
+
+        const char *prefillGraphPhaseName(PrefillGraphPhase phase)
+        {
+            switch (phase)
+            {
+            case PrefillGraphPhase::Disabled:
+                return "disabled";
+            case PrefillGraphPhase::Cold:
+                return "cold";
+            case PrefillGraphPhase::Warmup:
+                return "warmup";
+            case PrefillGraphPhase::Capturing:
+                return "capturing";
+            case PrefillGraphPhase::Ready:
+                return "ready";
+            }
+            return "unknown";
+        }
+
+        PrefillGraphCacheKey makePrefillGraphKey(
+            const ForwardInput &input,
+            const IForwardExecutionHost &host)
+        {
+            PrefillGraphCacheKey key;
+            key.seq_len = input.seq_len;
+            key.device_id = input.device;
+            key.domain_id = host.prefillGraphDomainId();
+            key.participant_id = host.prefillGraphParticipantId();
+            key.placement_epoch = host.moePlacementEpoch();
+            key.topology_signature = host.prefillGraphTopologySignature();
+            return key;
+        }
+
+        PrefillGraphExecutionObservation makePrefillGraphObservation(
+            const ForwardInput &input,
+            const PrefillGraphCacheKey &key,
+            const char *capture_phase,
+            const std::string &recapture_reason)
+        {
+            const int real_count = effectiveRealSeqLen(input);
+            const int bucket_len = effectiveBucketSeqLen(input);
+            PrefillGraphExecutionObservation observation;
+            observation.valid = true;
+            observation.chunk_index = input.prefill_chunk_index;
+            observation.bucket_seq_len = bucket_len;
+            observation.real_token_start = effectiveTokenOffset(input);
+            observation.real_token_count = real_count;
+            observation.real_token_end = observation.real_token_start + real_count;
+            observation.domain_id = key.domain_id;
+            observation.participant_id = key.participant_id;
+            observation.placement_epoch = key.placement_epoch;
+            observation.topology_signature = key.topology_signature;
+            observation.capture_phase = capture_phase ? capture_phase : "unknown";
+            observation.recapture_reason = recapture_reason.empty() ? "none" : recapture_reason;
+            return observation;
+        }
+
+        PerfStatsCollector::Tags prefillGraphObservationTags(
+            const PrefillGraphExecutionObservation &observation,
+            const char *cache_phase)
+        {
+            return {
+                {"capture_phase", observation.capture_phase},
+                {"cache_phase", cache_phase ? cache_phase : "unknown"},
+                {"chunk_index", std::to_string(observation.chunk_index)},
+                {"bucket_seq_len", std::to_string(observation.bucket_seq_len)},
+                {"real_token_start", std::to_string(observation.real_token_start)},
+                {"real_token_count", std::to_string(observation.real_token_count)},
+                {"real_token_end", std::to_string(observation.real_token_end)},
+                {"domain_id", observation.domain_id},
+                {"participant_id", std::to_string(observation.participant_id)},
+                {"placement_epoch", std::to_string(observation.placement_epoch)},
+                {"topology_signature", std::to_string(observation.topology_signature)},
+                {"recapture_reason", observation.recapture_reason}};
+        }
+
+        void publishPrefillGraphObservation(
+            ForwardGraphCache &forward_cache,
+            const ForwardInput &input,
+            const PrefillGraphCacheKey &key,
+            PrefillGraphPhase cache_phase,
+            const char *capture_phase,
+            const std::string &recapture_reason)
+        {
+            auto observation = makePrefillGraphObservation(
+                input,
+                key,
+                capture_phase,
+                recapture_reason);
+            forward_cache.last_prefill_graph_observation = observation;
+
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "prefill_graph_lifecycle",
+                1.0,
+                "prefill",
+                input.device.toString(),
+                prefillGraphObservationTags(observation, prefillGraphPhaseName(cache_phase)));
         }
 
         std::string forwardGraphPerfContext(const ForwardGraphSignature &signature)
@@ -1341,11 +1441,7 @@ namespace llaminar2
 
         auto &cache = *forward_cache.prefill_graph_cache;
 
-        PrefillGraphCacheKey key;
-        key.seq_len = input.seq_len;
-        key.device_id = input.device;
-        key.placement_epoch = host.moePlacementEpoch();
-        // Tier 1 defaults: domain_id="single", topology_signature=0
+        PrefillGraphCacheKey key = makePrefillGraphKey(input, host);
 
         auto phase = cache.phase(key);
         const int real_seq_len = effectiveRealSeqLen(input);
@@ -1432,6 +1528,13 @@ namespace llaminar2
             if (cache.config().trace)
                 LOG_INFO("[ForwardExecutionEngine] Prefill graph REPLAY seq_len=" << input.seq_len
                                                                                   << " replay_count=" << cache.replayCount(key));
+            publishPrefillGraphObservation(
+                forward_cache,
+                input,
+                key,
+                PrefillGraphPhase::Ready,
+                "replay",
+                "none");
             return true;
         }
 
@@ -1494,6 +1597,13 @@ namespace llaminar2
 
             LOG_INFO("[ForwardExecutionEngine] Prefill graph CAPTURED seq_len=" << input.seq_len
                                                                                 << " nodes=" << cache.nodeCount(key));
+            publishPrefillGraphObservation(
+                forward_cache,
+                input,
+                key,
+                PrefillGraphPhase::Ready,
+                "capture",
+                phase == PrefillGraphPhase::Warmup ? "armed_warmup" : "recapture");
             return true;
         }
 
@@ -1555,13 +1665,30 @@ namespace llaminar2
             if (cold_capture_candidate && cold_stream_ready)
             {
                 cache.markWarmedUp(key);
+                publishPrefillGraphObservation(
+                    forward_cache,
+                    input,
+                    key,
+                    PrefillGraphPhase::Warmup,
+                    "warmup",
+                    "none");
                 if (cache.config().trace)
                     LOG_INFO("[ForwardExecutionEngine] Prefill graph ARMED for capture: seq_len=" << input.seq_len);
             }
-            else if (cache.config().trace)
+            else
             {
-                LOG_INFO("[ForwardExecutionEngine] Prefill graph capture rejected: "
-                         << toString(cold_reject_reason) << " seq_len=" << input.seq_len);
+                if (cache.config().trace)
+                {
+                    LOG_INFO("[ForwardExecutionEngine] Prefill graph capture rejected: "
+                             << toString(cold_reject_reason) << " seq_len=" << input.seq_len);
+                }
+                publishPrefillGraphObservation(
+                    forward_cache,
+                    input,
+                    key,
+                    PrefillGraphPhase::Cold,
+                    "rejected",
+                    toString(cold_reject_reason));
             }
             // Rejection is NOT fatal — we just won't use graph capture for this seq_len.
         }
@@ -1642,10 +1769,7 @@ namespace llaminar2
         if (should_cache && build_cache && signature.is_bucketed_prefill && isPaddedBucketExecution(effective_input))
         {
             PrefillGraphCache preflight_cache(makePrefillGraphConfigFromEnv());
-            PrefillGraphCacheKey key;
-            key.seq_len = effective_input.seq_len;
-            key.device_id = effective_input.device;
-            key.placement_epoch = host.moePlacementEpoch();
+            PrefillGraphCacheKey key = makePrefillGraphKey(effective_input, host);
 
             const PrefillGraphRejectReason reject_reason = preflightPrefillGraph(
                 preflight_cache,
@@ -1889,6 +2013,30 @@ namespace llaminar2
         const ForwardGraphCache &forward_cache = it->second;
         snapshot.forward_cache_valid = forward_cache.valid;
         snapshot.eviction_count = bucketed_prefill_forward_eviction_count_;
+        snapshot.bucket_seq_len = key.seq_len;
+        snapshot.domain_id = key.domain_id;
+        snapshot.participant_id = key.participant_id;
+        snapshot.placement_epoch = key.placement_epoch;
+        snapshot.topology_signature = key.topology_signature;
+        snapshot.capture_phase = "unknown";
+        snapshot.recapture_reason = "none";
+
+        if (forward_cache.last_prefill_graph_observation.valid)
+        {
+            const auto &observation = forward_cache.last_prefill_graph_observation;
+            snapshot.observation_valid = true;
+            snapshot.chunk_index = observation.chunk_index;
+            snapshot.bucket_seq_len = observation.bucket_seq_len;
+            snapshot.real_token_start = observation.real_token_start;
+            snapshot.real_token_count = observation.real_token_count;
+            snapshot.real_token_end = observation.real_token_end;
+            snapshot.domain_id = observation.domain_id;
+            snapshot.participant_id = observation.participant_id;
+            snapshot.placement_epoch = observation.placement_epoch;
+            snapshot.topology_signature = observation.topology_signature;
+            snapshot.capture_phase = observation.capture_phase;
+            snapshot.recapture_reason = observation.recapture_reason;
+        }
 
         if (!forward_cache.prefill_graph_cache)
             return snapshot;

@@ -605,6 +605,7 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_ExactPlanDelegatesWithChunk
         /*pad_token_id=*/0,
         /*allow_padded_execution=*/false);
     ASSERT_TRUE(plan) << plan.error;
+    plan.chunk_index = 9;
 
     ForwardOutput output{};
     EXPECT_TRUE(engine.runPrefillChunk(base_input, plan, output, host));
@@ -620,6 +621,7 @@ TEST_F(Test__ForwardExecutionEngine, RunPrefillChunk_ExactPlanDelegatesWithChunk
     EXPECT_EQ(host.last_forward_input.bucket_seq_len, plan.chunk.bucket_seq_len);
     EXPECT_EQ(host.last_forward_input.token_offset, plan.chunk.token_offset);
     EXPECT_EQ(host.last_forward_input.position_offset, plan.chunk.token_offset);
+    EXPECT_EQ(host.last_forward_input.prefill_chunk_index, 9);
     EXPECT_EQ(host.last_workspace_seq_len, plan.chunk.bucket_seq_len);
 }
 

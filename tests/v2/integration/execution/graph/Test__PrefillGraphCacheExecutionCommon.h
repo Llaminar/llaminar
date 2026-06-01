@@ -26,6 +26,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -50,6 +51,24 @@ namespace
     constexpr int kKVProbeHeads = 1;
     constexpr int kKVProbeDim = kKVProbeHeads * kKVProbeHeadDim;
     constexpr int kPadTokenId = 0;
+
+    double findPrefillGraphLifecycleCounter(
+        const std::vector<PerfStatRecord> &records,
+        const PerfStatsCollector::Tags &tags)
+    {
+        for (const auto &record : records)
+        {
+            if (record.kind == PerfStatRecord::Kind::Counter &&
+                record.domain == "forward_graph" &&
+                record.name == "prefill_graph_lifecycle" &&
+                record.phase == "prefill" &&
+                record.tags == tags)
+            {
+                return record.value;
+            }
+        }
+        return 0.0;
+    }
 
     /**
      * @brief Scoped environment override that reloads debugEnv() immediately.
@@ -469,6 +488,11 @@ namespace
 
         PPCopyInfo resolvePPCopyInfo(const ForwardInput &) const override { return {}; }
 
+        uint64_t moePlacementEpoch() const override { return placement_epoch; }
+        std::string prefillGraphDomainId() const override { return domain_id; }
+        int prefillGraphParticipantId() const override { return participant_id; }
+        uint64_t prefillGraphTopologySignature() const override { return topology_signature; }
+
         /// @brief Enable the row-select replay-param consumer for padded bucket tests.
         void setUseRowSelectProbe(bool enabled) { use_row_select_probe_ = enabled; }
 
@@ -501,6 +525,10 @@ namespace
         int last_build_seq_len = 0;
         int last_build_bucket_seq_len = 0;
         int last_build_real_seq_len = 0;
+        std::string domain_id = "single";
+        int participant_id = 0;
+        uint64_t placement_epoch = 0;
+        uint64_t topology_signature = 0;
 
     private:
         DeviceId device_;
@@ -533,11 +561,21 @@ namespace
         return signature;
     }
 
-    PrefillGraphCacheKey prefillGraphKey(DeviceId device, int seq_len)
+    PrefillGraphCacheKey prefillGraphKey(
+        DeviceId device,
+        int seq_len,
+        const std::string &domain_id = "single",
+        int participant_id = 0,
+        uint64_t placement_epoch = 0,
+        uint64_t topology_signature = 0)
     {
         PrefillGraphCacheKey key;
         key.seq_len = seq_len;
         key.device_id = device;
+        key.domain_id = domain_id;
+        key.participant_id = participant_id;
+        key.placement_epoch = placement_epoch;
+        key.topology_signature = topology_signature;
         return key;
     }
 
@@ -737,10 +775,16 @@ namespace
             {"LLAMINAR_VALIDATE_BUFFERS", "0"},
             {"LLAMINAR_VALIDATE_INPUTS", "0"},
             {"LLAMINAR_FAIL_ON_ZERO", "0"},
+            {"LLAMINAR_PERF_STATS_JSON", "1"},
         });
+        PerfStatsCollector::reset();
 
         host_->setUseRowSelectProbe(true);
         host_->setUseKVAppendProbe(true);
+        host_->domain_id = "overlay_routed_rocm_hot";
+        host_->participant_id = 2;
+        host_->placement_epoch = 17;
+        host_->topology_signature = 0x321u;
 
         auto tokens61 = makeSequentialInts(kExactBucketSeqLen - 3, 3000);
         ForwardInput input61;
@@ -778,7 +822,13 @@ namespace
 
         ForwardOutput output;
         const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
-        const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
+        const auto key = prefillGraphKey(
+            device_,
+            kExactBucketSeqLen,
+            host_->domain_id,
+            host_->participant_id,
+            host_->placement_epoch,
+            host_->topology_signature);
 
         ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
         EXPECT_EQ(host_->build_calls, 1);
@@ -811,6 +861,18 @@ namespace
         EXPECT_EQ(after_warmup->phase, PrefillGraphPhase::Warmup);
         EXPECT_EQ(after_warmup->warmup_count, 1u);
         EXPECT_EQ(after_warmup->capture_count, 0u);
+        EXPECT_TRUE(after_warmup->observation_valid);
+        EXPECT_EQ(after_warmup->chunk_index, 0);
+        EXPECT_EQ(after_warmup->bucket_seq_len, kExactBucketSeqLen);
+        EXPECT_EQ(after_warmup->real_token_start, 512);
+        EXPECT_EQ(after_warmup->real_token_count, kExactBucketSeqLen - 1);
+        EXPECT_EQ(after_warmup->real_token_end, 512 + kExactBucketSeqLen - 1);
+        EXPECT_EQ(after_warmup->domain_id, "overlay_routed_rocm_hot");
+        EXPECT_EQ(after_warmup->participant_id, 2);
+        EXPECT_EQ(after_warmup->placement_epoch, 17u);
+        EXPECT_EQ(after_warmup->topology_signature, 0x321u);
+        EXPECT_EQ(after_warmup->capture_phase, "warmup");
+        EXPECT_EQ(after_warmup->recapture_reason, "none");
 
         ASSERT_TRUE(engine_->runPrefillChunk(input61, plan61, output, *host_));
         EXPECT_EQ(host_->build_calls, 1);
@@ -826,6 +888,12 @@ namespace
         EXPECT_EQ(after_capture->capture_count, 1u);
         EXPECT_EQ(after_capture->replay_count, 1);
         EXPECT_GT(after_capture->node_count, 0u);
+        EXPECT_TRUE(after_capture->observation_valid);
+        EXPECT_EQ(after_capture->real_token_start, 128);
+        EXPECT_EQ(after_capture->real_token_count, kExactBucketSeqLen - 3);
+        EXPECT_EQ(after_capture->real_token_end, 128 + kExactBucketSeqLen - 3);
+        EXPECT_EQ(after_capture->capture_phase, "capture");
+        EXPECT_EQ(after_capture->recapture_reason, "armed_warmup");
 
         ASSERT_TRUE(engine_->runPrefillChunk(input63, plan63, output, *host_));
         EXPECT_EQ(host_->build_calls, 1);
@@ -845,6 +913,33 @@ namespace
             << "Changing real_seq_len inside one bucket must update replay params, not recapture.";
         EXPECT_EQ(after_replay->replay_count, 2);
         EXPECT_EQ(after_replay->eviction_count, 0u);
+        EXPECT_TRUE(after_replay->observation_valid);
+        EXPECT_EQ(after_replay->real_token_start, 512);
+        EXPECT_EQ(after_replay->real_token_count, kExactBucketSeqLen - 1);
+        EXPECT_EQ(after_replay->real_token_end, 512 + kExactBucketSeqLen - 1);
+        EXPECT_EQ(after_replay->domain_id, "overlay_routed_rocm_hot");
+        EXPECT_EQ(after_replay->participant_id, 2);
+        EXPECT_EQ(after_replay->placement_epoch, 17u);
+        EXPECT_EQ(after_replay->topology_signature, 0x321u);
+        EXPECT_EQ(after_replay->capture_phase, "replay");
+        EXPECT_EQ(after_replay->recapture_reason, "none");
+
+        const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+        const PerfStatsCollector::Tags replay_tags = {
+            {"bucket_seq_len", std::to_string(kExactBucketSeqLen)},
+            {"cache_phase", "ready"},
+            {"capture_phase", "replay"},
+            {"chunk_index", "0"},
+            {"domain_id", "overlay_routed_rocm_hot"},
+            {"participant_id", "2"},
+            {"placement_epoch", "17"},
+            {"real_token_count", std::to_string(kExactBucketSeqLen - 1)},
+            {"real_token_end", std::to_string(512 + kExactBucketSeqLen - 1)},
+            {"real_token_start", "512"},
+            {"recapture_reason", "none"},
+            {"topology_signature", std::to_string(0x321u)}};
+        EXPECT_DOUBLE_EQ(findPrefillGraphLifecycleCounter(records, replay_tags), 1.0);
+        PerfStatsCollector::reset();
     }
 
     TEST_F(PrefillGraphCacheExecutionTest, ServerStyleRawExecuteReusesPaddedBucketAcrossRealLengths)

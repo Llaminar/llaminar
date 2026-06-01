@@ -134,6 +134,30 @@ namespace llaminar2
     };
 
     /**
+     * @brief Latest runtime metadata observed for a prefill graph-cache entry.
+     *
+     * The cache key remains bucket-shaped so one captured graph can safely serve
+     * multiple real-token lengths in the same bucket. This observation records
+     * the latest real chunk that flowed through that stable shape for diagnostics,
+     * perf export, and Phase 12 graph-capture acceptance.
+     */
+    struct PrefillGraphExecutionObservation
+    {
+        bool valid = false;
+        int chunk_index = 0;
+        int bucket_seq_len = 0;
+        int real_token_start = 0;
+        int real_token_count = 0;
+        int real_token_end = 0;
+        std::string domain_id = "single";
+        int participant_id = 0;
+        uint64_t placement_epoch = 0;
+        uint64_t topology_signature = 0;
+        std::string capture_phase = "cold";
+        std::string recapture_reason = "none";
+    };
+
+    /**
      * @brief RAII owner for an explicit GPU stream used by cached graph capture.
      *
      * The stream is created through the same worker GPU context that owns the
@@ -289,6 +313,9 @@ namespace llaminar2
         /// Prefill graph capture/replay cache (keyed by seq_len)
         std::unique_ptr<PrefillGraphCache> prefill_graph_cache;
 
+        /// Latest diagnostic metadata for bucketed/chunked prefill graph execution.
+        PrefillGraphExecutionObservation last_prefill_graph_observation;
+
         /// Monotonic engine-level LRU tick for bucketed prefill forward-cache eviction.
         uint64_t bucketed_prefill_last_access_tick = 0;
 
@@ -382,6 +409,7 @@ namespace llaminar2
             segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
             if (prefill_graph_cache)
                 prefill_graph_cache->invalidateAll();
+            last_prefill_graph_observation = {};
             prefill_capture_stream.reset();
             bucketed_prefill_last_access_tick = 0;
             graph.reset();

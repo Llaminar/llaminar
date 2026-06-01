@@ -147,6 +147,15 @@ namespace llaminar2
         /** Domain placement epoch for MoE-sensitive prefill graph-cache keys. */
         virtual uint64_t moePlacementEpoch() const { return 0; }
 
+        /** Domain id for MoE-sensitive prefill graph-cache observations. */
+        virtual std::string prefillGraphDomainId() const { return "single"; }
+
+        /** Domain-local participant id for MoE-sensitive prefill graph-cache observations. */
+        virtual int prefillGraphParticipantId() const { return 0; }
+
+        /** Stable topology fingerprint for MoE-sensitive prefill graph-cache observations. */
+        virtual uint64_t prefillGraphTopologySignature() const { return 0; }
+
         /**
          * @brief Return safety state for optional chunk-boundary maintenance.
          *
@@ -381,6 +390,18 @@ namespace llaminar2
             uint64_t warmup_count = 0;                         ///< Lifetime warmups for this bucket.
             uint64_t capture_count = 0;                        ///< Lifetime successful captures for this bucket.
             uint64_t eviction_count = 0;                       ///< Total prefill bucket evictions observed by this engine.
+            bool observation_valid = false;                    ///< True when runtime chunk/capture metadata has been observed.
+            int chunk_index = 0;                               ///< Stable chunk ordinal from the latest prefill execution.
+            int bucket_seq_len = 0;                            ///< Fixed graph bucket length from the latest prefill execution.
+            int real_token_start = 0;                          ///< Inclusive real-token start offset from the latest prefill execution.
+            int real_token_count = 0;                          ///< Real tokens represented by the latest prefill execution.
+            int real_token_end = 0;                            ///< Exclusive real-token end offset from the latest prefill execution.
+            std::string domain_id;                             ///< Prefix/MoE domain id associated with this graph observation.
+            int participant_id = 0;                            ///< Domain-local participant id associated with this graph observation.
+            uint64_t placement_epoch = 0;                      ///< MoE placement epoch associated with this graph observation.
+            uint64_t topology_signature = 0;                   ///< Topology signature associated with this graph observation.
+            std::string capture_phase;                         ///< cold, warmup, capture, replay, or rejected.
+            std::string recapture_reason;                      ///< none or a structured reason for recapture/rejection.
         };
 
         /**

@@ -179,6 +179,17 @@ Latest ROCm dense evidence:
   - `V2_Unit_ForwardGraphTypes` also includes
     `ReplayPhasePerfStatsSplitFinalStreamSync`, which locks in per-stream final
     sync timers for graph replay diagnostics.
+  - `V2_Unit_ForwardExecutionEngine` now proves bucketed `runPrefillChunk()`
+    carries the stable chunk ordinal into graph execution metadata.
+  - `V2_Unit_DeviceGraphOrchestrator` now proves prefill graph observations use
+    the same MoE domain id and domain-local participant id as the rebalance
+    controller path.
+  - `V2_Integration_PrefillGraphCacheExecution_CUDA` and
+    `V2_Integration_PrefillGraphCacheExecution_ROCm` now assert structured
+    prefill graph snapshot/perf observability for chunk id, bucket length,
+    real-token range, domain id, participant id, placement epoch, topology
+    signature, capture/replay phase, and recapture reason while preserving
+    padded-bucket graph reuse across changing real-token lengths.
 
 Next graph-capture questions:
 

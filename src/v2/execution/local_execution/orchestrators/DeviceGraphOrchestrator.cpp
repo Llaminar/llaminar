@@ -920,6 +920,18 @@ namespace llaminar2
         return moe_rebalance_controller_->placementEpoch();
     }
 
+    std::string DeviceGraphOrchestrator::prefillGraphDomainId() const
+    {
+        if (!moe_rebalance_controller_)
+            return "single";
+        return moe_rebalance_controller_->domainId();
+    }
+
+    int DeviceGraphOrchestrator::prefillGraphParticipantId() const
+    {
+        return moeRebalanceParticipantId();
+    }
+
     PrefillChunkMaintenanceState DeviceGraphOrchestrator::prefillChunkMaintenanceState(
         const PrefillChunkPlan &chunk) const
     {

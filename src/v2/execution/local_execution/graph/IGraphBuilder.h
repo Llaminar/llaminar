@@ -62,6 +62,7 @@ namespace llaminar2
         int real_seq_len = 0;              ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
         int bucket_seq_len = 0;            ///< Fixed bucket length for graph shape (0 = seq_len)
         int token_offset = 0;              ///< Chunk offset within the original prompt
+        int prefill_chunk_index = 0;       ///< Stable chunk ordinal for chunked graph-captured prefill.
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
 

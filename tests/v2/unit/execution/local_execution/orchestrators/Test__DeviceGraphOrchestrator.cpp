@@ -1084,6 +1084,11 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped
     EXPECT_EQ(controllers.front(), controller_ptr);
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("single_cpu_moe"), controller_ptr);
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("other_domain"), nullptr);
+
+    IForwardExecutionHost &host = *orchestrator;
+    EXPECT_EQ(host.prefillGraphDomainId(), "single_cpu_moe")
+        << "Prefill graph observations must report the active MoE domain.";
+    EXPECT_EQ(host.prefillGraphParticipantId(), 0);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIncludesRoutedOverlayDomains)
@@ -1128,6 +1133,9 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesGlobalTPDomainI
 
     EXPECT_EQ(orchestrator->moeRebalanceParticipantId(), 1)
         << "GlobalTP rebalance must use rank-in-domain, not MPI local rank";
+    IForwardExecutionHost &host = *orchestrator;
+    EXPECT_EQ(host.prefillGraphParticipantId(), 1)
+        << "Prefill graph observations must use the same domain-local participant id.";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceDomainMismatchFailsBeforeMutation)

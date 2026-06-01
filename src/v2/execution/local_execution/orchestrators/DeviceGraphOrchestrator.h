@@ -1765,6 +1765,8 @@ namespace llaminar2
 
         /** Return the active MoE placement epoch for graph-cache keying. */
         uint64_t moePlacementEpoch() const override;
+        std::string prefillGraphDomainId() const override;
+        int prefillGraphParticipantId() const override;
 
         // =========================================================================
         // IInferenceRunner Interface Implementation
