@@ -36,6 +36,7 @@
 #include "../../utils/MPITopology.h"
 #include "../../utils/NodeDetection.h"
 #include "../../utils/NUMATopology.h"
+#include "../../utils/PerfStatsCollector.h"
 #include "../../utils/WeightLoadingProfiler.h"
 #include "../local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "../../execution/moe/MoERebalanceController.h"
@@ -469,6 +470,8 @@ namespace llaminar2
             return;
         }
 
+        PerfStatsCollector::flushFromEnv();
+
         // Release resources in reverse order
         runner_.reset();
         local_pp_ctx_.reset();
@@ -841,6 +844,9 @@ namespace llaminar2
 
     GenerationResult OrchestrationRunner::decodeStepMTP()
     {
+        PerfStatsCollector::ScopedTimer step_timer("mtp", "decode_step_total", "decode");
+        PerfStatsCollector::addCounter("mtp", "decode_step_calls", 1.0, "decode");
+
         GenerationResult result;
         const int vocab = vocabSize();
         if (vocab <= 0)
@@ -849,9 +855,14 @@ namespace llaminar2
             return result;
         }
 
-        PrefixStateSnapshot checkpoint = runner_->captureLivePrefixState();
+        PrefixStateSnapshot checkpoint;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "capture_live_prefix_state", "decode");
+            checkpoint = runner_->captureLivePrefixState();
+        }
         if (!checkpoint.valid)
         {
+            PerfStatsCollector::addCounter("mtp", "capture_live_prefix_state_failures", 1.0, "decode");
             result.error = "MTP decode could not capture live prefix state";
             return result;
         }
@@ -861,77 +872,153 @@ namespace llaminar2
 
         auto fail_after_checkpoint = [&](const std::string &message) -> GenerationResult
         {
-            runner_->setComputeAllPositionLogits(false);
-            if (runner_->restoreLivePrefixState(checkpoint))
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "disable_all_position_logits_after_failure", "decode");
+                runner_->setComputeAllPositionLogits(false);
+            }
+            bool restored = false;
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "restore_live_prefix_state_after_failure", "decode");
+                restored = runner_->restoreLivePrefixState(checkpoint);
+            }
+            if (restored)
             {
                 ++mtp_stats_.rollbacks;
+                PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
             }
+            PerfStatsCollector::addCounter("mtp", "decode_step_failures", 1.0, "decode",
+                                           std::string{}, {{"reason", message}});
             prefill_logits_ready_ = use_ready_logits;
             result.error = message;
             return result;
         };
 
         const int32_t condition_token = last_token_;
-        if (!use_ready_logits && !runner_->forward(&condition_token, 1))
+        if (!use_ready_logits)
         {
-            return fail_after_checkpoint("Forward pass failed during MTP condition decode");
+            bool ok = false;
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "condition_forward", "decode");
+                ok = runner_->forward(&condition_token, 1);
+            }
+            if (!ok)
+                return fail_after_checkpoint("Forward pass failed during MTP condition decode");
+        }
+        else if (use_ready_logits)
+        {
+            PerfStatsCollector::addCounter("mtp", "condition_forward_skipped_ready_logits", 1.0, "decode");
         }
 
-        int32_t first_token = runner_->sampleGreedyOnDevice();
+        int32_t first_token = -1;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "sample_first_token_device", "decode");
+            first_token = runner_->sampleGreedyOnDevice();
+        }
         if (first_token < 0)
         {
+            PerfStatsCollector::addCounter("mtp", "first_token_host_sampling_fallbacks", 1.0, "decode");
             const float *main_logits = runner_->logits();
             if (!main_logits)
             {
                 return fail_after_checkpoint("No logits available for MTP first draft token");
             }
-            first_token = sampler_.sample(
-                main_logits,
-                static_cast<size_t>(vocab),
-                active_sampling_params_);
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "sample_first_token_host", "decode");
+                first_token = sampler_.sample(
+                    main_logits,
+                    static_cast<size_t>(vocab),
+                    active_sampling_params_);
+            }
+        }
+        else
+        {
+            PerfStatsCollector::addCounter("mtp", "first_token_device_samples", 1.0, "decode");
         }
 
-        if (!runner_->forwardMTP(first_token))
+        bool sidecar_ok = false;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "sidecar_forward", "decode");
+            sidecar_ok = runner_->forwardMTP(first_token);
+        }
+        if (!sidecar_ok)
         {
             return fail_after_checkpoint("MTP sidecar forward failed");
         }
 
-        int32_t mtp_token = runner_->sampleGreedyFromMTPLogitsOnDevice();
+        int32_t mtp_token = -1;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_device", "decode");
+            mtp_token = runner_->sampleGreedyFromMTPLogitsOnDevice();
+        }
         if (mtp_token < 0)
         {
+            PerfStatsCollector::addCounter("mtp", "mtp_token_host_sampling_fallbacks", 1.0, "decode");
             const float *mtp_logits = runner_->mtpLogits();
             if (!mtp_logits)
             {
                 return fail_after_checkpoint("No MTP logits available");
             }
-            mtp_token = sampler_.sample(
-                mtp_logits,
-                static_cast<size_t>(vocab),
-                active_sampling_params_);
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_host", "decode");
+                mtp_token = sampler_.sample(
+                    mtp_logits,
+                    static_cast<size_t>(vocab),
+                    active_sampling_params_);
+            }
+        }
+        else
+        {
+            PerfStatsCollector::addCounter("mtp", "mtp_token_device_samples", 1.0, "decode");
         }
         ++mtp_stats_.draft_steps;
+        PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
 
-        if (!runner_->setComputeAllPositionLogits(true))
+        bool all_position_enabled = false;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "enable_all_position_logits", "decode");
+            all_position_enabled = runner_->setComputeAllPositionLogits(true);
+        }
+        if (!all_position_enabled)
         {
             return fail_after_checkpoint("Runner does not support all-position logits for MTP verification");
         }
 
         const std::vector<int32_t> draft_tokens = {first_token, mtp_token};
-        if (!runner_->forward(draft_tokens.data(), static_cast<int>(draft_tokens.size())))
+        bool verifier_ok = false;
         {
-            runner_->setComputeAllPositionLogits(false);
+            PerfStatsCollector::ScopedTimer timer("mtp", "verifier_forward", "decode");
+            verifier_ok = runner_->forward(draft_tokens.data(), static_cast<int>(draft_tokens.size()));
+        }
+        if (!verifier_ok)
+        {
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "disable_all_position_logits_after_verifier_failure", "decode");
+                runner_->setComputeAllPositionLogits(false);
+            }
             return fail_after_checkpoint("Forward pass failed during MTP verification");
         }
         ++mtp_stats_.verifier_runs;
         mtp_stats_.verifier_token_count += static_cast<uint64_t>(draft_tokens.size());
-        if (!runner_->setComputeAllPositionLogits(false))
+        PerfStatsCollector::addCounter("mtp", "verifier_runs", 1.0, "decode");
+        PerfStatsCollector::addCounter("mtp", "verifier_tokens", static_cast<double>(draft_tokens.size()), "decode");
+        bool all_position_disabled = false;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "disable_all_position_logits", "decode");
+            all_position_disabled = runner_->setComputeAllPositionLogits(false);
+        }
+        if (!all_position_disabled)
         {
             return fail_after_checkpoint("Failed to disable all-position logits after MTP verification");
         }
 
-        int32_t verified_next = runner_->sampleGreedyFromAllPositionLogitsOnDevice(0);
+        int32_t verified_next = -1;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_token_device", "decode");
+            verified_next = runner_->sampleGreedyFromAllPositionLogitsOnDevice(0);
+        }
         if (verified_next < 0)
         {
+            PerfStatsCollector::addCounter("mtp", "verifier_token_host_sampling_fallbacks", 1.0, "decode");
             const float *all_logits = runner_->getAllPositionLogits();
             if (!all_logits)
             {
@@ -939,10 +1026,17 @@ namespace llaminar2
             }
 
             const float *verify_row0 = all_logits;
-            verified_next = sampler_.sample(
-                verify_row0,
-                static_cast<size_t>(vocab),
-                active_sampling_params_);
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_token_host", "decode");
+                verified_next = sampler_.sample(
+                    verify_row0,
+                    static_cast<size_t>(vocab),
+                    active_sampling_params_);
+            }
+        }
+        else
+        {
+            PerfStatsCollector::addCounter("mtp", "verifier_token_device_samples", 1.0, "decode");
         }
         const bool accepted_second_draft = verified_next == mtp_token;
 
@@ -966,15 +1060,26 @@ namespace llaminar2
             }
         }
 
-        if (!runner_->restoreLivePrefixState(checkpoint))
+        bool restored = false;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "restore_live_prefix_state", "decode");
+            restored = runner_->restoreLivePrefixState(checkpoint);
+        }
+        if (!restored)
         {
             result.error = "MTP decode failed to restore live prefix checkpoint";
             return result;
         }
         ++mtp_stats_.rollbacks;
+        PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
         if (!accepted_second_draft && accepted_tokens.size() >= 2)
         {
             ++mtp_stats_.rejected_tokens;
+            PerfStatsCollector::addCounter("mtp", "rejected_tokens", 1.0, "decode");
+        }
+        else if (accepted_tokens.size() >= 2)
+        {
+            PerfStatsCollector::addCounter("mtp", "accepted_second_draft_tokens", 1.0, "decode");
         }
 
         std::vector<int32_t> replay_tokens;
@@ -987,7 +1092,13 @@ namespace llaminar2
         {
             replay_tokens.push_back(token);
         }
-        if (!runner_->forward(replay_tokens.data(), static_cast<int>(replay_tokens.size())))
+        PerfStatsCollector::addCounter("mtp", "replay_tokens", static_cast<double>(replay_tokens.size()), "decode");
+        bool replay_ok = false;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "replay_forward", "decode");
+            replay_ok = runner_->forward(replay_tokens.data(), static_cast<int>(replay_tokens.size()));
+        }
+        if (!replay_ok)
         {
             result.error = "Forward pass failed during MTP replay";
             return result;
@@ -1000,6 +1111,7 @@ namespace llaminar2
             result.tokens.push_back(token);
         }
         mtp_stats_.accepted_tokens += static_cast<uint64_t>(accepted_tokens.size());
+        PerfStatsCollector::addCounter("mtp", "accepted_tokens", static_cast<double>(accepted_tokens.size()), "decode");
         if (!accepted_tokens.empty())
         {
             last_token_ = accepted_tokens.back();

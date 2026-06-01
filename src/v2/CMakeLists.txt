@@ -1454,6 +1454,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     utils/ChatTemplate.cpp
     utils/ChatUI.cpp
     utils/ToolCallParser.cpp
+    utils/PerfStatsCollector.cpp
     utils/BenchmarkRunner.cpp
     # Collective communication infrastructure
     collective/DeviceGroup.cpp

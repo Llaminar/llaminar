@@ -26,6 +26,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/MPIContext.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../tensors/TensorFactory.h"
 #include "../../../tensors/TensorClasses.h" // For FP32Tensor::createMapped()
 #include "../../../kernels/cpu/CPUKVCache.h"
@@ -209,6 +210,20 @@ namespace llaminar2
             sync_backend("CUDA", getCUDABackend());
             sync_backend("ROCm", getROCmBackend());
             return ok;
+        }
+
+        const char *perfPhaseName()
+        {
+            switch (GraphExecutorStats::currentPhase())
+            {
+            case ExecutionPhase::PREFILL:
+                return "prefill";
+            case ExecutionPhase::DECODE:
+                return "decode";
+            case ExecutionPhase::COMBINED:
+            default:
+                return "combined";
+            }
         }
 
         GreedyLogitCandidate sampleGreedyCandidateFromTensor(
@@ -3198,6 +3213,11 @@ namespace llaminar2
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "terminal_hidden_refresh",
+            perfPhaseName(),
+            state_.device_id.toString());
         if (seq_len <= 0 || batch_size <= 0)
             return false;
         if (batch_size != 1)
@@ -3239,6 +3259,11 @@ namespace llaminar2
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "terminal_hidden_row_select",
+            perfPhaseName(),
+            state_.device_id.toString());
         if (row_idx < 0 || row_idx >= seq_len)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP hidden row selection: row="
@@ -3280,6 +3305,21 @@ namespace llaminar2
         TensorBase *terminal_hidden,
         int position_id)
     {
+        const std::string device_key = state_.device_id.toString();
+        const std::string phase = perfPhaseName();
+        PerfStatsCollector::ScopedTimer total_timer(
+            "mtp",
+            "sidecar_depth0_total",
+            phase,
+            device_key,
+            {{"depth", "0"}});
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "sidecar_depth0_calls",
+            1.0,
+            phase,
+            device_key,
+            {{"depth", "0"}});
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return false;
         if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
@@ -3293,7 +3333,16 @@ namespace llaminar2
             return false;
         }
 
-        auto bindings = makeModelWeightBindings(*frozen_weight_set_);
+        ModelWeightBindings bindings;
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "sidecar_resolve_weight_bindings",
+                phase,
+                device_key,
+                {{"depth", "0"}});
+            bindings = makeModelWeightBindings(*frozen_weight_set_);
+        }
         if (bindings.mtp.empty() || bindings.mtp.depths.empty())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar requested without MTP weight bindings");
@@ -3390,11 +3439,20 @@ namespace llaminar2
         output.moe_gate_scratch = mtp_moe_gate_scratch;
         output.moe_up_scratch = mtp_moe_up_scratch;
 
-        ComputeGraph graph = graph_builder_->buildMTPGraph(
-            0,
-            bindings.mtp.depths[0],
-            input,
-            output);
+        ComputeGraph graph;
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "sidecar_build_graph",
+                phase,
+                device_key,
+                {{"depth", "0"}});
+            graph = graph_builder_->buildMTPGraph(
+                0,
+                bindings.mtp.depths[0],
+                input,
+                output);
+        }
         if (graph.size() == 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to build MTP sidecar graph");
@@ -3405,7 +3463,17 @@ namespace llaminar2
         if (!ctx)
             return false;
 
-        return execute(graph, ctx);
+        bool ok = false;
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "sidecar_execute_graph",
+                phase,
+                device_key,
+                {{"depth", "0"}});
+            ok = execute(graph, ctx);
+        }
+        return ok;
     }
 
     bool DeviceGraphOrchestrator::populateMTPShiftedCacheFromPrefill(

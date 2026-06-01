@@ -2712,6 +2712,22 @@ add_v2_test(V2_Unit_BenchmarkRunnerCPU
     MPI_PROCS 1
 )
 
+# Test: PerfStatsCollector (unified structured perf counter export)
+add_executable(v2_test_perf_stats_collector unit/utils/Test__PerfStatsCollector.cpp)
+target_include_directories(v2_test_perf_stats_collector PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor  # For nlohmann/json.hpp
+)
+target_link_libraries(v2_test_perf_stats_collector
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PerfStatsCollector
+    COMMAND $<TARGET_FILE:v2_test_perf_stats_collector>
+    LABELS "V2;Unit;Profiling;Benchmark;JSON;CSV"
+    MPI_PROCS 1
+)
+
 # Test: ChatTemplate (chat template detection and formatting)
 add_executable(v2_test_chat_template unit/utils/Test__ChatTemplate.cpp)
 target_link_libraries(v2_test_chat_template 

@@ -38,6 +38,7 @@
 #include "../../../utils/CUDAKernelProfiler.h" // Phase propagation to worker threads
 #include "../../../utils/KVCacheProfiler.h"    // Phase propagation to worker threads
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../mpi_orchestration/RankExecutionPlan.h" // For Config::fromPlan()
 #include "../../../collective/PPActivationContract.h"  // PPActivationContract for forwardPP
 #include "fort.hpp"                                    // libfort for TP profiling summary table
@@ -2102,6 +2103,12 @@ namespace llaminar2
 
     bool RankOrchestrator::forwardMTP(int32_t draft_condition_token)
     {
+        PerfStatsCollector::ScopedTimer total_timer(
+            "mtp",
+            "rank_forward_mtp_total",
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())}});
         if (device_runners_.empty())
         {
             return false;
@@ -2109,6 +2116,12 @@ namespace llaminar2
 
         if (device_runners_.size() == 1)
         {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rank_forward_mtp_single_participant_calls",
+                1.0,
+                "decode",
+                "rank");
             return device_runners_[0] && device_runners_[0]->forwardMTP(draft_condition_token);
         }
 
@@ -2130,44 +2143,61 @@ namespace llaminar2
         auto kv_phase = KVCacheProfiler::getCurrentPhase();
         auto executor_phase = GraphExecutorStats::currentPhase();
 
-        tp_worker_pool_->dispatch(
-            [this, draft_condition_token, kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
-            {
-                KernelProfiler::setCurrentPhase(kernel_phase);
-                ROCmKernelProfiler::setCurrentPhase(rocm_phase);
-                CUDAKernelProfiler::setCurrentPhase(cuda_phase);
-                KVCacheProfiler::setCurrentPhase(kv_phase);
-                GraphExecutorStats::setCurrentPhase(executor_phase);
-
-                auto device_id = device_runners_[i]->primaryDeviceId();
-                ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
-                CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
-
-                if (debugEnv().tp_collective_contract_trace)
+        {
+            PerfStatsCollector::ScopedTimer dispatch_timer(
+                "mtp",
+                "rank_forward_mtp_dispatch",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())}});
+            tp_worker_pool_->dispatch(
+                [this, draft_condition_token, kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
                 {
-                    LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_mtp_enter"
-                              << " worker=" << i
-                              << " device=" << device_id.toString()
-                              << " token=" << draft_condition_token);
-                }
+                    KernelProfiler::setCurrentPhase(kernel_phase);
+                    ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                    CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                    KVCacheProfiler::setCurrentPhase(kv_phase);
+                    GraphExecutorStats::setCurrentPhase(executor_phase);
 
-                const bool ok = device_runners_[i] &&
-                                device_runners_[i]->forwardMTP(draft_condition_token);
+                    auto device_id = device_runners_[i]->primaryDeviceId();
+                    ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                    CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
 
-                if (debugEnv().tp_collective_contract_trace)
-                {
-                    LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_mtp_leave"
-                              << " worker=" << i
-                              << " device=" << device_id.toString()
-                              << " success=" << (ok ? 1 : 0));
-                }
-                return ok;
-            });
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_mtp_enter"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " token=" << draft_condition_token);
+                    }
+
+                    const bool ok = device_runners_[i] &&
+                                    device_runners_[i]->forwardMTP(draft_condition_token);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=forward_mtp_leave"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " success=" << (ok ? 1 : 0));
+                    }
+                    return ok;
+                });
+        }
 
         bool all_success = true;
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
-        auto results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+        std::vector<TPWorkerPool::WorkerResult> results;
+        {
+            PerfStatsCollector::ScopedTimer collect_timer(
+                "mtp",
+                "rank_forward_mtp_collect",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())}});
+            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+        }
         bool worker_timeout = false;
         for (auto &r : results)
         {

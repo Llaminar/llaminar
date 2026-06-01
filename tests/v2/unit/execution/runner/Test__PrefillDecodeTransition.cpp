@@ -30,10 +30,13 @@
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "tensors/Tensors.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../../mocks/MockModelContext.h"
 #include "../../../mocks/MockMPIContext.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <string>
@@ -45,6 +48,48 @@ using namespace testing;
 
 namespace
 {
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            setenv(name, value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
+    };
+
+    const PerfStatRecord *findPerfRecord(
+        const std::vector<PerfStatRecord> &records,
+        PerfStatRecord::Kind kind,
+        const std::string &name)
+    {
+        auto it = std::find_if(records.begin(), records.end(), [&](const auto &record)
+                               {
+                                   return record.kind == kind &&
+                                          record.domain == "mtp" &&
+                                          record.name == name;
+                               });
+        return it == records.end() ? nullptr : &*it;
+    }
 
     // =========================================================================
     // Mock IInferenceRunner
@@ -709,6 +754,48 @@ namespace
         EXPECT_EQ(probe.mtp_verifier_runs, 1u);
         EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPDecodeRecordsStructuredPerfStats)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_decode_perf_stats_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+
+            std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+            ASSERT_TRUE(runner->prefill(prompt));
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success());
+            EXPECT_EQ(mock->forwardMTPCount(), 1);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *step_calls =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "decode_step_calls");
+            ASSERT_NE(step_calls, nullptr);
+            EXPECT_DOUBLE_EQ(step_calls->value, 1.0);
+
+            const PerfStatRecord *capture_timer =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "capture_live_prefix_state");
+            ASSERT_NE(capture_timer, nullptr);
+            EXPECT_EQ(capture_timer->count, 1u);
+
+            const PerfStatRecord *sidecar_timer =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "sidecar_forward");
+            ASSERT_NE(sidecar_timer, nullptr);
+            EXPECT_EQ(sidecar_timer->count, 1u);
+
+            const PerfStatRecord *verifier_timer =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "verifier_forward");
+            ASSERT_NE(verifier_timer, nullptr);
+            EXPECT_EQ(verifier_timer->count, 1u);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSecondDecodeUsesReplayTerminalLogitsWithoutRefeedingPreviousToken)

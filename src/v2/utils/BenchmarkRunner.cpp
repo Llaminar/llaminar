@@ -12,6 +12,7 @@
 #include "KVCacheProfiler.h"
 #include "CUDAKernelProfiler.h"
 #include "ROCmKernelProfiler.h"
+#include "PerfStatsCollector.h"
 #include "WeightLoadingProfiler.h"
 #include "../execution/local_execution/graph/IGraphExecutor.h"
 
@@ -815,6 +816,7 @@ namespace llaminar2
             CUDAKernelProfiler::reset();
             ROCmKernelProfiler::reset();
         }
+        PerfStatsCollector::reset();
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 
@@ -1321,6 +1323,11 @@ namespace llaminar2
             tbl.column(1).set_cell_text_align(fort::text_align::right);
             tbl.column(2).set_cell_text_align(fort::text_align::right);
             std::print("{}", tbl.to_string());
+        }
+
+        if (!PerfStatsCollector::flushFromEnv())
+        {
+            std::print("Warning: failed to write one or more perf stats export files.\n");
         }
 
         // Status

@@ -40,3 +40,35 @@ Follow-up blockers before MTP default enablement:
 Telemetry fix landed with this benchmark slice:
 
 - Benchmark JSON now computes top-level `mtp.acceptance_rate` as `accepted_tokens / (accepted_tokens + rejected_tokens)`, matching the per-request summary and keeping the value bounded between 0 and 1 when each draft step proposes multiple tokens.
+
+## 2026-06-01 MTP Perf Stats Export Slice
+
+Command shape:
+
+```bash
+LLAMINAR_PERF_STATS_JSON=/tmp/llaminar_qwen36_dense_rocm_mtp_perf_stats_phasefix.json \
+LLAMINAR_PERF_STATS_CSV=/tmp/llaminar_qwen36_dense_rocm_mtp_perf_stats_phasefix.csv \
+LLAMINAR_PERF_STATS_FILTER=mtp \
+./build_v2_release/llaminar2 benchmark \
+  -m /opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf \
+  -d rocm:0 -n 1 --mtp \
+  --benchmark-json-output /tmp/llaminar_qwen36_dense_rocm_mtp_phasefix_benchmark.json
+```
+
+Key structured records:
+
+| Record | Phase | Count | Total ms | Avg |
+|--------|-------|-------|----------|-----|
+| `terminal_hidden_row_select` | prefill | 1782 | 4234.15 | 2376.06 us |
+| `sidecar_depth0_total` | prefill | 1782 | 1011.52 | 567.63 us |
+| `capture_live_prefix_state` | decode | 3 | 1409.12 | 469.71 ms |
+| `verifier_forward` | decode | 3 | 722.71 | 240.90 ms |
+| `replay_forward` | decode | 3 | 215.66 | 71.89 ms |
+| `restore_live_prefix_state` | decode | 3 | 167.19 | 55.73 ms |
+| `sidecar_forward` | decode | 3 | 4.36 | 1.45 ms |
+
+Conclusions:
+
+- MTP sidecar decode itself is not the decode bottleneck on this run; checkpoint capture dominates decode wall time.
+- MTP shifted-cache prefill is expensive because it performs per-token terminal hidden row selection and per-token depth-0 sidecar execution.
+- Next optimization work should target logical checkpoint capture/restore and a batched/captured shifted-cache prefill path before tuning sidecar graph execution.
