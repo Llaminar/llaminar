@@ -705,6 +705,12 @@ namespace llaminar2
             return {};
         }
 
+        virtual PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const
+        {
+            (void)seq_idx;
+            return {};
+        }
+
         virtual bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0)
         {
             (void)snapshot;

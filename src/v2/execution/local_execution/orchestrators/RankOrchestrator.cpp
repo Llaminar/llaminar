@@ -3009,6 +3009,56 @@ namespace llaminar2
         return aggregate;
     }
 
+    PrefixStateSnapshot RankOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const
+    {
+        PrefixStateSnapshot aggregate;
+        bool saw_runner = false;
+        bool have_common_tokens = false;
+        bool all_logical = true;
+        int common_tokens = 0;
+
+        auto capture_runners = [&](const std::vector<std::unique_ptr<IInferenceRunner>> &runners)
+        {
+            for (const auto &runner : runners)
+            {
+                if (!runner)
+                    continue;
+
+                saw_runner = true;
+                PrefixStateSnapshot child = runner->captureLivePrefixCheckpoint(seq_idx);
+                if (!child.valid)
+                    return false;
+
+                if (!have_common_tokens)
+                {
+                    common_tokens = child.cached_tokens;
+                    have_common_tokens = true;
+                }
+                else if (child.cached_tokens != common_tokens)
+                {
+                    return false;
+                }
+
+                all_logical = all_logical && child.logical_checkpoint;
+                aggregate.participant_snapshots.push_back(std::move(child));
+            }
+            return true;
+        };
+
+        if (!capture_runners(device_runners_) ||
+            !capture_runners(pp_stage_runners_) ||
+            !saw_runner ||
+            !have_common_tokens)
+        {
+            return {};
+        }
+
+        aggregate.valid = true;
+        aggregate.logical_checkpoint = all_logical;
+        aggregate.cached_tokens = common_tokens;
+        return aggregate;
+    }
+
     bool RankOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)
     {
         if (!snapshot.valid || snapshot.participant_snapshots.empty())

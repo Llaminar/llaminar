@@ -241,19 +241,25 @@ namespace llaminar2
         {
             if (stateBytes() == 0)
                 return true;
-            auto *dst = static_cast<float *>(dst_host ? dst_host : dst_device);
-            if (!dst || !gpu_state_)
+            if ((!dst_host && !dst_device) || !gpu_state_)
                 return false;
 
             cudaGDN_gpu_set_device(device_ordinal_);
-            if (stream)
+            if (dst_device)
             {
-                cudaGDN_gpu_memcpy_d2h_async(dst, gpu_state_, static_cast<size_t>(state_size_), stream);
-                cudaGDN_stream_synchronize(stream);
+                auto *dst = static_cast<float *>(dst_device);
+                if (stream)
+                    cudaGDN_gpu_memcpy_async(dst, gpu_state_, static_cast<size_t>(state_size_), stream);
+                else
+                    cudaGDN_gpu_memcpy(dst, gpu_state_, static_cast<size_t>(state_size_));
             }
             else
             {
-                cudaGDN_gpu_memcpy_d2h(dst, gpu_state_, static_cast<size_t>(state_size_));
+                auto *dst = static_cast<float *>(dst_host);
+                if (stream)
+                    cudaGDN_gpu_memcpy_d2h_async(dst, gpu_state_, static_cast<size_t>(state_size_), stream);
+                else
+                    cudaGDN_gpu_memcpy_d2h(dst, gpu_state_, static_cast<size_t>(state_size_));
             }
             return true;
         }
@@ -275,7 +281,6 @@ namespace llaminar2
             if (stream)
             {
                 cudaGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
-                cudaGDN_stream_synchronize(stream);
             }
             else
             {

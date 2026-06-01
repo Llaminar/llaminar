@@ -31,7 +31,9 @@ namespace llaminar2
     struct PrefixStateSnapshot
     {
         bool valid = false;
+        bool logical_checkpoint = false;
         int cached_tokens = 0;
+        std::vector<int> mtp_cached_tokens;
         std::vector<PrefixBlockHandle> blocks;
         std::vector<PrefixBlockHandle> mtp_blocks;
         std::vector<PrefixStateSnapshot> participant_snapshots;

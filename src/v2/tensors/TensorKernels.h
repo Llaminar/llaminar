@@ -2779,7 +2779,9 @@ namespace llaminar2
         /// Size of implementation-owned recurrent state, if exportable.
         virtual size_t stateBytes() const { return 0; }
 
-        /// Export implementation-owned state. CPU implementations normally return true for empty state.
+        /// Export implementation-owned state. When stream is non-null, GPU
+        /// implementations may enqueue async copies; callers must synchronize
+        /// the stream before consuming the exported payload.
         virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
         {
             (void)dst_host;
@@ -2788,7 +2790,9 @@ namespace llaminar2
             return stateBytes() == 0;
         }
 
-        /// Import implementation-owned state. CPU implementations normally return true for empty state.
+        /// Import implementation-owned state. When stream is non-null, GPU
+        /// implementations may enqueue async copies; callers must synchronize
+        /// the stream before using the imported state.
         virtual bool importState(const void *src_host, const void *src_device, void *stream)
         {
             (void)src_host;
@@ -2885,7 +2889,9 @@ namespace llaminar2
         /// Size of implementation-owned recurrent state, if exportable.
         virtual size_t stateBytes() const { return 0; }
 
-        /// Export implementation-owned state. CPU implementations normally return true for empty state.
+        /// Export implementation-owned state. When stream is non-null, GPU
+        /// implementations may enqueue async copies; callers must synchronize
+        /// the stream before consuming the exported payload.
         virtual bool exportState(void *dst_host, void *dst_device, void *stream) const
         {
             (void)dst_host;
@@ -2894,7 +2900,9 @@ namespace llaminar2
             return stateBytes() == 0;
         }
 
-        /// Import implementation-owned state. CPU implementations normally return true for empty state.
+        /// Import implementation-owned state. When stream is non-null, GPU
+        /// implementations may enqueue async copies; callers must synchronize
+        /// the stream before using the imported state.
         virtual bool importState(const void *src_host, const void *src_device, void *stream)
         {
             (void)src_host;

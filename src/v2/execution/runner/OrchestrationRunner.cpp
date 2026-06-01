@@ -858,7 +858,7 @@ namespace llaminar2
         PrefixStateSnapshot checkpoint;
         {
             PerfStatsCollector::ScopedTimer timer("mtp", "capture_live_prefix_state", "decode");
-            checkpoint = runner_->captureLivePrefixState();
+            checkpoint = runner_->captureLivePrefixCheckpoint();
         }
         if (!checkpoint.valid)
         {
@@ -866,6 +866,11 @@ namespace llaminar2
             result.error = "MTP decode could not capture live prefix state";
             return result;
         }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            checkpoint.logical_checkpoint ? "live_prefix_checkpoint_logical" : "live_prefix_checkpoint_payload",
+            1.0,
+            "decode");
 
         const bool use_ready_logits = prefill_logits_ready_;
         prefill_logits_ready_ = false;

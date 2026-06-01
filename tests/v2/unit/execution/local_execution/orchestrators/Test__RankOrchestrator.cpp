@@ -279,6 +279,19 @@ public:
         return snapshot;
     }
 
+    PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+    {
+        (void)seq_idx;
+        prefix_live_capture_calls_.fetch_add(1, std::memory_order_relaxed);
+        PrefixStateSnapshot snapshot;
+        if (!prefix_live_capture_ok_)
+            return snapshot;
+        snapshot.valid = true;
+        snapshot.logical_checkpoint = true;
+        snapshot.cached_tokens = position_;
+        return snapshot;
+    }
+
     bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override
     {
         (void)seq_idx;

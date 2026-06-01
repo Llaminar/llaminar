@@ -412,6 +412,29 @@ namespace llaminar2
             return key.token_start == 0 ? std::max(0, key.token_count - 1) : key.token_count;
         }
 
+        size_t tensorElementCountForBytes(size_t bytes)
+        {
+            return (bytes + sizeof(float) - 1) / sizeof(float);
+        }
+
+        std::shared_ptr<TensorBase> allocateDeviceByteStorage(size_t bytes,
+                                                              DeviceId device)
+        {
+            if (bytes == 0 || !device.is_gpu())
+            {
+                return nullptr;
+            }
+
+            auto tensor = std::make_shared<FP32Tensor>(
+                std::vector<size_t>{tensorElementCountForBytes(bytes)},
+                DeviceId::cpu());
+            if (!tensor->allocateOnDevice(device))
+            {
+                return nullptr;
+            }
+            return tensor;
+        }
+
         bool exportMTPPrefixPayload(const IKVCache &mtp_cache,
                                     int seq_idx,
                                     const PrefixCacheKey &key,
@@ -515,6 +538,10 @@ namespace llaminar2
 
         void *hybridPayloadDevicePtr(PrefixBlockHandle &handle)
         {
+            if (handle.device_hybrid_storage)
+            {
+                return handle.device_hybrid_storage->gpu_data_ptr();
+            }
             if (handle.layout.hybrid_device_state_bytes == 0 || !handle.hybrid_payload)
             {
                 return nullptr;
@@ -525,6 +552,10 @@ namespace llaminar2
 
         const void *hybridPayloadDevicePtr(const PrefixBlockHandle &handle)
         {
+            if (handle.device_hybrid_storage)
+            {
+                return handle.device_hybrid_storage->gpu_data_ptr();
+            }
             if (handle.layout.hybrid_device_state_bytes == 0 || !handle.hybrid_payload)
             {
                 return nullptr;
@@ -544,7 +575,9 @@ namespace llaminar2
                 return true;
             }
             const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
-            if (!hybrid || !handle->hybrid_payload)
+            if (!hybrid ||
+                (handle->layout.hybrid_host_state_bytes > 0 && !hybridPayloadHostPtr(*handle)) ||
+                (handle->layout.hybrid_device_state_bytes > 0 && !hybridPayloadDevicePtr(*handle)))
             {
                 return false;
             }
@@ -573,7 +606,9 @@ namespace llaminar2
                 return true;
             }
             auto *hybrid = dynamic_cast<IHybridKVCache *>(&cache);
-            if (!hybrid || !handle.has_hybrid_state || !handle.hybrid_payload)
+            if (!hybrid || !handle.has_hybrid_state ||
+                (handle.layout.hybrid_host_state_bytes > 0 && !hybridPayloadHostPtr(handle)) ||
+                (handle.layout.hybrid_device_state_bytes > 0 && !hybridPayloadDevicePtr(handle)))
             {
                 return false;
             }
@@ -601,6 +636,56 @@ namespace llaminar2
                     cache.clear_layer(layer);
                 }
             }
+        }
+
+        bool liveCheckpointHasHybridState(const IKVCache &cache,
+                                          DeviceId device,
+                                          int cached_tokens)
+        {
+            if (cached_tokens <= 0)
+            {
+                return false;
+            }
+
+            const PrefixPayloadLayout layout =
+                buildDensePrefixPayloadLayout(cache, device, cached_tokens);
+            return layout.includes_hybrid_state && layout.hybrid_state_bytes > 0;
+        }
+
+        bool liveCheckpointLacksHeadroom(const IKVCache &cache,
+                                         int cached_tokens,
+                                         int speculative_append_headroom)
+        {
+            if (cached_tokens < 0 || speculative_append_headroom < 0)
+            {
+                return true;
+            }
+
+            return cached_tokens + speculative_append_headroom > cache.max_seq_len();
+        }
+
+        PrefixPayloadLayout hybridOnlyCheckpointLayout(const PrefixPayloadLayout &layout)
+        {
+            PrefixPayloadLayout hybrid_layout = layout;
+            hybrid_layout.fa_layers = 0;
+            hybrid_layout.local_kv_heads = 0;
+            hybrid_layout.kv_head_start = 0;
+            hybrid_layout.head_dim = 0;
+            hybrid_layout.bytes_per_fa_layer_k = 0;
+            hybrid_layout.bytes_per_fa_layer_v = 0;
+            hybrid_layout.terminal_hidden_bytes = 0;
+            hybrid_layout.terminal_logits_bytes = 0;
+            hybrid_layout.includes_terminal_hidden = false;
+            hybrid_layout.includes_terminal_logits = false;
+            hybrid_layout.mtp_layers = 0;
+            hybrid_layout.mtp_local_kv_heads = 0;
+            hybrid_layout.mtp_kv_head_start = 0;
+            hybrid_layout.mtp_head_dim = 0;
+            hybrid_layout.bytes_per_mtp_layer_k = 0;
+            hybrid_layout.bytes_per_mtp_layer_v = 0;
+            hybrid_layout.mtp_kv_bytes = 0;
+            hybrid_layout.includes_mtp_state = false;
+            return hybrid_layout;
         }
     }
 
@@ -4841,6 +4926,149 @@ namespace llaminar2
         return snapshot;
     }
 
+    bool DeviceGraphOrchestrator::ensureLiveHybridCheckpointStorage(PrefixBlockHandle &handle) const
+    {
+        if (!handle.layout.includes_hybrid_state)
+        {
+            return true;
+        }
+
+        if (handle.layout.hybrid_host_state_bytes > 0)
+        {
+            if (!live_hybrid_checkpoint_host_storage_)
+            {
+                live_hybrid_checkpoint_host_storage_ = std::make_shared<std::vector<uint8_t>>();
+            }
+            live_hybrid_checkpoint_host_storage_->resize(handle.layout.hybrid_host_state_bytes);
+            handle.hybrid_storage = live_hybrid_checkpoint_host_storage_;
+            handle.hybrid_payload = handle.hybrid_storage->data();
+        }
+        else
+        {
+            handle.hybrid_storage.reset();
+            handle.hybrid_payload = nullptr;
+        }
+
+        if (handle.layout.hybrid_device_state_bytes > 0)
+        {
+            const bool needs_allocation =
+                !live_hybrid_checkpoint_device_storage_ ||
+                live_hybrid_checkpoint_device_ != state_.device_id ||
+                live_hybrid_checkpoint_device_bytes_ < handle.layout.hybrid_device_state_bytes;
+            if (needs_allocation)
+            {
+                live_hybrid_checkpoint_device_storage_ =
+                    allocateDeviceByteStorage(handle.layout.hybrid_device_state_bytes,
+                                              state_.device_id);
+                if (!live_hybrid_checkpoint_device_storage_)
+                {
+                    live_hybrid_checkpoint_device_bytes_ = 0;
+                    live_hybrid_checkpoint_device_ = DeviceId::invalid();
+                    return false;
+                }
+                live_hybrid_checkpoint_device_bytes_ = handle.layout.hybrid_device_state_bytes;
+                live_hybrid_checkpoint_device_ = state_.device_id;
+            }
+            handle.device_hybrid_storage = live_hybrid_checkpoint_device_storage_;
+        }
+        else
+        {
+            handle.device_hybrid_storage.reset();
+        }
+
+        return true;
+    }
+
+    PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const
+    {
+        PrefixStateSnapshot snapshot;
+        if (!state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            return snapshot;
+        }
+
+        const int cached_tokens = restorablePrefixCachedTokens(*state_.kv_cache, seq_idx);
+        if (cached_tokens < 0 || cached_tokens > state_.kv_cache->max_seq_len())
+        {
+            return snapshot;
+        }
+
+        const int draft_tokens =
+            graph_builder_ ? std::max(1, graph_builder_->config().mtp.draft_tokens) : 1;
+        const int main_headroom = draft_tokens + 2;
+        if (liveCheckpointLacksHeadroom(*state_.kv_cache, cached_tokens, main_headroom))
+        {
+            PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_payload_required", 1.0, "decode",
+                                           state_.device_id.toString(),
+                                           {{"reason", "main_cache_headroom"}});
+            return captureLivePrefixState(seq_idx);
+        }
+
+        snapshot.valid = true;
+        snapshot.logical_checkpoint = true;
+        snapshot.cached_tokens = cached_tokens;
+        snapshot.mtp_cached_tokens.assign(state_.mtp_kv_caches.size(), -1);
+
+        if (liveCheckpointHasHybridState(*state_.kv_cache, state_.device_id, cached_tokens))
+        {
+            PrefixPayloadLayout layout = buildDensePrefixPayloadLayout(
+                *state_.kv_cache,
+                state_.device_id,
+                cached_tokens);
+
+            PrefixBlockHandle handle;
+            handle.key.fingerprint = prefix_fingerprint_ != 0 ? prefix_fingerprint_ : 1;
+            handle.key.block_index = 0;
+            handle.key.token_start = 0;
+            handle.key.token_count = cached_tokens;
+            handle.layout = hybridOnlyCheckpointLayout(layout);
+            handle.total_bytes = handle.layout.totalBytes();
+            if (!ensureLiveHybridCheckpointStorage(handle))
+                return {};
+            if (!exportHybridPrefixPayload(*state_.kv_cache, seq_idx, cached_tokens, &handle))
+            {
+                return {};
+            }
+            snapshot.blocks.push_back(std::move(handle));
+            PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_hybrid_state_captures", 1.0, "decode",
+                                           state_.device_id.toString());
+        }
+
+        for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+        {
+            const auto &cache = state_.mtp_kv_caches[depth];
+            if (!cache)
+            {
+                continue;
+            }
+
+            const int mtp_cached_tokens = restorablePrefixCachedTokens(*cache, seq_idx);
+            if (mtp_cached_tokens < 0 || mtp_cached_tokens > cache->max_seq_len())
+            {
+                return {};
+            }
+            if (liveCheckpointHasHybridState(*cache, state_.device_id, mtp_cached_tokens))
+            {
+                PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_payload_required", 1.0, "decode",
+                                               state_.device_id.toString(),
+                                               {{"reason", "mtp_hybrid_state"}});
+                return captureLivePrefixState(seq_idx);
+            }
+            if (liveCheckpointLacksHeadroom(*cache, mtp_cached_tokens, draft_tokens))
+            {
+                PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_payload_required", 1.0, "decode",
+                                               state_.device_id.toString(),
+                                               {{"reason", "mtp_cache_headroom"}});
+                return captureLivePrefixState(seq_idx);
+            }
+            snapshot.mtp_cached_tokens[depth] = mtp_cached_tokens;
+        }
+
+        PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_logical_captures", 1.0, "decode",
+                                       state_.device_id.toString());
+        return snapshot;
+    }
+
     bool DeviceGraphOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)
     {
         auto fail = [](const std::string &reason) -> bool
@@ -4858,6 +5086,79 @@ namespace llaminar2
             return fail("cached token count out of range: cached_tokens=" +
                         std::to_string(snapshot.cached_tokens) +
                         " max_seq_len=" + std::to_string(state_.kv_cache->max_seq_len()));
+        }
+
+        if (snapshot.logical_checkpoint)
+        {
+            if (!snapshot.mtp_blocks.empty())
+            {
+                return fail("logical checkpoint unexpectedly contains MTP payload blocks");
+            }
+            if (snapshot.blocks.size() > 1)
+            {
+                return fail("logical checkpoint contains more than one hybrid payload block");
+            }
+            const PrefixBlockHandle *hybrid_handle = nullptr;
+            if (!snapshot.blocks.empty())
+            {
+                hybrid_handle = &snapshot.blocks.front();
+                if (!hybrid_handle->layout.includes_hybrid_state ||
+                    !hybrid_handle->has_hybrid_state ||
+                    !hybrid_handle->hybrid_payload ||
+                    hybrid_handle->key.token_start != 0 ||
+                    hybrid_handle->key.token_count != snapshot.cached_tokens)
+                {
+                    return fail("logical checkpoint hybrid payload block is invalid");
+                }
+            }
+            if (snapshot.mtp_cached_tokens.size() != state_.mtp_kv_caches.size())
+            {
+                return fail("logical checkpoint MTP cache count does not match runner state");
+            }
+            if (!state_.kv_cache->truncateSequence(seq_idx, snapshot.cached_tokens))
+            {
+                return fail("main KV logical checkpoint truncate failed for tokens=" +
+                            std::to_string(snapshot.cached_tokens));
+            }
+            if (snapshot.cached_tokens == 0)
+            {
+                resetHybridPrefixPayloadState(*state_.kv_cache);
+            }
+            else if (hybrid_handle &&
+                     !importHybridPrefixPayload(*state_.kv_cache, *hybrid_handle, seq_idx))
+            {
+                return fail("logical checkpoint hybrid payload import failed");
+            }
+
+            for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
+            {
+                auto &cache = state_.mtp_kv_caches[depth];
+                const int mtp_cached_tokens = snapshot.mtp_cached_tokens[depth];
+                if (!cache)
+                {
+                    if (mtp_cached_tokens >= 0)
+                    {
+                        return fail("logical checkpoint contains MTP tokens for a missing cache");
+                    }
+                    continue;
+                }
+                if (mtp_cached_tokens < 0 || mtp_cached_tokens > cache->max_seq_len())
+                {
+                    return fail("logical checkpoint MTP token count out of range for depth=" +
+                                std::to_string(depth) +
+                                " tokens=" + std::to_string(mtp_cached_tokens));
+                }
+                if (!cache->truncateSequence(seq_idx, mtp_cached_tokens))
+                {
+                    return fail("MTP KV logical checkpoint truncate failed for depth=" +
+                                std::to_string(depth) +
+                                " tokens=" + std::to_string(mtp_cached_tokens));
+                }
+            }
+
+            state_.positions[seq_idx] = snapshot.cached_tokens;
+            state_.sequence_lengths[seq_idx] = snapshot.cached_tokens;
+            return true;
         }
 
         state_.kv_cache->clear_sequence(seq_idx);

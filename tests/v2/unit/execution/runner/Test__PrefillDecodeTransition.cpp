@@ -338,6 +338,23 @@ namespace
             return snapshot;
         }
 
+        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+        {
+            (void)seq_idx;
+            if (use_captured_snapshot_)
+            {
+                PrefixStateSnapshot snapshot = captured_snapshot_;
+                snapshot.cached_tokens = position_;
+                return snapshot;
+            }
+            PrefixStateSnapshot snapshot;
+            snapshot.valid = mtp_enabled_;
+            snapshot.logical_checkpoint = true;
+            snapshot.cached_tokens = position_;
+            snapshot.mtp_cached_tokens = {std::max(0, position_ - 1)};
+            return snapshot;
+        }
+
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override
         {
             (void)seq_idx;
@@ -744,6 +761,7 @@ namespace
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_EQ(mock->restoreCount(), 1);
+        EXPECT_TRUE(mock->lastRestoredSnapshot().logical_checkpoint);
         EXPECT_GE(mock->setAllPositionCount(), 2);
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
@@ -783,6 +801,11 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "capture_live_prefix_state");
             ASSERT_NE(capture_timer, nullptr);
             EXPECT_EQ(capture_timer->count, 1u);
+
+            const PerfStatRecord *logical_checkpoint =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_checkpoint_logical");
+            ASSERT_NE(logical_checkpoint, nullptr);
+            EXPECT_DOUBLE_EQ(logical_checkpoint->value, 1.0);
 
             const PerfStatRecord *sidecar_timer =
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "sidecar_forward");

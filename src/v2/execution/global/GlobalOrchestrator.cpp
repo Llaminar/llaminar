@@ -546,6 +546,56 @@ namespace llaminar2
         return aggregate;
     }
 
+    PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixCheckpointAll(int seq_idx) const
+    {
+        PrefixStateSnapshot aggregate;
+        bool saw_runner = false;
+        bool have_common_tokens = false;
+        bool all_logical = true;
+        int common_tokens = 0;
+
+        auto capture_runner = [&](const IInferenceRunner &runner)
+        {
+            saw_runner = true;
+            PrefixStateSnapshot child = runner.captureLivePrefixCheckpoint(seq_idx);
+            if (!child.valid)
+                return false;
+
+            if (!have_common_tokens)
+            {
+                common_tokens = child.cached_tokens;
+                have_common_tokens = true;
+            }
+            else if (child.cached_tokens != common_tokens)
+            {
+                return false;
+            }
+
+            all_logical = all_logical && child.logical_checkpoint;
+            aggregate.participant_snapshots.push_back(std::move(child));
+            return true;
+        };
+
+        for (const auto &entry : entries_)
+        {
+            if (!capture_runner(*entry.runner))
+                return {};
+        }
+        if (compatibility_runner_ && !capture_runner(*compatibility_runner_))
+        {
+            return {};
+        }
+        if (!saw_runner || !have_common_tokens)
+        {
+            return {};
+        }
+
+        aggregate.valid = true;
+        aggregate.logical_checkpoint = all_logical;
+        aggregate.cached_tokens = common_tokens;
+        return aggregate;
+    }
+
     bool StageRunnerRegistry::restoreLivePrefixStateAll(const PrefixStateSnapshot &snapshot, int seq_idx)
     {
         if (!snapshot.valid || snapshot.participant_snapshots.empty())
@@ -1303,6 +1353,11 @@ namespace llaminar2
     PrefixStateSnapshot GlobalOrchestrator::captureLivePrefixState(int seq_idx) const
     {
         return stage_runners_.captureLivePrefixStateAll(seq_idx);
+    }
+
+    PrefixStateSnapshot GlobalOrchestrator::captureLivePrefixCheckpoint(int seq_idx) const
+    {
+        return stage_runners_.captureLivePrefixCheckpointAll(seq_idx);
     }
 
     bool GlobalOrchestrator::restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx)

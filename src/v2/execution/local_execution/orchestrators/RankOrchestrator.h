@@ -545,6 +545,7 @@ namespace llaminar2
         bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
         bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
+        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
 

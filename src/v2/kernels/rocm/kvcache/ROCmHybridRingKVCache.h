@@ -16,6 +16,7 @@
 #include "../../HybridKVCacheConfig.h"
 #include "../../IHybridKVCache.h"
 #include "../../../tensors/TensorKernels.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 
 #include <cstdint>
 #include <cstring>
@@ -477,9 +478,20 @@ namespace llaminar2
                 return false;
             }
 
+            void *effective_stream = desc.stream;
+            if (!effective_stream && this->device_id() >= 0)
+                effective_stream = GPUDeviceContextPool::instance()
+                                       .getAMDContext(this->device_id())
+                                       .defaultStream();
+
             auto *host_cursor = reinterpret_cast<uint8_t *>(dst_host);
             auto *device_cursor = reinterpret_cast<uint8_t *>(dst_device);
-            return exportHybridStatePayload(host_cursor, device_cursor, desc.stream);
+            const bool ok = exportHybridStatePayload(host_cursor, device_cursor, effective_stream);
+            if (ok && effective_stream)
+                GPUDeviceContextPool::instance()
+                    .getAMDContext(this->device_id())
+                    .synchronizeStream(effective_stream);
+            return ok;
         }
 
         bool importHybridPrefixState(
@@ -497,9 +509,20 @@ namespace llaminar2
                 return false;
             }
 
+            void *effective_stream = desc.stream;
+            if (!effective_stream && this->device_id() >= 0)
+                effective_stream = GPUDeviceContextPool::instance()
+                                       .getAMDContext(this->device_id())
+                                       .defaultStream();
+
             const auto *host_cursor = reinterpret_cast<const uint8_t *>(src_host);
             const auto *device_cursor = reinterpret_cast<const uint8_t *>(src_device);
-            return importHybridStatePayload(host_cursor, device_cursor, desc.stream);
+            const bool ok = importHybridStatePayload(host_cursor, device_cursor, effective_stream);
+            if (ok && effective_stream)
+                GPUDeviceContextPool::instance()
+                    .getAMDContext(this->device_id())
+                    .synchronizeStream(effective_stream);
+            return ok;
         }
 
         const HybridLayerMap &layerMap() const { return layer_map_; }

@@ -325,6 +325,54 @@ TEST(Test__CUDAHybridKVCacheReset, ClearLayerResetsGDNGPUKernelState)
     expectNearVector(actual_rec, fresh_rec, 1e-4f, "recurrence output after clear_layer vs fresh");
 }
 
+TEST(Test__CUDAHybridKVCacheReset, DevicePointerStateExportRoundTripRestoresGPUKernelState)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    auto cache = createHybridCache();
+    auto *state = cache.hybrid->getGDNState(0);
+    ASSERT_NE(state, nullptr);
+    ASSERT_NE(state->conv_kernel, nullptr);
+    ASSERT_NE(state->rec_kernel, nullptr);
+
+    mutateGDNState(cache.hybrid, /*layer=*/0);
+
+    const size_t conv_bytes = state->conv_kernel->stateBytes();
+    const size_t rec_bytes = state->rec_kernel->stateBytes();
+    ASSERT_GT(conv_bytes, 0u);
+    ASSERT_GT(rec_bytes, 0u);
+    ASSERT_EQ(conv_bytes % sizeof(float), 0u);
+    ASSERT_EQ(rec_bytes % sizeof(float), 0u);
+
+    std::vector<float> expected_conv(conv_bytes / sizeof(float));
+    std::vector<float> expected_rec(rec_bytes / sizeof(float));
+    ASSERT_TRUE(state->conv_kernel->exportState(expected_conv.data(), nullptr, nullptr));
+    ASSERT_TRUE(state->rec_kernel->exportState(expected_rec.data(), nullptr, nullptr));
+
+    CudaFloatBuffer d_conv_snapshot(expected_conv.size());
+    CudaFloatBuffer d_rec_snapshot(expected_rec.size());
+    cudaStream_t stream = nullptr;
+    checkCuda(cudaStreamCreate(&stream), "cudaStreamCreate");
+    ASSERT_TRUE(state->conv_kernel->exportState(nullptr, d_conv_snapshot.ptr, stream));
+    ASSERT_TRUE(state->rec_kernel->exportState(nullptr, d_rec_snapshot.ptr, stream));
+    checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize after device state export");
+
+    cache.owner->clear_layer(/*layer=*/0);
+    ASSERT_TRUE(state->conv_kernel->importState(nullptr, d_conv_snapshot.ptr, stream));
+    ASSERT_TRUE(state->rec_kernel->importState(nullptr, d_rec_snapshot.ptr, stream));
+    checkCuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize after device state import");
+    checkCuda(cudaStreamDestroy(stream), "cudaStreamDestroy");
+
+    std::vector<float> actual_conv(expected_conv.size());
+    std::vector<float> actual_rec(expected_rec.size());
+    ASSERT_TRUE(state->conv_kernel->exportState(actual_conv.data(), nullptr, nullptr));
+    ASSERT_TRUE(state->rec_kernel->exportState(actual_rec.data(), nullptr, nullptr));
+
+    expectNearVector(actual_conv, expected_conv, 1e-6f, "device-pointer short-conv state restore");
+    expectNearVector(actual_rec, expected_rec, 1e-6f, "device-pointer recurrence state restore");
+}
+
 TEST(Test__CUDAHybridKVCacheReset, HybridPrefixStateRoundTripRestoresHostAndGPUStateAndPreservesKernels)
 {
     if (!hasCUDA())

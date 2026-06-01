@@ -87,6 +87,7 @@ namespace llaminar2
     class RamPrefixStorageBackend;
     class DiskPrefixStorageBackend;
     class DeviceHotPrefixStorageBackend;
+    struct PrefixBlockHandle;
     struct ExpertReplicaSet;
     class ActivationRotation;
     enum class KVCacheLayoutMode : uint8_t;
@@ -1919,6 +1920,7 @@ namespace llaminar2
         bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
         bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
+        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
 
@@ -2198,6 +2200,10 @@ namespace llaminar2
         uint64_t prefix_fingerprint_ = 0;
         bool prefix_cache_bypassed_ = false;
         std::string prefix_cache_bypass_reason_;
+        mutable std::shared_ptr<std::vector<uint8_t>> live_hybrid_checkpoint_host_storage_;
+        mutable std::shared_ptr<TensorBase> live_hybrid_checkpoint_device_storage_;
+        mutable size_t live_hybrid_checkpoint_device_bytes_ = 0;
+        mutable DeviceId live_hybrid_checkpoint_device_ = DeviceId::invalid();
 
         bool ensurePrefixCacheReady();
         bool isPrefixCacheMoEModel() const;
@@ -2208,6 +2214,7 @@ namespace llaminar2
             int block_index,
             uint64_t parent_hash) const;
         void disablePrefixCacheForRunner(const std::string &reason);
+        bool ensureLiveHybridCheckpointStorage(PrefixBlockHandle &handle) const;
         bool initializeMTPKVCaches(
             int batch_size,
             int max_seq_len,

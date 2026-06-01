@@ -1702,6 +1702,51 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
     EXPECT_EQ(maxCachedTokens(after_second_restore.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
 }
 
+TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogicalTruncate)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+    orchestrator.setWeights(fixture.modelWeights());
+    PreparedWeightStore prepared_store;
+    ASSERT_NO_THROW(prepareDenseForwardWeights(orchestrator, *graph_builder, prepared_store, DeviceId::cpu()));
+
+    const std::vector<int> prefix_tokens = {1, 2, 3};
+    ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
+
+    PrefixStateSnapshot checkpoint = orchestrator.captureLivePrefixCheckpoint();
+    ASSERT_TRUE(checkpoint.valid);
+    EXPECT_TRUE(checkpoint.logical_checkpoint);
+    EXPECT_TRUE(checkpoint.blocks.empty());
+    EXPECT_TRUE(checkpoint.mtp_blocks.empty());
+    ASSERT_EQ(checkpoint.mtp_cached_tokens.size(), 1u);
+    EXPECT_EQ(checkpoint.cached_tokens, static_cast<int>(prefix_tokens.size()));
+    EXPECT_EQ(checkpoint.mtp_cached_tokens[0], static_cast<int>(prefix_tokens.size()) - 1);
+
+    const std::vector<int> speculative_tokens = {4, 5};
+    ASSERT_NE(orchestrator.forward(speculative_tokens.data(),
+                                   static_cast<int>(speculative_tokens.size()),
+                                   1),
+              nullptr);
+    const auto after_speculative = orchestrator.prefixStateProbe();
+    EXPECT_EQ(maxCachedTokens(after_speculative.kv_caches),
+              static_cast<int>(prefix_tokens.size() + speculative_tokens.size()));
+
+    ASSERT_TRUE(orchestrator.restoreLivePrefixState(checkpoint));
+    const auto after_restore = orchestrator.prefixStateProbe();
+    EXPECT_EQ(maxCachedTokens(after_restore.kv_caches), static_cast<int>(prefix_tokens.size()));
+    EXPECT_EQ(maxCachedTokens(after_restore.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
+    ASSERT_FALSE(after_restore.positions.empty());
+    EXPECT_EQ(after_restore.positions[0], static_cast<int>(prefix_tokens.size()));
+}
+
 TEST(Test__MTPGraphConstruction, LiveForwardExposesAllPositionLogitsOnCPU)
 {
     DeviceManager::instance().initialize(-1, false);

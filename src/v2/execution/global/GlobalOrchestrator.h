@@ -143,6 +143,7 @@ namespace llaminar2
         bool setComputeAllPositionLogitsAll(bool enabled);
         uint64_t moePlacementEpochAll() const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
+        PrefixStateSnapshot captureLivePrefixCheckpointAll(int seq_idx = 0) const;
         bool restoreLivePrefixStateAll(const PrefixStateSnapshot &snapshot, int seq_idx = 0);
         bool truncateLivePrefixStateAll(int cached_tokens, int seq_idx = 0);
         std::string mtpDecodeUnsupportedReasonAll() const;
@@ -273,6 +274,7 @@ namespace llaminar2
         int sampleGreedyFromMTPLogitsOnDevice() override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
+        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
 
