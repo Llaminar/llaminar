@@ -258,4 +258,24 @@ namespace llaminar2::test
                         .ok());
     }
 
+    TEST(Test__MoEExpertParallelPlanner, NoFallbackTierCapacityMustCoverEveryExpert)
+    {
+        auto plan = twoTierRocmCpuPlan();
+        plan.routed_tiers.pop_back();
+        plan.routed_tiers[0].max_experts_per_layer = 5;
+
+        try
+        {
+            (void)MoEExpertParallelPlanner::plan(plan, metadata());
+            FAIL() << "Expected no-fallback capacity validation to throw";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            const std::string message = error.what();
+            EXPECT_NE(
+                message.find("no-fallback routed tier capacity cannot cover every expert"),
+                std::string::npos);
+        }
+    }
+
 } // namespace llaminar2::test

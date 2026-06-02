@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Qwen36DenseParityTestBase.h"
+#include "backends/BackendManager.h"
 #include "backends/HardwareInventory.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
 
@@ -13,6 +14,7 @@ namespace llaminar2::test::parity::qwen36
     enum class MoEPrefixParityTopology
     {
         SingleDevice,
+        ExpertOverlayRocm2TPHotOnly,
         ExpertOverlayRocm2TPHotCpu2LocalTPCold,
     };
 
@@ -37,6 +39,18 @@ namespace llaminar2::test::parity::qwen36
     inline size_t gib(size_t value)
     {
         return value * 1024ull * 1024ull * 1024ull;
+    }
+
+    inline size_t mib(size_t value)
+    {
+        return value * 1024ull * 1024ull;
+    }
+
+    inline std::string formatMiBForSkip(size_t bytes)
+    {
+        std::ostringstream oss;
+        oss << (bytes / mib(1)) << " MiB";
+        return oss.str();
     }
 
     inline std::chrono::steady_clock::time_point parityPhaseStart()
@@ -113,6 +127,28 @@ namespace llaminar2::test::parity::qwen36
         plan->routed_tiers = {
             routedTier("hot", kRocmHotDomain, 0, 240, gib(4)),
             routedTier("cold", kCpuColdDomain, 1, 0, 0, true),
+        };
+        return plan;
+    }
+
+    inline std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayPlanRocm2TPHotOnly()
+    {
+        constexpr const char *kRocmHotDomain = "qwen36_moe_rocm_hot";
+
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->continuation_domain = kRocmHotDomain;
+        plan->shared_expert_domain = kRocmHotDomain;
+        plan->domains = {
+            localTPMoEDomain(
+                kRocmHotDomain,
+                CollectiveBackendType::RCCL,
+                {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)}),
+        };
+        plan->routed_tiers = {
+            routedTier("hot", kRocmHotDomain, 0, 256, gib(8)),
         };
         return plan;
     }
@@ -227,6 +263,65 @@ namespace llaminar2::test::parity::qwen36
             }
         }
 
+        if (test_case.topology == MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly)
+        {
+            IBackend *rocm = getROCmBackend();
+            if (!rocm)
+            {
+                return test_case.name + " requires ROCm backend memory queries";
+            }
+
+            // This fixture is the real Qwen3.6 35B MoE IQ3_S hot-only overlay.
+            // On 32 GiB ROCm cards the base graph setup leaves only ~8.7 GiB
+            // free for the all-256-expert hot tier, just below the runner's
+            // resident-weight preflight requirement plus safety margin. Keep
+            // this as a test prerequisite; the runtime path still hard-fails
+            // if a user asks for an infeasible plan directly.
+            constexpr size_t kMinimumRocmHotOnlyTotalBytes = 40ull * 1024ull * 1024ull * 1024ull;
+            constexpr size_t kQwen36MoEHotOnlyResidentBytes = 7386ull * 1024ull * 1024ull;
+            for (const auto &device : test_case.devices)
+            {
+                if (!device.isROCm())
+                {
+                    continue;
+                }
+
+                const size_t total = rocm->deviceMemoryTotal(device.device_ordinal);
+                const size_t free = rocm->deviceMemoryFree(device.device_ordinal);
+                if (total == 0 || free == 0)
+                {
+                    return test_case.name + " cannot query ROCm VRAM for " +
+                           device.toShortString();
+                }
+
+                if (total < kMinimumRocmHotOnlyTotalBytes)
+                {
+                    std::ostringstream oss;
+                    oss << test_case.name << " requires ROCm participants with at least "
+                        << formatMiBForSkip(kMinimumRocmHotOnlyTotalBytes)
+                        << " total VRAM for the no-fallback hot-only resident expert plan"
+                        << " (" << device.toShortString()
+                        << " total=" << formatMiBForSkip(total) << ")";
+                    return oss.str();
+                }
+
+                const size_t safety_margin = std::max(mib(512), total / size_t{20});
+                const size_t required = kQwen36MoEHotOnlyResidentBytes + safety_margin;
+                if (required > free)
+                {
+                    std::ostringstream oss;
+                    oss << test_case.name << " requires "
+                        << formatMiBForSkip(required)
+                        << " free on " << device.toShortString()
+                        << " for the no-fallback hot-only resident expert plan"
+                        << " (free=" << formatMiBForSkip(free)
+                        << ", safety_margin=" << formatMiBForSkip(safety_margin)
+                        << ")";
+                    return oss.str();
+                }
+            }
+        }
+
         return std::nullopt;
     }
 
@@ -263,6 +358,7 @@ namespace llaminar2::test::parity::qwen36
                                               ? GlobalDeviceAddress::cpu()
                                               : test_case.devices.front();
             break;
+        case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly:
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold:
             config.tp_degree = 1;
             config.pp_degree = 1;
@@ -300,6 +396,15 @@ namespace llaminar2::test::parity::qwen36
         case MoEPrefixParityTopology::SingleDevice:
             test_case.devices = {GlobalDeviceAddress::rocm(0)};
             test_case.required_rocm_devices = 1;
+            break;
+        case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly:
+            test_case.devices = {
+                GlobalDeviceAddress::rocm(0),
+                GlobalDeviceAddress::rocm(1),
+            };
+            test_case.required_rocm_devices = 2;
+            test_case.moe_expert_parallel_plan =
+                qwen36MoEOverlayPlanRocm2TPHotOnly();
             break;
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold:
             test_case.devices = {
@@ -352,6 +457,12 @@ namespace llaminar2::test::parity::qwen36
             pytorch_decode_tokens.begin() + test_case.decode_steps);
     }
 
+    inline bool moeReferenceInputsStoppedCurrentTest()
+    {
+        return ::testing::Test::IsSkipped() ||
+               ::testing::Test::HasFatalFailure();
+    }
+
     inline void runMoEPrefixRestoreParity(
         const MoEPrefixRestoreParityCase &test_case,
         PrefixRestoreParityMode mode)
@@ -361,6 +472,10 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> expected_tokens;
         auto phase_start = parityPhaseStart();
         loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
         logMoEParityPhase(test_case, "reference-inputs", phase_start);
 
         const int block_size = mode == PrefixRestoreParityMode::FullHit
@@ -458,6 +573,10 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> expected_tokens;
         auto phase_start = parityPhaseStart();
         loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
         logMoEParityPhase(test_case, "reference-inputs", phase_start);
 
         const int block_size = enable_prefix_cache
@@ -589,6 +708,10 @@ namespace llaminar2::test::parity::qwen36
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
         loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
         ASSERT_GE(expected_tokens.size(), 2u);
 
         auto factory = createOrchestrationRunnerFactory();

@@ -336,6 +336,20 @@ Latest LocalPP ROCm dense evidence:
 
 Latest Expert overlay 2x ROCm MoE evidence:
 
+- Parity-suite coverage:
+  `V2_Integration_Parity_Qwen36MoE_ExpertOverlay` now registers
+  `MTPGreedyMatchesBaselineTokens_ROCm2TPHotOnly` and
+  `PrefixCacheMTPRestore_ROCm2TPHotOnly`. On the current 32 GB ROCm cards these
+  report an explicit prerequisite skip rather than failing late: the no-fallback
+  hot-only plan covers all 256 routed experts and needs the resident expert
+  payload plus the runner's 5% VRAM safety margin on each ROCm participant.
+  The parity harness requires at least 40 GiB total VRAM per ROCm participant
+  for this hot-only fixture because the 32 GiB cards repeatedly fail the real
+  runner preflight after graph/model setup with only 8912/8994 MiB free.
+  The no-fallback planner coverage hard-fail is pinned by
+  `V2_Unit_MoEExpertParallelPlanner`. Focused CTest passed on 2026-06-02 for
+  `V2_Integration_Parity_Qwen36MoE_ExpertOverlay_.*ROCm2TPHotOnly$`; both
+  hot-only tests completed through the prerequisite path in about 1.3s each.
 - Config and harness coverage:
   `configs/moe_overlay/rocm2_replicated_static.yaml` is a one-rank LocalTP
   `ReplicatedExperts` overlay domain over `rocm:0,rocm:1`, with all 256
@@ -363,6 +377,13 @@ Latest Expert overlay 2x ROCm MoE evidence:
 
 Latest Expert overlay 2x ROCm plus 2x CPU MoE evidence:
 
+- Correctness parity note:
+  `V2_Integration_Parity_Qwen36MoE_ExpertOverlay` passed on 2026-06-02 for
+  both `MTPGreedyMatchesBaselineTokens_ROCm2TPHot_CPU2LocalTPCold` and
+  `PrefixCacheMTPRestore_ROCm2TPHot_CPU2LocalTPCold`. That parity case uses the
+  normal in-process ExpertOverlay plan from the Qwen3.6 parity harness. The
+  blocked artifacts below are still valid for the separate benchmark CLI/config
+  path and remain Phase 14 blockers, not Phase 12 correctness blockers.
 - Config and harness coverage:
   `configs/moe_overlay/rocm2_cpu2_replicated_static.yaml` is a two-rank
   heterogeneous overlay config. Rank 0 owns a LocalTP `ReplicatedExperts`

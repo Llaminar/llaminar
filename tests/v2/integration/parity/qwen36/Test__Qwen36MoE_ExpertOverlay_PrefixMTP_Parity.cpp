@@ -17,6 +17,23 @@ namespace
             "Qwen3.6 MoE ExpertOverlay ROCm2TP hot + CPU2LocalTP cold parity",
             MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold);
     }
+
+    MoEPrefixRestoreParityCase rocmOnlyExpertOverlayCase()
+    {
+        return qwen36MoEPrefixParityCase(
+            "Qwen3.6 MoE ExpertOverlay ROCm2TP hot-only parity",
+            MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly);
+    }
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPHotOnly)
+{
+    runMoEMTPParity(rocmOnlyExpertOverlayCase(), false);
+}
+
+TEST(Qwen36MoEExpertOverlayPrefixMTPParity, PrefixCacheMTPRestore_ROCm2TPHotOnly)
+{
+    runMoEMTPParity(rocmOnlyExpertOverlayCase(), true);
 }
 
 TEST(Qwen36MoEExpertOverlayPrefixMTPParity, MTPGreedyMatchesBaselineTokens_ROCm2TPHot_CPU2LocalTPCold)
