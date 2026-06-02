@@ -603,6 +603,22 @@ Latest ROCm dense evidence:
     from 95.90 ms to 91.65 ms total. This is a stable verifier win, but the
     remaining `main_verifier` replay is still dominated by GDN projection,
     ordinary GEMM, and fused Gate/Up buckets.
+  - Graph-enabled native-VNNI split-reduce hardening:
+    `/tmp/llaminar-mtp-bench/dense-rocm-graphdirect-mtp-c64-n8-bench.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-graphdirect-mtp-c64-n8-stats.json`,
+    and `/tmp/llaminar-mtp-bench/dense-rocm-graphdirect-mtp-c64-n8-stats.csv`.
+    A real Qwen3.6 dense ROCm default run with `LLAMINAR_GPU_GRAPHS=1`,
+    `The quick brown fox`, `-c 64`, `-n 8`, depth-1 MTP, and no
+    `LLAMINAR_ROCM_NVNNI_GEMV_KB` override completed warmup and decode after
+    the small-M launcher forced graph-enabled `M=2/3/4` native-VNNI routes to
+    direct `kb=1`. Structured `kernel.rocm_native_vnni_small_m_launch` counters
+    report 0 split-reduce launches; all single and batched `M=2`/`M=4`
+    launches used `path=direct`, `kb=1`. The safety tradeoff is visible:
+    decode was 16.95 tok/s with 75% acceptance and `mtp.verifier_forward`
+    averaged about 86.87 ms/call, so this is correctness/hardening evidence,
+    not a speedup result. Next ROCm work should make split-reduce or an
+    equivalent graph-capturable reduction real-model-safe instead of relying on
+    direct `kb=1`.
   - Focused verifier replay follow-up:
     `/tmp/llaminar-mtp-bench/dense-rocm-gdn-fp32-alpha-beta-batched-mtp-c64-n8.log`,
     `/tmp/llaminar-mtp-bench/dense-rocm-mtp-c64-n8-nvnni-kb{1,2,4,8}.csv`,

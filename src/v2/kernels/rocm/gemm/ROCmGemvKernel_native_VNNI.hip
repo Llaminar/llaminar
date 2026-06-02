@@ -3472,8 +3472,25 @@ bool rocmLaunch_native_vnni_small_m_fp32(
             if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
         }
     }
+    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
+    if (graph_capture_enabled)
+    {
+        // Real Qwen3.6 ROCm graph warmup can fault on small-M split-reduce
+        // replay even though isolated synthetic captures pass. Keep graph
+        // execution on the direct launcher until split-reduce is proven safe
+        // under full-model graph replay.
+        kb = 1;
+    }
     if (kb_override > 0)
     {
+        if (kb_override > 1 && kb_override != kb)
+        {
+            fprintf(stderr,
+                    "[rocmGemv_native_vnni_small_m_fp32] forced kb=%d differs from graph-safe auto kb=%d; "
+                    "refusing split-K override for small-M verifier route (M=%d N=%d K=%d)\n",
+                    kb_override, kb, SMALL_M, N, K);
+            return false;
+        }
         kb = min(kb_override, KB_CAP);
         if (kb > blocks_per_row) kb = blocks_per_row;
     }
@@ -3618,8 +3635,24 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
             if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
         }
     }
+    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
+    if (graph_capture_enabled)
+    {
+        // Match the single-projection policy: small-M split-reduce remains a
+        // real-model graph replay hazard, so use the direct batched launcher
+        // while GPU graph replay is enabled.
+        kb = 1;
+    }
     if (kb_override > 0)
     {
+        if (kb_override > 1 && kb_override != kb)
+        {
+            fprintf(stderr,
+                    "[rocmGemv_native_vnni_small_m_batched_fp32] forced kb=%d differs from graph-safe auto kb=%d; "
+                    "refusing split-K override for batched small-M verifier route (M=%d K=%d projections=%d)\n",
+                    kb_override, kb, SMALL_M, K, num_projections);
+            return false;
+        }
         kb = min(kb_override, KB_CAP);
         if (kb > blocks_per_row) kb = blocks_per_row;
     }

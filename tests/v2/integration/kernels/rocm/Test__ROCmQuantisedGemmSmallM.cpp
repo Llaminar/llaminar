@@ -1166,7 +1166,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
         true,
         4);
 
-    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
     auto route_record = std::find_if(
         records.begin(),
         records.end(),
@@ -1190,6 +1190,42 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     EXPECT_GE(route_record->value, 1.0);
     EXPECT_EQ(route_record->device, "rocm:0");
     EXPECT_EQ(route_record->tags.at("codebook"), "5");
+
+    double graph_direct_launches = 0.0;
+    double graph_split_reduce_launches = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain != "kernel" ||
+            record.name != "rocm_native_vnni_small_m_launch" ||
+            record.kind != PerfStatRecord::Kind::Counter ||
+            record.tags.count("m") == 0 ||
+            record.tags.at("m") != "2" ||
+            record.tags.count("n") == 0 ||
+            record.tags.at("n") != "5120" ||
+            record.tags.count("k") == 0 ||
+            record.tags.at("k") != "17408")
+        {
+            continue;
+        }
+
+        if (record.tags.count("path") != 0 &&
+            record.tags.at("path") == "direct" &&
+            record.tags.count("kb") != 0 &&
+            record.tags.at("kb") == "1")
+        {
+            graph_direct_launches += record.value;
+        }
+        if (record.tags.count("path") != 0 &&
+            record.tags.at("path") == "split_reduce")
+        {
+            graph_split_reduce_launches += record.value;
+        }
+    }
+
+    EXPECT_GE(graph_direct_launches, 1.0)
+        << "GPU-graph Qwen3.6 small-M FFN down must use the direct native-VNNI route";
+    EXPECT_EQ(graph_split_reduce_launches, 0.0)
+        << "GPU-graph small-M split-reduce has caused real-model ROCm HSA faults";
 
     PerfStatsCollector::reset();
 }
@@ -1915,6 +1951,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
     double heterogeneous_n_bypasses = 0.0;
     double shared_quant_calls = 0.0;
     double batched_projection_calls = 0.0;
+    double graph_direct_launches = 0.0;
+    double graph_split_reduce_launches = 0.0;
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
@@ -1961,6 +1999,31 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
         {
             batched_projection_calls += record.value;
         }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_launch" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("batched") != 0 &&
+            record.tags.at("batched") == "true" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            if (record.tags.count("path") != 0 &&
+                record.tags.at("path") == "direct" &&
+                record.tags.count("kb") != 0 &&
+                record.tags.at("kb") == "1")
+            {
+                graph_direct_launches += record.value;
+            }
+            if (record.tags.count("path") != 0 &&
+                record.tags.at("path") == "split_reduce")
+            {
+                graph_split_reduce_launches += record.value;
+            }
+        }
     }
 
     EXPECT_GE(batched_calls, 1.0)
@@ -1971,6 +2034,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
         << "The batched qkv/z subgroup should quantize activations once";
     EXPECT_GE(batched_projection_calls, 2.0)
         << "The batched qkv/z subgroup should cover both heterogeneous-N projection payloads";
+    EXPECT_GE(graph_direct_launches, 1.0)
+        << "GPU-graph Qwen3.6 batched GDN qkv/z small-M route must use direct native-VNNI launch";
+    EXPECT_EQ(graph_split_reduce_launches, 0.0)
+        << "GPU-graph batched small-M split-reduce has caused real-model ROCm HSA faults";
 
     PerfStatsCollector::reset();
 }
@@ -2044,6 +2111,67 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
     PerfStatsCollector::reset();
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM4MatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    std::vector<WeightCreator> creators = {
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); }};
+
+    runMixedProjectionGroupSmallMMatchesSeparate(
+        "mixed Q5_K/Q4_K native-VNNI Qwen3.6 GDN qkv/z heterogeneous-N pair",
+        4,
+        5120,
+        creators,
+        0.9999f,
+        {10240, 6144},
+        true,
+        4);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    double mixed_bypasses = 0.0;
+    double batched_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_bypasses" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("reason") != 0 &&
+            record.tags.at("reason") == "mixed_codebook" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2" &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "4")
+        {
+            mixed_bypasses += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "4" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            batched_calls += record.value;
+        }
+    }
+
+    EXPECT_GE(mixed_bypasses, 1.0)
+        << "Mixed-codebook Qwen3.6 qkv/z M=4 must take the explicit per-projection route";
+    EXPECT_EQ(batched_calls, 0.0)
+        << "Mixed-codebook Qwen3.6 qkv/z M=4 must not enter the batched route";
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KGDNProjectionM2RejectsUnsafeKBOverride)
 {
     if (!hasROCmDevice())
@@ -2103,4 +2231,40 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KGDNProjectionM2RejectsUnsafeKBOverri
 
     for (auto &kernel : kernels)
         kernel->unbindWorkspace();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, SingleProjectionQ4KFFNDownM2RejectsUnsafeKBOverride)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv force_unsafe_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "2");
+
+    constexpr int M = 2;
+    constexpr int K = 17408;
+    constexpr int N = 5120;
+
+    auto weights = TestTensorFactory::createQ4_KRandom({N, K}, 909);
+    ROCmPackedWeights packed;
+    ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+    expectPackedPath(packed, PackedPath::NativeVNNI);
+
+    ROCmQuantisedGemmKernel kernel(&packed, 0);
+    auto workspace = bindWorkspace(kernel, M, N, K);
+    ASSERT_NE(workspace, nullptr);
+
+    auto input = TestTensorFactory::createFP32Random({M, K});
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+
+    auto output = TestTensorFactory::createFP32({M, N});
+    ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+    EXPECT_FALSE(kernel.multiply_tensor(input.get(), output.get(), M, N, K))
+        << "Forced split-K overrides that diverge from the graph-safe auto KB must hard-fail "
+           "before launching small-M verifier GEMV";
+
+#ifdef HAVE_ROCM
+    EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
+#endif
+    kernel.unbindWorkspace();
 }
