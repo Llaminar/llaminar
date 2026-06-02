@@ -3180,44 +3180,6 @@ namespace llaminar2
                 return false;
             }
 
-            if (m > 1 && m <= 2)
-            {
-                LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M fused verifier path M="
-                          << m << " projections=" << projections.size());
-                for (const auto &proj : projections)
-                {
-                    if (!proj.kernel || !proj.output)
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M projection has null kernel or output");
-                        return false;
-                    }
-
-                    proj.kernel->setGPUStream(gpu_stream_);
-                    if (!proj.kernel->multiply_tensor(
-                            input,
-                            proj.output,
-                            m,
-                            proj.n,
-                            k,
-                            true,
-                            1.0f,
-                            0.0f,
-                            proj.bias,
-                            mpi_ctx,
-                            -1,
-                            ws))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M projection failed for "
-                                  << (proj.name ? proj.name : "unnamed"));
-                        return false;
-                    }
-                }
-
-                if (ws && ws != saved_workspace)
-                    workspace_ = saved_workspace;
-                return true;
-            }
-
             // Step 2: Validate and populate workspace pointers (shared across all projections)
             validateWorkspace();
 
@@ -3269,6 +3231,19 @@ namespace llaminar2
                 }
 
                 fused_uses_blockwise_shared_quant = all_projections_have_vnni_weights;
+
+                if (m == 2 && projections.size() >= 2 && PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "rocm_fused_m2_shared_quant_calls",
+                        1.0,
+                        "gemm",
+                        "rocm:" + std::to_string(rocm_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"k", std::to_string(k)},
+                            {"projections", std::to_string(projections.size())}});
+                }
             }
 
             // Step 5: Execute projections using the SHARED quantized activations
@@ -3320,7 +3295,7 @@ namespace llaminar2
             //      main stream waits on all completion events
             // =========================================================================
 #ifdef HAVE_ROCM
-            if (m > 1 && projections.size() >= 2 &&
+            if (m > 2 && projections.size() >= 2 &&
                 fused_uses_blockwise_shared_quant &&
                 debugEnv().rocm.concurrent_prefill)
             {
@@ -3983,6 +3958,111 @@ namespace llaminar2
                 const bool output_is_mapped = fp32_output->isMapped();
                 const bool output_needs_copyout = output_is_mapped;
                 float *d_prefill_output = output_needs_copyout ? impl_->d_C_fp32 : d_output;
+
+                const bool supports_native_m2_q4 =
+                    native_vnni_fused &&
+                    (rocm_kernel->impl_->native_vnni_codebook_id == 0 ||
+                     rocm_kernel->impl_->native_vnni_codebook_id == 5);
+                if (m == 2 && supports_native_m2_q4)
+                {
+                    if ((k % 32) != 0)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused M=2 Q4 verifier requires K multiple of 32, got K="
+                                  << k);
+                        all_success = false;
+                        break;
+                    }
+                    if (!impl_->d_A_int8 || !impl_->d_scales_A_blockwise ||
+                        !rocm_kernel->impl_->d_weights_native_vnni ||
+                        !rocm_kernel->impl_->d_weights_native_scales ||
+                        !rocm_kernel->impl_->d_scatter_partial)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused M=2 Q4 verifier missing graph-native buffers"
+                                  << " A=" << static_cast<const void *>(impl_->d_A_int8)
+                                  << " scale_A_blockwise=" << static_cast<const void *>(impl_->d_scales_A_blockwise)
+                                  << " weights=" << static_cast<const void *>(rocm_kernel->impl_->d_weights_native_vnni)
+                                  << " scales=" << static_cast<const void *>(rocm_kernel->impl_->d_weights_native_scales)
+                                  << " partial=" << static_cast<const void *>(rocm_kernel->impl_->d_scatter_partial));
+                        all_success = false;
+                        break;
+                    }
+
+                    if (!rocmGemv_native_vnni_q4_m2_fp32(
+                            impl_->d_A_int8,
+                            rocm_kernel->impl_->d_weights_native_vnni,
+                            rocm_kernel->impl_->d_weights_native_scales,
+                            rocm_kernel->impl_->d_weights_native_mins,
+                            d_prefill_output,
+                            impl_->d_scales_A_blockwise,
+                            rocm_kernel->impl_->d_scatter_partial,
+                            n, k,
+                            rocm_kernel->impl_->native_vnni_codebook_id,
+                            rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused M=2 Q4 verifier GEMV failed for projection "
+                                  << i);
+                        all_success = false;
+                        break;
+                    }
+
+                    if (d_bias)
+                    {
+                        if (!rocmQuantGemm_applyFp32Epilogue(
+                                d_prefill_output,
+                                d_bias,
+                                m,
+                                n,
+                                1.0f,
+                                rocm_device_id_,
+                                gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused M=2 Q4 epilogue failed for projection "
+                                      << i);
+                            all_success = false;
+                            break;
+                        }
+                    }
+
+                    if (output_needs_copyout)
+                    {
+                        const size_t output_bytes = static_cast<size_t>(m) * n * sizeof(float);
+                        if (output_is_mapped)
+                        {
+                            float *host_dst = fp32_output->mutable_data();
+                            hipMemcpyAsync(host_dst, d_prefill_output,
+                                           output_bytes,
+                                           hipMemcpyDeviceToHost,
+                                           static_cast<hipStream_t>(gpu_stream_));
+                            hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                        }
+                        else
+                        {
+                            hipMemcpyAsync(d_output, d_prefill_output,
+                                           output_bytes,
+                                           hipMemcpyDeviceToDevice,
+                                           static_cast<hipStream_t>(gpu_stream_));
+                        }
+                    }
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_native_vnni_m2_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"codebook", std::to_string(static_cast<int>(rocm_kernel->impl_->native_vnni_codebook_id))},
+                                {"n", std::to_string(n)},
+                                {"k", std::to_string(k)},
+                                {"shared_quant", "true"}});
+                    }
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                                                                             << " fused native M=2 Q4 verifier complete");
+                    continue;
+                }
 
                 if (rocm_kernel->tryPrefillNativeGemm(
                         impl_->d_A_int8,

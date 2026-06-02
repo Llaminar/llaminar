@@ -508,3 +508,58 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2MatchesSeparate)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f);
 }
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2RecordsSharedQuantizedNativeRoute)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const int K = 1024;
+    runFusedQKVM2MatchesSeparate(
+        "Q4_K native-VNNI shared quant counter",
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.9999f);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    auto shared_quant_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [K](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_fused_m2_shared_quant_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.count("projections") != 0 &&
+                   record.tags.at("projections") == "3";
+        });
+
+    ASSERT_NE(shared_quant_record, records.end())
+        << "Fused Q4_K M=2 QKV must quantize activations once before projection dispatch";
+    EXPECT_GE(shared_quant_record->value, 1.0);
+    EXPECT_EQ(shared_quant_record->device, "rocm:0");
+
+    double shared_native_projection_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_m2_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("shared_quant") != 0 &&
+            record.tags.at("shared_quant") == "true")
+        {
+            shared_native_projection_calls += record.value;
+        }
+    }
+    EXPECT_GE(shared_native_projection_calls, 3.0)
+        << "Fused QKV M=2 should dispatch Q, K, and V through the shared-quant native route";
+
+    PerfStatsCollector::reset();
+}
