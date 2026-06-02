@@ -1170,10 +1170,23 @@ Latest ROCm dense evidence:
     replay-prefix forward. The real Qwen3.6 ROCm chained graph smoke passed in
     16.27 s after adding an env-selectable single-device ROCm ordinal
     (`LLAMINAR_QWEN36_ROCM_DEVICE` or `LLAMINAR_TEST_ROCM_DEVICE`) for these
-    smokes. Fresh long-lane speed evidence is still pending; the next ROCm
-    SingleDevice sprint target is to rerun the `-c 64`, `-n 48` ratchet and
-    then attack the remaining captured verifier GPU work and MTP per-step
-    overhead.
+    smokes. Fresh same-binary long-lane evidence on idle `rocm:1`, GPU graphs
+    enabled, `The quick brown fox`, `-c 64`, `-n 48`: baseline
+    `/tmp/llaminar-mtp-bench/dense-rocm-verifierrow-baseline-c64-n48-rocm1-bench.json`
+    at 20.65 decode tok/s; depth-1 MTP
+    `/tmp/llaminar-mtp-bench/dense-rocm-verifierrow-mtp-d1-c64-n48-rocm1-bench.json`
+    at 32.83 decode tok/s, 95.83% acceptance, 92 accepted tokens,
+    4 rejected tokens, and 4 rollbacks. Structured stats:
+    `/tmp/llaminar-mtp-bench/dense-rocm-verifierrow-mtp-d1-c64-n48-rocm1-stats.json`
+    and `/tmp/llaminar-mtp-bench/dense-rocm-verifierrow-mtp-d1-c64-n48-rocm1-stats.csv`.
+    This preserves the 1.59x speedup ratchet rather than setting a new best.
+    Measured stats recorded three `rollback_verifier_state_row_shortcuts`,
+    three `verifier_state_row_restores` across 48 GDN layers, and three
+    `live_prefix_replay_state_preserved{operation=restore_mtp_verifier_state_row}`
+    events. `restore_verifier_state_row` averaged about 317 us, while the
+    captured two-token `verifier_forward` still averaged about 52.97 ms/call,
+    so the next ROCm SingleDevice sprint target remains the captured verifier
+    GPU work and MTP per-step overhead.
 
 Latest CUDA dense evidence:
 
