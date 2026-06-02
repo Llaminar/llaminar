@@ -1509,7 +1509,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
     EXPECT_GE(mtp_snapshot.mtp_accepted_tokens + mtp_snapshot.mtp_rejected_tokens, 2u);
 }
 
-TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsHardFailsBeforeDecode)
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsRealModelSmoke)
 {
     ScopedDebugEnv env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -1531,7 +1531,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsHardFailsBeforeDecode)
     dm.initialize(-1, false);
     if (dm.rocm_device_count() <= 0)
     {
-        GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP graph hard-fail smoke";
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP GPU-graphs smoke";
     }
 
     OrchestrationConfig config = OrchestrationConfig::defaults();
@@ -1558,16 +1558,17 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsHardFailsBeforeDecode)
 
     SamplingParams greedy;
     greedy.temperature = 0.0f;
-    auto result = runner->generate(prompt, 1, greedy);
+    auto result = runner->generate(prompt, 2, greedy);
     const auto snapshot = runner->prefixStateProbe();
     runner->shutdown();
 
-    ASSERT_FALSE(result.error.empty());
-    EXPECT_NE(result.error.find("LLAMINAR_GPU_GRAPHS=1"), std::string::npos)
-        << result.error;
-    EXPECT_EQ(snapshot.mtp_draft_steps, 0u);
-    EXPECT_EQ(snapshot.mtp_verifier_runs, 0u);
-    EXPECT_EQ(snapshot.mtp_rollbacks, 0u);
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    ASSERT_FALSE(result.tokens.empty());
+    EXPECT_TRUE(snapshot.mtp_config_enabled);
+    EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
+    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
+    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
+    EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)

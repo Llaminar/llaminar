@@ -824,13 +824,10 @@ namespace llaminar2
             return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_DECODE; use LLAMINAR_ROCM_CONCURRENT_M2_ROWS for M=2 verifier experiments";
         }
         if (runner_->primaryDeviceId().is_rocm() &&
-            debugEnv().execution.gpu_graphs)
+            debugEnv().execution.gpu_graphs &&
+            debugEnv().rocm.concurrent_m2_rows)
         {
-            if (debugEnv().rocm.concurrent_m2_rows)
-            {
-                return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_M2_ROWS when LLAMINAR_GPU_GRAPHS=1; M=2 row-overlap launches side streams that are not graph-capture safe";
-            }
-            return "ROCm MTP decode is incompatible with LLAMINAR_GPU_GRAPHS=1; ROCm MTP sidecar/verifier graph capture can fault during warmup and is disabled until the path is graph-safe";
+            return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_M2_ROWS when LLAMINAR_GPU_GRAPHS=1; M=2 row-overlap launches side streams that are not graph-capture safe";
         }
         if (debugEnv().execution.gpu_graphs &&
             debugEnv().execution.gpu_graph_collective_segmented &&
