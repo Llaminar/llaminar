@@ -62,11 +62,13 @@ static void recordNativeVNNISmallMLaunch(
     int kb,
     int target_waves_per_cu,
     bool batched,
-    int projections)
+    int projections,
+    bool atomic_reduce)
 {
     if (!llaminar2::PerfStatsCollector::isEnabled())
         return;
 
+    const char* path = (kb <= 1) ? "direct" : (atomic_reduce ? "atomic_reduce" : "split_reduce");
     llaminar2::PerfStatsCollector::addCounter(
         "kernel",
         "rocm_native_vnni_small_m_launch",
@@ -80,11 +82,17 @@ static void recordNativeVNNISmallMLaunch(
             {"codebook", std::to_string(codebook)},
             {"grid_n", std::to_string(grid_n)},
             {"kb", std::to_string(kb)},
-            {"path", kb > 1 ? "split_reduce" : "direct"},
+            {"path", path},
             {"target_waves_per_cu", std::to_string(target_waves_per_cu)},
             {"batched", batched ? "true" : "false"},
             {"projections", std::to_string(projections)}});
 }
+
+extern "C" bool rocmQuantGemm_biasAdd(
+    float *d_output,
+    const float *d_bias,
+    int M, int N,
+    int rocm_device_id, void *stream);
 
 extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu)
 {
@@ -2419,6 +2427,10 @@ __global__ void gemv_native_vnni_small_m_batched_kernel_t(
                 out_base[static_cast<size_t>(row) * N + n] =
                     acc[row][c] + (bias_base ? bias_base[n] : 0.0f);
             }
+            else if (partial_base == nullptr)
+            {
+                atomicAdd(&out_base[static_cast<size_t>(row) * N + n], acc[row][c]);
+            }
             else
             {
                 partial_base[(static_cast<size_t>(kb) * SMALL_M + static_cast<size_t>(row)) *
@@ -2561,6 +2573,11 @@ __global__ void gemv_native_vnni_q4_m2_batched_kernel_t(
             out_base[n] = acc0[c] + (bias_base ? bias_base[n] : 0.0f);
             out_base[static_cast<size_t>(N) + n] = acc1[c] + (bias_base ? bias_base[n] : 0.0f);
         }
+        else if (partial_base == nullptr)
+        {
+            atomicAdd(&out_base[n], acc0[c]);
+            atomicAdd(&out_base[static_cast<size_t>(N) + n], acc1[c]);
+        }
         else
         {
             partial_base[(static_cast<size_t>(kb) * 2u) *
@@ -2686,6 +2703,10 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
             if (kblocks == 1)
             {
                 d_C_fp32[static_cast<size_t>(row) * N + n] = acc[row][c];
+            }
+            else if (d_partial_fp32 == nullptr)
+            {
+                atomicAdd(&d_C_fp32[static_cast<size_t>(row) * N + n], acc[row][c]);
             }
             else
             {
@@ -2821,6 +2842,11 @@ __global__ void gemv_native_vnni_q4_m2_kernel_t(
         {
             d_C_fp32[n] = acc0[c];
             d_C_fp32[static_cast<size_t>(N) + n] = acc1[c];
+        }
+        else if (d_partial_fp32 == nullptr)
+        {
+            atomicAdd(&d_C_fp32[n], acc0[c]);
+            atomicAdd(&d_C_fp32[static_cast<size_t>(N) + n], acc1[c]);
         }
         else
         {
@@ -3447,6 +3473,8 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
     const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
     const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
+    const bool use_atomic_reduce = graph_capture_enabled || rocm_env.nvnni_atomic_reduce;
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
@@ -3472,35 +3500,34 @@ bool rocmLaunch_native_vnni_small_m_fp32(
             if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
         }
     }
-    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
-    if (graph_capture_enabled)
-    {
-        // Real Qwen3.6 ROCm graph warmup can fault on small-M split-reduce
-        // replay even though isolated synthetic captures pass. Keep graph
-        // execution on the direct launcher until split-reduce is proven safe
-        // under full-model graph replay.
-        kb = 1;
-    }
     if (kb_override > 0)
     {
-        if (kb_override > 1 && kb_override != kb)
-        {
-            fprintf(stderr,
-                    "[rocmGemv_native_vnni_small_m_fp32] forced kb=%d differs from graph-safe auto kb=%d; "
-                    "refusing split-K override for small-M verifier route (M=%d N=%d K=%d)\n",
-                    kb_override, kb, SMALL_M, N, K);
-            return false;
-        }
         kb = min(kb_override, KB_CAP);
         if (kb > blocks_per_row) kb = blocks_per_row;
     }
     if (kb < 1) kb = 1;
 
-    if (kb > 1 && !d_partial_fp32)
+    if (kb > 1 && !d_partial_fp32 && !use_atomic_reduce)
     {
         fprintf(stderr, "[rocmGemv_native_vnni_small_m_fp32] kb=%d>1 but no small-M partial buffer (M=%d N=%d K=%d)\n",
                 kb, SMALL_M, N, K);
         return false;
+    }
+    float* partial_arg = use_atomic_reduce ? nullptr : d_partial_fp32;
+    if (kb > 1 && use_atomic_reduce)
+    {
+        hipError_t memset_err = hipMemsetAsync(
+            d_C_fp32,
+            0,
+            static_cast<size_t>(SMALL_M) * static_cast<size_t>(N) * sizeof(float),
+            static_cast<hipStream_t>(stream));
+        if (memset_err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "[rocmGemv_native_vnni_small_m_fp32] atomic output memset failed: %s (M=%d N=%d K=%d codebook=%u)\n",
+                    hipGetErrorString(memset_err), SMALL_M, N, K, static_cast<unsigned>(FMT));
+            return false;
+        }
     }
 
     recordNativeVNNISmallMLaunch(
@@ -3512,7 +3539,8 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         kb,
         target_waves_per_cu,
         false,
-        1);
+        1,
+        kb > 1 && use_atomic_reduce);
 
     dim3 block(THREADS, 1, 1);
     dim3 grid(grid_n, kb, 1);
@@ -3522,7 +3550,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
             HIP_KERNEL_NAME(gemv_native_vnni_q4_m2_kernel_t<TN, CPT, FMT>),
             grid, block, 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_payload, d_block_scales, d_block_mins,
-            d_C_fp32, d_partial_fp32, d_scale_A_blockwise, N, K, kb);
+            d_C_fp32, partial_arg, d_scale_A_blockwise, N, K, kb);
     }
     else
     {
@@ -3530,7 +3558,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
             HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<TN, CPT, SMALL_M, FMT>),
             grid, block, 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
-            d_C_fp32, d_partial_fp32, d_scale_A_blockwise, N, K, kb);
+            d_C_fp32, partial_arg, d_scale_A_blockwise, N, K, kb);
     }
 
     hipError_t err = hipGetLastError();
@@ -3541,7 +3569,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         return false;
     }
 
-    if (kb > 1)
+    if (kb > 1 && !use_atomic_reduce)
     {
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_kernel_t<TN, CPT, SMALL_M>),
@@ -3610,6 +3638,8 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
     const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
     const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
+    const bool use_atomic_reduce = graph_capture_enabled || rocm_env.nvnni_atomic_reduce;
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
@@ -3635,30 +3665,14 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
             if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
         }
     }
-    const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
-    if (graph_capture_enabled)
-    {
-        // Match the single-projection policy: small-M split-reduce remains a
-        // real-model graph replay hazard, so use the direct batched launcher
-        // while GPU graph replay is enabled.
-        kb = 1;
-    }
     if (kb_override > 0)
     {
-        if (kb_override > 1 && kb_override != kb)
-        {
-            fprintf(stderr,
-                    "[rocmGemv_native_vnni_small_m_batched_fp32] forced kb=%d differs from graph-safe auto kb=%d; "
-                    "refusing split-K override for batched small-M verifier route (M=%d K=%d projections=%d)\n",
-                    kb_override, kb, SMALL_M, K, num_projections);
-            return false;
-        }
         kb = min(kb_override, KB_CAP);
         if (kb > blocks_per_row) kb = blocks_per_row;
     }
     if (kb < 1) kb = 1;
 
-    if (kb > 1)
+    if (kb > 1 && !use_atomic_reduce)
     {
         for (int p = 0; p < num_projections; ++p)
         {
@@ -3667,6 +3681,25 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
                 fprintf(stderr,
                         "[rocmGemv_native_vnni_small_m_batched_fp32] kb=%d>1 but projection %d has no partial buffer (M=%d N=%d K=%d)\n",
                         kb, p, SMALL_M, args.N[p], K);
+                return false;
+            }
+        }
+    }
+    if (kb > 1 && use_atomic_reduce)
+    {
+        for (int p = 0; p < num_projections; ++p)
+        {
+            args.partial[p] = nullptr;
+            hipError_t memset_err = hipMemsetAsync(
+                args.output[p],
+                0,
+                static_cast<size_t>(SMALL_M) * static_cast<size_t>(args.N[p]) * sizeof(float),
+                static_cast<hipStream_t>(stream));
+            if (memset_err != hipSuccess)
+            {
+                fprintf(stderr,
+                        "[rocmGemv_native_vnni_small_m_batched_fp32] atomic output memset failed: %s (M=%d N=%d K=%d projection=%d codebook=%u)\n",
+                        hipGetErrorString(memset_err), SMALL_M, args.N[p], K, p, static_cast<unsigned>(FMT));
                 return false;
             }
         }
@@ -3681,7 +3714,8 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         kb,
         target_waves_per_cu,
         true,
-        num_projections);
+        num_projections,
+        kb > 1 && use_atomic_reduce);
 
     bool all_n_equal = true;
     for (int p = 1; p < num_projections; ++p)
@@ -3723,7 +3757,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         return false;
     }
 
-    if (kb > 1)
+    if (kb > 1 && !use_atomic_reduce)
     {
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(gemv_native_vnni_reduce_small_m_batched_kernel_t<TN, CPT, SMALL_M>),
@@ -3738,6 +3772,29 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
                 "[rocmGemv_native_vnni_small_m_batched_fp32] reduce launch failed: %s (M=%d K=%d projections=%d codebook=%u)\n",
                 hipGetErrorString(err), SMALL_M, K, num_projections, static_cast<unsigned>(FMT));
         return false;
+    }
+
+    if (kb > 1 && use_atomic_reduce)
+    {
+        for (int p = 0; p < num_projections; ++p)
+        {
+            if (d_biases && d_biases[p])
+            {
+                if (!rocmQuantGemm_biasAdd(
+                        d_outputs[p],
+                        d_biases[p],
+                        SMALL_M,
+                        Ns[p],
+                        device_id,
+                        stream))
+                {
+                    fprintf(stderr,
+                            "[rocmGemv_native_vnni_small_m_batched_fp32] bias add failed after atomic reduce (M=%d N=%d K=%d projection=%d codebook=%u)\n",
+                            SMALL_M, Ns[p], K, p, static_cast<unsigned>(FMT));
+                    return false;
+                }
+            }
+        }
     }
 
     return true;

@@ -1191,7 +1191,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     EXPECT_EQ(route_record->device, "rocm:0");
     EXPECT_EQ(route_record->tags.at("codebook"), "5");
 
-    double graph_direct_launches = 0.0;
+    double graph_atomic_launches = 0.0;
     double graph_split_reduce_launches = 0.0;
     for (const auto &record : records)
     {
@@ -1209,11 +1209,11 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
         }
 
         if (record.tags.count("path") != 0 &&
-            record.tags.at("path") == "direct" &&
+            record.tags.at("path") == "atomic_reduce" &&
             record.tags.count("kb") != 0 &&
-            record.tags.at("kb") == "1")
+            std::stoi(record.tags.at("kb")) > 1)
         {
-            graph_direct_launches += record.value;
+            graph_atomic_launches += record.value;
         }
         if (record.tags.count("path") != 0 &&
             record.tags.at("path") == "split_reduce")
@@ -1222,8 +1222,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
         }
     }
 
-    EXPECT_GE(graph_direct_launches, 1.0)
-        << "GPU-graph Qwen3.6 small-M FFN down must use the direct native-VNNI route";
+    EXPECT_GE(graph_atomic_launches, 1.0)
+        << "GPU-graph Qwen3.6 small-M FFN down must use graph-capturable atomic K-partitioning";
     EXPECT_EQ(graph_split_reduce_launches, 0.0)
         << "GPU-graph small-M split-reduce has caused real-model ROCm HSA faults";
 
@@ -1951,7 +1951,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
     double heterogeneous_n_bypasses = 0.0;
     double shared_quant_calls = 0.0;
     double batched_projection_calls = 0.0;
-    double graph_direct_launches = 0.0;
+    double graph_atomic_launches = 0.0;
     double graph_split_reduce_launches = 0.0;
     for (const auto &record : records)
     {
@@ -2012,11 +2012,11 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
             record.tags.at("projections") == "2")
         {
             if (record.tags.count("path") != 0 &&
-                record.tags.at("path") == "direct" &&
+                record.tags.at("path") == "atomic_reduce" &&
                 record.tags.count("kb") != 0 &&
-                record.tags.at("kb") == "1")
+                std::stoi(record.tags.at("kb")) > 1)
             {
-                graph_direct_launches += record.value;
+                graph_atomic_launches += record.value;
             }
             if (record.tags.count("path") != 0 &&
                 record.tags.at("path") == "split_reduce")
@@ -2034,8 +2034,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
         << "The batched qkv/z subgroup should quantize activations once";
     EXPECT_GE(batched_projection_calls, 2.0)
         << "The batched qkv/z subgroup should cover both heterogeneous-N projection payloads";
-    EXPECT_GE(graph_direct_launches, 1.0)
-        << "GPU-graph Qwen3.6 batched GDN qkv/z small-M route must use direct native-VNNI launch";
+    EXPECT_GE(graph_atomic_launches, 1.0)
+        << "GPU-graph Qwen3.6 batched GDN qkv/z small-M route must use graph-capturable atomic K-partitioning";
     EXPECT_EQ(graph_split_reduce_launches, 0.0)
         << "GPU-graph batched small-M split-reduce has caused real-model ROCm HSA faults";
 
@@ -2233,12 +2233,15 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KGDNProjectionM2RejectsUnsafeKBOverri
         kernel->unbindWorkspace();
 }
 
-TEST(Test__ROCmQuantisedGemmSmallM, SingleProjectionQ4KFFNDownM2RejectsUnsafeKBOverride)
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedSingleProjectionQ4KFFNDownM2HonorsAtomicKBOverride)
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
 
-    ScopedEnv force_unsafe_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "2");
+    ScopedEnv force_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "2");
+    ScopedEnv force_graphs("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
 
     constexpr int M = 2;
     constexpr int K = 17408;
@@ -2259,12 +2262,49 @@ TEST(Test__ROCmQuantisedGemmSmallM, SingleProjectionQ4KFFNDownM2RejectsUnsafeKBO
     auto output = TestTensorFactory::createFP32({M, N});
     ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
 
-    EXPECT_FALSE(kernel.multiply_tensor(input.get(), output.get(), M, N, K))
-        << "Forced split-K overrides that diverge from the graph-safe auto KB must hard-fail "
-           "before launching small-M verifier GEMV";
+    EXPECT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K))
+        << "Graph-captured forced KB=2 should use atomic K-partitioning, not split-reduce replay";
 
 #ifdef HAVE_ROCM
     EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
 #endif
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    double atomic_launches = 0.0;
+    double split_reduce_launches = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain != "kernel" ||
+            record.name != "rocm_native_vnni_small_m_launch" ||
+            record.kind != PerfStatRecord::Kind::Counter ||
+            record.tags.count("m") == 0 ||
+            record.tags.at("m") != "2" ||
+            record.tags.count("n") == 0 ||
+            record.tags.at("n") != "5120" ||
+            record.tags.count("k") == 0 ||
+            record.tags.at("k") != "17408")
+        {
+            continue;
+        }
+        if (record.tags.count("path") != 0 &&
+            record.tags.at("path") == "atomic_reduce" &&
+            record.tags.count("kb") != 0 &&
+            record.tags.at("kb") == "2")
+        {
+            atomic_launches += record.value;
+        }
+        if (record.tags.count("path") != 0 &&
+            record.tags.at("path") == "split_reduce")
+        {
+            split_reduce_launches += record.value;
+        }
+    }
+
+    EXPECT_GE(atomic_launches, 1.0)
+        << "Graph-captured KB override should be honored by the atomic route";
+    EXPECT_EQ(split_reduce_launches, 0.0)
+        << "Graph-captured KB override must not re-enable split-reduce replay";
+
+    PerfStatsCollector::reset();
     kernel.unbindWorkspace();
 }

@@ -86,6 +86,32 @@ can remain enabled because it does not by itself disable segmented graph replay.
 | Expert overlay EP | 2x ROCm | Qwen3.6 MoE 35B | Blocked before inference | Blocked before graph-capture measurement | Sparse dispatch/return graph capture required where ROCm supports it, but the current run blocks during resident expert preparation first | Blocked | N/A | `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-replicated-streaming-hardfail.txt` | Added `configs/moe_overlay/rocm2_replicated_static.yaml` and harness coverage for a one-rank LocalTP `ReplicatedExperts` ROCm domain. Real Qwen3.6 MoE reaches graph config, but both ROCm devices fail resident expert VRAM preflight by the safety-margin check. `LLAMINAR_WEIGHT_STREAMING=1` is already enabled in the confirming run, but resident MoE expert streaming is not active for this GPU pipeline path. |
 | Expert overlay EP | 2x ROCm plus 2x CPU dual-socket | Qwen3.6 MoE 35B | Blocked before inference | Blocked before graph-capture measurement | Heterogeneous sparse collectives must be graph-aware, but the current run stops before sparse dispatch because CPU fallback participant ranks no longer have sidecar endpoint runners | Blocked | N/A | `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-cpu2-endpoint-hardfail.txt` | Added `configs/moe_overlay/rocm2_cpu2_replicated_static.yaml` and harness coverage for a rank-0 ROCm LocalTP hot tier plus rank-1 CPU LocalTP fallback tier. Real Qwen3.6 MoE rank 1 hard-fails as `CpuFallbackParticipant` because sidecar endpoint ranks were removed by graph-native MoE productionization. Next slice needs proper graph-native CPU fallback participant workers and sparse return through `TransferEngine`, not a fallback sidecar. |
 
+Latest graph-atomic small-M hardening validation:
+
+- ROCm Qwen3.6 dense 27B Q4_K_S, `rocm:0`, GPU graphs enabled,
+  `The quick brown fox`, `-c 64`, `-n 8`, depth-1 MTP:
+  `/tmp/llaminar-mtp-bench/dense-rocm-graphatomic-mtp-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-graphatomic-mtp-c64-n8-stats.json`,
+  and `/tmp/llaminar-mtp-bench/dense-rocm-graphatomic-mtp-c64-n8-stats.csv`.
+  The run completed without the previous full-model ROCm graph replay fault and
+  every small-M K-partitioned native-VNNI launch used `path=atomic_reduce`
+  rather than `split_reduce`.
+- Same short-prompt comparator artifacts:
+  baseline `/tmp/llaminar-mtp-bench/dense-rocm-graphdirect-baseline-c64-n8-bench.json`
+  at 21.42 decode tok/s and old direct-MTP hardening
+  `/tmp/llaminar-mtp-bench/dense-rocm-graphdirect-mtp-c64-n8-bench.json`
+  at 16.95 decode tok/s.
+- The atomic path reached 17.32 decode tok/s with 75% acceptance. It cut the
+  short-smoke `main_verifier` ordinary-GEMM bucket from about 234 ms total in
+  the direct graph run to about 89 ms total, but the request remained slower
+  than baseline because `main_verifier` still dominated: `GDN_PROJECTION`
+  was about 125 ms total, `GEMM` about 89 ms total, and
+  `GEMM_FUSED_GATE_UP` about 70 ms total across six recorded verifier passes.
+  This is a graph-safety and profiling improvement, not Phase 14 speedup
+  evidence. The next ROCm dense sprint should profile a fresh same-binary
+  baseline/MTP pair and attack the remaining verifier replay budget rather
+  than treating global atomic reduction as the final reduction path.
+
 Latest workspace-binding validation:
 
 - ROCm FP32 mapped-output GEMM redirects now use the declared
