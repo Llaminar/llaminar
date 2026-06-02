@@ -20,7 +20,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 | SingleDevice | CUDA `cuda:0` | Qwen3.6 dense 27B Q4_K_S | 43.92 at `-c 64` | Small-context dense MTP reaches segmented replay with zero manual stages; default 4096-context run still does not fit this 24 GB device | N/A | 7.46 | 0.17x decode | `/tmp/llaminar-mtp-bench/dense-cuda-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-cuda-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-cuda-mtp-gpugraphs-c64-n4-stats.json` | CUDA graph capture is viable at small context, but MTP is much slower than baseline with 50% acceptance. Need verifier/rollback cost reduction and larger-context evidence on a GPU that fits the model. |
 | SingleDevice | ROCm | Qwen3.6 MoE 35B | 21.23 | Partial: MTP GPU graphs now survive rollback/restore through the `-n 4` crash reproducer, but replay state is reset after each live-state rewind | N/A | 10.89 | 0.51x decode | `/tmp/llaminar-mtp-bench/moe-rocm-baseline-n4.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n3-fixed.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n4-fixed.json` | Crash fixed by resetting captured forward and MTP sidecar replay state after live prefix restore/truncate. MTP remains slower than baseline with 0% acceptance on this prompt; need sidecar/verifier acceptance and replay-cost work before claiming speedup. |
 | SingleDevice | CUDA `cuda:0` | Qwen3.6 MoE 35B | 27.56 at `-c 64` | Small-context MoE MTP reaches segmented replay with zero manual stages; single-participant rebalance downgrades to observe | N/A | 16.74 | 0.61x decode | `/tmp/llaminar-mtp-bench/moe-cuda-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4-stats.json` | CUDA MoE graph capture is stable at small context, but MTP is slower with 0% acceptance. Need MoE MTP acceptance quality and verifier/rollback cost reduction before speedup claims. |
-| LocalTP | ROCm `rocm:0,rocm:1` | Qwen3.6 dense 27B Q4_K_S | 24.15 at `-c 64` | Not fully captured: verifier graphs detect collectives; forcing segmented collective replay for RCCL MTP now hard-fails before sidecar launch | RCCL collectives currently force non-captured verifier execution by default; `LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1` is blocked for ROCm LocalTP MTP until the sidecar path is made safe | 20.46 | 0.85x decode | `/tmp/llaminar-mtp-bench/dense-localtp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-c64-n4-stats.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-segmented-hardfail.json` | Correct LocalTP MTP with 100% acceptance is present, but the attempted RCCL segmented path produced an HSA memory fault before the guard. It now hard-fails with a structured `failure_reason`. Need real graph-safe RCCL/allreduce capture for MTP sidecar execution, or a deliberately optimized manual collective boundary, before speedup claims. |
+| LocalTP | ROCm `rocm:0,rocm:1` | Qwen3.6 dense 27B Q4_K_S | 24.15 at `-c 64` | Not fully captured: verifier and sidecar graphs detect collectives and choose `allow_segmented=false`; forcing segmented collective replay for RCCL MTP hard-fails before sidecar launch | RCCL collectives currently force non-captured verifier/sidecar execution; `LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1` is blocked for ROCm LocalTP MTP until the path is graph-safe | 20.46 best same-prompt; 17.94 post-guard explicit prompt | 0.85x decode best same-prompt; 0.74x post-guard explicit prompt | `/tmp/llaminar-mtp-bench/dense-localtp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-after-broad-bench.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-after-broad-stats.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-segmented-hardfail.json` | Correct LocalTP MTP with 100% acceptance is present, and the post-guard graph-enabled/manual-collective path remains green. The attempted RCCL segmented path produced an HSA memory fault before the guard and now hard-fails with a structured `failure_reason`. Need real graph-safe RCCL/allreduce capture for MTP sidecar and verifier execution, or a deliberately optimized manual collective boundary, before speedup claims. |
 | LocalPP | ROCm `stage0=rocm:0, stage1=rocm:1` | Qwen3.6 dense 27B Q4_K_S | 20.47 at `-c 64` | Blocked: MTP is a hard fail before prefill on PP topologies | PP activation transfers are present in the baseline path, but MTP graph capture is not attempted | Blocked | N/A | `/tmp/llaminar-mtp-bench/dense-localpp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localpp-rocm-mtp-gpugraphs-c64-n4-hardfail.json` | PP MTP shifted-prefill and verifier execution are not implemented. The previous late stage-1 shifted-cache failure is now a prefill hard-fail with an explicit unsupported-topology message. |
 | NodeLocalTP | CPU sockets | Qwen3.6 dense 27B Q4_K_S | Pending | N/A for GPU graphs | Host/MPI coordination only | Pending | Pending | Pending | Needed for correctness/speed evidence, but not GPU graph-capture gating. |
 | Expert overlay EP | 2x ROCm | Qwen3.6 MoE 35B | Blocked before inference | Blocked before graph-capture measurement | Sparse dispatch/return graph capture required where ROCm supports it, but the current run blocks during resident expert preparation first | Blocked | N/A | `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-replicated-streaming-hardfail.txt` | Added `configs/moe_overlay/rocm2_replicated_static.yaml` and harness coverage for a one-rank LocalTP `ReplicatedExperts` ROCm domain. Real Qwen3.6 MoE reaches graph config, but both ROCm devices fail resident expert VRAM preflight by the safety-margin check. `LLAMINAR_WEIGHT_STREAMING=1` is already enabled in the confirming run, but resident MoE expert streaming is not active for this GPU pipeline path. |
@@ -274,6 +274,20 @@ Latest LocalTP ROCm dense evidence:
     supports it, or a deliberately optimized manual collective boundary.
   - Current best MTP decode throughput is about 0.85x the same-prompt
     baseline despite perfect acceptance.
+- Post-guard graph-enabled/manual-collective run:
+  `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-after-broad-bench.json`
+  and `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-after-broad-stats.json`.
+  - Same model/domain/context with explicit 7-token prompt, `-n 4`,
+    `LLAMINAR_GPU_GRAPHS=1`, and `LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=0`.
+  - Decode 222.91 ms for 4 tokens, 17.94 tok/s.
+  - MTP counters: 8 draft steps, 8 accepted tokens, 0 rejected tokens,
+    0 rollbacks, 8 verifier runs, 16 verifier tokens, 100% acceptance.
+  - Both `ROCm:0` and `ROCm:1` verifier policy records report
+    `has_collectives=true`, `allow_segmented=false`,
+    `collective_segmented=false`, and `collectives_graph_capturable=false`.
+  - Both MTP decode-sidecar policy records report the same collective/manual
+    policy with `context=mtp_decode_sidecar`; shifted-prefill sidecar records
+    also detect collectives and remain uncaptured.
 - Forced segmented-collective reproducer:
   `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-segmented-hardfail.json`
   and `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-segmented-hardfail-stats.json`.
@@ -429,6 +443,11 @@ Latest ROCm MoE evidence:
     matching real-model regression for the HSA fault/hang class. It runs with
     `LLAMINAR_GPU_GRAPHS=1`, expects the structured hard-fail before decode-side
     MTP launch, and asserts no MTP verifier counters were incremented.
+  - `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPSmoke` keeps
+    `LLAMINAR_GPU_GRAPHS=1` and disables only
+    `LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED`, proving the LocalTP
+    graph-enabled/manual-collective path remains green with active MTP/verifier
+    counters.
   - `V2_Unit_PrefillDecodeTransition` also includes
     `ROCmMTPHardFailsWithM2RowOverlapUnderGpuGraphs`, which reproduces the
     unsafe `LLAMINAR_GPU_GRAPHS=1` plus `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1`

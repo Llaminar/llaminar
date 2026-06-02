@@ -1687,7 +1687,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
 {
     ScopedDebugEnv env({
-        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
         {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
