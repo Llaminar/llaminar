@@ -67,8 +67,8 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    // Qwen3.5 has 20 main layer buffers plus 15 one-row MTP sidecar buffers.
-    EXPECT_EQ(reqs.buffers.size(), 35u) << "Expected 35 layer buffers";
+    // Qwen3.5 has 20 main layer buffers plus 17 MTP verifier sidecar buffers.
+    EXPECT_EQ(reqs.buffers.size(), 37u) << "Expected 37 layer buffers";
 
     // ── Shared buffers ──
 
@@ -224,32 +224,32 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_ExactShapes)
 
     auto *mtp_embedding = findBuf(reqs, "mtp_embedding");
     ASSERT_NE(mtp_embedding, nullptr);
-    EXPECT_EQ(mtp_embedding->shape[0], 1u);
+    EXPECT_EQ(mtp_embedding->shape[0], 4u);
     EXPECT_EQ(mtp_embedding->shape[1], 2560u);
 
     auto *mtp_concat = findBuf(reqs, "mtp_concat");
     ASSERT_NE(mtp_concat, nullptr);
-    EXPECT_EQ(mtp_concat->shape[0], 1u);
+    EXPECT_EQ(mtp_concat->shape[0], 4u);
     EXPECT_EQ(mtp_concat->shape[1], 5120u);
 
     auto *mtp_q = findBuf(reqs, "mtp_q");
     ASSERT_NE(mtp_q, nullptr);
-    EXPECT_EQ(mtp_q->shape[0], 1u);
+    EXPECT_EQ(mtp_q->shape[0], 4u);
     EXPECT_EQ(mtp_q->shape[1], 4096u);
 
     auto *mtp_k = findBuf(reqs, "mtp_k");
     ASSERT_NE(mtp_k, nullptr);
-    EXPECT_EQ(mtp_k->shape[0], 1u);
+    EXPECT_EQ(mtp_k->shape[0], 4u);
     EXPECT_EQ(mtp_k->shape[1], 1024u);
 
     auto *mtp_gate = findBuf(reqs, "mtp_gate");
     ASSERT_NE(mtp_gate, nullptr);
-    EXPECT_EQ(mtp_gate->shape[0], 1u);
+    EXPECT_EQ(mtp_gate->shape[0], 4u);
     EXPECT_EQ(mtp_gate->shape[1], 9216u);
 
     auto *mtp_logits = findBuf(reqs, "mtp_logits");
     ASSERT_NE(mtp_logits, nullptr);
-    EXPECT_EQ(mtp_logits->shape[0], 1u);
+    EXPECT_EQ(mtp_logits->shape[0], 4u);
     EXPECT_EQ(mtp_logits->shape[1], 248320u);
 }
 
@@ -358,7 +358,7 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
 
     auto reqs = BufferAllocator::resolveLayerBuffers(schema, config);
 
-    EXPECT_EQ(reqs.buffers.size(), 35u);
+    EXPECT_EQ(reqs.buffers.size(), 37u);
 
     // Q: [4096, 8*256=2048] under TP=2
     auto *Q = findBuf(reqs, "Q");
@@ -409,6 +409,6 @@ TEST(Test__Qwen35BufferSizes, LayerBuffers_TP2)
 
     auto *mtp_logits = findBuf(reqs, "mtp_logits");
     ASSERT_NE(mtp_logits, nullptr);
-    EXPECT_EQ(mtp_logits->shape[0], 1u);
+    EXPECT_EQ(mtp_logits->shape[0], 4u);
     EXPECT_EQ(mtp_logits->shape[1], 124160u);
 }

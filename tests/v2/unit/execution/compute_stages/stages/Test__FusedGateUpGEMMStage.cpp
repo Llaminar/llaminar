@@ -523,4 +523,28 @@ namespace llaminar2
         EXPECT_FALSE(stage.execute(ctx_.get()));
     }
 
+    TEST_F(Test__FusedGateUpGEMMStage, OutputCapacityTooSmallFailsBeforeKernelLookup)
+    {
+        auto undersized_gate = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(m_ - 1), static_cast<size_t>(n_gate_)},
+            DeviceId::cpu());
+
+        FusedGateUpGEMMStage::Params params{
+            .input = input_.get(),
+            .m = m_,
+            .k = k_,
+            .w_gate = w_gate_.get(),
+            .output_gate = undersized_gate.get(),
+            .n_gate = n_gate_,
+            .bias_gate = nullptr,
+            .w_up = w_up_.get(),
+            .output_up = output_up_.get(),
+            .n_up = n_up_,
+            .bias_up = nullptr};
+
+        FusedGateUpGEMMStage stage(params);
+
+        EXPECT_FALSE(stage.execute(ctx_.get()));
+    }
+
 } // namespace llaminar2

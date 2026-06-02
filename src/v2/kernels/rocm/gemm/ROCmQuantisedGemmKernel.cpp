@@ -117,6 +117,71 @@ namespace llaminar2
         namespace
         {
             std::atomic<uint32_t> g_rocm_gemm_workspace_slice_counter{1};
+
+            int computeNativeVNNISmallMBatchedKBForValidation(
+                const std::array<int, 8> &Ns,
+                int num_projections,
+                int K)
+            {
+                constexpr int NUM_CUS = 60;
+                constexpr int MIN_BLOCKS_PER_WAVE = 1;
+                constexpr int KB_CAP = 8;
+                constexpr int TN = 64;
+                constexpr int DEFAULT_TARGET_WAVES_PER_CU = 12;
+
+                if (num_projections <= 0 || K <= 0 || (K % 32) != 0)
+                    return 1;
+
+                int total_grid_n = 0;
+                for (int p = 0; p < num_projections; ++p)
+                {
+                    if (Ns[p] <= 0)
+                        return 1;
+                    total_grid_n += (Ns[p] + TN - 1) / TN;
+                }
+                if (total_grid_n <= 0)
+                    return 1;
+
+                const auto &rocm_env = debugEnv().rocm;
+                const int blocks_per_row = K / 32;
+                if (rocm_env.nvnni_gemv_kb > 0)
+                {
+                    int kb = std::min(rocm_env.nvnni_gemv_kb, KB_CAP);
+                    if (kb > blocks_per_row)
+                        kb = blocks_per_row;
+                    return std::max(1, kb);
+                }
+
+                const int target_waves_per_cu =
+                    (rocm_env.nvnni_gemv_target_waves > 0)
+                        ? rocm_env.nvnni_gemv_target_waves
+                        : DEFAULT_TARGET_WAVES_PER_CU;
+                const int target_total_waves = target_waves_per_cu * NUM_CUS;
+                int kb_raw = std::max(1, (target_total_waves + total_grid_n - 1) / total_grid_n);
+                int kb_max = std::max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
+                kb_max = std::min(kb_max, KB_CAP);
+                kb_raw = std::min(kb_raw, kb_max);
+
+                int kb = kb_raw;
+                if (blocks_per_row % kb_raw != 0)
+                {
+                    for (int d = 1; d < kb_raw; ++d)
+                    {
+                        if (kb_raw - d >= 1 && blocks_per_row % (kb_raw - d) == 0)
+                        {
+                            kb = kb_raw - d;
+                            break;
+                        }
+                        if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0)
+                        {
+                            kb = kb_raw + d;
+                            break;
+                        }
+                    }
+                }
+
+                return std::max(1, kb);
+            }
         }
 
         // =====================================================================
@@ -3793,12 +3858,36 @@ namespace llaminar2
                         mark_batched_bypass("mapped_output");
                         break;
                     }
+
+                    try
+                    {
+                        rocm_kernel->validateWorkspace();
+                    }
+                    catch (const std::exception &ex)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                  << " cannot validate graph workspace for batched small-M route: "
+                                  << ex.what());
+                        return false;
+                    }
+
                     if (!rocm_kernel->impl_->d_weights_native_vnni ||
                         !rocm_kernel->impl_->d_weights_native_scales ||
                         !rocm_kernel->impl_->d_scatter_partial)
                     {
                         mark_batched_bypass("missing_native_buffers");
                         break;
+                    }
+                    if (fp32_output->rows() < static_cast<size_t>(m) ||
+                        fp32_output->cols() < static_cast<size_t>(proj.n))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                  << " output capacity too small for graph-native batched small-M route"
+                                  << " rows=" << fp32_output->rows()
+                                  << " cols=" << fp32_output->cols()
+                                  << " required_rows=" << m
+                                  << " required_cols=" << proj.n);
+                        return false;
                     }
 
                     const uint8_t codebook = rocm_kernel->impl_->native_vnni_codebook_id;
@@ -3866,10 +3955,80 @@ namespace llaminar2
                     partials[i] = rocm_kernel->impl_->d_scatter_partial;
                     biases[i] = d_bias;
                     Ns[i] = proj.n;
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M batched projection "
+                              << i
+                              << " name=" << (proj.name ? proj.name : "?")
+                              << " kernel=" << static_cast<const void *>(rocm_kernel)
+                              << " output=" << static_cast<const void *>(outputs[i])
+                              << " partial=" << static_cast<const void *>(partials[i])
+                              << " partial_name=" << rocm_kernel->scatterPartialBufferName()
+                              << " partial_bytes="
+                              << (rocm_kernel->workspace_
+                                      ? rocm_kernel->workspace_->getBufferSize(rocm_kernel->scatterPartialBufferName())
+                                      : 0)
+                              << " n=" << proj.n);
                 }
 
                 if (batched_eligible)
                 {
+                    const int expected_kb = computeNativeVNNISmallMBatchedKBForValidation(
+                        Ns,
+                        static_cast<int>(projections.size()),
+                        k);
+
+                    for (size_t i = 0; i < projections.size(); ++i)
+                    {
+                        for (size_t j = i + 1; j < projections.size(); ++j)
+                        {
+                            if (outputs[i] == outputs[j])
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projections "
+                                          << i << " and " << j
+                                          << " share one output buffer in graph-native batched small-M route"
+                                          << " output=" << static_cast<const void *>(outputs[i]));
+                                return false;
+                            }
+                            if (expected_kb > 1 && partials[i] == partials[j])
+                            {
+                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projections "
+                                          << i << " and " << j
+                                          << " share one split-K partial buffer in graph-native batched small-M route"
+                                          << " partial=" << static_cast<const void *>(partials[i])
+                                          << " expected_kb=" << expected_kb
+                                          << ". Each projection must declare and bind a distinct "
+                                          << GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL
+                                          << " workspace slice.");
+                                return false;
+                            }
+                        }
+
+                        auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(projections[i].kernel);
+                        const std::string partial_name = rocm_kernel->scatterPartialBufferName();
+                        const size_t partial_bytes =
+                            rocm_kernel->workspace_
+                                ? rocm_kernel->workspace_->getBufferSize(partial_name)
+                                : 0;
+                        const size_t required_partial_bytes =
+                            static_cast<size_t>(std::max(1, expected_kb)) *
+                            static_cast<size_t>(m) *
+                            static_cast<size_t>(Ns[i]) *
+                            sizeof(float);
+                        if (expected_kb > 1 && partial_bytes < required_partial_bytes)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
+                                      << " declared split-K partial buffer is too small"
+                                      << " partial_name=" << partial_name
+                                      << " bytes=" << partial_bytes
+                                      << " required=" << required_partial_bytes
+                                      << " expected_kb=" << expected_kb
+                                      << " m=" << m
+                                      << " n=" << Ns[i]
+                                      << " k=" << k);
+                            return false;
+                        }
+                    }
+
                     if (!rocmGemv_native_vnni_small_m_batched_fp32(
                             impl_->d_A_int8,
                             payloads.data(),

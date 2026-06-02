@@ -27,6 +27,10 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "../../utils/TestTensorFactory.h"
 
+#ifdef HAVE_ROCM
+#include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
+#endif
+
 using namespace llaminar::v2::kernels;
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -273,6 +277,37 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_ReactivateAfterReset)
     kernel->setDynamicTokenIds(tokens2.data(), static_cast<int>(tokens2.size()));
     EXPECT_TRUE(kernel->hasDynamicStateActive())
         << "Kernel must be re-activatable after reset";
+}
+
+TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_UnbindClearsDeviceSpecificWorkspace)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm backend not compiled";
+#else
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm GPU available";
+
+    ROCmEmbeddingKernelT kernel;
+    DeviceId device = DeviceId::rocm(0);
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024);
+
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({EmbeddingWorkspaceBuffers::TOKEN_IDS,
+                            512 * sizeof(int), 256, true});
+    ASSERT_TRUE(workspace->allocate(reqs));
+
+    kernel.bindWorkspace(workspace.get());
+
+    std::vector<int> tokens = {1, 5, 10};
+    kernel.setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
+    ASSERT_TRUE(kernel.hasDynamicStateActive());
+
+    kernel.bindWorkspace(nullptr);
+    kernel.setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
+    EXPECT_FALSE(kernel.hasDynamicStateActive())
+        << "Unbind must clear device-specific workspace bindings, including "
+           "bindings created while device_idx_ was unspecified";
+#endif
 }
 
 // ============================================================================

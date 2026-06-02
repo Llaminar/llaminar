@@ -1550,6 +1550,229 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36QKVM2MatchesSeparate)
         1024);
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36FFNGateUpM2MatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    runFusedProjectionGroupSmallMMatchesSeparate(
+        "Q4_K native-VNNI Qwen3.6 FFN gate/up MTP verifier group",
+        2,
+        5120,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.9999f,
+        {17408, 17408},
+        true,
+        true,
+        2);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    double batched_calls = 0.0;
+    double batched_projection_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            batched_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120")
+        {
+            batched_projection_calls += record.value;
+        }
+    }
+
+    EXPECT_GE(batched_calls, 1.0)
+        << "Graph-captured Qwen3.6 FFN gate/up should use one batched native route";
+    EXPECT_GE(batched_projection_calls, 2.0)
+        << "Batched FFN gate/up route should cover both projection payloads";
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ5KQwen36FFNGateUpM2MatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    runFusedProjectionGroupSmallMMatchesSeparate(
+        "Q5_K native-VNNI Qwen3.6 FFN gate/up MTP verifier group",
+        2,
+        5120,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+        0.999f,
+        {17408, 17408},
+        true,
+        true,
+        2);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    double batched_calls = 0.0;
+    double batched_projection_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            batched_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120")
+        {
+            batched_projection_calls += record.value;
+        }
+    }
+
+    EXPECT_GE(batched_calls, 1.0)
+        << "Graph-captured Qwen3.6 Q5_K FFN gate/up should use one batched native route";
+    EXPECT_GE(batched_projection_calls, 2.0)
+        << "Batched Q5_K FFN gate/up route should cover both projection payloads";
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsAliasedSplitKPartialWorkspace)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    constexpr int M = 2;
+    constexpr int K = 5120;
+    constexpr int N = 17408;
+
+    auto weights = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 501);
+    ROCmPackedWeights packed;
+    ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+    expectPackedPath(packed, PackedPath::NativeVNNI);
+
+    ROCmQuantisedGemmKernel kernel(&packed, 0);
+    auto workspace = bindWorkspace(kernel, M, N, K);
+    ASSERT_NE(workspace, nullptr);
+
+    auto input = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(M), static_cast<size_t>(K)});
+    auto gate = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+    auto up = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(gate->allocateOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(up->allocateOnDevice(DeviceId::rocm(0)));
+
+    std::vector<ITensorGemm::TensorProjectionDesc> projections;
+    projections.emplace_back(&kernel, gate.get(), N, nullptr, "gate");
+    projections.emplace_back(&kernel, up.get(), N, nullptr, "up");
+
+    EXPECT_FALSE(kernel.multiply_fused_tensor(input.get(), projections, M, K))
+        << "Batched small-M split-K must reject aliased projection partial buffers before HIP launch";
+#ifdef HAVE_ROCM
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+#endif
+
+    kernel.unbindWorkspace();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsUndersizedDeclaredPartialWorkspace)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    constexpr int M = 2;
+    constexpr int K = 5120;
+    constexpr int N = 17408;
+
+    std::vector<std::unique_ptr<TensorBase>> weights;
+    std::vector<ROCmPackedWeights> packed(2);
+    std::vector<std::unique_ptr<ROCmQuantisedGemmKernel>> kernels;
+    WorkspaceRequirements combined;
+
+    for (int i = 0; i < 2; ++i)
+    {
+        weights.push_back(TestTensorFactory::createQ4_KRandom(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            static_cast<uint32_t>(601 + i)));
+        ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
+        expectPackedPath(packed[i], PackedPath::NativeVNNI);
+        kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
+        combined.merge(kernels.back()->getWorkspaceRequirements(M, N, K));
+    }
+
+    bool shrunk_partial = false;
+    const std::string partial_prefix = std::string(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL) + "_";
+    for (auto &buf : combined.buffers)
+    {
+        if (!shrunk_partial && buf.name.rfind(partial_prefix, 0) == 0)
+        {
+            buf.size_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float);
+            shrunk_partial = true;
+        }
+    }
+    ASSERT_TRUE(shrunk_partial);
+
+    DeviceWorkspaceManager workspace(
+        DeviceId::rocm(0),
+        combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace.allocate(combined));
+    for (auto &kernel : kernels)
+        kernel->bindWorkspace(&workspace);
+
+    auto input = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(M), static_cast<size_t>(K)});
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+
+    auto gate = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+    auto up = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+    ASSERT_TRUE(gate->allocateOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(up->allocateOnDevice(DeviceId::rocm(0)));
+
+    std::vector<ITensorGemm::TensorProjectionDesc> projections;
+    projections.emplace_back(kernels[0].get(), gate.get(), N, nullptr, "gate");
+    projections.emplace_back(kernels[1].get(), up.get(), N, nullptr, "up");
+
+    EXPECT_FALSE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K))
+        << "Batched small-M split-K must reject undersized declared partial workspace before HIP launch";
+#ifdef HAVE_ROCM
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+#endif
+
+    for (auto &kernel : kernels)
+        kernel->unbindWorkspace();
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesSeparate)
 {
     if (!hasROCmDevice())

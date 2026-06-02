@@ -374,7 +374,55 @@ namespace llaminar2
 
     StageBufferRequirements GDNProjectionStage::getBufferRequirements() const
     {
-        return {};
+        StageBufferRequirements reqs;
+
+        if (!params_.input ||
+            !params_.w_qkv || !params_.w_z || !params_.w_a || !params_.w_b)
+        {
+            return reqs;
+        }
+
+        const BufferTensorType input_type = toBufferTensorType(params_.input->native_type());
+        reqs.addInput(
+            "input",
+            {static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)},
+            input_type);
+
+        reqs.addWeight(
+            "w_qkv",
+            {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_qkv)},
+            toBufferTensorType(params_.w_qkv->native_type()));
+        reqs.addWeight(
+            "w_z",
+            {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_z)},
+            toBufferTensorType(params_.w_z->native_type()));
+        reqs.addWeight(
+            "w_a",
+            {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_a)},
+            toBufferTensorType(params_.w_a->native_type()));
+        reqs.addWeight(
+            "w_b",
+            {static_cast<size_t>(params_.k), static_cast<size_t>(params_.n_b)},
+            toBufferTensorType(params_.w_b->native_type()));
+
+        const auto addOutput = [&](const char *name, const ITensor *tensor, int n)
+        {
+            if (!tensor || n <= 0)
+            {
+                return;
+            }
+            reqs.addOutput(
+                name,
+                {static_cast<size_t>(params_.m), static_cast<size_t>(n)},
+                toBufferTensorType(tensor->native_type()));
+        };
+
+        addOutput("output_qkv", params_.output_qkv, params_.n_qkv);
+        addOutput("output_z", params_.output_z, params_.n_z);
+        addOutput("output_a", params_.output_a, params_.n_a);
+        addOutput("output_b", params_.output_b, params_.n_b);
+
+        return reqs;
     }
 
     StageBufferContract GDNProjectionStage::bufferContract() const

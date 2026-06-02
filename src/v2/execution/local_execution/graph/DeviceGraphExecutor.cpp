@@ -719,7 +719,19 @@ namespace llaminar2
                 if (profiling_fast)
                     t0 = std::chrono::high_resolution_clock::now();
 
+                if (debugEnv().execution.trace_stages)
+                {
+                    LOG_DEBUG("[StageTrace] begin stage='" << node.name
+                                                          << "' type=" << static_cast<int>(node.stage->type())
+                                                          << " device=" << target_device.to_string());
+                }
                 bool ok = node.stage->execute(ctx);
+                if (debugEnv().execution.trace_stages)
+                {
+                    LOG_DEBUG("[StageTrace] end stage='" << node.name
+                                                        << "' ok=" << (ok ? "true" : "false")
+                                                        << " device=" << target_device.to_string());
+                }
 
                 if (ok && debugEnv().validation.sync_each_stage)
                 {
@@ -979,6 +991,14 @@ namespace llaminar2
 
         if (should_dump)
         {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Stage dump requested during GPU graph capture for stage '"
+                          << node.name
+                          << "'. Stage dumps materialize tensor payloads on host and are not graph-capturable.");
+                return false;
+            }
+
             const auto &dump_cfg = debugEnv().stage_dump;
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
@@ -1050,7 +1070,19 @@ namespace llaminar2
             phase_start = std::chrono::high_resolution_clock::now();
 
         // Stream already bound above (before coherence section)
+        if (debugEnv().execution.trace_stages)
+        {
+            LOG_DEBUG("[StageTrace] begin stage='" << node.name
+                                                  << "' type=" << static_cast<int>(node.stage->type())
+                                                  << " device=" << target_device.to_string());
+        }
         bool success = node.stage->execute(ctx);
+        if (debugEnv().execution.trace_stages)
+        {
+            LOG_DEBUG("[StageTrace] end stage='" << node.name
+                                                << "' ok=" << (success ? "true" : "false")
+                                                << " device=" << target_device.to_string());
+        }
 
         if (success && debugEnv().validation.sync_each_stage)
         {

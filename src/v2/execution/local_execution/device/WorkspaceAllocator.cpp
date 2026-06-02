@@ -14,6 +14,7 @@
 #include "../../../utils/Logger.h"
 #include <algorithm>
 #include <cctype>
+#include <limits>
 
 namespace llaminar2
 {
@@ -138,6 +139,60 @@ namespace llaminar2
             int k = 0;
         };
 
+        auto clampDimToInt = [](size_t value) -> int
+        {
+            if (value > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return std::numeric_limits<int>::max();
+            }
+            return static_cast<int>(value);
+        };
+
+        auto applyDeclaredStageShape = [&](const IComputeStage &stage,
+                                           ConsumerBinding &binding) -> bool
+        {
+            const StageBufferRequirements buffer_reqs = stage.getBufferRequirements();
+            int declared_m = 0;
+            int declared_k = 0;
+
+            for (const auto &buffer : buffer_reqs.buffers)
+            {
+                if (buffer.shape.size() < 2 || buffer.shape[0] == 0 || buffer.shape.back() == 0)
+                {
+                    continue;
+                }
+
+                const bool activation_like =
+                    buffer.role == BufferRole::INPUT ||
+                    buffer.role == BufferRole::INOUT ||
+                    buffer.role == BufferRole::OUTPUT ||
+                    buffer.role == BufferRole::SCRATCH;
+                if (!activation_like)
+                {
+                    continue;
+                }
+
+                declared_m = clampDimToInt(buffer.shape[0]);
+                if (buffer.role == BufferRole::INPUT || buffer.role == BufferRole::INOUT)
+                {
+                    declared_k = clampDimToInt(buffer.shape.back());
+                }
+                break;
+            }
+
+            if (declared_m <= 0)
+            {
+                return false;
+            }
+
+            binding.m = std::max(1, declared_m);
+            if (declared_k > 0)
+            {
+                binding.k = declared_k;
+            }
+            return true;
+        };
+
         std::unordered_map<DeviceId, std::vector<ConsumerBinding>> consumers_by_device;
 
         const auto execution_order = graph.getExecutionOrder();
@@ -199,6 +254,7 @@ namespace llaminar2
                 binding.m = std::max(1, hints.max_seq_len);
                 binding.n = 0;
                 binding.k = 0;
+                (void)applyDeclaredStageShape(*node->stage, binding);
             }
 
             consumers_by_device[device].push_back(binding);

@@ -588,9 +588,11 @@ namespace llaminar2
             return false;
         }
 
+        const bool capture_active = isGraphCaptureActive();
         const bool sync_embedding_stage =
             debugEnv().validation.sync_each_stage ||
             debugEnv().validation.sync_after_embedding_stage;
+        const bool allow_sync_embedding_stage = sync_embedding_stage && !capture_active;
 
         // =====================================================================
         // Step 3: Route by embedding table format
@@ -730,7 +732,7 @@ namespace llaminar2
                 }
             }
             const size_t output_bytes = static_cast<size_t>(num_tokens) * static_cast<size_t>(d_model) * sizeof(float);
-            const bool use_dev0_canary = validate_gpu_ptrs && (dev == 0);
+            const bool use_dev0_canary = validate_gpu_ptrs && (dev == 0) && !capture_active;
             float *kernel_output = d_output;
             void *canary_base = nullptr;
 
@@ -789,7 +791,7 @@ namespace llaminar2
                                       static_cast<int>(blocks_per_row),
                                       local_vocab_size,
                                       vocab_offset,
-                                      (validate_gpu_ptrs && dev == 0) ? 1 : 0,
+                                      (validate_gpu_ptrs && dev == 0 && !capture_active) ? 1 : 0,
                                       stream);
             if (validate_gpu_ptrs)
             {
@@ -842,7 +844,7 @@ namespace llaminar2
                     return false;
                 }
                 // Synchronize to ensure canary data is available on host
-                hipStreamSynchronize(static_cast<hipStream_t>(getStream()));
+                (void)hipStreamSynchronize(static_cast<hipStream_t>(getStream()));
 
                 auto find_mismatch = [](const std::vector<unsigned char> &buf, unsigned char expected) -> size_t
                 {
@@ -879,7 +881,7 @@ namespace llaminar2
                 }
             }
 
-            if (sync_embedding_stage)
+            if (allow_sync_embedding_stage)
             {
                 hipError_t sync_err = hipStreamSynchronize(stream);
                 if (sync_err != hipSuccess)
@@ -954,12 +956,24 @@ namespace llaminar2
 
     void ROCmEmbeddingKernelT::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
-        int dev_key = device_idx_;
-        if (workspace)
+        if (!workspace)
         {
-            const DeviceId ws_device = workspace->device();
-            dev_key = ws_device.toKernelDeviceIndex();
+            {
+                std::lock_guard<std::mutex> lock(workspace_mutex_);
+                workspace_ = nullptr;
+                workspace_by_device_.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lock(embed_cache_mutex_);
+                cached_embed_table_ = nullptr;
+                cached_embed_table_by_device_.clear();
+            }
+            return;
         }
+
+        int dev_key = device_idx_;
+        const DeviceId ws_device = workspace->device();
+        dev_key = ws_device.toKernelDeviceIndex();
 
         bool workspace_changed = false;
         {

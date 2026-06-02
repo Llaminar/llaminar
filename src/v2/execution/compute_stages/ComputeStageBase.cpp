@@ -5,6 +5,7 @@
 
 #include "IComputeStage.h"
 #include "ComputeStageUtils.h"
+#include "../local_execution/graph/GraphCaptureGuard.h"
 #include "../../utils/DebugEnv.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorVerification.h"
@@ -216,6 +217,20 @@ namespace llaminar2
 
         const auto &cfg = debugEnv().execution;
 
+        if (isGraphCaptureActive())
+        {
+            std::ostringstream oss;
+            oss << "[TRACE] " << name() << " INPUT '" << tensor_name << "' ";
+            if (cfg.trace_shapes)
+            {
+                oss << "[" << tensor->rows() << "x" << tensor->cols() << " "
+                    << tensor->dtype_name() << "] ";
+            }
+            oss << "[payload skipped during graph capture]";
+            LOG_DEBUG(oss.str());
+            return;
+        }
+
         // Safe data access - numel() and fp32_data() may return nullptr for released tensors
         size_t count = 0;
         try
@@ -294,6 +309,20 @@ namespace llaminar2
 
         const auto &cfg = debugEnv().execution;
 
+        if (isGraphCaptureActive())
+        {
+            std::ostringstream oss;
+            oss << "[TRACE] " << name() << " OUTPUT '" << tensor_name << "' ";
+            if (cfg.trace_shapes)
+            {
+                oss << "[" << tensor->rows() << "x" << tensor->cols() << " "
+                    << tensor->dtype_name() << "] ";
+            }
+            oss << "[payload skipped during graph capture]";
+            LOG_DEBUG(oss.str());
+            return;
+        }
+
         // Safe data access - numel() and fp32_data() may crash for invalid/empty tensors
         size_t count = 0;
         try
@@ -363,6 +392,19 @@ namespace llaminar2
             return;
 
         const auto &cfg = debugEnv().execution;
+
+        if (isGraphCaptureActive())
+        {
+            std::ostringstream oss;
+            oss << "[TRACE] " << name() << " INTERMEDIATE '" << array_name << "' ";
+            if (cfg.trace_shapes)
+            {
+                oss << "[" << count << " elems] ";
+            }
+            oss << "[payload skipped during graph capture]";
+            LOG_DEBUG(oss.str());
+            return;
+        }
 
         std::ostringstream oss;
         oss << "[TRACE] " << name() << " INTERMEDIATE '" << array_name << "' ";

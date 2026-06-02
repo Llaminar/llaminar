@@ -3681,6 +3681,12 @@ namespace llaminar2
             }
         }
 
+        if (!ensureDeviceWorkspaceAllocated(*sidecar_cache.graph))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate MTP sidecar workspace before dynamic param update");
+            return false;
+        }
+
         sidecar_cache.token_id = draft_condition_token;
         sidecar_cache.position_id = position_id;
         for (auto *stage : sidecar_cache.dynamic_param_stages)
@@ -3717,7 +3723,6 @@ namespace llaminar2
             bool used_segmented_capture = false;
             if (try_gpu_graph_capture && !rebuilt_graph)
             {
-                ensureDeviceWorkspaceAllocated(*sidecar_cache.graph);
                 if (!sidecar_gpu_ctx)
                 {
                     auto &pool = GPUDeviceContextPool::instance();

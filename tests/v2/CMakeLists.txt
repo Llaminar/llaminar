@@ -2878,6 +2878,19 @@ add_v2_test(V2_Unit_EmbeddingStage_GraphCapture
     MPI_PROCS 1
 )
 
+# Test: ComputeStage tracing must not materialize tensor payloads during graph capture
+add_executable(v2_test_compute_stage_trace_graph_capture unit/execution/compute_stages/Test__ComputeStageTraceGraphCapture.cpp)
+target_link_libraries(v2_test_compute_stage_trace_graph_capture
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_ComputeStageTraceGraphCapture
+    COMMAND $<TARGET_FILE:v2_test_compute_stage_trace_graph_capture>
+    LABELS "V2;Unit;Execution;ComputeStage;GraphCapture;Tracing;Regression;CPU"
+    MPI_PROCS 1
+)
+
 # Test: SwiGLU parity regression tests (locks in correct formula: gate * silu(up))
 add_executable(v2_test_swiglu_parity unit/kernels/cpu/ops/Test__SwiGLUParity.cpp)
 target_link_libraries(v2_test_swiglu_parity 

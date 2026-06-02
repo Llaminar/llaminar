@@ -96,9 +96,12 @@ namespace llaminar2
             LOG_ERROR("[FusedGateUpGEMMStage] Null output buffer(s)");
             return false;
         }
-        if (params_.m <= 0 || params_.k <= 0)
+        if (params_.m <= 0 || params_.k <= 0 || params_.n_gate <= 0 || params_.n_up <= 0)
         {
-            LOG_ERROR("[FusedGateUpGEMMStage] Invalid dimensions: m=" << params_.m << " k=" << params_.k);
+            LOG_ERROR("[FusedGateUpGEMMStage] Invalid dimensions: m=" << params_.m
+                                                                       << " k=" << params_.k
+                                                                       << " n_gate=" << params_.n_gate
+                                                                       << " n_up=" << params_.n_up);
             return false;
         }
 
@@ -115,6 +118,43 @@ namespace llaminar2
             return false;
         }
 
+        // Cast input/output tensors before resolving the prepared kernel so
+        // graph-declared arena buffer mismatches fail on the CPU side.
+        auto *input_base = requireTensorBase(params_.input, "input");
+        auto *output_gate_base = asTensorBase(params_.output_gate, "output_gate");
+        auto *output_up_base = asTensorBase(params_.output_up, "output_up");
+
+        if (!input_base || !output_gate_base || !output_up_base)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Failed to cast input/output tensors");
+            return false;
+        }
+
+        auto has_capacity = [](const TensorBase *tensor,
+                               const char *name,
+                               size_t rows,
+                               size_t cols) -> bool
+        {
+            const auto &shape = tensor->shape();
+            if (shape.size() < 2 || shape[0] < rows || shape[1] < cols)
+            {
+                LOG_ERROR("[FusedGateUpGEMMStage] " << name
+                                                    << " shape is too small: got ["
+                                                    << (shape.size() > 0 ? shape[0] : 0) << ", "
+                                                    << (shape.size() > 1 ? shape[1] : 0) << "], need at least ["
+                                                    << rows << ", " << cols << "]");
+                return false;
+            }
+            return true;
+        };
+
+        if (!has_capacity(input_base, "input", static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)) ||
+            !has_capacity(output_gate_base, "output_gate", static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_gate)) ||
+            !has_capacity(output_up_base, "output_up", static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_up)))
+        {
+            return false;
+        }
+
         LOG_DEBUG("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
                                                                        << " up=" << (void *)w_up_base << " device=" << params_.device_id.to_string());
 
@@ -128,17 +168,6 @@ namespace llaminar2
             return false;
         }
         fused_kernel->setGPUStream(gpuStream());
-
-        // Cast input/output tensors
-        auto *input_base = requireTensorBase(params_.input, "input");
-        auto *output_gate_base = asTensorBase(params_.output_gate, "output_gate");
-        auto *output_up_base = asTensorBase(params_.output_up, "output_up");
-
-        if (!input_base || !output_gate_base || !output_up_base)
-        {
-            LOG_ERROR("[FusedGateUpGEMMStage] Failed to cast input/output tensors");
-            return false;
-        }
 
         // Check if we have bias - use appropriate execute method
         if (params_.bias_gate || params_.bias_up)

@@ -326,26 +326,27 @@ namespace llaminar2
                 {"workspace_mask", {"batch_size * seq_len", "seq_len"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention mask"},
                 {"lm_head_input_row", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Stable selected hidden row for bucketed prefill LM head"},
 
-                // MTP sidecar buffers are one-token scratch surfaces. They stay
-                // separate from main graph scratch so speculative sidecar work
-                // cannot trample the terminal hidden/logit state being verified.
-                {"mtp_embedding", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding"},
-                {"mtp_norm_hidden", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden"},
-                {"mtp_norm_embedding", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding"},
-                {"mtp_concat", {"1", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized embedding and hidden"},
-                {"mtp_projected", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
-                {"mtp_hidden", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
-                {"mtp_q_raw", {"1", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output"},
-                {"mtp_q_gate", {"1", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate"},
-                {"mtp_q", {"1", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
-                {"mtp_k", {"1", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
-                {"mtp_v", {"1", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
-                {"mtp_attn_output", {"1", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention output"},
-                {"mtp_attn_proj", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
-                {"mtp_gate", {"1", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
-                {"mtp_up", {"1", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
-                {"mtp_ffn_output", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
-                {"mtp_logits", {"1", "local_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits shard"},
+                // MTP verifier sidecar buffers are declared as graph scratch with
+                // capacity for Phase 13.5 small-M verifier rows (M <= 4). Stages
+                // still execute their actual runtime m, so this is capacity, not
+                // a request to process four rows every time.
+                {"mtp_embedding", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding"},
+                {"mtp_norm_hidden", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden"},
+                {"mtp_norm_embedding", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding"},
+                {"mtp_concat", {"4", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized embedding and hidden"},
+                {"mtp_projected", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
+                {"mtp_hidden", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
+                {"mtp_q_raw", {"4", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output"},
+                {"mtp_q_gate", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate"},
+                {"mtp_q", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
+                {"mtp_k", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
+                {"mtp_v", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
+                {"mtp_attn_output", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention output"},
+                {"mtp_attn_proj", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
+                {"mtp_gate", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
+                {"mtp_up", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
+                {"mtp_ffn_output", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
+                {"mtp_logits", {"4", "local_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits shard"},
             };
 
             schema.model_buffers = {
