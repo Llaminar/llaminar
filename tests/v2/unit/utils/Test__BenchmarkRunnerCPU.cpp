@@ -381,6 +381,31 @@ TEST(Test__BenchmarkRunnerCPU, FailsBeforePrefillWhenPromptExceedsContext)
     EXPECT_NE(result.failure_reason.find("context length is 4"), std::string::npos);
 }
 
+TEST(Test__BenchmarkRunnerCPU, FailsBeforePrefillWhenPromptPlusDecodeExceedsContext)
+{
+    auto runner = std::make_shared<MockCPUInferenceRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Prompt fits, decode does not";
+    config.max_seq_len = 8;
+    config.n_predict = 4;
+
+    auto result = bench.run(config);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.prefill_success);
+    EXPECT_EQ(result.prefill_tokens, 5);
+    EXPECT_EQ(runner->forwardCount(), 0)
+        << "BenchmarkRunner must reject prompt+decode context overflow before prefill";
+    EXPECT_NE(result.failure_reason.find("benchmark request needs 9 total tokens"), std::string::npos);
+    EXPECT_NE(result.failure_reason.find("5 prompt + 4 decode"), std::string::npos);
+    EXPECT_NE(result.failure_reason.find("context length is 8"), std::string::npos);
+}
+
 TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
 {
     auto runner = std::make_shared<MockOrchestratedDecodeRunner>();

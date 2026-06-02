@@ -701,6 +701,26 @@ namespace llaminar2
             n_decode = 128; // Default for benchmark
         }
 
+        if (config.max_seq_len > 0 && n_decode > 0)
+        {
+            const int64_t requested_tokens =
+                static_cast<int64_t>(token_count) + static_cast<int64_t>(n_decode);
+            if (requested_tokens > static_cast<int64_t>(config.max_seq_len))
+            {
+                last_failure_reason_ =
+                    "benchmark request needs " + std::to_string(requested_tokens) +
+                    " total tokens (" + std::to_string(token_count) +
+                    " prompt + " + std::to_string(n_decode) +
+                    " decode) but context length is " + std::to_string(config.max_seq_len) +
+                    "; reduce -n/--n-predict, pass a shorter -p/--prompt, or increase -c/--context-length";
+                if (mpi_ctx_->rank() == 0)
+                {
+                    LOG_ERROR(last_failure_reason_);
+                }
+                return capture_and_return();
+            }
+        }
+
         if (mpi_ctx_->rank() == 0)
         {
             LOG_DEBUG("Benchmark configuration:");
