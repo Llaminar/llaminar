@@ -103,6 +103,16 @@ Latest workspace-binding validation:
   and `/tmp/llaminar-mtp-bench/dense-rocm-workspace-binding-mtp-c64-n8-stats.csv`.
   This was a validation smoke rather than a new best-speed result: decode was
   17.64 tok/s with 75% acceptance.
+- Follow-up release smoke after GDN/FusedQKV/FusedGateUp projection-specific
+  workspace sizing completed on Qwen3.6 dense ROCm SingleDevice with GPU stage
+  timing enabled: `/tmp/llaminar-mtp-bench/dense-rocm-workspace-projection-sizing-mtp-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-workspace-projection-sizing-mtp-c64-n8-stats.json`,
+  and `/tmp/llaminar-mtp-bench/dense-rocm-workspace-projection-sizing-mtp-c64-n8-stats.csv`.
+  Decode was 21.43 tok/s with 75% acceptance. This is diagnostic rather than a
+  new best-speed result because `LLAMINAR_GPU_STAGE_TIMING=1` was enabled;
+  `mtp.verifier_forward` averaged 68.84 ms, with main-verifier GPU stage totals
+  still dominated by `GDN_PROJECTION` 270.38 ms, `GEMM` 187.23 ms, and
+  `GEMM_FUSED_GATE_UP` 153.09 ms across the 12 verifier calls.
 
 Latest ROCm dense evidence:
 
