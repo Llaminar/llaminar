@@ -64,7 +64,7 @@ namespace llaminar2
     struct GraphCacheConfig
     {
         bool enabled = true;         ///< Enable graph caching (Phase 10)
-        int decode_seq_len = 2;      ///< Max continuation length that can use decode caching.
+        int decode_seq_len = 4;      ///< Max continuation length that can use decode caching.
         bool cache_attention = true; ///< Cache attention graphs
         bool cache_ffn = true;       ///< Cache FFN graphs
     };

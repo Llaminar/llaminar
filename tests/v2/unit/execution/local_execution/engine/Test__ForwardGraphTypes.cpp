@@ -385,7 +385,7 @@ TEST(Test__GraphCacheConfig, Defaults)
 {
     GraphCacheConfig config;
     EXPECT_TRUE(config.enabled);
-    EXPECT_EQ(config.decode_seq_len, 2);
+    EXPECT_EQ(config.decode_seq_len, 4);
     EXPECT_TRUE(config.cache_attention);
     EXPECT_TRUE(config.cache_ffn);
 }

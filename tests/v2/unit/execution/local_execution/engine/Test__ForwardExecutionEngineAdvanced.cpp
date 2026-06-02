@@ -398,6 +398,50 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, ShortContinuationDecodeShapeCachesF
         << "Fixed two-token verifier continuations should be eligible for decode graph capture";
 }
 
+TEST_F(Test__ForwardExecutionEngineAdvanced, FourTokenAllPositionVerifierUsesDecodeCache)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    TrackingHost host(&gpu_ctx);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    TestInput verifier1(4, 1, DeviceId::cuda(0), /*position_offset=*/128);
+    engine.execute(verifier1.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+
+    TestInput verifier2(4, 1, DeviceId::cuda(0), /*position_offset=*/132);
+    engine.execute(verifier2.input, output, host);
+    EXPECT_EQ(host.build_calls, 1)
+        << "M=4 all-position verifier continuations should reuse the decode graph cache";
+    EXPECT_GT(host.build_decode_policy_calls, 0)
+        << "M=4 verifier continuations should be eligible for decode graph capture";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, ThreeTokenAllPositionVerifierUsesDecodeCache)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    TrackingHost host(&gpu_ctx);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    TestInput verifier1(3, 1, DeviceId::cuda(0), /*position_offset=*/128);
+    engine.execute(verifier1.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+
+    TestInput verifier2(3, 1, DeviceId::cuda(0), /*position_offset=*/131);
+    engine.execute(verifier2.input, output, host);
+    EXPECT_EQ(host.build_calls, 1)
+        << "M=3 all-position verifier continuations should reuse the decode graph cache";
+    EXPECT_GT(host.build_decode_policy_calls, 0)
+        << "M=3 verifier continuations should be eligible for decode graph capture";
+}
+
 TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryDoesNotUseDecodeCache)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
