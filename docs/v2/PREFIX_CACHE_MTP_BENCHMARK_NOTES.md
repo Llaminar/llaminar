@@ -1204,8 +1204,8 @@ Latest ROCm dense evidence:
     compares each projection against the direct native-VNNI path. The focused
     release binary run passed with cosine 1.0 for all rows:
     `Q4_1`, `K=5120`, `N={12288,6144,1024}` measured M=2/3/4 at about
-    112.8/128.0/127.5 us; `Q5_1`, `K=5120`, `N={10240,1024}` measured
-    M=2/3/4 at about 92.6/100.3/106.9 us. A scoped `CPT=2` experiment in the
+    111.5/129.1/127.4 us; `Q5_1`, `K=5120`, `N={10240,1024}` measured
+    M=2/3/4 at about 103.7/108.8/111.5 us. A scoped `CPT=2` experiment in the
     batched launcher was rejected because it slowed the same rows to about
     192.8/203.5/221.9 us and 147.4/163.5/181.1 us respectively. This explains
     why the full verifier GDN projection bucket remains around 10 ms/pass:
