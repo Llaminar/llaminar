@@ -92,10 +92,19 @@ namespace llaminar2
                 if (!backend)
                     return -1;
 
+                const auto &shape = info.tensor->shape();
+                const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+                const size_t cols = info.vocab_local;
+                if (cols == 0 || static_cast<size_t>(row) >= rows)
+                    return -1;
+
+                const auto *row_ptr =
+                    static_cast<const float *>(info.gpu_ptr) + static_cast<size_t>(row) * cols;
+
                 // Drive the multi-block argmax with the runner's arena-owned scratch
                 // (null/zero capacity -> argmaxF32 fails, and we degrade to host-side
                 // sampling below). No allocation happens on this hot path.
-                if (!backend->argmaxF32(info.gpu_ptr,
+                if (!backend->argmaxF32(row_ptr,
                                         static_cast<int>(info.vocab_local),
                                         info.device->gpu_ordinal(),
                                         &max_val, &max_idx, info.stream,

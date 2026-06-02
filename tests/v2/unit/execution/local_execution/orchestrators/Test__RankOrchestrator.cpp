@@ -1961,7 +1961,7 @@ TEST_F(Test__RankOrchestrator, MultiChildAllPositionSamplingUsesRequestedColumnP
         /*rows=*/2,
         /*local_vocab=*/2,
         {0.1f, 0.2f,
-         0.3f, 4.0f});
+         0.3f, 6.0f});
 
     auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
     runner1->set_mock_all_position_logits_local(
@@ -1984,7 +1984,7 @@ TEST_F(Test__RankOrchestrator, MultiChildAllPositionSamplingUsesRequestedColumnP
         makeRankConfigForRunnerCount(2));
 
     EXPECT_EQ(orchestrator->sampleGreedyFromAllPositionLogitsOnDevice(0), 2);
-    EXPECT_EQ(orchestrator->sampleGreedyFromAllPositionLogitsOnDevice(1), 2);
+    EXPECT_EQ(orchestrator->sampleGreedyFromAllPositionLogitsOnDevice(1), 1);
     EXPECT_EQ(orchestrator->sampleGreedyFromAllPositionLogitsOnDevice(2), -1);
 }
 
