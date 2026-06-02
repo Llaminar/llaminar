@@ -340,6 +340,35 @@ namespace llaminar2
         return dynamic_cast<IWorkspaceConsumer *>(cached_kernel_);
     }
 
+    WorkspaceRequirements FusedGateUpGEMMStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_gate.has_value() ||
+            !params_.prepared_ref_up.has_value())
+        {
+            LOG_TRACE("[FusedGateUpGEMMStage::getWorkspaceRequirements] PreparedWeightStore and gate/up refs are required");
+            return {};
+        }
+
+        const int workspace_m = (m > 0) ? m : params_.m;
+        const int workspace_k = (k > 0) ? k : params_.k;
+
+        WorkspaceRequirements combined;
+        auto mergeFrom = [&](const PreparedWeightRef &ref, int projection_n)
+        {
+            auto *gemm = params_.prepared_store->gemmKernel(ref);
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+            if (!consumer)
+                return;
+            const int workspace_n = (projection_n > 0) ? projection_n : n;
+            combined.merge(consumer->getWorkspaceRequirements(workspace_m, workspace_n, workspace_k));
+        };
+
+        mergeFrom(params_.prepared_ref_gate.value(), params_.n_gate);
+        mergeFrom(params_.prepared_ref_up.value(), params_.n_up);
+        return combined;
+    }
+
     StageBufferContract FusedGateUpGEMMStage::bufferContract() const
     {
         if (!params_.input_buffer_id || !params_.output_gate_buffer_id ||

@@ -84,6 +84,9 @@ Latest workspace-binding validation:
 - Dense FusedQKV workspace planning now asks the Q, K, and V kernels for their
   actual projection widths (`n_q`, `n_k`, `n_v`) rather than passing one generic
   graph hint across GQA projections.
+- Dense FusedGateUp workspace planning now asks the gate and up kernels for
+  their actual projection widths (`n_gate`, `n_up`) instead of delegating one
+  generic `n` through the fused adapter.
 - Focused regressions:
   `Test__ROCmFloatingPointGemmKernel.GraphCapturedBatchedFusedProjectionAlphaBetaM2MatchesReference`,
   `Test__ROCmFloatingPointGemmKernel.BatchedFusedProjectionRequiresWorkspace`,
@@ -93,7 +96,7 @@ Latest workspace-binding validation:
   adds `Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch`
   and `Projection_WorkspaceRequirementsUsePerProjectionN` plus the existing
   ShortConv/GDN recurrence workspace requirement checks. `V2_Unit_FusedQKVGEMMStage`
-  adds `WorkspaceRequirementsUsePerProjectionN`.
+  and `V2_Unit_FusedGateUpGEMMStage` add `WorkspaceRequirementsUsePerProjectionN`.
 - Real Qwen3.6 dense ROCm depth-1 MTP graph-capture smoke completed:
   `/tmp/llaminar-mtp-bench/dense-rocm-workspace-binding-mtp-c64-n8-bench.json`,
   `/tmp/llaminar-mtp-bench/dense-rocm-workspace-binding-mtp-c64-n8-stats.json`,

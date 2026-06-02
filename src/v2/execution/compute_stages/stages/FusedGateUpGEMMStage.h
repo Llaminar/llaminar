@@ -90,6 +90,7 @@ namespace llaminar2
         // IWorkspaceConsumerStage Implementation
         // =============================================================================
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
     private:
         Params params_;
