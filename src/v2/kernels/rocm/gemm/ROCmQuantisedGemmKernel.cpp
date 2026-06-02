@@ -310,6 +310,22 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
+            bool rocmGemv_native_vnni_small_m_batched_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *const *d_payloads,
+                const uint16_t *const *d_block_scales,
+                const uint16_t *const *d_block_mins,
+                const uint32_t *const *d_block_emins,
+                const float *const *d_biases,
+                float *const *d_outputs,
+                const float *d_scale_A_blockwise, // [M × blocks_per_row]
+                float *const *d_partials,         // per-projection [KB_MAX × M × N]
+                const int *Ns,
+                int num_projections,
+                int M, int K,
+                uint8_t codebook_id,
+                int device_id, void *stream);
+
             // =========================================================================
             // Fused FP32→INT8 quantize + GEMV + scale kernel for decode (M=1)
             // Eliminates 3-kernel pipeline: quantize → GEMV → applyScaling
@@ -3719,6 +3735,208 @@ namespace llaminar2
                     if (ws && ws != saved_workspace)
                         workspace_ = saved_workspace;
                     return true;
+                }
+            }
+#endif // HAVE_ROCM
+
+#ifdef HAVE_ROCM
+            if (small_m_native_verifier_fused &&
+                projections.size() >= 2 &&
+                projections.size() <= 8)
+            {
+                std::array<const uint8_t *, 8> payloads{};
+                std::array<const uint16_t *, 8> scales{};
+                std::array<const uint16_t *, 8> mins{};
+                std::array<const uint32_t *, 8> emins{};
+                std::array<float *, 8> outputs{};
+                std::array<float *, 8> partials{};
+                std::array<const float *, 8> biases{};
+                std::array<int, 8> Ns{};
+
+                bool batched_eligible = true;
+                std::string batched_bypass_reason;
+                uint8_t common_codebook = 0;
+                bool have_common_codebook = false;
+
+                auto mark_batched_bypass = [&](std::string reason)
+                {
+                    if (batched_bypass_reason.empty())
+                        batched_bypass_reason = std::move(reason);
+                    batched_eligible = false;
+                };
+
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(proj.kernel);
+                    auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
+                    if (!rocm_kernel || !rocm_kernel->impl_ || !rocm_kernel->impl_->has_native_vnni)
+                    {
+                        mark_batched_bypass("non_native_projection");
+                        break;
+                    }
+                    if (!fp32_output)
+                    {
+                        mark_batched_bypass("non_fp32_output");
+                        break;
+                    }
+                    if (fp32_output->isMapped())
+                    {
+                        mark_batched_bypass("mapped_output");
+                        break;
+                    }
+                    if (!rocm_kernel->impl_->d_weights_native_vnni ||
+                        !rocm_kernel->impl_->d_weights_native_scales ||
+                        !rocm_kernel->impl_->d_scatter_partial)
+                    {
+                        mark_batched_bypass("missing_native_buffers");
+                        break;
+                    }
+
+                    const uint8_t codebook = rocm_kernel->impl_->native_vnni_codebook_id;
+                    if (!have_common_codebook)
+                    {
+                        common_codebook = codebook;
+                        have_common_codebook = true;
+                    }
+                    else if (common_codebook != codebook)
+                    {
+                        mark_batched_bypass("mixed_codebook");
+                        break;
+                    }
+
+                    float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                    if (!d_output)
+                    {
+                        mark_batched_bypass("missing_output_device_ptr");
+                        break;
+                    }
+
+                    const float *d_bias = nullptr;
+                    if (proj.bias)
+                    {
+                        if (proj.bias->native_type() != TensorType::FP32)
+                        {
+                            mark_batched_bypass("non_fp32_bias");
+                            break;
+                        }
+
+                        auto *bias_tensor = const_cast<TensorBase *>(proj.bias);
+                        const DeviceId target_device = DeviceId::rocm(rocm_device_id_);
+                        const auto current_dev = bias_tensor->current_device();
+                        if (current_dev.has_value() && current_dev.value() == target_device)
+                        {
+                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        }
+                        else if (current_dev.has_value() && current_dev->is_gpu())
+                        {
+                            mark_batched_bypass("bias_wrong_gpu");
+                            break;
+                        }
+                        else
+                        {
+                            if (!bias_tensor->ensureOnDevice(target_device))
+                            {
+                                mark_batched_bypass("bias_upload_failed");
+                                break;
+                            }
+                            d_bias = static_cast<const float *>(bias_tensor->gpu_data_ptr());
+                        }
+
+                        if (!d_bias)
+                        {
+                            mark_batched_bypass("missing_bias_device_ptr");
+                            break;
+                        }
+                    }
+
+                    payloads[i] = rocm_kernel->impl_->d_weights_native_vnni;
+                    scales[i] = static_cast<const uint16_t *>(rocm_kernel->impl_->d_weights_native_scales);
+                    mins[i] = static_cast<const uint16_t *>(rocm_kernel->impl_->d_weights_native_mins);
+                    emins[i] = static_cast<const uint32_t *>(rocm_kernel->impl_->d_weights_native_emins);
+                    outputs[i] = d_output;
+                    partials[i] = rocm_kernel->impl_->d_scatter_partial;
+                    biases[i] = d_bias;
+                    Ns[i] = proj.n;
+                }
+
+                if (batched_eligible)
+                {
+                    if (!rocmGemv_native_vnni_small_m_batched_fp32(
+                            impl_->d_A_int8,
+                            payloads.data(),
+                            scales.data(),
+                            mins.data(),
+                            emins.data(),
+                            biases.data(),
+                            outputs.data(),
+                            impl_->d_scales_A_blockwise,
+                            partials.data(),
+                            Ns.data(),
+                            static_cast<int>(projections.size()),
+                            m, k,
+                            common_codebook,
+                            rocm_device_id_,
+                            gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M batched GEMV failed"
+                                  << " m=" << m << " k=" << k
+                                  << " projections=" << projections.size()
+                                  << " codebook=" << static_cast<int>(common_codebook));
+                        return false;
+                    }
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_native_vnni_small_m_batched_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"codebook", std::to_string(static_cast<int>(common_codebook))},
+                                {"k", std::to_string(k)},
+                                {"projections", std::to_string(projections.size())}});
+
+                        for (const int n_value : Ns)
+                        {
+                            if (n_value <= 0)
+                                continue;
+                            PerfStatsCollector::addCounter(
+                                "kernel",
+                                "rocm_native_vnni_small_m_batched_projection_calls",
+                                1.0,
+                                "gemm",
+                                "rocm:" + std::to_string(rocm_device_id_),
+                                PerfStatsCollector::Tags{
+                                    {"m", std::to_string(m)},
+                                    {"codebook", std::to_string(static_cast<int>(common_codebook))},
+                                    {"n", std::to_string(n_value)},
+                                    {"k", std::to_string(k)}});
+                        }
+                    }
+
+                    LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched native small-M verifier complete"
+                              << " M=" << m << " K=" << k
+                              << " projections=" << projections.size());
+                    return true;
+                }
+
+                if (PerfStatsCollector::isEnabled() && !batched_bypass_reason.empty())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "rocm_native_vnni_small_m_batched_bypasses",
+                        1.0,
+                        "gemm",
+                        "rocm:" + std::to_string(rocm_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"m", std::to_string(m)},
+                            {"k", std::to_string(k)},
+                            {"projections", std::to_string(projections.size())},
+                            {"reason", batched_bypass_reason}});
                 }
             }
 #endif // HAVE_ROCM

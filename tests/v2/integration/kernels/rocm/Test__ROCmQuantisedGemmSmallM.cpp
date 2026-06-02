@@ -744,26 +744,40 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMRecordsSharedQuantizedNativ
     EXPECT_GE(shared_quant_record->value, 1.0);
     EXPECT_EQ(shared_quant_record->device, "rocm:0");
 
-    double shared_native_projection_calls = 0.0;
+    double batched_calls = 0.0;
+    double batched_projection_calls = 0.0;
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_small_m_calls" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
             record.tags.count("m") != 0 &&
             record.tags.at("m") == std::to_string(M) &&
-            record.tags.count("shared_quant") != 0 &&
-            record.tags.at("shared_quant") == "true")
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == std::to_string(K) &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "3")
         {
-            shared_native_projection_calls += record.value;
+            batched_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == std::to_string(M) &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == std::to_string(K))
+        {
+            batched_projection_calls += record.value;
         }
     }
-    if (shared_native_projection_calls < 3.0)
+    if (batched_calls < 1.0 || batched_projection_calls < 3.0)
     {
         for (const auto &record : records)
         {
             if (record.domain != "kernel" ||
-                record.name.find("rocm_native_vnni") == std::string::npos)
+                (record.name.find("rocm_native_vnni") == std::string::npos &&
+                 record.name.find("rocm_fused") == std::string::npos))
             {
                 continue;
             }
@@ -780,8 +794,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMRecordsSharedQuantizedNativ
                      << " tags=" << tags);
         }
     }
-    EXPECT_GE(shared_native_projection_calls, 3.0)
-        << "Fused QKV M=4 should dispatch Q, K, and V through the shared-quant native route";
+    EXPECT_GE(batched_calls, 1.0)
+        << "Fused QKV M=4 should use one graph-native batched native route";
+    EXPECT_GE(batched_projection_calls, 3.0)
+        << "Fused QKV M=4 batched route should cover Q, K, and V projections";
 
     PerfStatsCollector::reset();
 }
@@ -824,20 +840,37 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2RecordsSharedQuantizedNativeRou
     EXPECT_GE(shared_quant_record->value, 1.0);
     EXPECT_EQ(shared_quant_record->device, "rocm:0");
 
-    double shared_native_projection_calls = 0.0;
+    double batched_calls = 0.0;
+    double batched_projection_calls = 0.0;
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
-            record.name == "rocm_native_vnni_m2_calls" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
             record.kind == PerfStatRecord::Kind::Counter &&
-            record.tags.count("shared_quant") != 0 &&
-            record.tags.at("shared_quant") == "true")
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == std::to_string(K) &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "3")
         {
-            shared_native_projection_calls += record.value;
+            batched_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == std::to_string(K))
+        {
+            batched_projection_calls += record.value;
         }
     }
-    EXPECT_GE(shared_native_projection_calls, 3.0)
-        << "Fused QKV M=2 should dispatch Q, K, and V through the shared-quant native route";
+    EXPECT_GE(batched_calls, 1.0)
+        << "Fused QKV M=2 should use one graph-native batched native route";
+    EXPECT_GE(batched_projection_calls, 3.0)
+        << "Fused QKV M=2 batched route should cover Q, K, and V projections";
 
     PerfStatsCollector::reset();
 }
