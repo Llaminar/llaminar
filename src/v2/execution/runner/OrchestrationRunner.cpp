@@ -1021,6 +1021,15 @@ namespace llaminar2
         {
             return fail_after_checkpoint("MTP sidecar forward failed");
         }
+        PrefixStateSnapshot post_sidecar_checkpoint;
+        {
+            PerfStatsCollector::ScopedTimer timer("mtp", "capture_post_sidecar_prefix_state", "decode");
+            post_sidecar_checkpoint = runner_->captureLivePrefixCheckpoint();
+        }
+        if (!post_sidecar_checkpoint.valid)
+        {
+            return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
+        }
 
         int32_t mtp_token = -1;
         {
@@ -1214,6 +1223,14 @@ namespace llaminar2
                 PerfStatsCollector::addCounter("mtp", "verifier_terminal_token_device_samples", 1.0, "decode");
             }
 
+            if (!runner_->commitMTPShiftedRowsFromLastForward(
+                    accepted_tokens.data(),
+                    static_cast<int>(accepted_tokens.size()),
+                    /*already_appended_tokens=*/1))
+            {
+                return fail_after_checkpoint("MTP shifted-cache commit failed after accepted verifier");
+            }
+
             PerfStatsCollector::addCounter("mtp", "verifier_state_commits", 1.0, "decode");
             prefill_logits_ready_ = true;
             ready_sampled_token_ = next_ready_token;
@@ -1234,22 +1251,18 @@ namespace llaminar2
         bool restored = false;
         {
             PerfStatsCollector::ScopedTimer timer("mtp", "restore_live_prefix_state", "decode");
-            restored = runner_->restoreLivePrefixState(checkpoint);
+            restored = runner_->restoreLivePrefixState(post_sidecar_checkpoint);
         }
         if (!restored)
         {
-            result.error = "MTP decode failed to restore live prefix checkpoint";
+            result.error = "MTP decode failed to restore post-sidecar live prefix checkpoint";
             return result;
         }
         ++mtp_stats_.rollbacks;
         PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
 
         std::vector<int32_t> replay_tokens;
-        replay_tokens.reserve((use_ready_logits ? 0 : 1) + accepted_tokens.size());
-        if (!use_ready_logits)
-        {
-            replay_tokens.push_back(condition_token);
-        }
+        replay_tokens.reserve(accepted_tokens.size());
         for (int32_t token : accepted_tokens)
         {
             replay_tokens.push_back(token);
@@ -1263,6 +1276,14 @@ namespace llaminar2
         if (!replay_ok)
         {
             result.error = "Forward pass failed during MTP replay";
+            return result;
+        }
+        if (!runner_->commitMTPShiftedRowsFromLastForward(
+                accepted_tokens.data(),
+                static_cast<int>(accepted_tokens.size()),
+                /*already_appended_tokens=*/1))
+        {
+            result.error = "MTP shifted-cache commit failed after replay";
             return result;
         }
         prefill_logits_ready_ = true;

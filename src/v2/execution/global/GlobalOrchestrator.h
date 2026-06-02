@@ -140,6 +140,10 @@ namespace llaminar2
         void setAccumulatePrefillAll(bool accumulate);
         void flushStageTimelineAll();
         bool forwardMTPAll(int32_t draft_condition_token);
+        bool commitMTPShiftedRowsFromLastForwardAll(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens);
         bool setComputeAllPositionLogitsAll(bool enabled);
         uint64_t moePlacementEpochAll() const;
         PrefixStateSnapshot captureLivePrefixStateAll(int seq_idx = 0) const;
@@ -261,6 +265,10 @@ namespace llaminar2
         ExecutionPath executionPath() const override;
         const char *architecture() const override;
         bool forwardMTP(int32_t draft_condition_token) override;
+        bool commitMTPShiftedRowsFromLastForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens) override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;

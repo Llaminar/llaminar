@@ -209,6 +209,21 @@ namespace
             return mtp_logits_.empty() ? nullptr : mtp_logits_.data();
         }
 
+        bool commitMTPShiftedRowsFromLastForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens) override
+        {
+            commit_mtp_shifted_count_++;
+            last_commit_mtp_already_appended_ = already_appended_tokens;
+            last_commit_mtp_tokens_.clear();
+            if (tokens && token_count > 0)
+            {
+                last_commit_mtp_tokens_.assign(tokens, tokens + token_count);
+            }
+            return token_count <= already_appended_tokens || tokens != nullptr;
+        }
+
         bool hasMTPLogitsLocal() const override
         {
             return column_parallel_logits_ && mtp_logits_local_ != nullptr;
@@ -325,6 +340,9 @@ namespace
         int restoreCount() const { return restore_count_; }
         int setAllPositionCount() const { return set_all_position_count_; }
         int lastMTPConditionToken() const { return last_mtp_condition_token_; }
+        int commitMTPShiftedCount() const { return commit_mtp_shifted_count_; }
+        int lastCommitMTPAlreadyAppended() const { return last_commit_mtp_already_appended_; }
+        const std::vector<int> &lastCommitMTPTokens() const { return last_commit_mtp_tokens_; }
         int sampleMainLogitsCount() const { return sample_main_logits_count_; }
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
         int sampleAllPositionLogitsCount() const { return sample_all_position_logits_count_; }
@@ -507,6 +525,8 @@ namespace
         int clear_cache_count_{0};
         int restore_count_{0};
         int set_all_position_count_{0};
+        int commit_mtp_shifted_count_{0};
+        int last_commit_mtp_already_appended_{0};
         int sample_main_logits_count_{0};
         int sample_mtp_logits_count_{0};
         int sample_all_position_logits_count_{0};
@@ -526,6 +546,7 @@ namespace
         PrefixStateSnapshot captured_snapshot_;
         PrefixStateSnapshot last_restored_snapshot_;
         std::vector<int> last_forward_tokens_;
+        std::vector<int> last_commit_mtp_tokens_;
         int last_forward_seq_len_{0};
         int position_{0};
     };
@@ -821,6 +842,11 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_THAT(mock->lastCommitMTPTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(mock->restoreCount(), 0);
         EXPECT_GE(mock->setAllPositionCount(), 2);
         EXPECT_THAT(mock->lastForwardTokens(),
@@ -873,6 +899,11 @@ namespace
             GenerationResult step1 = runner->decodeStep();
             ASSERT_TRUE(step1.success());
             EXPECT_EQ(mock->forwardMTPCount(), 1);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_THAT(mock->lastCommitMTPTokens(),
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *step_calls =
@@ -945,6 +976,11 @@ namespace
             ASSERT_TRUE(step1.success());
             EXPECT_EQ(mock->forwardMTPCount(), 1);
             EXPECT_EQ(mock->restoreCount(), 1);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_THAT(mock->lastCommitMTPTokens(),
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *reject_trace =
@@ -1158,6 +1194,11 @@ namespace
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_EQ(mock->restoreCount(), 1);
+        EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_THAT(mock->lastCommitMTPTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
@@ -1396,6 +1437,11 @@ namespace
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(child_ptr->forwardMTPCount(), 1);
         EXPECT_EQ(child_ptr->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+        EXPECT_EQ(child_ptr->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(child_ptr->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_THAT(child_ptr->lastCommitMTPTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_EQ(child_ptr->restoreCount(), 0);
 
         auto probe = runner->prefixStateProbe();
@@ -1424,6 +1470,16 @@ namespace
         EXPECT_EQ(harness.child1->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_EQ(harness.child0->restoreCount(), 0);
         EXPECT_EQ(harness.child1->restoreCount(), 0);
+        EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child0->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_EQ(harness.child1->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_THAT(harness.child0->lastCommitMTPTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_THAT(harness.child1->lastCommitMTPTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
         EXPECT_GE(harness.child0->setAllPositionCount(), 2);
         EXPECT_GE(harness.child1->setAllPositionCount(), 2);
         EXPECT_THAT(harness.child0->lastForwardTokens(),
@@ -1482,6 +1538,16 @@ namespace
         EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
         EXPECT_EQ(harness.child0->restoreCount(), 1);
         EXPECT_EQ(harness.child1->restoreCount(), 1);
+        EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child0->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_EQ(harness.child1->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_THAT(harness.child0->lastCommitMTPTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+        EXPECT_THAT(harness.child1->lastCommitMTPTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_THAT(harness.child0->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));

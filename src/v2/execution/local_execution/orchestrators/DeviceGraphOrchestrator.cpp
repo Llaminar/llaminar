@@ -3901,6 +3901,99 @@ namespace llaminar2
             "mtp_decode_sidecar");
     }
 
+    bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromLastForward(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (token_count <= already_appended_tokens)
+            return true;
+        if (!tokens || token_count <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires accepted tokens");
+            return false;
+        }
+        if (already_appended_tokens < 1)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit expects the sidecar to own the first accepted token");
+            return false;
+        }
+        if (!state_.hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires hidden rows from the last main forward");
+            return false;
+        }
+        if (state_.positions.empty())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires position state");
+            return false;
+        }
+
+        const int position_offset = state_.positions[0] - token_count;
+        if (position_offset < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP shifted-row commit position_offset="
+                      << position_offset << " token_count=" << token_count);
+            return false;
+        }
+
+        IKVCache *cache = state_.mtp_kv_caches.empty() ? nullptr : state_.mtp_kv_caches[0].get();
+        if (!cache)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires an initialized MTP KV cache");
+            return false;
+        }
+
+        const int expected_cached_tokens =
+            std::max(0, position_offset - 1 + already_appended_tokens);
+        const int current_cached_tokens =
+            cache->get_cached_tokens(cache->first_layer_index(), 0);
+        if (current_cached_tokens != expected_cached_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit cache mismatch: current="
+                      << current_cached_tokens << " expected=" << expected_cached_tokens
+                      << " position_offset=" << position_offset
+                      << " already_appended=" << already_appended_tokens);
+            return false;
+        }
+
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "shifted_row_commit",
+            perfPhaseName(),
+            state_.device_id.toString());
+
+        for (int token_index = already_appended_tokens; token_index < token_count; ++token_index)
+        {
+            const int hidden_row = token_index - 1;
+            if (!selectMTPTerminalHiddenRow(hidden_row, token_count))
+                return false;
+            if (!executeMTPDepth0(tokens[token_index],
+                                  state_.prefix_terminal_hidden.get(),
+                                  position_offset + token_index,
+                                  "mtp_decode_catchup"))
+            {
+                return false;
+            }
+        }
+
+        if (!refreshMTPTerminalHiddenState(token_count, 1))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to restore terminal hidden after MTP shifted-row commit");
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_rows_committed",
+            static_cast<double>(token_count - already_appended_tokens),
+            perfPhaseName(),
+            state_.device_id.toString());
+        return true;
+    }
+
     const float *DeviceGraphOrchestrator::mtpLogits() const
     {
         auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);

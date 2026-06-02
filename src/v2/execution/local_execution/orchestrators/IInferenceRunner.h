@@ -167,6 +167,29 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Commit shifted MTP KV rows from the most recent main forward.
+         *
+         * MTP decode calls forwardMTP() before verifier/replay; that sidecar
+         * step already appends the shifted row for tokens[0]. After the main
+         * verifier or replay forward produces hidden rows for the accepted
+         * token sequence, this method appends any remaining shifted rows so
+         * the depth-0 MTP KV cache returns to the main_position - 1 invariant.
+         *
+         * @param tokens Accepted/correction tokens from the last main forward.
+         * @param token_count Number of accepted/correction tokens.
+         * @param already_appended_tokens Prefix of tokens already represented
+         *        by the speculative sidecar KV append.
+         */
+        virtual bool commitMTPShiftedRowsFromLastForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens)
+        {
+            (void)tokens;
+            return token_count <= already_appended_tokens;
+        }
+
         virtual const float *mtpLogits() const
         {
             return nullptr;

@@ -468,6 +468,34 @@ namespace llaminar2
         return saw_runner && ok;
     }
 
+    bool StageRunnerRegistry::commitMTPShiftedRowsFromLastForwardAll(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens)
+    {
+        bool saw_runner = false;
+        bool ok = true;
+        for (auto &entry : entries_)
+        {
+            saw_runner = true;
+            ok = entry.runner->commitMTPShiftedRowsFromLastForward(
+                     tokens,
+                     token_count,
+                     already_appended_tokens) &&
+                 ok;
+        }
+        if (compatibility_runner_)
+        {
+            saw_runner = true;
+            ok = compatibility_runner_->commitMTPShiftedRowsFromLastForward(
+                     tokens,
+                     token_count,
+                     already_appended_tokens) &&
+                 ok;
+        }
+        return saw_runner && ok;
+    }
+
     bool StageRunnerRegistry::setComputeAllPositionLogitsAll(bool enabled)
     {
         bool saw_runner = false;
@@ -1209,6 +1237,19 @@ namespace llaminar2
         if (!mtpDecodeUnsupportedReason().empty())
             return false;
         return stage_runners_.forwardMTPAll(draft_condition_token);
+    }
+
+    bool GlobalOrchestrator::commitMTPShiftedRowsFromLastForward(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens)
+    {
+        if (!mtpDecodeUnsupportedReason().empty())
+            return false;
+        return stage_runners_.commitMTPShiftedRowsFromLastForwardAll(
+            tokens,
+            token_count,
+            already_appended_tokens);
     }
 
     const float *GlobalOrchestrator::mtpLogits() const
