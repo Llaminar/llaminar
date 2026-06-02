@@ -402,6 +402,13 @@ Latest ROCm dense evidence:
     `main_verifier` replay still averages about 103.33 ms per two-token graph,
     with final sync about 103.07 ms; decode sidecar replay averages about
     2.65 ms and catch-up replay about 0.64 ms.
+  - Rejected ROCm sidecar no-recapture experiment: removing the
+    ROCm-specific sidecar `force_recapture` policy passed the synthetic
+    graph-construction unit path but failed real Qwen3.6
+    `PrefixCacheMTPRestore` parity with an HSA memory access fault after prefix
+    restore. The current unit regression records the policy explicitly:
+    ROCm sidecar decode/shifted-prefill uses `force_recapture=true`, while CUDA
+    remains `force_recapture=false`.
   - Next ROCm SingleDevice sprint target remains the captured verifier graph's
     GPU work and MTP per-step overhead. More host-side fallbacks or flag guards
     are not expected to create the Phase 14 speedup.

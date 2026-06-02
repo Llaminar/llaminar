@@ -1749,11 +1749,13 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
     ASSERT_NE(segmented_path, nullptr);
     EXPECT_GE(segmented_path->value, 3.0);
 
+    const std::string expected_force_recapture = device->is_rocm() ? "true" : "false";
     const auto policy_tags = PerfStatsCollector::Tags{
         {"allow_segmented", "true"},
         {"collective_segmented", "false"},
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_decode_sidecar"},
+        {"force_recapture", expected_force_recapture},
         {"has_collectives", "false"}};
     const PerfStatRecord *policy_record = findMTPRecord(
         records,
@@ -1803,11 +1805,13 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
     ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const std::string expected_force_recapture = device->is_rocm() ? "true" : "false";
     const auto policy_tags = PerfStatsCollector::Tags{
         {"allow_segmented", "true"},
         {"collective_segmented", "false"},
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_shifted_prefill"},
+        {"force_recapture", expected_force_recapture},
         {"has_collectives", "false"}};
     const PerfStatRecord *policy_record = findMTPRecord(
         records,
