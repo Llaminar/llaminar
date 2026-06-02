@@ -193,6 +193,7 @@ foreach(_full_name IN LISTS _all_tests)
     # Parity tests load large models and consume significant memory/GPU resources.
     # Using the same lock as regular integration tests prevents any concurrent execution.
     string(APPEND _output "    RESOURCE_LOCK \"Integration_Serial\"\n")
+    string(APPEND _output "    RUN_SERIAL TRUE\n")
     string(APPEND _output ")\n\n")
 endforeach()
 
