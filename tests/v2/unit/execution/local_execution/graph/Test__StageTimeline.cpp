@@ -305,6 +305,7 @@ TEST_F(Test__StageTimeline, Collect_NoValidEvents_ReturnsEarly)
     timeline.initialize(gpu_ctx_.get(), 5);
 
     // Don't record any events — all valid flags are false
+    EXPECT_FALSE(timeline.hasValidRecords());
 
     timeline.collect(gpu_ctx_.get());
 
@@ -334,9 +335,11 @@ TEST_F(Test__StageTimeline, ResetTimings_ClearsValidFlags)
         timeline.recordStart(i, gpu_ctx_.get(), stream);
         timeline.recordStop(i, gpu_ctx_.get(), stream);
     }
+    EXPECT_TRUE(timeline.hasValidRecords());
 
     // Reset
     timeline.resetTimings();
+    EXPECT_FALSE(timeline.hasValidRecords());
 
     // Now collect should find no valid events and return early
     timeline.collect(gpu_ctx_.get());
@@ -369,10 +372,12 @@ TEST_F(Test__StageTimeline, StaleEvents_NotCollectedAfterReset)
         timeline.recordStart(i, gpu_ctx_.get(), stream);
         timeline.recordStop(i, gpu_ctx_.get(), stream);
     }
+    EXPECT_TRUE(timeline.hasValidRecords());
 
     // Phase 2: Simulate "suppressed collectTimeline" calling resetTimings()
     // This is the fix — previously this was skipped when suppressed.
     timeline.resetTimings();
+    EXPECT_FALSE(timeline.hasValidRecords());
 
     // Phase 3: Simulate graph capture phase — NO new events recorded
     // (isGraphCaptureActive() prevents recording)

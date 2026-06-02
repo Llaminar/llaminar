@@ -301,6 +301,12 @@ namespace llaminar2
 
         bool isInitialized() const { return initialized_; }
 
+        bool hasValidRecords() const
+        {
+            return std::any_of(records_.begin(), records_.end(),
+                               [](const StageRecord &rec) { return rec.valid; });
+        }
+
         /**
          * @brief Reset all timing data (keeps events allocated)
          */

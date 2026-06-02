@@ -1046,6 +1046,57 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     PerfStatsCollector::reset();
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDownM4MatchesReference)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    constexpr int M = 4;
+    constexpr int N = 5120;
+    constexpr int K = 17408;
+    runFusedSwiGLUDownSmallMMatchesReference(
+        "Q4_K native-VNNI Qwen3.6 FFN down shifted-prefill shape",
+        M,
+        N,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.9999f,
+        true,
+        4);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    auto route_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("source") != 0 &&
+                   record.tags.at("source") == "fused_swiglu" &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == "4" &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == "5120" &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == "17408";
+        });
+
+    ASSERT_NE(route_record, records.end())
+        << "Qwen3.6 MTP shifted prefill FFN down must use graph-native ROCm fused SwiGLU/down small-M route";
+    EXPECT_GE(route_record->value, 1.0);
+    EXPECT_EQ(route_record->device, "rocm:0");
+    EXPECT_EQ(route_record->tags.at("codebook"), "5");
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, ConcurrentDispatchQ4KM2MatchesReference)
 {
     if (!hasROCmDevice())
@@ -1405,6 +1456,64 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesS
         << "Graph-captured Qwen3.6 GDN projection group should use one batched native route";
     EXPECT_GE(batched_projection_calls, 4.0)
         << "Batched GDN route should cover qkv/z/alpha/beta projection payloads";
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM4MatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    runFusedProjectionGroupSmallMMatchesSeparate(
+        "Q4_K native-VNNI Qwen3.6 GDN projection shifted-prefill group",
+        4,
+        5120,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.9999f,
+        {10240, 10240, 1024, 1024},
+        true,
+        true,
+        4);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    double batched_calls = 0.0;
+    double batched_projection_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "4" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "4")
+        {
+            batched_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "4" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120")
+        {
+            batched_projection_calls += record.value;
+        }
+    }
+
+    EXPECT_GE(batched_calls, 1.0)
+        << "Graph-captured Qwen3.6 M=4 GDN projection group should use one batched native route";
+    EXPECT_GE(batched_projection_calls, 4.0)
+        << "Batched M=4 GDN route should cover qkv/z/alpha/beta projection payloads";
 
     PerfStatsCollector::reset();
 }

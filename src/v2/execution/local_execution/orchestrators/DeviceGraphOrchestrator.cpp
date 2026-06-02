@@ -3770,6 +3770,14 @@ namespace llaminar2
             auto &timeline = executor_.stageTimeline();
             if (timeline.isInitialized())
             {
+                // MTP sidecar graph capture/replay can leave a timeline initialized
+                // without fresh events. Clear it here so stale warmup events are never queried.
+                if (suppress_timeline_ || !timeline.hasValidRecords())
+                {
+                    timeline.resetTimings();
+                    return ok;
+                }
+
                 auto &pool = GPUDeviceContextPool::instance();
                 auto &gpu_ctx = pool.getContext(state_.device_id);
                 timeline.collect(&gpu_ctx);

@@ -262,14 +262,19 @@ Latest ROCm dense evidence:
   `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-baseline-n16.json`,
   `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-mtp-n16.json`,
   `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-baseline-n8.json`,
-  and `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-mtp-n8.json`.
+  `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-mtp-n8.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-mtp-clean-graphs-n8-bench.json`,
+  and `/tmp/llaminar-mtp-bench/dense-rocm-mtp-clean-graphs-n8.csv`.
   - `ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu()` now routes
     eligible native-VNNI `M=2/3/4` verifier shapes through the graph-native
     small-M path instead of generic native prefill GEMM. If that selected
     route cannot launch, it hard-fails.
   - Focused regression: `V2_Integration_ROCmQuantisedGemmSmallM` now covers
     fused-SwiGLU/FFN down Q4_K M=2 and Q5_K M=4 with route counters tagged
-    `source=fused_swiglu` plus FP32-reference cosine.
+    `source=fused_swiglu` plus FP32-reference cosine. It also covers
+    graph-captured Qwen3.6-scale Q4_K FFN-down shapes for M=2 and M=4
+    (`N=5120`, `K=17408`) and graph-captured M=4 GDN projection bundles
+    (`N={10240,10240,1024,1024}`, `K=5120`).
   - Same-binary Qwen3.6 dense ROCm `The quick brown fox`, `-c 64`, `-n 16`:
     baseline decode 866.11 ms for 16 tokens, 18.47 tok/s; depth-1 MTP decode
     627.25 ms for 16 tokens, 25.51 tok/s, with 32 draft steps, 28 accepted,
@@ -283,6 +288,15 @@ Latest ROCm dense evidence:
     two-token graph to about 56.3 ms. Sidecar replay remained about 2.37 ms
     and catch-up replay about 0.35 ms, so the next ROCm work should profile
     the remaining verifier GPU kernels rather than add fallback paths.
+  - Clean verifier-focused rerun with stage timing and graph capture:
+    `The quick brown fox`, `-c 64`, `-n 8` completed at 17.44 tok/s with
+    75% acceptance. `main_verifier` segmented replay was 56.16 ms per
+    two-token graph, down from the sidecar-normal-replay diagnostic's
+    97.95 ms; `mtp.verifier_forward` was 74.06 ms/call, down from
+    107.92 ms/call. This confirms main verifier replay is no longer the
+    dominant ROCm blocker in the short diagnostic. Remaining work is
+    sidecar/capture overhead, rollback frequency, and longer-prompt speedup
+    evidence.
 - Rejected shared-quant fused M=2 experiment:
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-bench.json` and
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-stats.json`.
