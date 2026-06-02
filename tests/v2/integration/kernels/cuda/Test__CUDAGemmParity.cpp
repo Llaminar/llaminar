@@ -33,6 +33,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/MPIContext.h"
 #include "../../../utils/TestModelHelper.h"
 #ifdef HAVE_CUDA
@@ -47,6 +48,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <random>
 #include <numeric>
 #include <filesystem>
@@ -63,6 +65,38 @@ using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 
 namespace
 {
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            setenv(name, value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::string old_value_;
+        bool had_old_ = false;
+    };
+
 
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
     {
@@ -929,6 +963,41 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
+TEST_F(Test__CUDAGemmParity, Q4_0_SmallPrefillM4_UsesNativeSmallMRoute)
+{
+    const int M = 4;
+    const int N = 896;
+    const int K = 896;
+
+    auto weights = TestTensorFactory::createQ4_0Random({(size_t)N, (size_t)K}, 231);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_0 small-prefill native GEMV route 4x896x896");
+    EXPECT_FALSE(result.has_nan_inf)
+        << "CUDA small-prefill M=4 route must not emit NaN/Inf";
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low: " << result.cosine_similarity;
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
 TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
 {
     const int M = 1;
@@ -1124,6 +1193,49 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_2x512x768)
     cleanupWorkspaceIfNeeded(cuda_kernel);
     EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
         << "Small-M verifier GEMV test must not leak CUDA dynamic state after workspace cleanup";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesNativeM2Route)
+{
+    const int M = 2;
+    const int N = 896;
+    const int K = 768;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto weights = TestTensorFactory::createQ4_KRandom({(size_t)N, (size_t)K}, 229);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m2_calls"});
+    auto route_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "cuda_native_vnni_m2_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter;
+        });
+
+    ASSERT_NE(route_record, records.end())
+        << "Q4_K M=2 verifier GEMM must use the graph-native two-row native route";
+    EXPECT_GE(route_record->value, 1.0);
+    EXPECT_EQ(route_record->device, "cuda:" + std::to_string(gpu_device_.ordinal));
+    EXPECT_EQ(route_record->tags.at("codebook"), "5");
+    EXPECT_EQ(route_record->tags.at("n"), std::to_string(N));
+    EXPECT_EQ(route_record->tags.at("k"), std::to_string(K));
+
+    PerfStatsCollector::reset();
+    cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 

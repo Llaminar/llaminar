@@ -452,11 +452,11 @@ namespace llaminar2
             /**
              * @brief Small-M FP32 activations -> native-VNNI row-wise GEMV.
              *
-             * Greedy MTP verifier forwards commonly use M=2. The generic native
-             * VNNI prefill path is correct for that shape, but it is much slower
-             * than the decode-class GEMV path. This helper quantizes all rows
-             * once, then dispatches the tuned M=1 GEMV kernel per row on the
-             * caller-provided graph stream.
+             * Greedy MTP verifier forwards commonly use M=2, while graph-captured
+             * replay and parity smoke tests also hit tiny prefill batches. This
+             * helper quantizes all rows once, then dispatches the tuned GEMV
+             * kernel for native-VNNI small-M shapes on the caller-provided graph
+             * stream.
              */
             bool multiply_fp32_to_fp32_small_m_gemv(
                 const float *d_A, float *d_C, const float *d_bias,

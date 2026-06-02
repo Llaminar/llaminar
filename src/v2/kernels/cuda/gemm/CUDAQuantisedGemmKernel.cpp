@@ -36,6 +36,7 @@
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <cuda_runtime.h>
 
@@ -127,6 +128,24 @@ namespace llaminar2
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
             bool cudaNativeVNNIGemvTuned_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                int cuda_device_id,
+                void *stream,
+                CUDAGemvContext *gemv_ctx,
+                CUDARowMajorWeights **rm_slot);
+
+            bool cudaNativeVNNIGemvTuned_m2_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *d_payload,
                 const uint16_t *d_scales,
@@ -569,6 +588,94 @@ namespace llaminar2
                 }
 
                 return false;
+            }
+
+            template <typename ImplT>
+            bool runNativeVNNIBlockwiseM2IfSupported(
+                const ImplT *impl,
+                const int8_t *d_A_int8,
+                float *d_C_fp32,
+                const float *d_scales_A_blockwise,
+                int n, int k,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                int cuda_device_id,
+                void *stream,
+                CUDARowMajorWeights **rm_slot = nullptr)
+            {
+                if (!impl || !d_A_int8 || !d_C_fp32 || !d_scales_A_blockwise ||
+                    n <= 0 || k <= 0 || (k % 32) != 0)
+                {
+                    return false;
+                }
+                if (!impl->d_weights_native_vnni ||
+                    !impl->d_weights_native_scales ||
+                    !cudaNativeVNNIGemvTuned_supportsCodebook(impl->native_codebook_id))
+                {
+                    return false;
+                }
+
+                const bool needs_iq_tables = impl->native_codebook_id >= 11 && impl->native_codebook_id <= 17;
+                if (needs_iq_tables)
+                {
+                    static std::mutex iq_table_mutex;
+                    static std::unordered_set<int> iq_init_devices;
+
+                    std::lock_guard<std::mutex> lock(iq_table_mutex);
+                    if (!iq_init_devices.count(cuda_device_id))
+                    {
+                        if (!cudaQuantGemm_setDevice(cuda_device_id))
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to set CUDA device " << cuda_device_id
+                                                                                             << " before IQ grid table initialization");
+                            return false;
+                        }
+                        if (!cudaNativeVNNIInitIQGridTables_tuned())
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to initialize IQ grid tables for CUDA device " << cuda_device_id);
+                            return false;
+                        }
+                        iq_init_devices.insert(cuda_device_id);
+                    }
+                }
+
+                if (!impl->gemv_ctx)
+                    impl->gemv_ctx = cudaGemvContext_create(cuda_device_id);
+                if (!impl->gemv_ctx)
+                    return false;
+
+                const bool ok = cudaNativeVNNIGemvTuned_m2_fp32(
+                    d_A_int8,
+                    impl->d_weights_native_vnni,
+                    impl->d_weights_native_scales,
+                    impl->d_weights_native_mins,
+                    impl->d_weights_native_emins,
+                    d_C_fp32,
+                    d_scales_A_blockwise,
+                    n, k,
+                    alpha, beta,
+                    d_C_existing,
+                    d_bias,
+                    impl->native_codebook_id,
+                    cuda_device_id,
+                    stream,
+                    impl->gemv_ctx,
+                    rm_slot);
+                if (ok && PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cuda_native_vnni_m2_calls",
+                        1.0,
+                        "gemm",
+                        "cuda:" + std::to_string(cuda_device_id),
+                        PerfStatsCollector::Tags{
+                            {"codebook", std::to_string(static_cast<int>(impl->native_codebook_id))},
+                            {"n", std::to_string(n)},
+                            {"k", std::to_string(k)}});
+                }
+                return ok;
             }
         }
 
@@ -1320,9 +1427,9 @@ namespace llaminar2
                 return false;
             }
 
-            if (m > 1 && m <= 2 && (k % 32) == 0)
+            if (m > 1 && m <= 4 && (k % 32) == 0)
             {
-                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M native GEMV path M="
                           << m << " projections=" << projections.size());
 
                 validateWorkspace();
@@ -1433,6 +1540,25 @@ namespace llaminar2
                         return false;
                     }
 
+                    if (m == 2 &&
+                        runNativeVNNIBlockwiseM2IfSupported(
+                            cuda_kernel->impl_.get(),
+                            d_A_int8,
+                            d_output,
+                            d_scales_A_blockwise,
+                            proj.n,
+                            k,
+                            1.0f,
+                            0.0f,
+                            nullptr,
+                            d_bias,
+                            cuda_device_id_,
+                            gpu_stream_,
+                            cuda_kernel->packed_ ? &cuda_kernel->packed_->rowmajor_ : nullptr))
+                    {
+                        continue;
+                    }
+
                     for (int row = 0; row < m; ++row)
                     {
                         const int8_t *row_A = d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(k);
@@ -1466,7 +1592,7 @@ namespace llaminar2
 
                 return true;
             }
-            if (m > 1 && m <= 2)
+            if (m > 1 && m <= 4)
             {
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M native prefill path M="
                           << m << " projections=" << projections.size()
@@ -2113,7 +2239,7 @@ namespace llaminar2
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Null input or output");
                 return false;
             }
-            if (m <= 1 || m > 2 || n <= 0 || k <= 0)
+            if (m <= 1 || m > 4 || n <= 0 || k <= 0)
             {
                 return false;
             }
@@ -2148,6 +2274,25 @@ namespace llaminar2
             }
 
             const int blocks_per_row = k / 32;
+            if (m == 2 &&
+                runNativeVNNIBlockwiseM2IfSupported(
+                    impl_.get(),
+                    d_A_int8,
+                    d_C,
+                    d_scales_A_blockwise,
+                    n,
+                    k,
+                    alpha,
+                    beta,
+                    (beta != 0.0f) ? d_C : nullptr,
+                    d_bias,
+                    cuda_device_id_,
+                    gpu_stream_,
+                    packed_ ? &packed_->rowmajor_ : nullptr))
+            {
+                return true;
+            }
+
             for (int row = 0; row < m; ++row)
             {
                 const int8_t *row_A = d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(k);
@@ -2240,7 +2385,7 @@ namespace llaminar2
                 LOG_WARN("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM failed, falling back");
             }
 
-            if (m > 1 && m <= 2 &&
+            if (m > 1 && m <= 4 &&
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, nullptr, m, n, k, alpha, beta))
             {
@@ -2310,7 +2455,7 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            if (m > 1 && m <= 2 &&
+            if (m > 1 && m <= 4 &&
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, d_bias, m, n, k, alpha, beta))
             {
