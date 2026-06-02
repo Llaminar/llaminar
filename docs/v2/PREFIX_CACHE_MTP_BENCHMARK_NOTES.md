@@ -343,6 +343,27 @@ Latest ROCm dense evidence:
     from 95.90 ms to 91.65 ms total. This is a stable verifier win, but the
     remaining `main_verifier` replay is still dominated by GDN projection,
     ordinary GEMM, and fused Gate/Up buckets.
+  - Focused verifier replay follow-up:
+    `/tmp/llaminar-mtp-bench/dense-rocm-gdn-fp32-alpha-beta-batched-mtp-c64-n8.log`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-mtp-c64-n8-nvnni-kb{1,2,4,8}.csv`,
+    and direct perf runs of
+    `NativeVNNIGEMMPerfTest.MTP_SmallM_DirectPrefillRouteComparison` plus
+    `NativeVNNIGEMMPerfTest.MTP_SmallM_VerifierShapes_AllFormats`.
+    A custom FP32 small-N alpha/beta projection batch passed its synthetic
+    graph-capture unit but faulted in the real Qwen3.6 ROCm smoke before
+    producing stats, so it was rejected and not committed. The real-model
+    KB sweep showed smaller split-K is worse for verifier replay:
+    `KB=1/2/4/8` produced `mtp.verifier_forward` totals of about
+    1103.60/892.26/828.80/805.90 ms for 12 calls, with `KB=8` best.
+    The focused perf binary agreed for the hot Q4_1/Q5_1 FFN-down and GDN
+    output shapes: `KB=8` preserved the best M=4 and Q5-heavy timings while
+    `KB=2` regressed sharply. Conclusion: keep the graph-safe native-VNNI
+    small-M KB cap at 8; the next ROCm replay lever is not K-partition tuning.
+    After several aborted full-model graph runs, subsequent full-model ROCm
+    benchmarks timed out during large-model load/preflight and emitted ROCm
+    memory-fault messages on timeout teardown, while focused HIP graph-capture
+    kernels still passed. A driver/device reset is needed before trusting new
+    full-model ROCm timing artifacts from this session.
 - Rejected shared-quant fused M=2 experiment:
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-bench.json` and
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-stats.json`.
