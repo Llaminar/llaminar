@@ -3736,7 +3736,12 @@ namespace llaminar2
                 auto &gpu_ctx = pool.getContext(state_.device_id);
                 timeline.collect(&gpu_ctx);
                 const std::string mtp_phase = "mtp_" + phase;
-                timeline.recordPerfStats(mtp_phase.c_str(), device_key.c_str(), "mtp_stage_gpu");
+                timeline.recordPerfStats(
+                    mtp_phase.c_str(),
+                    device_key.c_str(),
+                    "mtp_stage_gpu",
+                    {{"context", phase == "decode" ? "mtp_decode_sidecar" : "mtp_shifted_prefill"},
+                     {"depth", "0"}});
                 timeline.resetTimings();
             }
         }

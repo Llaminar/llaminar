@@ -21,6 +21,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "backends/IGPUGraphCapture.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -254,6 +255,48 @@ TEST_F(Test__StageTimeline, RecordAndCollect_BasicFlow)
 
     // Check total GPU time
     EXPECT_FLOAT_EQ(timeline.totalGpuMs(), 1.5f * 3);
+}
+
+TEST_F(Test__StageTimeline, RecordPerfStatsCarriesContextTags)
+{
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "/tmp/stage_timeline_context_tags.json");
+    PerfStatsCollector::reset();
+
+    StageTimeline timeline;
+    timeline.initialize(gpu_ctx_.get(), 2);
+    timeline.setStageInfo(0, "gemm_stage", ComputeStageType::GEMM);
+    timeline.setStageInfo(1, "lm_head_stage", ComputeStageType::LM_HEAD);
+
+    void *stream = gpu_ctx_->defaultStream();
+    for (size_t i = 0; i < 2; ++i)
+    {
+        timeline.recordStart(i, gpu_ctx_.get(), stream);
+        timeline.recordStop(i, gpu_ctx_.get(), stream);
+    }
+    timeline.collect(gpu_ctx_.get());
+
+    timeline.recordPerfStats(
+        "decode",
+        "CUDA:0",
+        "stage_gpu",
+        {{"context", "main_verifier"}});
+
+    const auto records = PerfStatsCollector::snapshot({"stage_gpu"});
+    auto has_record = [&](const std::string &name, const PerfStatsCollector::Tags &tags) {
+        return std::any_of(records.begin(), records.end(), [&](const PerfStatRecord &record) {
+            return record.domain == "stage_gpu" &&
+                   record.name == name &&
+                   record.phase == "decode" &&
+                   record.device == "CUDA:0" &&
+                   record.tags == tags;
+        });
+    };
+
+    EXPECT_TRUE(has_record("total", {{"context", "main_verifier"}}));
+    EXPECT_TRUE(has_record("type.GEMM", {{"context", "main_verifier"}, {"stage_count", "1"}}));
+    EXPECT_TRUE(has_record("gemm_stage", {{"context", "main_verifier"}, {"index", "0"}, {"type", "GEMM"}}));
+
+    PerfStatsCollector::reset();
 }
 
 TEST_F(Test__StageTimeline, Collect_NoValidEvents_ReturnsEarly)

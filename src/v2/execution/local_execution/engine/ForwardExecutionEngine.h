@@ -480,7 +480,8 @@ namespace llaminar2
             IDeviceContext *ctx,
             bool is_decode,
             const ForwardInput &input,
-            std::chrono::high_resolution_clock::time_point start);
+            std::chrono::high_resolution_clock::time_point start,
+            std::string stage_context = {});
 
         // ----- Configuration -----
         Config config_;

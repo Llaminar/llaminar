@@ -381,7 +381,8 @@ namespace llaminar2
 
     void StageTimeline::recordPerfStats(const char *phase_name,
                                         const char *device_name,
-                                        const char *domain) const
+                                        const char *domain,
+                                        std::map<std::string, std::string> tags) const
     {
         if (!PerfStatsCollector::isEnabled())
             return;
@@ -389,6 +390,10 @@ namespace llaminar2
         const std::string phase = phase_name ? phase_name : "";
         const std::string device = device_name ? device_name : "";
         const std::string perf_domain = domain ? domain : "stage_gpu";
+        auto merge_tags = [&](PerfStatsCollector::Tags record_tags = {}) {
+            record_tags.insert(tags.begin(), tags.end());
+            return record_tags;
+        };
 
         const float total_ms = totalGpuMs();
         if (total_ms > 0.0f)
@@ -398,7 +403,8 @@ namespace llaminar2
                 "total",
                 static_cast<uint64_t>(static_cast<double>(total_ms) * 1.0e6),
                 phase,
-                device);
+                device,
+                merge_tags());
         }
 
         auto agg = aggregateByType();
@@ -412,7 +418,7 @@ namespace llaminar2
                 static_cast<uint64_t>(static_cast<double>(entry.total_ms) * 1.0e6),
                 phase,
                 device,
-                {{"stage_count", std::to_string(entry.count)}});
+                merge_tags({{"stage_count", std::to_string(entry.count)}}));
         }
 
         for (size_t i = 0; i < records_.size(); ++i)
@@ -426,8 +432,8 @@ namespace llaminar2
                 static_cast<uint64_t>(static_cast<double>(rec.gpu_ms) * 1.0e6),
                 phase,
                 device,
-                {{"type", computeStageTypeName(rec.type)},
-                 {"index", std::to_string(i)}});
+                merge_tags({{"type", computeStageTypeName(rec.type)},
+                            {"index", std::to_string(i)}}));
         }
     }
 

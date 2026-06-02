@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <map>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -295,7 +296,8 @@ namespace llaminar2
          */
         void recordPerfStats(const char *phase_name,
                              const char *device_name = nullptr,
-                             const char *domain = "stage_gpu") const;
+                             const char *domain = "stage_gpu",
+                             std::map<std::string, std::string> tags = {}) const;
 
         bool isInitialized() const { return initialized_; }
 

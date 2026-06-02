@@ -1356,7 +1356,13 @@ namespace llaminar2
                 host.syncLogitsAtBoundary(ctx);
             }
 
-            collectTimeline(ctx, is_decode, input, start);
+            const std::string stage_context =
+                is_decode
+                    ? (forward_cache.segment_cache.perf_context.empty()
+                           ? "main_decode"
+                           : forward_cache.segment_cache.perf_context)
+                    : "prefill";
+            collectTimeline(ctx, is_decode, input, start, stage_context);
         }
 
         auto end = std::chrono::high_resolution_clock::now();
@@ -1869,9 +1875,13 @@ namespace llaminar2
                 host.syncLogitsAtBoundary(sync_ctx);
             }
 
+            const std::string stage_context =
+                should_cache
+                    ? forwardGraphPerfContext(signature)
+                    : (is_decode ? "main_decode" : "prefill");
             collectTimeline(
                 host.getDeviceContext(effective_input.device),
-                is_decode, effective_input, start);
+                is_decode, effective_input, start, stage_context);
         }
 
         // Cache the graph for future matching forward signatures
@@ -1933,7 +1943,8 @@ namespace llaminar2
         IDeviceContext *ctx,
         bool is_decode,
         const ForwardInput &input,
-        std::chrono::high_resolution_clock::time_point start)
+        std::chrono::high_resolution_clock::time_point start,
+        std::string stage_context)
     {
         if (!(debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled()) ||
             !ctx || !ctx->deviceId().is_gpu())
@@ -1966,7 +1977,10 @@ namespace llaminar2
         std::string dev_str = ctx->deviceId().toString();
         const char *dev_name = dev_str.c_str();
         const char *phase_name = is_decode ? "decode" : "prefill";
-        timeline.recordPerfStats(phase_name, dev_name, "stage_gpu");
+        PerfStatsCollector::Tags stage_tags;
+        if (!stage_context.empty())
+            stage_tags.emplace("context", std::move(stage_context));
+        timeline.recordPerfStats(phase_name, dev_name, "stage_gpu", std::move(stage_tags));
 
         if (is_decode)
         {
