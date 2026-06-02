@@ -9,15 +9,43 @@
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
 
+#include <array>
+#include <optional>
 #include <typeinfo>
 
 namespace llaminar2
 {
     namespace
     {
+        std::optional<uint8_t> nativeVNNICodebook(ITensorGemm *kernel)
+        {
+            if (!kernel)
+                return std::nullopt;
+
+            DeviceNativeVNNIMatrixDesc desc;
+            if (!kernel->exportNativeVNNIMatrixDesc(desc) || !desc.valid())
+                return std::nullopt;
+            return desc.codebook_id;
+        }
+
         bool sameKernelType(const ITensorGemm *lhs, const ITensorGemm *rhs)
         {
             return lhs && rhs && typeid(*lhs) == typeid(*rhs);
+        }
+
+        bool fusedProjectionCompatible(
+            ITensorGemm *lhs,
+            ITensorGemm *rhs,
+            const std::optional<uint8_t> &lhs_codebook,
+            const std::optional<uint8_t> &rhs_codebook)
+        {
+            if (!sameKernelType(lhs, rhs))
+                return false;
+            if (lhs_codebook.has_value() != rhs_codebook.has_value())
+                return false;
+            if (lhs_codebook.has_value())
+                return lhs_codebook.value() == rhs_codebook.value();
+            return true;
         }
 
         bool multiplyProjectionFallback(
@@ -211,10 +239,16 @@ namespace llaminar2
             {gemm_a, C_a, params_.n_a, nullptr, "alpha"},
             {gemm_b, C_b, params_.n_b, nullptr, "beta"}};
 
+        std::array<std::optional<uint8_t>, 4> native_codebooks = {
+            nativeVNNICodebook(gemm_qkv),
+            nativeVNNICodebook(gemm_z),
+            nativeVNNICodebook(gemm_a),
+            nativeVNNICodebook(gemm_b)};
+
         const bool homogeneous_projection_kernels =
-            sameKernelType(gemm_qkv, gemm_z) &&
-            sameKernelType(gemm_qkv, gemm_a) &&
-            sameKernelType(gemm_qkv, gemm_b);
+            fusedProjectionCompatible(gemm_qkv, gemm_z, native_codebooks[0], native_codebooks[1]) &&
+            fusedProjectionCompatible(gemm_qkv, gemm_a, native_codebooks[0], native_codebooks[2]) &&
+            fusedProjectionCompatible(gemm_qkv, gemm_b, native_codebooks[0], native_codebooks[3]);
 
         bool success = false;
         if (homogeneous_projection_kernels)
@@ -231,42 +265,59 @@ namespace llaminar2
             LOG_DEBUG("[GDNProjectionStage] Mixed projection GEMM kernels; trying supported fused subgroups");
 
             std::vector<bool> completed(projections.size(), false);
-            for (size_t i = 0; i < projections.size(); ++i)
+            auto runFusedSubgroups = [&](bool require_native_compatibility) -> bool
             {
-                if (completed[i] || !projections[i].kernel ||
-                    !projections[i].kernel->supports_fused_projection())
+                for (size_t i = 0; i < projections.size(); ++i)
                 {
-                    continue;
-                }
-
-                std::vector<size_t> group_indices;
-                group_indices.push_back(i);
-                for (size_t j = i + 1; j < projections.size(); ++j)
-                {
-                    if (!completed[j] && projections[j].kernel &&
-                        projections[j].kernel->supports_fused_projection() &&
-                        sameKernelType(projections[i].kernel, projections[j].kernel))
+                    if (completed[i] || !projections[i].kernel ||
+                        !projections[i].kernel->supports_fused_projection())
                     {
-                        group_indices.push_back(j);
+                        continue;
                     }
+
+                    std::vector<size_t> group_indices;
+                    group_indices.push_back(i);
+                    for (size_t j = i + 1; j < projections.size(); ++j)
+                    {
+                        if (!completed[j] && projections[j].kernel &&
+                            projections[j].kernel->supports_fused_projection())
+                        {
+                            const bool compatible =
+                                require_native_compatibility
+                                    ? fusedProjectionCompatible(
+                                          projections[i].kernel,
+                                          projections[j].kernel,
+                                          native_codebooks[i],
+                                          native_codebooks[j])
+                                    : sameKernelType(projections[i].kernel, projections[j].kernel);
+                            if (compatible)
+                                group_indices.push_back(j);
+                        }
+                    }
+
+                    if (group_indices.size() < 2)
+                        continue;
+
+                    auto group = selectProjections(projections, group_indices);
+                    if (!group.front().kernel->multiply_fused_tensor(
+                            A_base, group, M, K, nullptr, bound_workspace_))
+                    {
+                        LOG_ERROR("[GDNProjectionStage] Fused projection subgroup failed for "
+                                  << (group.front().name ? group.front().name : "unnamed")
+                                  << " group_size=" << group.size());
+                        return false;
+                    }
+
+                    for (size_t index : group_indices)
+                        completed[index] = true;
                 }
+                return true;
+            };
 
-                if (group_indices.size() < 2)
-                    continue;
-
-                auto group = selectProjections(projections, group_indices);
-                if (!group.front().kernel->multiply_fused_tensor(
-                        A_base, group, M, K, nullptr, bound_workspace_))
-                {
-                    LOG_ERROR("[GDNProjectionStage] Fused projection subgroup failed for "
-                              << (group.front().name ? group.front().name : "unnamed")
-                              << " group_size=" << group.size());
-                    return false;
-                }
-
-                for (size_t index : group_indices)
-                    completed[index] = true;
-            }
+            if (!runFusedSubgroups(/*require_native_compatibility=*/true))
+                return false;
+            if (!runFusedSubgroups(/*require_native_compatibility=*/false))
+                return false;
 
             std::vector<ITensorGemm::TensorProjectionDesc> remaining;
             remaining.reserve(projections.size());

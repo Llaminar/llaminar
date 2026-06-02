@@ -88,6 +88,37 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- ROCm GDN projection grouping now makes native-VNNI codebook compatibility
+  explicit at the stage boundary before attempting same-codebook fused
+  subgroups, then keeps the legacy mixed-codebook shared-quant fallback for
+  leftover compatible kernel-type groups. This hardens the real Qwen3.6
+  qkv/z/alpha/beta projection contract without changing the current lower-level
+  kernel mix. Focused regressions:
+  `V2_Unit_GDNKernels`, `V2_Integration_ROCmQuantisedGemmSmallM`, and the full
+  `^V2_Integration_Parity_Qwen36_SingleDevice_` slice. Fresh long-lane ROCm
+  Qwen3.6 dense 27B Q4_K_S evidence with GPU graphs enabled, `The quick brown
+  fox`, `-c 64`, `-n 48`: baseline
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-codebook-baseline-c64-n48-bench.json`
+  at 20.72 decode tok/s; MTP
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-codebook-mtp-c64-n48-bench.json`
+  at 32.81 decode tok/s and repeat
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-codebook-mtp-repeat-c64-n48-bench.json`
+  at 33.15 decode tok/s. Both MTP runs recorded 95.83% acceptance, 92 accepted
+  tokens, 4 rejected tokens, and 4 rollbacks. Structured stats:
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-codebook-mtp-c64-n48-stats.json` and
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-codebook-mtp-repeat-c64-n48-stats.json`.
+  This preserves the 1.58x-1.60x depth-1 speedup ratchet against the same-day
+  baseline but does not replace the older 33.57 tok/s best.
+- Deeper chained-draft retest, same ROCm/Qwen3.6 dense long lane, confirms
+  depth-1 remains the best current speed path. Depth-2
+  `/tmp/llaminar-mtp-bench/dense-rocm-depth2-seq-c64-n48-bench.json` reached
+  26.31 decode tok/s with 87.10% acceptance, 108 accepted tokens, 16 rejected
+  tokens, and 20 rollbacks. Depth-3
+  `/tmp/llaminar-mtp-bench/dense-rocm-depth3-seq-c64-n48-bench.json` reached
+  25.22 decode tok/s with 80.15% acceptance, 109 accepted tokens, 27 rejected
+  tokens, and 30 rollbacks. The M=3/4 verifier route is graph-captured and
+  useful for diagnostics, but acceptance and rollback rate still erase the
+  expected amortization benefit on this prompt.
 - ROCm MTP sidecar workspace-generation validation after the Qwen3.6
   Prefix+MTP parity crash:
   `DeviceGraphOrchestrator` sidecar caches now track the shared GPU workspace
