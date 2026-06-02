@@ -17,6 +17,7 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
@@ -286,6 +288,62 @@ namespace
     };
 #endif
 
+    class RecordingWorkspaceGemm final : public ITensorGemm, public IWorkspaceConsumer
+    {
+    public:
+        explicit RecordingWorkspaceGemm(std::string name)
+            : name_(std::move(name))
+        {
+        }
+
+        bool supports_device(int) const override { return true; }
+
+        bool multiply_tensor(
+            const TensorBase *,
+            TensorBase *,
+            int,
+            int,
+            int,
+            bool,
+            float,
+            float,
+            const TensorBase *,
+            const IMPIContext *,
+            int,
+            DeviceWorkspaceManager *,
+            int) override
+        {
+            return false;
+        }
+
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+        {
+            observed_m.push_back(m);
+            observed_n.push_back(n);
+            observed_k.push_back(k);
+
+            WorkspaceRequirements reqs;
+            reqs.buffers.push_back({
+                name_ + "_n" + std::to_string(n),
+                static_cast<size_t>(std::max(1, n)),
+                1,
+                true});
+            return reqs;
+        }
+
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+        bool hasWorkspace() const override { return workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
+        mutable std::vector<int> observed_m;
+        mutable std::vector<int> observed_n;
+        mutable std::vector<int> observed_k;
+
+    private:
+        std::string name_;
+        DeviceWorkspaceManager *workspace_ = nullptr;
+    };
+
 } // namespace
 
 TEST(GDNROCmConfig, ConcurrentDecodeFlagDefaultsOffAndParsesEnv)
@@ -366,6 +424,39 @@ TEST(Test__GDNKernels, Recurrence_WorkspaceRequirementSharesMergedQKVScratch)
     EXPECT_EQ(scratch->size_bytes,
               static_cast<size_t>(1536) * row_floats * sizeof(float));
     EXPECT_TRUE(scratch->required);
+}
+
+TEST(Test__GDNKernels, Projection_WorkspaceRequirementsUsePerProjectionN)
+{
+    RecordingWorkspaceGemm qkv("qkv");
+    RecordingWorkspaceGemm z("z");
+    RecordingWorkspaceGemm alpha("alpha");
+    RecordingWorkspaceGemm beta("beta");
+
+    GDNProjectionStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.m = 4;
+    p.k = 128;
+    p.n_qkv = 96;
+    p.n_z = 64;
+    p.n_a = 8;
+    p.n_b = 12;
+    p.gemm_qkv = &qkv;
+    p.gemm_z = &z;
+    p.gemm_a = &alpha;
+    p.gemm_b = &beta;
+
+    GDNProjectionStage stage(p);
+    const auto reqs = stage.getWorkspaceRequirements(/*m=*/4, /*n=*/999, /*k=*/128);
+    (void)reqs;
+
+    ASSERT_EQ(qkv.observed_n, std::vector<int>({96}));
+    ASSERT_EQ(z.observed_n, std::vector<int>({64}));
+    ASSERT_EQ(alpha.observed_n, std::vector<int>({8}));
+    ASSERT_EQ(beta.observed_n, std::vector<int>({12}));
+
+    EXPECT_EQ(qkv.observed_m, std::vector<int>({4}));
+    EXPECT_EQ(z.observed_k, std::vector<int>({128}));
 }
 
 // ============================================================================
