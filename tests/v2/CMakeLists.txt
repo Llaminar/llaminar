@@ -6041,6 +6041,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmSmoke
     MPI_PROCS 1
     TIMEOUT 1200
 )
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsHardFail
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPGpuGraphsHardFailsBeforeDecode
+    LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;Regression"
+    MPI_PROCS 1
+    TIMEOUT 600
+)
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmPrefixSmoke
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmPrefixCacheMTPRealModelSmoke
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU"

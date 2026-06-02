@@ -20,6 +20,7 @@
 #include "utils/Sampler.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/Tokenizer.h"
+#include "utils/DebugEnv.h"
 
 #include <mpi.h>
 
@@ -44,6 +45,48 @@ using namespace llaminar2::test;
 namespace
 {
     constexpr const char *kDenseModelPath = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
+
+    class ScopedDebugEnv
+    {
+    public:
+        explicit ScopedDebugEnv(std::initializer_list<std::pair<const char *, const char *>> values)
+        {
+            for (const auto &[name, value] : values)
+            {
+                Entry entry;
+                entry.name = name;
+                if (const char *old = std::getenv(name))
+                    entry.old_value = old;
+                entries_.push_back(std::move(entry));
+                ::setenv(name, value, 1);
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedDebugEnv()
+        {
+            for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
+            {
+                if (it->old_value.has_value())
+                    ::setenv(it->name.c_str(), it->old_value->c_str(), 1);
+                else
+                    ::unsetenv(it->name.c_str());
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ScopedDebugEnv(const ScopedDebugEnv &) = delete;
+        ScopedDebugEnv &operator=(const ScopedDebugEnv &) = delete;
+
+    private:
+        struct Entry
+        {
+            std::string name;
+            std::optional<std::string> old_value;
+        };
+
+        std::vector<Entry> entries_;
+    };
 
     std::vector<int32_t> readTokenListFromMetadata(
         const std::filesystem::path &metadata_path,
@@ -1387,6 +1430,12 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen35CPUSplitPrefillMatchesPyTorchDecodeToken
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
 {
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+    });
+
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
         env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
@@ -1457,11 +1506,78 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
     EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
     EXPECT_GE(mtp_snapshot.mtp_draft_steps, 2u);
     EXPECT_GE(mtp_snapshot.mtp_verifier_runs, 2u);
-    EXPECT_GE(mtp_snapshot.mtp_rollbacks, 2u);
+    EXPECT_GE(mtp_snapshot.mtp_accepted_tokens + mtp_snapshot.mtp_rejected_tokens, 2u);
+}
+
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsHardFailsBeforeDecode)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+    });
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP graph hard-fail smoke";
+    }
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = 32;
+    config.batch_size = 1;
+    config.tp_degree = 1;
+    config.pp_degree = 1;
+    config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+    config.kv_cache_precision = "auto";
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    auto tokenizer = runner->tokenizer();
+    ASSERT_NE(tokenizer, nullptr);
+    const auto encoded = tokenizer->encode("Paris is", /*add_bos=*/false, /*add_eos=*/false);
+    ASSERT_FALSE(encoded.empty());
+    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    auto result = runner->generate(prompt, 1, greedy);
+    const auto snapshot = runner->prefixStateProbe();
+    runner->shutdown();
+
+    ASSERT_FALSE(result.error.empty());
+    EXPECT_NE(result.error.find("LLAMINAR_GPU_GRAPHS=1"), std::string::npos)
+        << result.error;
+    EXPECT_EQ(snapshot.mtp_draft_steps, 0u);
+    EXPECT_EQ(snapshot.mtp_verifier_runs, 0u);
+    EXPECT_EQ(snapshot.mtp_rollbacks, 0u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
 {
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+    });
+
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
         env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
@@ -1570,6 +1686,13 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
 {
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+    });
+
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
         env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
@@ -1621,11 +1744,18 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
     EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
     EXPECT_GE(snapshot.mtp_draft_steps, 1u);
     EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
-    EXPECT_GE(snapshot.mtp_rollbacks, 1u);
+    EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
 {
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+    });
+
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
         env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");

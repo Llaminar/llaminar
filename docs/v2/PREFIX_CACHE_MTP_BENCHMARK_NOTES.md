@@ -421,6 +421,14 @@ Latest ROCm MoE evidence:
     `ROCmMTPHardFailsWithGpuGraphsBeforeSidecarLaunch`, which reproduces the
     unsafe base ROCm MTP GPU-graph configuration and proves it fails before
     `forwardMTP()` can launch.
+  - `V2_Integration_PrefixCacheMTP_Qwen36ROCmSmoke` now pins the supported
+    real Qwen3.6 ROCm dense MTP smoke to `LLAMINAR_GPU_GRAPHS=0`, and asserts
+    exact token parity plus active MTP/verifier counters without requiring a
+    brittle rollback count.
+  - `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsHardFail` is the
+    matching real-model regression for the HSA fault/hang class. It runs with
+    `LLAMINAR_GPU_GRAPHS=1`, expects the structured hard-fail before decode-side
+    MTP launch, and asserts no MTP verifier counters were incremented.
   - `V2_Unit_PrefillDecodeTransition` also includes
     `ROCmMTPHardFailsWithM2RowOverlapUnderGpuGraphs`, which reproduces the
     unsafe `LLAMINAR_GPU_GRAPHS=1` plus `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1`
