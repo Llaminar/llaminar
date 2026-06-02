@@ -188,6 +188,26 @@ Latest ROCm dense evidence:
     `main_verifier` graph replay at about 98 ms per two-token replay; sidecar
     graph replay and catch-up are much smaller. The next ROCm sprint should
     shrink verifier GPU work rather than add fallback paths.
+- Phase 13.5 Q4_0/Q4_1 M=2 ROCm specialization smoke:
+  `/tmp/llaminar-mtp-bench/dense-rocm-phase135-postcommit-mtp-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-phase135-postcommit-mtp-c64-n8-stats.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-phase135-q4m2-mtp-c64-n8-bench.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-phase135-q4m2-mtp-c64-n8-stats.json`.
+  - The focused ROCm integration regression now replays the Qwen3.6-scale
+    graph-captured GDN projection bundle four times and asserts native batched
+    small-M route counters, so the shared-workspace split-K fix and batched
+    path stay covered.
+  - A dedicated Q4_0/Q4_1 `M=2` HIP path for single and batched native-VNNI
+    small-M calls completed the real Qwen3.6 dense MTP smoke with GPU graphs:
+    prefill 137.06 ms for 4 tokens, decode 570.82 ms for 8 tokens,
+    14.02 tok/s, 16 draft steps, 12 accepted, 4 rejected, 4 rollbacks, and
+    75% acceptance.
+  - The paired post-commit pre-specialization smoke was 13.96 tok/s with
+    the same acceptance. `mtp.verifier_forward` moved from 108.06 ms to
+    107.86 ms per call and `forward_graph.main_verifier` remained about
+    97.94 ms per two-token replay. This confirms the specialization is
+    graph-capture stable but not the missing ROCm speedup lever.
 - Rejected shared-quant fused M=2 experiment:
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-bench.json` and
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-stats.json`.

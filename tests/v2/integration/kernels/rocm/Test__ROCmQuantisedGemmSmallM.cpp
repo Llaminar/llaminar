@@ -358,9 +358,11 @@ namespace
         float min_cosine,
         const std::vector<int> &Ns,
         bool graph_capture,
-        bool bind_fused_to_shared_workspace = false)
+        bool bind_fused_to_shared_workspace = false,
+        int graph_replays = 1)
     {
         ASSERT_FALSE(Ns.empty());
+        ASSERT_GE(graph_replays, 1);
 
 #ifdef HAVE_ROCM
         hipStream_t stream = nullptr;
@@ -454,16 +456,21 @@ namespace
             ASSERT_NE(graph, nullptr);
             ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
             ASSERT_NE(exec, nullptr);
-            for (size_t i = 0; i < Ns.size(); ++i)
+            for (int replay = 0; replay < graph_replays; ++replay)
             {
-                ASSERT_EQ(hipMemsetAsync(fused[i]->gpu_data_ptr(),
-                                         0,
-                                         static_cast<size_t>(M) * Ns[i] * sizeof(float),
-                                         stream),
-                          hipSuccess);
+                for (size_t i = 0; i < Ns.size(); ++i)
+                {
+                    ASSERT_EQ(hipMemsetAsync(fused[i]->gpu_data_ptr(),
+                                             0,
+                                             static_cast<size_t>(M) * Ns[i] * sizeof(float),
+                                             stream),
+                              hipSuccess);
+                }
+                ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess)
+                    << "replay=" << replay;
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
+                    << "replay=" << replay;
             }
-            ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
-            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
         }
         else
 #endif
@@ -1047,6 +1054,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesS
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
 
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
     runFusedProjectionGroupSmallMMatchesSeparate(
         "Q4_K native-VNNI Qwen3.6 GDN projection group",
         2,
@@ -1057,5 +1067,103 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesS
         0.9999f,
         {10240, 10240, 1024, 1024},
         true,
-        true);
+        true,
+        4);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    double batched_calls = 0.0;
+    double batched_projection_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "4")
+        {
+            batched_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120")
+        {
+            batched_projection_calls += record.value;
+        }
+    }
+
+    EXPECT_GE(batched_calls, 1.0)
+        << "Graph-captured Qwen3.6 GDN projection group should use one batched native route";
+    EXPECT_GE(batched_projection_calls, 4.0)
+        << "Batched GDN route should cover qkv/z/alpha/beta projection payloads";
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KGDNProjectionM2RejectsUnsafeKBOverride)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv force_unsafe_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB", "32");
+
+    constexpr int M = 2;
+    constexpr int K = 5120;
+    const std::vector<int> Ns = {10240, 10240, 1024, 1024};
+
+    std::vector<std::unique_ptr<TensorBase>> weights;
+    std::vector<ROCmPackedWeights> packed(Ns.size());
+    std::vector<std::unique_ptr<ROCmQuantisedGemmKernel>> kernels;
+    weights.reserve(Ns.size());
+    kernels.reserve(Ns.size());
+
+    WorkspaceRequirements combined;
+    for (size_t i = 0; i < Ns.size(); ++i)
+    {
+        weights.push_back(TestTensorFactory::createQ4_KRandom(
+            {static_cast<size_t>(Ns[i]), static_cast<size_t>(K)},
+            static_cast<uint32_t>(300 + i)));
+        ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
+        expectPackedPath(packed[i], PackedPath::NativeVNNI);
+        kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
+        combined.merge(kernels.back()->getWorkspaceRequirements(M, Ns[i], K));
+    }
+
+    DeviceWorkspaceManager workspace(
+        DeviceId::rocm(0),
+        combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace.allocate(combined));
+    for (auto &kernel : kernels)
+        kernel->bindWorkspace(&workspace);
+
+    auto input = TestTensorFactory::createFP32Random({M, K});
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+
+    std::vector<std::unique_ptr<FP32Tensor>> outputs;
+    std::vector<ITensorGemm::TensorProjectionDesc> projections;
+    outputs.reserve(Ns.size());
+    projections.reserve(Ns.size());
+    for (size_t i = 0; i < Ns.size(); ++i)
+    {
+        outputs.push_back(TestTensorFactory::createFP32({M, static_cast<size_t>(Ns[i])}));
+        ASSERT_TRUE(outputs.back()->allocateOnDevice(DeviceId::rocm(0)));
+        projections.emplace_back(kernels[i].get(),
+                                 outputs.back().get(),
+                                 Ns[i],
+                                 nullptr,
+                                 "gdn_projection");
+    }
+
+    EXPECT_FALSE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K))
+        << "Unsafe small-M split-K overrides must hard-fail before launching graph-captured kernels";
+
+    for (auto &kernel : kernels)
+        kernel->unbindWorkspace();
 }
