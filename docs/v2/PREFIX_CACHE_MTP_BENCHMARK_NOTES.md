@@ -54,8 +54,17 @@ the `kernel` perf domain in the combined artifact:
 LLAMINAR_PERF_STATS_FILTER=mtp,forward_graph,kernel
 ```
 
+When the run is intended to decide what to optimize next inside a captured GPU
+verifier graph, include `stage_gpu` as well:
+
+```bash
+LLAMINAR_GPU_STAGE_TIMING=1
+LLAMINAR_PERF_STATS_FILTER=mtp,forward_graph,kernel,stage_gpu
+```
+
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
+| SingleDevice current profiling slice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S post fused-SwiGLU workspace binding | 16.87 clean same-binary `The quick brown fox`, `-c 64`, `-n 16`; 17.95 stage-timed `-c 64`, `-n 8` | Fully captured for dense depth-1 MTP. `stage_gpu` export now records concrete stage names for `main_decode`, `main_verifier`, sidecar, and shifted-prefill contexts. | N/A | 24.30 clean same-binary `-c 64`, `-n 16`; 21.49 stage-timed `-c 64`, `-n 8` | 1.44x clean same-binary; 1.20x under stage timing | `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-baseline-c64-n16-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-baseline-c64-n16-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-mtp-c64-n16-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-mtp-c64-n16-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-baseline-c64-n8-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-baseline-c64-n8-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-c64-n8-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-c64-n8-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-atomicreduce-c64-n8-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-atomicreduce-c64-n8-stats.json` | Current clean speedup is real but below the Phase 14 target. Stage-timed `main_verifier` averages about 62.82 ms per two-token verifier graph, with `GDN_PROJECTION` about 22.48 ms, generic down/GDN-output `GEMM` about 15.60 ms, and `GEMM_FUSED_GATE_UP` about 12.82 ms per verifier call. `LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE=1` is neutral on this build: 21.42 tok/s versus 21.49 tok/s. Depth-1 MTP cannot plausibly reach 2x on this prompt unless the verifier graph becomes much cheaper than one ordinary decode graph, so the next speedup lever is either real verifier-kernel reduction or enabling deeper graph-native drafts that use the existing M=3/4 verifier kernels to amortize the verifier. |
 | SingleDevice current slice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S workspace-bound MTP smoke | 16.90 same-binary `The quick brown fox`, `-c 64`, `-n 16` | Fully captured for the dense depth-1 path in this smoke. Terminal-hidden row select is a cached graph stage with a stable declared workspace scalar, GDN recurrence GPU merged-QKV deinterleave requires the declared `gdn_deinterleave_scratch` graph workspace before backend dispatch, GDN projection / FusedQKV / FusedGateUp workspace planning now asks each prepared kernel for the projection's real output width, and `WorkspaceAllocator` synchronizes the affected GPU before releasing/reallocating a declared device workspace so in-flight ROCm graph work cannot read freed workspace memory. | N/A | 24.42 same-binary `The quick brown fox`, `-c 64`, `-n 16` | 1.45x current workspace-sizing smoke | `/tmp/llaminar-mtp-bench/dense-rocm-workspace-sizing-baseline-c64-n16-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-workspace-sizing-baseline-c64-n16-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-workspace-sizing-mtp-c64-n16-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-workspace-sizing-mtp-c64-n16-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-workspace-sizing-mtp-c64-n16-stats.csv`; focused regressions: `V2_Unit_HiddenStateRowSelectStage`, `V2_Unit_WorkspaceAllocator` selected cases, `V2_Unit_GDNKernels`, `V2_Unit_FusedQKVGEMMStage`, and `V2_Unit_FusedGateUpGEMMStage` workspace cases | The workspace-binding slice is fixed and speed-positive. `mtp.verifier_forward` still averages about 67.37 ms per two-token verifier, while sidecar averages about 3.27 ms. Next ROCm work remains the captured verifier graph's GPU work and moving any remaining rebuilt graph-native scratch onto declared `IWorkspaceConsumer` buffers rather than ad-hoc allocations. |
 | SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 16.90 current workspace-sizing pair fox `-c 64 -n 16`; 18.47 current fused-SwiGLU-route fox `-c 64 -n 16`; 19.06 current fused-SwiGLU-route fox `-c 64 -n 8`; 18.07 previous KB-cap same-binary fox `-c 64 -n 16`; 18.96 previous clean all-codebook fox `-c 64 -n 16`; 18.14 sidecar-normal-replay fox `-c 64 -n 8`; historical baselines below | Captured and correctness-green for the dense MTP path: main verifier, sidecar, shifted-prefill, and catch-up replay as capturable segments with zero manual stages; ROCm MTP sidecar shifted-prefill/decode now uses normal replay instead of force-recapture; the M=2/3/4 graph-native verifier route is covered in focused ROCm integration across Q8 and native Q/K/IQ codebooks; fused native small-M QKV/GateUp dispatch shares activation quantization once through a graph-native batched same-codebook route; GDN qkv/z same-codebook subgroups now share activation quantization, and Qwen3.6 heterogeneous-N `N={10240,6144}` qkv/z pairs use the generic graph-native batched route instead of the unsafe Q4/M=2 specialized pair route; fused-SwiGLU/FFN down now uses the graph-native native-VNNI small-M route for eligible M=2/3/4 verifier shapes; per-kernel ROCm scatter-partial workspace slices prevent shared-workspace split-K aliasing; native small-M M=2/3/4 split-K caps default graph-safe KB at 8 and hard-fails unsafe overrides; stage-GPU timing now completes after guarding stale MTP sidecar timeline events; dense projection stages now declare per-projection workspace sizes through `IWorkspaceConsumer` planning instead of generic-width hints | N/A | 25.51 current fused-SwiGLU-route `-c 64 -n 16`; 24.42 current workspace-sizing pair `-c 64 -n 16`; 22.35 heterogeneous-N GDN qkv/z batched route `-c 64 -n 8`; 22.19 fused-SwiGLU-route `-c 64 -n 8`; 22.14 stage-GPU diagnostic `-c 64 -n 8`; 16.21 clean all-codebook route before batched fused projection; 15.80 batched fused-projection shared-partial rerun; 15.27 KB-cap stable rerun; 14.04 sidecar-normal-replay diagnostic | 1.45x current workspace-sizing pair against 16.90 tok/s baseline; 1.38x current fused-SwiGLU route against 18.47 tok/s baseline; 1.17x current short smoke against 19.06 tok/s baseline; 0.86x previous clean all-codebook route against 18.96 baseline | `/tmp/llaminar-mtp-bench/dense-rocm-workspace-sizing-baseline-c64-n16-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-workspace-sizing-mtp-c64-n16-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-workspace-sizing-mtp-c64-n16-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-baseline-n16.json`, `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-mtp-n16.json`, `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-baseline-n16.csv`, `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-mtp-n16.csv`, `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-baseline-n8.json`, `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-mtp-n8.json`, `/tmp/llaminar-mtp-bench/dense-rocm-gdn-heteron-batched-mtp-c64-n8-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-gdn-heteron-batched-mtp-c64-n8.csv`, `/tmp/llaminar-mtp-bench/dense-rocm-fusedswiglu-stagegpu-mtp-n8.json`, `/tmp/llaminar-mtp-bench/dense-rocm-fusedswiglu-stagegpu-mtp-n8.csv`; focused Phase 13.5 tests: `V2_Integration_ROCmQuantisedGemmSmallM`, `V2_Unit_GDNKernels`, `V2_Unit_FusedQKVGEMMStage`, `V2_Unit_FusedGateUpGEMMStage`, `V2_Unit_StageTimeline`, `NativeVNNIGEMMPerfTest.MTP_SmallM_VerifierShapes_AllFormats`, `NativeVNNIGEMMPerfTest.MTP_SmallM_DirectPrefillRouteComparison` | First ROCm SingleDevice dense speed-positive slice is proven after routing fused-SwiGLU/FFN down through graph-native small-M, and the workspace-sizing pair confirms that moving dense projection scratch to declared per-projection graph workspaces preserves a real MTP speedup. The current no-stage-timing pair records `mtp.verifier_forward` at about 67.37 ms per two-token graph and `sidecar_forward` at about 3.27 ms, while the latest stage diagnostic still shows `GDN_PROJECTION`, `GEMM`, and `GEMM_FUSED_GATE_UP` dominate GPU time. This is not Phase 14 complete: repeat longer-prompt evidence, characterize remaining GDN/LM-head/recurrence work, and port the M=2/3/4 quantize-once GEMV-many contract to CUDA and CPU. |
 | SingleDevice | CUDA `cuda:0` | Qwen3.6 dense 27B Q4_K_S | 40.44 current same-binary `-c 128 -n 64`; 40.48 earlier `-c 128 -n 64`; 41.39 current `-c 64 -n 16`; 43.76 current no-stats `-c 64 -n 4` | Small-context dense MTP reaches segmented replay with zero manual stages. Main verifier, full decode sidecar, and KV-only shifted-row catch-up decode graphs are capturable/replayed; default 4096-context run still does not fit this 24 GB device | N/A | 54.02 native M=2 verifier `-c 128 -n 64`; 46.93 stage-timing diagnostic `-c 128 -n 16`; 38.16 same-prompt `-n 4` clean run; 37.69 retained KV-only catch-up `-c 128 -n 64`; 36.78 rejected post-sidecar checkpoint-elision experiment | 1.34x current same-binary depth-1 MTP; 0.93x pre-native-M2 retained telemetry; 0.91x rejected checkpoint-elision experiment | `/tmp/llaminar-mtp-bench/dense-cuda-current-baseline-m2native-c128-n64-forwardgraph.json`, `/tmp/llaminar-mtp-bench/dense-cuda-current-baseline-m2native-c128-n64-forwardgraph-stats.csv`, `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-m2native-c128-n64-combined.json`, `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-m2native-c128-n64-combined-stats.csv`, `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-m2native-stagegpu-c128-n16-stats.csv`; historical artifacts are in Latest CUDA dense evidence below | First concrete CUDA SingleDevice dense MTP speedup is proven for depth-1 MTP after the graph-native CUDA M=2 native-VNNI verifier route: 54.02 tok/s versus 40.44 tok/s baseline with 96.88% acceptance, aligned shifted KV (`current_position=68`, `mtp_cached_tokens=67`), and zero manual segmented-replay stages. A fresh stage-timing diagnostic shows the captured main verifier replay is still about 30.5 ms per two-token graph; non-replay stage events show GEMM, GDN projection, and fused gate/up dominate the remaining GPU work. This is still below the Phase 14 dense target of roughly 2x. Next work should tune the remaining main-verifier cost, investigate deeper draft verification, and port the graph-native small-M path to ROCm, TP, and MoE domains. |
@@ -148,6 +157,56 @@ Latest workspace-binding validation:
   GDN alpha/beta path and `rocm_fused_m2_shared_quant_calls` for the quantized
   projection route. `mtp.verifier_forward` still averages 67.37 ms per two-token
   verifier and remains the next ROCm SingleDevice tuning target.
+- Post fused-SwiGLU workspace-binding same-binary pair completed on Qwen3.6 dense
+  ROCm SingleDevice:
+  `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-baseline-c64-n16-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-baseline-c64-n16-stats.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-baseline-c64-n16-stats.csv`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-mtp-c64-n16-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-mtp-c64-n16-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-post-swiglu-ws-mtp-c64-n16-stats.csv`.
+  Baseline decode was 16.87 tok/s; depth-1 MTP decode was 24.30 tok/s with
+  87.5% acceptance, 32 draft steps, 28 accepted tokens, 4 rejected tokens,
+  4 rollbacks, 32 verifier runs, and 64 verifier tokens. `mtp.verifier_forward`
+  still dominated: 24 measured verifier calls took 1625.27 ms total, about
+  67.72 ms per two-token verifier. `sidecar_forward` averaged about 3.27 ms,
+  and replay after rejection averaged about 75.61 ms.
+- Stage-name profiler pair completed with `LLAMINAR_GPU_STAGE_TIMING=1` and
+  `LLAMINAR_PERF_STATS_FILTER=mtp,forward_graph,kernel,stage_gpu`:
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-baseline-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-baseline-c64-n8-stats.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-baseline-c64-n8-stats.csv`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-c64-n8-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-c64-n8-stats.csv`.
+  The stage-timed baseline was 17.95 tok/s. The stage-timed MTP run was
+  21.49 tok/s with 75% acceptance. In the MTP run, `main_verifier` recorded
+  12 stage-timed verifier graph executions totaling 753.88 ms, about 62.82 ms
+  per two-token verifier graph. Per verifier graph, the hottest type buckets
+  were `GDN_PROJECTION` about 22.48 ms, generic down/GDN-output `GEMM` about
+  15.60 ms, `GEMM_FUSED_GATE_UP` about 12.82 ms, `FUSED_RESIDUAL_NORM` about
+  2.74 ms, `GEMM_FUSED_QKV` about 1.68 ms, and `LM_HEAD` about 1.66 ms.
+  Individual stage-name export shows the GDN projection cost spread across all
+  48 GDN layers rather than one pathological layer; the hottest named node was
+  `lm_head` at about 1.66 ms per verifier graph, followed by per-layer
+  `layer*_gdn_proj` entries around 0.47-0.54 ms each.
+- Current atomic native-VNNI reduction rerun rejected it as a speed lever for
+  this path:
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-atomicreduce-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-atomicreduce-c64-n8-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-stagegpu-mtp-atomicreduce-c64-n8-stats.csv`.
+  With `LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE=1`, stage-timed MTP reached
+  21.42 tok/s versus 21.49 tok/s without atomic reduce, and the hot buckets
+  were effectively unchanged.
+- Depth-1 MTP is now speed-positive but structurally below the 2x Phase 14
+  target on this prompt. With one draft token, the verifier graph must become
+  substantially cheaper than one ordinary decode graph, or deeper graph-native
+  drafts must amortize verifier cost by using the existing M=3/M=4 small-M
+  verifier kernels. The current `--mtp-draft-tokens > 1` hard fail is therefore
+  a speedup blocker rather than just a feature gap.
 
 Latest ROCm dense evidence:
 
