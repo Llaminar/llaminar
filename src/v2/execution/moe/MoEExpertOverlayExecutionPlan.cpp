@@ -446,6 +446,18 @@ namespace llaminar2
         return &*it;
     }
 
+    std::optional<std::string> graphNativeMoEOverlayBuildBlocker(
+        const MoEExpertOverlayExecutionPlan &execution_plan)
+    {
+        if (execution_plan.buildsRootGraph())
+            return std::nullopt;
+
+        const auto &rank_plan = execution_plan.currentRankPlan();
+        return std::string("MoE overlay rank ") + std::to_string(rank_plan.world_rank) +
+               " has role " + toString(rank_plan.role) +
+               " but sidecar endpoint ranks were removed by graph-native MoE productionization";
+    }
+
     MoEExpertOverlayExecutionPlan buildMoEExpertOverlayExecutionPlan(
         const MoEExpertOverlayRuntimePlan &runtime_plan,
         int requested_world_size)

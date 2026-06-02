@@ -14,6 +14,7 @@
 #include "MoEExpertOverlayRuntimePlan.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -96,5 +97,8 @@ namespace llaminar2
     MoEExpertOverlayExecutionPlan resolveMoEExpertOverlayExecutionPlan(
         std::shared_ptr<const MoEExpertParallelPlan> plan,
         const MoEExpertOverlayExecutionPlanResolverOptions &options);
+
+    std::optional<std::string> graphNativeMoEOverlayBuildBlocker(
+        const MoEExpertOverlayExecutionPlan &execution_plan);
 
 } // namespace llaminar2

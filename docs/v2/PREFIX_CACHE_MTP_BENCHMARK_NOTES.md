@@ -24,7 +24,7 @@ manual stages, uncaptured collectives, or large host/replay overhead.
 | LocalPP | ROCm `stage0=rocm:0, stage1=rocm:1` | Qwen3.6 dense 27B Q4_K_S | 20.47 at `-c 64` | Blocked: MTP is a hard fail before prefill on PP topologies | PP activation transfers are present in the baseline path, but MTP graph capture is not attempted | Blocked | N/A | `/tmp/llaminar-mtp-bench/dense-localpp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localpp-rocm-mtp-gpugraphs-c64-n4-hardfail.json` | PP MTP shifted-prefill and verifier execution are not implemented. The previous late stage-1 shifted-cache failure is now a prefill hard-fail with an explicit unsupported-topology message. |
 | NodeLocalTP | CPU sockets | Qwen3.6 dense 27B Q4_K_S | Pending | N/A for GPU graphs | Host/MPI coordination only | Pending | Pending | Pending | Needed for correctness/speed evidence, but not GPU graph-capture gating. |
 | Expert overlay EP | 2x ROCm | Qwen3.6 MoE 35B | Blocked before inference | Blocked before graph-capture measurement | Sparse dispatch/return graph capture required where ROCm supports it, but the current run blocks during resident expert preparation first | Blocked | N/A | `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-replicated-streaming-hardfail.txt` | Added `configs/moe_overlay/rocm2_replicated_static.yaml` and harness coverage for a one-rank LocalTP `ReplicatedExperts` ROCm domain. Real Qwen3.6 MoE reaches graph config, but both ROCm devices fail resident expert VRAM preflight by the safety-margin check. `LLAMINAR_WEIGHT_STREAMING=1` is already enabled in the confirming run, but resident MoE expert streaming is not active for this GPU pipeline path. |
-| Expert overlay EP | 2x ROCm plus 2x CPU dual-socket | Qwen3.6 MoE 35B | Pending | Pending | Heterogeneous sparse collectives must be graph-aware with hard fail for unsupported legs | Pending | Pending | Pending | Need host-staged sparse return path through `TransferEngine`, then graph capture where possible. |
+| Expert overlay EP | 2x ROCm plus 2x CPU dual-socket | Qwen3.6 MoE 35B | Blocked before inference | Blocked before graph-capture measurement | Heterogeneous sparse collectives must be graph-aware, but the current run stops before sparse dispatch because CPU fallback participant ranks no longer have sidecar endpoint runners | Blocked | N/A | `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-cpu2-endpoint-hardfail.txt` | Added `configs/moe_overlay/rocm2_cpu2_replicated_static.yaml` and harness coverage for a rank-0 ROCm LocalTP hot tier plus rank-1 CPU LocalTP fallback tier. Real Qwen3.6 MoE rank 1 hard-fails as `CpuFallbackParticipant` because sidecar endpoint ranks were removed by graph-native MoE productionization. Next slice needs proper graph-native CPU fallback participant workers and sparse return through `TransferEngine`, not a fallback sidecar. |
 
 Latest ROCm dense evidence:
 
@@ -285,6 +285,30 @@ Latest Expert overlay 2x ROCm MoE evidence:
     execution. The next 2x ROCm EP slice must either reduce resident expert
     budget for this config or implement resident MoE expert streaming before
     MTP graph-capture evidence can be collected.
+
+Latest Expert overlay 2x ROCm plus 2x CPU MoE evidence:
+
+- Config and harness coverage:
+  `configs/moe_overlay/rocm2_cpu2_replicated_static.yaml` is a two-rank
+  heterogeneous overlay config. Rank 0 owns a LocalTP `ReplicatedExperts`
+  hot tier over `rocm:0,rocm:1`; rank 1 owns a LocalTP `ReplicatedExperts`
+  CPU fallback tier over `cpu:0,cpu:1`.
+  `V2_Perf_MoEGraphNativeOverlay` validates the config shape and command
+  generation with `--mpi-procs 2`.
+- Real Qwen3.6 MoE smoke:
+  `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-cpu2-endpoint-hardfail.txt`.
+  - Model: `/opt/llaminar-models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf`.
+  - Domain: `configs/moe_overlay/rocm2_cpu2_replicated_static.yaml`,
+    `--mpi-procs 2`, `-c 64`, deterministic prompt, `-n 1`.
+  - Rank 1 hard-fails before inference:
+    `MoE overlay rank 1 has role CpuFallbackParticipant but sidecar endpoint
+    ranks were removed by graph-native MoE productionization`.
+  - Rank 0 then reports cross-rank initialization failure at
+    `buildComputeGraph`.
+  - The next heterogeneous EP slice must implement graph-native CPU fallback
+    participant workers and host-staged sparse dispatch/return through
+    `TransferEngine` before MTP graph-capture or speedup evidence can be
+    collected.
 
 Latest ROCm MoE evidence:
 

@@ -69,6 +69,7 @@ mkdir -p "${run_dir}"
 
 configs=(
   rocm2_replicated_static.yaml
+  rocm2_cpu2_replicated_static.yaml
   cuda_hot_rocm_warm_static.yaml
   cuda_hot_rocm_warm_rebalanced.yaml
   cuda_hot_rocm_warm_cpu_cold_static.yaml

@@ -2453,12 +2453,10 @@ namespace llaminar2
         auto overlay_execution_plan = resolveOverlayExecutionPlanForRunner(
             config_.moe_expert_parallel_plan,
             moe_expert_overlay_mpi_ctx_ ? moe_expert_overlay_mpi_ctx_ : mpi_ctx_);
-        if (overlay_execution_plan && !overlay_execution_plan->buildsRootGraph())
+        if (overlay_execution_plan)
         {
-            const auto &rank_plan = overlay_execution_plan->currentRankPlan();
-            return setError(std::string("MoE overlay rank ") + std::to_string(rank_plan.world_rank) +
-                            " has role " + toString(rank_plan.role) +
-                            " but sidecar endpoint ranks were removed by graph-native MoE productionization");
+            if (auto blocker = graphNativeMoEOverlayBuildBlocker(*overlay_execution_plan))
+                return setError(*blocker);
         }
 
         // Check if LOCAL PP is configured (takes priority over TP, because

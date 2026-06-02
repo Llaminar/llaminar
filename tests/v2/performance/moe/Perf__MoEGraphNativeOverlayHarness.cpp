@@ -29,6 +29,7 @@ namespace
     {
         static const std::vector<ConfigExpectation> configs = {
             {"rocm2_replicated_static.yaml", false, false, 1},
+            {"rocm2_cpu2_replicated_static.yaml", true, false, 2},
             {"cuda_hot_rocm_warm_static.yaml", false, false, 2},
             {"cuda_hot_rocm_warm_rebalanced.yaml", false, true, 2},
             {"cuda_hot_rocm_warm_cpu_cold_static.yaml", true, false, 3},
