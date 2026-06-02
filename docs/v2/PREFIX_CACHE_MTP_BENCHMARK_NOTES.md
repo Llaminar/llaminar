@@ -221,6 +221,29 @@ Latest graph-atomic small-M hardening validation:
   `V2_Unit_PrefillDecodeTransition.MTPChainedDraftCapturesOnlyFirstPostSidecarCheckpoint`,
   `V2_Unit_MTPGraphConstruction`, `V2_Unit_RankOrchestrator`, and the focused
   real-model `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`.
+- Chained first-speculative reject replay cleanup: the lagged-correction replay
+  shortcut now also applies to deeper drafts when the first speculative token is
+  rejected. This is the same safe state contract as depth-1: restore to the
+  first post-sidecar checkpoint, replay only the first main token, append the
+  correction token's shifted MTP row, and discard later chained sidecar scratch.
+  Focused regression:
+  `V2_Unit_PrefillDecodeTransition.MTPChainedFirstSpecRejectUsesLaggedCorrectionReplay`.
+  Fresh depth-2 ROCm/Qwen3.6 dense long-lane evidence after the checkpoint
+  cleanup but before the generalized lagged replay:
+  `/tmp/llaminar-mtp-bench/dense-rocm-chained-checkpoint-d2-c64-n48-bench.json`
+  reached 30.27 decode tok/s with 77.24% acceptance, 28 rejected tokens,
+  and 32 rollbacks; measured stats recorded
+  `post_sidecar_checkpoint_skipped_speculative=51` and `replay_tokens=36`.
+  After generalized lagged replay,
+  `/tmp/llaminar-mtp-bench/dense-rocm-chained-lagged-reject-d2-c64-n48-bench.json`
+  reached 28.12 decode tok/s with 76.23% acceptance, 29 rejected tokens,
+  and 33 rollbacks; measured stats recorded
+  `lagged_rejected_correction_replays=6`,
+  `post_sidecar_checkpoint_skipped_speculative=51`, and `replay_tokens=30`.
+  The shortcut is correct and reduces replay work, but it is not a speed ratchet:
+  depth-2 remains dominated by lower draft acceptance, more rollbacks, and
+  about 64 ms per three-token verifier, while depth-1 remains the best ROCm
+  long-lane MTP path.
 
 Latest workspace-binding validation:
 

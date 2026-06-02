@@ -1273,7 +1273,7 @@ namespace llaminar2
             static_cast<int>(accepted_tokens.size()) > accepted_speculative_prefix + 1;
         const bool can_lag_rejected_correction =
             rejected_speculative_token &&
-            speculative_draft_count == 1 &&
+            accepted_speculative_prefix == 0 &&
             accepted_tokens.size() == 2 &&
             already_appended_for_output == 1;
         const bool verifier_state_matches_output =
