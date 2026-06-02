@@ -91,6 +91,28 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- Fresh both-shortcuts recheck after rebuilding `build_v2_release`, Qwen3.6
+  27B Q4_K_S on `rocm:0`, GPU graphs enabled, `The quick brown fox`,
+  `-c 64`, `-n 48`: baseline
+  `/tmp/llaminar-mtp-bench/dense-rocm-both-shortcuts-recheck-baseline-c64-n48-bench.json`
+  reached 20.83 decode tok/s; depth-1 MTP
+  `/tmp/llaminar-mtp-bench/dense-rocm-both-shortcuts-recheck-mtp-d1-c64-n48-bench.json`
+  reached 34.01 decode tok/s for a 1.63x same-binary speedup. Structured
+  stats:
+  `/tmp/llaminar-mtp-bench/dense-rocm-both-shortcuts-recheck-mtp-d1-c64-n48-stats.json`
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-both-shortcuts-recheck-mtp-d1-c64-n48-stats.csv`.
+  The request recorded 93.75% acceptance, 90 accepted tokens, 6 rejected
+  tokens, and 6 rollbacks. The measured stats window recorded three
+  `rollback_verifier_state_row_shortcuts`, three
+  `live_prefix_replay_state_preserved` rows for
+  `operation=restore_mtp_verifier_state_row`, no replay-token/replay-forward
+  counter in the filtered stats, `main_verifier` forward-cache hits after
+  warmup, `mtp.verifier_forward` averaging about 51.68 ms, and
+  `sidecar_forward` averaging about 2.91 ms. This reconfirms the GDN
+  verifier-row restore shortcut and replay-cache preservation are active in
+  real ROCm inference, but it does not replace the 34.28 tok/s mixed-native
+  ratchet; the remaining Phase 13.5 lever is still captured verifier GPU work.
 - Fresh post-row-cache ROCm SingleDevice dense long-lane evidence, Qwen3.6
   27B Q4_K_S on `rocm:0`, GPU graphs enabled, `The quick brown fox`,
   `-c 64`, `-n 48`: baseline
