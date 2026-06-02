@@ -200,6 +200,57 @@ namespace
         return ok;
     }
 
+    bool cpuFusedSwiGLUDownToVector(ITensorGemm *kernel,
+                                    const float *gate_host,
+                                    const float *up_host,
+                                    float *C_host,
+                                    int M, int N, int K,
+                                    float alpha = 1.0f, float beta = 0.0f)
+    {
+        auto gate_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        auto up_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(gate_tensor->mutable_data(), gate_host, (size_t)M * K * sizeof(float));
+        std::memcpy(up_tensor->mutable_data(), up_host, (size_t)M * K * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+        if (beta != 0.0f)
+            std::memcpy(C_tensor->mutable_data(), C_host, (size_t)M * N * sizeof(float));
+
+        bool ok = kernel->multiply_tensor_with_fused_swiglu(
+            gate_tensor.get(), up_tensor.get(), C_tensor.get(),
+            M, N, K, alpha, beta);
+        if (ok)
+            std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
+        return ok;
+    }
+
+    bool cudaFusedSwiGLUDownViaTensor(ITensorGemm *kernel,
+                                      const float *gate_host,
+                                      const float *up_host,
+                                      float *C_host,
+                                      int M, int N, int K,
+                                      DeviceId gpu_device,
+                                      float alpha = 1.0f, float beta = 0.0f)
+    {
+        auto gate_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        auto up_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(gate_tensor->mutable_data(), gate_host, (size_t)M * K * sizeof(float));
+        std::memcpy(up_tensor->mutable_data(), up_host, (size_t)M * K * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+        if (beta != 0.0f)
+            std::memcpy(C_tensor->mutable_data(), C_host, (size_t)M * N * sizeof(float));
+
+        bool ok = with_gpu_coherence(gpu_device, {gate_tensor.get(), up_tensor.get()}, {C_tensor.get()},
+                                     [&]
+                                     {
+                                         return kernel->multiply_tensor_with_fused_swiglu(
+                                             gate_tensor.get(), up_tensor.get(), C_tensor.get(),
+                                             M, N, K, alpha, beta);
+                                     });
+        if (ok)
+            std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
+        return ok;
+    }
+
 } // namespace
 
 // ============================================================================
@@ -1143,6 +1194,46 @@ TEST_F(Test__CUDAGemmParity, Q4_K_FusedVerifierSmallM_2RowsTwoProjections)
         << "Small-M fused verifier projection 1 must not leak CUDA dynamic state after workspace cleanup";
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights0.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_FusedSwiGLUDownSmallM_2x896x768)
+{
+    const int M = 2;
+    const int N = 896;
+    const int K = 768;
+
+    auto weights = TestTensorFactory::createQ4_KRandom({(size_t)N, (size_t)K}, 228);
+    auto gate_data = randomFP32(static_cast<size_t>(M) * K);
+    auto up_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuFusedSwiGLUDownToVector(
+        cpu_kernel.get(), gate_data.data(), up_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+        cuda_kernel, gate_data.data(), up_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_K fused-SwiGLU down small-M 2x896x768");
+    EXPECT_FALSE(result.has_nan_inf);
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low: " << result.cosine_similarity;
+    EXPECT_LE(result.relative_l2_error, 0.15)
+        << "Relative L2 error too high: " << (result.relative_l2_error * 100.0) << "%";
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "Small-M fused-SwiGLU down test must not leak CUDA dynamic state after workspace cleanup";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================

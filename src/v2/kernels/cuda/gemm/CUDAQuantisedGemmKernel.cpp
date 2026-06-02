@@ -1991,6 +1991,44 @@ namespace llaminar2
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
 
+                if (m > 1 && m <= 2 && canUseNativeVNNIBlockwise(impl_.get(), 1, k))
+                {
+                    const int blocks_per_row = k / 32;
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const int8_t *row_A = d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(k);
+                        const float *row_scales =
+                            d_scales_A_blockwise + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+                        float *row_C = d_C + static_cast<size_t>(row) * static_cast<size_t>(n);
+                        const float *row_existing = (beta != 0.0f) ? row_C : nullptr;
+
+                        if (!runNativeVNNIBlockwiseIfSupported(
+                                impl_.get(),
+                                row_A,
+                                nullptr,
+                                row_C,
+                                row_scales,
+                                1,
+                                n,
+                                k,
+                                alpha,
+                                beta,
+                                row_existing,
+                                nullptr,
+                                cuda_device_id_,
+                                gpu_stream_,
+                                packed_ ? &packed_->rowmajor_ : nullptr))
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Row "
+                                      << row << " native-VNNI GEMV failed");
+                            return false;
+                        }
+                    }
+
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (small-M row-wise native GEMV)");
+                    return true;
+                }
+
                 // Try native VNNI blockwise path (GEMV for decode)
                 if (runNativeVNNIBlockwiseIfSupported(
                         impl_.get(),
