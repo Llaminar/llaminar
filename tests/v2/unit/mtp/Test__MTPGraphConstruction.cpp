@@ -1702,6 +1702,74 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
     ASSERT_NE(segmented_path, nullptr);
     EXPECT_GE(segmented_path->value, 3.0);
 
+    const auto policy_tags = PerfStatsCollector::Tags{
+        {"allow_segmented", "true"},
+        {"collective_segmented", "false"},
+        {"collectives_graph_capturable", "false"},
+        {"context", "mtp_decode_sidecar"},
+        {"has_collectives", "false"}};
+    const PerfStatRecord *policy_record = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_decode_capture_policy",
+        policy_tags);
+    ASSERT_NE(policy_record, nullptr);
+    EXPECT_GE(policy_record->value, 3.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefillContext)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    const auto device = firstAvailableGraphCaptureGPU();
+    if (!device.has_value())
+        GTEST_SKIP() << "No GPU backend available for MTP shifted-prefill context regression";
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.default_device = *device;
+
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        *device));
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture, *device);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForDevice(*orchestrator.frozenWeightSet(), store, *device);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::vector<int> prefix_tokens = {1, 2, 3, 4};
+    ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto policy_tags = PerfStatsCollector::Tags{
+        {"allow_segmented", "true"},
+        {"collective_segmented", "false"},
+        {"collectives_graph_capturable", "false"},
+        {"context", "mtp_shifted_prefill"},
+        {"has_collectives", "false"}};
+    const PerfStatRecord *policy_record = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_decode_capture_policy",
+        policy_tags);
+    ASSERT_NE(policy_record, nullptr);
+    EXPECT_GE(policy_record->value, 2.0);
+
     PerfStatsCollector::reset();
 }
 

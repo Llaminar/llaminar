@@ -98,6 +98,11 @@ namespace llaminar2
             return value;
         }
 
+        std::string boolTag(bool value)
+        {
+            return value ? "true" : "false";
+        }
+
         size_t fp32LogitsRowBytes(const TensorBase *tensor)
         {
             if (!tensor)
@@ -3431,10 +3436,15 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::executeMTPDepth0(
         int32_t draft_condition_token,
         TensorBase *terminal_hidden,
-        int position_id)
+        int position_id,
+        const char *sidecar_perf_context)
     {
         const std::string device_key = state_.device_id.toString();
         const std::string phase = perfPhaseName();
+        const std::string sidecar_context =
+            (sidecar_perf_context && sidecar_perf_context[0] != '\0')
+                ? sidecar_perf_context
+                : ((phase == "prefill") ? "mtp_shifted_prefill" : "mtp_decode_sidecar");
         PerfStatsCollector::ScopedTimer total_timer(
             "mtp",
             "sidecar_depth0_total",
@@ -3676,12 +3686,22 @@ namespace llaminar2
                 ensureDeviceWorkspaceAllocated(*sidecar_cache.graph);
                 auto &pool = GPUDeviceContextPool::instance();
                 IWorkerGPUContext &gpu_ctx = pool.getContext(state_.device_id);
-                sidecar_cache.segment_cache.perf_context =
-                    (phase == "prefill") ? "mtp_shifted_prefill" : "mtp_decode_sidecar";
+                sidecar_cache.segment_cache.perf_context = sidecar_context;
                 const auto capture_policy = buildDecodeCapturePolicy(
                     !collective_nodes.empty(),
                     ctx,
                     sidecar_cache.segment_cache.consecutive_failures);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "sidecar_decode_capture_policy",
+                    1.0,
+                    phase,
+                    device_key,
+                    {{"context", sidecar_cache.segment_cache.perf_context},
+                     {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
+                     {"has_collectives", boolTag(!collective_nodes.empty())},
+                     {"collective_segmented", boolTag(capture_policy.collective_segmented_enabled)},
+                     {"collectives_graph_capturable", boolTag(capture_policy.collectives_graph_capturable)}});
                 ok = executor_.executeDecodeWithCapturePolicy(
                     *sidecar_cache.graph,
                     ctx,
@@ -3773,7 +3793,8 @@ namespace llaminar2
         {
             if (!executeMTPDepth0(tokens[0],
                                   state_.prefix_terminal_hidden.get(),
-                                  previous_tokens))
+                                  previous_tokens,
+                                  "mtp_shifted_prefill"))
             {
                 return false;
             }
@@ -3785,7 +3806,8 @@ namespace llaminar2
                 return false;
             if (!executeMTPDepth0(tokens[row + 1],
                                   state_.prefix_terminal_hidden.get(),
-                                  position_offset + row + 1))
+                                  position_offset + row + 1,
+                                  "mtp_shifted_prefill"))
             {
                 return false;
             }
@@ -3867,7 +3889,11 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] forwardMTP requires a terminal hidden row");
             return false;
         }
-        return executeMTPDepth0(draft_condition_token, terminal_hidden, position_id);
+        return executeMTPDepth0(
+            draft_condition_token,
+            terminal_hidden,
+            position_id,
+            "mtp_decode_sidecar");
     }
 
     const float *DeviceGraphOrchestrator::mtpLogits() const

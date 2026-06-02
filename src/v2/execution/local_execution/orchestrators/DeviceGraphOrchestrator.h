@@ -2241,7 +2241,8 @@ namespace llaminar2
         bool selectMTPTerminalHiddenRow(int row_idx, int seq_len);
         bool executeMTPDepth0(int32_t draft_condition_token,
                               TensorBase *terminal_hidden,
-                              int position_id);
+                              int position_id,
+                              const char *sidecar_perf_context);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,
