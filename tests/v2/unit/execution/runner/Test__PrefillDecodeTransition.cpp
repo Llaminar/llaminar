@@ -201,6 +201,28 @@ namespace
             return true;
         }
 
+        bool supportsChainedMTPDrafts() const override
+        {
+            return supports_chained_mtp_drafts_;
+        }
+
+        bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override
+        {
+            if (!mtp_enabled_ || !supports_chained_mtp_drafts_ || position_id < 0)
+                return false;
+            forward_mtp_from_last_draft_count_++;
+            last_chained_mtp_condition_token_ = draft_condition_token;
+            last_chained_mtp_position_id_ = position_id;
+            mtp_logits_.assign(VOCAB_SIZE, -10.0f);
+            mtp_logits_[MTP_ARGMAX_TOKEN] = 10.0f;
+            if (column_parallel_logits_)
+            {
+                resetLocalTensor(mtp_logits_local_, 1);
+                setLocalToken(mtp_logits_local_, 0, MTP_ARGMAX_TOKEN, 10.0f);
+            }
+            return true;
+        }
+
         const float *mtpLogits() const override
         {
             if (hide_local_logits_)
@@ -355,10 +377,13 @@ namespace
         int forwardCallCount() const { return forward_call_count_; }
         int clearCacheCount() const { return clear_cache_count_; }
         int forwardMTPCount() const { return forward_mtp_count_; }
+        int forwardMTPFromLastDraftCount() const { return forward_mtp_from_last_draft_count_; }
         int restoreCount() const { return restore_count_; }
         int captureCheckpointCount() const { return capture_checkpoint_count_; }
         int setAllPositionCount() const { return set_all_position_count_; }
         int lastMTPConditionToken() const { return last_mtp_condition_token_; }
+        int lastChainedMTPConditionToken() const { return last_chained_mtp_condition_token_; }
+        int lastChainedMTPPositionId() const { return last_chained_mtp_position_id_; }
         int commitMTPShiftedCount() const { return commit_mtp_shifted_count_; }
         int lastCommitMTPAlreadyAppended() const { return last_commit_mtp_already_appended_; }
         int lastCommitMTPMainForwardTokenCount() const { return last_commit_mtp_main_forward_token_count_; }
@@ -374,6 +399,10 @@ namespace
         {
             mtp_enabled_ = true;
             accept_mtp_token_ = accept_mtp_token;
+        }
+        void enableChainedMTPDrafts()
+        {
+            supports_chained_mtp_drafts_ = true;
         }
         void setMTPUnsupportedReason(std::string reason)
         {
@@ -544,6 +573,7 @@ namespace
         std::shared_ptr<FP32Tensor> all_position_logits_local_;
         int forward_call_count_{0};
         int forward_mtp_count_{0};
+        int forward_mtp_from_last_draft_count_{0};
         int clear_cache_count_{0};
         int restore_count_{0};
         mutable int capture_checkpoint_count_{0};
@@ -555,12 +585,15 @@ namespace
         int sample_mtp_logits_count_{0};
         int sample_all_position_logits_count_{0};
         int last_mtp_condition_token_{-1};
+        int last_chained_mtp_condition_token_{-1};
+        int last_chained_mtp_position_id_{-1};
         bool is_first_forward_in_cycle_{true};
         bool mtp_enabled_{false};
         bool accept_mtp_token_{true};
         bool all_position_logits_enabled_{false};
         bool column_parallel_logits_{false};
         bool supports_mtp_token_coordination_{false};
+        bool supports_chained_mtp_drafts_{false};
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
         DeviceId primary_device_{DeviceId::cpu()};
@@ -615,13 +648,18 @@ namespace
                                                                              bool mtp_token_coordination = false,
                                                                              bool hide_local_logits = false,
                                                                              DeviceId primary_device = DeviceId::cpu(),
-                                                                             int mtp_draft_tokens = 1)
+                                                                             int mtp_draft_tokens = 1,
+                                                                             bool chained_mtp_support = false)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
             if (mtp_enabled)
             {
                 mock_ptr->enableMTP(mtp_accept);
+            }
+            if (chained_mtp_support)
+            {
+                mock_ptr->enableChainedMTPDrafts();
             }
             mock_ptr->setMTPUnsupportedReason(std::move(mtp_unsupported_reason));
             mock_ptr->setPrimaryDevice(primary_device);
@@ -905,6 +943,50 @@ namespace
             << runner->lastError();
         EXPECT_EQ(mock->forwardMTPCount(), 0);
         EXPECT_EQ(mock->forwardCallCount(), 0);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPChainedDraftCapturesOnlyFirstPostSidecarCheckpoint)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_chained_checkpoint_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/3,
+                /*chained_mtp_support=*/true);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+
+            EXPECT_EQ(mock->forwardMTPCount(), 1);
+            EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 2);
+            EXPECT_EQ(mock->captureCheckpointCount(), 2)
+                << "only the live checkpoint plus the first post-sidecar checkpoint are restorable";
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *post_sidecar_capture =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "capture_post_sidecar_prefix_state");
+            ASSERT_NE(post_sidecar_capture, nullptr);
+            EXPECT_EQ(post_sidecar_capture->count, 1u);
+
+            const PerfStatRecord *skipped_speculative =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "post_sidecar_checkpoint_skipped_speculative");
+            ASSERT_NE(skipped_speculative, nullptr);
+            EXPECT_DOUBLE_EQ(skipped_speculative->value, 2.0);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPDecodeRecordsStructuredPerfStats)

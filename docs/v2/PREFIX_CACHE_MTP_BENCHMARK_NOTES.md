@@ -212,6 +212,14 @@ Latest graph-atomic small-M hardening validation:
   averaged about 1.86 ms, `sidecar_forward` about 2.66 ms, and
   `verifier_forward` about 52.55 ms. The remaining Phase 14 blocker is still
   verifier graph work, not rollback state restoration or sidecar launch.
+- Chained-draft rollback checkpoint cleanup: for `--mtp-draft-tokens > 1`, only
+  the first post-sidecar checkpoint is restorable. Later chained sidecar KV rows
+  are speculative scratch and are discarded before verifier-backed shifted rows
+  are committed, so the runner now skips redundant later post-sidecar checkpoint
+  captures and records `mtp.post_sidecar_checkpoint_skipped_speculative`.
+  Focused regression coverage:
+  `V2_Unit_PrefillDecodeTransition.MTPChainedDraftCapturesOnlyFirstPostSidecarCheckpoint`,
+  plus `V2_Unit_MTPGraphConstruction` and `V2_Unit_RankOrchestrator`.
 
 Latest workspace-binding validation:
 

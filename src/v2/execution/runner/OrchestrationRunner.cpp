@@ -1061,7 +1061,7 @@ namespace llaminar2
         draft_tokens.push_back(first_token);
 
         std::vector<PrefixStateSnapshot> sidecar_checkpoints;
-        sidecar_checkpoints.reserve(static_cast<size_t>(speculative_draft_count));
+        sidecar_checkpoints.reserve(1);
 
         auto sample_mtp_token = [&]() -> int32_t
         {
@@ -1116,13 +1116,22 @@ namespace llaminar2
                         : "Chained MTP sidecar forward failed");
             }
 
+            if (draft_idx == 0)
             {
                 PerfStatsCollector::ScopedTimer timer("mtp", "capture_post_sidecar_prefix_state", "decode");
                 sidecar_checkpoints.push_back(runner_->captureLivePrefixCheckpoint());
+                if (!sidecar_checkpoints.back().valid)
+                {
+                    return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
+                }
             }
-            if (!sidecar_checkpoints.back().valid)
+            else
             {
-                return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "post_sidecar_checkpoint_skipped_speculative",
+                    1.0,
+                    "decode");
             }
 
             int32_t mtp_token = sample_mtp_token();
