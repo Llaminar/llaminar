@@ -2266,6 +2266,7 @@ namespace llaminar2
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
             std::vector<IComputeStage *> dynamic_param_stages;
             TensorBase *terminal_hidden = nullptr;
+            uint64_t workspace_generation = 0;
             int32_t token_id = 0;
             int position_id = 0;
             bool valid = false;
@@ -2275,12 +2276,18 @@ namespace llaminar2
                 segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
             }
 
+            void resetReplayStateAfterWorkspaceRebind()
+            {
+                resetReplayState();
+            }
+
             void invalidate()
             {
                 segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
                 graph.reset();
                 dynamic_param_stages.clear();
                 terminal_hidden = nullptr;
+                workspace_generation = 0;
                 token_id = 0;
                 position_id = 0;
                 valid = false;

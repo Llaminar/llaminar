@@ -3730,10 +3730,44 @@ namespace llaminar2
             }
         }
 
-        if (!ensureDeviceWorkspaceAllocated(*sidecar_cache.graph))
+        const bool sidecar_uses_gpu_workspace =
+            state_.device_id.is_gpu() && sidecar_cache.graph;
+        const uint64_t current_workspace_generation =
+            sidecar_uses_gpu_workspace ? workspaceGeneration(state_.device_id) : 0;
+        const bool sidecar_workspace_validated =
+            sidecar_uses_gpu_workspace &&
+            sidecar_cache.workspace_generation != 0 &&
+            current_workspace_generation == sidecar_cache.workspace_generation;
+
+        if (!sidecar_workspace_validated &&
+            !ensureDeviceWorkspaceAllocated(*sidecar_cache.graph))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to allocate MTP sidecar workspace before dynamic param update");
             return false;
+        }
+        if (sidecar_uses_gpu_workspace && !sidecar_workspace_validated)
+        {
+            const uint64_t new_workspace_generation = workspaceGeneration(state_.device_id);
+            if (new_workspace_generation != sidecar_cache.workspace_generation)
+            {
+                if (sidecar_cache.workspace_generation != 0)
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] MTP sidecar workspace generation changed on "
+                              << state_.device_id.toString()
+                              << " from " << sidecar_cache.workspace_generation
+                              << " to " << new_workspace_generation
+                              << "; dropping captured sidecar replay state");
+                    sidecar_cache.resetReplayStateAfterWorkspaceRebind();
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "sidecar_workspace_rebinds",
+                        1.0,
+                        phase,
+                        device_key,
+                        {{"depth", "0"}});
+                }
+                sidecar_cache.workspace_generation = new_workspace_generation;
+            }
         }
 
         sidecar_cache.token_id = draft_condition_token;

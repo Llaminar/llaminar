@@ -88,6 +88,28 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- ROCm MTP sidecar workspace-generation validation after the Qwen3.6
+  Prefix+MTP parity crash:
+  `DeviceGraphOrchestrator` sidecar caches now track the shared GPU workspace
+  generation and drop captured sidecar replay state after workspace rebinding,
+  matching the main decode cache contract. Focused regressions:
+  `V2_Unit_MTPGraphConstruction`,
+  `V2_Integration_Parity_Qwen36_SingleDevice_Qwen36SingleDevicePrefixMTPParity_MTPGreedyMatchesPyTorchDecodeTokens`,
+  `V2_Integration_Parity_Qwen36_SingleDevice_Qwen36SingleDevicePrefixMTPParity_PrefixCacheMTPRestore`,
+  and the full `^V2_Integration_Parity_Qwen36_SingleDevice_` slice. Fresh
+  release long-lane evidence with GPU graphs enabled and no stage timing:
+  baseline
+  `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-wsgen-baseline-c64-n48-bench.json`
+  at 20.89 decode tok/s; depth-1 MTP
+  `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-wsgen-mtp-c64-n48-bench.json`
+  at 33.01 decode tok/s, 95.83% acceptance, 92 accepted tokens, 4 rejected
+  tokens, and 4 rollbacks. Structured stats:
+  `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-wsgen-mtp-c64-n48-stats.json`
+  and `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-wsgen-mtp-c64-n48-stats.csv`.
+  The stats recorded `mtp.sidecar_workspace_rebinds=12`, segmented sidecar
+  replay for decode/catchup, and no manual graph segments. This is not a new
+  best over the older 33.57 tok/s run, but it preserves the 1.58x speedup
+  ratchet after fixing the stale captured-workspace crash.
 - Current same-binary long-lane ROCm Qwen3.6 dense 27B Q4_K_S,
   `rocm:0`, GPU graphs enabled, `The quick brown fox`, `-c 64`, `-n 48`:
   baseline `/tmp/llaminar-mtp-bench/dense-rocm-atomic-baseline-c64-n48-bench.json`
