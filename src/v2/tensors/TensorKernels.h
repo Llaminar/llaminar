@@ -2778,6 +2778,34 @@ namespace llaminar2
             (void)scratch_size;
         }
 
+        /**
+         * @brief Bind workspace for verifier-row conv-state snapshots.
+         *
+         * When enabled for an all-position MTP verifier graph, implementations may
+         * write the conv state after each candidate verifier row into this buffer.
+         * Layout is [rows, channels, kernel_size - 1] in FP32.
+         */
+        virtual void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
+        {
+            (void)workspace;
+            (void)rows;
+            (void)state_size;
+        }
+
+        /**
+         * @brief Restore a previously captured verifier-row conv state.
+         *
+         * CPU implementations copy into dst_state. GPU implementations may ignore
+         * dst_state and restore their implementation-owned device state.
+         */
+        virtual bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
+        {
+            (void)dst_state;
+            (void)row;
+            (void)stream;
+            return false;
+        }
+
         /// Return true when padded prefill can commit state using a dynamic real length.
         virtual bool supportsPaddedPrefillRealLength() const { return false; }
 
@@ -2833,6 +2861,54 @@ namespace llaminar2
             float *output, float *conv_state,
             int seq_len, int channels, int kernel_size,
             bool apply_silu = true) = 0;
+
+        /**
+         * @brief Apply short conv and snapshot the mutable conv state after each row.
+         *
+         * Snapshot rows are laid out as:
+         *   state_snapshots[row * snapshot_stride_floats + state_index]
+         * where state_index spans [channels, kernel_size - 1]. The caller may
+         * restore one row to avoid replaying accepted verifier tokens.
+         */
+        virtual bool forwardWithStateSnapshots(
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int channels, int kernel_size,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows,
+            bool apply_silu = true)
+        {
+            (void)input;
+            (void)weight;
+            (void)bias;
+            (void)output;
+            (void)conv_state;
+            (void)seq_len;
+            (void)channels;
+            (void)kernel_size;
+            (void)state_snapshots;
+            (void)snapshot_stride_floats;
+            (void)max_snapshot_rows;
+            (void)apply_silu;
+            return false;
+        }
+
+        /**
+         * @brief Restore conv state from a row produced by forwardWithStateSnapshots().
+         */
+        virtual bool restoreStateFromSnapshot(
+            float *state, const float *state_snapshots,
+            int snapshot_row, int snapshot_stride_floats,
+            int state_floats, void *stream = nullptr)
+        {
+            (void)state;
+            (void)state_snapshots;
+            (void)snapshot_row;
+            (void)snapshot_stride_floats;
+            (void)state_floats;
+            (void)stream;
+            return false;
+        }
 
         /**
          * @brief Prefill variant whose state commit length is read from device memory.
@@ -2931,6 +3007,34 @@ namespace llaminar2
         virtual bool supportsPaddedPrefillRealLength() const { return false; }
 
         /**
+         * @brief Bind workspace for verifier-row recurrence-state snapshots.
+         *
+         * When enabled for an all-position MTP verifier graph, implementations may
+         * write the recurrence state after each candidate verifier row into this
+         * buffer. Layout is [rows, n_heads, d_k, d_v] in FP32.
+         */
+        virtual void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
+        {
+            (void)workspace;
+            (void)rows;
+            (void)state_size;
+        }
+
+        /**
+         * @brief Restore a previously captured verifier-row recurrence state.
+         *
+         * CPU implementations copy into dst_state. GPU implementations may ignore
+         * dst_state and restore their implementation-owned device state.
+         */
+        virtual bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
+        {
+            (void)dst_state;
+            (void)row;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Deinterleave merged QKV buffer on device (GPU-only)
          *
          * Splits a merged [seq_len, q_dim + k_dim + v_dim] device buffer into
@@ -3018,6 +3122,61 @@ namespace llaminar2
             float *output, float *state,
             int seq_len, int n_heads, int d_k, int d_v,
             int chunk_size, bool use_qk_l2norm) = 0;
+
+        /**
+         * @brief Chunk prefill with recurrence-state snapshots after each row.
+         *
+         * Snapshot rows are laid out as:
+         *   state_snapshots[row * snapshot_stride_floats + state_index]
+         * where state_index spans [n_heads, d_k, d_v].
+         */
+        virtual bool chunkForwardWithStateSnapshots(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows)
+        {
+            (void)Q;
+            (void)K;
+            (void)V;
+            (void)alpha;
+            (void)beta_raw;
+            (void)A_log;
+            (void)dt_bias;
+            (void)output;
+            (void)state;
+            (void)seq_len;
+            (void)n_heads;
+            (void)d_k;
+            (void)d_v;
+            (void)chunk_size;
+            (void)use_qk_l2norm;
+            (void)state_snapshots;
+            (void)snapshot_stride_floats;
+            (void)max_snapshot_rows;
+            return false;
+        }
+
+        /**
+         * @brief Restore recurrence state from a row produced by chunkForwardWithStateSnapshots().
+         */
+        virtual bool restoreStateFromSnapshot(
+            float *state, const float *state_snapshots,
+            int snapshot_row, int snapshot_stride_floats,
+            int state_floats, void *stream = nullptr)
+        {
+            (void)state;
+            (void)state_snapshots;
+            (void)snapshot_row;
+            (void)snapshot_stride_floats;
+            (void)state_floats;
+            (void)stream;
+            return false;
+        }
 
         /**
          * @brief Chunk prefill variant with a graph-replay-updated real length.

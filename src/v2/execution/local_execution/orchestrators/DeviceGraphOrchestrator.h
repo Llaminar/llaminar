@@ -1489,7 +1489,8 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens,
-            int main_forward_token_count) override;
+            int main_forward_token_count,
+            bool allow_speculative_discard = false) override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;
@@ -1947,6 +1948,10 @@ namespace llaminar2
         PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
+        bool restoreMTPVerifierStateRow(
+            int verifier_row,
+            int target_cached_tokens,
+            int seq_idx = 0) override;
 
         /**
          * @brief Inspect request-local runtime state for prefix-cache/MTP probes.

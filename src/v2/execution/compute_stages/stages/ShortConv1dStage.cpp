@@ -63,10 +63,25 @@ namespace llaminar2
         (void)k;
 
         WorkspaceRequirements reqs;
-        if (!params_.device_id.is_gpu() || params_.channels <= 0)
+        if (params_.channels <= 0)
             return reqs;
 
         const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
+        if (params_.verifier_state_capture_rows > 0 && params_.kernel_size > 1)
+        {
+            const int rows = std::min(params_.verifier_state_capture_rows, max_seq_len);
+            const size_t state_floats =
+                static_cast<size_t>(params_.channels) *
+                static_cast<size_t>(params_.kernel_size - 1);
+            reqs.buffers.push_back({verifierStateCaptureBufferName(),
+                                    static_cast<size_t>(rows) * state_floats * sizeof(float),
+                                    256,
+                                    true});
+        }
+
+        if (!params_.device_id.is_gpu())
+            return reqs;
+
         if (max_seq_len > 1)
             reqs.buffers.push_back({effectiveSeqLenScalarBufferName(), sizeof(int), alignof(int), true});
 
@@ -108,6 +123,29 @@ namespace llaminar2
         }
 
         params_.kernel->bindScratchWorkspace(scratch, scratch_floats);
+
+        float *capture = nullptr;
+        int capture_rows = 0;
+        const int capture_state_size = params_.channels * std::max(0, params_.kernel_size - 1);
+        if (params_.verifier_state_capture_rows > 0 &&
+            bound_workspace_ &&
+            bound_workspace_->hasBuffer(verifierStateCaptureBufferName()))
+        {
+            const std::string capture_name = verifierStateCaptureBufferName();
+            capture = static_cast<float *>(bound_workspace_->getBuffer(capture_name));
+            const size_t available_floats =
+                bound_workspace_->getBufferSize(capture_name) / sizeof(float);
+            if (capture_state_size > 0)
+            {
+                capture_rows = static_cast<int>(std::min<size_t>(
+                    static_cast<size_t>(params_.verifier_state_capture_rows),
+                    available_floats / static_cast<size_t>(capture_state_size)));
+            }
+        }
+        params_.kernel->bindVerifierStateCaptureWorkspace(
+            capture,
+            capture_rows,
+            capture_state_size);
     }
 
     int ShortConv1dStage::effectivePrefillSeqLen() const
@@ -132,6 +170,11 @@ namespace llaminar2
         return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + std::to_string(workspace_slice_id_);
     }
 
+    std::string ShortConv1dStage::verifierStateCaptureBufferName() const
+    {
+        return std::string(WS_VERIFIER_STATE_CAPTURE) + "_" + std::to_string(workspace_slice_id_);
+    }
+
     void ShortConv1dStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
     {
         prefill_replay_params_set_ = true;
@@ -144,6 +187,23 @@ namespace llaminar2
     bool ShortConv1dStage::supportsPaddedPrefillRealLengthContract() const
     {
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
+    }
+
+    bool ShortConv1dStage::hasVerifierStateCapture() const
+    {
+        return params_.kernel &&
+               params_.verifier_state_capture_rows > 0 &&
+               params_.conv_state != nullptr;
+    }
+
+    bool ShortConv1dStage::restoreVerifierStateCaptureRow(int row, void *stream)
+    {
+        if (!hasVerifierStateCapture())
+            return false;
+        return params_.kernel->restoreVerifierStateCaptureRow(
+            params_.conv_state,
+            row,
+            stream ? stream : gpuStream());
     }
 
     bool ShortConv1dStage::ensureGpuEffectiveSeqLenStateInitialized()

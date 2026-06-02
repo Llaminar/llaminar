@@ -127,6 +127,25 @@ static inline __m256 avx2_fast_sigmoid(__m256 vx)
 
 namespace llaminar2
 {
+    void CPUGatedDeltaNet::bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
+    {
+        verifier_state_capture_ = workspace;
+        verifier_state_capture_rows_ = rows;
+        verifier_state_capture_size_ = state_size;
+    }
+
+    bool CPUGatedDeltaNet::restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
+    {
+        if (row < 0 || row >= verifier_state_capture_rows_)
+            return false;
+        return restoreStateFromSnapshot(
+            dst_state,
+            verifier_state_capture_,
+            row,
+            verifier_state_capture_size_,
+            verifier_state_capture_size_,
+            stream);
+    }
 
     // =========================================================================
     // Scratch buffer management (grow-only, eliminates per-call allocations)
@@ -854,8 +873,78 @@ namespace llaminar2
         const float *A_log, const float *dt_bias,
         float *output, float *state,
         int seq_len, int n_heads, int d_k, int d_v,
-        int /*chunk_size*/, bool use_qk_l2norm)
+        int chunk_size, bool use_qk_l2norm)
     {
+        const int state_floats = n_heads * d_k * d_v;
+        float *state_snapshots = nullptr;
+        int snapshot_stride_floats = 0;
+        int max_snapshot_rows = 0;
+        if (verifier_state_capture_ &&
+            verifier_state_capture_rows_ > 0 &&
+            verifier_state_capture_size_ >= state_floats)
+        {
+            state_snapshots = verifier_state_capture_;
+            snapshot_stride_floats = verifier_state_capture_size_;
+            max_snapshot_rows = verifier_state_capture_rows_;
+        }
+        return chunkForwardImpl(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows);
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardWithStateSnapshots(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        int chunk_size, bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        return chunkForwardImpl(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+    }
+
+    bool CPUGatedDeltaNet::restoreStateFromSnapshot(
+        float *state, const float *state_snapshots,
+        int snapshot_row, int snapshot_stride_floats,
+        int state_floats, void *stream)
+    {
+        (void)stream;
+        if (!state || !state_snapshots || snapshot_row < 0 ||
+            snapshot_stride_floats < state_floats || state_floats < 0)
+            return false;
+
+        std::memcpy(state,
+                    state_snapshots + static_cast<size_t>(snapshot_row) * snapshot_stride_floats,
+                    static_cast<size_t>(state_floats) * sizeof(float));
+        return true;
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardImpl(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        int /*chunk_size*/, bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        const int state_floats = n_heads * d_k * d_v;
+        const bool capture_state_snapshots = state_snapshots != nullptr;
+        if (capture_state_snapshots &&
+            (snapshot_stride_floats < state_floats || max_snapshot_rows <= 0))
+        {
+            return false;
+        }
+
         ensureScratch(seq_len, n_heads, d_k, d_v);
 
         const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
@@ -930,7 +1019,8 @@ namespace llaminar2
 #pragma omp for schedule(static)
             for (int h = 0; h < n_heads; ++h)
             {
-                float *S = state + static_cast<size_t>(h) * d_k * d_v;
+                const size_t head_state_floats = static_cast<size_t>(d_k) * d_v;
+                float *S = state + static_cast<size_t>(h) * head_state_floats;
 
 #if defined(__AVX512F__)
                 if (d_v == 128)
@@ -1072,6 +1162,14 @@ namespace llaminar2
                         _mm512_storeu_ps(o_t + 96, o6);
                         _mm512_storeu_ps(o_t + 112, o7);
 
+                        if (capture_state_snapshots && t < max_snapshot_rows)
+                        {
+                            float *snapshot_head =
+                                state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
+                                static_cast<size_t>(h) * head_state_floats;
+                            std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
+                        }
+
                     } // timesteps
                 }
                 else
@@ -1151,6 +1249,13 @@ namespace llaminar2
                             }
                         }
 #endif
+                        if (capture_state_snapshots && t < max_snapshot_rows)
+                        {
+                            float *snapshot_head =
+                                state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
+                                static_cast<size_t>(h) * head_state_floats;
+                            std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
+                        }
                     } // timesteps
                 }
             } // heads

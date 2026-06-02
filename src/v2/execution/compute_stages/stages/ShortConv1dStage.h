@@ -45,6 +45,7 @@ namespace llaminar2
     public:
         static constexpr const char *WS_INPLACE_PREFILL_SCRATCH = "gdn_shortconv_inplace_scratch";
         static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_shortconv_effective_seq_len_scalar";
+        static constexpr const char *WS_VERIFIER_STATE_CAPTURE = "gdn_shortconv_verifier_state_capture";
 
         struct Params
         {
@@ -59,6 +60,7 @@ namespace llaminar2
             int seq_len = 0;             ///< Sequence length
             int channels = 0;            ///< Number of channels (= QKV dim)
             int kernel_size = 4;         ///< Convolution kernel width
+            int verifier_state_capture_rows = 0; ///< Candidate verifier rows to snapshot for MTP rollback.
 
             /// Kernel implementation (set during graph construction)
             ITensorShortConvolution *kernel = nullptr;
@@ -107,6 +109,8 @@ namespace llaminar2
         bool hasPrefillReplayParams() const override { return true; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
         bool supportsPaddedPrefillRealLengthContract() const override;
+        bool hasVerifierStateCapture() const override;
+        bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
 
         // Short conv1d operates fully on-device when GPU is active — graph-capturable
         bool isGraphCapturable() const override { return true; }
@@ -127,6 +131,7 @@ namespace llaminar2
         int effectivePrefillSeqLen() const;
         bool shouldUseRealLengthContract() const;
         std::string effectiveSeqLenScalarBufferName() const;
+        std::string verifierStateCaptureBufferName() const;
         bool ensureGpuEffectiveSeqLenStateInitialized();
         bool uploadGpuEffectiveSeqLen();
         void refreshPinnedEffectiveSeqLen();

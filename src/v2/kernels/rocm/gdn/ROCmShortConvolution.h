@@ -23,6 +23,9 @@ extern "C"
         float *output, float *conv_state,
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int device_idx, void *stream);
 
     bool rocmGDN_short_conv1d_effective(
@@ -31,6 +34,9 @@ extern "C"
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         const int *device_effective_seq_len,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int device_idx, void *stream);
 
     // GPU memory helpers (implemented in ROCmGatedDeltaNetKernels.hip)
@@ -65,6 +71,34 @@ namespace llaminar2
         void allocateGPUState(int state_size) override { allocateState(state_size); }
         bool allocateGPUScratch(int scratch_size) override { return allocateScratch(scratch_size); }
         void resetGPUState() override { resetState(); }
+        void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
+        {
+            verifier_state_capture_ = workspace;
+            verifier_state_capture_rows_ = rows;
+            verifier_state_capture_size_ = state_size;
+        }
+
+        bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
+        {
+            (void)dst_state;
+            if (!gpu_state_ || !verifier_state_capture_ ||
+                row < 0 || row >= verifier_state_capture_rows_ ||
+                verifier_state_capture_size_ != state_size_)
+            {
+                return false;
+            }
+
+            rocmGDN_gpu_set_device(device_ordinal_);
+            const float *src =
+                verifier_state_capture_ +
+                static_cast<size_t>(row) * static_cast<size_t>(verifier_state_capture_size_);
+            if (stream)
+                rocmGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
+            else
+                rocmGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
+            return true;
+        }
+
         bool supportsPaddedPrefillRealLength() const override { return true; }
         size_t stateBytes() const override
         {
@@ -150,6 +184,9 @@ namespace llaminar2
             const bool ok = rocmGDN_short_conv1d(
                 input, weight, bias, effective_output, effective_state,
                 seq_len, channels, kernel_size, apply_silu,
+                verifier_state_capture_,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
                 device_ordinal_, stream_);
             if (!ok)
                 return false;
@@ -198,6 +235,9 @@ namespace llaminar2
                 input, weight, bias, effective_output, gpu_state_,
                 seq_len, channels, kernel_size, apply_silu,
                 device_effective_seq_len,
+                verifier_state_capture_,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
                 device_ordinal_, stream_);
             if (!ok)
                 return false;
@@ -280,6 +320,9 @@ namespace llaminar2
         int scratch_size_ = 0;
         float *bound_scratch_ = nullptr;
         int bound_scratch_size_ = 0;
+        float *verifier_state_capture_ = nullptr;
+        int verifier_state_capture_rows_ = 0;
+        int verifier_state_capture_size_ = 0;
 
         float *scratchPointer() const
         {

@@ -228,9 +228,11 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens,
-            int main_forward_token_count)
+            int main_forward_token_count,
+            bool allow_speculative_discard = false)
         {
             (void)main_forward_token_count;
+            (void)allow_speculative_discard;
             return commitMTPShiftedRowsFromLastForward(
                 tokens,
                 token_count,
@@ -791,6 +793,27 @@ namespace llaminar2
         virtual bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0)
         {
             (void)cached_tokens;
+            (void)seq_idx;
+            return false;
+        }
+
+        /**
+         * @brief Restore mutable verifier state from a captured all-position
+         *        verifier row, without replaying the accepted verifier prefix.
+         *
+         * The target cached token count is the logical main-model position after
+         * the restored row. Implementations must restore every mutable hybrid
+         * state participant they own, truncate main KV state to target_cached_tokens,
+         * and update decode position bookkeeping. Unsupported topologies return
+         * false so callers can select the slower checkpoint replay path.
+         */
+        virtual bool restoreMTPVerifierStateRow(
+            int verifier_row,
+            int target_cached_tokens,
+            int seq_idx = 0)
+        {
+            (void)verifier_row;
+            (void)target_cached_tokens;
             (void)seq_idx;
             return false;
         }

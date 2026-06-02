@@ -256,6 +256,9 @@ void rocm_gdn_chunk_forward_kernel(
     float *__restrict__ output,
     float *__restrict__ state,
     const int *__restrict__ effective_seq_len_ptr,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm)
 {
@@ -536,6 +539,44 @@ void rocm_gdn_chunk_forward_kernel(
                 out_vi += reduce_out[col_in_block + s * cols_per_block];
             o_dst[vi] = out_vi;
         }
+        if (state_snapshots && t < max_snapshot_rows && vi < d_v) {
+            float *snapshot =
+                state_snapshots +
+                (size_t)t * snapshot_stride_floats +
+                (size_t)h * d_k * d_v;
+            snapshot[(j_start +  0) * d_v + vi] = sc0;
+            snapshot[(j_start +  1) * d_v + vi] = sc1;
+            snapshot[(j_start +  2) * d_v + vi] = sc2;
+            snapshot[(j_start +  3) * d_v + vi] = sc3;
+            snapshot[(j_start +  4) * d_v + vi] = sc4;
+            snapshot[(j_start +  5) * d_v + vi] = sc5;
+            snapshot[(j_start +  6) * d_v + vi] = sc6;
+            snapshot[(j_start +  7) * d_v + vi] = sc7;
+            snapshot[(j_start +  8) * d_v + vi] = sc8;
+            snapshot[(j_start +  9) * d_v + vi] = sc9;
+            snapshot[(j_start + 10) * d_v + vi] = sc10;
+            snapshot[(j_start + 11) * d_v + vi] = sc11;
+            snapshot[(j_start + 12) * d_v + vi] = sc12;
+            snapshot[(j_start + 13) * d_v + vi] = sc13;
+            snapshot[(j_start + 14) * d_v + vi] = sc14;
+            snapshot[(j_start + 15) * d_v + vi] = sc15;
+            snapshot[(j_start + 16) * d_v + vi] = sc16;
+            snapshot[(j_start + 17) * d_v + vi] = sc17;
+            snapshot[(j_start + 18) * d_v + vi] = sc18;
+            snapshot[(j_start + 19) * d_v + vi] = sc19;
+            snapshot[(j_start + 20) * d_v + vi] = sc20;
+            snapshot[(j_start + 21) * d_v + vi] = sc21;
+            snapshot[(j_start + 22) * d_v + vi] = sc22;
+            snapshot[(j_start + 23) * d_v + vi] = sc23;
+            snapshot[(j_start + 24) * d_v + vi] = sc24;
+            snapshot[(j_start + 25) * d_v + vi] = sc25;
+            snapshot[(j_start + 26) * d_v + vi] = sc26;
+            snapshot[(j_start + 27) * d_v + vi] = sc27;
+            snapshot[(j_start + 28) * d_v + vi] = sc28;
+            snapshot[(j_start + 29) * d_v + vi] = sc29;
+            snapshot[(j_start + 30) * d_v + vi] = sc30;
+            snapshot[(j_start + 31) * d_v + vi] = sc31;
+        }
         __syncthreads();
     }
 
@@ -621,6 +662,9 @@ __global__ void rocm_short_conv1d_prefill_kernel(
     float *__restrict__ output,
     float *__restrict__ conv_state,
     const int *__restrict__ effective_seq_len_ptr,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int seq_len, int channels, int kernel_size,
     bool apply_silu)
 {
@@ -656,6 +700,19 @@ __global__ void rocm_short_conv1d_prefill_kernel(
             sum = sum / (1.0f + expf(-sum));
     }
     output[t * channels + ch] = sum;
+
+    if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows) {
+        float *snapshot =
+            state_snapshots +
+            (size_t)t * snapshot_stride_floats +
+            (size_t)ch * ks_minus1;
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx) {
+            int src_t = t - ks_minus1 + 1 + state_idx;
+            snapshot[state_idx] =
+                (src_t >= 0) ? input[src_t * channels + ch]
+                             : (conv_state ? conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
+        }
+    }
 }
 
 __global__ void rocm_short_conv1d_state_update_kernel(
@@ -1034,6 +1091,9 @@ bool rocmGDN_chunk_forward(
     float *output, float *state,
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -1070,6 +1130,9 @@ bool rocmGDN_chunk_forward(
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
         output, state,
         nullptr,
+        state_snapshots,
+        snapshot_stride_floats,
+        max_snapshot_rows,
         seq_len, n_heads, d_k, d_v, use_qk_l2norm);
 
     hipError_t err = hipGetLastError();
@@ -1097,6 +1160,9 @@ bool rocmGDN_chunk_forward_effective(
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
     const int *device_effective_seq_len,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -1130,6 +1196,9 @@ bool rocmGDN_chunk_forward_effective(
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
         output, state,
         device_effective_seq_len,
+        state_snapshots,
+        snapshot_stride_floats,
+        max_snapshot_rows,
         seq_len, n_heads, d_k, d_v, use_qk_l2norm);
 
     hipError_t err = hipGetLastError();
@@ -1154,6 +1223,9 @@ bool rocmGDN_short_conv1d(
     float *output, float *conv_state,
     int seq_len, int channels, int kernel_size,
     bool apply_silu,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -1173,6 +1245,9 @@ bool rocmGDN_short_conv1d(
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output, conv_state,
             nullptr,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
             seq_len, channels, kernel_size, apply_silu);
         int state_blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_state_update_kernel,
@@ -1195,6 +1270,9 @@ bool rocmGDN_short_conv1d_effective(
     int seq_len, int channels, int kernel_size,
     bool apply_silu,
     const int *device_effective_seq_len,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -1214,6 +1292,9 @@ bool rocmGDN_short_conv1d_effective(
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output, conv_state,
             device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
             seq_len, channels, kernel_size, apply_silu);
         int state_blocks = (channels + threads - 1) / threads;
         hipLaunchKernelGGL(rocm_short_conv1d_state_update_kernel,

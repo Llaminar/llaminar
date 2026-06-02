@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 
 #if defined(__AVX512F__) || defined(__AVX2__)
@@ -29,6 +30,26 @@
 
 namespace llaminar2
 {
+    void CPUShortConvolution::bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
+    {
+        verifier_state_capture_ = workspace;
+        verifier_state_capture_rows_ = rows;
+        verifier_state_capture_size_ = state_size;
+    }
+
+    bool CPUShortConvolution::restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
+    {
+        if (row < 0 || row >= verifier_state_capture_rows_)
+            return false;
+        return restoreStateFromSnapshot(
+            dst_state,
+            verifier_state_capture_,
+            row,
+            verifier_state_capture_size_,
+            verifier_state_capture_size_,
+            stream);
+    }
+
 
     bool CPUShortConvolution::forward(
         const float *input, const float *weight, const float *bias,
@@ -44,34 +65,132 @@ namespace llaminar2
         else
         {
             const int state_len = kernel_size - 1;
-            const bool in_place_with_state =
-                input == output && conv_state && state_len > 0;
-            std::vector<float> raw_tail;
-            if (in_place_with_state)
+            const int state_floats = channels * state_len;
+            if (verifier_state_capture_ &&
+                verifier_state_capture_rows_ > 0 &&
+                verifier_state_capture_size_ >= state_floats)
             {
-                raw_tail.resize(static_cast<size_t>(channels) * state_len);
-                for (int c = 0; c < channels; ++c)
+                return forwardWithStateSnapshots(
+                    input, weight, bias,
+                    output, conv_state,
+                    seq_len, channels, kernel_size,
+                    verifier_state_capture_,
+                    verifier_state_capture_size_,
+                    verifier_state_capture_rows_,
+                    apply_silu);
+            }
+
+            const bool ok = executePrefillPreservingInPlaceTail(
+                input, weight, bias, output, conv_state,
+                seq_len, channels, kernel_size, apply_silu);
+            return ok;
+        }
+    }
+
+    bool CPUShortConvolution::forwardWithStateSnapshots(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *conv_state,
+        int seq_len, int channels, int kernel_size,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows,
+        bool apply_silu)
+    {
+        if (!conv_state || !state_snapshots || seq_len <= 0 || channels <= 0 || kernel_size <= 0)
+            return false;
+
+        const int state_len = kernel_size - 1;
+        const int state_floats = channels * state_len;
+        if (state_len <= 0 || snapshot_stride_floats < state_floats || max_snapshot_rows <= 0)
+            return false;
+
+        std::vector<float> initial_state(conv_state, conv_state + state_floats);
+        std::vector<float> raw_input_copy;
+        const float *raw_input = input;
+        if (input == output)
+        {
+            raw_input_copy.assign(input, input + static_cast<size_t>(seq_len) * channels);
+            raw_input = raw_input_copy.data();
+        }
+
+        if (!executePrefillPreservingInPlaceTail(
+                input, weight, bias, output, conv_state,
+                seq_len, channels, kernel_size, apply_silu))
+            return false;
+
+        auto do_work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int c = 0; c < channels; ++c)
+            {
+                const int rows_to_capture = std::min(seq_len, max_snapshot_rows);
+                for (int t = 0; t < rows_to_capture; ++t)
                 {
+                    float *row = state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats;
+                    float *state = row + static_cast<size_t>(c) * state_len;
                     for (int s = 0; s < state_len; ++s)
                     {
-                        const int src_t = seq_len - state_len + s;
-                        raw_tail[static_cast<size_t>(c) * state_len + s] =
-                            (src_t >= 0) ? input[static_cast<size_t>(src_t) * channels + c]
-                                         : conv_state[c * state_len + state_len + src_t];
+                        const int src_t = t - state_len + 1 + s;
+                        state[s] = (src_t >= 0)
+                                       ? raw_input[static_cast<size_t>(src_t) * channels + c]
+                                       : initial_state[static_cast<size_t>(c) * state_len + state_len + src_t];
                     }
                 }
             }
+        };
+        OMP_WORKSHARE_REGION(do_work);
+        return true;
+    }
 
-            const bool ok = executePrefill(input, weight, bias, output, conv_state,
-                                           seq_len, channels, kernel_size, apply_silu);
-            if (ok && in_place_with_state)
+    bool CPUShortConvolution::executePrefillPreservingInPlaceTail(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *conv_state,
+        int seq_len, int channels, int kernel_size,
+        bool apply_silu)
+    {
+        const int state_len = kernel_size - 1;
+        const bool in_place_with_state =
+            input == output && conv_state && state_len > 0;
+        std::vector<float> raw_tail;
+        if (in_place_with_state)
+        {
+            raw_tail.resize(static_cast<size_t>(channels) * state_len);
+            for (int c = 0; c < channels; ++c)
             {
-                std::memcpy(conv_state,
-                            raw_tail.data(),
-                            raw_tail.size() * sizeof(float));
+                for (int s = 0; s < state_len; ++s)
+                {
+                    const int src_t = seq_len - state_len + s;
+                    raw_tail[static_cast<size_t>(c) * state_len + s] =
+                        (src_t >= 0) ? input[static_cast<size_t>(src_t) * channels + c]
+                                     : conv_state[c * state_len + state_len + src_t];
+                }
             }
-            return ok;
         }
+
+        const bool ok = executePrefill(input, weight, bias, output, conv_state,
+                                       seq_len, channels, kernel_size, apply_silu);
+        if (ok && in_place_with_state)
+        {
+            std::memcpy(conv_state,
+                        raw_tail.data(),
+                        raw_tail.size() * sizeof(float));
+        }
+        return ok;
+    }
+
+    bool CPUShortConvolution::restoreStateFromSnapshot(
+        float *state, const float *state_snapshots,
+        int snapshot_row, int snapshot_stride_floats,
+        int state_floats, void *stream)
+    {
+        (void)stream;
+        if (!state || !state_snapshots || snapshot_row < 0 ||
+            snapshot_stride_floats < state_floats || state_floats < 0)
+            return false;
+
+        std::memcpy(state,
+                    state_snapshots + static_cast<size_t>(snapshot_row) * snapshot_stride_floats,
+                    static_cast<size_t>(state_floats) * sizeof(float));
+        return true;
     }
 
 #ifdef __AVX512F__

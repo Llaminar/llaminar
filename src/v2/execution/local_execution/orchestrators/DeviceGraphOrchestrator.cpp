@@ -4083,7 +4083,8 @@ namespace llaminar2
         const int32_t *tokens,
         int token_count,
         int already_appended_tokens,
-        int main_forward_token_count)
+        int main_forward_token_count,
+        bool allow_speculative_discard)
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
@@ -4142,7 +4143,7 @@ namespace llaminar2
         {
             const int configured_draft_tokens =
                 graph_builder_ ? std::max(1, graph_builder_->config().mtp.draft_tokens) : 1;
-            if (configured_draft_tokens <= 1)
+            if (configured_draft_tokens <= 1 && !allow_speculative_discard)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit cache has unexpected extra rows: current="
                           << current_cached_tokens << " expected=" << expected_cached_tokens
@@ -5925,6 +5926,95 @@ namespace llaminar2
         state_.positions[seq_idx] = cached_tokens;
         state_.sequence_lengths[seq_idx] = cached_tokens;
         handleLivePrefixReplayStateAfterMutation("truncate_live_prefix");
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::restoreMTPVerifierStateRow(
+        int verifier_row,
+        int target_cached_tokens,
+        int seq_idx)
+    {
+        auto fail = [&](const std::string &reason) -> bool
+        {
+            PerfStatsCollector::addCounter("mtp",
+                                           "verifier_state_row_restore_failures",
+                                           1.0,
+                                           "decode",
+                                           state_.device_id.toString(),
+                                           {{"reason", reason}});
+            LOG_DEBUG("[DeviceGraphOrchestrator] MTP verifier state row restore unavailable: " << reason);
+            return false;
+        };
+
+        if (!state_.kv_cache || seq_idx < 0 || seq_idx >= state_.batch_size)
+        {
+            return fail("missing_cache_or_bad_sequence");
+        }
+        if (verifier_row < 0 || target_cached_tokens < 0 ||
+            target_cached_tokens > state_.kv_cache->max_seq_len())
+        {
+            return fail("bad_restore_bounds");
+        }
+
+        auto *hybrid = dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
+        if (!hybrid)
+        {
+            return fail("non_hybrid_cache");
+        }
+
+        void *stream = nullptr;
+        if (state_.device_id.is_gpu())
+        {
+            stream = GPUDeviceContextPool::instance().getContext(state_.device_id).defaultStream();
+        }
+
+        int restored_layers = 0;
+        for (int layer = 0; layer < state_.kv_cache->n_layers(); ++layer)
+        {
+            if (!hybrid->isGDNLayer(layer))
+            {
+                continue;
+            }
+
+            auto *conv_kernel = hybrid->getConvKernel(layer);
+            float *conv_state = hybrid->getConvState(layer);
+            auto *recurrence_kernel = hybrid->getRecurrenceKernel(layer);
+            float *recurrence_state = hybrid->getRecurrenceState(layer);
+            if (!conv_kernel || !conv_state || !recurrence_kernel || !recurrence_state)
+            {
+                return fail("missing_gdn_state_or_kernel");
+            }
+            if (!conv_kernel->restoreVerifierStateCaptureRow(conv_state, verifier_row, stream))
+            {
+                return fail("shortconv_restore_failed");
+            }
+            if (!recurrence_kernel->restoreVerifierStateCaptureRow(recurrence_state, verifier_row, stream))
+            {
+                return fail("recurrence_restore_failed");
+            }
+            ++restored_layers;
+        }
+
+        if (restored_layers == 0)
+        {
+            return fail("no_gdn_layers");
+        }
+        if (!state_.kv_cache->truncateSequence(seq_idx, target_cached_tokens, stream))
+        {
+            return fail("main_kv_truncate_failed");
+        }
+
+        state_.positions[seq_idx] = target_cached_tokens;
+        state_.sequence_lengths[seq_idx] = target_cached_tokens;
+        handleLivePrefixReplayStateAfterMutation("restore_mtp_verifier_state_row");
+        PerfStatsCollector::addCounter("mtp",
+                                       "verifier_state_row_restores",
+                                       1.0,
+                                       "decode",
+                                       state_.device_id.toString(),
+                                       {{"row", std::to_string(verifier_row)},
+                                        {"target_cached_tokens", std::to_string(target_cached_tokens)},
+                                        {"gdn_layers", std::to_string(restored_layers)}});
         return true;
     }
 

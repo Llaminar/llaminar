@@ -1404,6 +1404,133 @@ namespace llaminar2
 
         const PrefixStateSnapshot &replay_checkpoint =
             sidecar_checkpoints[static_cast<size_t>(already_appended_for_output - 1)];
+        const int accepted_verifier_input_count =
+            already_appended_for_output + accepted_speculative_prefix;
+
+        bool rollback_recorded = false;
+        auto record_rollback = [&]()
+        {
+            if (rollback_recorded)
+                return;
+            ++mtp_stats_.rollbacks;
+            PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
+            rollback_recorded = true;
+        };
+
+        if (rejected_speculative_token &&
+            accepted_verifier_input_count > 0 &&
+            accepted_verifier_input_count <= static_cast<int>(draft_tokens.size()) &&
+            accepted_verifier_input_count <= static_cast<int>(accepted_tokens.size()))
+        {
+            const int verifier_restore_row = accepted_verifier_input_count - 1;
+            const int target_cached_tokens =
+                replay_checkpoint.cached_tokens + accepted_verifier_input_count;
+            bool restored_verifier_state = false;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "restore_verifier_state_row",
+                    "decode",
+                    {},
+                    {{"row", std::to_string(verifier_restore_row)},
+                     {"target_cached_tokens", std::to_string(target_cached_tokens)}});
+                restored_verifier_state = runner_->restoreMTPVerifierStateRow(
+                    verifier_restore_row,
+                    target_cached_tokens);
+            }
+
+            if (restored_verifier_state)
+            {
+                record_rollback();
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "rollback_verifier_state_row_shortcuts",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"row", std::to_string(verifier_restore_row)},
+                     {"main_forward_token_count", std::to_string(accepted_verifier_input_count)}});
+
+                if (!runner_->commitMTPShiftedRowsFromPartialForward(
+                        accepted_tokens.data(),
+                        static_cast<int>(accepted_tokens.size()),
+                        already_appended_for_output,
+                        accepted_verifier_input_count,
+                        /*allow_speculative_discard=*/true))
+                {
+                    result.error = "MTP shifted-cache commit failed after verifier-row restore";
+                    return result;
+                }
+
+                const int suffix_start = accepted_verifier_input_count;
+                const int suffix_count =
+                    can_lag_rejected_correction
+                        ? 0
+                        : static_cast<int>(accepted_tokens.size()) - suffix_start;
+                if (suffix_count < 0)
+                {
+                    result.error = "MTP verifier-row restore selected an invalid replay suffix";
+                    return result;
+                }
+                if (suffix_count > 0)
+                {
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "verifier_state_row_replay_suffix_tokens",
+                        static_cast<double>(suffix_count),
+                        "decode");
+                    bool suffix_ok = false;
+                    {
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "verifier_state_row_replay_suffix_forward",
+                            "decode");
+                        suffix_ok = runner_->forward(
+                            accepted_tokens.data() + suffix_start,
+                            suffix_count);
+                    }
+                    if (!suffix_ok)
+                    {
+                        result.error = "Forward pass failed during MTP verifier-row replay suffix";
+                        return result;
+                    }
+                }
+                else if (can_lag_rejected_correction)
+                {
+                    PerfStatsCollector::addCounter("mtp", "lagged_rejected_correction_replays", 1.0, "decode");
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "lagged_rejected_correction_tokens",
+                        static_cast<double>(accepted_tokens.size() - accepted_verifier_input_count),
+                        "decode");
+                }
+
+                prefill_logits_ready_ = suffix_count > 0;
+                if (!prefill_logits_ready_)
+                {
+                    ready_sampled_token_.reset();
+                }
+
+                for (int32_t token : accepted_tokens)
+                {
+                    sampler_.record_token(token);
+                    result.tokens.push_back(token);
+                }
+                if (!accepted_tokens.empty())
+                {
+                    last_token_ = accepted_tokens.back();
+                }
+
+                return result;
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rollback_verifier_state_row_shortcut_unavailable",
+                1.0,
+                "decode");
+        }
+
         bool restored = false;
         {
             PerfStatsCollector::ScopedTimer timer("mtp", "restore_live_prefix_state", "decode");
@@ -1414,8 +1541,7 @@ namespace llaminar2
             result.error = "MTP decode failed to restore post-sidecar live prefix checkpoint";
             return result;
         }
-        ++mtp_stats_.rollbacks;
-        PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
+        record_rollback();
 
         std::vector<int32_t> replay_tokens;
         const int main_forward_token_count =

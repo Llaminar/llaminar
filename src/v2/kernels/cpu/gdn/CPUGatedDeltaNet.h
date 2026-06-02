@@ -27,6 +27,8 @@ namespace llaminar2
     {
     public:
         bool supportsPaddedPrefillRealLength() const override { return true; }
+        void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
+        bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
 
         bool chunk_forward(
             const float *Q, const float *K, const float *V,
@@ -35,6 +37,21 @@ namespace llaminar2
             float *output, float *state,
             int seq_len, int n_heads, int d_k, int d_v,
             int chunk_size, bool use_qk_l2norm) override;
+
+        bool chunkForwardWithStateSnapshots(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows) override;
+
+        bool restoreStateFromSnapshot(
+            float *state, const float *state_snapshots,
+            int snapshot_row, int snapshot_stride_floats,
+            int state_floats, void *stream = nullptr) override;
 
         bool recurrent_step(
             const float *q, const float *k, const float *v,
@@ -58,11 +75,24 @@ namespace llaminar2
         /// Ensure scratch buffers are large enough, reallocating only when needed
         void ensureScratch(int seq_len, int n_heads, int d_k, int d_v);
 
+        bool chunkForwardImpl(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows);
+
         // Reusable scratch buffers (grow-only, never shrink during lifetime)
         std::vector<float> q_scratch_;        ///< Preprocessed Q buffer
         std::vector<float> k_scratch_;        ///< Preprocessed K buffer
         std::vector<float> gate_scratch_;     ///< Gate values
         std::vector<float> beta_sig_scratch_; ///< Sigmoid of beta
+        float *verifier_state_capture_ = nullptr;
+        int verifier_state_capture_rows_ = 0;
+        int verifier_state_capture_size_ = 0;
     };
 
 } // namespace llaminar2

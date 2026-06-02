@@ -248,11 +248,13 @@ namespace
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens,
-            int main_forward_token_count) override
+            int main_forward_token_count,
+            bool allow_speculative_discard = false) override
         {
             commit_mtp_shifted_count_++;
             last_commit_mtp_already_appended_ = already_appended_tokens;
             last_commit_mtp_main_forward_token_count_ = main_forward_token_count;
+            last_commit_mtp_allow_speculative_discard_ = allow_speculative_discard;
             last_commit_mtp_tokens_.clear();
             if (tokens && token_count > 0)
             {
@@ -387,6 +389,7 @@ namespace
         int commitMTPShiftedCount() const { return commit_mtp_shifted_count_; }
         int lastCommitMTPAlreadyAppended() const { return last_commit_mtp_already_appended_; }
         int lastCommitMTPMainForwardTokenCount() const { return last_commit_mtp_main_forward_token_count_; }
+        bool lastCommitMTPAllowSpeculativeDiscard() const { return last_commit_mtp_allow_speculative_discard_; }
         const std::vector<int> &lastCommitMTPTokens() const { return last_commit_mtp_tokens_; }
         int sampleMainLogitsCount() const { return sample_main_logits_count_; }
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
@@ -473,6 +476,28 @@ namespace
             all_position_logits_enabled_ = false;
             return true;
         }
+
+        bool restoreMTPVerifierStateRow(int verifier_row,
+                                        int target_cached_tokens,
+                                        int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            if (!verifier_row_restore_enabled_)
+                return false;
+
+            restore_verifier_row_count_++;
+            last_verifier_restore_row_ = verifier_row;
+            last_verifier_restore_target_tokens_ = target_cached_tokens;
+            verifier_restore_after_checkpoint_restore_ = restore_count_ > 0;
+            position_ = target_cached_tokens;
+            return true;
+        }
+
+        int restoreVerifierRowCount() const { return restore_verifier_row_count_; }
+        int lastVerifierRestoreRow() const { return last_verifier_restore_row_; }
+        int lastVerifierRestoreTargetTokens() const { return last_verifier_restore_target_tokens_; }
+        bool verifierRestoreAfterCheckpointRestore() const { return verifier_restore_after_checkpoint_restore_; }
+        void enableVerifierRowRestore() { verifier_row_restore_enabled_ = true; }
 
     private:
         static int greedyArgmax(const float *logits, int vocab)
@@ -579,8 +604,11 @@ namespace
         mutable int capture_checkpoint_count_{0};
         int set_all_position_count_{0};
         int commit_mtp_shifted_count_{0};
+        int restore_verifier_row_count_{0};
         int last_commit_mtp_already_appended_{0};
         int last_commit_mtp_main_forward_token_count_{0};
+        int last_verifier_restore_row_{-1};
+        int last_verifier_restore_target_tokens_{-1};
         int sample_main_logits_count_{0};
         int sample_mtp_logits_count_{0};
         int sample_all_position_logits_count_{0};
@@ -596,6 +624,9 @@ namespace
         bool supports_chained_mtp_drafts_{false};
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
+        bool last_commit_mtp_allow_speculative_discard_{false};
+        bool verifier_row_restore_enabled_{false};
+        bool verifier_restore_after_checkpoint_restore_{false};
         DeviceId primary_device_{DeviceId::cpu()};
         int vocab_start_{0};
         int vocab_local_{VOCAB_SIZE};
@@ -1424,6 +1455,60 @@ namespace
         ASSERT_TRUE(step2.success()) << step2.error;
         EXPECT_THAT(mock->forwardHistory(),
                     Contains(ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN)));
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPForcedRejectRestoresVerifierRowBeforeCheckpointAndSkipsReplay)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_verifier_row_restore_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/false);
+            mock->enableVerifierRowRestore();
+
+            std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+            ASSERT_TRUE(runner->prefill(prompt));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+            EXPECT_EQ(mock->restoreCount(), 0);
+            EXPECT_EQ(mock->restoreVerifierRowCount(), 1);
+            EXPECT_FALSE(mock->verifierRestoreAfterCheckpointRestore());
+            EXPECT_EQ(mock->lastVerifierRestoreRow(), 0);
+            EXPECT_EQ(mock->lastVerifierRestoreTargetTokens(), 6);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
+            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "the fast path should keep only the verifier forward, not a replay prefix forward";
+            EXPECT_THAT(mock->forwardHistory(),
+                        Not(Contains(ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN))));
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *shortcut =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "rollback_verifier_state_row_shortcuts");
+            ASSERT_NE(shortcut, nullptr);
+            EXPECT_DOUBLE_EQ(shortcut->value, 1.0);
+
+            const PerfStatRecord *replay_tokens =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
+            EXPECT_EQ(replay_tokens, nullptr);
+
+            const PerfStatRecord *replay_forward =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "replay_forward");
+            EXPECT_EQ(replay_forward, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPForcedRejectRestoresHybridPayloadSnapshot)

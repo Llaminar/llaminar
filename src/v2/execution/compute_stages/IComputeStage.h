@@ -604,6 +604,30 @@ namespace llaminar2
         virtual bool manualGraphBoundaryComplete() const { return true; }
 
         /**
+         * @brief True when the stage captured mutable verifier-row state.
+         *
+         * MTP verifier forwards may compute multiple candidate rows in one
+         * graph. Stages with recurrent model state can snapshot their state
+         * after each row so rollback can restore the accepted prefix without
+         * replaying the main graph.
+         */
+        virtual bool hasVerifierStateCapture() const { return false; }
+
+        /**
+         * @brief Restore mutable model state captured after a verifier row.
+         *
+         * The row is zero-based within the most recent all-position verifier
+         * forward. Implementations should restore only stage-owned mutable
+         * model state; KV truncation and runner bookkeeping are handled above.
+         */
+        virtual bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr)
+        {
+            (void)row;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Whether this stage allows all-zero output tensors
          *
          * By default, all-zero outputs are treated as bugs (likely uninitialized

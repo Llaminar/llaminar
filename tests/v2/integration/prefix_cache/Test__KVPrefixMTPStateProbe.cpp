@@ -341,6 +341,35 @@ namespace
         return fallback;
     }
 
+    int firstIntEnvOrDefault(
+        const std::vector<std::string> &names,
+        int fallback)
+    {
+        for (const auto &name : names)
+        {
+            const char *value = std::getenv(name.c_str());
+            if (!value || !*value)
+            {
+                continue;
+            }
+
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end != value && end && *end == '\0')
+            {
+                return static_cast<int>(parsed);
+            }
+        }
+        return fallback;
+    }
+
+    int qwen36RocmSingleDeviceOrdinal()
+    {
+        return firstIntEnvOrDefault(
+            {"LLAMINAR_QWEN36_ROCM_DEVICE", "LLAMINAR_TEST_ROCM_DEVICE"},
+            0);
+    }
+
     int mpiWorldSize()
     {
         int world_size = 1;
@@ -1474,6 +1503,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
     {
         GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP smoke";
     }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
 
     auto factory = createOrchestrationRunnerFactory();
     SamplingParams greedy;
@@ -1488,7 +1521,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPRealModelSmoke)
         config.batch_size = 1;
         config.tp_degree = 1;
         config.pp_degree = 1;
-        config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+        config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
         config.kv_cache_precision = "auto";
         config.mtp.enabled = enable_mtp;
         config.mtp.draft_tokens = 1;
@@ -1555,6 +1588,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsRealModelSmoke)
     {
         GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP GPU-graphs smoke";
     }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
 
     OrchestrationConfig config = OrchestrationConfig::defaults();
     config.model_path = model_path;
@@ -1562,7 +1599,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsRealModelSmoke)
     config.batch_size = 1;
     config.tp_degree = 1;
     config.pp_degree = 1;
-    config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+    config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
     config.kv_cache_precision = "auto";
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 1;
@@ -1620,6 +1657,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
     {
         GTEST_SKIP() << "No ROCm device available for Qwen3.6 chained MTP GPU-graphs smoke";
     }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
 
     OrchestrationConfig config = OrchestrationConfig::defaults();
     config.model_path = model_path;
@@ -1627,7 +1668,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
     config.batch_size = 1;
     config.tp_degree = 1;
     config.pp_degree = 1;
-    config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+    config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
     config.kv_cache_precision = "auto";
     config.mtp.enabled = true;
     config.mtp.draft_tokens = 2;
@@ -1701,6 +1742,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsBaselineThenMTPRegressio
     {
         GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP GPU-graphs regression";
     }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
 
     auto factory = createOrchestrationRunnerFactory();
     SamplingParams greedy;
@@ -1715,7 +1760,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsBaselineThenMTPRegressio
         config.batch_size = 1;
         config.tp_degree = 1;
         config.pp_degree = 1;
-        config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+        config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
         config.kv_cache_precision = "auto";
         config.mtp.enabled = enable_mtp;
         config.mtp.draft_tokens = 1;
@@ -1783,6 +1828,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
     {
         GTEST_SKIP() << "No ROCm device available for Qwen3.6 prefix+MTP smoke";
     }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
 
     auto factory = createOrchestrationRunnerFactory();
     SamplingParams greedy;
@@ -1797,7 +1846,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
         config.batch_size = 1;
         config.tp_degree = 1;
         config.pp_degree = 1;
-        config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+        config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
         config.kv_cache_precision = "auto";
         config.prefix_cache.enabled = enable_prefix_cache;
         config.prefix_cache.storage_mode = enable_prefix_cache

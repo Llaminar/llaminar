@@ -14,6 +14,7 @@
 #include "../../utils/Assertions.h"
 #include "../../utils/Logger.h"
 
+#include <algorithm>
 #include <set>
 
 namespace llaminar2
@@ -734,6 +735,12 @@ namespace llaminar2
                                                                     << " n_v_heads=" << n_v_heads << " (full=" << n_v_heads_full << ")"
                                                                     << " d_k=" << d_k << " d_v=" << d_v
                                                                     << " qkv_dim=" << qkv_dim << " value_dim=" << value_dim);
+        const bool verifier_state_capture_supported =
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled &&
+            (device.is_cpu() || device.is_rocm());
+        const int verifier_state_capture_rows =
+            verifier_state_capture_supported ? std::max(0, config_.mtp.draft_tokens) : 0;
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm
@@ -796,6 +803,7 @@ namespace llaminar2
         conv_params.seq_len = total_tokens;
         conv_params.channels = qkv_dim;
         conv_params.kernel_size = config_.gdn.conv_kernel_size;
+        conv_params.verifier_state_capture_rows = verifier_state_capture_rows;
 
         // Use kernel instance from hybrid cache (lifetime tied to cache)
         conv_params.kernel = gdn_state->conv_kernel.get();
@@ -834,6 +842,7 @@ namespace llaminar2
         rec_params.d_v = d_v;
         rec_params.chunk_size = 64;
         rec_params.use_qk_l2norm = true;
+        rec_params.verifier_state_capture_rows = verifier_state_capture_rows;
 
         // Under TP, V-heads are always sharded (each rank owns a contiguous
         // slice of global V-heads). The global_v_head_offset tells the

@@ -2295,7 +2295,8 @@ namespace llaminar2
         const int32_t *tokens,
         int token_count,
         int already_appended_tokens,
-        int main_forward_token_count)
+        int main_forward_token_count,
+        bool allow_speculative_discard)
     {
         PerfStatsCollector::ScopedTimer total_timer(
             "mtp",
@@ -2325,7 +2326,8 @@ namespace llaminar2
                        tokens,
                        token_count,
                        already_appended_tokens,
-                       main_forward_token_count);
+                       main_forward_token_count,
+                       allow_speculative_discard);
         }
 
         if (!tp_worker_pool_)
@@ -2356,7 +2358,7 @@ namespace llaminar2
                 {{"participants", std::to_string(device_runners_.size())}});
             tp_worker_pool_->dispatch(
                 [this, &committed_tokens, token_count, already_appended_tokens,
-                 main_forward_token_count,
+                 main_forward_token_count, allow_speculative_discard,
                  kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
                 {
                     KernelProfiler::setCurrentPhase(kernel_phase);
@@ -2384,7 +2386,8 @@ namespace llaminar2
                                         committed_tokens.data(),
                                         token_count,
                                         already_appended_tokens,
-                                        main_forward_token_count);
+                                        main_forward_token_count,
+                                        allow_speculative_discard);
 
                     if (debugEnv().tp_collective_contract_trace)
                     {
@@ -3324,6 +3327,30 @@ namespace llaminar2
         truncate_runners(device_runners_);
         truncate_runners(pp_stage_runners_);
         return saw_runner && ok;
+    }
+
+    bool RankOrchestrator::restoreMTPVerifierStateRow(
+        int verifier_row,
+        int target_cached_tokens,
+        int seq_idx)
+    {
+        if (pp_stage_runners_.empty() &&
+            device_runners_.size() == 1 &&
+            device_runners_[0])
+        {
+            return device_runners_[0]->restoreMTPVerifierStateRow(
+                verifier_row,
+                target_cached_tokens,
+                seq_idx);
+        }
+
+        PerfStatsCollector::addCounter("mtp",
+                                       "verifier_state_row_restore_unavailable",
+                                       1.0,
+                                       "decode",
+                                       "rank",
+                                       {{"reason", "multi_participant_rank"}});
+        return false;
     }
 
     PrefixRuntimeStateSnapshot RankOrchestrator::prefixStateProbe() const

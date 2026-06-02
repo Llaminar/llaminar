@@ -1148,11 +1148,32 @@ Latest ROCm dense evidence:
     recorded three measured `live_prefix_replay_state_preserved` events and no
     MoE reset events. Depth-2 MTP reached 29.63 tok/s with 107 accepted,
     17 rejected, 21 rollbacks, and 86.29% acceptance. The dense preserve change
-    removes avoidable graph reconstruction, but verifier replay and rollback
-    replay remain the speedup blockers.
-  - Next ROCm SingleDevice sprint target remains the captured verifier graph's
-    GPU work and MTP per-step overhead. More host-side fallbacks or flag guards
-    are not expected to create the Phase 14 speedup.
+    removes avoidable graph reconstruction; MoE still keeps the targeted reset
+    guard until sparse collective rollback is graph-capture safe.
+  - Verifier-row GDN state restore slice: short-conv and GDN recurrence kernels
+    now expose declared verifier-state capture buffers for verifier rows, and
+    dense rollback restores the accepted verifier row after the post-sidecar
+    checkpoint instead of replaying that accepted prefix token. The runner then
+    commits shifted MTP rows from the partial verifier forward and only replays
+    a suffix when the accepted output truly extends beyond the restored row.
+    Focused regression passed:
+    `V2_Unit_GDNMathematicalCorrectness`,
+    `V2_Unit_GDNKernels`,
+    `V2_Unit_PrefillGraphCaptureGuards`,
+    `V2_Unit_PrefillGraphCaptureDynamicParams`,
+    `V2_Unit_MTPGraphConstruction`,
+    `V2_Unit_PrefillDecodeTransition`, and
+    `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`.
+    The new `V2_Unit_PrefillDecodeTransition` regression proves the shortcut
+    restores checkpoint state first, restores verifier row 0 to cached token 6,
+    records `mtp.rollback_verifier_state_row_shortcuts`, and skips the old
+    replay-prefix forward. The real Qwen3.6 ROCm chained graph smoke passed in
+    16.27 s after adding an env-selectable single-device ROCm ordinal
+    (`LLAMINAR_QWEN36_ROCM_DEVICE` or `LLAMINAR_TEST_ROCM_DEVICE`) for these
+    smokes. Fresh long-lane speed evidence is still pending; the next ROCm
+    SingleDevice sprint target is to rerun the `-c 64`, `-n 48` ratchet and
+    then attack the remaining captured verifier GPU work and MTP per-step
+    overhead.
 
 Latest CUDA dense evidence:
 
