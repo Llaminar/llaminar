@@ -5119,6 +5119,22 @@ if(ZLIB_FOUND)
         TIMEOUT 1800
     )
 
+    add_executable(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36_CPU_SingleDevice_PrefixMTP_Parity.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
+        llaminar2_core GTest::gtest
+    )
+    target_include_directories(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36_CPU_SingleDevice
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;CPU;SingleDevice;PyTorch"
+        MPI_PROCS 1
+        TIMEOUT 2400
+    )
+
     add_executable(v2_integration_parity_qwen36_local_tp_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_LocalTP_PrefixMTP_Parity.cpp
     )
