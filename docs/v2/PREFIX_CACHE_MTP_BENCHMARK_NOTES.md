@@ -219,7 +219,8 @@ Latest graph-atomic small-M hardening validation:
   captures and records `mtp.post_sidecar_checkpoint_skipped_speculative`.
   Focused regression coverage:
   `V2_Unit_PrefillDecodeTransition.MTPChainedDraftCapturesOnlyFirstPostSidecarCheckpoint`,
-  plus `V2_Unit_MTPGraphConstruction` and `V2_Unit_RankOrchestrator`.
+  `V2_Unit_MTPGraphConstruction`, `V2_Unit_RankOrchestrator`, and the focused
+  real-model `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`.
 
 Latest workspace-binding validation:
 
