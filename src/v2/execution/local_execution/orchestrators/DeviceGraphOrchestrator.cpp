@@ -3728,15 +3728,6 @@ namespace llaminar2
                     !collective_nodes.empty(),
                     ctx,
                     sidecar_cache.segment_cache.consecutive_failures);
-                if (state_.device_id.is_rocm())
-                {
-                    // ROCm sidecar dynamic-input replay is not safe yet: real
-                    // Qwen3.6 prefix+MTP restore faults in HSA when reusing the
-                    // captured sidecar graph after token/position changes.
-                    // Re-capture keeps the graph path correct until the dynamic
-                    // scalar/input contract is made replay-safe.
-                    capture_policy.force_recapture = true;
-                }
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "sidecar_decode_capture_policy",

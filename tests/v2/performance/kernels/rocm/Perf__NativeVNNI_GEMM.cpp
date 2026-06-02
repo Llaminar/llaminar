@@ -52,6 +52,30 @@
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 #include "GpuVerification.h"
+
+extern "C"
+{
+    bool rocmQuantGemm_quantizeActivationsBlockwise(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_blockwise,
+        int M, int K,
+        int rocm_device_id, void *stream,
+        int block_size);
+
+    bool rocmGemm_native_vnni_fp32(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const void *d_block_scales,
+        const void *d_block_mins,
+        const void *d_block_emins,
+        float *d_output,
+        const float *d_scales_A,
+        const float *d_scales_A_blockwise,
+        int M, int N, int K,
+        uint8_t codebook_id,
+        int device_id, void *stream);
+}
 #endif
 
 using namespace llaminar2;
@@ -208,6 +232,54 @@ namespace
         // GFLOPS
         double gflops = 0.0;
     };
+
+    struct DirectPrefillComparisonResult
+    {
+        std::string format_name;
+        std::string shape_name;
+        int M = 0;
+        int N = 0;
+        int K = 0;
+
+        double small_m_min_us = 0.0;
+        double direct_prefill_min_us = 0.0;
+        double direct_prefill_quant_min_us = 0.0;
+        double prefill_quant_speedup = 0.0;
+
+        float cosine_sim = 0.0f;
+        bool correctness_pass = false;
+        bool valid = false;
+    };
+
+#ifdef HAVE_ROCM
+    struct HipBuffer
+    {
+        void *ptr = nullptr;
+
+        ~HipBuffer()
+        {
+            if (ptr)
+                (void)hipFree(ptr);
+        }
+
+        bool allocate(size_t bytes)
+        {
+            return hipMalloc(&ptr, bytes) == hipSuccess;
+        }
+
+        template <typename T>
+        T *as()
+        {
+            return reinterpret_cast<T *>(ptr);
+        }
+
+        template <typename T>
+        const T *as() const
+        {
+            return reinterpret_cast<const T *>(ptr);
+        }
+    };
+#endif
 
     // =============================================================================
     // Statistics helper
@@ -499,6 +571,260 @@ namespace
             }
 
             kernel.unbindWorkspace();
+            return result;
+        }
+
+        static std::vector<double> timeDirectNativePrefill(
+            const DeviceNativeVNNIMatrixDesc &desc,
+            const float *d_input,
+            int8_t *d_A_int8,
+            float *d_scales_A,
+            float *d_scales_A_blockwise,
+            float *d_output,
+            int M, int N, int K,
+            int device_id,
+            bool include_quantization)
+        {
+            (void)hipSetDevice(device_id);
+
+            const auto run_once = [&]() -> bool
+            {
+                if (include_quantization)
+                {
+                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                            d_input,
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            M, K,
+                            device_id,
+                            nullptr,
+                            32))
+                    {
+                        return false;
+                    }
+                }
+
+                return rocmGemm_native_vnni_fp32(
+                    d_A_int8,
+                    desc.payload,
+                    desc.scales,
+                    desc.mins,
+                    desc.emins,
+                    d_output,
+                    d_scales_A,
+                    d_scales_A_blockwise,
+                    M, N, K,
+                    desc.codebook_id,
+                    device_id,
+                    nullptr);
+            };
+
+            if (!include_quantization)
+            {
+                if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                        d_input,
+                        d_A_int8,
+                        d_scales_A_blockwise,
+                        M, K,
+                        device_id,
+                        nullptr,
+                        32))
+                {
+                    return {};
+                }
+            }
+
+            for (int i = 0; i < WARMUP_RUNS; ++i)
+            {
+                if (!run_once())
+                    return {};
+            }
+            (void)hipDeviceSynchronize();
+
+            hipEvent_t start = nullptr, stop = nullptr;
+            (void)hipEventCreate(&start);
+            (void)hipEventCreate(&stop);
+
+            std::vector<double> times_us;
+            times_us.reserve(BENCH_RUNS);
+
+            for (int i = 0; i < BENCH_RUNS; ++i)
+            {
+                (void)hipDeviceSynchronize();
+                (void)hipEventRecord(start);
+                if (!run_once())
+                {
+                    (void)hipEventDestroy(start);
+                    (void)hipEventDestroy(stop);
+                    return {};
+                }
+                (void)hipEventRecord(stop);
+                (void)hipEventSynchronize(stop);
+
+                float ms = 0.0f;
+                (void)hipEventElapsedTime(&ms, start, stop);
+                times_us.push_back(static_cast<double>(ms) * 1000.0);
+            }
+
+            (void)hipEventDestroy(start);
+            (void)hipEventDestroy(stop);
+
+            std::sort(times_us.begin(), times_us.end());
+            return times_us;
+        }
+
+        static DirectPrefillComparisonResult compareSmallMToDirectPrefill(
+            const GEMMFormatSpec &fmt,
+            const GEMMShape &shape,
+            int M,
+            int device_id)
+        {
+            (void)hipSetDevice(device_id);
+
+            DirectPrefillComparisonResult result{};
+            result.format_name = fmt.name;
+            result.shape_name = shape.name;
+            result.M = M;
+            result.N = shape.N;
+            result.K = shape.K;
+
+            auto weights = fmt.create(
+                static_cast<size_t>(shape.N),
+                static_cast<size_t>(shape.K));
+            if (!weights)
+                return result;
+
+            ROCmPackedWeights packed;
+            if (!packWeightsToROCm(weights.get(), packed))
+                return result;
+            if (packed.native_vnni_payload.empty())
+                return result;
+
+            ROCmQuantisedGemmKernel kernel(&packed, device_id);
+            auto reqs = kernel.getWorkspaceRequirements(M, shape.N, shape.K);
+            const size_t budget = reqs.total_bytes_with_alignment() + (8 * 1024 * 1024);
+            auto workspace = std::make_unique<DeviceWorkspaceManager>(
+                DeviceId::rocm(device_id), budget);
+            if (!workspace->allocate(reqs))
+                return result;
+            kernel.bindWorkspace(workspace.get());
+
+            DeviceNativeVNNIMatrixDesc desc{};
+            if (!kernel.exportNativeVNNIMatrixDesc(desc))
+            {
+                kernel.unbindWorkspace();
+                return result;
+            }
+
+            auto input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(M), static_cast<size_t>(shape.K)});
+            auto small_m_output = TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(shape.N)});
+            auto direct_output = TestTensorFactory::createFP32(
+                {static_cast<size_t>(M), static_cast<size_t>(shape.N)});
+
+            if (!input->ensureOnDevice(DeviceId::rocm(device_id)) ||
+                !small_m_output->allocateOnDevice(DeviceId::rocm(device_id)) ||
+                !direct_output->allocateOnDevice(DeviceId::rocm(device_id)))
+            {
+                kernel.unbindWorkspace();
+                return result;
+            }
+
+            auto *input_fp32 = dynamic_cast<FP32Tensor *>(input.get());
+            auto *small_fp32 = dynamic_cast<FP32Tensor *>(small_m_output.get());
+            auto *direct_fp32 = dynamic_cast<FP32Tensor *>(direct_output.get());
+            if (!input_fp32 || !small_fp32 || !direct_fp32)
+            {
+                kernel.unbindWorkspace();
+                return result;
+            }
+
+            const float *d_input = reinterpret_cast<const float *>(input_fp32->gpu_data_ptr());
+            float *d_small_output = reinterpret_cast<float *>(small_fp32->gpu_data_ptr());
+            float *d_direct_output = reinterpret_cast<float *>(direct_fp32->gpu_data_ptr());
+            if (!d_input || !d_small_output || !d_direct_output)
+            {
+                kernel.unbindWorkspace();
+                return result;
+            }
+
+            HipBuffer d_A_int8;
+            HipBuffer d_scales_A;
+            HipBuffer d_scales_A_blockwise;
+
+            const size_t activation_count = static_cast<size_t>(M) * shape.K;
+            const size_t scale_block_count =
+                static_cast<size_t>(M) * static_cast<size_t>(shape.K / 32);
+            if (!d_A_int8.allocate(activation_count * sizeof(int8_t)) ||
+                !d_scales_A.allocate(static_cast<size_t>(M) * sizeof(float)) ||
+                !d_scales_A_blockwise.allocate(scale_block_count * sizeof(float)))
+            {
+                kernel.unbindWorkspace();
+                return result;
+            }
+
+            std::vector<float> row_scales(static_cast<size_t>(M), 1.0f);
+            if (hipMemcpy(
+                    d_scales_A.ptr,
+                    row_scales.data(),
+                    row_scales.size() * sizeof(float),
+                    hipMemcpyHostToDevice) != hipSuccess)
+            {
+                kernel.unbindWorkspace();
+                return result;
+            }
+
+            auto small_m_times = timeGEMMKernel(
+                kernel,
+                input.get(),
+                small_m_output.get(),
+                M, shape.N, shape.K,
+                device_id);
+
+            auto prefill_times = timeDirectNativePrefill(
+                desc,
+                d_input,
+                d_A_int8.as<int8_t>(),
+                d_scales_A.as<float>(),
+                d_scales_A_blockwise.as<float>(),
+                d_direct_output,
+                M, shape.N, shape.K,
+                device_id,
+                false);
+
+            auto prefill_quant_times = timeDirectNativePrefill(
+                desc,
+                d_input,
+                d_A_int8.as<int8_t>(),
+                d_scales_A.as<float>(),
+                d_scales_A_blockwise.as<float>(),
+                d_direct_output,
+                M, shape.N, shape.K,
+                device_id,
+                true);
+
+            kernel.unbindWorkspace();
+
+            if (small_m_times.empty() || prefill_times.empty() || prefill_quant_times.empty())
+                return result;
+
+            result.small_m_min_us = small_m_times.front();
+            result.direct_prefill_min_us = prefill_times.front();
+            result.direct_prefill_quant_min_us = prefill_quant_times.front();
+            result.prefill_quant_speedup =
+                result.direct_prefill_quant_min_us > 0.0
+                    ? result.small_m_min_us / result.direct_prefill_quant_min_us
+                    : 0.0;
+
+            const size_t out_elems = static_cast<size_t>(M) * shape.N;
+            result.cosine_sim = gpuCosineSimilarity(
+                d_small_output,
+                d_direct_output,
+                out_elems,
+                device_id);
+            result.correctness_pass = (result.cosine_sim >= MTP_SMALL_M_COSINE_GATE);
+            result.valid = true;
             return result;
         }
 #endif
@@ -1227,6 +1553,108 @@ namespace
                   << (r.correctness_pass ? "PASS" : "COS FAIL")
                   << fort::endr;
 
+            EXPECT_GE(r.cosine_sim, MTP_SMALL_M_COSINE_GATE)
+                << r.format_name << " " << r.shape_name << " M=" << r.M
+                << " cosine=" << r.cosine_sim;
+        }
+
+        fprintf(stderr, "\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(NativeVNNIGEMMPerfTest, MTP_SmallM_DirectPrefillRouteComparison)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device available";
+
+        fprintf(stderr, "\n[NativeVNNI GEMM] Phase 13.5 small-M route comparison\n");
+        fprintf(stderr, "[NativeVNNI GEMM] Device: %s\n", device_name_.c_str());
+        fprintf(stderr, "[NativeVNNI GEMM] Signal: speedup = small-M route / direct prefill+quant route (>1 means direct prefill is faster)\n");
+
+        const std::vector<std::string> selected_formats = {"Q4_1", "Q5_1"};
+        const std::vector<std::string> selected_shapes = {
+            "Qwen36_FFN_DownProjection",
+            "Qwen36_GDN_OutputProjection",
+        };
+        const std::vector<int> selected_m_values = {2, 4};
+
+        std::vector<DirectPrefillComparisonResult> results;
+        results.reserve(selected_formats.size() * selected_shapes.size() * selected_m_values.size());
+
+        for (const auto &shape_name : selected_shapes)
+        {
+            auto shape_it = std::find_if(
+                MTP_SMALL_M_SHAPES.begin(),
+                MTP_SMALL_M_SHAPES.end(),
+                [&](const GEMMShape &shape)
+                {
+                    return shape.name == shape_name;
+                });
+            ASSERT_NE(shape_it, MTP_SMALL_M_SHAPES.end()) << shape_name;
+
+            for (const auto &format_name : selected_formats)
+            {
+                auto fmt_it = std::find_if(
+                    GEMM_FORMATS.begin(),
+                    GEMM_FORMATS.end(),
+                    [&](const GEMMFormatSpec &fmt)
+                    {
+                        return fmt.name == format_name;
+                    });
+                ASSERT_NE(fmt_it, GEMM_FORMATS.end()) << format_name;
+
+                for (int M : selected_m_values)
+                {
+                    auto r = compareSmallMToDirectPrefill(*fmt_it, *shape_it, M, 0);
+                    results.push_back(r);
+
+                    fprintf(stderr,
+                            "  %s/%s M=%d: small-M=%.1f μs direct=%.1f μs direct+quant=%.1f μs signal=%.2fx cosine=%.6f\n",
+                            r.format_name.c_str(),
+                            r.shape_name.c_str(),
+                            r.M,
+                            r.small_m_min_us,
+                            r.direct_prefill_min_us,
+                            r.direct_prefill_quant_min_us,
+                            r.prefill_quant_speedup,
+                            r.cosine_sim);
+                }
+            }
+        }
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Format" << "Shape" << "M"
+              << "Small-M μs" << "Prefill μs" << "Prefill+Quant μs"
+              << "Signal" << "Cosine" << "Gate" << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::left);
+        for (int c = 2; c <= 8; ++c)
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        for (const auto &r : results)
+        {
+            char b_m[8], b_small[16], b_prefill[16], b_prefill_quant[16], b_signal[16], b_cos[16];
+            snprintf(b_m, sizeof(b_m), "%d", r.M);
+            snprintf(b_small, sizeof(b_small), "%.1f", r.small_m_min_us);
+            snprintf(b_prefill, sizeof(b_prefill), "%.1f", r.direct_prefill_min_us);
+            snprintf(b_prefill_quant, sizeof(b_prefill_quant), "%.1f", r.direct_prefill_quant_min_us);
+            snprintf(b_signal, sizeof(b_signal), "%.2fx", r.prefill_quant_speedup);
+            snprintf(b_cos, sizeof(b_cos), "%.6f", r.cosine_sim);
+
+            table << r.format_name << r.shape_name << b_m
+                  << b_small << b_prefill << b_prefill_quant
+                  << b_signal << b_cos
+                  << (r.correctness_pass ? "PASS" : "COS FAIL")
+                  << fort::endr;
+
+            EXPECT_TRUE(r.valid)
+                << r.format_name << " " << r.shape_name << " M=" << r.M;
             EXPECT_GE(r.cosine_sim, MTP_SMALL_M_COSINE_GATE)
                 << r.format_name << " " << r.shape_name << " M=" << r.M
                 << " cosine=" << r.cosine_sim;
