@@ -26,7 +26,11 @@
 #include "mocks/MockCollectiveContext.h"
 #include "mocks/MockComputeStage.h"
 #include "config/TPDomain.h"
+#include "utils/DebugEnv.h"
+#include <cstdlib>
 #include <future>
+#include <optional>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -58,7 +62,10 @@ namespace
 
         void *createEvent() override { return reinterpret_cast<void *>(0xCAFEBABE); }
         void destroyEvent(void * /*event*/) override {}
-        void recordEvent(void * /*event*/, void * /*stream*/) override {}
+        void recordEvent(void * /*event*/, void *stream) override
+        {
+            recorded_event_streams_.push_back(stream);
+        }
         void waitEvent(void * /*event*/, void * /*stream*/) override {}
         void synchronizeEvent(void * /*event*/) override {}
         float eventElapsedTime(void * /*start*/, void * /*stop*/) override { return 0.0f; }
@@ -76,10 +83,45 @@ namespace
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void * /*stream*/) override { return nullptr; }
 
+        const std::vector<void *> &recordedEventStreams() const { return recorded_event_streams_; }
+
     private:
         int device_ordinal_ = -1;
         void *default_stream_ = nullptr;
         void *collective_comm_ = nullptr;
+        std::vector<void *> recorded_event_streams_;
+    };
+
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            if (const char *old = std::getenv(name))
+                old_value_ = old;
+            if (value)
+                ::setenv(name, value, 1);
+            else
+                ::unsetenv(name);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnv()
+        {
+            if (old_value_)
+                ::setenv(name_.c_str(), old_value_->c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> old_value_;
     };
 } // namespace
 
@@ -738,4 +780,35 @@ TEST_F(Test__GraphExecutorStreamBinding, CudaContextUsedWhenNodeAndStageDevicesA
 
     ASSERT_TRUE(executor.execute(graph, &ctx));
     EXPECT_EQ(stage_raw->gpuStream(), cuda_default_stream_);
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, TimelineEventsUsePreBoundStageStream)
+{
+    ScopedEnv timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    void *capture_stream = reinterpret_cast<void *>(0xFACEB00C);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM,
+        "capture_stream_stage",
+        DeviceId::rocm(0));
+    auto *stage_raw = stage.get();
+    stage_raw->setGPUStream(capture_stream);
+
+    ComputeGraph graph;
+    graph.addNode("capture_stream_stage", std::move(stage), DeviceId::rocm(0));
+
+    ASSERT_TRUE(executor.executeFastDecode(graph, &ctx));
+    EXPECT_EQ(stage_raw->gpuStream(), capture_stream);
+
+    auto *worker = dynamic_cast<MockWorkerGPUContext *>(&GPUDeviceContextPool::instance().getContext(DeviceId::rocm(0)));
+    ASSERT_NE(worker, nullptr);
+    ASSERT_EQ(worker->recordedEventStreams().size(), 2u);
+    EXPECT_EQ(worker->recordedEventStreams()[0], capture_stream);
+    EXPECT_EQ(worker->recordedEventStreams()[1], capture_stream);
+    EXPECT_NE(worker->recordedEventStreams()[0], rocm_default_stream_);
 }

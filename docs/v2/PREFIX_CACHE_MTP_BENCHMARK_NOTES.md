@@ -263,6 +263,26 @@ Latest workspace-binding validation:
   `/tmp/llaminar-mtp-bench/dense-rocm-context-guard-c64-n64-bench.json`.
   Unit coverage:
   `V2_Unit_BenchmarkRunnerCPU.FailsBeforePrefillWhenPromptPlusDecodeExceedsContext`.
+- Stage-timing stream-binding regression from this profiling slice:
+  `LLAMINAR_GPU_STAGE_TIMING=1` previously faulted during ROCm segmented warmup
+  because per-stage timing events were recorded on the worker default stream
+  while graph-captured stages had already been rebound to the capture stream.
+  `DeviceGraphExecutor` now records start/stop timing events on each stage's
+  currently bound GPU stream, falling back to the worker default stream only
+  when a stage has no explicit stream. Unit coverage:
+  `V2_Unit_GraphExecutorCollective.TimelineEventsUsePreBoundStageStream`.
+  The real Qwen3.6 dense depth-1 MTP diagnostic completed without the old HSA
+  fault under stage timing:
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-stage-mtp-d1-c64-n8-streamfix-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-stage-mtp-d1-c64-n8-streamfix-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-stage-mtp-d1-c64-n8-streamfix-stats.csv`.
+  Decode was 17.42 diagnostic tok/s with 75% acceptance. The profiler-guided
+  next target remains the captured main verifier: `mtp.verifier_forward`
+  averaged about 89.82 ms/call in this diagnostic run, `sidecar_forward`
+  averaged about 3.47 ms/call, and the top `main_verifier` buckets were
+  `GDN_PROJECTION` at about 20.75 ms/call, ordinary `GEMM` at about
+  14.71 ms/call, and `GEMM_FUSED_GATE_UP` at about 11.62 ms/call.
 - Depth-1 MTP is now speed-positive but structurally below the 2x Phase 14
   target on this prompt. With one draft token, the verifier graph must become
   substantially cheaper than one ordinary decode graph, or deeper graph-native

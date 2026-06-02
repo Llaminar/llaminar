@@ -531,13 +531,11 @@ namespace llaminar2
         const bool timeline_requested = debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled();
         const bool timeline_active = policy.timeline && timeline_requested && ctx->isGPU() && !isGraphCaptureActive();
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
-        void *timeline_stream = nullptr;
         if (timeline_active)
         {
             timeline_gpu_ctx = tryGetWorkerContext(ctx->deviceId());
             if (timeline_gpu_ctx)
             {
-                timeline_stream = timeline_gpu_ctx->defaultStream();
                 stage_timeline_.ensureCapacity(timeline_gpu_ctx, schedule.size());
                 stage_timeline_.resetTimings();
 
@@ -573,9 +571,16 @@ namespace llaminar2
                 return false;
 
             ensureStageGPUStreamBound(*node, ctx);
+            void *stage_timeline_stream = nullptr;
+            if (timeline_active && timeline_gpu_ctx)
+            {
+                stage_timeline_stream = node->stage->gpuStream();
+                if (!stage_timeline_stream)
+                    stage_timeline_stream = timeline_gpu_ctx->defaultStream();
+            }
 
             if (timeline_active && timeline_gpu_ctx)
-                stage_timeline_.recordStart(i, timeline_gpu_ctx, timeline_stream);
+                stage_timeline_.recordStart(i, timeline_gpu_ctx, stage_timeline_stream);
 
             if (debugEnv().vram_trace && ctx->isGPU())
             {
@@ -612,7 +617,7 @@ namespace llaminar2
             graph.markCompleted(node->name);
 
             if (timeline_active && timeline_gpu_ctx)
-                stage_timeline_.recordStop(i, timeline_gpu_ctx, timeline_stream);
+                stage_timeline_.recordStop(i, timeline_gpu_ctx, stage_timeline_stream);
         }
 
         // =====================================================================
