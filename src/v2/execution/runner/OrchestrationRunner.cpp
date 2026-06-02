@@ -810,6 +810,10 @@ namespace llaminar2
         if (!mtp.enabled || !runner_)
             return {};
 
+        if (mtp.draft_tokens != 1)
+        {
+            return "MTP decode currently supports exactly one draft token; set --mtp-draft-tokens 1";
+        }
         if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
         {
             return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_DECODE; use LLAMINAR_ROCM_CONCURRENT_M2_ROWS for M=2 verifier experiments";

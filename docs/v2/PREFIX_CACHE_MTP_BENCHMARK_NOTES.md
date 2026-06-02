@@ -27,6 +27,11 @@ stage policy, collective policy, and graph final-sync costs. Keeping both
 domains together prevents graph-only artifacts from hiding high-level MTP
 decode costs, or MTP-only artifacts from hiding graph-capture policy.
 
+All current Phase 14 MTP benchmark evidence is for the implemented depth-1
+sidecar path (`--mtp-draft-tokens 1`). Requests for deeper MTP drafts now fail
+before sidecar launch rather than silently running depth-1 behavior under a
+depth-N configuration.
+
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
 | SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Blocked: ROCm MTP with `LLAMINAR_GPU_GRAPHS=1` now hard-fails before decode-side MTP launch after real HSA fault/hang reproducers | N/A | 12.32 without GPU graphs; 11.66 standard post-guard | 0.68x decode best observed; 0.64x standard post-guard | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-no-graphs-long-after-guard-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-notiming-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-gpugraph-hardfail.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-gpugraph-hardfail.json` | ROCm MTP GPU graph capture is not rollout-safe. Both the base graph path and the opt-in M=2 row-overlap path produced HSA memory faults/hangs in fresh real Qwen3.6 smokes and now fail with structured `failure_reason`. The supported no-graph path remains green after the guard, but still slower than baseline. Need a graph-safe ROCm MTP verifier/sidecar path, likely graph-native two-row verifier kernels plus safe replay state, before speedup work resumes for this cell. |

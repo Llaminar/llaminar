@@ -542,7 +542,8 @@ namespace
                                                                              std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
                                                                              bool mtp_token_coordination = false,
                                                                              bool hide_local_logits = false,
-                                                                             DeviceId primary_device = DeviceId::cpu())
+                                                                             DeviceId primary_device = DeviceId::cpu(),
+                                                                             int mtp_draft_tokens = 1)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -565,7 +566,7 @@ namespace
             else
                 config.device_for_this_rank = GlobalDeviceAddress::cpu();
             config.mtp.enabled = mtp_enabled;
-            config.mtp.draft_tokens = 1;
+            config.mtp.draft_tokens = mtp_draft_tokens;
             config.mtp.verify_mode = MTPVerifyMode::Greedy;
 
             std::unique_ptr<OrchestrationRunner> runner;
@@ -807,6 +808,30 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
         EXPECT_EQ(probe.mtp_rollbacks, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPDraftDepthGreaterThanOneHardFailsBeforeSidecar)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/2);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step = runner->decodeStep();
+        EXPECT_FALSE(step.success());
+        EXPECT_NE(step.error.find("exactly one draft token"), std::string::npos)
+            << step.error;
+        EXPECT_NE(step.error.find("--mtp-draft-tokens 1"), std::string::npos)
+            << step.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+        EXPECT_EQ(mock->forwardCallCount(), 1);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPDecodeRecordsStructuredPerfStats)
