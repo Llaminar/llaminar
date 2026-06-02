@@ -88,6 +88,18 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- Current same-binary long-lane ROCm Qwen3.6 dense 27B Q4_K_S,
+  `rocm:0`, GPU graphs enabled, `The quick brown fox`, `-c 64`, `-n 48`:
+  baseline `/tmp/llaminar-mtp-bench/dense-rocm-atomic-baseline-c64-n48-bench.json`
+  at 21.01 decode tok/s; MTP
+  `/tmp/llaminar-mtp-bench/dense-rocm-atomic-mtp-c64-n48-bench.json`
+  at 33.25 decode tok/s, 95.83% acceptance, 92 accepted tokens,
+  4 rejected tokens, and 4 rollbacks. Structured MTP/graph stats:
+  `/tmp/llaminar-mtp-bench/dense-rocm-atomic-mtp-c64-n48-stats.json`
+  and `/tmp/llaminar-mtp-bench/dense-rocm-atomic-mtp-c64-n48-stats.csv`.
+  This confirms the earlier 1.6x depth-1 MTP lane still survives after the
+  graph-safe atomic K-partitioning slice: current safe-path speedup is 1.58x,
+  compared with the older best-observed 33.57 tok/s run.
 - ROCm Qwen3.6 dense 27B Q4_K_S, `rocm:0`, GPU graphs enabled,
   `The quick brown fox`, `-c 64`, `-n 8`, depth-1 MTP:
   `/tmp/llaminar-mtp-bench/dense-rocm-graphatomic-mtp-c64-n8-bench.json`,
@@ -96,6 +108,15 @@ Latest graph-atomic small-M hardening validation:
   The run completed without the previous full-model ROCm graph replay fault and
   every small-M K-partitioned native-VNNI launch used `path=atomic_reduce`
   rather than `split_reduce`.
+- Fresh short-stage diagnostic with the same current path:
+  `/tmp/llaminar-mtp-bench/dense-rocm-atomic-stage-mtp-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-atomic-stage-mtp-c64-n8-stats.json`,
+  and `/tmp/llaminar-mtp-bench/dense-rocm-atomic-stage-mtp-c64-n8-stats.csv`.
+  This is intentionally not a speedup lane: only 8 decode tokens, 75%
+  acceptance, and heavy `stage_gpu,kernel` export. It reproduced the 17.30
+  tok/s short result and identifies the current main-verifier GPU budget:
+  `GDN_PROJECTION` about 20.86 ms per recorded verifier pass, ordinary
+  `GEMM` about 14.89 ms, and `GEMM_FUSED_GATE_UP` about 11.64 ms.
 - Same short-prompt comparator artifacts:
   baseline `/tmp/llaminar-mtp-bench/dense-rocm-graphdirect-baseline-c64-n8-bench.json`
   at 21.42 decode tok/s and old direct-MTP hardening
