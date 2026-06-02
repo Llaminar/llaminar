@@ -215,6 +215,14 @@ Latest ROCm dense evidence:
 
 Latest CUDA dense evidence:
 
+- Focused correctness prerequisite:
+  `ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_Qwen36_CUDA_SingleDevice_" --output-on-failure --parallel`.
+  - Passed on 2026-06-02 for all five CUDA SingleDevice dense Qwen3.6
+    prefix/MTP parity cases: prefix full hit, prefix partial hit, split
+    prefill, MTP greedy, and prefix+MTP restore.
+  - This closes the CUDA SingleDevice correctness slice for the current
+    Phase 13 matrix, but it does not change the Phase 14 speedup blocker:
+    current CUDA dense MTP still trails the no-MTP decode baseline.
 - Baseline: `/tmp/llaminar-mtp-bench/dense-cuda-baseline-c64-n4.json`.
   - Model: `/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf`.
   - Device/context: `cuda:0` RTX 3090, `-c 64`, deterministic 9-token

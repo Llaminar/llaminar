@@ -51,6 +51,7 @@ namespace llaminar2::test::parity::qwen36
         int max_seq_len = 96;
         int main_layers = 64;
         int mpi_ranks = 1;
+        int required_cuda_devices = 0;
         int required_rocm_devices = 0;
     };
 
@@ -243,10 +244,18 @@ namespace llaminar2::test::parity::qwen36
             return test_case.name + " is a local topology test and must run with one MPI rank";
         }
 
-        if (test_case.required_rocm_devices > 0)
+        if (test_case.required_cuda_devices > 0 || test_case.required_rocm_devices > 0)
         {
             auto &dm = DeviceManager::instance();
             dm.initialize(-1, false);
+            if (dm.cuda_device_count() < test_case.required_cuda_devices)
+            {
+                std::ostringstream oss;
+                oss << test_case.name << " requires "
+                    << test_case.required_cuda_devices
+                    << " CUDA device(s)";
+                return oss.str();
+            }
             if (dm.rocm_device_count() < test_case.required_rocm_devices)
             {
                 std::ostringstream oss;
