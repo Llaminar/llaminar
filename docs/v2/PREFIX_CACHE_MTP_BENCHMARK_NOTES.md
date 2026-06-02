@@ -303,6 +303,19 @@ Latest ROCm dense evidence:
     (~6.30 ms/pass). Remaining work is to shrink those verifier buckets,
     characterize rollback/acceptance sensitivity, and repeat longer-prompt
     speedup evidence.
+  - Rejected mixed-codebook GDN subgroup batching experiment:
+    `/tmp/llaminar-mtp-bench/dense-rocm-subgroup-gdn-mtp-c64-n8.log`
+    reproduced a real Qwen3.6 ROCm HSA memory access fault after changing the
+    fused projection dispatcher to batch same-codebook subgroups inside an
+    otherwise mixed-codebook GDN projection set. The focused regression
+    `GraphCapturedFusedMixedCodebookGDNProjectionM4BypassesBatchedRoute`
+    now proves graph-captured mixed Q4_K/Q5_K GDN projection output correctness
+    while requiring an explicit `mixed_codebook` batched-route bypass. The
+    follow-up safe real-model rerun,
+    `/tmp/llaminar-mtp-bench/dense-rocm-mixedcodebook-safe-mtp-c64-n8-bench.json`
+    plus `.csv`, completed at 21.65 tok/s with 75% acceptance and no lingering
+    KFD process. Do not reintroduce subgroup batching until the lower-level
+    batched native-VNNI launcher has a real-model-safe mixed-group design.
 - Rejected shared-quant fused M=2 experiment:
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-bench.json` and
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-sharedquant-stats.json`.
