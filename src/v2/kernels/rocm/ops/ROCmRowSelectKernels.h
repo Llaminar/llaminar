@@ -16,6 +16,16 @@
 namespace llaminar2::rocm
 {
 
+    /** @brief Allocate pinned host scalar storage for selected row. */
+    bool allocateRowSelectHostParam(
+        int device_ordinal,
+        int **host_selected_row);
+
+    /** @brief Free pinned host scalar storage allocated by allocateRowSelectHostParam(). */
+    void freeRowSelectHostParam(
+        int device_ordinal,
+        int *host_selected_row);
+
     /** @brief Allocate pinned host and device scalar storage for selected row. */
     bool allocateRowSelectParam(
         int device_ordinal,

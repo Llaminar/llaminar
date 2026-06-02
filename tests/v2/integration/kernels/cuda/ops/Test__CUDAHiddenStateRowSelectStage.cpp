@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
 
@@ -92,6 +93,9 @@ TEST(Test__CUDAHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     params.seq_len = bucket_seq_len;
     params.d_model = d_model;
     HiddenStateRowSelectStage stage(params);
+    DeviceWorkspaceManager workspace(device, 1024);
+    ASSERT_TRUE(workspace.allocate(stage.getWorkspaceRequirements(bucket_seq_len, d_model, 0)));
+    stage.bindWorkspace(&workspace);
 
     cudaStream_t stream = nullptr;
     ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);

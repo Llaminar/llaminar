@@ -11,12 +11,14 @@
 
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "tensors/Tensors.h"
 #include "utils/PreparedWeightTestHarness.h"
 
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <string>
 #include <vector>
 
 using namespace llaminar2;
@@ -143,6 +145,21 @@ TEST(Test__HiddenStateRowSelectStage, CPUReplayParamsChangeSelectedRow)
     {
         EXPECT_FLOAT_EQ(scratch->data()[column], hidden->data()[static_cast<size_t>(3) * d_model + column]);
     }
+}
+
+TEST(Test__HiddenStateRowSelectStage, GPUWorkspaceRequirementsDeclareSelectedRowScalar)
+{
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 8;
+    params.d_model = 32;
+    HiddenStateRowSelectStage stage(params);
+
+    const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(8, 32, 0);
+    ASSERT_EQ(reqs.buffers.size(), 1u);
+    EXPECT_NE(reqs.buffers[0].name.find(HiddenStateRowSelectStage::WS_SELECTED_ROW_SCALAR), std::string::npos);
+    EXPECT_GE(reqs.buffers[0].size_bytes, sizeof(int));
+    EXPECT_TRUE(reqs.buffers[0].required);
 }
 
 TEST(Test__HiddenStateRowSelectStage, LMHeadUsesScratchOffsetZeroWhenSelectedRowChanges)

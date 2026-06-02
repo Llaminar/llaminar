@@ -73,6 +73,31 @@ namespace llaminar2::cuda
         }
     }
 
+    bool allocateRowSelectHostParam(
+        int device_ordinal,
+        int **host_selected_row)
+    {
+        if (!host_selected_row)
+            return false;
+
+        *host_selected_row = nullptr;
+
+        // Pin the host scalar so the captured cudaMemcpyAsync is legal and
+        // replays from a stable address without pageable-memory staging.
+        if (!ok(cudaSetDevice(device_ordinal)))
+            return false;
+        return ok(cudaHostAlloc(reinterpret_cast<void **>(host_selected_row), sizeof(int), cudaHostAllocDefault));
+    }
+
+    void freeRowSelectHostParam(
+        int device_ordinal,
+        int *host_selected_row)
+    {
+        cudaSetDevice(device_ordinal);
+        if (host_selected_row)
+            cudaFreeHost(host_selected_row);
+    }
+
     bool allocateRowSelectParam(
         int device_ordinal,
         int **host_selected_row,
@@ -84,15 +109,11 @@ namespace llaminar2::cuda
         *host_selected_row = nullptr;
         *device_selected_row = nullptr;
 
-        // Pin the host scalar so the captured cudaMemcpyAsync is legal and
-        // replays from a stable address without pageable-memory staging.
-        if (!ok(cudaSetDevice(device_ordinal)))
-            return false;
-        if (!ok(cudaHostAlloc(reinterpret_cast<void **>(host_selected_row), sizeof(int), cudaHostAllocDefault)))
+        if (!allocateRowSelectHostParam(device_ordinal, host_selected_row))
             return false;
         if (!ok(cudaMalloc(reinterpret_cast<void **>(device_selected_row), sizeof(int))))
         {
-            cudaFreeHost(*host_selected_row);
+            freeRowSelectHostParam(device_ordinal, *host_selected_row);
             *host_selected_row = nullptr;
             return false;
         }
@@ -107,8 +128,7 @@ namespace llaminar2::cuda
         cudaSetDevice(device_ordinal);
         if (device_selected_row)
             cudaFree(device_selected_row);
-        if (host_selected_row)
-            cudaFreeHost(host_selected_row);
+        freeRowSelectHostParam(device_ordinal, host_selected_row);
     }
 
     bool uploadRowSelectParam(

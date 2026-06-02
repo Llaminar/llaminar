@@ -9,6 +9,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
 
@@ -92,6 +93,9 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     params.seq_len = bucket_seq_len;
     params.d_model = d_model;
     HiddenStateRowSelectStage stage(params);
+    DeviceWorkspaceManager workspace(device, 1024);
+    ASSERT_TRUE(workspace.allocate(stage.getWorkspaceRequirements(bucket_seq_len, d_model, 0)));
+    stage.bindWorkspace(&workspace);
 
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
@@ -127,5 +131,38 @@ TEST(Test__ROCmHiddenStateRowSelectStage, CapturedGraphReplayUsesUpdatedSelected
     hipGraphExecDestroy(graph_exec);
     hipGraphDestroy(graph);
     hipStreamDestroy(stream);
+#endif
+}
+
+TEST(Test__ROCmHiddenStateRowSelectStage, GpuExecutionRequiresBoundWorkspace)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm support not compiled";
+#else
+    int device_count = 0;
+    hipGetDeviceCount(&device_count);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+    hipSetDevice(0);
+
+    const DeviceId device = DeviceId::rocm(0);
+    const int bucket_seq_len = 4;
+    const int d_model = 16;
+    auto hidden = makeHiddenStates(bucket_seq_len, d_model, device);
+    auto scratch = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(d_model)},
+        DeviceId::cpu());
+    scratch->ensureOnDevice(device);
+
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = device;
+    params.input = hidden.get();
+    params.output = scratch.get();
+    params.seq_len = bucket_seq_len;
+    params.d_model = d_model;
+    HiddenStateRowSelectStage stage(params);
+
+    stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{2, bucket_seq_len, 0});
+    EXPECT_FALSE(stage.execute(nullptr));
 #endif
 }

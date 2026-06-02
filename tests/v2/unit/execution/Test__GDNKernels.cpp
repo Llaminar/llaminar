@@ -32,6 +32,7 @@
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/IComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/cache/HybridCacheManager.h"
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
@@ -329,6 +330,19 @@ TEST(Test__GDNKernels, ShortConv_WorkspaceRequirementUsesActiveSeqLen)
     EXPECT_EQ(scratch->size_bytes,
               static_cast<size_t>(1536) * static_cast<size_t>(8192) * sizeof(float));
     EXPECT_TRUE(scratch->required);
+
+    const WorkspaceDescriptor *effective_len = nullptr;
+    for (const auto &buffer : reqs.buffers)
+    {
+        if (buffer.name.find(ShortConv1dStage::WS_EFFECTIVE_SEQ_LEN_SCALAR) != std::string::npos)
+        {
+            effective_len = &buffer;
+            break;
+        }
+    }
+    ASSERT_NE(effective_len, nullptr);
+    EXPECT_GE(effective_len->size_bytes, sizeof(int));
+    EXPECT_TRUE(effective_len->required);
 }
 
 TEST(Test__GDNKernels, Recurrence_WorkspaceRequirementSharesMergedQKVScratch)

@@ -11,18 +11,21 @@
  * ComputeGraph and updated by the forward execution engine on that graph's
  * execution thread.
  *
- * Lifecycle: GPU scalar buffers are lazily allocated during warmup execution and
- * reused for all later captures/replays. No allocations occur after warmup.
+ * Lifecycle: the device scalar is a declared graph workspace buffer. The stage
+ * owns only a pinned host scalar used as the captured H2D replay source.
  */
 
 #pragma once
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace llaminar2
 {
@@ -35,9 +38,11 @@ namespace llaminar2
      * updating PrefillReplayParams changes the pinned scalar that captured graph
      * replays read at launch time.
      */
-    class HiddenStateRowSelectStage : public IComputeStage
+    class HiddenStateRowSelectStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
+        static constexpr const char *WS_SELECTED_ROW_SCALAR = "hidden_row_select_selected_row_scalar";
+
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -70,6 +75,11 @@ namespace llaminar2
                        : CoherencePolicy::NONE;
         }
         bool hasPrefillReplayParams() const override { return true; }
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
 
         /**
          * @brief Update selected source row for fixed-bucket prefill replay.
@@ -87,8 +97,11 @@ namespace llaminar2
         Params params_;
         int selected_row_idx_ = 0;
         std::unique_ptr<GpuParamState> gpu_state_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        uint32_t workspace_slice_id_ = 0;
 
         int normalizeSelectedRow(int requested_row) const;
+        std::string selectedRowScalarBufferName() const;
         bool validateCommon(TensorBase **input_base, TensorBase **output_base);
         bool executeCPU(TensorBase *input_base, TensorBase *output_base);
         bool executeGPU(TensorBase *input_base, TensorBase *output_base);

@@ -27,11 +27,17 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 
 namespace llaminar2
 {
+    namespace
+    {
+        std::atomic<uint32_t> g_shortconv_workspace_slice_counter{0};
+    }
+
     struct ShortConv1dStage::GpuEffectiveSeqLenState
     {
         DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
@@ -40,7 +46,9 @@ namespace llaminar2
     };
 
     ShortConv1dStage::ShortConv1dStage(Params params)
-        : IComputeStage(params.device_id), params_(std::move(params))
+        : IComputeStage(params.device_id),
+          params_(std::move(params)),
+          workspace_slice_id_(g_shortconv_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
     }
 
@@ -59,6 +67,8 @@ namespace llaminar2
             return reqs;
 
         const int max_seq_len = std::max(1, m > 0 ? m : params_.seq_len);
+        if (max_seq_len > 1)
+            reqs.buffers.push_back({effectiveSeqLenScalarBufferName(), sizeof(int), alignof(int), true});
 
         const size_t bytes = static_cast<size_t>(max_seq_len) *
                              static_cast<size_t>(params_.channels) * sizeof(float);
@@ -69,6 +79,8 @@ namespace llaminar2
     void ShortConv1dStage::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
         bound_workspace_ = workspace;
+        if (gpu_effective_seq_len_state_)
+            gpu_effective_seq_len_state_->device_effective_seq_len = nullptr;
         bindKernelWorkspace();
     }
 
@@ -115,6 +127,11 @@ namespace llaminar2
                params_.kernel->supportsPaddedPrefillRealLength();
     }
 
+    std::string ShortConv1dStage::effectiveSeqLenScalarBufferName() const
+    {
+        return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + std::to_string(workspace_slice_id_);
+    }
+
     void ShortConv1dStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
     {
         prefill_replay_params_set_ = true;
@@ -131,35 +148,58 @@ namespace llaminar2
 
     bool ShortConv1dStage::ensureGpuEffectiveSeqLenStateInitialized()
     {
+        const std::string scalar_buffer = effectiveSeqLenScalarBufferName();
+        if (!bound_workspace_ ||
+            !bound_workspace_->hasBuffer(scalar_buffer) ||
+            bound_workspace_->getBufferSize(scalar_buffer) < sizeof(int))
+        {
+            LOG_ERROR("[ShortConv1dStage] Missing required graph workspace buffer '"
+                      << scalar_buffer << "' for effective sequence length on "
+                      << params_.device_id.toString());
+            return false;
+        }
+
+        auto *device_effective_seq_len =
+            static_cast<int *>(bound_workspace_->getBuffer(scalar_buffer));
+        if (!device_effective_seq_len)
+        {
+            LOG_ERROR("[ShortConv1dStage] Graph workspace buffer '"
+                      << scalar_buffer << "' resolved to null on "
+                      << params_.device_id.toString());
+            return false;
+        }
+
         if (gpu_effective_seq_len_state_)
+        {
+            gpu_effective_seq_len_state_->device_effective_seq_len = device_effective_seq_len;
             return true;
+        }
 
         auto state = std::make_unique<GpuEffectiveSeqLenState>();
         state->device = params_.device_id;
+        state->device_effective_seq_len = device_effective_seq_len;
 
         bool allocated = false;
         if (params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
-            allocated = cuda::allocateRowSelectParam(
+            allocated = cuda::allocateRowSelectHostParam(
                 params_.device_id.cuda_ordinal(),
-                &state->host_effective_seq_len,
-                &state->device_effective_seq_len);
+                &state->host_effective_seq_len);
 #endif
         }
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
-            allocated = rocm::allocateRowSelectParam(
+            allocated = rocm::allocateRowSelectHostParam(
                 params_.device_id.rocm_ordinal(),
-                &state->host_effective_seq_len,
-                &state->device_effective_seq_len);
+                &state->host_effective_seq_len);
 #endif
         }
 
         if (!allocated || !state->host_effective_seq_len || !state->device_effective_seq_len)
         {
-            LOG_ERROR("[ShortConv1dStage] Failed to allocate graph-captured effective length scalar on "
+            LOG_ERROR("[ShortConv1dStage] Failed to allocate pinned effective length replay scalar on "
                       << params_.device_id.toString());
             return false;
         }
@@ -210,19 +250,17 @@ namespace llaminar2
         if (gpu_effective_seq_len_state_->device.is_cuda())
         {
 #ifdef HAVE_CUDA
-            cuda::freeRowSelectParam(
+            cuda::freeRowSelectHostParam(
                 gpu_effective_seq_len_state_->device.cuda_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpu_effective_seq_len_state_->device_effective_seq_len);
+                gpu_effective_seq_len_state_->host_effective_seq_len);
 #endif
         }
         else if (gpu_effective_seq_len_state_->device.is_rocm())
         {
 #ifdef HAVE_ROCM
-            rocm::freeRowSelectParam(
+            rocm::freeRowSelectHostParam(
                 gpu_effective_seq_len_state_->device.rocm_ordinal(),
-                gpu_effective_seq_len_state_->host_effective_seq_len,
-                gpu_effective_seq_len_state_->device_effective_seq_len);
+                gpu_effective_seq_len_state_->host_effective_seq_len);
 #endif
         }
 

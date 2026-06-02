@@ -19,6 +19,23 @@ namespace llaminar2::cuda
 {
 
     /**
+     * @brief Allocate pinned host scalar storage for selected row.
+     *
+     * Device scalar storage should normally be graph workspace. This helper
+     * owns only the stable host replay source for captured H2D copies.
+     */
+    bool allocateRowSelectHostParam(
+        int device_ordinal,
+        int **host_selected_row);
+
+    /**
+     * @brief Free pinned host scalar storage allocated by allocateRowSelectHostParam().
+     */
+    void freeRowSelectHostParam(
+        int device_ordinal,
+        int *host_selected_row);
+
+    /**
      * @brief Allocate pinned host and device scalar storage for selected row.
      *
      * @param device_ordinal CUDA device ordinal that owns the device scalar.

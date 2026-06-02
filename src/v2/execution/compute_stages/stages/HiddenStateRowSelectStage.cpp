@@ -10,6 +10,8 @@
 
 #include "HiddenStateRowSelectStage.h"
 
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 
@@ -22,11 +24,17 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
 namespace llaminar2
 {
+    namespace
+    {
+        std::atomic<uint32_t> g_row_select_workspace_slice_counter{0};
+    }
+
     struct HiddenStateRowSelectStage::GpuParamState
     {
         DeviceId device = DeviceId::invalid(); ///< Device that owns device_selected_row.
@@ -35,7 +43,9 @@ namespace llaminar2
     };
 
     HiddenStateRowSelectStage::HiddenStateRowSelectStage(Params params)
-        : IComputeStage(params.device_id), params_(std::move(params))
+        : IComputeStage(params.device_id),
+          params_(std::move(params)),
+          workspace_slice_id_(g_row_select_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
     {
         selected_row_idx_ = normalizeSelectedRow(params_.selected_row_idx);
     }
@@ -52,6 +62,35 @@ namespace llaminar2
         if (requested_row < 0)
             return params_.seq_len - 1;
         return std::clamp(requested_row, 0, params_.seq_len - 1);
+    }
+
+    std::string HiddenStateRowSelectStage::selectedRowScalarBufferName() const
+    {
+        return std::string(WS_SELECTED_ROW_SCALAR) + "_" + std::to_string(workspace_slice_id_);
+    }
+
+    WorkspaceRequirements HiddenStateRowSelectStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        (void)m;
+        (void)n;
+        (void)k;
+
+        WorkspaceRequirements reqs;
+        if (params_.device_id.is_gpu())
+            reqs.buffers.push_back({selectedRowScalarBufferName(), sizeof(int), alignof(int), true});
+        return reqs;
+    }
+
+    void HiddenStateRowSelectStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        bound_workspace_ = workspace;
+        if (gpu_state_)
+            gpu_state_->device_selected_row = nullptr;
+    }
+
+    void HiddenStateRowSelectStage::unbindWorkspace()
+    {
+        bindWorkspace(nullptr);
     }
 
     void HiddenStateRowSelectStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
@@ -142,20 +181,44 @@ namespace llaminar2
 
     bool HiddenStateRowSelectStage::ensureGpuParamStateInitialized()
     {
+        const std::string scalar_buffer = selectedRowScalarBufferName();
+        if (!bound_workspace_ ||
+            !bound_workspace_->hasBuffer(scalar_buffer) ||
+            bound_workspace_->getBufferSize(scalar_buffer) < sizeof(int))
+        {
+            LOG_ERROR("[HiddenStateRowSelectStage] Missing required graph workspace buffer '"
+                      << scalar_buffer << "' for selected-row scalar on "
+                      << params_.device_id.toString());
+            return false;
+        }
+
+        auto *device_selected_row =
+            static_cast<int *>(bound_workspace_->getBuffer(scalar_buffer));
+        if (!device_selected_row)
+        {
+            LOG_ERROR("[HiddenStateRowSelectStage] Graph workspace buffer '"
+                      << scalar_buffer << "' resolved to null on "
+                      << params_.device_id.toString());
+            return false;
+        }
+
         if (gpu_state_)
+        {
+            gpu_state_->device_selected_row = device_selected_row;
             return true;
+        }
 
         auto state = std::make_unique<GpuParamState>();
         state->device = params_.device_id;
+        state->device_selected_row = device_selected_row;
 
         bool allocated = false;
         if (params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
-            allocated = cuda::allocateRowSelectParam(
+            allocated = cuda::allocateRowSelectHostParam(
                 params_.device_id.cuda_ordinal(),
-                &state->host_selected_row,
-                &state->device_selected_row);
+                &state->host_selected_row);
 #else
             allocated = false;
 #endif
@@ -163,10 +226,9 @@ namespace llaminar2
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
-            allocated = rocm::allocateRowSelectParam(
+            allocated = rocm::allocateRowSelectHostParam(
                 params_.device_id.rocm_ordinal(),
-                &state->host_selected_row,
-                &state->device_selected_row);
+                &state->host_selected_row);
 #else
             allocated = false;
 #endif
@@ -174,7 +236,7 @@ namespace llaminar2
 
         if (!allocated || !state->host_selected_row || !state->device_selected_row)
         {
-            LOG_ERROR("[HiddenStateRowSelectStage] Failed to allocate graph-captured selected-row scalar on "
+            LOG_ERROR("[HiddenStateRowSelectStage] Failed to allocate pinned selected-row replay scalar on "
                       << params_.device_id.toString());
             return false;
         }
@@ -262,19 +324,17 @@ namespace llaminar2
         if (gpu_state_->device.is_cuda())
         {
 #ifdef HAVE_CUDA
-            cuda::freeRowSelectParam(
+            cuda::freeRowSelectHostParam(
                 gpu_state_->device.cuda_ordinal(),
-                gpu_state_->host_selected_row,
-                gpu_state_->device_selected_row);
+                gpu_state_->host_selected_row);
 #endif
         }
         else if (gpu_state_->device.is_rocm())
         {
 #ifdef HAVE_ROCM
-            rocm::freeRowSelectParam(
+            rocm::freeRowSelectHostParam(
                 gpu_state_->device.rocm_ordinal(),
-                gpu_state_->host_selected_row,
-                gpu_state_->device_selected_row);
+                gpu_state_->host_selected_row);
 #endif
         }
 

@@ -259,6 +259,10 @@ Latest ROCm dense evidence:
     graph-capture workaround, but it is not the speedup lever: `main_verifier`
     still replays a 644-stage graph at about 97.95 ms per two-token verifier.
 - Phase 13.5 ROCm FP32 GDN alpha/beta batched SGEMM workspace slice:
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-fp32-hipblas-baseline-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-fp32-hipblas-baseline-c64-n8.csv`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-fp32-hipblas-mtp-c64-n8-bench.json`,
+  and `/tmp/llaminar-mtp-bench/dense-rocm-gdn-fp32-hipblas-mtp-c64-n8.csv`.
   - `ROCmFloatingPointGemmKernel` now exposes `IWorkspaceConsumer`
     requirements for hipBLAS batched SGEMM pointer arrays. The graph path
     supplies these through named `DeviceWorkspaceManager` buffers; the batched
@@ -274,6 +278,22 @@ Latest ROCm dense evidence:
     `Test__ROCmQuantisedGemmSmallM.GraphCapturedFusedQ4KGDNProjectionM2MatchesSeparate`,
     and
     `Test__ROCmQuantisedGemmSmallM.GraphCapturedFusedQ4KQwen36GDNQkvZPairM2UsesHeterogeneousNBatchedRoute`.
+  - Real Qwen3.6 dense ROCm `The quick brown fox`, `-c 64`, `-n 8`, GPU
+    graphs, and stage timing completed after the workspace-backed hipBLAS
+    route landed: same-binary baseline 21.70 tok/s; depth-1 MTP 24.70 tok/s,
+    with 16 draft steps, 12 accepted tokens, 4 rejected tokens, 4 rollbacks,
+    and 75% acceptance.
+  - Structured counters prove the FP32 batched route is active in the real
+    model: `kernel.rocm_fp32_batched_projection_calls` for `batch=2`,
+    `k=5120`, `n=48`, and `M=2/4`. The MTP run recorded `M=2` count 576
+    and `M=4` count 144.
+  - The paired diagnostic puts `forward_graph.main_verifier` segmented replay
+    at about 48.58 ms per two-token graph, `mtp.verifier_forward` at about
+    58.63 ms/call, `mtp.sidecar_forward` at about 2.83 ms/call, and
+    `mtp_decode_catchup` replay at about 0.38 ms/call. This is a useful
+    verifier win and a 1.14x same-binary speedup for the short prompt, but
+    still below the Phase 14 target; remaining work should keep attacking GDN
+    projection, generic GEMM, and fused Gate/Up buckets.
 - Phase 13.5 fused-SwiGLU/FFN down small-M ROCm route:
   `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-baseline-n16.json`,
   `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-mtp-n16.json`,

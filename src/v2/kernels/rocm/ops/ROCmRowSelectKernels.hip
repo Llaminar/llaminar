@@ -73,6 +73,31 @@ namespace llaminar2::rocm
         }
     }
 
+    bool allocateRowSelectHostParam(
+        int device_ordinal,
+        int **host_selected_row)
+    {
+        if (!host_selected_row)
+            return false;
+
+        *host_selected_row = nullptr;
+
+        // Pin the host scalar so the captured hipMemcpyAsync replays from a
+        // stable address and avoids pageable-memory staging inside capture.
+        if (!ok(hipSetDevice(device_ordinal)))
+            return false;
+        return ok(hipHostMalloc(reinterpret_cast<void **>(host_selected_row), sizeof(int), hipHostMallocDefault));
+    }
+
+    void freeRowSelectHostParam(
+        int device_ordinal,
+        int *host_selected_row)
+    {
+        hipSetDevice(device_ordinal);
+        if (host_selected_row)
+            hipHostFree(host_selected_row);
+    }
+
     bool allocateRowSelectParam(
         int device_ordinal,
         int **host_selected_row,
@@ -84,15 +109,11 @@ namespace llaminar2::rocm
         *host_selected_row = nullptr;
         *device_selected_row = nullptr;
 
-        // Pin the host scalar so the captured hipMemcpyAsync replays from a
-        // stable address and avoids pageable-memory staging inside capture.
-        if (!ok(hipSetDevice(device_ordinal)))
-            return false;
-        if (!ok(hipHostMalloc(reinterpret_cast<void **>(host_selected_row), sizeof(int), hipHostMallocDefault)))
+        if (!allocateRowSelectHostParam(device_ordinal, host_selected_row))
             return false;
         if (!ok(hipMalloc(reinterpret_cast<void **>(device_selected_row), sizeof(int))))
         {
-            hipHostFree(*host_selected_row);
+            freeRowSelectHostParam(device_ordinal, *host_selected_row);
             *host_selected_row = nullptr;
             return false;
         }
@@ -107,8 +128,7 @@ namespace llaminar2::rocm
         hipSetDevice(device_ordinal);
         if (device_selected_row)
             hipFree(device_selected_row);
-        if (host_selected_row)
-            hipHostFree(host_selected_row);
+        freeRowSelectHostParam(device_ordinal, host_selected_row);
     }
 
     bool uploadRowSelectParam(

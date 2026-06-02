@@ -22,8 +22,10 @@
 #include "../../../memory/BufferId.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 
 namespace llaminar2
 {
@@ -42,6 +44,7 @@ namespace llaminar2
     {
     public:
         static constexpr const char *WS_INPLACE_PREFILL_SCRATCH = "gdn_shortconv_inplace_scratch";
+        static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_shortconv_effective_seq_len_scalar";
 
         struct Params
         {
@@ -119,9 +122,11 @@ namespace llaminar2
         bool prefill_replay_params_set_ = false;
         std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        uint32_t workspace_slice_id_ = 0;
 
         int effectivePrefillSeqLen() const;
         bool shouldUseRealLengthContract() const;
+        std::string effectiveSeqLenScalarBufferName() const;
         bool ensureGpuEffectiveSeqLenStateInitialized();
         bool uploadGpuEffectiveSeqLen();
         void refreshPinnedEffectiveSeqLen();
