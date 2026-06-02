@@ -5950,6 +5950,11 @@ namespace llaminar2
         {
             return fail("missing_cache_or_bad_sequence");
         }
+        if (seq_idx >= static_cast<int>(state_.positions.size()) ||
+            seq_idx >= static_cast<int>(state_.sequence_lengths.size()))
+        {
+            return fail("missing_sequence_bookkeeping");
+        }
         if (verifier_row < 0 || target_cached_tokens < 0 ||
             target_cached_tokens > state_.kv_cache->max_seq_len())
         {
