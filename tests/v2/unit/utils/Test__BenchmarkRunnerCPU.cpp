@@ -355,6 +355,32 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeSucceedsWithDeviceArgmax)
         << "GPU decode phase must succeed";
 }
 
+TEST(Test__BenchmarkRunnerCPU, FailsBeforePrefillWhenPromptExceedsContext)
+{
+    auto runner = std::make_shared<MockCPUInferenceRunner>();
+    auto tokenizer = createMockTokenizer();
+    ON_CALL(*tokenizer, encode(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3, 4, 5, 6}));
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "This prompt intentionally does not fit";
+    config.max_seq_len = 4;
+    config.n_predict = 1;
+
+    auto result = bench.run(config);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.prefill_success);
+    EXPECT_EQ(result.prefill_tokens, 6);
+    EXPECT_EQ(runner->forwardCount(), 0)
+        << "BenchmarkRunner must reject an oversized prompt before prefill";
+    EXPECT_NE(result.failure_reason.find("benchmark prompt has 6 tokens"), std::string::npos);
+    EXPECT_NE(result.failure_reason.find("context length is 4"), std::string::npos);
+}
+
 TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
 {
     auto runner = std::make_shared<MockOrchestratedDecodeRunner>();

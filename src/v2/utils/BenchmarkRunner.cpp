@@ -668,6 +668,20 @@ namespace llaminar2
             last_failure_reason_ = "benchmark prompt tokenization failed";
             return capture_and_return(); // Return empty result on error
         }
+        result.prefill_tokens = token_count;
+
+        if (config.max_seq_len > 0 && token_count > config.max_seq_len)
+        {
+            last_failure_reason_ =
+                "benchmark prompt has " + std::to_string(token_count) +
+                " tokens but context length is " + std::to_string(config.max_seq_len) +
+                "; pass a shorter -p/--prompt or increase -c/--context-length";
+            if (mpi_ctx_->rank() == 0)
+            {
+                LOG_ERROR(last_failure_reason_);
+            }
+            return capture_and_return();
+        }
 
         // Broadcast tokens to all ranks
         if (mpi_ctx_->rank() != 0)
@@ -676,8 +690,6 @@ namespace llaminar2
         }
         if (mpi_ctx_->world_size() > 1)
             mpi_ctx_->broadcast_int32(tokens.data(), token_count, 0);
-
-        result.prefill_tokens = token_count;
 
         // Determine number of decode tokens
         // -1 means "use default" (128 for benchmark)
