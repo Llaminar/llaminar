@@ -1666,6 +1666,92 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM4MatchesS
     PerfStatsCollector::reset();
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2UsesHeterogeneousNBatchedRoute)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    runFusedProjectionGroupSmallMMatchesSeparate(
+        "Q4_K native-VNNI Qwen3.6 GDN qkv/z heterogeneous-N pair",
+        2,
+        5120,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.9999f,
+        {10240, 6144},
+        true,
+        true,
+        4);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    double batched_calls = 0.0;
+    double heterogeneous_n_bypasses = 0.0;
+    double shared_quant_calls = 0.0;
+    double batched_projection_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            batched_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_bypasses" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("reason") != 0 &&
+            record.tags.at("reason") == "heterogeneous_n_pair" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            heterogeneous_n_bypasses += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_fused_small_m_shared_quant_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            shared_quant_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120")
+        {
+            batched_projection_calls += record.value;
+        }
+    }
+
+    EXPECT_GE(batched_calls, 1.0)
+        << "Real Qwen3.6 GDN qkv/z should use the graph-captured heterogeneous-N batched route";
+    EXPECT_EQ(heterogeneous_n_bypasses, 0.0)
+        << "The heterogeneous-N qkv/z shape should be handled by the generic batched kernel, not bypassed";
+    EXPECT_GE(shared_quant_calls, 1.0)
+        << "The batched qkv/z subgroup should quantize activations once";
+    EXPECT_GE(batched_projection_calls, 2.0)
+        << "The batched qkv/z subgroup should cover both heterogeneous-N projection payloads";
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjectionM4BypassesBatchedRoute)
 {
     if (!hasROCmDevice())

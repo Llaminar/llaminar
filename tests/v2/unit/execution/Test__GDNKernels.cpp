@@ -394,12 +394,17 @@ template <int Tag>
 class CountingProjectionGemm : public ITensorGemm
 {
 public:
-    explicit CountingProjectionGemm(float fill_value)
-        : fill_value_(fill_value)
+    explicit CountingProjectionGemm(float fill_value,
+                                    bool supports_fused = false,
+                                    bool fused_success = false)
+        : fill_value_(fill_value),
+          supports_fused_(supports_fused),
+          fused_success_(fused_success)
     {
     }
 
     bool supports_device(int) const override { return true; }
+    bool supports_fused_projection() const override { return supports_fused_; }
 
     bool multiply_tensor(
         const TensorBase *,
@@ -429,21 +434,39 @@ public:
 
     bool multiply_fused_tensor(
         const TensorBase *,
-        const std::vector<TensorProjectionDesc> &,
-        int,
+        const std::vector<TensorProjectionDesc> &projections,
+        int m,
         int,
         const IMPIContext * = nullptr,
         DeviceWorkspaceManager * = nullptr) override
     {
         ++fused_calls;
-        return false;
+        fused_projection_count += static_cast<int>(projections.size());
+        if (!fused_success_)
+            return false;
+
+        for (const auto &projection : projections)
+        {
+            auto *typed_kernel = dynamic_cast<CountingProjectionGemm<Tag> *>(projection.kernel);
+            auto *output = dynamic_cast<FP32Tensor *>(projection.output);
+            if (!typed_kernel || !output)
+                return false;
+
+            float *values = output->mutable_data();
+            for (int i = 0; i < m * projection.n; ++i)
+                values[i] = typed_kernel->fill_value_;
+        }
+        return true;
     }
 
     int multiply_calls = 0;
     int fused_calls = 0;
+    int fused_projection_count = 0;
 
 private:
     float fill_value_;
+    bool supports_fused_ = false;
+    bool fused_success_ = false;
 };
 
 // ============================================================================
@@ -586,6 +609,114 @@ TEST(Test__GDNKernels, Projection_MixedKernelTypesUsePerProjectionFallback)
     EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
     EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
     EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+}
+
+TEST(Test__GDNKernels, Projection_MixedKernelTypesFuseSupportedSubgroups)
+{
+    auto ctx = makeCPUContext();
+
+    auto input = makeFP32Seq({2, 3});
+    auto w_qkv = makeFP32({3, 4});
+    auto out_qkv = makeFP32({2, 4});
+    auto w_z = makeFP32({3, 2});
+    auto out_z = makeFP32({2, 2});
+    auto w_a = makeFP32({3, 1});
+    auto out_a = makeFP32({2, 1});
+    auto w_b = makeFP32({3, 1});
+    auto out_b = makeFP32({2, 1});
+
+    CountingProjectionGemm<0> qkv_gemm(1.0f, true, true);
+    CountingProjectionGemm<0> z_gemm(2.0f, true, true);
+    CountingProjectionGemm<1> a_gemm(3.0f);
+    CountingProjectionGemm<1> b_gemm(4.0f);
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = 2;
+    p.k = 3;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = 4;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = 2;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = 1;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = 1;
+    p.gemm_qkv = &qkv_gemm;
+    p.gemm_z = &z_gemm;
+    p.gemm_a = &a_gemm;
+    p.gemm_b = &b_gemm;
+
+    GDNProjectionStage stage(p);
+    EXPECT_TRUE(stage.execute(ctx.get()));
+
+    EXPECT_EQ(qkv_gemm.fused_calls, 1);
+    EXPECT_EQ(qkv_gemm.fused_projection_count, 2);
+    EXPECT_EQ(z_gemm.fused_calls, 0);
+    EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+    EXPECT_EQ(z_gemm.multiply_calls, 0);
+    EXPECT_EQ(a_gemm.multiply_calls, 1);
+    EXPECT_EQ(b_gemm.multiply_calls, 1);
+
+    EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
+    EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
+    EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+}
+
+TEST(Test__GDNKernels, Projection_FusedSubgroupFailureHardFails)
+{
+    auto ctx = makeCPUContext();
+
+    auto input = makeFP32Seq({2, 3});
+    auto w_qkv = makeFP32({3, 4});
+    auto out_qkv = makeFP32({2, 4});
+    auto w_z = makeFP32({3, 2});
+    auto out_z = makeFP32({2, 2});
+    auto w_a = makeFP32({3, 1});
+    auto out_a = makeFP32({2, 1});
+    auto w_b = makeFP32({3, 1});
+    auto out_b = makeFP32({2, 1});
+
+    CountingProjectionGemm<0> qkv_gemm(1.0f, true, false);
+    CountingProjectionGemm<0> z_gemm(2.0f, true, false);
+    CountingProjectionGemm<1> a_gemm(3.0f);
+    CountingProjectionGemm<1> b_gemm(4.0f);
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = 2;
+    p.k = 3;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = 4;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = 2;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = 1;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = 1;
+    p.gemm_qkv = &qkv_gemm;
+    p.gemm_z = &z_gemm;
+    p.gemm_a = &a_gemm;
+    p.gemm_b = &b_gemm;
+
+    GDNProjectionStage stage(p);
+    EXPECT_FALSE(stage.execute(ctx.get()));
+
+    EXPECT_EQ(qkv_gemm.fused_calls, 1);
+    EXPECT_EQ(qkv_gemm.fused_projection_count, 2);
+    EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+    EXPECT_EQ(z_gemm.multiply_calls, 0);
+    EXPECT_EQ(a_gemm.multiply_calls, 0);
+    EXPECT_EQ(b_gemm.multiply_calls, 0);
 }
 
 TEST(Test__GDNKernels, Projection_Qwen36NodeLocalTPPrefillShapeResolvesPreparedMixedFallback)

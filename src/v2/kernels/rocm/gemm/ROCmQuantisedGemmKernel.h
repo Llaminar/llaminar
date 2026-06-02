@@ -479,6 +479,8 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
+            bool supports_fused_projection() const override { return true; }
+
             /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *

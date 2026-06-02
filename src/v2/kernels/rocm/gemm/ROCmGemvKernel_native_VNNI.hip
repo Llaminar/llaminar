@@ -3650,14 +3650,28 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         true,
         num_projections);
 
+    bool all_n_equal = true;
+    for (int p = 1; p < num_projections; ++p)
+        all_n_equal = all_n_equal && (args.N[p] == args.N[0]);
+
     dim3 block(THREADS, 1, 1);
     dim3 grid(args.total_grid_n, kb, 1);
     if constexpr (SMALL_M == 2 && (FMT == NVNNI_Q4_0 || FMT == NVNNI_Q4_1))
     {
-        hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(gemv_native_vnni_q4_m2_batched_kernel_t<TN, CPT, FMT>),
-            grid, block, 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_scale_A_blockwise, args, K, kb);
+        if (all_n_equal)
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_q4_m2_batched_kernel_t<TN, CPT, FMT>),
+                grid, block, 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_scale_A_blockwise, args, K, kb);
+        }
+        else
+        {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_kernel_t<TN, CPT, SMALL_M, FMT>),
+                grid, block, 0, static_cast<hipStream_t>(stream),
+                d_A_int8, d_scale_A_blockwise, args, K, kb);
+        }
     }
     else
     {

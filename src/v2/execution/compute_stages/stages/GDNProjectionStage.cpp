@@ -54,6 +54,17 @@ namespace llaminar2
             }
             return true;
         }
+
+        std::vector<ITensorGemm::TensorProjectionDesc> selectProjections(
+            const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
+            const std::vector<size_t> &indices)
+        {
+            std::vector<ITensorGemm::TensorProjectionDesc> selected;
+            selected.reserve(indices.size());
+            for (size_t index : indices)
+                selected.push_back(projections[index]);
+            return selected;
+        }
     } // namespace
 
     GDNProjectionStage::GDNProjectionStage(Params params)
@@ -210,15 +221,64 @@ namespace llaminar2
         {
             success = gemm_qkv->multiply_fused_tensor(A_base, projections, M, K, nullptr, bound_workspace_);
             if (!success)
-                LOG_WARN("[GDNProjectionStage] Fused 4-projection GEMM failed; retrying per-projection fallback");
+            {
+                LOG_ERROR("[GDNProjectionStage] Fused 4-projection GEMM failed");
+                return false;
+            }
         }
         else
         {
-            LOG_DEBUG("[GDNProjectionStage] Mixed projection GEMM kernels; using per-projection fallback");
-        }
+            LOG_DEBUG("[GDNProjectionStage] Mixed projection GEMM kernels; trying supported fused subgroups");
 
-        if (!success)
-            success = multiplyProjectionFallback(A_base, projections, M, K, bound_workspace_);
+            std::vector<bool> completed(projections.size(), false);
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                if (completed[i] || !projections[i].kernel ||
+                    !projections[i].kernel->supports_fused_projection())
+                {
+                    continue;
+                }
+
+                std::vector<size_t> group_indices;
+                group_indices.push_back(i);
+                for (size_t j = i + 1; j < projections.size(); ++j)
+                {
+                    if (!completed[j] && projections[j].kernel &&
+                        projections[j].kernel->supports_fused_projection() &&
+                        sameKernelType(projections[i].kernel, projections[j].kernel))
+                    {
+                        group_indices.push_back(j);
+                    }
+                }
+
+                if (group_indices.size() < 2)
+                    continue;
+
+                auto group = selectProjections(projections, group_indices);
+                if (!group.front().kernel->multiply_fused_tensor(
+                        A_base, group, M, K, nullptr, bound_workspace_))
+                {
+                    LOG_ERROR("[GDNProjectionStage] Fused projection subgroup failed for "
+                              << (group.front().name ? group.front().name : "unnamed")
+                              << " group_size=" << group.size());
+                    return false;
+                }
+
+                for (size_t index : group_indices)
+                    completed[index] = true;
+            }
+
+            std::vector<ITensorGemm::TensorProjectionDesc> remaining;
+            remaining.reserve(projections.size());
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                if (!completed[i])
+                    remaining.push_back(projections[i]);
+            }
+
+            success = remaining.empty() ||
+                      multiplyProjectionFallback(A_base, remaining, M, K, bound_workspace_);
+        }
 
         if (!success)
         {
