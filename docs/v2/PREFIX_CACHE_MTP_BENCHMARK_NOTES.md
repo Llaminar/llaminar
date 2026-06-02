@@ -172,6 +172,21 @@ Latest graph-atomic small-M hardening validation:
   tok/s short result and identifies the current main-verifier GPU budget:
   `GDN_PROJECTION` about 20.86 ms per recorded verifier pass, ordinary
   `GEMM` about 14.89 ms, and `GEMM_FUSED_GATE_UP` about 11.64 ms.
+- Current route-counter diagnostic after the verifier-row and MoE replay
+  preservation slices:
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-route-mtp-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-route-mtp-c64-n8-stats.json`,
+  and `/tmp/llaminar-mtp-bench/dense-rocm-current-route-mtp-c64-n8-stats.csv`.
+  This used `rocm:1`, GPU graphs, stage timing, `kernel` counters,
+  `The quick brown fox`, `-c 64`, `-n 8`, and depth-1 MTP. It reached
+  26.63 tok/s with 75% acceptance. The stage budget remained dominated by
+  `GDN_PROJECTION` at about 21.04 ms per recorded verifier pass, `GEMM` at
+  about 15.13 ms, and `GEMM_FUSED_GATE_UP` at about 11.97 ms. Kernel counters
+  prove the hot verifier projections are on the intended graph-native small-M
+  routes: fused-SwiGLU down uses `source=fused_swiglu`, GDN projection groups
+  use batched/shared-quant routes where codebook-compatible, mixed-codebook
+  groups record explicit bypasses, and no hidden fallback explains the
+  remaining budget.
 - Same short-prompt comparator artifacts:
   baseline `/tmp/llaminar-mtp-bench/dense-rocm-graphdirect-baseline-c64-n8-bench.json`
   at 21.42 decode tok/s and old direct-MTP hardening
