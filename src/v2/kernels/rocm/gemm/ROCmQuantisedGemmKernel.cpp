@@ -397,6 +397,22 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
+            bool rocmGemv_native_vnni_small_m_batched_mixed_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *const *d_payloads,
+                const uint16_t *const *d_block_scales,
+                const uint16_t *const *d_block_mins,
+                const uint32_t *const *d_block_emins,
+                const float *const *d_biases,
+                float *const *d_outputs,
+                const float *d_scale_A_blockwise, // [M × blocks_per_row]
+                float *const *d_partials,         // per-projection [KB_MAX × M × N]
+                const int *Ns,
+                const uint8_t *codebook_ids,
+                int num_projections,
+                int M, int K,
+                int device_id, void *stream);
+
             // =========================================================================
             // Fused FP32→INT8 quantize + GEMV + scale kernel for decode (M=1)
             // Eliminates 3-kernel pipeline: quantize → GEMV → applyScaling
@@ -3827,11 +3843,13 @@ namespace llaminar2
                 std::array<float *, 8> partials{};
                 std::array<const float *, 8> biases{};
                 std::array<int, 8> Ns{};
+                std::array<uint8_t, 8> codebooks{};
 
                 bool batched_eligible = true;
                 std::string batched_bypass_reason;
                 uint8_t common_codebook = 0;
                 bool have_common_codebook = false;
+                bool mixed_codebooks = false;
 
                 auto mark_batched_bypass = [&](std::string reason)
                 {
@@ -3900,8 +3918,7 @@ namespace llaminar2
                     }
                     else if (common_codebook != codebook)
                     {
-                        mark_batched_bypass("mixed_codebook");
-                        break;
+                        mixed_codebooks = true;
                     }
 
                     float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
@@ -3957,6 +3974,7 @@ namespace llaminar2
                     partials[i] = nullptr;
                     biases[i] = d_bias;
                     Ns[i] = proj.n;
+                    codebooks[i] = codebook;
 
                     LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M batched projection "
                               << i
@@ -4044,27 +4062,45 @@ namespace llaminar2
                                   << " n=" << Ns[i]);
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_batched_fp32(
-                            impl_->d_A_int8,
-                            payloads.data(),
-                            scales.data(),
-                            mins.data(),
-                            emins.data(),
-                            biases.data(),
-                            outputs.data(),
-                            impl_->d_scales_A_blockwise,
-                            partials.data(),
-                            Ns.data(),
-                            static_cast<int>(projections.size()),
-                            m, k,
-                            common_codebook,
-                            rocm_device_id_,
-                            gpu_stream_))
+                    const bool gemv_ok = mixed_codebooks
+                        ? rocmGemv_native_vnni_small_m_batched_mixed_fp32(
+                              impl_->d_A_int8,
+                              payloads.data(),
+                              scales.data(),
+                              mins.data(),
+                              emins.data(),
+                              biases.data(),
+                              outputs.data(),
+                              impl_->d_scales_A_blockwise,
+                              partials.data(),
+                              Ns.data(),
+                              codebooks.data(),
+                              static_cast<int>(projections.size()),
+                              m, k,
+                              rocm_device_id_,
+                              gpu_stream_)
+                        : rocmGemv_native_vnni_small_m_batched_fp32(
+                              impl_->d_A_int8,
+                              payloads.data(),
+                              scales.data(),
+                              mins.data(),
+                              emins.data(),
+                              biases.data(),
+                              outputs.data(),
+                              impl_->d_scales_A_blockwise,
+                              partials.data(),
+                              Ns.data(),
+                              static_cast<int>(projections.size()),
+                              m, k,
+                              common_codebook,
+                              rocm_device_id_,
+                              gpu_stream_);
+                    if (!gemv_ok)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M batched GEMV failed"
                                   << " m=" << m << " k=" << k
                                   << " projections=" << projections.size()
-                                  << " codebook=" << static_cast<int>(common_codebook));
+                                  << " codebook=" << (mixed_codebooks ? std::string("mixed") : std::to_string(static_cast<int>(common_codebook))));
                         return false;
                     }
 
@@ -4078,12 +4114,27 @@ namespace llaminar2
                             "rocm:" + std::to_string(rocm_device_id_),
                             PerfStatsCollector::Tags{
                                 {"m", std::to_string(m)},
-                                {"codebook", std::to_string(static_cast<int>(common_codebook))},
+                                {"codebook", mixed_codebooks ? std::string("mixed") : std::to_string(static_cast<int>(common_codebook))},
                                 {"k", std::to_string(k)},
                                 {"projections", std::to_string(projections.size())}});
 
-                        for (const int n_value : Ns)
+                        if (mixed_codebooks)
                         {
+                            PerfStatsCollector::addCounter(
+                                "kernel",
+                                "rocm_native_vnni_small_m_batched_mixed_calls",
+                                1.0,
+                                "gemm",
+                                "rocm:" + std::to_string(rocm_device_id_),
+                                PerfStatsCollector::Tags{
+                                    {"m", std::to_string(m)},
+                                    {"k", std::to_string(k)},
+                                    {"projections", std::to_string(projections.size())}});
+                        }
+
+                        for (size_t projection_index = 0; projection_index < projections.size(); ++projection_index)
+                        {
+                            const int n_value = Ns[projection_index];
                             if (n_value <= 0)
                                 continue;
                             PerfStatsCollector::addCounter(
@@ -4094,7 +4145,7 @@ namespace llaminar2
                                 "rocm:" + std::to_string(rocm_device_id_),
                                 PerfStatsCollector::Tags{
                                     {"m", std::to_string(m)},
-                                    {"codebook", std::to_string(static_cast<int>(common_codebook))},
+                                    {"codebook", std::to_string(static_cast<int>(codebooks[projection_index]))},
                                     {"n", std::to_string(n_value)},
                                     {"k", std::to_string(k)}});
                         }

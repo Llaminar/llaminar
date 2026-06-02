@@ -1225,7 +1225,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDown
     EXPECT_GE(graph_atomic_launches, 1.0)
         << "GPU-graph Qwen3.6 small-M FFN down must use graph-capturable atomic K-partitioning";
     EXPECT_EQ(graph_split_reduce_launches, 0.0)
-        << "GPU-graph small-M split-reduce has caused real-model ROCm HSA faults";
+        << "GPU-graph small-M split/reduce is graph-safe in focused tests but slower on real Qwen3.6";
 
     PerfStatsCollector::reset();
 }
@@ -2096,12 +2096,12 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KQwen36GDNQkvZPairM2Uses
     EXPECT_GE(graph_atomic_launches, 1.0)
         << "GPU-graph Qwen3.6 batched GDN qkv/z small-M route must use graph-capturable atomic K-partitioning";
     EXPECT_EQ(graph_split_reduce_launches, 0.0)
-        << "GPU-graph batched small-M split-reduce has caused real-model ROCm HSA faults";
+        << "GPU-graph batched small-M split/reduce is graph-safe in focused tests but slower on real Qwen3.6";
 
     PerfStatsCollector::reset();
 }
 
-TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjectionM4BypassesBatchedRoute)
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjectionM4UsesMixedBatchedRoute)
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
@@ -2130,7 +2130,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
         4);
 
     const auto records = PerfStatsCollector::snapshot({"kernel"});
-    double subgroup_batched_calls = 0.0;
+    double mixed_batched_calls = 0.0;
     double full_mixed_bypasses = 0.0;
     for (const auto &record : records)
     {
@@ -2142,10 +2142,23 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
             record.tags.count("k") != 0 &&
             record.tags.at("k") == "5120" &&
             record.tags.count("projections") != 0 &&
-            record.tags.at("projections") == "2" &&
-            record.tags.count("codebook") != 0)
+            record.tags.at("projections") == "4" &&
+            record.tags.count("codebook") != 0 &&
+            record.tags.at("codebook") == "mixed")
         {
-            subgroup_batched_calls += record.value;
+            mixed_batched_calls += record.value;
+        }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_mixed_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "4" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "4")
+        {
+            mixed_batched_calls += record.value;
         }
         if (record.domain == "kernel" &&
             record.name == "rocm_native_vnni_small_m_batched_bypasses" &&
@@ -2159,13 +2172,10 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedMixedCodebookGDNProjection
         }
     }
 
-    EXPECT_EQ(subgroup_batched_calls, 0.0)
-        << "Mixed-codebook GDN subgroup batching caused a real Qwen3.6 ROCm HSA fault; "
-           "keep this path on the known-safe per-projection route until the lower-level "
-           "batched launcher is fixed for mixed groups";
-    EXPECT_GE(full_mixed_bypasses, 1.0)
-        << "Mixed-codebook GDN groups must record an explicit bypass before falling back "
-           "to per-projection graph-native small-M GEMV";
+    EXPECT_GE(mixed_batched_calls, 1.0)
+        << "Mixed-codebook GDN groups should use the graph-capturable mixed native small-M batched route";
+    EXPECT_EQ(full_mixed_bypasses, 0.0)
+        << "Mixed-codebook GDN groups should no longer bypass to per-projection small-M GEMV";
 
     PerfStatsCollector::reset();
 }
@@ -2197,6 +2207,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM
     const auto records = PerfStatsCollector::snapshot({"kernel"});
     double mixed_bypasses = 0.0;
     double batched_calls = 0.0;
+    double mixed_batched_calls = 0.0;
     for (const auto &record : records)
     {
         if (record.domain == "kernel" &&
@@ -2217,16 +2228,30 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedMixedCodebookQwen36GDNQkvZPairM
             record.tags.count("m") != 0 &&
             record.tags.at("m") == "4" &&
             record.tags.count("projections") != 0 &&
-            record.tags.at("projections") == "2")
+            record.tags.at("projections") == "2" &&
+            record.tags.count("codebook") != 0 &&
+            record.tags.at("codebook") == "mixed")
         {
             batched_calls += record.value;
         }
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_mixed_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "4" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            mixed_batched_calls += record.value;
+        }
     }
 
-    EXPECT_GE(mixed_bypasses, 1.0)
-        << "Mixed-codebook Qwen3.6 qkv/z M=4 must take the explicit per-projection route";
-    EXPECT_EQ(batched_calls, 0.0)
-        << "Mixed-codebook Qwen3.6 qkv/z M=4 must not enter the batched route";
+    EXPECT_EQ(mixed_bypasses, 0.0)
+        << "Mixed-codebook Qwen3.6 qkv/z M=4 should no longer bypass the batched route";
+    EXPECT_GE(batched_calls, 1.0)
+        << "Mixed-codebook Qwen3.6 qkv/z M=4 must enter the mixed batched route";
+    EXPECT_GE(mixed_batched_calls, 1.0)
+        << "Mixed-codebook Qwen3.6 qkv/z M=4 must record the mixed route counter";
 
     PerfStatsCollector::reset();
 }
@@ -2322,7 +2347,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedSingleProjectionQ4KFFNDownM2Hon
     ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
 
     EXPECT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K))
-        << "Graph-captured forced KB=2 should use atomic K-partitioning, not split-reduce replay";
+        << "Graph-captured forced KB=2 should use atomic K-partitioning, not split/reduce replay";
 
 #ifdef HAVE_ROCM
     EXPECT_EQ(hipDeviceSynchronize(), hipSuccess);
@@ -2362,7 +2387,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedSingleProjectionQ4KFFNDownM2Hon
     EXPECT_GE(atomic_launches, 1.0)
         << "Graph-captured KB override should be honored by the atomic route";
     EXPECT_EQ(split_reduce_launches, 0.0)
-        << "Graph-captured KB override must not re-enable split-reduce replay";
+        << "Graph-captured KB override must not re-enable split/reduce replay";
 
     PerfStatsCollector::reset();
     kernel.unbindWorkspace();
