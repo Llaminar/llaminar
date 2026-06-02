@@ -1012,6 +1012,7 @@ namespace llaminar2
             if (forward_engine_)
                 forward_engine_->clearCache();
             mtp_sidecar_depth0_cache_.invalidate();
+            mtp_sidecar_depth0_chained_cache_.invalidate();
             mtp_sidecar_depth0_kv_only_cache_.invalidate();
             mtp_terminal_hidden_row_select_cache_.invalidate();
             for (auto &cache : layer_graph_cache_)
@@ -2335,6 +2336,7 @@ namespace llaminar2
         if (forward_engine_)
             forward_engine_->clearCache();
         mtp_sidecar_depth0_cache_.invalidate();
+        mtp_sidecar_depth0_chained_cache_.invalidate();
         mtp_sidecar_depth0_kv_only_cache_.invalidate();
         mtp_terminal_hidden_row_select_cache_.invalidate();
 
@@ -3483,7 +3485,8 @@ namespace llaminar2
         TensorBase *terminal_hidden,
         int position_id,
         const char *sidecar_perf_context,
-        bool kv_cache_only)
+        bool kv_cache_only,
+        BufferId terminal_hidden_buffer_id)
     {
         const std::string device_key = state_.device_id.toString();
         const std::string phase = perfPhaseName();
@@ -3601,6 +3604,7 @@ namespace llaminar2
         input.batch_size = 1;
         input.seq_len = 1;
         input.device = state_.device_id;
+        input.terminal_hidden_buffer_id = terminal_hidden_buffer_id;
         input.kv_cache_only = kv_cache_only;
 
         MTPForwardOutput output;
@@ -3630,7 +3634,9 @@ namespace llaminar2
 
         auto &sidecar_cache = kv_cache_only
             ? mtp_sidecar_depth0_kv_only_cache_
-            : mtp_sidecar_depth0_cache_;
+            : (terminal_hidden_buffer_id == BufferId::MTP_HIDDEN
+                   ? mtp_sidecar_depth0_chained_cache_
+                   : mtp_sidecar_depth0_cache_);
         const bool needs_graph_rebuild =
             !sidecar_cache.valid ||
             !sidecar_cache.graph ||
@@ -3997,6 +4003,36 @@ namespace llaminar2
             "mtp_decode_sidecar");
     }
 
+    bool DeviceGraphOrchestrator::forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+        if (position_id < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Chained MTP sidecar requires a non-negative position_id");
+            return false;
+        }
+
+        auto it = state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+        TensorBase *mtp_hidden =
+            (it == state_.extension_buffers.end() || !it->second) ? nullptr : it->second.get();
+        if (!mtp_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Chained MTP sidecar requires previous MTP hidden state");
+            return false;
+        }
+
+        return executeMTPDepth0(
+            draft_condition_token,
+            mtp_hidden,
+            position_id,
+            "mtp_decode_sidecar_chain",
+            false,
+            BufferId::MTP_HIDDEN);
+    }
+
     bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromLastForward(
         const int32_t *tokens,
         int token_count,
@@ -4044,9 +4080,35 @@ namespace llaminar2
 
         const int expected_cached_tokens =
             std::max(0, position_offset - 1 + already_appended_tokens);
-        const int current_cached_tokens =
+        int current_cached_tokens =
             cache->get_cached_tokens(cache->first_layer_index(), 0);
-        if (current_cached_tokens != expected_cached_tokens)
+        if (current_cached_tokens > expected_cached_tokens)
+        {
+            const int configured_draft_tokens =
+                graph_builder_ ? std::max(1, graph_builder_->config().mtp.draft_tokens) : 1;
+            if (configured_draft_tokens <= 1)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit cache has unexpected extra rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens
+                          << " position_offset=" << position_offset
+                          << " already_appended=" << already_appended_tokens);
+                return false;
+            }
+            if (!cache->truncateSequence(0, expected_cached_tokens))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit failed to discard speculative rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens);
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "speculative_shifted_rows_discarded",
+                static_cast<double>(current_cached_tokens - expected_cached_tokens),
+                perfPhaseName(),
+                state_.device_id.toString());
+            current_cached_tokens = expected_cached_tokens;
+        }
+        if (current_cached_tokens < expected_cached_tokens)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit cache mismatch: current="
                       << current_cached_tokens << " expected=" << expected_cached_tokens
@@ -5521,6 +5583,7 @@ namespace llaminar2
             if (forward_engine_)
                 forward_engine_->resetCapturedReplayState();
             mtp_sidecar_depth0_cache_.resetReplayState();
+            mtp_sidecar_depth0_chained_cache_.resetReplayState();
             mtp_sidecar_depth0_kv_only_cache_.resetReplayState();
         };
 
@@ -5788,6 +5851,7 @@ namespace llaminar2
         if (forward_engine_)
             forward_engine_->resetCapturedReplayState();
         mtp_sidecar_depth0_cache_.resetReplayState();
+        mtp_sidecar_depth0_chained_cache_.resetReplayState();
         mtp_sidecar_depth0_kv_only_cache_.resetReplayState();
         return true;
     }
@@ -5971,6 +6035,7 @@ namespace llaminar2
         if (forward_engine_)
             forward_engine_->clearCache();
         mtp_sidecar_depth0_cache_.invalidate();
+        mtp_sidecar_depth0_chained_cache_.invalidate();
         mtp_sidecar_depth0_kv_only_cache_.invalidate();
         mtp_terminal_hidden_row_select_cache_.invalidate();
 

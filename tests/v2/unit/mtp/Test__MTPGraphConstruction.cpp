@@ -2002,6 +2002,79 @@ TEST(Test__MTPGraphConstruction, CPUForwardUpdatesShiftedMTPCacheProbe)
                             [](int value) { return value == 0; }));
 }
 
+TEST(Test__MTPGraphConstruction, ChainedSidecarCommitDiscardsSpeculativeShiftedRows)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.draft_tokens = 2;
+
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::vector<int> prefix_tokens = {1, 2, 3, 4};
+    ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
+
+    const auto after_prefill = orchestrator.prefixStateProbe();
+    EXPECT_EQ(maxCachedTokens(after_prefill.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
+
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/5));
+    ASSERT_TRUE(orchestrator.forwardMTPFromLastDraft(
+        /*draft_condition_token=*/6,
+        orchestrator.get_position() + 1));
+
+    const auto after_chained_sidecars = orchestrator.prefixStateProbe();
+    EXPECT_GT(maxCachedTokens(after_chained_sidecars.mtp_kv_caches),
+              static_cast<int>(prefix_tokens.size()));
+
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    const std::vector<int> verify_tokens = {5, 6, 7};
+    ASSERT_NE(orchestrator.forward(verify_tokens.data(), static_cast<int>(verify_tokens.size()), 1), nullptr);
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+
+    const std::vector<int32_t> accepted_tokens = {5, 6, 7};
+    ASSERT_TRUE(orchestrator.commitMTPShiftedRowsFromLastForward(
+        accepted_tokens.data(),
+        static_cast<int>(accepted_tokens.size()),
+        /*already_appended_tokens=*/1));
+
+    const auto after_commit = orchestrator.prefixStateProbe();
+    EXPECT_EQ(maxCachedTokens(after_commit.kv_caches),
+              static_cast<int>(prefix_tokens.size() + accepted_tokens.size()));
+    EXPECT_EQ(maxCachedTokens(after_commit.mtp_kv_caches),
+              static_cast<int>(prefix_tokens.size() + accepted_tokens.size()) - 1);
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto discard_counter = std::find_if(records.begin(), records.end(), [](const PerfStatRecord &record)
+    {
+        return record.kind == PerfStatRecord::Kind::Counter &&
+               record.domain == "mtp" &&
+               record.name == "speculative_shifted_rows_discarded";
+    });
+    ASSERT_NE(discard_counter, records.end());
+    EXPECT_GT(discard_counter->value, 0.0);
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
 {
     DeviceManager::instance().initialize(-1, false);

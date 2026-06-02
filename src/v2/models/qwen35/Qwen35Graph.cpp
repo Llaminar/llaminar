@@ -440,7 +440,7 @@ namespace llaminar2
                           .eps = config_.rms_norm_eps,
                           .subtract_one = config_.rms_norm_subtract_one,
                           .seq_len = total_tokens,
-                          .input_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
+                          .input_buffer_id = input.terminal_hidden_buffer_id,
                           .output_buffer_id = BufferId::MTP_NORM_HIDDEN,
                       }),
                       device);

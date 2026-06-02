@@ -2260,6 +2260,25 @@ namespace llaminar2
         return all_success;
     }
 
+    bool RankOrchestrator::supportsChainedMTPDrafts() const
+    {
+        if (device_runners_.size() != 1 || !device_runners_[0])
+        {
+            return false;
+        }
+        return device_runners_[0]->supportsChainedMTPDrafts();
+    }
+
+    bool RankOrchestrator::forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id)
+    {
+        if (device_runners_.size() != 1 || !device_runners_[0])
+        {
+            LOG_ERROR("[RankOrchestrator] Chained MTP drafts are not enabled for multi-participant TP domains yet");
+            return false;
+        }
+        return device_runners_[0]->forwardMTPFromLastDraft(draft_condition_token, position_id);
+    }
+
     bool RankOrchestrator::commitMTPShiftedRowsFromLastForward(
         const int32_t *tokens,
         int token_count,

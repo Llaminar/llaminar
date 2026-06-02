@@ -424,6 +424,8 @@ namespace llaminar2
          */
         const float *logits() const override;
         bool forwardMTP(int32_t draft_condition_token) override;
+        bool supportsChainedMTPDrafts() const override;
+        bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,

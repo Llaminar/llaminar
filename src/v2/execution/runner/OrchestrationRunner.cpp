@@ -635,10 +635,15 @@ namespace llaminar2
 
         if (active_mtp.enabled && runner_)
         {
-            if (active_mtp.draft_tokens != 1)
+            if (active_mtp.draft_tokens < 1 || active_mtp.draft_tokens > 3)
             {
                 return setError(
-                    "MTP decode currently supports exactly one draft token; set --mtp-draft-tokens 1");
+                    "MTP decode supports --mtp-draft-tokens in the range [1, 3] for verifier M=2..4");
+            }
+            if (active_mtp.draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
+            {
+                return setError(
+                    "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars");
             }
             const std::string unsupported_reason = runner_->mtpDecodeUnsupportedReason();
             if (unsupported_reason == "MTP decode is not enabled for PP topologies")
@@ -849,9 +854,13 @@ namespace llaminar2
         if (!mtp.enabled || !runner_)
             return {};
 
-        if (mtp.draft_tokens != 1)
+        if (mtp.draft_tokens < 1 || mtp.draft_tokens > 3)
         {
-            return "MTP decode currently supports exactly one draft token; set --mtp-draft-tokens 1";
+            return "MTP decode supports --mtp-draft-tokens in the range [1, 3] for verifier M=2..4";
+        }
+        if (mtp.draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
+        {
+            return "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars";
         }
         if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
         {
@@ -1043,52 +1052,89 @@ namespace llaminar2
             }
         }
 
-        bool sidecar_ok = false;
-        {
-            PerfStatsCollector::ScopedTimer timer("mtp", "sidecar_forward", "decode");
-            sidecar_ok = runner_->forwardMTP(first_token);
-        }
-        if (!sidecar_ok)
-        {
-            return fail_after_checkpoint("MTP sidecar forward failed");
-        }
-        PrefixStateSnapshot post_sidecar_checkpoint;
-        {
-            PerfStatsCollector::ScopedTimer timer("mtp", "capture_post_sidecar_prefix_state", "decode");
-            post_sidecar_checkpoint = runner_->captureLivePrefixCheckpoint();
-        }
-        if (!post_sidecar_checkpoint.valid)
-        {
-            return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
-        }
+        const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
+        const int speculative_draft_count = std::max(1, mtp.draft_tokens);
+        const int base_sidecar_position = runner_->get_position();
 
-        int32_t mtp_token = -1;
+        std::vector<int32_t> draft_tokens;
+        draft_tokens.reserve(static_cast<size_t>(speculative_draft_count) + 1);
+        draft_tokens.push_back(first_token);
+
+        std::vector<PrefixStateSnapshot> sidecar_checkpoints;
+        sidecar_checkpoints.reserve(static_cast<size_t>(speculative_draft_count));
+
+        auto sample_mtp_token = [&]() -> int32_t
         {
-            PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_device", "decode");
-            mtp_token = runner_->sampleGreedyFromMTPLogitsOnDevice();
-        }
-        if (mtp_token < 0)
-        {
+            int32_t token = -1;
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_device", "decode");
+                token = runner_->sampleGreedyFromMTPLogitsOnDevice();
+            }
+            if (token >= 0)
+            {
+                PerfStatsCollector::addCounter("mtp", "mtp_token_device_samples", 1.0, "decode");
+                return token;
+            }
+
             PerfStatsCollector::addCounter("mtp", "mtp_token_host_sampling_fallbacks", 1.0, "decode");
             const float *mtp_logits = runner_->mtpLogits();
             if (!mtp_logits)
             {
-                return fail_after_checkpoint("No MTP logits available");
+                return -1;
             }
             {
                 PerfStatsCollector::ScopedTimer timer("mtp", "sample_mtp_token_host", "decode");
-                mtp_token = sampler_.sample(
+                token = sampler_.sample(
                     mtp_logits,
                     static_cast<size_t>(vocab),
                     active_sampling_params_);
             }
-        }
-        else
+            return token;
+        };
+
+        for (int draft_idx = 0; draft_idx < speculative_draft_count; ++draft_idx)
         {
-            PerfStatsCollector::addCounter("mtp", "mtp_token_device_samples", 1.0, "decode");
+            bool sidecar_ok = false;
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "sidecar_forward", "decode");
+                if (draft_idx == 0)
+                {
+                    sidecar_ok = runner_->forwardMTP(draft_tokens.back());
+                }
+                else
+                {
+                    sidecar_ok = runner_->forwardMTPFromLastDraft(
+                        draft_tokens.back(),
+                        base_sidecar_position + draft_idx);
+                }
+            }
+            if (!sidecar_ok)
+            {
+                return fail_after_checkpoint(
+                    draft_idx == 0
+                        ? "MTP sidecar forward failed"
+                        : "Chained MTP sidecar forward failed");
+            }
+
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "capture_post_sidecar_prefix_state", "decode");
+                sidecar_checkpoints.push_back(runner_->captureLivePrefixCheckpoint());
+            }
+            if (!sidecar_checkpoints.back().valid)
+            {
+                return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
+            }
+
+            int32_t mtp_token = sample_mtp_token();
+            if (mtp_token < 0)
+            {
+                return fail_after_checkpoint("No MTP logits available");
+            }
+            draft_tokens.push_back(mtp_token);
+
+            ++mtp_stats_.draft_steps;
+            PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
         }
-        ++mtp_stats_.draft_steps;
-        PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
 
         bool all_position_enabled = false;
         {
@@ -1100,7 +1146,6 @@ namespace llaminar2
             return fail_after_checkpoint("Runner does not support all-position logits for MTP verification");
         }
 
-        const std::vector<int32_t> draft_tokens = {first_token, mtp_token};
         bool verifier_ok = false;
         {
             PerfStatsCollector::ScopedTimer timer("mtp", "verifier_forward", "decode");
@@ -1128,38 +1173,63 @@ namespace llaminar2
             return fail_after_checkpoint("Failed to disable all-position logits after MTP verification");
         }
 
-        int32_t verified_next = -1;
+        auto sample_verifier_row = [&](int row) -> int32_t
         {
-            PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_token_device", "decode");
-            verified_next = runner_->sampleGreedyFromAllPositionLogitsOnDevice(0);
-        }
-        if (verified_next < 0)
-        {
+            {
+                PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_token_device", "decode");
+                const int32_t token = runner_->sampleGreedyFromAllPositionLogitsOnDevice(row);
+                if (token >= 0)
+                {
+                    PerfStatsCollector::addCounter("mtp", "verifier_token_device_samples", 1.0, "decode");
+                    return token;
+                }
+            }
+
             PerfStatsCollector::addCounter("mtp", "verifier_token_host_sampling_fallbacks", 1.0, "decode");
             const float *all_logits = runner_->getAllPositionLogits();
             if (!all_logits)
             {
-                return fail_after_checkpoint("All-position logits unavailable after MTP verification");
+                return -1;
             }
-
-            const float *verify_row0 = all_logits;
-            {
-                PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_token_host", "decode");
-                verified_next = sampler_.sample(
-                    verify_row0,
-                    static_cast<size_t>(vocab),
-                    active_sampling_params_);
-            }
-        }
-        else
-        {
-            PerfStatsCollector::addCounter("mtp", "verifier_token_device_samples", 1.0, "decode");
-        }
-        const bool accepted_second_draft = verified_next == mtp_token;
+            const float *verify_row =
+                all_logits + static_cast<size_t>(row) * static_cast<size_t>(vocab);
+            PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_token_host", "decode");
+            return sampler_.sample(
+                verify_row,
+                static_cast<size_t>(vocab),
+                active_sampling_params_);
+        };
 
         std::vector<int32_t> accepted_tokens;
         accepted_tokens.push_back(first_token);
-        accepted_tokens.push_back(accepted_second_draft ? mtp_token : verified_next);
+
+        std::vector<int32_t> verifier_tokens;
+        verifier_tokens.reserve(static_cast<size_t>(speculative_draft_count));
+        int accepted_speculative_prefix = 0;
+        bool all_speculative_accepted = true;
+        int32_t rejected_verified_token = -1;
+        for (int draft_idx = 1; draft_idx < static_cast<int>(draft_tokens.size()); ++draft_idx)
+        {
+            const int row = draft_idx - 1;
+            const int32_t verified_token = sample_verifier_row(row);
+            if (verified_token < 0)
+            {
+                return fail_after_checkpoint("All-position logits unavailable after MTP verification");
+            }
+            verifier_tokens.push_back(verified_token);
+
+            if (verified_token == draft_tokens[static_cast<size_t>(draft_idx)])
+            {
+                accepted_tokens.push_back(draft_tokens[static_cast<size_t>(draft_idx)]);
+                ++accepted_speculative_prefix;
+                continue;
+            }
+
+            all_speculative_accepted = false;
+            rejected_verified_token = verified_token;
+            accepted_tokens.push_back(verified_token);
+            break;
+        }
 
         const size_t original_accepted_count = accepted_tokens.size();
         if (decode_step_token_budget_ > 0 &&
@@ -1178,14 +1248,34 @@ namespace llaminar2
             }
         }
 
+        const int already_appended_for_output =
+            accepted_tokens.empty() ? 0 : 1;
         const bool speculative_token_was_attempted = original_accepted_count >= 2;
         const bool speculative_token_is_output = accepted_tokens.size() >= 2;
-        const bool accepted_speculative_token =
-            accepted_second_draft && speculative_token_was_attempted && speculative_token_is_output;
+        const uint64_t accepted_speculative_output_count =
+            speculative_token_is_output
+                ? static_cast<uint64_t>(
+                      std::min<int>(accepted_speculative_prefix,
+                                    static_cast<int>(accepted_tokens.size()) - 1))
+                : 0;
         const bool rejected_speculative_token =
-            !accepted_second_draft && speculative_token_was_attempted && speculative_token_is_output;
+            !all_speculative_accepted &&
+            speculative_token_was_attempted &&
+            static_cast<int>(accepted_tokens.size()) > accepted_speculative_prefix + 1;
         const bool verifier_state_matches_output =
-            accepted_speculative_token && accepted_tokens.size() == draft_tokens.size();
+            all_speculative_accepted && accepted_tokens.size() == draft_tokens.size();
+
+        auto join_tokens = [](const std::vector<int32_t> &tokens) -> std::string
+        {
+            std::ostringstream oss;
+            for (size_t i = 0; i < tokens.size(); ++i)
+            {
+                if (i)
+                    oss << ",";
+                oss << tokens[i];
+            }
+            return oss.str();
+        };
 
         if (PerfStatsCollector::isEnabled())
         {
@@ -1199,13 +1289,16 @@ namespace llaminar2
                     {"draft_step", std::to_string(mtp_stats_.draft_steps)},
                     {"condition_token", std::to_string(condition_token)},
                     {"first_token", std::to_string(first_token)},
-                    {"mtp_token", std::to_string(mtp_token)},
-                    {"verified_token", std::to_string(verified_next)},
-                    {"accepted_second_draft", accepted_second_draft ? "true" : "false"},
+                    {"draft_tokens", join_tokens(draft_tokens)},
+                    {"verifier_tokens", join_tokens(verifier_tokens)},
+                    {"rejected_verified_token", std::to_string(rejected_verified_token)},
+                    {"accepted_speculative_prefix", std::to_string(accepted_speculative_prefix)},
+                    {"all_speculative_accepted", all_speculative_accepted ? "true" : "false"},
                     {"speculative_token_was_attempted", speculative_token_was_attempted ? "true" : "false"},
                     {"speculative_token_is_output", speculative_token_is_output ? "true" : "false"},
                     {"verifier_state_matches_output", verifier_state_matches_output ? "true" : "false"},
                     {"output_tokens", std::to_string(accepted_tokens.size())},
+                    {"already_appended_for_output", std::to_string(already_appended_for_output)},
                     {"used_ready_logits", use_ready_logits ? "true" : "false"},
                 });
         }
@@ -1215,11 +1308,19 @@ namespace llaminar2
             ++mtp_stats_.rejected_tokens;
             PerfStatsCollector::addCounter("mtp", "rejected_tokens", 1.0, "decode");
         }
-        if (accepted_speculative_token)
+        if (accepted_speculative_output_count > 0)
         {
-            ++mtp_stats_.accepted_tokens;
-            PerfStatsCollector::addCounter("mtp", "accepted_tokens", 1.0, "decode");
-            PerfStatsCollector::addCounter("mtp", "accepted_second_draft_tokens", 1.0, "decode");
+            mtp_stats_.accepted_tokens += accepted_speculative_output_count;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "accepted_tokens",
+                static_cast<double>(accepted_speculative_output_count),
+                "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "accepted_second_draft_tokens",
+                accepted_speculative_prefix > 0 ? 1.0 : 0.0,
+                "decode");
         }
         PerfStatsCollector::addCounter("mtp", "output_tokens", static_cast<double>(accepted_tokens.size()), "decode");
 
@@ -1279,10 +1380,19 @@ namespace llaminar2
             return result;
         }
 
+        if (already_appended_for_output <= 0 ||
+            already_appended_for_output > static_cast<int>(sidecar_checkpoints.size()))
+        {
+            result.error = "MTP decode could not select a valid post-sidecar checkpoint for replay";
+            return result;
+        }
+
+        const PrefixStateSnapshot &replay_checkpoint =
+            sidecar_checkpoints[static_cast<size_t>(already_appended_for_output - 1)];
         bool restored = false;
         {
             PerfStatsCollector::ScopedTimer timer("mtp", "restore_live_prefix_state", "decode");
-            restored = runner_->restoreLivePrefixState(post_sidecar_checkpoint);
+            restored = runner_->restoreLivePrefixState(replay_checkpoint);
         }
         if (!restored)
         {
@@ -1312,7 +1422,7 @@ namespace llaminar2
         if (!runner_->commitMTPShiftedRowsFromLastForward(
                 accepted_tokens.data(),
                 static_cast<int>(accepted_tokens.size()),
-                /*already_appended_tokens=*/1))
+                already_appended_for_output))
         {
             result.error = "MTP shifted-cache commit failed after replay";
             return result;

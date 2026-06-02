@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
+#include <algorithm>
+
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
@@ -25,7 +27,15 @@ namespace
             if (all_position_logits_enabled)
             {
                 all_position_logits.assign(static_cast<size_t>(seq_len) * vocab_size(), -1.0f);
-                all_position_logits[verify_argmax_token] = 10.0f;
+                for (int row = 0; row < seq_len; ++row)
+                {
+                    const int token =
+                        row < static_cast<int>(verify_argmax_tokens.size())
+                            ? verify_argmax_tokens[static_cast<size_t>(row)]
+                            : verify_argmax_token;
+                    all_position_logits[static_cast<size_t>(row) * vocab_size() +
+                                        static_cast<size_t>(token)] = 10.0f;
+                }
                 return true;
             }
             logits_buffer.assign(vocab_size(), -1.0f);
@@ -108,16 +118,53 @@ namespace
         {
             if (!mtp_enabled)
                 return false;
+            return forwardMTPCommon(draft_condition_token);
+        }
+
+        bool supportsChainedMTPDrafts() const override
+        {
+            return supports_chained_mtp;
+        }
+
+        bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override
+        {
+            if (!mtp_enabled || !supports_chained_mtp)
+                return false;
+            ++chained_mtp_calls;
+            chained_mtp_positions.push_back(position_id);
+            return forwardMTPCommon(draft_condition_token);
+        }
+
+        bool forwardMTPCommon(int32_t draft_condition_token)
+        {
             ++forward_mtp_calls;
             last_mtp_condition_token = draft_condition_token;
             mtp_logits.assign(vocab_size(), -1.0f);
-            mtp_logits[mtp_argmax_token] = 10.0f;
+            const int token_index = forward_mtp_calls - 1;
+            const int token =
+                token_index < static_cast<int>(mtp_argmax_tokens.size())
+                    ? mtp_argmax_tokens[static_cast<size_t>(token_index)]
+                    : mtp_argmax_token;
+            mtp_logits[token] = 10.0f;
+            ++shifted_mtp_rows;
             return true;
         }
 
         const float *mtpLogits() const override
         {
             return mtp_logits.empty() ? nullptr : mtp_logits.data();
+        }
+
+        bool commitMTPShiftedRowsFromLastForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens) override
+        {
+            ++commit_mtp_calls;
+            last_commit_already_appended = already_appended_tokens;
+            last_commit_tokens.assign(tokens, tokens + token_count);
+            shifted_mtp_rows += std::max(0, token_count - already_appended_tokens);
+            return true;
         }
 
         bool setComputeAllPositionLogits(bool enabled) override
@@ -139,7 +186,13 @@ namespace
             PrefixStateSnapshot snapshot;
             snapshot.valid = mtp_enabled;
             snapshot.cached_tokens = position;
+            snapshot.mtp_cached_tokens = {shifted_mtp_rows};
             return snapshot;
+        }
+
+        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+        {
+            return captureLivePrefixState(seq_idx);
         }
 
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override
@@ -149,6 +202,11 @@ namespace
                 return false;
             ++restore_live_calls;
             position = snapshot.cached_tokens;
+            if (!snapshot.mtp_cached_tokens.empty())
+            {
+                shifted_mtp_rows = snapshot.mtp_cached_tokens.front();
+                restored_mtp_rows.push_back(shifted_mtp_rows);
+            }
             all_position_logits_enabled = false;
             return true;
         }
@@ -157,18 +215,23 @@ namespace
         bool populate_ok = true;
         bool restore_terminal_ok = true;
         bool mtp_enabled = false;
+        bool supports_chained_mtp = true;
         bool all_position_logits_enabled = false;
         bool supports_chunk_schedule = false;
         bool chunk_schedule_ok = true;
         std::vector<float> logits_buffer = std::vector<float>(16, -1.0f);
         std::vector<float> mtp_logits;
         std::vector<float> all_position_logits;
+        std::vector<int> mtp_argmax_tokens;
+        std::vector<int> verify_argmax_tokens;
         int prefill_argmax_token = 9;
         int mtp_argmax_token = 11;
         int verify_argmax_token = 11;
         int forward_calls = 0;
         int chunk_schedule_calls = 0;
         int forward_mtp_calls = 0;
+        int chained_mtp_calls = 0;
+        int commit_mtp_calls = 0;
         int clear_calls = 0;
         int lookup_calls = 0;
         int populate_calls = 0;
@@ -179,7 +242,12 @@ namespace
         int restored_tokens = 0;
         int harvested_prompt_token_count = 0;
         int position = 0;
+        int shifted_mtp_rows = 0;
+        int last_commit_already_appended = 0;
         std::vector<int> last_forward_tokens;
+        std::vector<int> last_commit_tokens;
+        std::vector<int> chained_mtp_positions;
+        std::vector<int> restored_mtp_rows;
         std::vector<int> last_chunk_schedule_tokens;
         PrefillChunkSchedulerPolicy last_chunk_schedule_policy;
         int last_chunk_schedule_pad_token_id = -1;
@@ -223,7 +291,7 @@ namespace
         int old_pad_token_;
     };
 
-    RankExecutionPlan makePlan(bool mtp_enabled = false)
+    RankExecutionPlan makePlan(bool mtp_enabled = false, int mtp_draft_tokens = 1)
     {
         RankExecutionPlan plan;
         plan.rank = 0;
@@ -239,12 +307,12 @@ namespace
         plan.runtime.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
         plan.runtime.prefix_cache.block_size = 2;
         plan.runtime.mtp.enabled = mtp_enabled;
-        plan.runtime.mtp.draft_tokens = 1;
+        plan.runtime.mtp.draft_tokens = mtp_draft_tokens;
         plan.runtime.mtp.verify_mode = MTPVerifyMode::Greedy;
         return plan;
     }
 
-    OrchestrationConfig makeConfig(bool mtp_enabled = false)
+    OrchestrationConfig makeConfig(bool mtp_enabled = false, int mtp_draft_tokens = 1)
     {
         OrchestrationConfig config;
         config.device_for_this_rank = GlobalDeviceAddress::cpu();
@@ -252,18 +320,19 @@ namespace
         config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
         config.prefix_cache.block_size = 2;
         config.mtp.enabled = mtp_enabled;
-        config.mtp.draft_tokens = 1;
+        config.mtp.draft_tokens = mtp_draft_tokens;
         config.mtp.verify_mode = MTPVerifyMode::Greedy;
         return config;
     }
 
     std::unique_ptr<OrchestrationRunner> makeRunner(std::unique_ptr<PrefixFlowMockRunner> mock,
-                                                    bool mtp_enabled = false)
+                                                    bool mtp_enabled = false,
+                                                    int mtp_draft_tokens = 1)
     {
         mock->mtp_enabled = mtp_enabled;
         auto runner = std::make_unique<OrchestrationRunner>(
-            makeConfig(mtp_enabled),
-            makePlan(mtp_enabled),
+            makeConfig(mtp_enabled, mtp_draft_tokens),
+            makePlan(mtp_enabled, mtp_draft_tokens),
             std::move(mock));
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -469,7 +538,7 @@ TEST(Test__PrefixCachePrefillFlow, FullHitWithTerminalLogitsSkipsForward)
     EXPECT_EQ(step.tokens[0], mock_ptr->prefill_argmax_token);
 }
 
-TEST(Test__PrefixCachePrefillFlow, FullHitWithMTPReplaysAcceptedTokensWithoutPromptDuplication)
+TEST(Test__PrefixCachePrefillFlow, FullHitWithMTPCommitsAcceptedVerifierStateWithoutPromptDuplication)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
     auto *mock_ptr = mock.get();
@@ -492,8 +561,10 @@ TEST(Test__PrefixCachePrefillFlow, FullHitWithMTPReplaysAcceptedTokensWithoutPro
                                          mock_ptr->mtp_argmax_token));
     EXPECT_EQ(mock_ptr->forward_mtp_calls, 1);
     EXPECT_EQ(mock_ptr->last_mtp_condition_token, mock_ptr->prefill_argmax_token);
-    EXPECT_EQ(mock_ptr->restore_live_calls, 1);
-    EXPECT_THAT(mock_ptr->last_forward_tokens,
+    EXPECT_EQ(mock_ptr->restore_live_calls, 0);
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
+    EXPECT_THAT(mock_ptr->last_commit_tokens,
                 ElementsAre(mock_ptr->prefill_argmax_token,
                             mock_ptr->mtp_argmax_token));
 
@@ -504,13 +575,13 @@ TEST(Test__PrefixCachePrefillFlow, FullHitWithMTPReplaysAcceptedTokensWithoutPro
     EXPECT_TRUE(probe.mtp_request.enabled);
     EXPECT_FALSE(probe.mtp_request.bypassed);
     EXPECT_EQ(probe.mtp_request.draft_steps, 1u);
-    EXPECT_EQ(probe.mtp_request.accepted_tokens, 2u);
+    EXPECT_EQ(probe.mtp_request.accepted_tokens, 1u);
     EXPECT_EQ(probe.mtp_request.rejected_tokens, 0u);
     EXPECT_DOUBLE_EQ(probe.mtp_request.acceptance_rate, 1.0);
     EXPECT_EQ(probe.mtp_draft_steps, 1u);
-    EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+    EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
     EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
-    EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    EXPECT_EQ(probe.mtp_rollbacks, 0u);
     EXPECT_EQ(probe.mtp_verifier_runs, 1u);
     EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
 }
@@ -559,11 +630,98 @@ TEST(Test__PrefixCachePrefillFlow, MTPStatsRecordRejectedDraftToken)
 
     const auto probe = runner->prefixStateProbe();
     EXPECT_EQ(probe.mtp_draft_steps, 1u);
-    EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+    EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
     EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
     EXPECT_EQ(probe.mtp_rollbacks, 1u);
     EXPECT_EQ(probe.mtp_verifier_runs, 1u);
     EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+}
+
+TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthThreeCommitsAcceptedVerifierState)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->lookup_result.has_terminal_hidden = true;
+    mock_ptr->mtp_argmax_tokens = {11, 12, 13};
+    mock_ptr->verify_argmax_tokens = {11, 12, 13, 14};
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true, /*mtp_draft_tokens=*/3);
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    auto step = runner->decodeStep();
+    ASSERT_TRUE(step.success()) << step.error;
+    EXPECT_THAT(step.tokens, ElementsAre(9, 11, 12, 13));
+
+    EXPECT_EQ(mock_ptr->forward_mtp_calls, 3);
+    EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
+    EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
+    EXPECT_EQ(mock_ptr->restore_live_calls, 0);
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 12, 13));
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.mtp_draft_steps, 3u);
+    EXPECT_EQ(probe.mtp_accepted_tokens, 3u);
+    EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+    EXPECT_EQ(probe.mtp_rollbacks, 0u);
+    EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+    EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
+}
+
+TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthThreeRestoresMatchingSidecarCheckpointOnReject)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 4;
+    mock_ptr->lookup_result.has_terminal_logits = true;
+    mock_ptr->lookup_result.has_terminal_hidden = true;
+    mock_ptr->mtp_argmax_tokens = {11, 12, 13};
+    mock_ptr->verify_argmax_tokens = {11, 15, 13, 14};
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true, /*mtp_draft_tokens=*/3);
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    auto step = runner->decodeStep();
+    ASSERT_TRUE(step.success()) << step.error;
+    EXPECT_THAT(step.tokens, ElementsAre(9, 11, 15));
+
+    EXPECT_EQ(mock_ptr->forward_mtp_calls, 3);
+    EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
+    EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
+    ASSERT_THAT(mock_ptr->restored_mtp_rows, Not(IsEmpty()));
+    EXPECT_EQ(mock_ptr->restored_mtp_rows.back(), 1);
+    EXPECT_EQ(mock_ptr->restore_live_calls, 1);
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(9, 11, 15));
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 15));
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_EQ(probe.mtp_draft_steps, 3u);
+    EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+    EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+    EXPECT_EQ(probe.mtp_rollbacks, 1u);
+    EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+    EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
+}
+
+TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthHardFailsWhenRunnerDoesNotSupportIt)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    mock->supports_chained_mtp = false;
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true, /*mtp_draft_tokens=*/2);
+    ASSERT_FALSE(runner->prefill({1, 2, 3, 4}));
+    EXPECT_THAT(runner->lastError(), HasSubstr("requires runner support for chained MTP sidecars"));
 }
 
 TEST(Test__PrefixCachePrefillFlow, FullHitWithoutTerminalLogitsRecomputesFinalBlock)

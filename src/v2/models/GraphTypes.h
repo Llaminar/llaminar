@@ -690,6 +690,7 @@ namespace llaminar2
         int batch_size = 1;
         int seq_len = 1;
         DeviceId device = DeviceId::cpu();
+        BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
         bool kv_cache_only = false;
     };
 

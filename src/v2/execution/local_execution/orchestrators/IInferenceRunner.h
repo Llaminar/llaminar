@@ -168,6 +168,30 @@ namespace llaminar2
         }
 
         /**
+         * @brief True when the runner can chain depth-0 MTP sidecar calls.
+         *
+         * Chained drafts use the hidden state produced by the previous sidecar
+         * as the next sidecar's terminal-hidden input, while appending shifted
+         * MTP KV rows at explicit logical positions. Runners that cannot keep
+         * this state contract should return false so callers hard-fail for
+         * draft depths greater than one.
+         */
+        virtual bool supportsChainedMTPDrafts() const { return false; }
+
+        /**
+         * @brief Run a chained MTP sidecar step from the previous sidecar hidden.
+         *
+         * @param draft_condition_token Token whose shifted MTP KV row is appended.
+         * @param position_id Logical shifted-cache position for the append.
+         */
+        virtual bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id)
+        {
+            (void)draft_condition_token;
+            (void)position_id;
+            return false;
+        }
+
+        /**
          * @brief Commit shifted MTP KV rows from the most recent main forward.
          *
          * MTP decode calls forwardMTP() before verifier/replay; that sidecar

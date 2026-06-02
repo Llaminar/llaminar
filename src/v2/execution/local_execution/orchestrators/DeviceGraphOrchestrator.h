@@ -1479,6 +1479,8 @@ namespace llaminar2
         const float *logits() const override;
 
         bool forwardMTP(int32_t draft_condition_token) override;
+        bool supportsChainedMTPDrafts() const override { return true; }
+        bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -1846,6 +1848,7 @@ namespace llaminar2
                 forward_engine_->clearCache();
             }
             mtp_sidecar_depth0_cache_.invalidate();
+            mtp_sidecar_depth0_chained_cache_.invalidate();
             mtp_sidecar_depth0_kv_only_cache_.invalidate();
             mtp_terminal_hidden_row_select_cache_.invalidate();
             last_pos_offset_ = -1;
@@ -2249,7 +2252,8 @@ namespace llaminar2
                               TensorBase *terminal_hidden,
                               int position_id,
                               const char *sidecar_perf_context,
-                              bool kv_cache_only = false);
+                              bool kv_cache_only = false,
+                              BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,
@@ -2284,6 +2288,7 @@ namespace llaminar2
         };
 
         MTPSidecarGraphCache mtp_sidecar_depth0_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_chained_cache_;
         MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_cache_;
 
         struct MTPTerminalHiddenRowSelectGraphCache
