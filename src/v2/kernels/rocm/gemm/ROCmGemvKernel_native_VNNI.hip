@@ -3578,6 +3578,15 @@ bool rocmGemv_native_vnni_small_m_batched_fp32(
     int device_id,
     void* stream)
 {
+    hipError_t device_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_id));
+    if (device_err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGemv_native_vnni_small_m_batched_fp32] hipSetDevice(%d) failed: %s\n",
+                device_id, hipGetErrorString(device_err));
+        return false;
+    }
+
     if (M < 2 || M > 4)
     {
         fprintf(stderr, "[rocmGemv_native_vnni_small_m_batched_fp32] M must be 2, 3, or 4 (M=%d K=%d projections=%d)\n",

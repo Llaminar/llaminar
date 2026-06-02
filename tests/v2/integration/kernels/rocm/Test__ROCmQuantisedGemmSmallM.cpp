@@ -250,12 +250,11 @@ namespace
         int K,
         PackedPath expected_path,
         CreateWeights createWeights,
-        float min_cosine)
+        float min_cosine,
+        int Nq = 896,
+        int Nk = 128,
+        int Nv = 128)
     {
-        const int Nq = 896;
-        const int Nk = 128;
-        const int Nv = 128;
-
         auto wq = createWeights({static_cast<size_t>(Nq), static_cast<size_t>(K)}, 101);
         auto wk = createWeights({static_cast<size_t>(Nk), static_cast<size_t>(K)}, 102);
         auto wv = createWeights({static_cast<size_t>(Nv), static_cast<size_t>(K)}, 103);
@@ -347,6 +346,156 @@ namespace
         q_kernel.unbindWorkspace();
         k_kernel.unbindWorkspace();
         v_kernel.unbindWorkspace();
+    }
+
+    template <typename CreateWeights>
+    void runFusedProjectionGroupSmallMMatchesSeparate(
+        const char *label,
+        int M,
+        int K,
+        PackedPath expected_path,
+        CreateWeights createWeights,
+        float min_cosine,
+        const std::vector<int> &Ns,
+        bool graph_capture,
+        bool bind_fused_to_shared_workspace = false)
+    {
+        ASSERT_FALSE(Ns.empty());
+
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        if (graph_capture)
+            ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+#endif
+
+        std::vector<std::unique_ptr<TensorBase>> weights;
+        std::vector<ROCmPackedWeights> packed(Ns.size());
+        std::vector<std::unique_ptr<ROCmQuantisedGemmKernel>> kernels;
+        std::vector<std::unique_ptr<DeviceWorkspaceManager>> workspaces;
+        weights.reserve(Ns.size());
+        kernels.reserve(Ns.size());
+        workspaces.reserve(Ns.size());
+
+        for (size_t i = 0; i < Ns.size(); ++i)
+        {
+            weights.push_back(createWeights({static_cast<size_t>(Ns[i]), static_cast<size_t>(K)},
+                                            static_cast<uint32_t>(200 + i)));
+            ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
+            expectPackedPath(packed[i], expected_path);
+            kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
+#ifdef HAVE_ROCM
+            if (stream)
+                kernels.back()->setGPUStream(stream);
+#endif
+            workspaces.push_back(bindWorkspace(*kernels.back(), M, Ns[i], K));
+            ASSERT_NE(workspaces.back(), nullptr);
+        }
+
+        auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+
+        std::vector<std::unique_ptr<FP32Tensor>> separate;
+        std::vector<std::unique_ptr<FP32Tensor>> fused;
+        separate.reserve(Ns.size());
+        fused.reserve(Ns.size());
+        for (int n : Ns)
+        {
+            separate.push_back(TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n)}));
+            fused.push_back(TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n)}));
+            ASSERT_TRUE(separate.back()->allocateOnDevice(DeviceId::rocm(0)));
+            ASSERT_TRUE(fused.back()->allocateOnDevice(DeviceId::rocm(0)));
+        }
+
+        for (size_t i = 0; i < Ns.size(); ++i)
+        {
+            ASSERT_TRUE(kernels[i]->multiply_tensor(input.get(), separate[i].get(), M, Ns[i], K));
+        }
+#ifdef HAVE_ROCM
+        ASSERT_EQ(stream ? hipStreamSynchronize(stream) : hipDeviceSynchronize(), hipSuccess);
+#endif
+        for (auto &output : separate)
+            output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        std::unique_ptr<DeviceWorkspaceManager> shared_workspace;
+        if (bind_fused_to_shared_workspace)
+        {
+            WorkspaceRequirements combined;
+            for (size_t i = 0; i < Ns.size(); ++i)
+                combined.merge(kernels[i]->getWorkspaceRequirements(M, Ns[i], K));
+
+            shared_workspace = std::make_unique<DeviceWorkspaceManager>(
+                DeviceId::rocm(0),
+                combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
+            ASSERT_TRUE(shared_workspace->allocate(combined));
+
+            for (auto &kernel : kernels)
+                kernel->bindWorkspace(shared_workspace.get());
+        }
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections;
+        projections.reserve(Ns.size());
+        for (size_t i = 0; i < Ns.size(); ++i)
+        {
+            projections.emplace_back(kernels[i].get(),
+                                     fused[i].get(),
+                                     Ns[i],
+                                     nullptr,
+                                     "small_m_group");
+        }
+
+#ifdef HAVE_ROCM
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t exec = nullptr;
+        if (graph_capture)
+        {
+            ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
+            ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+            ASSERT_NE(graph, nullptr);
+            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
+            ASSERT_NE(exec, nullptr);
+            for (size_t i = 0; i < Ns.size(); ++i)
+            {
+                ASSERT_EQ(hipMemsetAsync(fused[i]->gpu_data_ptr(),
+                                         0,
+                                         static_cast<size_t>(M) * Ns[i] * sizeof(float),
+                                         stream),
+                          hipSuccess);
+            }
+            ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        }
+        else
+#endif
+        {
+            ASSERT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K));
+#ifdef HAVE_ROCM
+            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+#endif
+        }
+
+        for (size_t i = 0; i < Ns.size(); ++i)
+        {
+            fused[i]->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+            const float cos = cosineSim(fused[i]->data(),
+                                        separate[i]->data(),
+                                        static_cast<size_t>(M) * Ns[i]);
+            LOG_INFO("[SmallM] " << label << " projection=" << i
+                                 << " M=" << M << " N=" << Ns[i]
+                                 << " cosine=" << cos);
+            EXPECT_GT(cos, min_cosine);
+        }
+
+#ifdef HAVE_ROCM
+        if (exec)
+            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
+        if (graph)
+            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        if (stream)
+            EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+#endif
+        for (auto &kernel : kernels)
+            kernel->unbindWorkspace();
     }
 
 #ifdef HAVE_ROCM
@@ -873,4 +1022,40 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2RecordsSharedQuantizedNativeRou
         << "Fused QKV M=2 batched route should cover Q, K, and V projections";
 
     PerfStatsCollector::reset();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36QKVM2MatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    runFusedQKVSmallMMatchesSeparate(
+        "Q4_K native-VNNI Qwen3.6 QKV shape",
+        2,
+        5120,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.9999f,
+        5120,
+        1024,
+        1024);
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ4KGDNProjectionM2MatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    runFusedProjectionGroupSmallMMatchesSeparate(
+        "Q4_K native-VNNI Qwen3.6 GDN projection group",
+        2,
+        5120,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.9999f,
+        {10240, 10240, 1024, 1024},
+        true,
+        true);
 }

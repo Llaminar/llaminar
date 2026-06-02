@@ -775,16 +775,19 @@ namespace llaminar2
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
 
-            // Workspace buffer names for TEMP_C_FP32 / TEMP_A_FP32 are SHARED
-            // across all ROCm GEMM kernel instances (matching CUDA).  The workspace
-            // merger takes the max size, so all kernels share one allocation.
-            //
-            // Concurrent execution paths (FusedQKV prefill/decode) use the
-            // ConcurrentPrefillPool's own per-stream scratch and scatter_partial
-            // buffers — NOT these workspace buffers.  The workspace TEMP buffers
-            // are only used in serial paths (standalone multiply_tensor, sequential
-            // fallback in multiply_fused_tensor, fused SwiGLU decode), so a single
-            // shared allocation is safe.
+            // Per-kernel-instance workspace slice id. Shared graph stages bind
+            // several GEMM kernels to one DeviceWorkspaceManager; split-K native
+            // small-M GEMV-many needs distinct partial buffers per projection.
+            uint32_t slice_id_ = 0;
+
+            std::string scatterPartialBufferName() const
+            {
+                return std::string(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL) + "_" + std::to_string(slice_id_);
+            }
+
+            // TEMP_C_FP32 / TEMP_A_FP32 remain shared across ROCm GEMM kernels.
+            // Concurrent execution paths use their own pool scratch, while serial
+            // paths do not overlap the temp buffers.
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;

@@ -114,6 +114,11 @@ namespace llaminar2
 {
     namespace rocm
     {
+        namespace
+        {
+            std::atomic<uint32_t> g_rocm_gemm_workspace_slice_counter{1};
+        }
+
         // =====================================================================
         // Forward declarations for HIP implementation
         // =====================================================================
@@ -1039,6 +1044,7 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),
               owns_weight_memory_(true), // Legacy path owns weight memory
+              slice_id_(g_rocm_gemm_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed)),
               impl_(std::make_unique<Impl>())
         {
             if (!weights)
@@ -1077,6 +1083,7 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),  // Not yet uploaded to device
               owns_weight_memory_(false), // ROCmPackedWeights owns the memory
+              slice_id_(g_rocm_gemm_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed)),
               impl_(std::make_unique<Impl>())
         {
             if (!packed)
@@ -1108,6 +1115,7 @@ namespace llaminar2
               K_(static_cast<size_t>(K)),
               weights_converted_(true),   // Already on device
               owns_weight_memory_(false), // Batch allocation owns the memory
+              slice_id_(g_rocm_gemm_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed)),
               impl_(std::make_unique<Impl>())
         {
             impl_->d_weights_native_vnni = d_native_vnni;
@@ -4591,7 +4599,7 @@ namespace llaminar2
             size_t scatter_partial_bytes = static_cast<size_t>(SCATTER_KB_MAX) *
                                            static_cast<size_t>(scatter_rows) *
                                            static_cast<size_t>(n) * sizeof(float);
-            reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL, scatter_partial_bytes, 256, true});
+            reqs.buffers.push_back({scatterPartialBufferName(), scatter_partial_bytes, 256, true});
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
@@ -5262,10 +5270,12 @@ namespace llaminar2
             // NOTE: CK-specific buffers (ROCM_CK_INT32, ROCM_A_PADDED,
             // ROCM_SCALE_A_PADDED, ROCM_E_PADDED, ROCM_B_REPACK) are no
             // longer requested — the CK path is retired. Skipped here.
-            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL))
+            const std::string scatter_partial_name = scatterPartialBufferName();
+            if (!workspace_->hasBuffer(scatter_partial_name))
             {
                 throw std::runtime_error(
-                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_SCATTER_PARTIAL");
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
+                    scatter_partial_name);
             }
 
             // Populate impl_ pointers from workspace
@@ -5275,7 +5285,7 @@ namespace llaminar2
             impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
             impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
             impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
-            impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL));
+            impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(scatter_partial_name));
 
             // Set capacity values to max (workspace is pre-sized for maximum dimensions)
             // These are used by code paths that check capacity before use
