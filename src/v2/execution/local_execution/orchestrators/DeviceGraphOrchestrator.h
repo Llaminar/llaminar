@@ -2278,7 +2278,6 @@ namespace llaminar2
             std::vector<IComputeStage *> dynamic_param_stages;
             TensorBase *terminal_hidden = nullptr;
             uint64_t workspace_generation = 0;
-            uint64_t moe_placement_epoch = 0;
             int32_t token_id = 0;
             int position_id = 0;
             bool valid = false;
@@ -2300,7 +2299,6 @@ namespace llaminar2
                 dynamic_param_stages.clear();
                 terminal_hidden = nullptr;
                 workspace_generation = 0;
-                moe_placement_epoch = 0;
                 token_id = 0;
                 position_id = 0;
                 valid = false;

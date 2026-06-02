@@ -359,6 +359,52 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, TensorInterface_Basic)
     LOG_INFO("[Test] TensorInterface basic test passed, output sum=" << sum);
 }
 
+TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionWorkspaceNamesMergeCanonical)
+{
+    const size_t M = 2, N = 8, K = 16;
+
+    auto weights_alpha = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+    auto weights_beta = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+
+    ROCmFloatingPointGemmKernel alpha_kernel(weights_alpha.get(), rocm_device_id_);
+    ROCmFloatingPointGemmKernel beta_kernel(weights_beta.get(), rocm_device_id_);
+
+    WorkspaceRequirements reqs;
+    reqs.merge(alpha_kernel.getWorkspaceRequirements(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)));
+    reqs.merge(beta_kernel.getWorkspaceRequirements(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)));
+
+    int a_ptr_buffers = 0;
+    int b_ptr_buffers = 0;
+    int c_ptr_buffers = 0;
+    int old_slice_named_buffers = 0;
+    const std::vector<std::string> old_prefixes = {
+        std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS) + "_",
+        std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS) + "_",
+        std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS) + "_",
+    };
+
+    for (const auto &buf : reqs.buffers)
+    {
+        if (buf.name == GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS)
+            ++a_ptr_buffers;
+        if (buf.name == GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS)
+            ++b_ptr_buffers;
+        if (buf.name == GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS)
+            ++c_ptr_buffers;
+        for (const auto &prefix : old_prefixes)
+        {
+            if (buf.name.rfind(prefix, 0) == 0)
+                ++old_slice_named_buffers;
+        }
+    }
+
+    EXPECT_EQ(a_ptr_buffers, 1);
+    EXPECT_EQ(b_ptr_buffers, 1);
+    EXPECT_EQ(c_ptr_buffers, 1);
+    EXPECT_EQ(old_slice_named_buffers, 0)
+        << "FP32 batched pointer arrays must not use per-kernel names that churn graph workspace";
+}
+
 TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedBatchedFusedProjectionAlphaBetaM2MatchesReference)
 {
     const size_t M = 2, N = 32, K = 256;

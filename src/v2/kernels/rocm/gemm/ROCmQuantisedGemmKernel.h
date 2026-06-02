@@ -778,14 +778,19 @@ namespace llaminar2
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
 
-            // Per-kernel-instance workspace slice id. Shared graph stages bind
-            // several GEMM kernels to one DeviceWorkspaceManager; split-K native
-            // small-M GEMV-many needs distinct partial buffers per projection.
+            // Historical per-kernel slice id. Scratch buffers are now declared
+            // under stable names so graph rebuilds do not force workspace
+            // reallocations solely because new kernel instances were created.
             uint32_t slice_id_ = 0;
 
             std::string scatterPartialBufferName() const
             {
-                return std::string(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL) + "_" + std::to_string(slice_id_);
+                return GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL;
+            }
+
+            std::string scatterPartialBatchedBufferName() const
+            {
+                return GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED;
             }
 
             // TEMP_C_FP32 / TEMP_A_FP32 remain shared across ROCm GEMM kernels.

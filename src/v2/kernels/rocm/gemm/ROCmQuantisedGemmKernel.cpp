@@ -117,6 +117,7 @@ namespace llaminar2
         namespace
         {
             std::atomic<uint32_t> g_rocm_gemm_workspace_slice_counter{1};
+            constexpr int ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS = 4;
 
             int computeNativeVNNISmallMBatchedKBForValidation(
                 const std::array<int, 8> &Ns,
@@ -676,6 +677,7 @@ namespace llaminar2
 
             // Scatter+reduce partial buffer (from workspace)
             float *d_scatter_partial = nullptr; // [KB_MAX × N] FP32 scatter partials
+            float *d_scatter_partial_batched = nullptr; // [batch × KB_MAX × N] FP32 scatter partials
 
             // Capacity tracking for workspace buffers (set during validateWorkspace)
             size_t d_A_fp32_capacity = 0;
@@ -3952,7 +3954,7 @@ namespace llaminar2
                     mins[i] = static_cast<const uint16_t *>(rocm_kernel->impl_->d_weights_native_mins);
                     emins[i] = static_cast<const uint32_t *>(rocm_kernel->impl_->d_weights_native_emins);
                     outputs[i] = d_output;
-                    partials[i] = rocm_kernel->impl_->d_scatter_partial;
+                    partials[i] = nullptr;
                     biases[i] = d_bias;
                     Ns[i] = proj.n;
 
@@ -3961,12 +3963,6 @@ namespace llaminar2
                               << " name=" << (proj.name ? proj.name : "?")
                               << " kernel=" << static_cast<const void *>(rocm_kernel)
                               << " output=" << static_cast<const void *>(outputs[i])
-                              << " partial=" << static_cast<const void *>(partials[i])
-                              << " partial_name=" << rocm_kernel->scatterPartialBufferName()
-                              << " partial_bytes="
-                              << (rocm_kernel->workspace_
-                                      ? rocm_kernel->workspace_->getBufferSize(rocm_kernel->scatterPartialBufferName())
-                                      : 0)
                               << " n=" << proj.n);
                 }
 
@@ -3976,9 +3972,46 @@ namespace llaminar2
                         Ns,
                         static_cast<int>(projections.size()),
                         k);
+                    if (static_cast<int>(projections.size()) > ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M batched route "
+                                  << "requires projection count <= "
+                                  << ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS
+                                  << " for declared graph workspace, got " << projections.size());
+                        return false;
+                    }
+
+                    float *batched_partial_base = impl_->d_scatter_partial_batched;
+                    const size_t batched_partial_bytes =
+                        workspace_
+                            ? workspace_->getBufferSize(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED)
+                            : 0;
+                    size_t partial_offset_floats = 0;
 
                     for (size_t i = 0; i < projections.size(); ++i)
                     {
+                        const size_t required_projection_floats =
+                            static_cast<size_t>(std::max(1, expected_kb)) *
+                            static_cast<size_t>(m) *
+                            static_cast<size_t>(Ns[i]);
+                        const size_t next_offset = partial_offset_floats + required_projection_floats;
+                        if (!batched_partial_base ||
+                            next_offset * sizeof(float) > batched_partial_bytes)
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Batched split-K partial arena "
+                                      << "is missing or too small"
+                                      << " bytes=" << batched_partial_bytes
+                                      << " required=" << (next_offset * sizeof(float))
+                                      << " expected_kb=" << expected_kb
+                                      << " m=" << m
+                                      << " projection=" << i
+                                      << " n=" << Ns[i]
+                                      << " projections=" << projections.size());
+                            return false;
+                        }
+                        partials[i] = batched_partial_base + partial_offset_floats;
+                        partial_offset_floats = next_offset;
+
                         for (size_t j = i + 1; j < projections.size(); ++j)
                         {
                             if (outputs[i] == outputs[j])
@@ -3989,44 +4022,26 @@ namespace llaminar2
                                           << " output=" << static_cast<const void *>(outputs[i]));
                                 return false;
                             }
-                            if (expected_kb > 1 && partials[i] == partials[j])
+                            if (partials[i] == partials[j])
                             {
                                 LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projections "
                                           << i << " and " << j
                                           << " share one split-K partial buffer in graph-native batched small-M route"
                                           << " partial=" << static_cast<const void *>(partials[i])
                                           << " expected_kb=" << expected_kb
-                                          << ". Each projection must declare and bind a distinct "
-                                          << GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL
-                                          << " workspace slice.");
+                                          << ". Each projection must receive a distinct slice from "
+                                          << GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED
+                                          << ".");
                                 return false;
                             }
                         }
 
-                        auto *rocm_kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(projections[i].kernel);
-                        const std::string partial_name = rocm_kernel->scatterPartialBufferName();
-                        const size_t partial_bytes =
-                            rocm_kernel->workspace_
-                                ? rocm_kernel->workspace_->getBufferSize(partial_name)
-                                : 0;
-                        const size_t required_partial_bytes =
-                            static_cast<size_t>(std::max(1, expected_kb)) *
-                            static_cast<size_t>(m) *
-                            static_cast<size_t>(Ns[i]) *
-                            sizeof(float);
-                        if (expected_kb > 1 && partial_bytes < required_partial_bytes)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Projection " << i
-                                      << " declared split-K partial buffer is too small"
-                                      << " partial_name=" << partial_name
-                                      << " bytes=" << partial_bytes
-                                      << " required=" << required_partial_bytes
-                                      << " expected_kb=" << expected_kb
-                                      << " m=" << m
-                                      << " n=" << Ns[i]
-                                      << " k=" << k);
-                            return false;
-                        }
+                        LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Small-M batched projection "
+                                  << i
+                                  << " partial=" << static_cast<const void *>(partials[i])
+                                  << " arena=" << GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED
+                                  << " offset_floats=" << (partial_offset_floats - required_projection_floats)
+                                  << " n=" << Ns[i]);
                     }
 
                     if (!rocmGemv_native_vnni_small_m_batched_fp32(
@@ -4759,6 +4774,11 @@ namespace llaminar2
                                            static_cast<size_t>(scatter_rows) *
                                            static_cast<size_t>(n) * sizeof(float);
             reqs.buffers.push_back({scatterPartialBufferName(), scatter_partial_bytes, 256, true});
+            reqs.buffers.push_back({
+                scatterPartialBatchedBufferName(),
+                scatter_partial_bytes * ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS,
+                256,
+                true});
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
                       << "quant_a=" << (quant_a_bytes / 1024) << "KB, "
@@ -5436,6 +5456,13 @@ namespace llaminar2
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
                     scatter_partial_name);
             }
+            const std::string batched_scatter_partial_name = scatterPartialBatchedBufferName();
+            if (!workspace_->hasBuffer(batched_scatter_partial_name))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
+                    batched_scatter_partial_name);
+            }
 
             // Populate impl_ pointers from workspace
             impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
@@ -5445,6 +5472,7 @@ namespace llaminar2
             impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
             impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
             impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(scatter_partial_name));
+            impl_->d_scatter_partial_batched = static_cast<float *>(workspace_->getBuffer(batched_scatter_partial_name));
 
             // Set capacity values to max (workspace is pre-sized for maximum dimensions)
             // These are used by code paths that check capacity before use

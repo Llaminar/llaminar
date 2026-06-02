@@ -1702,7 +1702,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedQ5KQwen36FFNGateUpM2Matche
     PerfStatsCollector::reset();
 }
 
-TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsAliasedSplitKPartialWorkspace)
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2UsesCanonicalBatchedSplitKWorkspace)
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
@@ -1711,15 +1711,49 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsAliasedSplit
     constexpr int K = 5120;
     constexpr int N = 17408;
 
-    auto weights = TestTensorFactory::createQ4_KRandom(
-        {static_cast<size_t>(N), static_cast<size_t>(K)}, 501);
-    ROCmPackedWeights packed;
-    ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
-    expectPackedPath(packed, PackedPath::NativeVNNI);
+    std::vector<std::unique_ptr<TensorBase>> weights;
+    std::vector<ROCmPackedWeights> packed(2);
+    std::vector<std::unique_ptr<ROCmQuantisedGemmKernel>> kernels;
+    WorkspaceRequirements combined;
 
-    ROCmQuantisedGemmKernel kernel(&packed, 0);
-    auto workspace = bindWorkspace(kernel, M, N, K);
-    ASSERT_NE(workspace, nullptr);
+    for (int i = 0; i < 2; ++i)
+    {
+        weights.push_back(TestTensorFactory::createQ4_KRandom(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            static_cast<uint32_t>(501 + i)));
+        ASSERT_TRUE(packWeightsToROCm(weights.back().get(), packed[i]));
+        expectPackedPath(packed[i], PackedPath::NativeVNNI);
+        kernels.push_back(std::make_unique<ROCmQuantisedGemmKernel>(&packed[i], 0));
+        combined.merge(kernels.back()->getWorkspaceRequirements(M, N, K));
+    }
+
+    int single_partial_buffers = 0;
+    int batched_partial_buffers = 0;
+    int old_slice_named_buffers = 0;
+    const std::string old_partial_prefix =
+        std::string(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL) + "_";
+    for (const auto &buf : combined.buffers)
+    {
+        if (buf.name == GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL)
+            ++single_partial_buffers;
+        if (buf.name == GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED)
+            ++batched_partial_buffers;
+        if (buf.name.rfind(old_partial_prefix, 0) == 0)
+            ++old_slice_named_buffers;
+    }
+    EXPECT_EQ(single_partial_buffers, 1)
+        << "ROCm split-K single-projection scratch should be canonical across graph instances";
+    EXPECT_EQ(batched_partial_buffers, 1)
+        << "ROCm split-K GEMV-many scratch should be a single canonical arena";
+    EXPECT_EQ(old_slice_named_buffers, 0)
+        << "Per-kernel scatter partial names cause decode graph workspace reallocations";
+
+    DeviceWorkspaceManager workspace(
+        DeviceId::rocm(0),
+        combined.total_bytes_with_alignment() + 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace.allocate(combined));
+    for (auto &kernel : kernels)
+        kernel->bindWorkspace(&workspace);
 
     auto input = TestTensorFactory::createFP32Random(
         {static_cast<size_t>(M), static_cast<size_t>(K)});
@@ -1730,16 +1764,41 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsAliasedSplit
     ASSERT_TRUE(up->allocateOnDevice(DeviceId::rocm(0)));
 
     std::vector<ITensorGemm::TensorProjectionDesc> projections;
-    projections.emplace_back(&kernel, gate.get(), N, nullptr, "gate");
-    projections.emplace_back(&kernel, up.get(), N, nullptr, "up");
+    projections.emplace_back(kernels[0].get(), gate.get(), N, nullptr, "gate");
+    projections.emplace_back(kernels[1].get(), up.get(), N, nullptr, "up");
 
-    EXPECT_FALSE(kernel.multiply_fused_tensor(input.get(), projections, M, K))
-        << "Batched small-M split-K must reject aliased projection partial buffers before HIP launch";
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    EXPECT_TRUE(kernels.front()->multiply_fused_tensor(input.get(), projections, M, K))
+        << "Canonical batched split-K arena must still provide distinct per-projection partial slices";
 #ifdef HAVE_ROCM
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
 #endif
 
-    kernel.unbindWorkspace();
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    double batched_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_batched_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == "2" &&
+            record.tags.count("k") != 0 &&
+            record.tags.at("k") == "5120" &&
+            record.tags.count("projections") != 0 &&
+            record.tags.at("projections") == "2")
+        {
+            batched_calls += record.value;
+        }
+    }
+    EXPECT_GE(batched_calls, 1.0)
+        << "Canonical batched split-K arena should keep the graph-native GEMV-many route active";
+    PerfStatsCollector::reset();
+
+    for (auto &kernel : kernels)
+        kernel->unbindWorkspace();
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsUndersizedDeclaredPartialWorkspace)
@@ -1768,10 +1827,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2RejectsUndersizedDe
     }
 
     bool shrunk_partial = false;
-    const std::string partial_prefix = std::string(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL) + "_";
     for (auto &buf : combined.buffers)
     {
-        if (!shrunk_partial && buf.name.rfind(partial_prefix, 0) == 0)
+        if (!shrunk_partial && buf.name == GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED)
         {
             buf.size_bytes = static_cast<size_t>(M) * static_cast<size_t>(N) * sizeof(float);
             shrunk_partial = true;

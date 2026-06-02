@@ -399,17 +399,17 @@ namespace llaminar2
 
         std::string ROCmFloatingPointGemmKernel::batchAPtrsBufferName() const
         {
-            return std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS) + "_" + std::to_string(slice_id_);
+            return GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS;
         }
 
         std::string ROCmFloatingPointGemmKernel::batchBPtrsBufferName() const
         {
-            return std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS) + "_" + std::to_string(slice_id_);
+            return GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS;
         }
 
         std::string ROCmFloatingPointGemmKernel::batchCPtrsBufferName() const
         {
-            return std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS) + "_" + std::to_string(slice_id_);
+            return GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS;
         }
 
         bool ROCmFloatingPointGemmKernel::validateBatchedPointerWorkspace(

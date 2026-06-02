@@ -170,6 +170,7 @@ namespace llaminar2
 
         // ROCm scatter+reduce partial buffer for fused GEMV
         constexpr const char *ROCM_SCATTER_PARTIAL = "rocm_scatter_partial"; ///< [KB_MAX × N] FP32 scatter partials
+        constexpr const char *ROCM_SCATTER_PARTIAL_BATCHED = "rocm_scatter_partial_batched"; ///< [batch × KB_MAX × N] FP32 scatter partials
 
         // ROCm FP32 hipBLAS batched pointer arrays for graph-capturable fused projections
         constexpr const char *ROCM_FP32_BATCH_A_PTRS = "rocm_fp32_batch_a_ptrs"; ///< [batch] device pointers to A matrices

@@ -1652,6 +1652,8 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
         PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}};
     const auto plain_reuse_tags =
         PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}};
+    const auto depth_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}};
 
     const PerfStatRecord *plain_after_build = findMTPRecord(
         records,
@@ -1668,6 +1670,22 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
         plain_reuse_tags);
     ASSERT_NE(plain_reuse, nullptr);
     EXPECT_DOUBLE_EQ(plain_reuse->value, 1.0);
+
+    const PerfStatRecord *cache_misses = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_misses",
+        depth_tags);
+    ASSERT_NE(cache_misses, nullptr);
+    EXPECT_DOUBLE_EQ(cache_misses->value, 1.0);
+
+    const PerfStatRecord *cache_hits = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_hits",
+        depth_tags);
+    ASSERT_NE(cache_hits, nullptr);
+    EXPECT_DOUBLE_EQ(cache_hits->value, 1.0);
 
     PerfStatsCollector::reset();
 }

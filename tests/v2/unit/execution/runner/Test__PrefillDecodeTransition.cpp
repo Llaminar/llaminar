@@ -2112,6 +2112,65 @@ namespace
         EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
 
+    TEST_F(Test__PrefillDecodeTransition, MTPBudgetTruncationRestoresVerifierRowAndSkipsReplay)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_budget_row_restore_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
+            mock->enableVerifierRowRestore();
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3}));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            runner->setDecodeStepTokenBudget(1);
+            GenerationResult step = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
+
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_THAT(step.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+            EXPECT_EQ(mock->restoreCount(), 0);
+            EXPECT_EQ(mock->restoreVerifierRowCount(), 1);
+            EXPECT_FALSE(mock->verifierRestoreAfterCheckpointRestore());
+            EXPECT_EQ(mock->lastVerifierRestoreRow(), 0);
+            EXPECT_EQ(mock->lastVerifierRestoreTargetTokens(), 4);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
+            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
+                << "the verifier-row shortcut should avoid replaying the truncated prefix";
+            EXPECT_THAT(mock->lastForwardTokens(),
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *shortcut =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "rollback_verifier_state_row_shortcuts",
+                                       {{"reason", "partial_commit"},
+                                        {"row", "0"},
+                                        {"main_forward_token_count", "1"}});
+            ASSERT_NE(shortcut, nullptr);
+            EXPECT_DOUBLE_EQ(shortcut->value, 1.0);
+
+            const PerfStatRecord *replay_tokens =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
+            EXPECT_EQ(replay_tokens, nullptr);
+
+            const PerfStatRecord *replay_forward =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "replay_forward");
+            EXPECT_EQ(replay_forward, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, MTPGenerateCountsAcceptedDraftsTowardMaxNewTokens)
     {
         auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);

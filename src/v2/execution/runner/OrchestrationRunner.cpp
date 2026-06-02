@@ -1404,8 +1404,21 @@ namespace llaminar2
 
         const PrefixStateSnapshot &replay_checkpoint =
             sidecar_checkpoints[static_cast<size_t>(already_appended_for_output - 1)];
-        const int accepted_verifier_input_count =
+        const int rejected_verifier_input_count =
             already_appended_for_output + accepted_speculative_prefix;
+        const int partial_verifier_input_count =
+            static_cast<int>(std::min<size_t>(
+                accepted_tokens.size(),
+                draft_tokens.empty() ? 0 : draft_tokens.size() - 1));
+        const int accepted_verifier_input_count =
+            rejected_speculative_token
+                ? rejected_verifier_input_count
+                : partial_verifier_input_count;
+        const bool partial_verifier_commit_without_reject =
+            !rejected_speculative_token &&
+            !verifier_state_matches_output &&
+            accepted_verifier_input_count > 0 &&
+            accepted_verifier_input_count == static_cast<int>(accepted_tokens.size());
 
         bool rollback_recorded = false;
         auto record_rollback = [&]()
@@ -1417,9 +1430,9 @@ namespace llaminar2
             rollback_recorded = true;
         };
 
-        if (rejected_speculative_token &&
+        if ((rejected_speculative_token || partial_verifier_commit_without_reject) &&
             accepted_verifier_input_count > 0 &&
-            accepted_verifier_input_count <= static_cast<int>(draft_tokens.size()) &&
+            accepted_verifier_input_count < static_cast<int>(draft_tokens.size()) &&
             accepted_verifier_input_count <= static_cast<int>(accepted_tokens.size()))
         {
             const int verifier_restore_row = accepted_verifier_input_count - 1;
@@ -1449,7 +1462,8 @@ namespace llaminar2
                     "decode",
                     {},
                     {{"row", std::to_string(verifier_restore_row)},
-                     {"main_forward_token_count", std::to_string(accepted_verifier_input_count)}});
+                     {"main_forward_token_count", std::to_string(accepted_verifier_input_count)},
+                     {"reason", rejected_speculative_token ? "reject" : "partial_commit"}});
 
                 if (!runner_->commitMTPShiftedRowsFromPartialForward(
                         accepted_tokens.data(),
@@ -1528,7 +1542,9 @@ namespace llaminar2
                 "mtp",
                 "rollback_verifier_state_row_shortcut_unavailable",
                 1.0,
-                "decode");
+                "decode",
+                {},
+                {{"reason", rejected_speculative_token ? "reject" : "partial_commit"}});
         }
 
         bool restored = false;

@@ -3637,12 +3637,10 @@ namespace llaminar2
             : (terminal_hidden_buffer_id == BufferId::MTP_HIDDEN
                    ? mtp_sidecar_depth0_chained_cache_
                    : mtp_sidecar_depth0_cache_);
-        const uint64_t current_moe_placement_epoch = moePlacementEpoch();
         const bool needs_graph_rebuild =
             !sidecar_cache.valid ||
             !sidecar_cache.graph ||
-            sidecar_cache.terminal_hidden != terminal_hidden ||
-            sidecar_cache.moe_placement_epoch != current_moe_placement_epoch;
+            sidecar_cache.terminal_hidden != terminal_hidden;
 
         const bool rebuilt_graph = needs_graph_rebuild;
         if (needs_graph_rebuild)
@@ -3651,7 +3649,6 @@ namespace llaminar2
             sidecar_cache.token_id = draft_condition_token;
             sidecar_cache.position_id = position_id;
             sidecar_cache.terminal_hidden = terminal_hidden;
-            sidecar_cache.moe_placement_epoch = current_moe_placement_epoch;
 
             MTPForwardInput cached_input = input;
             cached_input.draft_token_ids = &sidecar_cache.token_id;
