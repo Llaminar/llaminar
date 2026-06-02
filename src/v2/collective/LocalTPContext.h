@@ -122,6 +122,18 @@ namespace llaminar2
 
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
 
+        /**
+         * @brief Return true when the current GPU graph configuration supports
+         *        LocalTP GPU-native collectives for a backend.
+         *
+         * @param backend Backend whose GPU graph policy should be checked.
+         * @param reason_out Optional pointer receiving human-readable reason.
+         * @return true when policy permits LocalTP collective execution.
+         */
+        static bool isLocalTPGpuGraphPolicySupported(
+            CollectiveBackendType backend,
+            std::string *reason_out = nullptr);
+
         // =====================================================================
         // Output Tensor Registry (ILocalTPContext interface + concrete impl)
         // =====================================================================
@@ -502,13 +514,10 @@ namespace llaminar2
 
         /**
          * @brief Return true when the current GPU graph configuration supports
-         *        LocalTP NCCL collectives.
-         *
-         * - If GPU graphs are OFF, LocalTP NCCL is supported.
-         * - If GPU graphs are ON, segmented collective mode must also be ON.
+         *        this context's LocalTP GPU-native collectives.
          *
          * @param reason_out Optional pointer receiving human-readable reason.
-         * @return true when policy permits LocalTP NCCL collective execution.
+         * @return true when policy permits LocalTP collective execution.
          */
         bool isLocalTPNCCLGraphPolicySupported(std::string *reason_out = nullptr) const;
     };

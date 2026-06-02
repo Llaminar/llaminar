@@ -18,7 +18,10 @@
 
 #include <gtest/gtest.h>
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
+#include <optional>
+#include <string>
 #include <vector>
 #include <cstring>
 #include <thread>
@@ -30,10 +33,44 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
 #include "tensors/Tensors.h"
+#include "utils/DebugEnv.h"
 #include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
+
+namespace
+{
+    class ScopedEnvVar
+    {
+    public:
+        ScopedEnvVar(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *existing = std::getenv(name);
+            if (existing)
+                previous_ = std::string(existing);
+            setenv(name, value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnvVar()
+        {
+            if (previous_)
+                setenv(name_.c_str(), previous_->c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnvVar(const ScopedEnvVar &) = delete;
+        ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> previous_;
+    };
+}
 
 // =============================================================================
 // Test Fixture
@@ -123,6 +160,34 @@ TEST_F(Test__LocalTPContext, ConstructUnnormalizedWeights)
     EXPECT_FLOAT_EQ(sum, 1.0f);
     EXPECT_NEAR(ctx->weights()[0], 2.0f / 3.0f, 0.0001f);
     EXPECT_NEAR(ctx->weights()[1], 1.0f / 3.0f, 0.0001f);
+}
+
+TEST_F(Test__LocalTPContext, GpuGraphPolicyRejectsRCCLSegmentedCollectives)
+{
+    ScopedEnvVar graphs("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar segmented("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
+
+    std::string reason;
+    const bool supported = LocalTPContext::isLocalTPGpuGraphPolicySupported(
+        CollectiveBackendType::RCCL,
+        &reason);
+
+    EXPECT_FALSE(supported);
+    EXPECT_EQ(reason, "rccl_segmented_collectives_unsafe");
+}
+
+TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsRCCLWithoutSegmentedCollectives)
+{
+    ScopedEnvVar graphs("LLAMINAR_GPU_GRAPHS", "1");
+    ScopedEnvVar segmented("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0");
+
+    std::string reason;
+    const bool supported = LocalTPContext::isLocalTPGpuGraphPolicySupported(
+        CollectiveBackendType::RCCL,
+        &reason);
+
+    EXPECT_TRUE(supported);
+    EXPECT_EQ(reason, "rccl_gpu_graphs_without_segmented_collectives");
 }
 
 /**

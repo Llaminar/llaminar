@@ -167,6 +167,7 @@ namespace llaminar2
         nlohmann::json doc{
             {"schema", "llaminar.benchmark.v1"},
             {"success", result.success},
+            {"failure_reason", result.failure_reason},
             {"prefill_success", result.prefill_success},
             {"decode_success", result.decode_success},
             {"tokens", {{"prefill", result.prefill_tokens},
@@ -410,6 +411,7 @@ namespace llaminar2
 
                 if (!synchronizeSuccess(step.error.empty(), "decode step"))
                 {
+                    last_failure_reason_ = step.error.empty() ? "decode step failed" : step.error;
                     auto end = std::chrono::high_resolution_clock::now();
                     double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                     return {false, time_ms, tokens_generated, generated_text};
@@ -430,6 +432,7 @@ namespace llaminar2
                     if (step.is_complete)
                         return {true, time_ms, tokens_generated, generated_text};
                     LOG_ERROR("Benchmark decode step produced no tokens");
+                    last_failure_reason_ = "decode step produced no tokens";
                     return {false, time_ms, tokens_generated, generated_text};
                 }
 
@@ -461,6 +464,7 @@ namespace llaminar2
                 const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
                 if (!synchronizeSuccess(maintenance_success, "decode maintenance"))
                 {
+                    last_failure_reason_ = "decode maintenance failed";
                     auto end = std::chrono::high_resolution_clock::now();
                     double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                     return {false, time_ms, tokens_generated, generated_text};
@@ -494,6 +498,7 @@ namespace llaminar2
                     {
                         LOG_ERROR("CPU sampling fallback failed at decode step " << i
                                                                                  << ": logits() returned nullptr.");
+                        last_failure_reason_ = "CPU sampling fallback failed: logits unavailable";
                         auto end = std::chrono::high_resolution_clock::now();
                         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                         return {false, time_ms, tokens_generated, generated_text};
@@ -543,6 +548,7 @@ namespace llaminar2
 
             if (!synchronizeSuccess(forward_success, "decode forward"))
             {
+                last_failure_reason_ = "decode forward failed";
                 auto end = std::chrono::high_resolution_clock::now();
                 double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                 return {false, time_ms, tokens_generated, generated_text};
@@ -560,7 +566,10 @@ namespace llaminar2
         double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
         if (!decode_success)
+        {
+            last_failure_reason_ = "decode synchronization failed";
             return {false, time_ms, tokens_generated, generated_text};
+        }
 
         // Accumulate inter-step profiling data across benchmark iterations
         if (profile_sampler && mpi_ctx_->rank() == 0 && tokens_generated > 0)
@@ -615,8 +624,10 @@ namespace llaminar2
     BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
     {
         BenchmarkResult result;
+        last_failure_reason_.clear();
         auto capture_and_return = [&]() -> BenchmarkResult
         {
+            result.failure_reason = last_failure_reason_;
             result.prefix_state = runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
             return result;
         };
@@ -654,6 +665,7 @@ namespace llaminar2
 
         if (token_count <= 0)
         {
+            last_failure_reason_ = "benchmark prompt tokenization failed";
             return capture_and_return(); // Return empty result on error
         }
 
@@ -750,6 +762,8 @@ namespace llaminar2
             {
                 LOG_ERROR("Warmup prefill failed");
             }
+            if (last_failure_reason_.empty())
+                last_failure_reason_ = "warmup prefill failed";
             return capture_and_return();
         }
 
@@ -765,6 +779,8 @@ namespace llaminar2
                 {
                     LOG_ERROR("Warmup decode failed");
                 }
+                if (last_failure_reason_.empty())
+                    last_failure_reason_ = "warmup decode failed";
                 return capture_and_return();
             }
         }
@@ -862,6 +878,8 @@ namespace llaminar2
                 {
                     LOG_ERROR("Prefill failed on iteration " << (iter + 1));
                 }
+                if (last_failure_reason_.empty())
+                    last_failure_reason_ = "prefill failed on benchmark iteration";
                 logGPUMemorySnapshot(("prefill-fail iter=" + std::to_string(iter + 1)).c_str());
                 return capture_and_return();
             }
@@ -885,6 +903,8 @@ namespace llaminar2
                     {
                         LOG_ERROR("Decode failed on iteration " << (iter + 1));
                     }
+                    if (last_failure_reason_.empty())
+                        last_failure_reason_ = "decode failed on benchmark iteration";
                     return capture_and_return();
                 }
                 decode_times.push_back(decode_time);
@@ -933,6 +953,7 @@ namespace llaminar2
         // Calculate totals
         result.total_time_ms = result.prefill_time_ms + result.decode_time_ms;
         result.success = result.prefill_success && result.decode_success;
+        result.failure_reason.clear();
 
         if (mpi_ctx_->rank() == 0)
         {

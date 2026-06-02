@@ -814,6 +814,21 @@ namespace llaminar2
         {
             return "ROCm MTP decode is incompatible with LLAMINAR_ROCM_CONCURRENT_DECODE; use LLAMINAR_ROCM_CONCURRENT_M2_ROWS for M=2 verifier experiments";
         }
+        if (debugEnv().execution.gpu_graphs &&
+            debugEnv().execution.gpu_graph_collective_segmented &&
+            plan_.usesLocalTP())
+        {
+            const bool has_rocm_participant =
+                std::any_of(plan_.local_tp_devices.begin(), plan_.local_tp_devices.end(),
+                            [](const GlobalDeviceAddress &address)
+                            {
+                                return address.toLocalDeviceId().is_rocm();
+                            });
+            if (has_rocm_participant)
+            {
+                return "ROCm LocalTP MTP decode is incompatible with LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED; RCCL segmented collective replay for MTP sidecar execution is not implemented";
+            }
+        }
 
         return {};
     }

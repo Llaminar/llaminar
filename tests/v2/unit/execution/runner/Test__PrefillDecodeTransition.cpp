@@ -590,12 +590,19 @@ namespace
         }
 
         LocalTPRunnerHarness createLocalTPRunner(bool mtp_accept = true,
-                                                 bool column_parallel_logits = false)
+                                                 bool column_parallel_logits = false,
+                                                 std::vector<GlobalDeviceAddress> devices = {})
         {
+            if (devices.empty())
+            {
+                devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
+            }
             auto child0 = std::make_unique<MockInferenceRunner>();
             auto child1 = std::make_unique<MockInferenceRunner>();
             child0->enableMTP(mtp_accept);
             child1->enableMTP(mtp_accept);
+            child0->setPrimaryDevice(devices[0].toLocalDeviceId());
+            child1->setPrimaryDevice(devices[1].toLocalDeviceId());
             if (column_parallel_logits)
             {
                 child0->enableColumnParallelShard(0, MockInferenceRunner::VOCAB_SIZE / 2);
@@ -612,7 +619,7 @@ namespace
 
             RankOrchestrator::Config rank_config;
             rank_config.mode = RankOrchestrator::ParallelismMode::TP;
-            rank_config.devices = {GlobalDeviceAddress::cpu(), GlobalDeviceAddress::cpu()};
+            rank_config.devices = devices;
             rank_config.mtp.enabled = true;
             rank_config.mtp.draft_tokens = 1;
             rank_config.mtp.verify_mode = MTPVerifyMode::Greedy;
@@ -627,13 +634,20 @@ namespace
                 rank_config);
 
             OrchestrationConfig config;
-            config.device_for_this_rank = GlobalDeviceAddress::cpu();
+            config.device_for_this_rank = devices.front();
             config.mtp.enabled = true;
             config.mtp.draft_tokens = 1;
             config.mtp.verify_mode = MTPVerifyMode::Greedy;
 
+            RankExecutionPlan runner_plan = plan_;
+            runner_plan.primary_device = devices.front();
+            runner_plan.local_tp_devices = devices;
+            runner_plan.local_tp_backend = devices.front().isROCm()
+                                               ? CollectiveBackendType::RCCL
+                                               : CollectiveBackendType::HOST;
+
             auto runner = std::make_unique<OrchestrationRunner>(
-                std::move(config), plan_, std::move(rank_runner));
+                std::move(config), std::move(runner_plan), std::move(rank_runner));
 
             SamplingParams greedy;
             greedy.temperature = 0.0f;
@@ -1261,6 +1275,29 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
         EXPECT_EQ(probe.mtp_rollbacks, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, ROCmLocalTPMTPSegmentedCollectivesFailBeforeSidecarLaunch)
+    {
+        ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
+        ScopedEnv segmented_collectives("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1");
+
+        auto harness = createLocalTPRunner(
+            /*mtp_accept=*/true,
+            /*column_parallel_logits=*/false,
+            {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+
+        std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+        ASSERT_TRUE(harness.runner->prefill(prompt));
+
+        GenerationResult step = harness.runner->decodeStep();
+        EXPECT_FALSE(step.success());
+        EXPECT_NE(step.error.find("ROCm LocalTP MTP decode is incompatible"), std::string::npos)
+            << step.error;
+        EXPECT_NE(step.error.find("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED"), std::string::npos)
+            << step.error;
+        EXPECT_EQ(harness.child0->forwardMTPCount(), 0);
+        EXPECT_EQ(harness.child1->forwardMTPCount(), 0);
     }
 
     TEST_F(Test__PrefillDecodeTransition, LocalTPMTPForcedRejectCountsOnceAcrossParticipants)

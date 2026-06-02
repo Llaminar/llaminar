@@ -69,11 +69,13 @@ namespace llaminar2
 {
     std::atomic<uint64_t> LocalTPContext::next_context_id_{1};
 
-    bool LocalTPContext::isLocalTPNCCLGraphPolicySupported(std::string *reason_out) const
+    bool LocalTPContext::isLocalTPGpuGraphPolicySupported(
+        CollectiveBackendType backend,
+        std::string *reason_out)
     {
         const auto &exec = debugEnv().execution;
 
-        // No graph capture in use: LocalTP NCCL is unaffected.
+        // No graph capture in use: LocalTP GPU-native collectives are unaffected.
         if (!exec.gpu_graphs)
         {
             if (reason_out)
@@ -83,8 +85,26 @@ namespace llaminar2
             return true;
         }
 
-        // Phase 3 support matrix: collectives under graph mode are only supported
-        // when segmented collective replay is explicitly enabled.
+        if (backend == CollectiveBackendType::RCCL)
+        {
+            if (exec.gpu_graph_collective_segmented)
+            {
+                if (reason_out)
+                {
+                    *reason_out = "rccl_segmented_collectives_unsafe";
+                }
+                return false;
+            }
+
+            if (reason_out)
+            {
+                *reason_out = "rccl_gpu_graphs_without_segmented_collectives";
+            }
+            return true;
+        }
+
+        // Phase 3 support matrix: NCCL collectives under graph mode are only
+        // supported when segmented collective replay is explicitly enabled.
         if (exec.gpu_graph_collective_segmented)
         {
             if (reason_out)
@@ -99,6 +119,11 @@ namespace llaminar2
             *reason_out = "gpu_graphs_on_without_segmented_collectives";
         }
         return false;
+    }
+
+    bool LocalTPContext::isLocalTPNCCLGraphPolicySupported(std::string *reason_out) const
+    {
+        return isLocalTPGpuGraphPolicySupported(backend_, reason_out);
     }
 
     bool LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce(
@@ -1993,7 +2018,8 @@ namespace llaminar2
             // If users enable global GPU graph mode without segmented-collective
             // support, we fail fast with a clear marker instead of attempting an
             // undefined collective scheduling path.
-            if (backend_ == CollectiveBackendType::NCCL)
+            if (backend_ == CollectiveBackendType::NCCL ||
+                (backend_ == CollectiveBackendType::RCCL && debugEnv().execution.gpu_graph_collective_segmented))
             {
                 std::string graph_policy_reason;
                 const bool graph_supported = isLocalTPNCCLGraphPolicySupported(&graph_policy_reason);
@@ -2001,18 +2027,23 @@ namespace llaminar2
                 {
                     if (!logged_graph_policy_reject_marker_.exchange(true))
                     {
-                        LOG_ERROR("LOCALTP_NCCL_GRAPH_POLICY=UNSUPPORTED reason=" << graph_policy_reason);
+                        LOG_ERROR("LOCALTP_GPU_GRAPH_POLICY=UNSUPPORTED backend="
+                                  << collectiveBackendTypeToString(backend_)
+                                  << " reason=" << graph_policy_reason);
                     }
 
-                    LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: Unsupported LocalTP NCCL graph mode. "
-                              << "Enable LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1 when LLAMINAR_GPU_GRAPHS=1");
+                    LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: Unsupported LocalTP GPU-native graph mode. "
+                              << "backend=" << collectiveBackendTypeToString(backend_)
+                              << " reason=" << graph_policy_reason);
                     barrier_result_ = false;
                     goto cleanup;
                 }
 
                 if (!logged_graph_policy_allow_marker_.exchange(true))
                 {
-                    LOG_DEBUG("LOCALTP_NCCL_GRAPH_POLICY=SUPPORTED reason=" << graph_policy_reason);
+                    LOG_DEBUG("LOCALTP_GPU_GRAPH_POLICY=SUPPORTED backend="
+                              << collectiveBackendTypeToString(backend_)
+                              << " reason=" << graph_policy_reason);
                 }
             }
 

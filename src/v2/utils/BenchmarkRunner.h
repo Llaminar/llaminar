@@ -67,6 +67,7 @@ namespace llaminar2
         // Overall
         double total_time_ms = 0.0; ///< Total benchmark time (ms)
         bool success = false;
+        std::string failure_reason;
 
         // Generated text (for verification)
         std::string generated_text;
@@ -156,6 +157,7 @@ namespace llaminar2
         std::function<void()> post_warmup_cb_;
         std::function<void()> decode_step_cb_;
         DecodeLoopProfile decode_loop_profile_; ///< Accumulated across benchmark iterations
+        std::string last_failure_reason_;
 
         /**
          * @brief Generate a default benchmark prompt if none provided
