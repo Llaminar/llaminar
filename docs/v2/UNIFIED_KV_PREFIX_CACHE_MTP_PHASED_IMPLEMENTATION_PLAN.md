@@ -28,7 +28,8 @@ This section is updated as phases are proven against the current worktree. A pha
 | Phase 11: TP-Compatible MTP Sidecar Execution | Complete | Focused Phase 11 unit tests passed on 2026-06-01: `V2_Unit_MTPGraphConstruction` proves dense sidecar TP allreduce insertion, vocab-parallel embedding allreduce, column-parallel verifier/MTP logits contracts, GlobalTP MTP greedy sampling coordination, shifted MTP KV harvest/restore, and live prefix snapshot restore; `V2_Unit_RankOrchestrator` proves LocalTP `forwardMTP()` enters every child concurrently, child failures still rendezvous every participant, MTP logits/all-position verifier logits gather column-parallel shards, and live checkpoint capture/truncate/restore applies to every child; `V2_Unit_PrefillDecodeTransition` proves GlobalTP and LocalTP MTP decode paths, coordinated world-size sampling, forced reject replay, and rollback/rejection counters are recorded once per request step rather than once per participant. Real-model Qwen3.6 parity passed on 2026-06-01: LocalTP ROCm and NodeLocalTP CPU `MTPGreedyMatchesPyTorchDecodeTokens` plus `PrefixCacheMTPRestore`. | None for dense TP-compatible MTP sidecar gates. PP MTP now hard-fails before prefill until a PP-aware shifted-prefill/verifier path exists; ExpertParallel/MoE MTP remains Phase 12. |
 | Phase 12: ExpertParallel Sparse MoE MTP Sidecar And Segmented Graph Capture | Complete | Focused Phase 12 slice passed on 2026-06-01: `V2_Unit_MTPGraphConstruction` proves graph-native overlay MoE MTP sidecar execution appends real shifted KV payload and marks sparse manual boundaries correctly after full graph execution; `V2_Unit_MoEOverlayCollectiveWorkspace` proves non-final sparse dispatch/return participants can complete their manual graph boundary after successful publish while final participants still require collective completion; `V2_Unit_MoEExpertWeightService` proves CPU prepared expert slabs are incrementally filled for disjoint masked participants without duplicating slabs; `V2_Unit_ForwardGraphTypes` proves named sparse/collective boundaries split segmented graph-capture plans unless graph-safe collective capture is explicitly enabled; the broader Phase 12 unit slice covering prefill graph cache, ForwardExecutionEngine chunking, MoE runtime table, decode histograms, rebalance controller, prepared-weight store resolution, and local expert prepared weights passed. Focused integration passed: `V2_Integration_MoEOverlaySparseTransport_MPI` and `V2_Integration_SegmentedGraphCaptureExecution`. Real-model graph-native overlay parity passed for Qwen3.5 MoE RocmHot/CpuCold `DecodeParity` and `PrefillParity`. Real Qwen3.6 MoE parity passes for SingleDevice `MTPGreedyMatchesPyTorchDecodeTokens` and `PrefixCacheMTPRestore`. Focused CTest passed on 2026-06-02 for heterogeneous ExpertOverlay ROCm2TP-hot/CPU2LocalTP-cold: `V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Qwen36MoEExpertOverlayPrefixMTPParity_MTPGreedyMatchesBaselineTokens_ROCm2TPHot_CPU2LocalTPCold` and `V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Qwen36MoEExpertOverlayPrefixMTPParity_PrefixCacheMTPRestore_ROCm2TPHot_CPU2LocalTPCold`. Additional focused slice passed on 2026-06-01: `V2_Unit_ForwardExecutionEngine`, `V2_Unit_DeviceGraphOrchestrator`, `V2_Integration_PrefillGraphCacheExecution_CUDA`, and `V2_Integration_PrefillGraphCacheExecution_ROCm` prove chunk index propagation, MoE domain/participant prefill graph identity hooks, snapshot observability for chunk id, bucket length, real-token range, domain id, participant id, placement epoch, topology signature, capture/replay phase, and structured `forward_graph.prefill_graph_lifecycle` counters while preserving padded-bucket reuse across changing real-token lengths. `V2_Unit_ForwardExecutionEngine` also proves placement-changing chunk-boundary maintenance clears the outer bucketed forward graph cache before the next chunk rebuilds under a new epoch. The CUDA/ROCm prefill graph-cache integrations now prove fixed-placement chunk schedules reach captured replay and forced chunk-boundary rebalance schedules clear, rebuild, recapture, and replay under a new placement epoch. `V2_Unit_ForwardExecutionEngine` now also proves live-state restore/truncate can reset captured replay state while preserving cached `ComputeGraph`s; real Qwen3.6 MoE SingleDevice ROCm MTP graph-capture smoke passed after this reset through the previous `-n 3`/`-n 4` rollback crash reproducer. Benchmark speedup evidence is intentionally deferred to Phase 14. | None for Phase 12 correctness and segmented-capture compatibility gates. |
 | Phase 13: PyTorch Parity Acceptance Matrix | In progress | Dense and MoE parity targets are registered as normal parity-suite tests, and several Phase 13 cells have already passed as evidence for earlier phases, including single-device dense/MoE, LocalTP dense, NodeLocalTP dense, and heterogeneous ExpertOverlay MoE prefix+MTP parity. Dense Qwen3.6 SingleDevice CPU and CUDA prefix/MTP parity now have explicit CTest entries under `V2_Integration_Parity_Qwen36_CPU_SingleDevice_` and `V2_Integration_Parity_Qwen36_CUDA_SingleDevice_` rather than being inferred from the ROCm SingleDevice harness. Focused CTest passed on 2026-06-02 for all five CPU dense SingleDevice cases: `PrefixRestoreFullHit`, `PrefixRestorePartialHit`, `SplitPrefillMatchesPyTorchDecodeTokens`, `MTPGreedyMatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`. Focused CTest also passed on 2026-06-02 for all five CUDA dense SingleDevice cases with the same coverage: `PrefixRestoreFullHit`, `PrefixRestorePartialHit`, `SplitPrefillMatchesPyTorchDecodeTokens`, `MTPGreedyMatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`. Focused CTest also passed on 2026-06-02 for all three dense NodeLocalTP CPU cases: `PrefixRestoreFullHit`, `MTPGreedyMatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`. Focused CTest passed on 2026-06-02 for `V2_Integration_Parity_Qwen36MoE_ExpertOverlay_`: the heterogeneous ROCm2TP-hot/CPU2LocalTP-cold MTP and prefix+MTP cases passed, and the 2x ROCm hot-only ExpertOverlay tests passed via an explicit resident-VRAM prerequisite skip on the current 32 GB ROCm machine. The hot-only harness currently requires at least 40 GiB total VRAM per ROCm participant because the no-fallback plan requires all 256 experts to fit on each ROCm participant. | Audit the full Phase 13 matrix requirement-by-requirement, rerun focused missing cells, and mark complete only after every required non-skipped parity cell has direct current evidence. |
-| Phase 14: Benchmark Acceptance And Default-Enablement Readiness | In progress | `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md` tracks real Qwen3.6 dense/MoE baseline, graph-capture status, and best observed MTP speedups by domain. CUDA SingleDevice dense now has direct Qwen3.6 evidence for a graph-captured depth-1 MTP speedup after the native M=2 verifier route: 54.02 tok/s versus 40.44 tok/s baseline at `-c 128 -n 64`, with 96.88% acceptance and aligned shifted KV state. CUDA SingleDevice MoE now has direct Qwen3.6 evidence for the same native M=2 route: 50.89 tok/s versus 31.20 tok/s baseline at `-c 64 -n 16`, with 78.12% acceptance and aligned shifted KV state. `V2_Integration_CUDAGemmParity` now includes regression coverage for the M=2 route and the M=4 Q4_0 small-prefill NaN issue found during the smoke. `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalPPHardFail` pins the current LocalPP matrix blocker as an early real-model hard fail with zero MTP draft/verifier counters, preventing recurrence of the old late stage-1 shifted-cache crash while the real PP-aware MTP path is still unimplemented. | Continue matrix-driven benchmark work until remaining supported domains show concrete speedups or documented blockers with traces, keep optimizing CUDA dense toward the approximately 2x Phase 14 target, and treat ExpertParallel MoE as a separate gate from SingleDevice MoE. |
+| Phase 13.5: Small-M GEMV-Many Kernel Prerequisite | In progress | Phase 14 speedup work exposed that correctness-green graph capture is not enough: ROCm SingleDevice dense Qwen3.6 remains speed-negative because the graph-captured verifier replay is still dominated by small-M GEMV/GDN/GEMM work. ROCm now has a graph-capturable native-VNNI small-M verifier route for M=2/3/4 across Q/K/IQ codebooks, fused QKV/GateUp shared-quant dispatch now bypasses concurrent prefill for native small-M verifier batches, and `V2_Integration_ROCmQuantisedGemmSmallM` passed on 2026-06-02 with Q8 plus all native Q/K/IQ codebooks, graph-captured Q4_K/IQ3_S M=3/4, route counters, and fused shared-quant counters. Release perf `NativeVNNIGEMMPerfTest.MTP_SmallM_VerifierShapes_AllFormats` passed on 2026-06-02 for Qwen3.6 hidden projection M=2/3/4; native codebook speedups versus INT8 were 1.27x-3.74x with cosine >= 0.999961. CUDA has a narrower M=2 route with direct SingleDevice dense/MoE speedups. | Next Phase 13.5 work is to port the same M=2/3/4 quantize-once GEMV-many contract and first-class perf rows to CUDA and CPU, then re-run ROCm real-model MTP decode benchmarks to prove the lower-level kernel speedup translates through full inference before returning to Phase 14 acceptance. |
+| Phase 14: Benchmark Acceptance And Default-Enablement Readiness | Waiting on Phase 13.5 | `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md` tracks real Qwen3.6 dense/MoE baseline, graph-capture status, and best observed MTP speedups by domain. CUDA SingleDevice dense currently has direct Qwen3.6 evidence for a graph-captured depth-1 MTP speedup after the native M=2 verifier route: 54.02 tok/s versus 40.44 tok/s baseline at `-c 128 -n 64`, with 96.88% acceptance and aligned shifted KV state. CUDA SingleDevice MoE currently has direct Qwen3.6 evidence for the same native M=2 route: 50.89 tok/s versus 31.20 tok/s baseline at `-c 64 -n 16`, with 78.12% acceptance and aligned shifted KV state. ROCm SingleDevice dense is graph-captured and correctness-green but speed-negative, which moved the small-M GEMV kernel work into Phase 13.5. `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalPPHardFail` pins the current LocalPP matrix blocker as an early real-model hard fail with zero MTP draft/verifier counters, preventing recurrence of the old late stage-1 shifted-cache crash while the real PP-aware MTP path is still unimplemented. | Do not use Phase 14 to paper over kernel deficits. Resume benchmark acceptance after Phase 13.5 provides graph-capturable M=2/3/4 GEMV-many coverage and perf evidence for the supported backend/codebook matrix; then continue matrix-driven benchmark work until remaining supported domains show concrete speedups or documented blockers with traces. |
 
 Note: CTest wraps these unit and integration binaries in `mpirun -np 1` in the current build. Inside the filesystem sandbox, PMIx socket setup can fail before test assertions. The CTest evidence above was collected by running the same focused CTest commands outside the sandbox; direct focused binaries were used only as the first debugging step where noted.
 
@@ -1262,6 +1263,7 @@ Rollout controls:
 - Enable dynamic MoE rebalance with prefix/MTP only after Phase 8 domain-scoped participant, placement epoch, and histogram tests pass.
 - Enable LocalTP or GlobalTP prefix cache only after the Phase 10 common-prefix coordination tests pass.
 - Enable MTP on single-device dense runners only after Phase 13 single-device parity passes.
+- Consider MTP speedup or default-enablement claims only after the relevant backend passes Phase 13.5 small-M GEMV-many gates.
 - Enable MTP on TP runners only after Phase 11 parity passes for the relevant TP scope.
 - Enable MTP on MoE/ExpertParallel runners only after Phase 12 and Phase 13 MoE parity pass.
 - Enable ExpertParallel graph-captured sparse overlay paths only after Phase 12 segmented-capture tests and Phase 14 benchmarks pass.
@@ -1715,11 +1717,127 @@ ctest --test-dir build_v2_integration -R "^V2_Integration_Parity_.*Qwen36" --out
 - ExpertParallel segmented graph-capture parity passes before enabling graph-captured sparse overlay paths.
 - Accepted token streams are identical to greedy main-model output for every tested MTP topology.
 
+## Phase 13.5: Small-M GEMV-Many Kernel Prerequisite
+
+### Goal
+
+Make the verifier kernel path needed for Phase 14 MTP speedups a first-class backend contract instead of a benchmark-side tuning detail. Quantized GEMV must support small verifier batches `M in {2, 3, 4}` by quantizing activations once, running many projections, and staying graph-capturable on GPU.
+
+This phase is a prerequisite to returning to Phase 14. Correctness-green MTP graph capture is already possible on some paths, but the current ROCm evidence shows that the captured verifier remains too expensive without deeper GEMV work.
+
+### Implementation Details
+
+Add or formalize a small-M GEMV-many path in the quantized GEMM interface:
+
+```cpp
+struct SmallMGemvProjection
+{
+    ITensorGemm *kernel = nullptr;
+    TensorBase *output = nullptr;
+    const TensorBase *bias = nullptr;
+    int n = 0;
+    const char *name = nullptr;
+};
+
+struct SmallMGemvManyRequest
+{
+    const TensorBase *input = nullptr;
+    std::span<const SmallMGemvProjection> projections;
+    int m = 0; // supported: 2, 3, 4
+    int k = 0;
+    DeviceWorkspaceManager *workspace = nullptr;
+};
+```
+
+The exact API can reuse `multiply_fused_tensor()` if that remains the cleanest local shape, but the behavior must be explicit and testable:
+
+- `M=2`, `M=3`, and `M=4` dispatch through a small-M GEMV route, not generic prefill GEMM.
+- Activations are quantized once per input row block and shared across all projections.
+- Fused QKV, fused Gate/Up, GDN QKV/Z/A/B projections, FFN down, LM head, and MoE expert gate/up/down shapes are covered where those projections appear in MTP verifier or sidecar paths.
+- GPU paths are graph capturable: no hot-path allocation, no host synchronization, no pointer-shape mutation, no pageable host staging, and no fallback to uncaptured per-row streams during capture.
+- Tensor movement and mapped-output staging use existing graph-stage contracts, `TransferEngine`, or preallocated workspace buffers. Do not mutate tensor placement/coherence flags directly to make a kernel path appear valid.
+- Unsupported codebooks or dimensions fail loudly in focused tests and real inference instead of falling back to a misleading slower path.
+
+Support the full quantized codebook inventory:
+
+| Family | Codebooks |
+|--------|-----------|
+| Q-quants | `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q8_1` where present |
+| K-quants | `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `Q6_K`, `Q8_K` where present |
+| IQ-quants | `IQ4_NL`, `IQ4_XS`, `IQ3_S`, `IQ3_XXS`, `IQ2_S`, `IQ2_XS`, `IQ2_XXS`, `IQ1_S`, `IQ1_M` |
+
+Backend work:
+
+- ROCm first: extend `ROCmGemvKernel_native_VNNI.hip`, `ROCmGemvKernel_INT8_VNNI.hip`, and `ROCmQuantisedGemmKernel.cpp` so Qwen3.6 verifier shapes use graph-capturable M=2/3/4 GEMV-many for every supported codebook. The current M=2 Q4/Q4_K route and shared fused activation quantization are starting evidence, not the end state.
+- CUDA second: generalize the existing native M=2 verifier route to M=3/4 and the full codebook set, preserving the graph-native speedup already observed for dense and MoE SingleDevice CUDA.
+- CPU third: add equivalent small-M fused activation quantization and GEMV-many paths in `CPUNativeVNNIGemmKernel`/native codebook kernels so NodeLocalTP and CPU SingleDevice MTP do not rely on generic small prefill behavior.
+
+Shape coverage should match inference, not only synthetic square cases:
+
+- Dense Qwen3.6 27B projections: GDN projection dimensions, QKV, Gate/Up, FFN Down, and LM Head.
+- MoE Qwen3.6 35B projections: router, routed expert Gate/Up/Down, shared expert paths, and LM Head.
+- TP-sharded variants for LocalTP/NodeLocalTP where `N` is split.
+- `M=2` for depth-1 MTP verifier, plus `M=3/4` for future deeper draft verification and grouped verifier replay.
+
+Current active slice:
+
+1. Resume ROCm SingleDevice dense work.
+2. Expand ROCm small-M native/int8 VNNI kernels from Q4-focused M=2 to all-codebook M=2/3/4.
+3. Prove graph-captured fused projection paths with focused ROCm integration tests.
+4. Add first-class ROCm small-M GEMV-many performance rows and update Phase 13.5 status with measured latency/throughput before re-running Phase 14 MTP benchmarks.
+
+### Files
+
+- `src/v2/tensors/TensorKernels.h`
+- `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
+- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
+- `src/v2/kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip`
+- `src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp`
+- `src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu`
+- `src/v2/kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h`
+- `src/v2/execution/compute_stages/stages/FusedQKVGEMMStage.cpp`
+- `src/v2/execution/compute_stages/stages/FusedGateUpGEMMStage.cpp`
+- `src/v2/execution/compute_stages/stages/GDNProjectionStage.cpp`
+- `tests/v2/integration/kernels/rocm/Test__ROCmQuantisedGemmSmallM.cpp`
+- `tests/v2/integration/kernels/cuda/Test__CUDAGemmParity.cpp`
+- `tests/v2/unit/kernels/` CPU small-M regression tests.
+- `tests/v2/performance/kernels/rocm/`
+- `tests/v2/performance/kernels/cuda/gemm/`
+- `tests/v2/performance/kernels/cpu/native_vnni/`
+
+### Tests
+
+- Unit or integration correctness tests for every supported codebook at `M=2`, `M=3`, and `M=4`.
+- Fused GEMV-many versus separate projection parity for QKV, Gate/Up, GDN QKV/Z/A/B, FFN Down, LM Head, and MoE expert projection shapes.
+- GPU graph-capture tests for ROCm and CUDA small-M fused paths: capture, instantiate, replay, compare to uncaptured output, and assert no manual fallback path was used.
+- Regression tests for every crash or wrong-output issue found while running real-model smokes.
+- Perf tests that run as first-class `Perf__` coverage, not ad hoc benchmark notes:
+
+```bash
+cmake --build build_v2_release --parallel
+ctest --test-dir build_v2_release -R "^V2_Perf_.*(ROCm|CUDA|CPU).*QuantisedGemm.*SmallM|^V2_Perf_.*NativeVNNI.*SmallM" --output-on-failure --parallel
+```
+
+Focused correctness command shape:
+
+```bash
+cmake --build build_v2_integration --parallel
+ctest --test-dir build_v2_integration -R "^V2_Integration_ROCmQuantisedGemmSmallM|^V2_Integration_CUDAGemmParity|^V2_Unit_.*NativeVNNI.*SmallM" --output-on-failure --parallel
+```
+
+### Exit Criteria
+
+- ROCm, CUDA, and CPU expose a deliberate small-M GEMV-many path for `M=2/3/4`.
+- Every supported Q/K/IQ codebook has correctness coverage for `M=2/3/4`, or an explicit hard-fail test documents why the codebook is not present for that backend.
+- ROCm and CUDA small-M fused paths are graph-capturable and replay correctly.
+- Perf tests report latency for inference-shaped projections and prove whether each backend is using the intended small-M route.
+- Phase 14 MTP benchmark work resumes only after the backend required for the next benchmark row has passed this phase's correctness and perf gates.
+
 ## Phase 14: Benchmark Acceptance And Default-Enablement Readiness
 
 ### Goal
 
-Measure whether prefix cache and MTP provide real speedups on the supported correctness matrix, and define the evidence needed before any future default enablement.
+Measure whether prefix cache and MTP provide real speedups on the supported correctness matrix, after the Phase 13.5 small-M GEMV-many prerequisite has landed for the backend under test, and define the evidence needed before any future default enablement.
 
 ### Implementation Details
 
@@ -1761,6 +1879,7 @@ Acceptance targets before considering default enablement:
 - RAM prefix hit shows a real prefill speedup on long shared prompts, with matched-token and timing counters proving prefill was skipped rather than hidden by measurement noise.
 - Device-hot tier is faster than RAM hydrate for GPU restore or is documented as not worth enabling for that backend.
 - Disk warm path improves repeated process startup or cross-process reuse workloads, or remains opt-in only.
+- MTP decode benchmarks must identify the Phase 13.5 small-M GEMV-many route used for the verifier backend/codebook mix.
 - Dense MTP target is approximately 2x decode throughput versus disabled on Qwen3.6 27B for the supported GPU backend.
 - MoE MTP target is approximately 1.5x decode throughput versus disabled on Qwen3.6 35B MoE for the supported ExpertParallel topology.
 - Prefix plus MTP must not regress versus the faster of prefix-only and MTP-only for the benchmarked prompt class without an explicit documented reason.
@@ -1847,4 +1966,5 @@ Then proceed in this order:
 11. Phase 11 TP-compatible dense MTP sidecar.
 12. Phase 12 ExpertParallel sparse-MoE MTP sidecar plus segmented overlay graph capture.
 13. Phase 13 PyTorch parity matrix.
-14. Phase 14 benchmark acceptance matrix.
+14. Phase 13.5 small-M GEMV-many kernel prerequisite, ROCm first, then CUDA and CPU.
+15. Phase 14 benchmark acceptance matrix.

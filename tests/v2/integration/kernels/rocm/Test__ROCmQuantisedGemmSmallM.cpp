@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -34,6 +35,17 @@ namespace
     {
         INT8VNNI,
         NativeVNNI,
+    };
+
+    using WeightCreator = std::function<std::unique_ptr<TensorBase>(
+        const std::vector<size_t> &shape,
+        uint32_t seed)>;
+
+    struct NativeFormatCase
+    {
+        const char *label;
+        WeightCreator create;
+        float min_cosine;
     };
 
     class ScopedEnv
@@ -143,17 +155,58 @@ namespace
         }
     }
 
+    std::vector<NativeFormatCase> nativeFormatCases()
+    {
+        return {
+            {"Q4_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_0Random(shape, seed); }, 0.985f},
+            {"Q4_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_1Random(shape, seed); }, 0.985f},
+            {"Q5_0", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_0Random(shape, seed); }, 0.985f},
+            {"Q5_1", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_1Random(shape, seed); }, 0.985f},
+            {"Q6_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ6_KRandom(shape, seed); }, 0.985f},
+            {"Q3_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ3_KRandom(shape, seed); }, 0.985f},
+            {"Q2_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ2_KRandom(shape, seed); }, 0.985f},
+            {"Q4_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ4_KRandom(shape, seed); }, 0.985f},
+            {"Q5_K", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createQ5_KRandom(shape, seed); }, 0.985f},
+            {"IQ4_NL", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }, 0.985f},
+            {"IQ4_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }, 0.985f},
+            {"IQ3_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ3_SRandom(shape, seed); }, 0.985f},
+            {"IQ3_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ3_XXSRandom(shape, seed); }, 0.985f},
+            {"IQ2_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_SRandom(shape, seed); }, 0.985f},
+            {"IQ2_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_XSRandom(shape, seed); }, 0.985f},
+            {"IQ2_XXS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ2_XXSRandom(shape, seed); }, 0.985f},
+            {"IQ1_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ1_SRandom(shape, seed); }, 0.985f},
+            {"IQ1_M", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<TensorBase>
+             { return TestTensorFactory::createIQ1_MRandom(shape, seed); }, 0.985f},
+        };
+    }
+
     template <typename CreateWeights>
-    void runDispatchM2MatchesReference(
+    void runDispatchSmallMMatchesReference(
         const char *label,
+        int M,
         int N,
         int K,
         PackedPath expected_path,
         CreateWeights createWeights,
         float min_cosine)
     {
-        const int M = 2;
-
         auto weights = createWeights(
             {static_cast<size_t>(N), static_cast<size_t>(K)},
             42);
@@ -184,21 +237,21 @@ namespace
         cpuFP32GemmRef(input->data(), W_fp32.data(), ref.data(), M, N, K);
 
         const float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
-        LOG_INFO("[SmallM] " << label << " M=2 cosine=" << cos);
+        LOG_INFO("[SmallM] " << label << " M=" << M << " cosine=" << cos);
         EXPECT_GT(cos, min_cosine);
 
         kernel.unbindWorkspace();
     }
 
     template <typename CreateWeights>
-    void runFusedQKVM2MatchesSeparate(
+    void runFusedQKVSmallMMatchesSeparate(
         const char *label,
+        int M,
         int K,
         PackedPath expected_path,
         CreateWeights createWeights,
         float min_cosine)
     {
-        const int M = 2;
         const int Nq = 896;
         const int Nk = 128;
         const int Nv = 128;
@@ -285,7 +338,7 @@ namespace
         const float k_cos = cosineSim(fused_k->data(), separate_k->data(), static_cast<size_t>(M) * Nk);
         const float v_cos = cosineSim(fused_v->data(), separate_v->data(), static_cast<size_t>(M) * Nv);
 
-        LOG_INFO("[SmallM] " << label << " fused QKV M=2 cosine q="
+        LOG_INFO("[SmallM] " << label << " fused QKV M=" << M << " cosine q="
                              << q_cos << " k=" << k_cos << " v=" << v_cos);
         EXPECT_GT(q_cos, min_cosine);
         EXPECT_GT(k_cos, min_cosine);
@@ -298,15 +351,14 @@ namespace
 
 #ifdef HAVE_ROCM
     template <typename CreateWeights>
-    void runGraphCapturedDispatchM2MatchesReference(
+    void runGraphCapturedDispatchSmallMMatchesReference(
         const char *label,
+        int M,
         int N,
         int K,
         CreateWeights createWeights,
         float min_cosine)
     {
-        const int M = 2;
-
         auto weights = createWeights(
             {static_cast<size_t>(N), static_cast<size_t>(K)},
             777);
@@ -353,7 +405,7 @@ namespace
         cpuFP32GemmRef(input->data(), W_fp32.data(), ref.data(), M, N, K);
 
         const float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
-        LOG_INFO("[SmallM] " << label << " graph-captured M=2 cosine=" << cos);
+        LOG_INFO("[SmallM] " << label << " graph-captured M=" << M << " cosine=" << cos);
         EXPECT_GT(cos, min_cosine);
 
         if (exec)
@@ -374,8 +426,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80M2MatchesReference)
 
     const int N = 896;
     const int K = 896;
-    runDispatchM2MatchesReference(
+    runDispatchSmallMMatchesReference(
         "Q8_0 INT8-VNNI",
+        2,
         N,
         K,
         PackedPath::INT8VNNI,
@@ -391,14 +444,59 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2MatchesReference)
 
     const int N = 896;
     const int K = 1024;
-    runDispatchM2MatchesReference(
+    runDispatchSmallMMatchesReference(
         "Q4_K native-VNNI",
+        2,
         N,
         K,
         PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.985f);
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80SmallMMatchesReference)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const int N = 512;
+    const int K = 1024;
+    for (int M : {2, 3, 4})
+    {
+        runDispatchSmallMMatchesReference(
+            "Q8_0 INT8-VNNI small-M sweep",
+            M,
+            N,
+            K,
+            PackedPath::INT8VNNI,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ8_0Random(shape, seed); },
+            0.985f);
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, DispatchNativeSmallMAllCodebooksMatchReference)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const int N = 512;
+    const int K = 1024;
+    for (const auto &format : nativeFormatCases())
+    {
+        for (int M : {2, 3, 4})
+        {
+            runDispatchSmallMMatchesReference(
+                format.label,
+                M,
+                N,
+                K,
+                PackedPath::NativeVNNI,
+                format.create,
+                format.min_cosine);
+        }
+    }
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2RecordsNativeRouteCounter)
@@ -411,8 +509,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2RecordsNativeRouteCounter)
 
     const int N = 896;
     const int K = 1024;
-    runDispatchM2MatchesReference(
+    runDispatchSmallMMatchesReference(
         "Q4_K native-VNNI counter",
+        2,
         N,
         K,
         PackedPath::NativeVNNI,
@@ -442,6 +541,53 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2RecordsNativeRouteCounter)
     PerfStatsCollector::reset();
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ5KSmallMRecordsNativeRouteCounter)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const int M = 4;
+    const int N = 512;
+    const int K = 1024;
+    runDispatchSmallMMatchesReference(
+        "Q5_K native-VNNI small-M counter",
+        M,
+        N,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+        0.985f);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    auto route_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [M, N, K](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == std::to_string(N) &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == std::to_string(K);
+        });
+
+    ASSERT_NE(route_record, records.end())
+        << "Q5_K M=4 verifier GEMM must use the graph-native ROCm small-M native route";
+    EXPECT_GE(route_record->value, 1.0);
+    EXPECT_EQ(route_record->device, "rocm:0");
+    EXPECT_EQ(route_record->tags.at("codebook"), "7");
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, ConcurrentDispatchQ4KM2MatchesReference)
 {
     if (!hasROCmDevice())
@@ -451,8 +597,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, ConcurrentDispatchQ4KM2MatchesReference)
 
     const int N = 896;
     const int K = 1024;
-    runDispatchM2MatchesReference(
+    runDispatchSmallMMatchesReference(
         "Q4_K native-VNNI concurrent rows",
+        2,
         N,
         K,
         PackedPath::NativeVNNI,
@@ -461,7 +608,7 @@ TEST(Test__ROCmQuantisedGemmSmallM, ConcurrentDispatchQ4KM2MatchesReference)
         0.985f);
 }
 
-TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedDispatchQ4KM2MatchesReference)
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedDispatchQ4KSmallMMatchesReference)
 {
     if (!hasROCmDevice())
         GTEST_SKIP() << "No ROCm device available";
@@ -469,13 +616,39 @@ TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedDispatchQ4KM2MatchesReference)
 #ifdef HAVE_ROCM
     const int N = 896;
     const int K = 1024;
-    runGraphCapturedDispatchM2MatchesReference(
-        "Q4_K native-VNNI",
-        N,
-        K,
-        [](const std::vector<size_t> &shape, uint32_t seed)
-        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
-        0.985f);
+    for (int M : {2, 3, 4})
+    {
+        runGraphCapturedDispatchSmallMMatchesReference(
+            "Q4_K native-VNNI",
+            M,
+            N,
+            K,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+            0.985f);
+    }
+#endif
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedDispatchIQ3SSmallMMatchesReference)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifdef HAVE_ROCM
+    const int N = 512;
+    const int K = 1024;
+    for (int M : {3, 4})
+    {
+        runGraphCapturedDispatchSmallMMatchesReference(
+            "IQ3_S native-VNNI",
+            M,
+            N,
+            K,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createIQ3_SRandom(shape, seed); },
+            0.985f);
+    }
 #endif
 }
 
@@ -485,8 +658,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ80QKVM2MatchesSeparate)
         GTEST_SKIP() << "No ROCm device available";
 
     const int K = 896;
-    runFusedQKVM2MatchesSeparate(
+    runFusedQKVSmallMMatchesSeparate(
         "Q8_0 INT8-VNNI",
+        2,
         K,
         PackedPath::INT8VNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
@@ -500,13 +674,116 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2MatchesSeparate)
         GTEST_SKIP() << "No ROCm device available";
 
     const int K = 1024;
-    runFusedQKVM2MatchesSeparate(
+    runFusedQKVSmallMMatchesSeparate(
         "Q4_K native-VNNI",
+        2,
         K,
         PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.9999f);
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMMatchesSeparate)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const int K = 1024;
+    for (int M : {3, 4})
+    {
+        runFusedQKVSmallMMatchesSeparate(
+            "Q5_K native-VNNI",
+            M,
+            K,
+            PackedPath::NativeVNNI,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+            0.9999f);
+    }
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedQ5KQKVSmallMRecordsSharedQuantizedNativeRoute)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const int M = 4;
+    const int K = 1024;
+    runFusedQKVSmallMMatchesSeparate(
+        "Q5_K native-VNNI shared small-M quant counter",
+        M,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+        0.9999f);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    auto shared_quant_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [M, K](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_fused_small_m_shared_quant_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.count("projections") != 0 &&
+                   record.tags.at("projections") == "3";
+        });
+
+    ASSERT_NE(shared_quant_record, records.end())
+        << "Fused Q5_K M=4 QKV must quantize activations once before projection dispatch";
+    EXPECT_GE(shared_quant_record->value, 1.0);
+    EXPECT_EQ(shared_quant_record->device, "rocm:0");
+
+    double shared_native_projection_calls = 0.0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "rocm_native_vnni_small_m_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.count("m") != 0 &&
+            record.tags.at("m") == std::to_string(M) &&
+            record.tags.count("shared_quant") != 0 &&
+            record.tags.at("shared_quant") == "true")
+        {
+            shared_native_projection_calls += record.value;
+        }
+    }
+    if (shared_native_projection_calls < 3.0)
+    {
+        for (const auto &record : records)
+        {
+            if (record.domain != "kernel" ||
+                record.name.find("rocm_native_vnni") == std::string::npos)
+            {
+                continue;
+            }
+            std::string tags;
+            for (const auto &tag : record.tags)
+            {
+                if (!tags.empty())
+                    tags += ",";
+                tags += tag.first + "=" + tag.second;
+            }
+            LOG_INFO("[SmallM] observed counter name=" << record.name
+                     << " value=" << record.value
+                     << " device=" << record.device
+                     << " tags=" << tags);
+        }
+    }
+    EXPECT_GE(shared_native_projection_calls, 3.0)
+        << "Fused QKV M=4 should dispatch Q, K, and V through the shared-quant native route";
+
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2RecordsSharedQuantizedNativeRoute)
@@ -518,8 +795,9 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQKVM2RecordsSharedQuantizedNativeRou
     PerfStatsCollector::reset();
 
     const int K = 1024;
-    runFusedQKVM2MatchesSeparate(
+    runFusedQKVSmallMMatchesSeparate(
         "Q4_K native-VNNI shared quant counter",
+        2,
         K,
         PackedPath::NativeVNNI,
         [](const std::vector<size_t> &shape, uint32_t seed)

@@ -77,6 +77,10 @@ namespace
     /// Correctness gate: cosine similarity between native-VNNI and FP32 reference
     constexpr float COSINE_SIM_GATE = 0.9999f;
 
+    /// Small-M verifier paths compare against quantized-activation output, so use
+    /// the same practical gate as focused integration regressions.
+    constexpr float MTP_SMALL_M_COSINE_GATE = 0.985f;
+
     /// Performance gate: speedup over INT8 GEMM baseline (grand total average)
     constexpr float SPEEDUP_GATE = 1.0f;
 
@@ -142,6 +146,9 @@ namespace
     /// Sequence lengths to benchmark (typical prefill sizes)
     static const std::vector<int> M_VALUES = {32, 64, 128, 256};
 
+    /// MTP verifier batch sizes exercised by the Phase 13.5 small-M route.
+    static const std::vector<int> MTP_SMALL_M_VALUES = {2, 3, 4};
+
     // Qwen2.5-0.5B:  hidden=896,  intermediate=4864
     // Qwen2.5-3B:    hidden=2048, intermediate=11008
     // Qwen2.5-7B:    hidden=3584, intermediate=18944
@@ -161,6 +168,10 @@ namespace
         {"7B_FFN_Up", 18944, 3584},
         {"7B_FFN_Dn", 3584, 18944},
         {"7B_LM_Head", 151936, 3584},
+    };
+
+    static const std::vector<GEMMShape> MTP_SMALL_M_SHAPES = {
+        {"Qwen36_MTP_HiddenProjection", 5120, 5120},
     };
 
     // =============================================================================
@@ -1114,6 +1125,107 @@ namespace
                     << " cosine=" << r.cosine_sim;
             }
             table << fort::separator;
+        }
+
+        fprintf(stderr, "\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(NativeVNNIGEMMPerfTest, MTP_SmallM_VerifierShapes_AllFormats)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device available";
+
+        fprintf(stderr, "\n[NativeVNNI GEMM] Phase 13.5 MTP small-M verifier benchmark\n");
+        fprintf(stderr, "[NativeVNNI GEMM] Device: %s\n", device_name_.c_str());
+        fprintf(stderr, "[NativeVNNI GEMM] Formats: %zu, Shapes: %zu, M values: %zu\n",
+                GEMM_FORMATS.size(), MTP_SMALL_M_SHAPES.size(), MTP_SMALL_M_VALUES.size());
+        fprintf(stderr, "[NativeVNNI GEMM] Correctness gate: cosine >= %.4f\n",
+                MTP_SMALL_M_COSINE_GATE);
+
+        struct SmallMResult
+        {
+            GEMMBenchResult result;
+        };
+
+        std::vector<SmallMResult> results;
+        results.reserve(GEMM_FORMATS.size() * MTP_SMALL_M_SHAPES.size() * MTP_SMALL_M_VALUES.size());
+
+        for (const auto &shape : MTP_SMALL_M_SHAPES)
+        {
+            std::unordered_map<int, double> int8_refs;
+            for (int M : MTP_SMALL_M_VALUES)
+            {
+                const double ref_us = benchmarkINT8GEMMReference(M, shape.N, shape.K, 0);
+                int8_refs[M] = ref_us;
+                fprintf(stderr, "  INT8 ref %s M=%d: %.1f μs\n",
+                        shape.name.c_str(), M, ref_us);
+            }
+
+            for (const auto &fmt : GEMM_FORMATS)
+            {
+                auto weights = fmt.create(
+                    static_cast<size_t>(shape.N),
+                    static_cast<size_t>(shape.K));
+
+                GpuWeightsCache gpu_w;
+                if (weights)
+                {
+                    const float *w_fp32 = weights->data();
+                    if (w_fp32)
+                        gpu_w.upload(w_fp32, shape.N, shape.K, 0);
+                }
+
+                for (int M : MTP_SMALL_M_VALUES)
+                {
+                    auto r = benchmarkGEMM(
+                        fmt, shape, M, int8_refs[M], weights.get(), &gpu_w, 0);
+                    r.correctness_pass = (r.cosine_sim >= MTP_SMALL_M_COSINE_GATE);
+                    results.push_back({std::move(r)});
+
+                    const auto &last = results.back().result;
+                    fprintf(stderr, "  %s/%s M=%d: %.1f μs speedup=%.2fx cosine=%.6f\n",
+                            last.format_name.c_str(), last.shape_name.c_str(), last.M,
+                            last.min_us, last.speedup_vs_int8, last.cosine_sim);
+                }
+            }
+        }
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header
+              << "Format" << "Shape" << "M"
+              << "NVNNI μs" << "INT8 μs" << "Speedup"
+              << "GFLOPS" << "Cosine" << "Gate" << fort::endr;
+
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        table.column(1).set_cell_text_align(fort::text_align::left);
+        for (int c = 2; c <= 8; ++c)
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        for (const auto &entry : results)
+        {
+            const auto &r = entry.result;
+            char b_m[8], b_min[16], b_int8[16], b_speedup[16], b_gflops[16], b_cos[16];
+            snprintf(b_m, sizeof(b_m), "%d", r.M);
+            snprintf(b_min, sizeof(b_min), "%.1f", r.min_us);
+            snprintf(b_int8, sizeof(b_int8), "%.1f", r.int8_min_us);
+            snprintf(b_speedup, sizeof(b_speedup), "%.2fx", r.speedup_vs_int8);
+            snprintf(b_gflops, sizeof(b_gflops), "%.0f", r.gflops);
+            snprintf(b_cos, sizeof(b_cos), "%.6f", r.cosine_sim);
+
+            table << r.format_name << r.shape_name << b_m
+                  << b_min << b_int8 << b_speedup
+                  << b_gflops << b_cos
+                  << (r.correctness_pass ? "PASS" : "COS FAIL")
+                  << fort::endr;
+
+            EXPECT_GE(r.cosine_sim, MTP_SMALL_M_COSINE_GATE)
+                << r.format_name << " " << r.shape_name << " M=" << r.M
+                << " cosine=" << r.cosine_sim;
         }
 
         fprintf(stderr, "\n%s\n", table.to_string().c_str());
