@@ -1813,6 +1813,92 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFai
     EXPECT_EQ(snapshot.mtp_rollbacks, 0u);
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalPPMTPHardFailsBeforePrefill)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+    });
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalPP MTP hard-fail smoke";
+    }
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = 32;
+    config.batch_size = 1;
+    config.tp_degree = 1;
+    config.pp_degree = 2;
+    config.pp_split = PPSplitMode::MANUAL;
+    config.kv_cache_precision = "auto";
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+
+    config.domain_definitions.clear();
+    config.pp_stage_definitions = {
+        PPStageDefinition{0, "stage0", 0, 31},
+        PPStageDefinition{1, "stage1", 32, 63},
+    };
+
+    DomainDefinition stage0;
+    stage0.name = "stage0";
+    stage0.devices = {GlobalDeviceAddress::rocm(0)};
+    stage0.scope = TPScope::LOCAL;
+    stage0.owner_rank = 0;
+    stage0.backend = CollectiveBackendType::AUTO;
+    config.domain_definitions.push_back(std::move(stage0));
+
+    DomainDefinition stage1;
+    stage1.name = "stage1";
+    stage1.devices = {GlobalDeviceAddress::rocm(1)};
+    stage1.scope = TPScope::LOCAL;
+    stage1.owner_rank = 0;
+    stage1.backend = CollectiveBackendType::AUTO;
+    config.domain_definitions.push_back(std::move(stage1));
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    auto tokenizer = runner->tokenizer();
+    ASSERT_NE(tokenizer, nullptr);
+    const auto encoded = tokenizer->encode("Paris is", /*add_bos=*/false, /*add_eos=*/false);
+    ASSERT_FALSE(encoded.empty());
+    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    auto result = runner->generate(prompt, 1, greedy);
+    const auto snapshot = runner->prefixStateProbe();
+    runner->shutdown();
+
+    ASSERT_FALSE(result.error.empty());
+    EXPECT_TRUE(result.tokens.empty());
+    EXPECT_NE(result.error.find("MTP is not enabled for PP topologies"), std::string::npos)
+        << result.error;
+    EXPECT_NE(result.error.find("disable MTP or use a supported SingleDevice/TP topology"), std::string::npos)
+        << result.error;
+    EXPECT_EQ(snapshot.mtp_draft_steps, 0u);
+    EXPECT_EQ(snapshot.mtp_verifier_runs, 0u);
+    EXPECT_EQ(snapshot.mtp_rollbacks, 0u);
+}
+
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
 {
     ScopedDebugEnv env({
