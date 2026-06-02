@@ -162,6 +162,49 @@ TEST(Test__HiddenStateRowSelectStage, GPUWorkspaceRequirementsDeclareSelectedRow
     EXPECT_TRUE(reqs.buffers[0].required);
 }
 
+TEST(Test__HiddenStateRowSelectStage, ReplayRowUpdateKeepsDeclaredWorkspaceNameStable)
+{
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 8;
+    params.d_model = 32;
+    params.selected_row_idx = 1;
+    HiddenStateRowSelectStage stage(params);
+
+    const WorkspaceRequirements before = stage.getWorkspaceRequirements(8, 32, 0);
+    ASSERT_EQ(before.buffers.size(), 1u);
+    stage.setSelectedRowForReplay(5);
+    EXPECT_EQ(stage.selectedRowForTesting(), 5);
+    const WorkspaceRequirements after = stage.getWorkspaceRequirements(8, 32, 0);
+    ASSERT_EQ(after.buffers.size(), 1u);
+    EXPECT_EQ(before.buffers[0].name, after.buffers[0].name);
+
+    stage.setSelectedRowForReplay(99);
+    EXPECT_EQ(stage.selectedRowForTesting(), 7);
+    const WorkspaceRequirements clamped = stage.getWorkspaceRequirements(8, 32, 0);
+    ASSERT_EQ(clamped.buffers.size(), 1u);
+    EXPECT_EQ(before.buffers[0].name, clamped.buffers[0].name);
+}
+
+TEST(Test__HiddenStateRowSelectStage, UsesExplicitStableWorkspaceBufferName)
+{
+    HiddenStateRowSelectStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 8;
+    params.d_model = 32;
+    params.workspace_buffer_name = "mtp_terminal_hidden_selected_row";
+    HiddenStateRowSelectStage stage(params);
+
+    const WorkspaceRequirements reqs = stage.getWorkspaceRequirements(8, 32, 0);
+    ASSERT_EQ(reqs.buffers.size(), 1u);
+    EXPECT_EQ(reqs.buffers[0].name, "mtp_terminal_hidden_selected_row");
+
+    stage.setSelectedRowForReplay(3);
+    const WorkspaceRequirements after = stage.getWorkspaceRequirements(8, 32, 0);
+    ASSERT_EQ(after.buffers.size(), 1u);
+    EXPECT_EQ(after.buffers[0].name, "mtp_terminal_hidden_selected_row");
+}
+
 TEST(Test__HiddenStateRowSelectStage, LMHeadUsesScratchOffsetZeroWhenSelectedRowChanges)
 {
     const int bucket_seq_len = 7;

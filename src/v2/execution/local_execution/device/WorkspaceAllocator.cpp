@@ -41,6 +41,29 @@ namespace llaminar2
                                      << " total_mib=" << (total_bytes / (1024 * 1024))
                                      << " bytes=" << bytes);
         }
+
+        bool synchronizeBeforeWorkspaceRelease(DeviceId device)
+        {
+            if (!device.is_gpu())
+                return true;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+            {
+                LOG_ERROR("[WorkspaceAllocator] Cannot synchronize " << device.toString()
+                                                                      << " before workspace release: backend unavailable");
+                return false;
+            }
+
+            const int device_idx = device.gpu_ordinal();
+            if (!backend->synchronize(device_idx))
+            {
+                LOG_ERROR("[WorkspaceAllocator] Failed to synchronize " << device.toString()
+                                                                        << " before workspace release");
+                return false;
+            }
+            return true;
+        }
     }
 
     // =========================================================================
@@ -348,6 +371,11 @@ namespace llaminar2
                 for (const auto &consumer_binding : consumers)
                 {
                     consumer_binding.consumer->bindWorkspace(nullptr);
+                }
+
+                if (!synchronizeBeforeWorkspaceRelease(device))
+                {
+                    return false;
                 }
 
                 existing->second->release();

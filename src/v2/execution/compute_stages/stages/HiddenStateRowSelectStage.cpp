@@ -66,6 +66,8 @@ namespace llaminar2
 
     std::string HiddenStateRowSelectStage::selectedRowScalarBufferName() const
     {
+        if (!params_.workspace_buffer_name.empty())
+            return params_.workspace_buffer_name;
         return std::string(WS_SELECTED_ROW_SCALAR) + "_" + std::to_string(workspace_slice_id_);
     }
 
@@ -99,7 +101,12 @@ namespace llaminar2
         // fall back to the captured bucket shape so exact legacy paths still use
         // the final bucket row.
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
-        selected_row_idx_ = normalizeSelectedRow(real_seq_len - 1);
+        setSelectedRowForReplay(real_seq_len - 1);
+    }
+
+    void HiddenStateRowSelectStage::setSelectedRowForReplay(int selected_row_idx)
+    {
+        selected_row_idx_ = normalizeSelectedRow(selected_row_idx);
         refreshPinnedSelectedRow();
     }
 

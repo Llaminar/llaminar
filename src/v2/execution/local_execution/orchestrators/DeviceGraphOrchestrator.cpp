@@ -1013,6 +1013,7 @@ namespace llaminar2
                 forward_engine_->clearCache();
             mtp_sidecar_depth0_cache_.invalidate();
             mtp_sidecar_depth0_kv_only_cache_.invalidate();
+            mtp_terminal_hidden_row_select_cache_.invalidate();
             for (auto &cache : layer_graph_cache_)
                 cache.invalidate();
             resetKernelDynamicState();
@@ -1917,7 +1918,8 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)
     {
         // Ensure GPU workspace is allocated for GEMM kernels
-        ensureDeviceWorkspaceAllocated(graph);
+        if (!ensureDeviceWorkspaceAllocated(graph))
+            return false;
         return executor_.execute(graph, ctx);
     }
 
@@ -2334,6 +2336,7 @@ namespace llaminar2
             forward_engine_->clearCache();
         mtp_sidecar_depth0_cache_.invalidate();
         mtp_sidecar_depth0_kv_only_cache_.invalidate();
+        mtp_terminal_hidden_row_select_cache_.invalidate();
 
         // Clear device contexts
         device_contexts_.clear();
@@ -3344,6 +3347,102 @@ namespace llaminar2
         return register_with_arena();
     }
 
+    bool DeviceGraphOrchestrator::executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len)
+    {
+        if (row_idx < 0 || row_idx >= seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP hidden row selection: row="
+                      << row_idx << " seq_len=" << seq_len);
+            return false;
+        }
+        if (!state_.hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden row without hidden-state buffer");
+            return false;
+        }
+        if (!ensureMTPTerminalHiddenBuffer())
+            return false;
+
+        if (state_.d_model <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden row with invalid d_model="
+                      << state_.d_model);
+            return false;
+        }
+
+        const size_t hidden_rows = state_.hidden->rows();
+        if (hidden_rows > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hidden-state row capacity exceeds int range: rows="
+                      << hidden_rows);
+            return false;
+        }
+        const int seq_capacity = static_cast<int>(hidden_rows);
+        if (seq_capacity < seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Hidden-state row-select capacity too small: capacity="
+                      << seq_capacity << " seq_len=" << seq_len);
+            return false;
+        }
+
+        auto &cache = mtp_terminal_hidden_row_select_cache_;
+        const bool rebuild =
+            !cache.valid ||
+            !cache.graph ||
+            !cache.stage ||
+            cache.input != state_.hidden.get() ||
+            cache.output != state_.prefix_terminal_hidden.get() ||
+            cache.device != state_.device_id ||
+            cache.seq_capacity != seq_capacity ||
+            cache.d_model != state_.d_model;
+
+        if (rebuild)
+        {
+            HiddenStateRowSelectStage::Params params;
+            params.device_id = state_.device_id;
+            params.input = state_.hidden.get();
+            params.output = state_.prefix_terminal_hidden.get();
+            params.seq_len = seq_capacity;
+            params.d_model = state_.d_model;
+            params.selected_row_idx = row_idx;
+            params.input_buffer_id = BufferId::HIDDEN_STATE;
+            params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
+            params.workspace_buffer_name =
+                std::string(HiddenStateRowSelectStage::WS_SELECTED_ROW_SCALAR) +
+                "_mtp_terminal_hidden";
+
+            auto stage = ComputeStageFactory::createHiddenStateRowSelect(params);
+            auto *row_select_stage = dynamic_cast<HiddenStateRowSelectStage *>(stage.get());
+            if (!row_select_stage)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] HiddenStateRowSelect factory returned an incompatible stage");
+                return false;
+            }
+
+            auto graph = std::make_unique<ComputeGraph>();
+            graph->addNode("mtp_terminal_hidden_row_select",
+                           std::move(stage),
+                           state_.device_id);
+
+            cache.graph = std::move(graph);
+            cache.stage = row_select_stage;
+            cache.input = state_.hidden.get();
+            cache.output = state_.prefix_terminal_hidden.get();
+            cache.device = state_.device_id;
+            cache.seq_capacity = seq_capacity;
+            cache.d_model = state_.d_model;
+            cache.valid = true;
+        }
+
+        cache.stage->setSelectedRowForReplay(row_idx);
+
+        IDeviceContext *ctx = getDeviceContext(state_.device_id);
+        if (!ctx)
+            return false;
+
+        return execute(*cache.graph, ctx);
+    }
+
     bool DeviceGraphOrchestrator::refreshMTPTerminalHiddenState(int seq_len, int batch_size)
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
@@ -3360,34 +3459,8 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] MTP terminal hidden capture currently supports batch_size=1 only");
             return false;
         }
-        if (!state_.hidden)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Cannot refresh MTP terminal hidden without hidden-state buffer");
-            return false;
-        }
-        if (!ensureMTPTerminalHiddenBuffer())
-            return false;
 
-        HiddenStateRowSelectStage::Params params;
-        params.device_id = state_.device_id;
-        params.input = state_.hidden.get();
-        params.output = state_.prefix_terminal_hidden.get();
-        params.seq_len = seq_len;
-        params.d_model = state_.d_model;
-        params.selected_row_idx = seq_len - 1;
-        params.input_buffer_id = BufferId::HIDDEN_STATE;
-        params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
-
-        ComputeGraph graph;
-        graph.addNode("mtp_terminal_hidden_row_select",
-                      ComputeStageFactory::createHiddenStateRowSelect(params),
-                      state_.device_id);
-
-        IDeviceContext *ctx = getDeviceContext(state_.device_id);
-        if (!ctx)
-            return false;
-
-        return execute(graph, ctx);
+        return executeMTPTerminalHiddenRowSelect(seq_len - 1, seq_len);
     }
 
     bool DeviceGraphOrchestrator::selectMTPTerminalHiddenRow(int row_idx, int seq_len)
@@ -3399,40 +3472,10 @@ namespace llaminar2
             "terminal_hidden_row_select",
             perfPhaseName(),
             state_.device_id.toString());
-        if (row_idx < 0 || row_idx >= seq_len)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP hidden row selection: row="
-                      << row_idx << " seq_len=" << seq_len);
-            return false;
-        }
-        if (!state_.hidden)
-        {
-            LOG_ERROR("[DeviceGraphOrchestrator] Cannot select MTP hidden row without hidden-state buffer");
-            return false;
-        }
-        if (!ensureMTPTerminalHiddenBuffer())
+        if (seq_len <= 0)
             return false;
 
-        HiddenStateRowSelectStage::Params params;
-        params.device_id = state_.device_id;
-        params.input = state_.hidden.get();
-        params.output = state_.prefix_terminal_hidden.get();
-        params.seq_len = seq_len;
-        params.d_model = state_.d_model;
-        params.selected_row_idx = row_idx;
-        params.input_buffer_id = BufferId::HIDDEN_STATE;
-        params.output_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
-
-        ComputeGraph graph;
-        graph.addNode("mtp_prefill_hidden_row_select",
-                      ComputeStageFactory::createHiddenStateRowSelect(params),
-                      state_.device_id);
-
-        IDeviceContext *ctx = getDeviceContext(state_.device_id);
-        if (!ctx)
-            return false;
-
-        return execute(graph, ctx);
+        return executeMTPTerminalHiddenRowSelect(row_idx, seq_len);
     }
 
     bool DeviceGraphOrchestrator::executeMTPDepth0(
@@ -5929,6 +5972,7 @@ namespace llaminar2
             forward_engine_->clearCache();
         mtp_sidecar_depth0_cache_.invalidate();
         mtp_sidecar_depth0_kv_only_cache_.invalidate();
+        mtp_terminal_hidden_row_select_cache_.invalidate();
 
         // Layer decode graphs can hold per-request stage/kernel state, so make
         // them rebuild after the request boundary.

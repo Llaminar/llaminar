@@ -55,6 +55,7 @@ namespace llaminar2
 
             std::optional<BufferId> input_buffer_id;  ///< Arena input binding, usually NORMALIZED.
             std::optional<BufferId> output_buffer_id; ///< Arena output binding, usually LM_HEAD_INPUT_ROW.
+            std::string workspace_buffer_name;        ///< Optional stable selected-row scalar buffer name.
         };
 
         explicit HiddenStateRowSelectStage(Params params);
@@ -90,6 +91,14 @@ namespace llaminar2
 
         /// @brief Return the currently selected source row, mainly for tests.
         int selectedRowForTesting() const { return selected_row_idx_; }
+
+        /**
+         * @brief Update the selected source row for direct graph replay users.
+         *
+         * The workspace buffer name and bound workspace remain stable; only the
+         * pinned scalar value consumed by the captured GPU row-select path changes.
+         */
+        void setSelectedRowForReplay(int selected_row_idx);
 
     private:
         struct GpuParamState;

@@ -1847,6 +1847,7 @@ namespace llaminar2
             }
             mtp_sidecar_depth0_cache_.invalidate();
             mtp_sidecar_depth0_kv_only_cache_.invalidate();
+            mtp_terminal_hidden_row_select_cache_.invalidate();
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();
@@ -2285,6 +2286,32 @@ namespace llaminar2
         MTPSidecarGraphCache mtp_sidecar_depth0_cache_;
         MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_cache_;
 
+        struct MTPTerminalHiddenRowSelectGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            HiddenStateRowSelectStage *stage = nullptr;
+            TensorBase *input = nullptr;
+            TensorBase *output = nullptr;
+            DeviceId device = DeviceId::invalid();
+            int seq_capacity = 0;
+            int d_model = 0;
+            bool valid = false;
+
+            void invalidate()
+            {
+                graph.reset();
+                stage = nullptr;
+                input = nullptr;
+                output = nullptr;
+                device = DeviceId::invalid();
+                seq_capacity = 0;
+                d_model = 0;
+                valid = false;
+            }
+        };
+
+        MTPTerminalHiddenRowSelectGraphCache mtp_terminal_hidden_row_select_cache_;
+
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)
         // =========================================================================
@@ -2515,6 +2542,9 @@ namespace llaminar2
 
         /// Ensure a stable one-row terminal hidden buffer exists for MTP sidecar input.
         bool ensureMTPTerminalHiddenBuffer();
+
+        /// Execute the cached graph-native row select used for MTP terminal hidden refresh.
+        bool executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len);
 
         /// Copy the latest forward pass terminal hidden row into the stable MTP input buffer.
         bool refreshMTPTerminalHiddenState(int seq_len, int batch_size);
