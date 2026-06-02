@@ -258,6 +258,22 @@ Latest ROCm dense evidence:
     `mtp_decode_catchup`, and `mtp_shifted_prefill`. This removes an old ROCm
     graph-capture workaround, but it is not the speedup lever: `main_verifier`
     still replays a 644-stage graph at about 97.95 ms per two-token verifier.
+- Phase 13.5 ROCm FP32 GDN alpha/beta batched SGEMM workspace slice:
+  - `ROCmFloatingPointGemmKernel` now exposes `IWorkspaceConsumer`
+    requirements for hipBLAS batched SGEMM pointer arrays. The graph path
+    supplies these through named `DeviceWorkspaceManager` buffers; the batched
+    route no longer performs ad hoc HIP allocations and hard-fails if workspace
+    is missing.
+  - `HipBLASGemmKernel` now wraps `hipblasSgemmBatched` for same-shape FP32
+    projection groups, allowing GDN alpha/beta-style `M=2/3/4` verifier
+    projections to share one hipBLAS call where their output `N` matches.
+  - Focused tests passed:
+    `Test__ROCmFloatingPointGemmKernel.GraphCapturedBatchedFusedProjectionAlphaBetaM2MatchesReference`,
+    `Test__ROCmFloatingPointGemmKernel.BatchedFusedProjectionRequiresWorkspace`,
+    `Test__ROCmFloatingPointGemmKernel.TensorInterface_Basic`,
+    `Test__ROCmQuantisedGemmSmallM.GraphCapturedFusedQ4KGDNProjectionM2MatchesSeparate`,
+    and
+    `Test__ROCmQuantisedGemmSmallM.GraphCapturedFusedQ4KQwen36GDNQkvZPairM2UsesHeterogeneousNBatchedRoute`.
 - Phase 13.5 fused-SwiGLU/FFN down small-M ROCm route:
   `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-baseline-n16.json`,
   `/tmp/llaminar-mtp-bench/dense-rocm-smallm-fusedswiglu-mtp-n16.json`,

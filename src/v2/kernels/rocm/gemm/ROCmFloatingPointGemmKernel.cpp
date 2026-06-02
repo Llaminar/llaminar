@@ -20,19 +20,28 @@
 #include "backends/ComputeBackend.h"   // DeviceManager
 #include "backends/DeviceId.h"         // DeviceId for cache lookup
 #include "kernels/DeviceKernelCache.h" // Universal kernel cache
+#include "kernels/rocm/ROCmKernelBase.h"
 #include "tensors/Tensors.h"           // FP32Tensor, BF16Tensor, FP16Tensor
 #include "tensors/KernelSnapshotInfo.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/ROCmKernelProfiler.h"
 
 #include <stdexcept>
 #include <mutex>
+#include <algorithm>
+#include <atomic>
 #include <hip/hip_runtime.h>
 
 namespace llaminar2
 {
     namespace rocm
     {
+        namespace
+        {
+            constexpr size_t MAX_FP32_BATCHED_PROJECTIONS = 8;
+            std::atomic<uint32_t> g_rocm_fp32_gemm_workspace_slice_counter{0};
+        }
 
         // =====================================================================
         // Constructor / Destructor
@@ -48,7 +57,8 @@ namespace llaminar2
               precision_(precision),
               N_(0),
               K_(0),
-              hipblas_kernel_(nullptr)
+              hipblas_kernel_(nullptr),
+              slice_id_(g_rocm_fp32_gemm_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
         {
             if (!weights)
             {
@@ -114,7 +124,8 @@ namespace llaminar2
               N_(static_cast<size_t>(N)),
               K_(static_cast<size_t>(K)),
               hipblas_kernel_(nullptr),
-              lifetime_owner_(std::move(lifetime_owner))
+              lifetime_owner_(std::move(lifetime_owner)),
+              slice_id_(g_rocm_fp32_gemm_workspace_slice_counter.fetch_add(1, std::memory_order_relaxed))
         {
             if (!d_weights)
             {
@@ -145,6 +156,9 @@ namespace llaminar2
                 d_mapped_redirect_ = nullptr;
                 mapped_redirect_capacity_ = 0;
             }
+            d_batch_A_ptrs_ = nullptr;
+            d_batch_B_ptrs_ = nullptr;
+            d_batch_C_ptrs_ = nullptr;
         }
 
         ROCmFloatingPointGemmKernel::ROCmFloatingPointGemmKernel(ROCmFloatingPointGemmKernel &&other) noexcept
@@ -157,12 +171,24 @@ namespace llaminar2
               hipblas_kernel_(other.hipblas_kernel_), // Just copy the shared pointer
               lifetime_owner_(std::move(other.lifetime_owner_)),
               d_mapped_redirect_(other.d_mapped_redirect_),
-              mapped_redirect_capacity_(other.mapped_redirect_capacity_)
+              mapped_redirect_capacity_(other.mapped_redirect_capacity_),
+              workspace_(other.workspace_),
+              slice_id_(other.slice_id_),
+              d_batch_A_ptrs_(other.d_batch_A_ptrs_),
+              d_batch_B_ptrs_(other.d_batch_B_ptrs_),
+              d_batch_C_ptrs_(other.d_batch_C_ptrs_),
+              cached_batch_A_ptrs_(std::move(other.cached_batch_A_ptrs_)),
+              cached_batch_B_ptrs_(std::move(other.cached_batch_B_ptrs_)),
+              cached_batch_C_ptrs_(std::move(other.cached_batch_C_ptrs_))
         {
             other.weights_ = nullptr;
             other.d_weights_ = nullptr;
             other.d_mapped_redirect_ = nullptr;
             other.mapped_redirect_capacity_ = 0;
+            other.d_batch_A_ptrs_ = nullptr;
+            other.d_batch_B_ptrs_ = nullptr;
+            other.d_batch_C_ptrs_ = nullptr;
+            other.workspace_ = nullptr;
             // Note: don't null other.hipblas_kernel_ - it's shared, not owned
         }
 
@@ -189,6 +215,19 @@ namespace llaminar2
                 mapped_redirect_capacity_ = other.mapped_redirect_capacity_;
                 other.d_mapped_redirect_ = nullptr;
                 other.mapped_redirect_capacity_ = 0;
+
+                workspace_ = other.workspace_;
+                slice_id_ = other.slice_id_;
+                d_batch_A_ptrs_ = other.d_batch_A_ptrs_;
+                d_batch_B_ptrs_ = other.d_batch_B_ptrs_;
+                d_batch_C_ptrs_ = other.d_batch_C_ptrs_;
+                cached_batch_A_ptrs_ = std::move(other.cached_batch_A_ptrs_);
+                cached_batch_B_ptrs_ = std::move(other.cached_batch_B_ptrs_);
+                cached_batch_C_ptrs_ = std::move(other.cached_batch_C_ptrs_);
+                other.d_batch_A_ptrs_ = nullptr;
+                other.d_batch_B_ptrs_ = nullptr;
+                other.d_batch_C_ptrs_ = nullptr;
+                other.workspace_ = nullptr;
             }
             return *this;
         }
@@ -359,6 +398,290 @@ namespace llaminar2
             }
         }
 
+        std::string ROCmFloatingPointGemmKernel::batchAPtrsBufferName() const
+        {
+            return std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS) + "_" + std::to_string(slice_id_);
+        }
+
+        std::string ROCmFloatingPointGemmKernel::batchBPtrsBufferName() const
+        {
+            return std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS) + "_" + std::to_string(slice_id_);
+        }
+
+        std::string ROCmFloatingPointGemmKernel::batchCPtrsBufferName() const
+        {
+            return std::string(GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS) + "_" + std::to_string(slice_id_);
+        }
+
+        bool ROCmFloatingPointGemmKernel::validateBatchedPointerWorkspace(
+            DeviceWorkspaceManager *workspace,
+            size_t required_count)
+        {
+            if (!validateROCmWorkspaceBinding(
+                    workspace,
+                    rocm_device_id_,
+                    "ROCmFloatingPointGemmKernel::multiply_fused_tensor"))
+            {
+                return false;
+            }
+
+            const std::string a_name = batchAPtrsBufferName();
+            const std::string b_name = batchBPtrsBufferName();
+            const std::string c_name = batchCPtrsBufferName();
+            const size_t required_bytes = required_count * sizeof(float *);
+            if (!workspace->hasBuffer(a_name) || workspace->getBufferSize(a_name) < required_bytes ||
+                !workspace->hasBuffer(b_name) || workspace->getBufferSize(b_name) < required_bytes ||
+                !workspace->hasBuffer(c_name) || workspace->getBufferSize(c_name) < required_bytes)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Missing or undersized "
+                          << "workspace pointer-array buffers. required_count=" << required_count
+                          << " A=" << a_name << " B=" << b_name << " C=" << c_name);
+                return false;
+            }
+
+            d_batch_A_ptrs_ = static_cast<const float **>(workspace->getBuffer(a_name));
+            d_batch_B_ptrs_ = static_cast<const float **>(workspace->getBuffer(b_name));
+            d_batch_C_ptrs_ = static_cast<float **>(workspace->getBuffer(c_name));
+            return d_batch_A_ptrs_ && d_batch_B_ptrs_ && d_batch_C_ptrs_;
+        }
+
+        bool ROCmFloatingPointGemmKernel::uploadBatchedPointersIfChanged(
+            const std::vector<const float *> &a_ptrs,
+            const std::vector<const float *> &b_ptrs,
+            const std::vector<float *> &c_ptrs,
+            DeviceWorkspaceManager *workspace)
+        {
+            const size_t count = a_ptrs.size();
+            if (count == 0 || b_ptrs.size() != count || c_ptrs.size() != count)
+                return false;
+            if (count > MAX_FP32_BATCHED_PROJECTIONS)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] Batched FP32 projection group exceeds workspace capacity: "
+                          << count << " > " << MAX_FP32_BATCHED_PROJECTIONS);
+                return false;
+            }
+            if (!validateBatchedPointerWorkspace(workspace, count))
+                return false;
+
+            if (cached_batch_A_ptrs_ == a_ptrs &&
+                cached_batch_B_ptrs_ == b_ptrs &&
+                cached_batch_C_ptrs_ == c_ptrs)
+            {
+                return true;
+            }
+
+            auto *stream = static_cast<hipStream_t>(gpu_stream_);
+            hipError_t err = hipMemcpyAsync(
+                d_batch_A_ptrs_, a_ptrs.data(), count * sizeof(float *),
+                hipMemcpyHostToDevice, stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] Failed to upload batched A pointers: "
+                          << hipGetErrorString(err));
+                return false;
+            }
+            err = hipMemcpyAsync(
+                d_batch_B_ptrs_, b_ptrs.data(), count * sizeof(float *),
+                hipMemcpyHostToDevice, stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] Failed to upload batched B pointers: "
+                          << hipGetErrorString(err));
+                return false;
+            }
+            err = hipMemcpyAsync(
+                d_batch_C_ptrs_, c_ptrs.data(), count * sizeof(float *),
+                hipMemcpyHostToDevice, stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] Failed to upload batched C pointers: "
+                          << hipGetErrorString(err));
+                return false;
+            }
+
+            cached_batch_A_ptrs_ = a_ptrs;
+            cached_batch_B_ptrs_ = b_ptrs;
+            cached_batch_C_ptrs_ = c_ptrs;
+            return true;
+        }
+
+        bool ROCmFloatingPointGemmKernel::multiply_fused_tensor(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext *mpi_ctx,
+            DeviceWorkspaceManager *workspace)
+        {
+            if (!input || projections.empty())
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Null input or empty projections");
+                return false;
+            }
+            if (precision_ != Precision::FP32 || input->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Only FP32 activations/weights are supported");
+                return false;
+            }
+
+            const float *d_input = static_cast<const float *>(input->gpu_data_ptr());
+            if (!d_input)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Input has no GPU data");
+                return false;
+            }
+            DeviceWorkspaceManager *effective_workspace = workspace ? workspace : workspace_;
+
+            std::vector<bool> completed(projections.size(), false);
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                if (completed[i])
+                    continue;
+
+                const auto &seed = projections[i];
+                if (!seed.kernel || !seed.output || seed.bias)
+                    continue;
+
+                auto *seed_kernel = dynamic_cast<ROCmFloatingPointGemmKernel *>(seed.kernel);
+                auto *seed_output = dynamic_cast<FP32Tensor *>(seed.output);
+                if (!seed_kernel || seed_kernel->precision_ != Precision::FP32 ||
+                    seed_kernel->rocm_device_id_ != rocm_device_id_ ||
+                    static_cast<int>(seed_kernel->K_) != k ||
+                    !seed_output || seed_output->isMapped())
+                {
+                    continue;
+                }
+
+                std::vector<size_t> group_indices;
+                group_indices.push_back(i);
+                for (size_t j = i + 1; j < projections.size(); ++j)
+                {
+                    const auto &candidate = projections[j];
+                    if (completed[j] || !candidate.kernel || !candidate.output || candidate.bias ||
+                        candidate.n != seed.n)
+                    {
+                        continue;
+                    }
+
+                    auto *candidate_kernel = dynamic_cast<ROCmFloatingPointGemmKernel *>(candidate.kernel);
+                    auto *candidate_output = dynamic_cast<FP32Tensor *>(candidate.output);
+                    if (!candidate_kernel || candidate_kernel->precision_ != Precision::FP32 ||
+                        candidate_kernel->rocm_device_id_ != rocm_device_id_ ||
+                        static_cast<int>(candidate_kernel->K_) != k ||
+                        !candidate_output || candidate_output->isMapped())
+                    {
+                        continue;
+                    }
+                    group_indices.push_back(j);
+                }
+
+                if (group_indices.size() < 2)
+                    continue;
+
+                std::vector<const float *> a_ptrs;
+                std::vector<const float *> b_ptrs;
+                std::vector<float *> c_ptrs;
+                a_ptrs.reserve(group_indices.size());
+                b_ptrs.reserve(group_indices.size());
+                c_ptrs.reserve(group_indices.size());
+
+                bool group_valid = true;
+                for (size_t index : group_indices)
+                {
+                    const auto &projection = projections[index];
+                    auto *projection_kernel = dynamic_cast<ROCmFloatingPointGemmKernel *>(projection.kernel);
+                    auto *fp32_output = dynamic_cast<FP32Tensor *>(projection.output);
+                    float *d_output = fp32_output
+                                          ? static_cast<float *>(fp32_output->gpu_data_ptr())
+                                          : nullptr;
+                    if (!projection_kernel || !projection_kernel->d_weights_ || !d_output)
+                    {
+                        group_valid = false;
+                        break;
+                    }
+                    a_ptrs.push_back(d_input);
+                    b_ptrs.push_back(static_cast<const float *>(projection_kernel->d_weights_));
+                    c_ptrs.push_back(d_output);
+                }
+
+                if (!group_valid)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Invalid batched projection group");
+                    return false;
+                }
+
+                if (!uploadBatchedPointersIfChanged(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
+                    return false;
+
+                if (!hipblas_kernel_->execute_batched(
+                        d_batch_A_ptrs_,
+                        d_batch_B_ptrs_,
+                        d_batch_C_ptrs_,
+                        m,
+                        seed.n,
+                        k,
+                        static_cast<int>(group_indices.size()),
+                        false,
+                        true,
+                        1.0f,
+                        0.0f))
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] hipBLAS batched SGEMM failed"
+                              << " group_size=" << group_indices.size()
+                              << " M=" << m << " N=" << seed.n << " K=" << k);
+                    return false;
+                }
+
+                if (PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "rocm_fp32_batched_projection_calls",
+                        1.0,
+                        "gemm",
+                        "rocm:" + std::to_string(rocm_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"m", std::to_string(m)},
+                            {"n", std::to_string(seed.n)},
+                            {"k", std::to_string(k)},
+                            {"batch", std::to_string(group_indices.size())}});
+                }
+
+                for (size_t index : group_indices)
+                    completed[index] = true;
+            }
+
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                if (completed[i])
+                    continue;
+
+                const auto &projection = projections[i];
+                if (!projection.kernel || !projection.output)
+                    return false;
+
+                if (!projection.kernel->multiply_tensor(
+                        input,
+                        projection.output,
+                        m,
+                        projection.n,
+                        k,
+                        true,
+                        1.0f,
+                        0.0f,
+                        projection.bias,
+                        mpi_ctx,
+                        -1,
+                        workspace))
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Projection failed for "
+                              << (projection.name ? projection.name : "unnamed"));
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         // =====================================================================
         // ITensorKernel interface
         // =====================================================================
@@ -389,6 +712,49 @@ namespace llaminar2
             {
                 hipblas_kernel_->setStream(stream);
             }
+        }
+
+        // =====================================================================
+        // IWorkspaceConsumer interface
+        // =====================================================================
+
+        WorkspaceRequirements ROCmFloatingPointGemmKernel::getWorkspaceRequirements(
+            [[maybe_unused]] int m,
+            [[maybe_unused]] int n,
+            [[maybe_unused]] int k) const
+        {
+            WorkspaceRequirements reqs;
+            if (precision_ != Precision::FP32)
+            {
+                return reqs;
+            }
+
+            const size_t pointer_array_bytes = MAX_FP32_BATCHED_PROJECTIONS * sizeof(float *);
+            reqs.buffers.push_back({batchAPtrsBufferName(), pointer_array_bytes, 256, true});
+            reqs.buffers.push_back({batchBPtrsBufferName(), pointer_array_bytes, 256, true});
+            reqs.buffers.push_back({batchCPtrsBufferName(), pointer_array_bytes, 256, true});
+            return reqs;
+        }
+
+        void ROCmFloatingPointGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
+        {
+            workspace_ = workspace;
+            d_batch_A_ptrs_ = nullptr;
+            d_batch_B_ptrs_ = nullptr;
+            d_batch_C_ptrs_ = nullptr;
+            cached_batch_A_ptrs_.clear();
+            cached_batch_B_ptrs_.clear();
+            cached_batch_C_ptrs_.clear();
+        }
+
+        bool ROCmFloatingPointGemmKernel::hasWorkspace() const
+        {
+            return workspace_ != nullptr;
+        }
+
+        DeviceWorkspaceManager *ROCmFloatingPointGemmKernel::getWorkspace() const
+        {
+            return workspace_;
         }
 
         // =====================================================================

@@ -172,6 +172,22 @@ namespace llaminar2
                 float alpha = 1.0f, float beta = 0.0f);
 
             /**
+             * @brief Batched FP32 GEMM with row-major Llaminar layout.
+             *
+             * All batch entries share dimensions and transpose flags, but may use
+             * different A/B/C device pointers. Pointer arrays must already be in
+             * device memory and valid for the active stream.
+             */
+            bool execute_batched(
+                const float *const *d_A_array,
+                const float *const *d_B_array,
+                float *const *d_C_array,
+                int M, int N, int K,
+                int batch_count,
+                bool transA = false, bool transB = false,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            /**
              * @brief GPU GEMM with fused bias: C = alpha * A @ B + beta * C + bias
              *
              * Uses hipBLASLt epilogue for fused bias addition.

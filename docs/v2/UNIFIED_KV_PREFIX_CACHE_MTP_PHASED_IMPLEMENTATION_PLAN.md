@@ -1799,12 +1799,15 @@ Current active slice:
 11. Done for the stage-timed ROCm verifier diagnostic: after adding a timeline validity guard for MTP sidecar graph replay, the previous `LLAMINAR_GPU_STAGE_TIMING=1` HSA fault repro completed on real Qwen3.6 dense at `-c 64 -n 8`: 22.14 tok/s, 75% acceptance, `main_verifier` segmented replay about 56.15 ms per two-token graph, `mtp.verifier_forward` about 66.18 ms/call, and `main_verifier` stage GPU total about 37.87 ms. The top structured stage-GPU buckets are GDN projection (~15.73 ms/pass), generic GEMM (~8.99 ms/pass), and fused Gate/Up (~6.30 ms/pass).
 12. Done for the mixed-codebook GDN subgroup safety slice: a same-codebook subgroup batching experiment passed synthetic graph-capture tests but caused a real Qwen3.6 ROCm HSA memory access fault. The live path now keeps mixed-codebook GDN projection sets on the known-safe per-projection graph-native small-M route, and `GraphCapturedFusedMixedCodebookGDNProjectionM4BypassesBatchedRoute` requires an explicit `mixed_codebook` batched-route bypass while preserving graph-captured output correctness. A safe real Qwen3.6 ROCm `-c 64 -n 8` rerun completed at 21.65 tok/s with 75% acceptance and no lingering KFD process.
 13. Done for the GDN qkv/z heterogeneous-N batching slice: Qwen3.6 GDN qkv/z `N={10240,6144}` pairs now use the generic native-VNNI small-M batched kernel instead of the unsafe Q4/M=2 specialized pair route. Focused ROCm integration captures and replays the exact shape, asserts batched projection counters, and real Qwen3.6 dense ROCm `-c 64 -n 8` completed at 22.35 tok/s with `main_verifier` GDN projection reduced from 95.90 ms to 91.65 ms total versus the earlier safe diagnostic.
-14. Next: characterize and shrink the remaining ROCm verifier projection budget, starting with ordinary GEMM and the residual GDN projection bucket without reintroducing mixed-codebook subgroup batching, then repeat longer-prompt ROCm dense evidence and port the M=2/3/4 quantize-once GEMV-many contract to CUDA and CPU before returning to Phase 14 acceptance.
+14. Done for the FP32 GDN alpha/beta projection slice: ROCm FP32 fused projections now use hipBLAS batched SGEMM for same-`N` alpha/beta-style groups with device pointer arrays supplied by declared `IWorkspaceConsumer` buffers. The batched route hard-fails when workspace is missing instead of allocating ad hoc scratch, and the focused ROCm FP32 graph-capture regression binds a `DeviceWorkspaceManager`, captures/replays the batched call, and compares against CPU reference.
+15. Next: characterize and shrink the remaining ROCm verifier projection budget, starting with ordinary GEMM and the residual GDN projection bucket without reintroducing mixed-codebook subgroup batching, then repeat longer-prompt ROCm dense evidence and port the M=2/3/4 quantize-once GEMV-many contract to CUDA and CPU before returning to Phase 14 acceptance.
 
 ### Files
 
 - `src/v2/tensors/TensorKernels.h`
 - `src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp`
+- `src/v2/kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h/.cpp`
+- `src/v2/kernels/rocm/gemm/HipBLASGemmKernel.h/.cpp`
 - `src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip`
 - `src/v2/kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip`
 - `src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp`
