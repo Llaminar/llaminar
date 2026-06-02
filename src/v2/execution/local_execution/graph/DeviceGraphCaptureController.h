@@ -332,7 +332,8 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             bool has_collective_nodes,
             uint64_t current_step,
-            const ReplayHooks &hooks);
+            const ReplayHooks &hooks,
+            bool force_recapture = false);
 
         /**
          * @brief Coherence helper for all stages in one replay segment.

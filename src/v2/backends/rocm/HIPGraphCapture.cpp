@@ -153,7 +153,7 @@ namespace llaminar2
             return GraphUpdateResult::Failed;
         }
 
-        hipGraphExecUpdateResult update_result;
+        hipGraphExecUpdateResult update_result = hipGraphExecUpdateError;
         hipError_t err = hipGraphExecUpdate(exec_, graph_, nullptr, &update_result);
 
         if (err == hipSuccess && update_result == hipGraphExecUpdateSuccess)

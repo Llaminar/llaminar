@@ -2272,8 +2272,8 @@ namespace llaminar2
 
             void invalidate()
             {
-                graph.reset();
                 segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+                graph.reset();
                 dynamic_param_stages.clear();
                 terminal_hidden = nullptr;
                 token_id = 0;

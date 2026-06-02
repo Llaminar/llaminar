@@ -3654,6 +3654,33 @@ namespace llaminar2
         if (!ctx)
             return false;
 
+        IWorkerGPUContext *sidecar_gpu_ctx = nullptr;
+        const bool try_gpu_graph_capture =
+            state_.device_id.is_gpu() &&
+            debugEnv().execution.gpu_graphs;
+        if (try_gpu_graph_capture && !rebuilt_graph)
+        {
+            auto &pool = GPUDeviceContextPool::instance();
+            sidecar_gpu_ctx = &pool.getContext(state_.device_id);
+            if (sidecar_cache.segment_cache.ensureCaptureStream(sidecar_gpu_ctx))
+            {
+                void *capture_stream = sidecar_cache.segment_cache.capture_stream;
+                for (const auto &node_name : sidecar_cache.graph->getExecutionOrder())
+                {
+                    ComputeNode *node = sidecar_cache.graph->getNode(node_name);
+                    if (node && node->stage)
+                    {
+                        node->stage->setGPUStream(capture_stream);
+                    }
+                }
+            }
+            else
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create MTP sidecar graph capture stream");
+                return false;
+            }
+        }
+
         sidecar_cache.token_id = draft_condition_token;
         sidecar_cache.position_id = position_id;
         for (auto *stage : sidecar_cache.dynamic_param_stages)
@@ -3688,19 +3715,23 @@ namespace llaminar2
                 {{"depth", "0"}});
 
             bool used_segmented_capture = false;
-            const bool try_gpu_graph_capture =
-                state_.device_id.is_gpu() &&
-                debugEnv().execution.gpu_graphs;
             if (try_gpu_graph_capture && !rebuilt_graph)
             {
                 ensureDeviceWorkspaceAllocated(*sidecar_cache.graph);
-                auto &pool = GPUDeviceContextPool::instance();
-                IWorkerGPUContext &gpu_ctx = pool.getContext(state_.device_id);
+                if (!sidecar_gpu_ctx)
+                {
+                    auto &pool = GPUDeviceContextPool::instance();
+                    sidecar_gpu_ctx = &pool.getContext(state_.device_id);
+                }
                 sidecar_cache.segment_cache.perf_context = sidecar_context;
-                const auto capture_policy = buildDecodeCapturePolicy(
+                auto capture_policy = buildDecodeCapturePolicy(
                     !collective_nodes.empty(),
                     ctx,
                     sidecar_cache.segment_cache.consecutive_failures);
+                if (state_.device_id.is_rocm())
+                {
+                    capture_policy.force_recapture = true;
+                }
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "sidecar_decode_capture_policy",
@@ -3709,6 +3740,7 @@ namespace llaminar2
                     device_key,
                     {{"context", sidecar_cache.segment_cache.perf_context},
                      {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
+                     {"force_recapture", boolTag(capture_policy.force_recapture)},
                      {"has_collectives", boolTag(!collective_nodes.empty())},
                      {"collective_segmented", boolTag(capture_policy.collective_segmented_enabled)},
                      {"collectives_graph_capturable", boolTag(capture_policy.collectives_graph_capturable)}});
@@ -3716,8 +3748,8 @@ namespace llaminar2
                     *sidecar_cache.graph,
                     ctx,
                     &sidecar_cache.segment_cache,
-                    gpu_ctx.defaultStream(),
-                    &gpu_ctx,
+                    sidecar_gpu_ctx->defaultStream(),
+                    sidecar_gpu_ctx,
                     collective_nodes.empty() ? nullptr : &collective_nodes,
                     capture_policy,
                     &used_segmented_capture);

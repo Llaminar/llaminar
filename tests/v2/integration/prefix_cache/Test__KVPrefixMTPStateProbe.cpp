@@ -1571,6 +1571,88 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsRealModelSmoke)
     EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsBaselineThenMTPRegression)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+    });
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 MTP GPU-graphs regression";
+    }
+
+    auto factory = createOrchestrationRunnerFactory();
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    const std::string prompt_text = "The quick brown fox jumps over the lazy dog";
+
+    auto make_config = [&](bool enable_mtp)
+    {
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = 64;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.device_for_this_rank = GlobalDeviceAddress::rocm(0);
+        config.kv_cache_precision = "auto";
+        config.mtp.enabled = enable_mtp;
+        config.mtp.draft_tokens = 1;
+        return config;
+    };
+
+    auto run_once = [&](bool enable_mtp,
+                        GenerationResult *result,
+                        PrefixRuntimeStateSnapshot *snapshot)
+    {
+        auto runner = factory->createFromOrchestrationConfig(make_config(enable_mtp));
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        auto tokenizer = runner->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        const auto encoded = tokenizer->encode(prompt_text, /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded.empty());
+        const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+        *result = runner->generate(prompt, 4, greedy);
+        *snapshot = runner->prefixStateProbe();
+        runner->shutdown();
+    };
+
+    GenerationResult baseline_result;
+    PrefixRuntimeStateSnapshot baseline_snapshot;
+    run_once(false, &baseline_result, &baseline_snapshot);
+
+    GenerationResult mtp_result;
+    PrefixRuntimeStateSnapshot mtp_snapshot;
+    run_once(true, &mtp_result, &mtp_snapshot);
+
+    ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+    ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
+    ASSERT_EQ(baseline_result.tokens.size(), 4u);
+    ASSERT_EQ(mtp_result.tokens.size(), 4u);
+    EXPECT_EQ(mtp_result.tokens, baseline_result.tokens);
+    EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+    EXPECT_FALSE(mtp_snapshot.mtp_bypassed) << mtp_snapshot.mtp_bypass_reason;
+    EXPECT_GE(mtp_snapshot.mtp_draft_steps, 2u);
+    EXPECT_GE(mtp_snapshot.mtp_verifier_runs, 2u);
+    EXPECT_GE(mtp_snapshot.mtp_accepted_tokens + mtp_snapshot.mtp_rejected_tokens, 2u);
+}
+
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
 {
     ScopedDebugEnv env({

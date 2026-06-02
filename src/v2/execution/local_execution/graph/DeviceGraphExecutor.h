@@ -407,8 +407,7 @@ namespace llaminar2
             GraphSegmentCache() = default;
             ~GraphSegmentCache()
             {
-                destroySyncEvent();
-                destroyCaptureStream();
+                reset(StreamResetPolicy::Destroy);
             }
 
             // Move-only (non-copyable due to stream/event ownership)
@@ -431,8 +430,7 @@ namespace llaminar2
             {
                 if (this != &other)
                 {
-                    destroySyncEvent();
-                    destroyCaptureStream();
+                    reset(StreamResetPolicy::Destroy);
                     segments = std::move(other.segments);
                     initialized = other.initialized;
                     needs_capture = other.needs_capture;
@@ -453,6 +451,7 @@ namespace llaminar2
 
             void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
             {
+                synchronizeCaptureStream();
                 segments.clear();
                 initialized = false;
                 needs_capture = false;
@@ -466,6 +465,9 @@ namespace llaminar2
             /// Create a local blocking stream for graph capture via the GPU context.
             /// @param ctx GPU context that creates the stream (stored for cleanup)
             bool ensureCaptureStream(IWorkerGPUContext *ctx);
+
+            /// Wait for queued replay/capture work before graph resources are torn down.
+            void synchronizeCaptureStream();
 
             /// Destroy the capture stream if it exists
             void destroyCaptureStream();
@@ -505,7 +507,8 @@ namespace llaminar2
                                               void *gpu_stream,
                                               IWorkerGPUContext *gpu_ctx,
                                               const std::unordered_set<std::string> *collective_nodes = nullptr,
-                                              bool collectives_graph_capturable = false);
+                                              bool collectives_graph_capturable = false,
+                                              bool force_recapture = false);
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
@@ -516,6 +519,7 @@ namespace llaminar2
             bool allow_segmented_capture = false;
             bool collective_segmented_enabled = false;
             bool collectives_graph_capturable = false; ///< True only for explicit future graph-captured collective paths
+            bool force_recapture = false;              ///< Re-record graph segments on replay for callers with dynamic params not yet replay-safe
             int max_segment_failures = 4;
         };
 

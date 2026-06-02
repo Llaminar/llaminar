@@ -218,7 +218,10 @@ namespace llaminar2
         void reset()
         {
             if (stream && ctx)
+            {
+                ctx->synchronizeStream(stream);
                 ctx->destroyStream(stream);
+            }
             stream = nullptr;
             ctx = nullptr;
         }

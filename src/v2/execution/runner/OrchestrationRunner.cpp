@@ -21,6 +21,7 @@
 #include "../../collective/LocalTPContext.h"
 #include "../../collective/ILocalPPContext.h"
 #include "../../collective/BackendRouter.h"
+#include "../../backends/BackendManager.h"
 #include "../../loaders/ModelContext.h"
 #include "../../loaders/ModelContextConfig.h"
 #include "../../loaders/ModelLoader.h"
@@ -30,6 +31,7 @@
 #include "../../planning/ClusterInventoryGatherer.h"
 #include "../../planning/ModelMemoryProfile.h"
 #include "../../backends/DeviceAddressAdapter.h"
+#include "../../kernels/KernelFactory.h"
 #include "../../tensors/TensorFactory.h"
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
@@ -73,6 +75,31 @@ namespace llaminar2
                     return true;
             }
             return false;
+        }
+
+        void synchronizeRunnerPrimaryDeviceBeforeRelease(const IInferenceRunner *runner)
+        {
+            if (!runner)
+                return;
+
+            const DeviceId device = runner->primaryDeviceId();
+            if (!device.is_gpu())
+                return;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+            {
+                LOG_WARN("[OrchestrationRunner] Could not synchronize "
+                         << device.toString()
+                         << " before runner shutdown: backend unavailable");
+                return;
+            }
+
+            if (!backend->synchronize(device.gpu_ordinal()))
+            {
+                LOG_WARN("[OrchestrationRunner] Device synchronization failed before runner shutdown on "
+                         << device.toString());
+            }
         }
 
         const char *prefixStorageTierName(PrefixStorageTier tier)
@@ -472,8 +499,15 @@ namespace llaminar2
 
         PerfStatsCollector::flushFromEnv();
 
+        if (runner_)
+        {
+            runner_->clear_cache();
+            synchronizeRunnerPrimaryDeviceBeforeRelease(runner_.get());
+        }
+
         // Release resources in reverse order
         runner_.reset();
+        llaminar::v2::kernels::KernelFactory::clearCache();
         local_pp_ctx_.reset();
         local_tp_ctx_.reset();
         model_ctx_.reset();

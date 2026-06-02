@@ -47,6 +47,12 @@ namespace llaminar2
         return true;
     }
 
+    void DeviceGraphExecutor::GraphSegmentCache::synchronizeCaptureStream()
+    {
+        if (capture_stream && gpu_ctx_ref)
+            gpu_ctx_ref->synchronizeStream(capture_stream);
+    }
+
     void DeviceGraphExecutor::GraphSegmentCache::destroyCaptureStream()
     {
         if (!capture_stream)
@@ -267,7 +273,8 @@ namespace llaminar2
                 gpu_stream,
                 gpu_ctx,
                 collective_nodes,
-                policy.collectives_graph_capturable);
+                policy.collectives_graph_capturable,
+                policy.force_recapture);
 
             if (success)
             {
@@ -295,7 +302,8 @@ namespace llaminar2
                                                                void *gpu_stream,
                                                                IWorkerGPUContext *gpu_ctx,
                                                                const std::unordered_set<std::string> *collective_nodes,
-                                                               bool collectives_graph_capturable)
+                                                               bool collectives_graph_capturable,
+                                                               bool force_recapture)
     {
         if (!gpu_stream || !gpu_ctx)
         {
@@ -337,7 +345,11 @@ namespace llaminar2
         // (cohere_inputs is skipped for capturable segments, execute_node is
         // unused). Avoid constructing unused lambdas and skip phase 1/2 checks
         // to minimize host overhead on the hot decode path.
-        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay)
+        const auto &exec_env = debugEnv().execution;
+        const bool replay_diagnostics_enabled =
+            exec_env.gpu_graph_verify || exec_env.gpu_graph_recapture || force_recapture;
+        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay &&
+            !replay_diagnostics_enabled)
         {
             DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
 
@@ -509,6 +521,32 @@ namespace llaminar2
                     },
                     /*skip_replay_callbacks=*/true);
             }};
+
+        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay)
+        {
+            const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
+                graph, segment_cache, ctx, gpu_ctx,
+                has_collective_nodes, current_step, replay_hooks, force_recapture);
+
+            if (!replay_result.success)
+            {
+                if (replay_result.launch_failure_fallback)
+                {
+                    segment_cache.consecutive_failures++;
+                    if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
+                    {
+                        LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
+                        segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
+                    }
+                    graph.reset();
+                    return executeFastDecode(graph, ctx, collective_nodes);
+                }
+                return false;
+            }
+
+            segment_cache.consecutive_failures = 0;
+            return true;
+        }
 
         // ===== Phase 1: Warmup (first call) — build segments, execute normally =====
         // We do NOT capture on the first call. Some kernels lazily initialize workspace

@@ -720,26 +720,57 @@ namespace llaminar2
             }
         }
 
-        if (!segment.capture->beginCapture())
-        {
-            LOG_ERROR("[DeviceGraphCaptureController] Re-capture beginCapture failed, seg " << segment_index);
-            return false;
-        }
-
         bool exec_ok = true;
-        for (const auto &stage_name : segment.stage_names)
+        bool end_capture_ok = true;
         {
-            auto *node = graph.getNode(stage_name);
-            if (!node || !node->stage || !node->stage->execute(ctx))
+            gpu_ctx->setGraphCaptureActive(true);
+            GraphCaptureGuard capture_guard(false);
+            gpu_ctx->clearLastError();
+
+            if (!segment.capture->beginCapture())
             {
-                exec_ok = false;
-                break;
+                gpu_ctx->setGraphCaptureActive(false);
+                LOG_ERROR("[DeviceGraphCaptureController] Re-capture beginCapture failed, seg " << segment_index);
+                return false;
+            }
+
+            for (const auto &stage_name : segment.stage_names)
+            {
+                auto *node = graph.getNode(stage_name);
+                if (!node || !node->stage || !node->stage->execute(ctx))
+                {
+                    exec_ok = false;
+                    break;
+                }
+            }
+
+            gpu_ctx->setGraphCaptureActive(false);
+            if (!exec_ok)
+            {
+                segment.capture->endCapture();
+                end_capture_ok = false;
+            }
+            else
+            {
+                end_capture_ok = segment.capture->endCapture();
             }
         }
 
-        if (!exec_ok || !segment.capture->endCapture())
+        if (!exec_ok || !end_capture_ok)
         {
-            LOG_ERROR("[DeviceGraphCaptureController] Re-capture failed, seg " << segment_index);
+            if (capture_stream)
+            {
+                gpu_ctx->synchronizeStream(capture_stream);
+            }
+            gpu_ctx->clearLastError();
+            if (!exec_ok)
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Re-capture stage execution failed, seg " << segment_index);
+            }
+            else
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Re-capture endCapture failed, seg " << segment_index);
+            }
             return false;
         }
 
@@ -747,6 +778,7 @@ namespace llaminar2
         if (update_result == GraphUpdateResult::NeedsReinstantiate ||
             update_result == GraphUpdateResult::Failed)
         {
+            gpu_ctx->clearLastError();
             if (!segment.capture->instantiate())
             {
                 LOG_ERROR("[DeviceGraphCaptureController] Re-capture instantiate failed");
@@ -1547,7 +1579,8 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         bool has_collective_nodes,
         uint64_t current_step,
-        const ReplayHooks &hooks)
+        const ReplayHooks &hooks,
+        bool force_recapture)
     {
         ReplayPhaseResult result{};
 
@@ -1567,7 +1600,7 @@ namespace llaminar2
         void *capture_stream = segment_cache.capture_stream;
         const auto &exec_cfg = debugEnv().execution;
         const bool verify_mode = exec_cfg.gpu_graph_verify;
-        const bool recapture_mode = exec_cfg.gpu_graph_recapture;
+        const bool recapture_mode = exec_cfg.gpu_graph_recapture || force_recapture;
         const bool needs_segment_sync = ctx->deviceId().is_cuda();
 
         const bool stream_only_mode = exec_cfg.gpu_graph_stream_only;

@@ -166,7 +166,7 @@ namespace llaminar2
         }
 
         // Use 4-arg version with cudaGraphExecUpdateResult for CUDA 10-12 compatibility
-        cudaGraphExecUpdateResult update_result;
+        cudaGraphExecUpdateResult update_result = cudaGraphExecUpdateError;
         cudaError_t err = cudaGraphExecUpdate(exec_, graph_, nullptr, &update_result);
 
         if (err == cudaSuccess && update_result == cudaGraphExecUpdateSuccess)
