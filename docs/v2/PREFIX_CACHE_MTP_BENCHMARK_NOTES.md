@@ -1107,6 +1107,49 @@ Latest ROCm dense evidence:
     restore. The current unit regression records the policy explicitly:
     ROCm sidecar decode/shifted-prefill uses `force_recapture=true`, while CUDA
     remains `force_recapture=false`.
+  - Rejected ROCm deferred post-sidecar checkpoint experiment:
+    `/tmp/llaminar-mtp-bench/dense-rocm-deferred-checkpoint-baseline-c64-n48-bench.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-deferred-checkpoint-mtp-d1-c64-n48-bench.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-deferred-checkpoint-mtp-d1-c64-n48-stats.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-deferred-checkpoint-mtp-d1-c64-n48-stats.csv`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-deferred-checkpoint-mtp-d2-c64-n48-bench.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-deferred-checkpoint-mtp-d2-c64-n48-stats.json`,
+    and `/tmp/llaminar-mtp-bench/dense-rocm-deferred-checkpoint-mtp-d2-c64-n48-stats.csv`.
+    The experiment deferred the post-sidecar checkpoint until verifier rejection.
+    Same-binary baseline was 21.15 tok/s. Depth-1 MTP reached 32.36 tok/s with
+    91 accepted, 5 rejected, 5 rollbacks, and 94.79% acceptance, which is below
+    the retained 33+ tok/s lane. Depth-2 MTP collapsed to 22.03 tok/s with
+    87 accepted, 34 rejected, 37 rollbacks, and 71.90% acceptance. The retained
+    contract keeps the eager post-sidecar checkpoint until verifier-row GDN state
+    restore can eliminate replay without rerunning the sidecar.
+  - Current dense replay-preservation slice: dense live-prefix restore/truncate
+    now preserves captured replay state instead of resetting the main and MTP
+    graph replay caches. MoE still resets replay state after live prefix mutation
+    until sparse collective graph capture is fully rollback-safe. Structured
+    counters distinguish both paths:
+    `mtp.live_prefix_replay_state_preserved` and
+    `mtp.live_prefix_replay_state_reset{reason=moe_live_state_mutation_guard}`.
+    Focused regression passed:
+    `V2_Unit_MTPGraphConstruction`,
+    `V2_Unit_PrefillDecodeTransition`, and
+    `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`.
+    Dense Qwen3.6 SingleDevice parity also passed for all five
+    `V2_Integration_Parity_Qwen36_SingleDevice_` cases.
+    Same-binary benchmark artifacts:
+    `/tmp/llaminar-mtp-bench/dense-rocm-preserve-replay-baseline-c64-n48-bench.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-preserve-replay-mtp-d1-c64-n48-bench.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-preserve-replay-mtp-d1-c64-n48-stats.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-preserve-replay-mtp-d1-c64-n48-stats.csv`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-preserve-replay-mtp-d2-c64-n48-bench.json`,
+    `/tmp/llaminar-mtp-bench/dense-rocm-preserve-replay-mtp-d2-c64-n48-stats.json`,
+    and `/tmp/llaminar-mtp-bench/dense-rocm-preserve-replay-mtp-d2-c64-n48-stats.csv`.
+    Baseline decode was 21.02 tok/s. Depth-1 MTP reached 32.88 tok/s with
+    92 accepted, 4 rejected, 4 rollbacks, and 95.83% acceptance; the stats
+    recorded three measured `live_prefix_replay_state_preserved` events and no
+    MoE reset events. Depth-2 MTP reached 29.63 tok/s with 107 accepted,
+    17 rejected, 21 rollbacks, and 86.29% acceptance. The dense preserve change
+    removes avoidable graph reconstruction, but verifier replay and rollback
+    replay remain the speedup blockers.
   - Next ROCm SingleDevice sprint target remains the captured verifier graph's
     GPU work and MTP per-step overhead. More host-side fallbacks or flag guards
     are not expected to create the Phase 14 speedup.

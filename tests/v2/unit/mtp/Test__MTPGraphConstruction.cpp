@@ -2078,6 +2078,8 @@ TEST(Test__MTPGraphConstruction, ChainedSidecarCommitDiscardsSpeculativeShiftedR
 TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
 {
     DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv perf_stats({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    PerfStatsCollector::reset();
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
@@ -2125,11 +2127,31 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
     const auto after_second_restore = orchestrator.prefixStateProbe();
     EXPECT_EQ(maxCachedTokens(after_second_restore.kv_caches), static_cast<int>(prefix_tokens.size()));
     EXPECT_EQ(maxCachedTokens(after_second_restore.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto restore_tags = PerfStatsCollector::Tags{{"operation", "restore_payload_checkpoint"}};
+    const auto truncate_tags = PerfStatsCollector::Tags{{"operation", "truncate_live_prefix"}};
+    const PerfStatRecord *restore_preserved =
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", restore_tags);
+    ASSERT_NE(restore_preserved, nullptr);
+    EXPECT_DOUBLE_EQ(restore_preserved->value, 2.0);
+    const PerfStatRecord *truncate_preserved =
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", truncate_tags);
+    ASSERT_NE(truncate_preserved, nullptr);
+    EXPECT_DOUBLE_EQ(truncate_preserved->value, 1.0);
+    const auto reset_tags = PerfStatsCollector::Tags{
+        {"operation", "restore_payload_checkpoint"},
+        {"reason", "moe_live_state_mutation_guard"}};
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", reset_tags),
+              nullptr);
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogicalTruncate)
 {
     DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv perf_stats({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    PerfStatsCollector::reset();
 
     TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
     auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
@@ -2170,6 +2192,57 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     EXPECT_EQ(maxCachedTokens(after_restore.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
     ASSERT_FALSE(after_restore.positions.empty());
     EXPECT_EQ(after_restore.positions[0], static_cast<int>(prefix_tokens.size()));
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto restore_tags = PerfStatsCollector::Tags{{"operation", "restore_logical_checkpoint"}};
+    const PerfStatRecord *restore_preserved =
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", restore_tags);
+    ASSERT_NE(restore_preserved, nullptr);
+    EXPECT_DOUBLE_EQ(restore_preserved->value, 1.0);
+    const auto reset_tags = PerfStatsCollector::Tags{
+        {"operation", "restore_logical_checkpoint"},
+        {"reason", "moe_live_state_mutation_guard"}};
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", reset_tags),
+              nullptr);
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestoreResetsMoEReplayState)
+{
+    DeviceManager::instance().initialize(-1, false);
+    ScopedDebugEnv perf_stats({{"LLAMINAR_PERF_STATS_JSON", "1"}});
+    PerfStatsCollector::reset();
+
+    DenseMTPGraphFixture fixture;
+    fixture.config.moe.num_experts = 4;
+    fixture.config.moe.top_k = 2;
+    fixture.config.moe.intermediate_size = 32;
+    auto graph_builder = std::make_shared<Qwen35MoEGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    PrefixStateSnapshot checkpoint;
+    checkpoint.valid = true;
+    checkpoint.logical_checkpoint = true;
+    checkpoint.cached_tokens = 0;
+    ASSERT_TRUE(orchestrator.restoreLivePrefixState(checkpoint));
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto reset_tags = PerfStatsCollector::Tags{
+        {"operation", "restore_logical_checkpoint"},
+        {"reason", "moe_live_state_mutation_guard"}};
+    const PerfStatRecord *reset =
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", reset_tags);
+    ASSERT_NE(reset, nullptr);
+    EXPECT_DOUBLE_EQ(reset->value, 1.0);
+    const auto preserve_tags = PerfStatsCollector::Tags{{"operation", "restore_logical_checkpoint"}};
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", preserve_tags),
+              nullptr);
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__MTPGraphConstruction, LiveForwardExposesAllPositionLogitsOnCPU)

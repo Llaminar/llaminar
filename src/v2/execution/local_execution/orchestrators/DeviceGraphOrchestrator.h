@@ -2234,6 +2234,7 @@ namespace llaminar2
 
         bool ensurePrefixCacheReady();
         bool isPrefixCacheMoEModel() const;
+        void handleLivePrefixReplayStateAfterMutation(const char *operation);
         PrefixCacheFingerprintResult buildCurrentPrefixFingerprint(
             const PrefixCacheRuntimeConfig &prefix_config) const;
         PrefixCacheKey makePrefixKeyForBlock(
