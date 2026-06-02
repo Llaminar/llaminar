@@ -1747,6 +1747,71 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
     EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFailsBeforeDraft)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "1"},
+    });
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() < 2)
+    {
+        GTEST_SKIP() << "Need at least two ROCm devices for Qwen3.6 LocalTP segmented MTP hard-fail smoke";
+    }
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = 32;
+    config.batch_size = 1;
+    config.tp_degree = 2;
+    config.tp_scope = TPScope::LOCAL;
+    config.tp_devices = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+    config.pp_degree = 1;
+    config.kv_cache_precision = "auto";
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    auto tokenizer = runner->tokenizer();
+    ASSERT_NE(tokenizer, nullptr);
+    const auto encoded = tokenizer->encode("Paris is", /*add_bos=*/false, /*add_eos=*/false);
+    ASSERT_FALSE(encoded.empty());
+    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+
+    SamplingParams greedy;
+    greedy.temperature = 0.0f;
+    auto result = runner->generate(prompt, 1, greedy);
+    const auto snapshot = runner->prefixStateProbe();
+    runner->shutdown();
+
+    ASSERT_FALSE(result.error.empty());
+    EXPECT_NE(result.error.find("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED"), std::string::npos)
+        << result.error;
+    EXPECT_NE(result.error.find("RCCL segmented collective replay"), std::string::npos)
+        << result.error;
+    EXPECT_EQ(snapshot.mtp_draft_steps, 0u);
+    EXPECT_EQ(snapshot.mtp_verifier_runs, 0u);
+    EXPECT_EQ(snapshot.mtp_rollbacks, 0u);
+}
+
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
 {
     ScopedDebugEnv env({

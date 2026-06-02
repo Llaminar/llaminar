@@ -315,9 +315,11 @@ Latest LocalTP ROCm dense evidence:
     `failure_reason`: `ROCm LocalTP MTP decode is incompatible with
     LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED; RCCL segmented collective replay
     for MTP sidecar execution is not implemented`.
-  - `V2_Unit_PrefillDecodeTransition` covers the early MTP hard fail, and
-    `V2_Integration_LocalTPContext` covers the RCCL segmented graph-policy
-    reject reason.
+  - `V2_Unit_PrefillDecodeTransition` covers the early MTP hard fail,
+    `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalTPSmoke` includes
+    `Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFailsBeforeDraft` for the
+    real-model LocalTP MTP path, and `V2_Integration_LocalTPContext` covers
+    the RCCL segmented graph-policy reject reason.
 
 Latest LocalPP ROCm dense evidence:
 
