@@ -10,8 +10,10 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../../utils/TestTensorFactory.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <memory>
@@ -397,6 +399,47 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2MatchesReference)
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.985f);
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2RecordsNativeRouteCounter)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const int N = 896;
+    const int K = 1024;
+    runDispatchM2MatchesReference(
+        "Q4_K native-VNNI counter",
+        N,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.985f);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_m2_calls"});
+    auto route_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_native_vnni_m2_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter;
+        });
+
+    ASSERT_NE(route_record, records.end())
+        << "Q4_K M=2 verifier GEMM must use the graph-native ROCm two-row native route";
+    EXPECT_GE(route_record->value, 1.0);
+    EXPECT_EQ(route_record->device, "rocm:0");
+    EXPECT_EQ(route_record->tags.at("codebook"), "5");
+    EXPECT_EQ(route_record->tags.at("n"), std::to_string(N));
+    EXPECT_EQ(route_record->tags.at("k"), std::to_string(K));
+
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, ConcurrentDispatchQ4KM2MatchesReference)

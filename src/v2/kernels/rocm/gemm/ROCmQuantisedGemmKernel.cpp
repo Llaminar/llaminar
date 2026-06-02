@@ -90,6 +90,7 @@
 #include "utils/ROCmKernelProfiler.h"
 #include "utils/DebugEnv.h"
 #include "utils/Assertions.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/WeightLoadingProfiler.h"
 
 #include <stdexcept>
@@ -283,6 +284,18 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream,
                 const float *d_scale_A_blockwise = nullptr);
+
+            bool rocmGemv_native_vnni_q4_m2_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const void *d_block_scales, // __half* (FP16 d)
+                const void *d_block_mins,   // __half* (FP16 m), Q4_1/Q4_K only
+                float *d_C_fp32,
+                const float *d_scale_A_blockwise, // [2 × blocks_per_row]
+                float *d_partial_fp32,            // [KB_MAX × 2 × N]
+                int N, int K,
+                uint8_t codebook_id,
+                int device_id, void *stream);
 
             // =========================================================================
             // Fused FP32→INT8 quantize + GEMV + scale kernel for decode (M=1)
@@ -2327,6 +2340,81 @@ namespace llaminar2
                 }
 #endif
 
+                const bool supports_native_m2_q4 =
+                    impl_->has_native_vnni &&
+                    (impl_->native_vnni_codebook_id == 0 || impl_->native_vnni_codebook_id == 5);
+                if (m == 2 && supports_native_m2_q4 &&
+                    !gemv_output_needs_copyout && beta == 0.0f)
+                {
+                    if ((k % 32) != 0)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI M=2 Q4 verifier requires K multiple of 32, got K="
+                                  << k);
+                        return false;
+                    }
+
+                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                            d_input,
+                            impl_->d_A_int8,
+                            impl_->d_scales_A_blockwise,
+                            m,
+                            k,
+                            rocm_device_id_,
+                            gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI M=2 Q4 blockwise activation quantization failed");
+                        return false;
+                    }
+
+                    if (!rocmGemv_native_vnni_q4_m2_fp32(
+                            impl_->d_A_int8,
+                            impl_->d_weights_native_vnni,
+                            impl_->d_weights_native_scales,
+                            impl_->d_weights_native_mins,
+                            d_output,
+                            impl_->d_scales_A_blockwise,
+                            impl_->d_scatter_partial,
+                            n, k,
+                            impl_->native_vnni_codebook_id,
+                            rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI M=2 Q4 verifier GEMV failed");
+                        return false;
+                    }
+
+                    if (alpha != 1.0f || d_bias)
+                    {
+                        if (!rocmQuantGemm_applyFp32Epilogue(
+                                d_output,
+                                d_bias,
+                                m,
+                                n,
+                                alpha,
+                                rocm_device_id_,
+                                gpu_stream_))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Native-VNNI M=2 Q4 epilogue failed");
+                            return false;
+                        }
+                    }
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_native_vnni_m2_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
+                                {"n", std::to_string(n)},
+                                {"k", std::to_string(k)}});
+                    }
+
+                    return true;
+                }
+
                 for (int row = 0; row < m; ++row)
                 {
                     const float *d_input_row = d_input + static_cast<size_t>(row) * k;
@@ -4118,13 +4206,18 @@ namespace llaminar2
             // file but is no longer reachable in normal execution. This saves
             // up to N×K bytes (≈1.27 GB for a Q4_K LM head).
 
-            // Scatter+reduce partial buffer: KB_MAX × N × sizeof(float)
+            // Scatter+reduce partial buffer: KB_MAX × rows × N × sizeof(float).
+            // The graph-safe native-VNNI M=2 verifier route stores both rows in
+            // one split-K partial buffer; serial M=1 paths use one row.
             // KB_MAX=64 is the maximum k-blocks the scatter dispatch can produce.
             // The workspace manager takes max across all kernel instances, so
             // the largest N (LM Head: 152064) determines the actual allocation.
-            // Size: 64 × 152064 × 4 ≈ 37 MB — reused across layers.
+            // M=2 LM head size: 64 × 2 × 152064 × 4 ≈ 74 MB — reused across layers.
             constexpr int SCATTER_KB_MAX = 64;
-            size_t scatter_partial_bytes = static_cast<size_t>(SCATTER_KB_MAX) * n * sizeof(float);
+            const int scatter_rows = (m == 2) ? 2 : 1;
+            size_t scatter_partial_bytes = static_cast<size_t>(SCATTER_KB_MAX) *
+                                           static_cast<size_t>(scatter_rows) *
+                                           static_cast<size_t>(n) * sizeof(float);
             reqs.buffers.push_back({GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL, scatter_partial_bytes, 256, true});
 
             LOG_DEBUG("[ROCmQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "

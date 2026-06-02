@@ -59,6 +59,7 @@ namespace
         bool endCapture() override { return true; }
         bool instantiate() override
         {
+            ++instantiate_calls_;
             executable_ = true;
             return true;
         }
@@ -67,13 +68,20 @@ namespace
             ++launch_calls_;
             return executable_;
         }
-        GraphUpdateResult tryUpdate() override { return GraphUpdateResult::Success; }
+        GraphUpdateResult tryUpdate() override
+        {
+            ++try_update_calls_;
+            return update_result_;
+        }
         bool hasExecutable() const override { return executable_; }
         size_t nodeCount() const override { return 1; }
         void reset() override { executable_ = false; }
         const char *backendName() const override { return "FakeReplay"; }
 
         int launch_calls_ = 0;
+        int instantiate_calls_ = 0;
+        int try_update_calls_ = 0;
+        GraphUpdateResult update_result_ = GraphUpdateResult::Success;
 
     private:
         bool executable_ = true;
@@ -756,4 +764,74 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", aggregate_tags), 1u);
 
     PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "verifier_graph", true);
+
+    DeviceGraphExecutor::GraphSegment segment;
+    segment.capturable = true;
+    segment.stage_names = {"verifier_graph"};
+    auto capture = std::make_unique<FakeReplayGraphCapture>();
+    FakeReplayGraphCapture *capture_ptr = capture.get();
+    segment.capture = std::move(capture);
+
+    FakeReplayGPUContext gpu_ctx;
+    int capture_stream = 0;
+    bool post_launch_called = false;
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    ASSERT_TRUE(DeviceGraphCaptureController::executeCapturedReplaySegmentRecapture(
+        graph,
+        segment,
+        &ctx,
+        &gpu_ctx,
+        &capture_stream,
+        /*segment_index=*/0,
+        [&](DeviceGraphExecutor::GraphSegment &, void *)
+        {
+            post_launch_called = true;
+        }));
+
+    EXPECT_TRUE(post_launch_called);
+    EXPECT_EQ(capture_ptr->try_update_calls_, 0);
+    EXPECT_EQ(capture_ptr->instantiate_calls_, 1);
+    EXPECT_EQ(capture_ptr->launch_calls_, 1);
+}
+
+TEST(Test__GraphSegmentCache, CUDARecaptureStillUsesInPlaceGraphUpdate)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "verifier_graph", true);
+
+    DeviceGraphExecutor::GraphSegment segment;
+    segment.capturable = true;
+    segment.stage_names = {"verifier_graph"};
+    auto capture = std::make_unique<FakeReplayGraphCapture>();
+    FakeReplayGraphCapture *capture_ptr = capture.get();
+    segment.capture = std::move(capture);
+
+    FakeReplayGPUContext gpu_ctx;
+    int capture_stream = 0;
+    bool post_launch_called = false;
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    ASSERT_TRUE(DeviceGraphCaptureController::executeCapturedReplaySegmentRecapture(
+        graph,
+        segment,
+        &ctx,
+        &gpu_ctx,
+        &capture_stream,
+        /*segment_index=*/0,
+        [&](DeviceGraphExecutor::GraphSegment &, void *)
+        {
+            post_launch_called = true;
+        }));
+
+    EXPECT_TRUE(post_launch_called);
+    EXPECT_EQ(capture_ptr->try_update_calls_, 1);
+    EXPECT_EQ(capture_ptr->instantiate_calls_, 0);
+    EXPECT_EQ(capture_ptr->launch_calls_, 1);
 }

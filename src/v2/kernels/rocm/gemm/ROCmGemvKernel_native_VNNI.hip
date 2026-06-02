@@ -2143,6 +2143,166 @@ __global__ void gemv_native_vnni_reduce_kernel_t(
     }
 }
 
+template <int TILE_N, int CPT>
+__global__ void gemv_native_vnni_reduce_m2_kernel_t(
+    const float* __restrict__ d_partial_fp32,    // [KB × 2 × N] partial buffer
+    float* __restrict__ d_C_fp32,                // [2 × N] output
+    int N, int kblocks)
+{
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n >= N) return;
+
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        #pragma unroll 16
+        for (int kb = 0; kb < kblocks; ++kb)
+        {
+            sum0 += d_partial_fp32[(static_cast<size_t>(kb) * 2u) * N + n];
+            sum1 += d_partial_fp32[(static_cast<size_t>(kb) * 2u + 1u) * N + n];
+        }
+
+        d_C_fp32[n] = sum0;
+        d_C_fp32[static_cast<size_t>(N) + n] = sum1;
+    }
+}
+
+// Q4_0/Q4_1 two-row verifier kernel. Qwen3.6 Q4_K uses the Q4_1 native
+// codebook after CPU packing, so this provides the graph-safe ROCm MTP path
+// without touching the broader IQ/native-VNNI matrix yet.
+template <int TILE_N, int CPT, NativeVNNIFormat FMT>
+__global__ void gemv_native_vnni_q4_m2_kernel_t(
+    const int8_t*    __restrict__ d_A_int8,       // [2 × K] quantized activations
+    const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × 16]
+    const uint16_t*  __restrict__ d_block_scales, // [blocks_per_row × N]
+    const uint16_t*  __restrict__ d_block_mins,   // [blocks_per_row × N], Q4_1 only
+    float*           __restrict__ d_C_fp32,       // [2 × N] output
+    float*           __restrict__ d_partial_fp32, // [KB × 2 × N] partials
+    const float*     __restrict__ d_scale_A_blockwise, // [2 × blocks_per_row]
+    int N, int K, int kblocks)
+{
+    using Traits = NVNNITraits<FMT>;
+    static_assert(FMT == NVNNI_Q4_0 || FMT == NVNNI_Q4_1, "M2 native-VNNI verifier only supports Q4_0/Q4_1");
+    static_assert(CPT == 1 || CPT == 2, "native-VNNI M2 supports CPT in {1,2}");
+
+    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const int kb = blockIdx.y;
+
+    const int blocks_per_row = K / 32;
+    const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
+    const int b_start = kb * b_per;
+    const int b_end = min(b_start + b_per, blocks_per_row);
+
+    float acc0[CPT];
+    float acc1[CPT];
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        acc0[c] = 0.0f;
+        acc1[c] = 0.0f;
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n >= N)
+            continue;
+
+        for (int b = b_start; b < b_end; ++b)
+        {
+            const int32_t* a0 = reinterpret_cast<const int32_t*>(d_A_int8 + b * 32);
+            const int32_t* a1 = reinterpret_cast<const int32_t*>(d_A_int8 + K + b * 32);
+
+            int32_t packed_groups[8];
+            const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) + static_cast<size_t>(n);
+            const uint8_t* payload = d_payload + linear * Traits::payload_bytes;
+
+            if constexpr (Traits::center_4bit == 8)
+            {
+                constexpr uint32_t SWAR_ADD = 0x78787878u;
+                constexpr uint32_t SWAR_XOR = 0x80808080u;
+                constexpr uint32_t NIBBLE_MASK = 0x0F0F0F0Fu;
+
+                #pragma unroll
+                for (int g = 0; g < 4; ++g)
+                {
+                    const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
+                    packed_groups[g] = static_cast<int32_t>(((raw & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
+                    packed_groups[g + 4] = static_cast<int32_t>((((raw >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
+                }
+            }
+            else
+            {
+                #pragma unroll
+                for (int g = 0; g < 4; ++g)
+                {
+                    const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
+                    packed_groups[g] = static_cast<int32_t>(raw & 0x0F0F0F0Fu);
+                    packed_groups[g + 4] = static_cast<int32_t>((raw >> 4) & 0x0F0F0F0Fu);
+                }
+            }
+
+            int32_t dot0 = 0;
+            int32_t dot1 = 0;
+            #pragma unroll
+            for (int g = 0; g < 8; ++g)
+            {
+                dot0 = __builtin_amdgcn_sdot4(a0[g], packed_groups[g], dot0, false);
+                dot1 = __builtin_amdgcn_sdot4(a1[g], packed_groups[g], dot1, false);
+            }
+
+            const uint16_t scale_bits = d_block_scales[linear];
+            const float block_d = __half2float(*reinterpret_cast<const __half*>(&scale_bits));
+            const float scale_a0 = d_scale_A_blockwise[b];
+            const float scale_a1 = d_scale_A_blockwise[blocks_per_row + b];
+            acc0[c] += static_cast<float>(dot0) * block_d * scale_a0;
+            acc1[c] += static_cast<float>(dot1) * block_d * scale_a1;
+
+            if constexpr (Traits::is_asymmetric)
+            {
+                constexpr int32_t ones = 0x01010101;
+                int32_t sum0 = 0;
+                int32_t sum1 = 0;
+                #pragma unroll
+                for (int g = 0; g < 8; ++g)
+                {
+                    sum0 = __builtin_amdgcn_sdot4(a0[g], ones, sum0, false);
+                    sum1 = __builtin_amdgcn_sdot4(a1[g], ones, sum1, false);
+                }
+
+                const uint16_t min_bits = d_block_mins[linear];
+                const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
+                acc0[c] += static_cast<float>(sum0) * block_m * scale_a0;
+                acc1[c] += static_cast<float>(sum1) * block_m * scale_a1;
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < CPT; ++c)
+    {
+        const int n = n_base + c;
+        if (n >= N)
+            continue;
+
+        if (kblocks == 1)
+        {
+            d_C_fp32[n] = acc0[c];
+            d_C_fp32[static_cast<size_t>(N) + n] = acc1[c];
+        }
+        else
+        {
+            d_partial_fp32[(static_cast<size_t>(kb) * 2u) * N + n] = acc0[c];
+            d_partial_fp32[(static_cast<size_t>(kb) * 2u + 1u) * N + n] = acc1[c];
+        }
+    }
+}
+
 
 // ============================================================================
 // C API: Launch wrappers
@@ -2731,6 +2891,141 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
 //
 // Eliminates atomicAdd and output memset from the old implementation.
 // ============================================================================
+bool rocmGemv_native_vnni_q4_m2_fp32(
+    const int8_t* d_A_int8,
+    const uint8_t* d_payload,
+    const void* d_block_scales,
+    const void* d_block_mins,
+    float* d_C_fp32,
+    const float* d_scale_A_blockwise,
+    float* d_partial_fp32,
+    int N, int K,
+    uint8_t codebook_id,
+    int device_id, void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    if ((K % 32) != 0)
+    {
+        fprintf(stderr, "[rocmGemv_native_vnni_q4_m2_fp32] K must be multiple of 32 (N=%d K=%d)\n", N, K);
+        return false;
+    }
+    if (!d_A_int8 || !d_payload || !d_block_scales || !d_C_fp32 || !d_scale_A_blockwise)
+    {
+        fprintf(stderr, "[rocmGemv_native_vnni_q4_m2_fp32] missing required pointer (N=%d K=%d)\n", N, K);
+        return false;
+    }
+    if (codebook_id == static_cast<uint8_t>(NVNNI_Q4_1) && !d_block_mins)
+    {
+        fprintf(stderr, "[rocmGemv_native_vnni_q4_m2_fp32] Q4_1/Q4_K requires min buffer (N=%d K=%d)\n", N, K);
+        return false;
+    }
+    if (codebook_id != static_cast<uint8_t>(NVNNI_Q4_0) &&
+        codebook_id != static_cast<uint8_t>(NVNNI_Q4_1))
+    {
+        return false;
+    }
+
+    constexpr int NUM_CUS = 60;
+    constexpr int MIN_BLOCKS_PER_WAVE = 1;
+    constexpr int KB_CAP = 64;
+    constexpr int TN = 64;
+    constexpr int CPT = 1;
+    constexpr int THREADS = TN / CPT;
+
+    const int blocks_per_row = K / 32;
+    const int grid_n = (N + TN - 1) / TN;
+    const auto& rocm_env = llaminar2::debugEnv().rocm;
+    const int api_kb_override = g_native_vnni_kb_override.load(std::memory_order_relaxed);
+    const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
+    const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
+    const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+
+    // The fused two-row verifier does more dot work per weight payload than
+    // the single-row GEMV path. Real Qwen3.6 ROCm MTP tuning prefers lower
+    // split-K pressure here than the generic single-row default.
+    constexpr int DEFAULT_TARGET_WAVES_PER_CU = 12;
+    const int target_waves_per_cu = (waves_override > 0) ? waves_override : DEFAULT_TARGET_WAVES_PER_CU;
+    const int target_total_waves = target_waves_per_cu * NUM_CUS;
+    int kb_raw = max(1, (target_total_waves + grid_n - 1) / grid_n);
+    int kb_max = max(1, blocks_per_row / MIN_BLOCKS_PER_WAVE);
+    kb_max = min(kb_max, KB_CAP);
+    kb_raw = min(kb_raw, kb_max);
+
+    int kb = kb_raw;
+    if (blocks_per_row % kb_raw != 0)
+    {
+        for (int d = 1; d < kb_raw; ++d)
+        {
+            if (kb_raw - d >= 1 && blocks_per_row % (kb_raw - d) == 0) { kb = kb_raw - d; break; }
+            if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
+        }
+    }
+    if (kb_override > 0)
+    {
+        kb = min(kb_override, KB_CAP);
+        if (kb > blocks_per_row) kb = blocks_per_row;
+    }
+    if (kb < 1) kb = 1;
+
+    if (kb > 1 && !d_partial_fp32)
+    {
+        fprintf(stderr, "[rocmGemv_native_vnni_q4_m2_fp32] kb=%d>1 but no M2 partial buffer (N=%d K=%d)\n", kb, N, K);
+        return false;
+    }
+
+    const uint16_t* d_scales_u16 = static_cast<const uint16_t*>(d_block_scales);
+    const uint16_t* d_mins_u16 = static_cast<const uint16_t*>(d_block_mins);
+    dim3 block(THREADS, 1, 1);
+    dim3 grid(grid_n, kb, 1);
+
+    switch (static_cast<NativeVNNIFormat>(codebook_id))
+    {
+    case NVNNI_Q4_0:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_native_vnni_q4_m2_kernel_t<TN, CPT, NVNNI_Q4_0>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_payload, d_scales_u16, d_mins_u16,
+            d_C_fp32, d_partial_fp32, d_scale_A_blockwise, N, K, kb);
+        break;
+    case NVNNI_Q4_1:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_native_vnni_q4_m2_kernel_t<TN, CPT, NVNNI_Q4_1>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_A_int8, d_payload, d_scales_u16, d_mins_u16,
+            d_C_fp32, d_partial_fp32, d_scale_A_blockwise, N, K, kb);
+        break;
+    default:
+        return false;
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_native_vnni_q4_m2_fp32] M2 kernel launch failed: %s (N=%d K=%d codebook=%u)\n",
+                hipGetErrorString(err), N, K, static_cast<unsigned>(codebook_id));
+        return false;
+    }
+
+    if (kb > 1)
+    {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(gemv_native_vnni_reduce_m2_kernel_t<TN, CPT>),
+            dim3(grid_n), block, 0, static_cast<hipStream_t>(stream),
+            d_partial_fp32, d_C_fp32, N, kb);
+    }
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGemv_native_vnni_q4_m2_fp32] M2 reduce launch failed: %s (N=%d K=%d codebook=%u)\n",
+                hipGetErrorString(err), N, K, static_cast<unsigned>(codebook_id));
+        return false;
+    }
+
+    return true;
+}
+
 bool rocmGemv_native_vnni_fp32(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,

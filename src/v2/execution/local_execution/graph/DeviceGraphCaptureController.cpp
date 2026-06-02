@@ -774,8 +774,14 @@ namespace llaminar2
             return false;
         }
 
-        auto update_result = segment.capture->tryUpdate();
-        if (update_result == GraphUpdateResult::NeedsReinstantiate ||
+        const bool skip_in_place_update = ctx->deviceId().is_rocm();
+        auto update_result = GraphUpdateResult::NeedsReinstantiate;
+        if (!skip_in_place_update)
+        {
+            update_result = segment.capture->tryUpdate();
+        }
+        if (skip_in_place_update ||
+            update_result == GraphUpdateResult::NeedsReinstantiate ||
             update_result == GraphUpdateResult::Failed)
         {
             gpu_ctx->clearLastError();
