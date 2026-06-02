@@ -803,6 +803,7 @@ namespace llaminar2
         conv_params.seq_len = total_tokens;
         conv_params.channels = qkv_dim;
         conv_params.kernel_size = config_.gdn.conv_kernel_size;
+        conv_params.layer_idx = layer_idx;
         conv_params.verifier_state_capture_rows = verifier_state_capture_rows;
 
         // Use kernel instance from hybrid cache (lifetime tied to cache)

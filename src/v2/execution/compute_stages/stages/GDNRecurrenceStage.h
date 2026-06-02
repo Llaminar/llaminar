@@ -178,6 +178,7 @@ namespace llaminar2
 
         int effectivePrefillSeqLen() const;
         bool shouldUseRealLengthContract() const;
+        std::string workspaceStableId() const;
         std::string effectiveSeqLenScalarBufferName() const;
         std::string verifierStateCaptureBufferName() const;
         bool ensureGpuEffectiveSeqLenStateInitialized();

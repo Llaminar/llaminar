@@ -60,6 +60,7 @@ namespace llaminar2
             int seq_len = 0;             ///< Sequence length
             int channels = 0;            ///< Number of channels (= QKV dim)
             int kernel_size = 4;         ///< Convolution kernel width
+            int layer_idx = -1;          ///< Logical model layer for stable graph workspace naming.
             int verifier_state_capture_rows = 0; ///< Candidate verifier rows to snapshot for MTP rollback.
 
             /// Kernel implementation (set during graph construction)
@@ -130,6 +131,7 @@ namespace llaminar2
 
         int effectivePrefillSeqLen() const;
         bool shouldUseRealLengthContract() const;
+        std::string workspaceStableId() const;
         std::string effectiveSeqLenScalarBufferName() const;
         std::string verifierStateCaptureBufferName() const;
         bool ensureGpuEffectiveSeqLenStateInitialized();

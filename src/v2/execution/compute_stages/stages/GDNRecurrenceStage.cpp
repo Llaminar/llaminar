@@ -255,14 +255,21 @@ namespace llaminar2
                params_.kernel->supportsPaddedPrefillRealLength();
     }
 
+    std::string GDNRecurrenceStage::workspaceStableId() const
+    {
+        if (params_.layer_idx >= 0)
+            return std::string("layer") + std::to_string(params_.layer_idx);
+        return std::string("slice") + std::to_string(workspace_slice_id_);
+    }
+
     std::string GDNRecurrenceStage::effectiveSeqLenScalarBufferName() const
     {
-        return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + std::to_string(workspace_slice_id_);
+        return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + workspaceStableId();
     }
 
     std::string GDNRecurrenceStage::verifierStateCaptureBufferName() const
     {
-        return std::string(WS_VERIFIER_STATE_CAPTURE) + "_" + std::to_string(workspace_slice_id_);
+        return std::string(WS_VERIFIER_STATE_CAPTURE) + "_" + workspaceStableId();
     }
 
     bool GDNRecurrenceStage::hasVerifierStateCapture() const

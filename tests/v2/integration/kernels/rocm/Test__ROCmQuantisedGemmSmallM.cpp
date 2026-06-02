@@ -1738,7 +1738,8 @@ TEST(Test__ROCmQuantisedGemmSmallM, FusedQ4KQwen36FFNGateUpM2UsesCanonicalBatche
             ++single_partial_buffers;
         if (buf.name == GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED)
             ++batched_partial_buffers;
-        if (buf.name.rfind(old_partial_prefix, 0) == 0)
+        if (buf.name != GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED &&
+            buf.name.rfind(old_partial_prefix, 0) == 0)
             ++old_slice_named_buffers;
     }
     EXPECT_EQ(single_partial_buffers, 1)

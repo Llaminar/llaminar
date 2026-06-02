@@ -165,14 +165,21 @@ namespace llaminar2
                params_.kernel->supportsPaddedPrefillRealLength();
     }
 
+    std::string ShortConv1dStage::workspaceStableId() const
+    {
+        if (params_.layer_idx >= 0)
+            return std::string("layer") + std::to_string(params_.layer_idx);
+        return std::string("slice") + std::to_string(workspace_slice_id_);
+    }
+
     std::string ShortConv1dStage::effectiveSeqLenScalarBufferName() const
     {
-        return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + std::to_string(workspace_slice_id_);
+        return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + workspaceStableId();
     }
 
     std::string ShortConv1dStage::verifierStateCaptureBufferName() const
     {
-        return std::string(WS_VERIFIER_STATE_CAPTURE) + "_" + std::to_string(workspace_slice_id_);
+        return std::string(WS_VERIFIER_STATE_CAPTURE) + "_" + workspaceStableId();
     }
 
     void ShortConv1dStage::updatePrefillReplayParams(const PrefillReplayParams &replay)

@@ -427,6 +427,76 @@ TEST(Test__GDNKernels, Recurrence_WorkspaceRequirementSharesMergedQKVScratch)
     EXPECT_TRUE(scratch->required);
 }
 
+TEST(Test__GDNKernels, ShortConv_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
+{
+    auto countPrefixed = [](const WorkspaceRequirements &reqs, const std::string &prefix)
+    {
+        int count = 0;
+        for (const auto &buffer : reqs.buffers)
+        {
+            if (buffer.name.rfind(prefix, 0) == 0)
+                ++count;
+        }
+        return count;
+    };
+
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = 2;
+    p.channels = 128;
+    p.kernel_size = 4;
+    p.layer_idx = 17;
+    p.verifier_state_capture_rows = 1;
+
+    ShortConv1dStage first(p);
+    ShortConv1dStage rebuilt(p);
+
+    WorkspaceRequirements merged;
+    merged.merge(first.getWorkspaceRequirements(/*m=*/2));
+    merged.merge(rebuilt.getWorkspaceRequirements(/*m=*/2));
+
+    EXPECT_NE(merged.find("gdn_shortconv_effective_seq_len_scalar_layer17"), nullptr);
+    EXPECT_NE(merged.find("gdn_shortconv_verifier_state_capture_layer17"), nullptr);
+    EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_EFFECTIVE_SEQ_LEN_SCALAR), 1);
+    EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_VERIFIER_STATE_CAPTURE), 1);
+}
+
+TEST(Test__GDNKernels, Recurrence_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
+{
+    auto countPrefixed = [](const WorkspaceRequirements &reqs, const std::string &prefix)
+    {
+        int count = 0;
+        for (const auto &buffer : reqs.buffers)
+        {
+            if (buffer.name.rfind(prefix, 0) == 0)
+                ++count;
+        }
+        return count;
+    };
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = 2;
+    p.n_heads = 2;
+    p.n_k_heads = 2;
+    p.d_k = 8;
+    p.d_v = 8;
+    p.layer_idx = 17;
+    p.verifier_state_capture_rows = 1;
+
+    GDNRecurrenceStage first(p);
+    GDNRecurrenceStage rebuilt(p);
+
+    WorkspaceRequirements merged;
+    merged.merge(first.getWorkspaceRequirements(/*m=*/2));
+    merged.merge(rebuilt.getWorkspaceRequirements(/*m=*/2));
+
+    EXPECT_NE(merged.find("gdn_effective_seq_len_scalar_layer17"), nullptr);
+    EXPECT_NE(merged.find("gdn_verifier_state_capture_layer17"), nullptr);
+    EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_EFFECTIVE_SEQ_LEN_SCALAR), 1);
+    EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_VERIFIER_STATE_CAPTURE), 1);
+}
+
 TEST(Test__GDNKernels, Projection_WorkspaceRequirementsUsePerProjectionN)
 {
     RecordingWorkspaceGemm qkv("qkv");

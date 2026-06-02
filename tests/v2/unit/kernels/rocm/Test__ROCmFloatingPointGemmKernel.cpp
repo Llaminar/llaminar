@@ -366,6 +366,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionWorkspaceNamesMe
     auto weights_alpha = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
     auto weights_beta = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
 
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
     ROCmFloatingPointGemmKernel alpha_kernel(weights_alpha.get(), rocm_device_id_);
     ROCmFloatingPointGemmKernel beta_kernel(weights_beta.get(), rocm_device_id_);
 
