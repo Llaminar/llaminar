@@ -1012,6 +1012,7 @@ namespace llaminar2
             if (forward_engine_)
                 forward_engine_->clearCache();
             mtp_sidecar_depth0_cache_.invalidate();
+            mtp_sidecar_depth0_kv_only_cache_.invalidate();
             for (auto &cache : layer_graph_cache_)
                 cache.invalidate();
             resetKernelDynamicState();
@@ -2332,6 +2333,7 @@ namespace llaminar2
         if (forward_engine_)
             forward_engine_->clearCache();
         mtp_sidecar_depth0_cache_.invalidate();
+        mtp_sidecar_depth0_kv_only_cache_.invalidate();
 
         // Clear device contexts
         device_contexts_.clear();
@@ -3437,7 +3439,8 @@ namespace llaminar2
         int32_t draft_condition_token,
         TensorBase *terminal_hidden,
         int position_id,
-        const char *sidecar_perf_context)
+        const char *sidecar_perf_context,
+        bool kv_cache_only)
     {
         const std::string device_key = state_.device_id.toString();
         const std::string phase = perfPhaseName();
@@ -3523,17 +3526,21 @@ namespace llaminar2
         TensorBase *mtp_moe_gate_scratch = get_extension(BufferId::MOE_GATE_SCRATCH);
         TensorBase *mtp_moe_up_scratch = get_extension(BufferId::MOE_UP_SCRATCH);
 
-        if (!terminal_hidden ||
-            !mtp_logits || !mtp_hidden || !mtp_embedding || !mtp_norm_hidden ||
-            !mtp_norm_embedding || !mtp_concat || !mtp_projected ||
-            !mtp_q || !mtp_k || !mtp_v || !mtp_q_raw || !mtp_q_gate ||
+        const bool missing_common_buffers =
+            !terminal_hidden ||
+            !mtp_embedding || !mtp_norm_hidden || !mtp_norm_embedding ||
+            !mtp_concat || !mtp_projected ||
+            !mtp_q || !mtp_k || !mtp_v || !mtp_q_raw || !mtp_q_gate;
+        const bool missing_full_sidecar_buffers =
+            !mtp_logits || !mtp_hidden ||
             !mtp_attn_output || !mtp_attn_proj || !mtp_gate || !mtp_up ||
-            !mtp_ffn_output)
+            !mtp_ffn_output;
+        if (missing_common_buffers || (!kv_cache_only && missing_full_sidecar_buffers))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar missing required buffers");
             return false;
         }
-        if (mtp_moe_sidecar &&
+        if (!kv_cache_only && mtp_moe_sidecar &&
             (!mtp_moe_expert_indices || !mtp_moe_expert_weights ||
              !mtp_moe_combined_output || !mtp_moe_shared_expert_output ||
              !mtp_moe_gate_scratch || !mtp_moe_up_scratch))
@@ -3551,6 +3558,7 @@ namespace llaminar2
         input.batch_size = 1;
         input.seq_len = 1;
         input.device = state_.device_id;
+        input.kv_cache_only = kv_cache_only;
 
         MTPForwardOutput output;
         output.logits = mtp_logits;
@@ -3577,7 +3585,9 @@ namespace llaminar2
         output.moe_gate_scratch = mtp_moe_gate_scratch;
         output.moe_up_scratch = mtp_moe_up_scratch;
 
-        auto &sidecar_cache = mtp_sidecar_depth0_cache_;
+        auto &sidecar_cache = kv_cache_only
+            ? mtp_sidecar_depth0_kv_only_cache_
+            : mtp_sidecar_depth0_cache_;
         const bool needs_graph_rebuild =
             !sidecar_cache.valid ||
             !sidecar_cache.graph ||
@@ -3740,7 +3750,7 @@ namespace llaminar2
                     mtp_phase.c_str(),
                     device_key.c_str(),
                     "mtp_stage_gpu",
-                    {{"context", phase == "decode" ? "mtp_decode_sidecar" : "mtp_shifted_prefill"},
+                    {{"context", sidecar_context},
                      {"depth", "0"}});
                 timeline.resetTimings();
             }
@@ -3799,7 +3809,8 @@ namespace llaminar2
             if (!executeMTPDepth0(tokens[0],
                                   state_.prefix_terminal_hidden.get(),
                                   previous_tokens,
-                                  "mtp_shifted_prefill"))
+                                  "mtp_shifted_prefill",
+                                  true))
             {
                 return false;
             }
@@ -3812,7 +3823,8 @@ namespace llaminar2
             if (!executeMTPDepth0(tokens[row + 1],
                                   state_.prefix_terminal_hidden.get(),
                                   position_offset + row + 1,
-                                  "mtp_shifted_prefill"))
+                                  "mtp_shifted_prefill",
+                                  true))
             {
                 return false;
             }
@@ -3973,7 +3985,8 @@ namespace llaminar2
             if (!executeMTPDepth0(tokens[token_index],
                                   state_.prefix_terminal_hidden.get(),
                                   position_offset + token_index,
-                                  "mtp_decode_catchup"))
+                                  "mtp_decode_catchup",
+                                  true))
             {
                 return false;
             }
@@ -5424,6 +5437,7 @@ namespace llaminar2
             if (forward_engine_)
                 forward_engine_->resetCapturedReplayState();
             mtp_sidecar_depth0_cache_.resetReplayState();
+            mtp_sidecar_depth0_kv_only_cache_.resetReplayState();
         };
 
         auto fail = [](const std::string &reason) -> bool
@@ -5690,6 +5704,7 @@ namespace llaminar2
         if (forward_engine_)
             forward_engine_->resetCapturedReplayState();
         mtp_sidecar_depth0_cache_.resetReplayState();
+        mtp_sidecar_depth0_kv_only_cache_.resetReplayState();
         return true;
     }
 
@@ -5872,6 +5887,7 @@ namespace llaminar2
         if (forward_engine_)
             forward_engine_->clearCache();
         mtp_sidecar_depth0_cache_.invalidate();
+        mtp_sidecar_depth0_kv_only_cache_.invalidate();
 
         // Layer decode graphs can hold per-request stage/kernel state, so make
         // them rebuild after the request boundary.

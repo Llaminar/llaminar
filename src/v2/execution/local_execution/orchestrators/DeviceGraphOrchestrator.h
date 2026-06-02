@@ -1846,6 +1846,7 @@ namespace llaminar2
                 forward_engine_->clearCache();
             }
             mtp_sidecar_depth0_cache_.invalidate();
+            mtp_sidecar_depth0_kv_only_cache_.invalidate();
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();
@@ -2246,7 +2247,8 @@ namespace llaminar2
         bool executeMTPDepth0(int32_t draft_condition_token,
                               TensorBase *terminal_hidden,
                               int position_id,
-                              const char *sidecar_perf_context);
+                              const char *sidecar_perf_context,
+                              bool kv_cache_only = false);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,
@@ -2281,6 +2283,7 @@ namespace llaminar2
         };
 
         MTPSidecarGraphCache mtp_sidecar_depth0_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_cache_;
 
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)

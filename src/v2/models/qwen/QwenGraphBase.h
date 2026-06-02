@@ -409,6 +409,21 @@ namespace llaminar2
             DeviceId device);
 
         /**
+         * Add KV cache append stage.
+         * @return KV append node name, or rope_dependency when no KV cache is present.
+         */
+        std::string addKVCacheAppend(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            IKVCache *kv_cache,
+            DeviceId device,
+            const std::string &rope_dependency);
+
+        /**
          * Add KV cache append, attention compute, and optional gather stages.
          * @return Terminal attention node name
          */

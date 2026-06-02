@@ -1119,6 +1119,53 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_TRUE(hasDependency(graph, "mtp0_lm_head", "mtp0_final_norm"));
 }
 
+TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCatchup)
+{
+    DenseMTPGraphFixture fixture;
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    auto weights = fixture.mtpWeights();
+    auto input = fixture.input();
+    input.kv_cache_only = true;
+    auto output = fixture.output();
+    output.logits = nullptr;
+    output.hidden = nullptr;
+    output.attn_output = nullptr;
+    output.attn_proj = nullptr;
+    output.gate = nullptr;
+    output.up = nullptr;
+    output.ffn_output = nullptr;
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    EXPECT_EQ(graph.terminalNode(), "layer0_kv_append");
+
+    ASSERT_NE(graph.getNode("mtp0_embedding"), nullptr);
+    ASSERT_NE(graph.getNode("mtp0_norm_hidden"), nullptr);
+    ASSERT_NE(graph.getNode("mtp0_norm_embedding"), nullptr);
+    ASSERT_NE(graph.getNode("mtp0_concat"), nullptr);
+    ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_qkv_proj"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_q_gate_split"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_rope"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_kv_append"), nullptr);
+
+    EXPECT_EQ(graph.getNode("layer0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
+    EXPECT_EQ(graph.getNode("layer0_qkv_proj")->stage->type(), ComputeStageType::GEMM_FUSED_QKV);
+
+    EXPECT_EQ(graph.getNode("layer0_attention"), nullptr);
+    EXPECT_EQ(graph.getNode("layer64_ffn_residual"), nullptr);
+    EXPECT_EQ(graph.getNode("mtp0_final_norm"), nullptr);
+    EXPECT_EQ(graph.getNode("mtp0_lm_head"), nullptr);
+
+    EXPECT_TRUE(hasDependency(graph, "mtp0_fc", "mtp0_concat"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_attn_norm", "mtp0_fc"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_qkv_proj", "layer0_attn_norm"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_rope"));
+}
+
 TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWeights)
 {
     DenseMTPGraphFixture fixture;

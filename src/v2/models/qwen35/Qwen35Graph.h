@@ -143,6 +143,16 @@ namespace llaminar2
             DeviceId device,
             const std::vector<int> *sequence_lengths);
 
+        ComputeGraph buildFAKVCacheAppendGraph(
+            const LayerWeights &layer,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            IKVCache *kv_cache,
+            const int *position_ids,
+            DeviceId device);
+
         // =====================================================================
         // GDN Attention Sub-Graph Building
         // =====================================================================

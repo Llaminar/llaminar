@@ -690,6 +690,7 @@ namespace llaminar2
         int batch_size = 1;
         int seq_len = 1;
         DeviceId device = DeviceId::cpu();
+        bool kv_cache_only = false;
     };
 
     struct MTPForwardOutput

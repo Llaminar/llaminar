@@ -2398,25 +2398,20 @@ namespace llaminar2
         return node_name;
     }
 
-    std::string QwenGraphBase::addKVCacheAndAttention(
+    std::string QwenGraphBase::addKVCacheAppend(
         ComputeGraph &graph,
         const std::string &prefix,
         ActivationBuffers &buffers,
         int layer_idx,
         int seq_len,
         int batch_size,
-        int local_n_heads,
-        int local_n_kv_heads,
         IKVCache *kv_cache,
-        const int *position_ids,
         DeviceId device,
-        bool has_qkv_proj,
         const std::string &rope_dependency)
     {
         int total_tokens = batch_size * seq_len;
         int kv_local_layer = layer_idx - config_.pp_layer_offset;
 
-        // --- KV Cache Append ---
         if (kv_cache)
         {
             graph.addNode(prefix + "kv_append",
@@ -2444,7 +2439,41 @@ namespace llaminar2
             // carries the Q/K norm dependencies. Appending directly after QKV GEMM
             // can cache pre-normalized K on Qwen3.5 FA layers.
             graph.addDependency(prefix + "kv_append", rope_dependency);
+            return prefix + "kv_append";
         }
+
+        return rope_dependency;
+    }
+
+    std::string QwenGraphBase::addKVCacheAndAttention(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        int layer_idx,
+        int seq_len,
+        int batch_size,
+        int local_n_heads,
+        int local_n_kv_heads,
+        IKVCache *kv_cache,
+        const int *position_ids,
+        DeviceId device,
+        bool has_qkv_proj,
+        const std::string &rope_dependency)
+    {
+        int total_tokens = batch_size * seq_len;
+        int kv_local_layer = layer_idx - config_.pp_layer_offset;
+
+        const std::string kv_append_dependency =
+            addKVCacheAppend(
+                graph,
+                prefix,
+                buffers,
+                layer_idx,
+                seq_len,
+                batch_size,
+                kv_cache,
+                device,
+                rope_dependency);
 
         // --- Determine K/V source for attention ---
         ITensor *K_for_attn = buffers.K;
@@ -2555,7 +2584,7 @@ namespace llaminar2
             if (use_gather_stage)
                 graph.addDependency(prefix + "attention", prefix + "kv_gather");
             else if (kv_cache)
-                graph.addDependency(prefix + "attention", prefix + "kv_append");
+                graph.addDependency(prefix + "attention", kv_append_dependency);
             else
                 graph.addDependency(prefix + "attention", rope_dependency);
         }
