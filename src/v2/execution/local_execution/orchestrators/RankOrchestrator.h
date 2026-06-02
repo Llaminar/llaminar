@@ -430,6 +430,11 @@ namespace llaminar2
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens) override;
+        bool commitMTPShiftedRowsFromPartialForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count) override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;

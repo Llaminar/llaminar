@@ -4072,6 +4072,19 @@ namespace llaminar2
         int token_count,
         int already_appended_tokens)
     {
+        return commitMTPShiftedRowsFromPartialForward(
+            tokens,
+            token_count,
+            already_appended_tokens,
+            token_count);
+    }
+
+    bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromPartialForward(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens,
+        int main_forward_token_count)
+    {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
         if (token_count <= already_appended_tokens)
@@ -4096,12 +4109,21 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires position state");
             return false;
         }
+        if (main_forward_token_count <= 0 ||
+            main_forward_token_count > token_count ||
+            token_count > main_forward_token_count + 1)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit received invalid main_forward_token_count="
+                      << main_forward_token_count << " token_count=" << token_count);
+            return false;
+        }
 
-        const int position_offset = state_.positions[0] - token_count;
+        const int position_offset = state_.positions[0] - main_forward_token_count;
         if (position_offset < 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP shifted-row commit position_offset="
-                      << position_offset << " token_count=" << token_count);
+                      << position_offset << " token_count=" << token_count
+                      << " main_forward_token_count=" << main_forward_token_count);
             return false;
         }
 
@@ -4160,7 +4182,7 @@ namespace llaminar2
         for (int token_index = already_appended_tokens; token_index < token_count; ++token_index)
         {
             const int hidden_row = token_index - 1;
-            if (!selectMTPTerminalHiddenRow(hidden_row, token_count))
+            if (!selectMTPTerminalHiddenRow(hidden_row, main_forward_token_count))
                 return false;
             if (!executeMTPDepth0(tokens[token_index],
                                   state_.prefix_terminal_hidden.get(),
@@ -4172,7 +4194,7 @@ namespace llaminar2
             }
         }
 
-        if (!refreshMTPTerminalHiddenState(token_count, 1))
+        if (!refreshMTPTerminalHiddenState(main_forward_token_count, 1))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to restore terminal hidden after MTP shifted-row commit");
             return false;

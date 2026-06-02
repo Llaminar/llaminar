@@ -2284,6 +2284,19 @@ namespace llaminar2
         int token_count,
         int already_appended_tokens)
     {
+        return commitMTPShiftedRowsFromPartialForward(
+            tokens,
+            token_count,
+            already_appended_tokens,
+            token_count);
+    }
+
+    bool RankOrchestrator::commitMTPShiftedRowsFromPartialForward(
+        const int32_t *tokens,
+        int token_count,
+        int already_appended_tokens,
+        int main_forward_token_count)
+    {
         PerfStatsCollector::ScopedTimer total_timer(
             "mtp",
             "rank_mtp_shifted_commit_total",
@@ -2294,16 +2307,25 @@ namespace llaminar2
             return true;
         if (!tokens || token_count <= 0)
             return false;
+        if (main_forward_token_count <= 0 ||
+            main_forward_token_count > token_count ||
+            token_count > main_forward_token_count + 1)
+        {
+            LOG_ERROR("RankOrchestrator::commitMTPShiftedRowsFromPartialForward: invalid main_forward_token_count="
+                      << main_forward_token_count << " token_count=" << token_count);
+            return false;
+        }
         if (device_runners_.empty())
             return false;
 
         if (device_runners_.size() == 1)
         {
             return device_runners_[0] &&
-                   device_runners_[0]->commitMTPShiftedRowsFromLastForward(
+                   device_runners_[0]->commitMTPShiftedRowsFromPartialForward(
                        tokens,
                        token_count,
-                       already_appended_tokens);
+                       already_appended_tokens,
+                       main_forward_token_count);
         }
 
         if (!tp_worker_pool_)
@@ -2334,6 +2356,7 @@ namespace llaminar2
                 {{"participants", std::to_string(device_runners_.size())}});
             tp_worker_pool_->dispatch(
                 [this, &committed_tokens, token_count, already_appended_tokens,
+                 main_forward_token_count,
                  kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
                 {
                     KernelProfiler::setCurrentPhase(kernel_phase);
@@ -2352,14 +2375,16 @@ namespace llaminar2
                                   << " worker=" << i
                                   << " device=" << device_id.toString()
                                   << " token_count=" << token_count
-                                  << " already_appended=" << already_appended_tokens);
+                                  << " already_appended=" << already_appended_tokens
+                                  << " main_forward_token_count=" << main_forward_token_count);
                     }
 
                     const bool ok = device_runners_[i] &&
-                                    device_runners_[i]->commitMTPShiftedRowsFromLastForward(
+                                    device_runners_[i]->commitMTPShiftedRowsFromPartialForward(
                                         committed_tokens.data(),
                                         token_count,
-                                        already_appended_tokens);
+                                        already_appended_tokens,
+                                        main_forward_token_count);
 
                     if (debugEnv().tp_collective_contract_trace)
                     {

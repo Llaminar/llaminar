@@ -1262,6 +1262,11 @@ namespace llaminar2
             !all_speculative_accepted &&
             speculative_token_was_attempted &&
             static_cast<int>(accepted_tokens.size()) > accepted_speculative_prefix + 1;
+        const bool can_lag_rejected_correction =
+            rejected_speculative_token &&
+            speculative_draft_count == 1 &&
+            accepted_tokens.size() == 2 &&
+            already_appended_for_output == 1;
         const bool verifier_state_matches_output =
             all_speculative_accepted && accepted_tokens.size() == draft_tokens.size();
 
@@ -1296,6 +1301,7 @@ namespace llaminar2
                     {"all_speculative_accepted", all_speculative_accepted ? "true" : "false"},
                     {"speculative_token_was_attempted", speculative_token_was_attempted ? "true" : "false"},
                     {"speculative_token_is_output", speculative_token_is_output ? "true" : "false"},
+                    {"lagged_rejected_correction", can_lag_rejected_correction ? "true" : "false"},
                     {"verifier_state_matches_output", verifier_state_matches_output ? "true" : "false"},
                     {"output_tokens", std::to_string(accepted_tokens.size())},
                     {"already_appended_for_output", std::to_string(already_appended_for_output)},
@@ -1403,10 +1409,22 @@ namespace llaminar2
         PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
 
         std::vector<int32_t> replay_tokens;
-        replay_tokens.reserve(accepted_tokens.size());
-        for (int32_t token : accepted_tokens)
+        const int main_forward_token_count =
+            can_lag_rejected_correction ? already_appended_for_output
+                                        : static_cast<int>(accepted_tokens.size());
+        replay_tokens.reserve(static_cast<size_t>(main_forward_token_count));
+        for (int i = 0; i < main_forward_token_count; ++i)
         {
-            replay_tokens.push_back(token);
+            replay_tokens.push_back(accepted_tokens[static_cast<size_t>(i)]);
+        }
+        if (can_lag_rejected_correction)
+        {
+            PerfStatsCollector::addCounter("mtp", "lagged_rejected_correction_replays", 1.0, "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "lagged_rejected_correction_tokens",
+                static_cast<double>(accepted_tokens.size() - replay_tokens.size()),
+                "decode");
         }
         PerfStatsCollector::addCounter("mtp", "replay_tokens", static_cast<double>(replay_tokens.size()), "decode");
         bool replay_ok = false;
@@ -1419,15 +1437,20 @@ namespace llaminar2
             result.error = "Forward pass failed during MTP replay";
             return result;
         }
-        if (!runner_->commitMTPShiftedRowsFromLastForward(
+        if (!runner_->commitMTPShiftedRowsFromPartialForward(
                 accepted_tokens.data(),
                 static_cast<int>(accepted_tokens.size()),
-                already_appended_for_output))
+                already_appended_for_output,
+                main_forward_token_count))
         {
             result.error = "MTP shifted-cache commit failed after replay";
             return result;
         }
-        prefill_logits_ready_ = true;
+        prefill_logits_ready_ = !can_lag_rejected_correction;
+        if (can_lag_rejected_correction)
+        {
+            ready_sampled_token_.reset();
+        }
 
         for (int32_t token : accepted_tokens)
         {

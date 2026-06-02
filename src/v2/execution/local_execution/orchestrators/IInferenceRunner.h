@@ -214,6 +214,29 @@ namespace llaminar2
             return token_count <= already_appended_tokens;
         }
 
+        /**
+         * @brief Commit shifted MTP rows when the most recent main forward only
+         *        replayed a prefix of the emitted token sequence.
+         *
+         * This lets MTP reject recovery leave the main model in the normal
+         * decode-lag state while still catching the shifted MTP cache up to the
+         * emitted correction token. Implementations should use
+         * main_forward_token_count, not token_count, to recover the logical
+         * position offset and terminal hidden row count from the last forward.
+         */
+        virtual bool commitMTPShiftedRowsFromPartialForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count)
+        {
+            (void)main_forward_token_count;
+            return commitMTPShiftedRowsFromLastForward(
+                tokens,
+                token_count,
+                already_appended_tokens);
+        }
+
         virtual const float *mtpLogits() const
         {
             return nullptr;

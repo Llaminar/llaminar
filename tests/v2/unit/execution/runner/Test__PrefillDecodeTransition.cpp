@@ -150,6 +150,7 @@ namespace
         {
             forward_call_count_++;
             last_forward_tokens_.assign(tokens, tokens + seq_len);
+            forward_history_.push_back(last_forward_tokens_);
             last_forward_seq_len_ = seq_len;
             position_ += seq_len;
 
@@ -214,14 +215,31 @@ namespace
             int token_count,
             int already_appended_tokens) override
         {
+            return commitMTPShiftedRowsFromPartialForward(
+                tokens,
+                token_count,
+                already_appended_tokens,
+                token_count);
+        }
+
+        bool commitMTPShiftedRowsFromPartialForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count) override
+        {
             commit_mtp_shifted_count_++;
             last_commit_mtp_already_appended_ = already_appended_tokens;
+            last_commit_mtp_main_forward_token_count_ = main_forward_token_count;
             last_commit_mtp_tokens_.clear();
             if (tokens && token_count > 0)
             {
                 last_commit_mtp_tokens_.assign(tokens, tokens + token_count);
             }
-            return token_count <= already_appended_tokens || tokens != nullptr;
+            return token_count <= already_appended_tokens ||
+                   (tokens != nullptr &&
+                    main_forward_token_count > 0 &&
+                    main_forward_token_count <= token_count);
         }
 
         bool hasMTPLogitsLocal() const override
@@ -343,12 +361,14 @@ namespace
         int lastMTPConditionToken() const { return last_mtp_condition_token_; }
         int commitMTPShiftedCount() const { return commit_mtp_shifted_count_; }
         int lastCommitMTPAlreadyAppended() const { return last_commit_mtp_already_appended_; }
+        int lastCommitMTPMainForwardTokenCount() const { return last_commit_mtp_main_forward_token_count_; }
         const std::vector<int> &lastCommitMTPTokens() const { return last_commit_mtp_tokens_; }
         int sampleMainLogitsCount() const { return sample_main_logits_count_; }
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
         int sampleAllPositionLogitsCount() const { return sample_all_position_logits_count_; }
         const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
+        const std::vector<std::vector<int>> &forwardHistory() const { return forward_history_; }
         int lastForwardSeqLen() const { return last_forward_seq_len_; }
         void enableMTP(bool accept_mtp_token)
         {
@@ -530,6 +550,7 @@ namespace
         int set_all_position_count_{0};
         int commit_mtp_shifted_count_{0};
         int last_commit_mtp_already_appended_{0};
+        int last_commit_mtp_main_forward_token_count_{0};
         int sample_main_logits_count_{0};
         int sample_mtp_logits_count_{0};
         int sample_all_position_logits_count_{0};
@@ -549,6 +570,7 @@ namespace
         PrefixStateSnapshot captured_snapshot_;
         PrefixStateSnapshot last_restored_snapshot_;
         std::vector<int> last_forward_tokens_;
+        std::vector<std::vector<int>> forward_history_;
         std::vector<int> last_commit_mtp_tokens_;
         int last_forward_seq_len_{0};
         int position_{0};
@@ -879,9 +901,7 @@ namespace
             /*mtp_draft_tokens=*/2);
 
         EXPECT_FALSE(runner->prefill({1, 2, 3, 4, 5}));
-        EXPECT_NE(runner->lastError().find("exactly one draft token"), std::string::npos)
-            << runner->lastError();
-        EXPECT_NE(runner->lastError().find("--mtp-draft-tokens 1"), std::string::npos)
+        EXPECT_NE(runner->lastError().find("requires runner support for chained MTP sidecars"), std::string::npos)
             << runner->lastError();
         EXPECT_EQ(mock->forwardMTPCount(), 0);
         EXPECT_EQ(mock->forwardCallCount(), 0);
@@ -948,10 +968,12 @@ namespace
             const PerfStatRecord *accept_trace =
                 findPerfRecordWithTags(records, PerfStatRecord::Kind::Counter, "acceptance_trace",
                                        {
-                                           {"accepted_second_draft", "true"},
                                            {"first_token", std::to_string(MockInferenceRunner::PREFILL_ARGMAX_TOKEN)},
-                                           {"mtp_token", std::to_string(MockInferenceRunner::MTP_ARGMAX_TOKEN)},
-                                           {"verified_token", std::to_string(MockInferenceRunner::MTP_ARGMAX_TOKEN)},
+                                           {"draft_tokens", "7,9"},
+                                           {"verifier_tokens", "9"},
+                                           {"accepted_speculative_prefix", "1"},
+                                           {"all_speculative_accepted", "true"},
+                                           {"lagged_rejected_correction", "false"},
                                            {"verifier_state_matches_output", "true"},
                                        });
             ASSERT_NE(accept_trace, nullptr);
@@ -988,6 +1010,7 @@ namespace
             EXPECT_EQ(mock->captureCheckpointCount(), 2);
             EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
                         ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                     MockInferenceRunner::VERIFY_REJECT_TOKEN));
@@ -996,10 +1019,13 @@ namespace
             const PerfStatRecord *reject_trace =
                 findPerfRecordWithTags(records, PerfStatRecord::Kind::Counter, "acceptance_trace",
                                        {
-                                           {"accepted_second_draft", "false"},
                                            {"first_token", std::to_string(MockInferenceRunner::PREFILL_ARGMAX_TOKEN)},
-                                           {"mtp_token", std::to_string(MockInferenceRunner::MTP_ARGMAX_TOKEN)},
-                                           {"verified_token", std::to_string(MockInferenceRunner::VERIFY_REJECT_TOKEN)},
+                                           {"draft_tokens", "7,9"},
+                                           {"verifier_tokens", "4"},
+                                           {"rejected_verified_token", std::to_string(MockInferenceRunner::VERIFY_REJECT_TOKEN)},
+                                           {"accepted_speculative_prefix", "0"},
+                                           {"all_speculative_accepted", "false"},
+                                           {"lagged_rejected_correction", "true"},
                                            {"verifier_state_matches_output", "false"},
                                        });
             ASSERT_NE(reject_trace, nullptr);
@@ -1017,6 +1043,16 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "rollbacks");
             ASSERT_NE(rollbacks, nullptr);
             EXPECT_DOUBLE_EQ(rollbacks->value, 1.0);
+
+            const PerfStatRecord *lagged_replay =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "lagged_rejected_correction_replays");
+            ASSERT_NE(lagged_replay, nullptr);
+            EXPECT_DOUBLE_EQ(lagged_replay->value, 1.0);
+
+            const PerfStatRecord *replay_tokens =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
+            ASSERT_NE(replay_tokens, nullptr);
+            EXPECT_DOUBLE_EQ(replay_tokens->value, 1.0);
 
             const PerfStatRecord *post_sidecar_capture =
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "capture_post_sidecar_prefix_state");
@@ -1197,7 +1233,7 @@ namespace
         EXPECT_EQ(mock->restoreCount(), 0);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeForcedRejectReplaysVerifiedToken)
+    TEST_F(Test__PrefillDecodeTransition, MTPFirstDecodeForcedRejectReplaysPrefixAndLagsCorrection)
     {
         auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/false);
 
@@ -1214,12 +1250,12 @@ namespace
         EXPECT_EQ(mock->captureCheckpointCount(), 2);
         EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
         EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
         EXPECT_THAT(mock->lastCommitMTPTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -1228,6 +1264,11 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
         EXPECT_EQ(probe.mtp_rollbacks, 1u);
+
+        GenerationResult step2 = runner->decodeStep();
+        ASSERT_TRUE(step2.success()) << step2.error;
+        EXPECT_THAT(mock->forwardHistory(),
+                    Contains(ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN)));
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPForcedRejectRestoresHybridPayloadSnapshot)
@@ -1564,6 +1605,8 @@ namespace
         EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 1);
         EXPECT_EQ(harness.child0->lastCommitMTPAlreadyAppended(), 1);
         EXPECT_EQ(harness.child1->lastCommitMTPAlreadyAppended(), 1);
+        EXPECT_EQ(harness.child0->lastCommitMTPMainForwardTokenCount(), 1);
+        EXPECT_EQ(harness.child1->lastCommitMTPMainForwardTokenCount(), 1);
         EXPECT_THAT(harness.child0->lastCommitMTPTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
@@ -1571,11 +1614,9 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_THAT(harness.child0->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child1->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
 
         const auto probe = harness.runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -1634,12 +1675,14 @@ namespace
 
         EXPECT_EQ(harness.child0->forwardMTPCount(), 1);
         EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
+        EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 1);
+        EXPECT_EQ(harness.child0->lastCommitMTPMainForwardTokenCount(), 1);
+        EXPECT_EQ(harness.child1->lastCommitMTPMainForwardTokenCount(), 1);
         EXPECT_THAT(harness.child0->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
         EXPECT_THAT(harness.child1->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
 
         const auto probe = harness.runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
