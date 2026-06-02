@@ -36,6 +36,7 @@
 #include "execution/cache/HybridCacheManager.h"
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
+#include "../../mocks/MockComputeStage.h"
 #ifdef HAVE_ROCM
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/rocm/ROCmWeightPacker.h"
@@ -402,7 +403,66 @@ public:
                  int n_heads, int d_k, int d_v,
                  bool use_qk_l2norm),
                 (override));
+
+    MOCK_METHOD(bool, deinterleave_qkv_device,
+                (const float *d_merged_qkv,
+                 float *&d_q, float *&d_k, float *&d_v,
+                 int seq_len, int n_k_heads, int n_v_heads,
+                 int head_dim_k, int head_dim_v, int global_v_head_offset),
+                (override));
 };
+
+TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch)
+{
+#ifdef HAVE_ROCM
+    static constexpr int seq_len = 2;
+    static constexpr int n_heads = 4;
+    static constexpr int n_k_heads = 2;
+    static constexpr int d_k = 8;
+    static constexpr int d_v = 8;
+
+    const int qkv_cols = n_k_heads * d_k * 2 + n_heads * d_v;
+    FP32Tensor merged_qkv({seq_len, qkv_cols}, DeviceId::rocm(0));
+    FP32Tensor alpha({seq_len, n_heads}, DeviceId::rocm(0));
+    FP32Tensor beta({seq_len, n_heads}, DeviceId::rocm(0));
+    FP32Tensor a_log({1, n_heads}, DeviceId::rocm(0));
+    FP32Tensor dt_bias({1, n_heads}, DeviceId::rocm(0));
+    FP32Tensor output({seq_len, n_heads * d_v}, DeviceId::rocm(0));
+    std::vector<float> recurrence_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+
+    MockGatedDeltaNet kernel;
+    EXPECT_CALL(kernel, deinterleave_qkv_device(_, _, _, _, _, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(kernel, chunk_forward(_, _, _, _, _, _, _, _, _, _, _, _, _, _, _)).Times(0);
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = seq_len;
+    p.n_heads = n_heads;
+    p.n_k_heads = n_k_heads;
+    p.d_k = d_k;
+    p.d_v = d_v;
+    p.global_v_head_offset = 1;
+    p.Q = &merged_qkv;
+    p.K = &merged_qkv;
+    p.V = &merged_qkv;
+    p.alpha = &alpha;
+    p.beta = &beta;
+    p.A_log = &a_log;
+    p.dt_bias = &dt_bias;
+    p.output = &output;
+    p.recurrence_state = recurrence_state.data();
+    p.kernel = &kernel;
+
+    GDNRecurrenceStage stage(p);
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    EXPECT_FALSE(stage.execute(&ctx))
+        << "Graph-stage GPU deinterleave must require the declared workspace buffer "
+           "instead of falling through to backend-owned scratch allocation";
+#else
+    GTEST_SKIP() << "ROCm backend not compiled";
+#endif
+}
 
 template <int Tag>
 class CountingProjectionGemm : public ITensorGemm

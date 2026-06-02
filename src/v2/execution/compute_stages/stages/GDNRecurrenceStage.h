@@ -180,6 +180,8 @@ namespace llaminar2
         void refreshPinnedEffectiveSeqLen();
         void releaseGpuEffectiveSeqLenState();
         void bindKernelWorkspace();
+        size_t deinterleaveScratchFloats(int seq_len) const;
+        bool ensureGpuDeinterleaveWorkspaceBound(int seq_len) const;
     };
 
 } // namespace llaminar2

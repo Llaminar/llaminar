@@ -164,9 +164,7 @@ namespace llaminar2
         if (decode_zero_copy)
             return reqs;
 
-        const size_t row_floats = static_cast<size_t>(params_.n_heads) *
-                                  static_cast<size_t>((2 * params_.d_k) + params_.d_v);
-        const size_t bytes = static_cast<size_t>(max_seq_len) * row_floats * sizeof(float);
+        const size_t bytes = deinterleaveScratchFloats(max_seq_len) * sizeof(float);
         reqs.buffers.push_back({WS_DEINTERLEAVE_SCRATCH, bytes, 256, true});
         return reqs;
     }
@@ -221,6 +219,51 @@ namespace llaminar2
     std::string GDNRecurrenceStage::effectiveSeqLenScalarBufferName() const
     {
         return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + std::to_string(workspace_slice_id_);
+    }
+
+    size_t GDNRecurrenceStage::deinterleaveScratchFloats(int seq_len) const
+    {
+        if (seq_len <= 0 || params_.n_heads <= 0 || params_.d_k <= 0 || params_.d_v <= 0)
+            return 0;
+
+        const size_t row_floats = static_cast<size_t>(params_.n_heads) *
+                                  static_cast<size_t>((2 * params_.d_k) + params_.d_v);
+        return static_cast<size_t>(seq_len) * row_floats;
+    }
+
+    bool GDNRecurrenceStage::ensureGpuDeinterleaveWorkspaceBound(int seq_len) const
+    {
+        const size_t required_bytes = deinterleaveScratchFloats(seq_len) * sizeof(float);
+        if (required_bytes == 0)
+        {
+            LOG_ERROR("[GDNRecurrenceStage] Invalid merged-QKV deinterleave scratch shape"
+                      << " seq_len=" << seq_len
+                      << " n_heads=" << params_.n_heads
+                      << " d_k=" << params_.d_k
+                      << " d_v=" << params_.d_v);
+            return false;
+        }
+
+        if (!bound_workspace_ ||
+            !bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH) ||
+            bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH) < required_bytes)
+        {
+            LOG_ERROR("[GDNRecurrenceStage] Missing required graph workspace buffer '"
+                      << WS_DEINTERLEAVE_SCRATCH << "' for merged-QKV GPU deinterleave"
+                      << " (requested=" << required_bytes << " bytes"
+                      << ", available="
+                      << (bound_workspace_ && bound_workspace_->hasBuffer(WS_DEINTERLEAVE_SCRATCH)
+                              ? bound_workspace_->getBufferSize(WS_DEINTERLEAVE_SCRATCH)
+                              : 0)
+                      << " bytes, seq_len=" << seq_len
+                      << ", n_heads=" << params_.n_heads
+                      << ", d_k=" << params_.d_k
+                      << ", d_v=" << params_.d_v
+                      << ", device=" << params_.device_id.toString() << ")");
+            return false;
+        }
+
+        return true;
     }
 
     void GDNRecurrenceStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
@@ -483,6 +526,9 @@ namespace llaminar2
                 else
                 {
                     // Use GPU deinterleave kernel for all other cases
+                    if (!ensureGpuDeinterleaveWorkspaceBound(params_.seq_len))
+                        return false;
+
                     float *dq_mut = nullptr, *dk_mut = nullptr, *dv_mut = nullptr;
                     if (!params_.kernel->deinterleave_qkv_device(
                             d_merged, dq_mut, dk_mut, dv_mut,
