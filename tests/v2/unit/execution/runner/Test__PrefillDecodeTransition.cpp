@@ -914,6 +914,33 @@ namespace
         EXPECT_EQ(mock->forwardMTPCount(), 1);
     }
 
+    TEST_F(Test__PrefillDecodeTransition, ROCmMTPHardFailsWithGpuGraphsBeforeSidecarLaunch)
+    {
+        ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
+        ScopedEnv broad_concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE", "0");
+        ScopedEnv m2_rows("LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0");
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::rocm(0));
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        EXPECT_FALSE(step1.success());
+        EXPECT_NE(step1.error.find("LLAMINAR_GPU_GRAPHS=1"), std::string::npos)
+            << step1.error;
+        EXPECT_NE(step1.error.find("graph-safe"), std::string::npos)
+            << step1.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+        EXPECT_EQ(mock->forwardCallCount(), 1);
+    }
+
     TEST_F(Test__PrefillDecodeTransition, ROCmMTPHardFailsWithM2RowOverlapUnderGpuGraphs)
     {
         ScopedEnv gpu_graphs("LLAMINAR_GPU_GRAPHS", "1");
