@@ -293,6 +293,76 @@ namespace
         k_kernel.unbindWorkspace();
         v_kernel.unbindWorkspace();
     }
+
+#ifdef HAVE_ROCM
+    template <typename CreateWeights>
+    void runGraphCapturedDispatchM2MatchesReference(
+        const char *label,
+        int N,
+        int K,
+        CreateWeights createWeights,
+        float min_cosine)
+    {
+        const int M = 2;
+
+        auto weights = createWeights(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            777);
+        std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+        weights->to_fp32(W_fp32.data());
+
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        expectPackedPath(packed, PackedPath::NativeVNNI);
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        kernel.setGPUStream(stream);
+        auto workspace = bindWorkspace(kernel, M, N, K);
+        ASSERT_NE(workspace, nullptr);
+
+        auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+        auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t exec = nullptr;
+        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+        ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+        ASSERT_NE(graph, nullptr);
+        ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
+        ASSERT_NE(exec, nullptr);
+
+        ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(), 0, static_cast<size_t>(M) * N * sizeof(float), stream),
+                  hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        std::vector<float> ref(static_cast<size_t>(M) * N);
+        cpuFP32GemmRef(input->data(), W_fp32.data(), ref.data(), M, N, K);
+
+        const float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+        LOG_INFO("[SmallM] " << label << " graph-captured M=2 cosine=" << cos);
+        EXPECT_GT(cos, min_cosine);
+
+        if (exec)
+            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
+        if (graph)
+            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        kernel.setGPUStream(nullptr);
+        EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+        kernel.unbindWorkspace();
+    }
+#endif
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ80M2MatchesReference)
@@ -346,6 +416,24 @@ TEST(Test__ROCmQuantisedGemmSmallM, ConcurrentDispatchQ4KM2MatchesReference)
         [](const std::vector<size_t> &shape, uint32_t seed)
         { return TestTensorFactory::createQ4_KRandom(shape, seed); },
         0.985f);
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedDispatchQ4KM2MatchesReference)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+#ifdef HAVE_ROCM
+    const int N = 896;
+    const int K = 1024;
+    runGraphCapturedDispatchM2MatchesReference(
+        "Q4_K native-VNNI",
+        N,
+        K,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.985f);
+#endif
 }
 
 TEST(Test__ROCmQuantisedGemmSmallM, FusedQ80QKVM2MatchesSeparate)
