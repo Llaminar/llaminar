@@ -172,6 +172,7 @@ namespace
 
     static const std::vector<GEMMShape> MTP_SMALL_M_SHAPES = {
         {"Qwen36_MTP_HiddenProjection", 5120, 5120},
+        {"Qwen36_FFN_DownProjection", 5120, 17408},
         {"Qwen36_GDN_InnerProjection", 10240, 5120},
         {"Qwen36_GDN_TimeProjection", 1024, 5120},
         {"Qwen36_GDN_OutputProjection", 5120, 6144},

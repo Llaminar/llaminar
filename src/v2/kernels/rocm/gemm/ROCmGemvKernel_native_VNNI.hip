@@ -38,9 +38,11 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
+#include <string>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <atomic>
 
@@ -50,6 +52,39 @@
 // ============================================================================
 static std::atomic<int> g_native_vnni_kb_override{-1};
 static std::atomic<int> g_native_vnni_target_waves_override{-1};
+
+static void recordNativeVNNISmallMLaunch(
+    int m,
+    int n,
+    int k,
+    unsigned codebook,
+    int grid_n,
+    int kb,
+    int target_waves_per_cu,
+    bool batched,
+    int projections)
+{
+    if (!llaminar2::PerfStatsCollector::isEnabled())
+        return;
+
+    llaminar2::PerfStatsCollector::addCounter(
+        "kernel",
+        "rocm_native_vnni_small_m_launch",
+        1.0,
+        "gemm",
+        {},
+        llaminar2::PerfStatsCollector::Tags{
+            {"m", std::to_string(m)},
+            {"n", std::to_string(n)},
+            {"k", std::to_string(k)},
+            {"codebook", std::to_string(codebook)},
+            {"grid_n", std::to_string(grid_n)},
+            {"kb", std::to_string(kb)},
+            {"path", kb > 1 ? "split_reduce" : "direct"},
+            {"target_waves_per_cu", std::to_string(target_waves_per_cu)},
+            {"batched", batched ? "true" : "false"},
+            {"projections", std::to_string(projections)}});
+}
 
 extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu)
 {
@@ -3451,6 +3486,17 @@ bool rocmLaunch_native_vnni_small_m_fp32(
         return false;
     }
 
+    recordNativeVNNISmallMLaunch(
+        SMALL_M,
+        N,
+        K,
+        static_cast<unsigned>(FMT),
+        grid_n,
+        kb,
+        target_waves_per_cu,
+        false,
+        1);
+
     dim3 block(THREADS, 1, 1);
     dim3 grid(grid_n, kb, 1);
     if constexpr (SMALL_M == 2 && (FMT == NVNNI_Q4_0 || FMT == NVNNI_Q4_1))
@@ -3592,6 +3638,17 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
             }
         }
     }
+
+    recordNativeVNNISmallMLaunch(
+        SMALL_M,
+        0,
+        K,
+        static_cast<unsigned>(FMT),
+        args.total_grid_n,
+        kb,
+        target_waves_per_cu,
+        true,
+        num_projections);
 
     dim3 block(THREADS, 1, 1);
     dim3 grid(args.total_grid_n, kb, 1);
