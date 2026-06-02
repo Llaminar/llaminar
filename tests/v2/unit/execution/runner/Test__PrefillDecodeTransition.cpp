@@ -338,6 +338,7 @@ namespace
         int clearCacheCount() const { return clear_cache_count_; }
         int forwardMTPCount() const { return forward_mtp_count_; }
         int restoreCount() const { return restore_count_; }
+        int captureCheckpointCount() const { return capture_checkpoint_count_; }
         int setAllPositionCount() const { return set_all_position_count_; }
         int lastMTPConditionToken() const { return last_mtp_condition_token_; }
         int commitMTPShiftedCount() const { return commit_mtp_shifted_count_; }
@@ -397,6 +398,7 @@ namespace
         PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
         {
             (void)seq_idx;
+            capture_checkpoint_count_++;
             if (use_captured_snapshot_)
             {
                 PrefixStateSnapshot snapshot = captured_snapshot_;
@@ -524,6 +526,7 @@ namespace
         int forward_mtp_count_{0};
         int clear_cache_count_{0};
         int restore_count_{0};
+        mutable int capture_checkpoint_count_{0};
         int set_all_position_count_{0};
         int commit_mtp_shifted_count_{0};
         int last_commit_mtp_already_appended_{0};
@@ -852,6 +855,7 @@ namespace
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->captureCheckpointCount(), 2);
 
         const auto probe = runner->prefixStateProbe();
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
@@ -916,6 +920,11 @@ namespace
             ASSERT_NE(capture_timer, nullptr);
             EXPECT_EQ(capture_timer->count, 1u);
 
+            const PerfStatRecord *post_sidecar_capture =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "capture_post_sidecar_prefix_state");
+            ASSERT_NE(post_sidecar_capture, nullptr);
+            EXPECT_EQ(post_sidecar_capture->count, 1u);
+
             const PerfStatRecord *logical_checkpoint =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_checkpoint_logical");
             ASSERT_NE(logical_checkpoint, nullptr);
@@ -976,6 +985,7 @@ namespace
             ASSERT_TRUE(step1.success());
             EXPECT_EQ(mock->forwardMTPCount(), 1);
             EXPECT_EQ(mock->restoreCount(), 1);
+            EXPECT_EQ(mock->captureCheckpointCount(), 2);
             EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
@@ -1007,6 +1017,15 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "rollbacks");
             ASSERT_NE(rollbacks, nullptr);
             EXPECT_DOUBLE_EQ(rollbacks->value, 1.0);
+
+            const PerfStatRecord *post_sidecar_capture =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "capture_post_sidecar_prefix_state");
+            ASSERT_NE(post_sidecar_capture, nullptr);
+            EXPECT_EQ(post_sidecar_capture->count, 1u);
+
+            const PerfStatRecord *replay_sidecar =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "replay_sidecar_forward");
+            EXPECT_EQ(replay_sidecar, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -1194,6 +1213,7 @@ namespace
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
         EXPECT_EQ(mock->restoreCount(), 1);
+        EXPECT_EQ(mock->captureCheckpointCount(), 2);
         EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
         EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
         EXPECT_THAT(mock->lastCommitMTPTokens(),
@@ -1253,6 +1273,8 @@ namespace
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::VERIFY_REJECT_TOKEN));
         ASSERT_EQ(mock->restoreCount(), 1);
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->captureCheckpointCount(), 2);
 
         const PrefixStateSnapshot &restored = mock->lastRestoredSnapshot();
         ASSERT_TRUE(restored.valid);
@@ -1538,6 +1560,8 @@ namespace
         EXPECT_EQ(harness.child1->forwardMTPCount(), 1);
         EXPECT_EQ(harness.child0->restoreCount(), 1);
         EXPECT_EQ(harness.child1->restoreCount(), 1);
+        EXPECT_EQ(harness.child0->captureCheckpointCount(), 2);
+        EXPECT_EQ(harness.child1->captureCheckpointCount(), 2);
         EXPECT_EQ(harness.child0->commitMTPShiftedCount(), 1);
         EXPECT_EQ(harness.child1->commitMTPShiftedCount(), 1);
         EXPECT_EQ(harness.child0->lastCommitMTPAlreadyAppended(), 1);
@@ -1772,6 +1796,7 @@ namespace
         EXPECT_THAT(result.tokens,
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->captureCheckpointCount(), 2);
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
 
@@ -1795,6 +1820,7 @@ namespace
         EXPECT_THAT(step.tokens,
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
         EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->captureCheckpointCount(), 2);
         EXPECT_THAT(mock->lastForwardTokens(),
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
 
