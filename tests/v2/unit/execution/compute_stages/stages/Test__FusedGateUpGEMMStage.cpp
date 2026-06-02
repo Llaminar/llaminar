@@ -26,6 +26,7 @@
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "tensors/IQQuantTables.h"
 #include "tensors/FP16Utils.h"
@@ -123,6 +124,22 @@ namespace llaminar2
                 return false;
             }
 
+            bool multiply_fused_tensor(
+                const TensorBase *,
+                const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
+                int m,
+                int k,
+                const IMPIContext *,
+                DeviceWorkspaceManager *workspace) override
+            {
+                ++fused_call_count;
+                observed_fused_m.push_back(m);
+                observed_fused_k.push_back(k);
+                observed_fused_projection_count.push_back(static_cast<int>(projections.size()));
+                last_fused_workspace = workspace;
+                return true;
+            }
+
             WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
             {
                 observed_m.push_back(m);
@@ -145,6 +162,11 @@ namespace llaminar2
             mutable std::vector<int> observed_m;
             mutable std::vector<int> observed_n;
             mutable std::vector<int> observed_k;
+            int fused_call_count = 0;
+            std::vector<int> observed_fused_m;
+            std::vector<int> observed_fused_k;
+            std::vector<int> observed_fused_projection_count;
+            DeviceWorkspaceManager *last_fused_workspace = nullptr;
 
         private:
             std::string name_;
@@ -155,10 +177,11 @@ namespace llaminar2
             PreparedWeightStore &store,
             std::shared_ptr<RecordingWorkspaceGemm> kernel,
             const std::string &canonical_name,
-            ModelContextId model_id)
+            ModelContextId model_id,
+            TensorBase *tensor = nullptr)
         {
             auto binding = test::makePreparedWeightTestBinding(
-                nullptr,
+                tensor,
                 DeviceId::cpu(),
                 canonical_name,
                 model_id);
@@ -174,6 +197,7 @@ namespace llaminar2
                 std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
             handle->device_id = DeviceId::cpu();
             handle->kind = llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CPU_PACKED;
+            handle->tensor = tensor;
             handle->prepared_weights = std::move(prepared_weights);
 
             return store.registerPreparedGemmHandle(
@@ -557,8 +581,8 @@ namespace llaminar2
         auto gate = std::make_shared<RecordingWorkspaceGemm>("gate");
         auto up = std::make_shared<RecordingWorkspaceGemm>("up");
 
-        auto gate_ref = registerRecordingGemm(store, gate, "blk.0.ffn_gate.weight", model_id);
-        auto up_ref = registerRecordingGemm(store, up, "blk.0.ffn_up.weight", model_id);
+        auto gate_ref = registerRecordingGemm(store, gate, "blk.0.ffn_gate.weight", model_id, w_gate_.get());
+        auto up_ref = registerRecordingGemm(store, up, "blk.0.ffn_up.weight", model_id, w_up_.get());
 
         FusedGateUpGEMMStage::Params params{
             .m = 4,
@@ -577,6 +601,80 @@ namespace llaminar2
         EXPECT_EQ(up->observed_n, std::vector<int>({256}));
         EXPECT_EQ(gate->observed_m, std::vector<int>({4}));
         EXPECT_EQ(up->observed_k, std::vector<int>({192}));
+    }
+
+    TEST_F(Test__FusedGateUpGEMMStage, ExecutePassesBoundWorkspaceToFusedKernel)
+    {
+        const ModelContextId model_id{9915};
+        PreparedWeightStore store(model_id);
+        auto gate = std::make_shared<RecordingWorkspaceGemm>("gate");
+        auto up = std::make_shared<RecordingWorkspaceGemm>("up");
+
+        auto gate_ref = registerRecordingGemm(store, gate, "blk.0.ffn_gate.weight", model_id, w_gate_.get());
+        auto up_ref = registerRecordingGemm(store, up, "blk.0.ffn_up.weight", model_id, w_up_.get());
+
+        FusedGateUpGEMMStage::Params params{
+            .input = input_.get(),
+            .m = m_,
+            .k = k_,
+            .w_gate = w_gate_.get(),
+            .output_gate = output_gate_.get(),
+            .n_gate = n_gate_,
+            .w_up = w_up_.get(),
+            .output_up = output_up_.get(),
+            .n_up = n_up_,
+            .prepared_ref_gate = gate_ref,
+            .prepared_ref_up = up_ref,
+            .prepared_store = &store};
+
+        FusedGateUpGEMMStage stage(params);
+        DeviceWorkspaceManager workspace(DeviceId::cpu(), 1024);
+        stage.bindWorkspace(&workspace);
+
+        ASSERT_TRUE(stage.execute(ctx_.get()));
+        EXPECT_EQ(gate->fused_call_count, 1);
+        EXPECT_EQ(gate->last_fused_workspace, &workspace);
+        EXPECT_EQ(gate->observed_fused_m, std::vector<int>({m_}));
+        EXPECT_EQ(gate->observed_fused_k, std::vector<int>({k_}));
+        EXPECT_EQ(gate->observed_fused_projection_count, std::vector<int>({2}));
+        EXPECT_EQ(up->getWorkspace(), &workspace);
+    }
+
+    TEST_F(Test__FusedGateUpGEMMStage, ExecuteWithBiasPassesBoundWorkspaceToFusedKernel)
+    {
+        const ModelContextId model_id{9916};
+        PreparedWeightStore store(model_id);
+        auto gate = std::make_shared<RecordingWorkspaceGemm>("gate");
+        auto up = std::make_shared<RecordingWorkspaceGemm>("up");
+
+        auto gate_ref = registerRecordingGemm(store, gate, "blk.0.ffn_gate.weight", model_id, w_gate_.get());
+        auto up_ref = registerRecordingGemm(store, up, "blk.0.ffn_up.weight", model_id, w_up_.get());
+
+        FusedGateUpGEMMStage::Params params{
+            .input = input_.get(),
+            .m = m_,
+            .k = k_,
+            .w_gate = w_gate_.get(),
+            .output_gate = output_gate_.get(),
+            .n_gate = n_gate_,
+            .bias_gate = bias_gate_.get(),
+            .w_up = w_up_.get(),
+            .output_up = output_up_.get(),
+            .n_up = n_up_,
+            .bias_up = bias_up_.get(),
+            .prepared_ref_gate = gate_ref,
+            .prepared_ref_up = up_ref,
+            .prepared_store = &store};
+
+        FusedGateUpGEMMStage stage(params);
+        DeviceWorkspaceManager workspace(DeviceId::cpu(), 1024);
+        stage.bindWorkspace(&workspace);
+
+        ASSERT_TRUE(stage.execute(ctx_.get()));
+        EXPECT_EQ(gate->fused_call_count, 1);
+        EXPECT_EQ(gate->last_fused_workspace, &workspace);
+        EXPECT_EQ(gate->observed_fused_projection_count, std::vector<int>({2}));
+        EXPECT_EQ(up->getWorkspace(), &workspace);
     }
 
     // =============================================================================

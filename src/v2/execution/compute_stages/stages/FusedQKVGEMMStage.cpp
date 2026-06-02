@@ -178,7 +178,9 @@ namespace llaminar2
                 input_base,
                 projections,
                 params_.m,
-                params_.k);
+                params_.k,
+                nullptr,
+                bound_workspace_);
 
             if (success)
             {
@@ -212,7 +214,9 @@ namespace llaminar2
                 input_base,
                 projections,
                 params_.m,
-                params_.k);
+                params_.k,
+                nullptr,
+                bound_workspace_);
 
             if (success && Logger::getInstance().shouldLog(LogLevel::TRACE))
             {

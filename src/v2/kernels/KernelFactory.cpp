@@ -3634,7 +3634,7 @@ namespace llaminar
                         {gemm_gate_, output_gate, n_gate, nullptr, "gate"},
                         {gemm_up_, output_up, n_up, nullptr, "up"}};
 
-                    return gemm_gate_->multiply_fused_tensor(input, projections, m, k);
+                    return gemm_gate_->multiply_fused_tensor(input, projections, m, k, nullptr, bound_workspace_);
                 }
 
                 bool execute_with_bias(
@@ -3663,7 +3663,7 @@ namespace llaminar
                             {gemm_gate_, output_gate, n_gate, bias_gate, "gate"},
                             {gemm_up_, output_up, n_up, bias_up, "up"}};
 
-                        return gemm_gate_->multiply_fused_tensor(input, projections, m, k);
+                        return gemm_gate_->multiply_fused_tensor(input, projections, m, k, nullptr, bound_workspace_);
                     }
                 }
 

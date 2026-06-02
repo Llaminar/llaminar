@@ -26,6 +26,7 @@
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "tensors/IQQuantTables.h"
 #include "tensors/FP16Utils.h"
@@ -135,6 +136,22 @@ namespace llaminar2
                 return false;
             }
 
+            bool multiply_fused_tensor(
+                const TensorBase *,
+                const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
+                int m,
+                int k,
+                const IMPIContext *,
+                DeviceWorkspaceManager *workspace) override
+            {
+                ++fused_call_count;
+                observed_fused_m.push_back(m);
+                observed_fused_k.push_back(k);
+                observed_fused_projection_count.push_back(static_cast<int>(projections.size()));
+                last_fused_workspace = workspace;
+                return true;
+            }
+
             WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
             {
                 observed_m.push_back(m);
@@ -157,6 +174,11 @@ namespace llaminar2
             mutable std::vector<int> observed_m;
             mutable std::vector<int> observed_n;
             mutable std::vector<int> observed_k;
+            int fused_call_count = 0;
+            std::vector<int> observed_fused_m;
+            std::vector<int> observed_fused_k;
+            std::vector<int> observed_fused_projection_count;
+            DeviceWorkspaceManager *last_fused_workspace = nullptr;
 
         private:
             std::string name_;
@@ -662,6 +684,50 @@ namespace llaminar2
         EXPECT_EQ(v->observed_n, std::vector<int>({24}));
         EXPECT_EQ(q->observed_m, std::vector<int>({3}));
         EXPECT_EQ(k->observed_k, std::vector<int>({128}));
+    }
+
+    TEST_F(Test__FusedQKVGEMMStage, ExecutePassesBoundWorkspaceToFusedKernel)
+    {
+        const ModelContextId model_id{9914};
+        PreparedWeightStore store(model_id);
+        auto q = std::make_shared<RecordingWorkspaceGemm>("q");
+        auto k = std::make_shared<RecordingWorkspaceGemm>("k");
+        auto v = std::make_shared<RecordingWorkspaceGemm>("v");
+
+        auto q_ref = registerRecordingGemm(store, q, "blk.0.attn_q.weight", model_id);
+        auto k_ref = registerRecordingGemm(store, k, "blk.0.attn_k.weight", model_id);
+        auto v_ref = registerRecordingGemm(store, v, "blk.0.attn_v.weight", model_id);
+
+        FusedQKVGEMMStage::Params params{
+            .input = input_.get(),
+            .m = m_,
+            .k = k_,
+            .wq = wq_.get(),
+            .output_q = output_q_.get(),
+            .n_q = n_q_,
+            .wk = wk_.get(),
+            .output_k = output_k_.get(),
+            .n_k = n_k_,
+            .wv = wv_.get(),
+            .output_v = output_v_.get(),
+            .n_v = n_v_,
+            .prepared_ref_q = q_ref,
+            .prepared_ref_k = k_ref,
+            .prepared_ref_v = v_ref,
+            .prepared_store = &store};
+
+        FusedQKVGEMMStage stage(params);
+        DeviceWorkspaceManager workspace(DeviceId::cpu(), 1024);
+        stage.bindWorkspace(&workspace);
+
+        ASSERT_TRUE(stage.execute(ctx_.get()));
+        EXPECT_EQ(q->fused_call_count, 1);
+        EXPECT_EQ(q->last_fused_workspace, &workspace);
+        EXPECT_EQ(q->observed_fused_m, std::vector<int>({m_}));
+        EXPECT_EQ(q->observed_fused_k, std::vector<int>({k_}));
+        EXPECT_EQ(q->observed_fused_projection_count, std::vector<int>({3}));
+        EXPECT_EQ(k->getWorkspace(), &workspace);
+        EXPECT_EQ(v->getWorkspace(), &workspace);
     }
 
     TEST_F(Test__FusedQKVGEMMStage, SupportsBackend)

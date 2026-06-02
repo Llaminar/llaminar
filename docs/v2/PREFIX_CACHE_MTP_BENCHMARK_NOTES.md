@@ -87,6 +87,9 @@ Latest workspace-binding validation:
 - Dense FusedGateUp workspace planning now asks the gate and up kernels for
   their actual projection widths (`n_gate`, `n_up`) instead of delegating one
   generic `n` through the fused adapter.
+- Dense FusedQKV and FusedGateUp execution now pass the stage-bound workspace
+  explicitly into `multiply_fused_tensor()`, matching the GDN projection path
+  instead of relying only on prior kernel binding.
 - Graph-stage scratch policy for this sprint: allocations needed by captured
   stages must be declared in graph workspace requirements, bound through
   `IWorkspaceConsumer`, and hard-fail at the stage boundary when the bound
@@ -102,7 +105,8 @@ Latest workspace-binding validation:
   adds `Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch`
   and `Projection_WorkspaceRequirementsUsePerProjectionN` plus the existing
   ShortConv/GDN recurrence workspace requirement checks. `V2_Unit_FusedQKVGEMMStage`
-  and `V2_Unit_FusedGateUpGEMMStage` add `WorkspaceRequirementsUsePerProjectionN`.
+  and `V2_Unit_FusedGateUpGEMMStage` add `WorkspaceRequirementsUsePerProjectionN`
+  and explicit `Execute*PassesBoundWorkspaceToFusedKernel` coverage.
 - Real Qwen3.6 dense ROCm depth-1 MTP graph-capture smoke completed:
   `/tmp/llaminar-mtp-bench/dense-rocm-workspace-binding-mtp-c64-n8-bench.json`,
   `/tmp/llaminar-mtp-bench/dense-rocm-workspace-binding-mtp-c64-n8-stats.json`,
