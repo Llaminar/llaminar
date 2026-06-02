@@ -40,7 +40,7 @@ depth-N configuration.
 | SingleDevice | CUDA `cuda:0` | Qwen3.6 MoE 35B | 27.56 at `-c 64`; 42.94 for the 10-token combined-telemetry prompt | Small-context MoE MTP reaches segmented replay with zero manual stages; single-participant rebalance downgrades to observe | N/A | 22.43 combined-telemetry short prompt | 0.61x old prompt; 0.52x combined same-prompt decode | `/tmp/llaminar-mtp-bench/moe-cuda-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4-stats.json`, `/tmp/llaminar-mtp-bench/moe-cuda-baseline-c64-n4-shortprompt-bench.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4-combined-bench.json`, `/tmp/llaminar-mtp-bench/moe-cuda-mtp-gpugraphs-c64-n4-combined-stats.json` | CUDA MoE graph capture is stable at small context, but MTP is slower. Combined telemetry shows sidecar graph replay is small, while verifier/replay cost and low draft acceptance dominate. Need MoE MTP acceptance quality and verifier/rollback cost reduction before speedup claims. |
 | LocalTP | ROCm `rocm:0,rocm:1` | Qwen3.6 dense 27B Q4_K_S | 24.15 at `-c 64` | Not fully captured: verifier and sidecar graphs detect collectives and choose `allow_segmented=false`; forcing segmented collective replay for RCCL MTP hard-fails before sidecar launch | RCCL collectives currently force non-captured verifier/sidecar execution; `LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1` is blocked for ROCm LocalTP MTP until the path is graph-safe | 20.46 best same-prompt; 17.94 post-guard explicit prompt | 0.85x decode best same-prompt; 0.74x post-guard explicit prompt | `/tmp/llaminar-mtp-bench/dense-localtp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-after-broad-bench.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-gpugraphs-after-broad-stats.json`, `/tmp/llaminar-mtp-bench/dense-localtp-rocm-mtp-segmented-hardfail.json` | Correct LocalTP MTP with 100% acceptance is present, and the post-guard graph-enabled/manual-collective path remains green. The attempted RCCL segmented path produced an HSA memory fault before the guard and now hard-fails with a structured `failure_reason`. Need real graph-safe RCCL/allreduce capture for MTP sidecar and verifier execution, or a deliberately optimized manual collective boundary, before speedup claims. |
 | LocalPP | ROCm `stage0=rocm:0, stage1=rocm:1` | Qwen3.6 dense 27B Q4_K_S | 20.47 at `-c 64` | Blocked: MTP is a hard fail before prefill on PP topologies | PP activation transfers are present in the baseline path, but MTP graph capture is not attempted | Blocked | N/A | `/tmp/llaminar-mtp-bench/dense-localpp-rocm-baseline-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-localpp-rocm-mtp-gpugraphs-c64-n4-hardfail.json` | PP MTP shifted-prefill and verifier execution are not implemented. The previous late stage-1 shifted-cache failure is now a prefill hard-fail with an explicit unsupported-topology message. |
-| NodeLocalTP | CPU sockets | Qwen3.6 dense 27B Q4_K_S | Pending | N/A for GPU graphs | Host/MPI coordination only | Pending | Pending | Pending | Needed for correctness/speed evidence, but not GPU graph-capture gating. |
+| NodeLocalTP | CPU sockets | Qwen3.6 dense 27B Q4_K_S | 9.79 at `-c 64` | N/A for GPU graphs | Host/MPI TP collectives are exercised; no GPU graph capture applies | 7.26 | 0.74x decode | `/tmp/llaminar-mtp-bench/dense-cpu-nodelocaltp-baseline-c64-n4-bench.json`, `/tmp/llaminar-mtp-bench/dense-cpu-nodelocaltp-mtp-c64-n4-bench.json`, `/tmp/llaminar-mtp-bench/dense-cpu-nodelocaltp-mtp-c64-n4-stats.json` | Real Qwen3.6 dense CPU socket TP correctness path is green, with 50% MTP acceptance. MTP is slower than baseline because verifier/replay dominate, not because sidecar launch dominates. |
 | Expert overlay EP | 2x ROCm | Qwen3.6 MoE 35B | Blocked before inference | Blocked before graph-capture measurement | Sparse dispatch/return graph capture required where ROCm supports it, but the current run blocks during resident expert preparation first | Blocked | N/A | `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-replicated-streaming-hardfail.txt` | Added `configs/moe_overlay/rocm2_replicated_static.yaml` and harness coverage for a one-rank LocalTP `ReplicatedExperts` ROCm domain. Real Qwen3.6 MoE reaches graph config, but both ROCm devices fail resident expert VRAM preflight by the safety-margin check. `LLAMINAR_WEIGHT_STREAMING=1` is already enabled in the confirming run, but resident MoE expert streaming is not active for this GPU pipeline path. |
 | Expert overlay EP | 2x ROCm plus 2x CPU dual-socket | Qwen3.6 MoE 35B | Blocked before inference | Blocked before graph-capture measurement | Heterogeneous sparse collectives must be graph-aware, but the current run stops before sparse dispatch because CPU fallback participant ranks no longer have sidecar endpoint runners | Blocked | N/A | `/tmp/llaminar-mtp-bench/moe-overlay-rocm2-cpu2-endpoint-hardfail.txt` | Added `configs/moe_overlay/rocm2_cpu2_replicated_static.yaml` and harness coverage for a rank-0 ROCm LocalTP hot tier plus rank-1 CPU LocalTP fallback tier. Real Qwen3.6 MoE rank 1 hard-fails as `CpuFallbackParticipant` because sidecar endpoint ranks were removed by graph-native MoE productionization. Next slice needs proper graph-native CPU fallback participant workers and sparse return through `TransferEngine`, not a fallback sidecar. |
 
@@ -366,6 +366,37 @@ Latest LocalTP ROCm dense evidence:
     `Qwen36ROCmLocalTPMTPSegmentedCollectiveHardFailsBeforeDraft` for the
     real-model LocalTP MTP path, and `V2_Integration_LocalTPContext` covers
     the RCCL segmented graph-policy reject reason.
+
+Latest NodeLocalTP CPU dense evidence:
+
+- Baseline: `/tmp/llaminar-mtp-bench/dense-cpu-nodelocaltp-baseline-c64-n4-bench.json`.
+  - Model: `/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf`.
+  - Domain: `-d cpu`, which self-launched 2 MPI ranks on one dual-socket
+    node, with 28 OpenMP threads per rank, `-c 64`, the 10-token short prompt,
+    and `-n 4`.
+  - Prefill 265.74 ms, 37.63 tok/s.
+  - Decode 408.61 ms for 4 tokens, 9.79 tok/s.
+- MTP run:
+  `/tmp/llaminar-mtp-bench/dense-cpu-nodelocaltp-mtp-c64-n4-bench.json`.
+  - Same model/domain/context/prompt with `--mtp --mtp-draft-tokens 1`.
+  - Prefill 367.04 ms, 27.25 tok/s.
+  - Decode 550.70 ms for 4 tokens, 7.26 tok/s, about 0.74x baseline.
+  - MTP counters: 8 draft steps, 4 accepted tokens, 4 rejected tokens,
+    4 rollbacks, 8 verifier runs, 16 verifier tokens, 50% acceptance.
+- Perf stats:
+  `/tmp/llaminar-mtp-bench/dense-cpu-nodelocaltp-mtp-c64-n4-stats.json`.
+  - Host/MPI TP collectives are exercised: the verifier policy reports
+    `has_collectives=true`, `allow_segmented=false`,
+    and `collectives_graph_capturable=false`.
+  - `verifier_forward`: 6 calls, 947.63 ms total, about 157.94 ms/call.
+  - `replay_forward`: 3 calls, 476.76 ms total, about 158.92 ms/call.
+  - `sidecar_forward`: 6 calls, 65.75 ms total, about 10.96 ms/call.
+  - Live checkpoint export/import is visible but secondary:
+    `capture_live_prefix_state` averaged about 17.37 ms/call and
+    `restore_live_prefix_state` about 17.47 ms/call.
+  - This closes the previous pending CPU matrix cell for correctness and
+    speed evidence. Like the GPU cells, the optimization target is verifier
+    and replay cost plus draft acceptance, not sidecar launch overhead.
 
 Latest LocalPP ROCm dense evidence:
 
