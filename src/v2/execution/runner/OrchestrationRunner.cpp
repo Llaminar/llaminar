@@ -601,6 +601,11 @@ namespace llaminar2
 
         if (active_mtp.enabled && runner_)
         {
+            if (active_mtp.draft_tokens != 1)
+            {
+                return setError(
+                    "MTP decode currently supports exactly one draft token; set --mtp-draft-tokens 1");
+            }
             const std::string unsupported_reason = runner_->mtpDecodeUnsupportedReason();
             if (unsupported_reason == "MTP decode is not enabled for PP topologies")
             {

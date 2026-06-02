@@ -29,7 +29,7 @@ decode costs, or MTP-only artifacts from hiding graph-capture policy.
 
 All current Phase 14 MTP benchmark evidence is for the implemented depth-1
 sidecar path (`--mtp-draft-tokens 1`). Requests for deeper MTP drafts now fail
-before sidecar launch rather than silently running depth-1 behavior under a
+before prefill forward rather than silently running depth-1 behavior under a
 depth-N configuration.
 
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |

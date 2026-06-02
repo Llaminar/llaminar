@@ -810,7 +810,7 @@ namespace
         EXPECT_EQ(probe.mtp_rollbacks, 0u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPDraftDepthGreaterThanOneHardFailsBeforeSidecar)
+    TEST_F(Test__PrefillDecodeTransition, MTPDraftDepthGreaterThanOneHardFailsBeforePrefillForward)
     {
         auto [runner, mock] = createRunner(
             /*mtp_enabled=*/true,
@@ -822,16 +822,13 @@ namespace
             DeviceId::cpu(),
             /*mtp_draft_tokens=*/2);
 
-        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
-
-        GenerationResult step = runner->decodeStep();
-        EXPECT_FALSE(step.success());
-        EXPECT_NE(step.error.find("exactly one draft token"), std::string::npos)
-            << step.error;
-        EXPECT_NE(step.error.find("--mtp-draft-tokens 1"), std::string::npos)
-            << step.error;
+        EXPECT_FALSE(runner->prefill({1, 2, 3, 4, 5}));
+        EXPECT_NE(runner->lastError().find("exactly one draft token"), std::string::npos)
+            << runner->lastError();
+        EXPECT_NE(runner->lastError().find("--mtp-draft-tokens 1"), std::string::npos)
+            << runner->lastError();
         EXPECT_EQ(mock->forwardMTPCount(), 0);
-        EXPECT_EQ(mock->forwardCallCount(), 1);
+        EXPECT_EQ(mock->forwardCallCount(), 0);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPDecodeRecordsStructuredPerfStats)
