@@ -152,7 +152,7 @@ namespace llaminar2
             params_.bias_tensor, // Bias fused into GEMM
             params_.mpi_ctx,
             params_.device_id.toKernelDeviceIndex(),
-            nullptr, // workspace
+            bound_workspace_,
             lm_activation_offset);
 
         if (!success)
@@ -279,6 +279,32 @@ namespace llaminar2
     // =============================================================================
     // IWorkspaceConsumerStage Implementation
     // =============================================================================
+
+    WorkspaceRequirements LMHeadStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        WorkspaceRequirements reqs = IWorkspaceConsumerStage::getWorkspaceRequirements(m, n, k);
+
+        const auto *logits = dynamic_cast<const TensorBase *>(params_.logits);
+        if (params_.device_id.is_rocm() && logits && logits->isMapped())
+        {
+            const int effective_m = params_.compute_all_positions
+                                        ? params_.seq_len
+                                        : ((params_.seq_len > 1) ? 1 : params_.seq_len);
+            if (effective_m > 0 && params_.vocab_size > 0)
+            {
+                const size_t bytes = static_cast<size_t>(effective_m) *
+                                     static_cast<size_t>(params_.vocab_size) *
+                                     sizeof(float);
+                reqs.buffers.push_back({
+                    GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT,
+                    bytes,
+                    256,
+                    true});
+            }
+        }
+
+        return reqs;
+    }
 
     IWorkspaceConsumer *LMHeadStage::getKernelAsWorkspaceConsumer()
     {

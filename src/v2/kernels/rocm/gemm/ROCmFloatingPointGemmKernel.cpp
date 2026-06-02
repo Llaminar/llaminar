@@ -150,12 +150,6 @@ namespace llaminar2
 
         ROCmFloatingPointGemmKernel::~ROCmFloatingPointGemmKernel()
         {
-            if (d_mapped_redirect_)
-            {
-                hipFree(d_mapped_redirect_);
-                d_mapped_redirect_ = nullptr;
-                mapped_redirect_capacity_ = 0;
-            }
             d_batch_A_ptrs_ = nullptr;
             d_batch_B_ptrs_ = nullptr;
             d_batch_C_ptrs_ = nullptr;
@@ -170,8 +164,6 @@ namespace llaminar2
               K_(other.K_),
               hipblas_kernel_(other.hipblas_kernel_), // Just copy the shared pointer
               lifetime_owner_(std::move(other.lifetime_owner_)),
-              d_mapped_redirect_(other.d_mapped_redirect_),
-              mapped_redirect_capacity_(other.mapped_redirect_capacity_),
               workspace_(other.workspace_),
               slice_id_(other.slice_id_),
               d_batch_A_ptrs_(other.d_batch_A_ptrs_),
@@ -183,8 +175,6 @@ namespace llaminar2
         {
             other.weights_ = nullptr;
             other.d_weights_ = nullptr;
-            other.d_mapped_redirect_ = nullptr;
-            other.mapped_redirect_capacity_ = 0;
             other.d_batch_A_ptrs_ = nullptr;
             other.d_batch_B_ptrs_ = nullptr;
             other.d_batch_C_ptrs_ = nullptr;
@@ -207,14 +197,6 @@ namespace llaminar2
                 other.weights_ = nullptr;
                 other.d_weights_ = nullptr;
                 // Note: don't null other.hipblas_kernel_ - it's shared, not owned
-
-                // Transfer redirect buffer ownership
-                if (d_mapped_redirect_)
-                    hipFree(d_mapped_redirect_);
-                d_mapped_redirect_ = other.d_mapped_redirect_;
-                mapped_redirect_capacity_ = other.mapped_redirect_capacity_;
-                other.d_mapped_redirect_ = nullptr;
-                other.mapped_redirect_capacity_ = 0;
 
                 workspace_ = other.workspace_;
                 slice_id_ = other.slice_id_;
@@ -272,7 +254,6 @@ namespace llaminar2
             int activation_row_offset)
         {
             ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_ROCBLAS, static_cast<hipStream_t>(gpu_stream_));
-            (void)workspace; // TODO: Use workspace for intermediate allocations
             if (!A || !C)
             {
                 LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Null input or output tensor");
@@ -314,15 +295,33 @@ namespace llaminar2
             if (C->isMapped())
             {
                 const size_t needed = static_cast<size_t>(m) * n;
-                if (needed > mapped_redirect_capacity_)
+                const size_t needed_bytes = needed * sizeof(float);
+                DeviceWorkspaceManager *effective_workspace = workspace ? workspace : workspace_;
+                if (!validateROCmWorkspaceBinding(
+                        effective_workspace,
+                        rocm_device_id_,
+                        "ROCmFloatingPointGemmKernel::multiply_tensor"))
                 {
-                    if (d_mapped_redirect_)
-                        hipFree(d_mapped_redirect_);
-                    hipMalloc(&d_mapped_redirect_, needed * sizeof(float));
-                    mapped_redirect_capacity_ = needed;
+                    return false;
+                }
+                if (!effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT) ||
+                    effective_workspace->getBufferSize(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT) < needed_bytes)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Missing or undersized "
+                              << "declared graph workspace buffer '"
+                              << GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT
+                              << "' for mapped-output redirect. required_bytes="
+                              << needed_bytes);
+                    return false;
                 }
                 d_mapped_output = d_C;
-                d_C = d_mapped_redirect_;
+                d_C = static_cast<float *>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT));
+                if (!d_C)
+                {
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Mapped-output redirect workspace resolved to null");
+                    return false;
+                }
                 static std::once_flag fp32gemm_mapped_once;
                 std::call_once(fp32gemm_mapped_once, [&]()
                                { LOG_WARN("[ROCmFloatingPointGemmKernel] MAPPED REDIRECT: M=" << m << " N=" << n

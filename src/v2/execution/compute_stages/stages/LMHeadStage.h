@@ -79,6 +79,7 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
         bool hasPrefillReplayParams() const override { return params_.use_prefill_replay_row_offset; }
         void updatePrefillReplayParams(const PrefillReplayParams &replay) override
