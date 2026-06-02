@@ -12,6 +12,7 @@
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
+#include "execution/moe/MoERebalanceController.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "loaders/PreparedWeightStore.h"
 #include "mocks/MockMPIContext.h"
@@ -734,6 +735,45 @@ namespace
         if (pool.hasNvidiaSupport())
             return DeviceId::cuda(0);
         return std::nullopt;
+    }
+
+    MoERebalanceController::Config makeTinyRebalanceConfig()
+    {
+        MoERebalanceController::Config cfg;
+        cfg.mode = MoERebalanceMode::DYNAMIC;
+        cfg.num_layers = 2;
+        cfg.num_experts = 8;
+        cfg.top_k = 2;
+        cfg.window_size = 16;
+        cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
+        cfg.initial_expert_to_socket.resize(static_cast<size_t>(cfg.num_experts));
+        for (int expert = 0; expert < cfg.num_experts; ++expert)
+            cfg.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+        cfg.rebalance_config.imbalance_threshold = 1.3f;
+        cfg.rebalance_config.max_swaps_per_layer = 4;
+        cfg.rebalance_config.max_total_swaps = 16;
+        cfg.rebalance_config.min_improvement_ratio = 0.05f;
+        cfg.rebalance_config.layer_cooldown_generations = 0;
+        cfg.rebalance_config.min_window_activations = 1;
+        return cfg;
+    }
+
+    void fillTinyRebalanceWindow(DecodeExpertHistogram &hist,
+                                 int window_size,
+                                 int num_layers,
+                                 int top_k)
+    {
+        for (int token = 0; token < window_size; ++token)
+        {
+            for (int layer = 0; layer < num_layers; ++layer)
+            {
+                std::vector<int> experts(static_cast<size_t>(top_k));
+                std::vector<float> weights(static_cast<size_t>(top_k), 1.0f / static_cast<float>(top_k));
+                for (int k = 0; k < top_k; ++k)
+                    experts[static_cast<size_t>(k)] = k;
+                hist.record(layer, experts.data(), weights.data(), top_k);
+            }
+        }
     }
 
     const PerfStatRecord *findMTPRecord(
@@ -1652,8 +1692,8 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
         PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}};
     const auto plain_reuse_tags =
         PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}};
-    const auto depth_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}};
+    const auto epoch0_depth_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
 
     const PerfStatRecord *plain_after_build = findMTPRecord(
         records,
@@ -1675,7 +1715,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_cache_misses",
-        depth_tags);
+        epoch0_depth_tags);
     ASSERT_NE(cache_misses, nullptr);
     EXPECT_DOUBLE_EQ(cache_misses->value, 1.0);
 
@@ -1683,9 +1723,103 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_cache_hits",
-        depth_tags);
+        epoch0_depth_tags);
     ASSERT_NE(cache_hits, nullptr);
     EXPECT_DOUBLE_EQ(cache_hits->value, 1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__MTPGraphConstruction, SidecarGraphCacheMissesWhenMoEPlacementEpochChanges)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    float *terminal_hidden = hidden->mutable_data();
+    ASSERT_NE(terminal_hidden, nullptr);
+    for (int i = 0; i < fixture.config.d_model; ++i)
+        terminal_hidden[i] = 0.01f * static_cast<float>((i % 19) + 1);
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    auto rebalance_config = makeTinyRebalanceConfig();
+    auto controller = std::make_unique<MoERebalanceController>(rebalance_config);
+    auto *controller_ptr = controller.get();
+    orchestrator.setMoERebalanceController(std::move(controller));
+    ASSERT_EQ(orchestrator.moePlacementEpoch(), 0u);
+
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/3));
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/4));
+
+    ASSERT_NE(controller_ptr->histogram(), nullptr);
+    fillTinyRebalanceWindow(*controller_ptr->histogram(),
+                            rebalance_config.window_size,
+                            rebalance_config.num_layers,
+                            rebalance_config.top_k);
+    ASSERT_TRUE(controller_ptr->shouldRebalance());
+    ASSERT_FALSE(controller_ptr->rebalance().empty());
+    ASSERT_EQ(orchestrator.moePlacementEpoch(), 1u);
+
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/5));
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto epoch0_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
+    const auto epoch1_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "1"}};
+
+    const PerfStatRecord *epoch0_miss = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_misses",
+        epoch0_tags);
+    ASSERT_NE(epoch0_miss, nullptr);
+    EXPECT_DOUBLE_EQ(epoch0_miss->value, 1.0);
+
+    const PerfStatRecord *epoch0_hit = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_hits",
+        epoch0_tags);
+    ASSERT_NE(epoch0_hit, nullptr);
+    EXPECT_DOUBLE_EQ(epoch0_hit->value, 1.0);
+
+    const PerfStatRecord *epoch1_miss = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_misses",
+        epoch1_tags);
+    ASSERT_NE(epoch1_miss, nullptr);
+    EXPECT_DOUBLE_EQ(epoch1_miss->value, 1.0);
+
+    const PerfStatRecord *epoch1_hit = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_hits",
+        epoch1_tags);
+    EXPECT_EQ(epoch1_hit, nullptr);
 
     PerfStatsCollector::reset();
 }
