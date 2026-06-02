@@ -46,7 +46,7 @@ depth-N configuration.
 
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
-| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 20.01 current same-prompt `-c 64 -n 4`; 18.25 older long-prompt baseline | Partial: base ROCm MTP with `LLAMINAR_GPU_GRAPHS=1` now runs real Qwen3.6 decode smoke and records MTP/verifier counters; the opt-in M=2 row-overlap path still hard-fails under GPU graphs | N/A | 12.32 without GPU graphs; 11.66 standard post-guard; 9.62 current same-prompt GPU-graph smoke | 0.68x decode best no-graph; 0.48x current same-prompt GPU-graph smoke | `/tmp/llaminar-mtp-bench/dense-rocm-current-baseline-gpugraphs-c64-n4-forwardgraph.json`, `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-gpugraphs-unguarded-c64-n4.json`, `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-no-graphs-long-after-guard-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-notiming-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-gpugraph-hardfail.json` | The broad ROCm GPU-graph MTP guard was stale: current real Qwen3.6 dense smoke completes with aligned MTP state. It is still slower than baseline, and `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` remains blocked under GPU graphs because side-stream row overlap is not graph-capture safe. Next work is optimizing the captured main-verifier graph and replacing row overlap with a graph-native two-row verifier kernel. |
+| SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 19.03 current same-prompt `Paris is -c 64 -n 8`; 20.01 current same-prompt `-n 4`; 18.25 older long-prompt baseline | Partial: base ROCm MTP with `LLAMINAR_GPU_GRAPHS=1` reaches segmented replay for main verifier, sidecar, and catch-up graphs; the opt-in M=2 row-overlap path still hard-fails under GPU graphs | N/A | 12.32 without GPU graphs; 11.68 current fox GPU-graph smoke; 11.57 current `Paris is` GPU-graph smoke | 0.68x decode best no-graph; 0.61x current same-prompt GPU-graph smoke | `/tmp/llaminar-mtp-bench/dense-rocm-current-baseline-gpugraphs-c64-n8-forwardgraph.json`, `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-gpugraphs-unguarded-c64-n8-combined.json`, `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-gpugraphs-unguarded-fox-c64-n8-combined.json`, `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-m2gemm-gpugraphs-fox-c64-n8-combined.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-gpugraph-hardfail.json` | Graph capture now works for the base ROCm dense MTP path, but main-verifier replay is the blocker: fox `main_verifier` replay averages 119.66 ms for the 2-token verifier graph versus baseline `main_decode` replay at 54.70 ms/token. The single-stream native-VNNI M=2 GEMM reuse experiment passed synthetic small-M parity but produced an HSA memory fault under real Qwen3.6 graph capture, so it was rejected. Need a purpose-built graph-capturable ROCm two-row verifier kernel or lower-level native-VNNI fix. |
 | SingleDevice | CUDA `cuda:0` | Qwen3.6 dense 27B Q4_K_S | 40.44 current same-binary `-c 128 -n 64`; 40.48 earlier `-c 128 -n 64`; 41.39 current `-c 64 -n 16`; 43.76 current no-stats `-c 64 -n 4` | Small-context dense MTP reaches segmented replay with zero manual stages. Main verifier, full decode sidecar, and KV-only shifted-row catch-up decode graphs are capturable/replayed; default 4096-context run still does not fit this 24 GB device | N/A | 54.02 native M=2 verifier `-c 128 -n 64`; 38.16 same-prompt `-n 4` clean run; 37.69 retained KV-only catch-up `-c 128 -n 64`; 36.78 rejected post-sidecar checkpoint-elision experiment | 1.34x current same-binary depth-1 MTP; 0.93x pre-native-M2 retained telemetry; 0.91x rejected checkpoint-elision experiment | `/tmp/llaminar-mtp-bench/dense-cuda-current-baseline-m2native-c128-n64-forwardgraph.json`, `/tmp/llaminar-mtp-bench/dense-cuda-current-baseline-m2native-c128-n64-forwardgraph-stats.csv`, `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-m2native-c128-n64-combined.json`, `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-m2native-c128-n64-combined-stats.csv`; historical artifacts are in Latest CUDA dense evidence below | First concrete CUDA SingleDevice dense MTP speedup is proven for depth-1 MTP after the graph-native CUDA M=2 native-VNNI verifier route: 54.02 tok/s versus 40.44 tok/s baseline with 96.88% acceptance, aligned shifted KV (`current_position=68`, `mtp_cached_tokens=67`), and zero manual segmented-replay stages. This is still below the Phase 14 dense target of roughly 2x. Next work should tune the remaining main-verifier cost, investigate deeper draft verification, and port the graph-native small-M path to ROCm, TP, and MoE domains. |
 | SingleDevice | ROCm | Qwen3.6 MoE 35B | 21.23 | Partial: MTP GPU graphs now survive rollback/restore through the `-n 4` crash reproducer, but replay state is reset after each live-state rewind | N/A | 10.89 | 0.51x decode | `/tmp/llaminar-mtp-bench/moe-rocm-baseline-n4.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n3-fixed.json`, `/tmp/llaminar-mtp-bench/moe-rocm-mtp-gpugraphs-n4-fixed.json` | Crash fixed by resetting captured forward and MTP sidecar replay state after live prefix restore/truncate. MTP remains slower than baseline with 0% acceptance on this prompt; need sidecar/verifier acceptance and replay-cost work before claiming speedup. |
 | SingleDevice | CUDA `cuda:0` | Qwen3.6 MoE 35B | 31.20 current same-binary `-c 64 -n 16`; 42.94 older 10-token `-n 4`; 27.56 older 9-token `-n 4` | Small-context MoE MTP reaches segmented replay with zero manual stages; single-participant rebalance downgrades to observe | N/A | 50.89 native M=2 verifier `-c 64 -n 16`; 22.43 older combined-telemetry short prompt | 1.63x current same-binary depth-1 MTP; 0.52x older combined telemetry | `/tmp/llaminar-mtp-bench/moe-cuda-current-baseline-m2native-c64-n16-forwardgraph.json`, `/tmp/llaminar-mtp-bench/moe-cuda-current-baseline-m2native-c64-n16-forwardgraph-stats.csv`, `/tmp/llaminar-mtp-bench/moe-cuda-current-mtp-m2native-c64-n16-combined.json`, `/tmp/llaminar-mtp-bench/moe-cuda-current-mtp-m2native-c64-n16-combined-stats.csv`; historical artifacts are in Latest CUDA MoE evidence below | CUDA SingleDevice MoE now has a real graph-captured speedup after the native M=2 verifier route: 50.89 tok/s versus 31.20 tok/s baseline, 78.12% acceptance, aligned shifted KV, and zero manual segmented-replay stages. This supports the single-device MoE path, but ExpertParallel MoE remains a separate Phase 14 gate. Next work should confirm across longer prompts and carry the small-M native route into ROCm/EP domains. |
@@ -156,6 +156,40 @@ Latest ROCm dense evidence:
     `mtp_cached_tokens=5`, and `mtp_kv_cache_count=1`.
   - This is a correctness and graph-capture stability improvement, not a
     speedup. The captured main-verifier graph still dominates decode cost.
+- Longer current GPU-graph replay evidence for base ROCm MTP:
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-baseline-gpugraphs-c64-n8-forwardgraph.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-baseline-gpugraphs-c64-n8-forwardgraph-stats.csv`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-gpugraphs-unguarded-c64-n8-combined.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-gpugraphs-unguarded-c64-n8-combined-stats.csv`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-gpugraphs-unguarded-fox-c64-n8-combined.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-gpugraphs-unguarded-fox-c64-n8-combined-stats.csv`.
+  - Same-prompt `Paris is` baseline decode: 420.37 ms for 8 tokens,
+    19.03 tok/s.
+  - Same-prompt `Paris is` MTP decode: 691.38 ms for 8 tokens, 11.57 tok/s,
+    with 16 draft steps, 12 accepted, 4 rejected, 4 rollbacks, and 75%
+    acceptance.
+  - The `The quick brown fox` MTP run reached 11.68 tok/s with the same 75%
+    acceptance but clearer replay counters: `main_verifier` replay reached
+    Phase 3 for 3 calls, averaging about 119.66 ms per two-token verifier
+    graph; `mtp_decode_sidecar` replay averaged about 2.36 ms and
+    `mtp_decode_catchup` replay averaged about 0.44 ms.
+  - Baseline `main_decode` replay on the same backend and context averaged
+    about 54.70 ms per one-token graph. ROCm MTP is therefore blocked by
+    verifier graph GPU work, not host launch overhead, sidecar cost, or
+    checkpoint capture/restore.
+- Rejected graph-native M=2 native-GEMM reuse experiment:
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-m2gemm-gpugraphs-fox-c64-n8-combined.json`
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-mtp-m2gemm-gpugraphs-fox-c64-n8-combined-stats.csv`.
+  - Routing Q4_K `M=2` verifier GEMM through the existing single-stream
+    native-VNNI prefill GEMM entrypoint passed the focused synthetic
+    `V2_Integration_ROCmQuantisedGemmSmallM` parity test, but produced an HSA
+    memory access fault under real Qwen3.6 graph capture during warmup and left
+    the benchmark process stuck until killed.
+  - The experiment was reverted. Do not reintroduce the prefill-GEMM route as
+    the MTP verifier fast path without a real captured Qwen3.6 smoke and a
+    lower-level fix for the HSA fault.
 - GPU-graph hard-fail for native-VNNI M=2 row overlap:
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-gpugraph-hardfail.json` and
   `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-gpugraph-hardfail-stats.json`.
