@@ -27,6 +27,18 @@ stage policy, collective policy, and graph final-sync costs. Keeping both
 domains together prevents graph-only artifacts from hiding high-level MTP
 decode costs, or MTP-only artifacts from hiding graph-capture policy.
 
+When MTP speedup is blocked by acceptance rather than verifier cost, also run
+a focused acceptance trace:
+
+```bash
+LLAMINAR_PERF_STATS_FILTER=mtp.acceptance_trace
+```
+
+The `mtp.acceptance_trace` counter records one tagged row per measured MTP
+step with the condition token, first main token, sidecar draft token, verifier
+token, whether the second draft was accepted, and whether verifier state was
+committed or replayed.
+
 All current Phase 14 MTP benchmark evidence is for the implemented depth-1
 sidecar path (`--mtp-draft-tokens 1`). Requests for deeper MTP drafts now fail
 before prefill forward rather than silently running depth-1 behavior under a
@@ -270,6 +282,29 @@ Latest CUDA dense evidence:
     0 rejected, 0 rollbacks, 100% acceptance.
   - Profiling/export overhead is not the main blocker: the clean run is only
     about 2.15 tok/s faster than the instrumented 36.01 tok/s run.
+- MTP acceptance-trace regression and real-model diagnostic:
+  `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-acceptance-trace-c64-n16.json`,
+  `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-acceptance-trace-c64-n16-stats.json`,
+  and `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-acceptance-trace-c64-n16-stats.csv`.
+  - Added `mtp.acceptance_trace` structured counter coverage in
+    `V2_Unit_PrefillDecodeTransition` for both accepted and forced-rejected
+    MTP decode branches. This is the regression test for future acceptance
+    diagnostics.
+  - Real CUDA dense trace command used Qwen3.6 dense 27B Q4_K_S on RTX 3090
+    `cuda:0`, `-c 64`, `-n 16`, deterministic 4-token prompt, GPU graphs
+    enabled, and `LLAMINAR_PERF_STATS_FILTER=mtp.acceptance_trace`.
+  - The run reproduced the longer-decode blocker: 32 draft steps, 12 accepted,
+    20 rejected, 20 rollbacks, 32 verifier runs, and 37.5% acceptance.
+  - The measured trace records start after warmup at draft step 9 and show a
+    stable three-accept, five-reject pattern repeated across the benchmarked
+    iterations:
+    `37550/33075 -> 888` accepted,
+    `888/279 -> 15217` accepted,
+    `15217/5388 -> 13` accepted, then verifier disagrees with sidecar drafts
+    for the next five steps.
+  - Next CUDA dense work should separate true sidecar quality from shifted-KV
+    or rollback-state drift after the first rejection. The trace makes this
+    debuggable without parsing logs.
 - Small-M verifier Phase 14 rerun:
   `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-smallm-alln-c64-n4.json`,
   `/tmp/llaminar-mtp-bench/dense-cuda-current-mtp-smallm-alln-c64-n4-stats.json`,

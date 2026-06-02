@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -90,6 +91,31 @@ namespace
                                    return record.kind == kind &&
                                           record.domain == "mtp" &&
                                           record.name == name;
+                               });
+        return it == records.end() ? nullptr : &*it;
+    }
+
+    const PerfStatRecord *findPerfRecordWithTags(
+        const std::vector<PerfStatRecord> &records,
+        PerfStatRecord::Kind kind,
+        const std::string &name,
+        const std::map<std::string, std::string> &expected_tags)
+    {
+        auto it = std::find_if(records.begin(), records.end(), [&](const auto &record)
+                               {
+                                   if (record.kind != kind ||
+                                       record.domain != "mtp" ||
+                                       record.name != name)
+                                   {
+                                       return false;
+                                   }
+                                   for (const auto &[key, value] : expected_tags)
+                                   {
+                                       auto tag_it = record.tags.find(key);
+                                       if (tag_it == record.tags.end() || tag_it->second != value)
+                                           return false;
+                                   }
+                                   return true;
                                });
         return it == records.end() ? nullptr : &*it;
     }
@@ -879,10 +905,72 @@ namespace
             ASSERT_NE(accepted, nullptr);
             EXPECT_DOUBLE_EQ(accepted->value, 1.0);
 
+            const PerfStatRecord *accept_trace =
+                findPerfRecordWithTags(records, PerfStatRecord::Kind::Counter, "acceptance_trace",
+                                       {
+                                           {"accepted_second_draft", "true"},
+                                           {"first_token", std::to_string(MockInferenceRunner::PREFILL_ARGMAX_TOKEN)},
+                                           {"mtp_token", std::to_string(MockInferenceRunner::MTP_ARGMAX_TOKEN)},
+                                           {"verified_token", std::to_string(MockInferenceRunner::MTP_ARGMAX_TOKEN)},
+                                           {"verifier_state_matches_output", "true"},
+                                       });
+            ASSERT_NE(accept_trace, nullptr);
+            EXPECT_DOUBLE_EQ(accept_trace->value, 1.0);
+            EXPECT_EQ(accept_trace->tags.at("draft_step"), "1");
+            EXPECT_EQ(accept_trace->tags.at("output_tokens"), "2");
+            EXPECT_EQ(accept_trace->tags.at("used_ready_logits"), "true");
+
             const PerfStatRecord *commits =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "verifier_state_commits");
             ASSERT_NE(commits, nullptr);
             EXPECT_DOUBLE_EQ(commits->value, 1.0);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPDecodeRecordsRejectedAcceptanceTrace)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_decode_reject_trace_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/false);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success());
+            EXPECT_EQ(mock->forwardMTPCount(), 1);
+            EXPECT_EQ(mock->restoreCount(), 1);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *reject_trace =
+                findPerfRecordWithTags(records, PerfStatRecord::Kind::Counter, "acceptance_trace",
+                                       {
+                                           {"accepted_second_draft", "false"},
+                                           {"first_token", std::to_string(MockInferenceRunner::PREFILL_ARGMAX_TOKEN)},
+                                           {"mtp_token", std::to_string(MockInferenceRunner::MTP_ARGMAX_TOKEN)},
+                                           {"verified_token", std::to_string(MockInferenceRunner::VERIFY_REJECT_TOKEN)},
+                                           {"verifier_state_matches_output", "false"},
+                                       });
+            ASSERT_NE(reject_trace, nullptr);
+            EXPECT_DOUBLE_EQ(reject_trace->value, 1.0);
+            EXPECT_EQ(reject_trace->tags.at("draft_step"), "1");
+            EXPECT_EQ(reject_trace->tags.at("output_tokens"), "2");
+            EXPECT_EQ(reject_trace->tags.at("used_ready_logits"), "true");
+
+            const PerfStatRecord *rejected =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "rejected_tokens");
+            ASSERT_NE(rejected, nullptr);
+            EXPECT_DOUBLE_EQ(rejected->value, 1.0);
+
+            const PerfStatRecord *rollbacks =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "rollbacks");
+            ASSERT_NE(rollbacks, nullptr);
+            EXPECT_DOUBLE_EQ(rollbacks->value, 1.0);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

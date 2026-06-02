@@ -1748,6 +1748,7 @@ Metrics:
 - Prefix lookup time, populate time, harvest time, disk hydration time, and device promotion time.
 - Matched blocks/tokens and hit tier.
 - MTP draft steps, verifier runs, accepted tokens, rejected tokens, rollbacks, and acceptance rate.
+- Optional per-step MTP acceptance trace with condition token, first main token, sidecar draft token, verifier token, output-token count, and rollback/commit outcome.
 - Sparse MoE dispatch/return bytes and dense bytes avoided.
 - Graph chunk capture time, replay time, recapture count, and ineligible/fail-fast reason.
 - Per-chunk histogram merge time, rebalance decision time, placement epoch flip time, and expert payload transfer/prepare time.

@@ -1147,6 +1147,29 @@ namespace llaminar2
         const bool verifier_state_matches_output =
             accepted_speculative_token && accepted_tokens.size() == draft_tokens.size();
 
+        if (PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "acceptance_trace",
+                1.0,
+                "decode",
+                {},
+                {
+                    {"draft_step", std::to_string(mtp_stats_.draft_steps)},
+                    {"condition_token", std::to_string(condition_token)},
+                    {"first_token", std::to_string(first_token)},
+                    {"mtp_token", std::to_string(mtp_token)},
+                    {"verified_token", std::to_string(verified_next)},
+                    {"accepted_second_draft", accepted_second_draft ? "true" : "false"},
+                    {"speculative_token_was_attempted", speculative_token_was_attempted ? "true" : "false"},
+                    {"speculative_token_is_output", speculative_token_is_output ? "true" : "false"},
+                    {"verifier_state_matches_output", verifier_state_matches_output ? "true" : "false"},
+                    {"output_tokens", std::to_string(accepted_tokens.size())},
+                    {"used_ready_logits", use_ready_logits ? "true" : "false"},
+                });
+        }
+
         if (rejected_speculative_token)
         {
             ++mtp_stats_.rejected_tokens;
