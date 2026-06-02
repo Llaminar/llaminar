@@ -1320,6 +1320,159 @@ namespace llaminar2
                 return false;
             }
 
+            if (m > 1 && m <= 2 && (k % 32) == 0)
+            {
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
+                          << m << " projections=" << projections.size());
+
+                validateWorkspace();
+                int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+                float *d_scales_A_blockwise =
+                    static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+
+                if (!cudaQuantGemm_quantizeActivationsBlockwise(
+                        d_input,
+                        d_A_int8,
+                        d_scales_A_blockwise,
+                        m,
+                        k,
+                        cuda_device_id_,
+                        gpu_stream_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M blockwise activation quantization failed");
+                    return false;
+                }
+
+                const int blocks_per_row = k / 32;
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    if (!proj.kernel || !proj.output)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                  << i << " has null kernel or output");
+                        return false;
+                    }
+
+                    auto *cuda_kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(proj.kernel);
+                    if (!cuda_kernel)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                  << i << " kernel is not CUDAQuantisedGemmKernel");
+                        return false;
+                    }
+
+                    auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
+                    if (!fp32_output)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                  << i << " output is not FP32Tensor");
+                        return false;
+                    }
+
+                    float *d_output = static_cast<float *>(fp32_output->gpu_data_ptr());
+                    if (!d_output)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                  << i << " output has no GPU data");
+                        return false;
+                    }
+
+                    const float *d_bias = nullptr;
+                    if (proj.bias)
+                    {
+                        const TensorBase *bias_tensor = proj.bias;
+                        if (auto *slice = dynamic_cast<const TensorSlice *>(proj.bias))
+                            bias_tensor = slice->inner();
+
+                        auto *fp32_bias = dynamic_cast<FP32Tensor *>(const_cast<TensorBase *>(bias_tensor));
+                        if (!fp32_bias)
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                      << i << " bias is not FP32Tensor");
+                            return false;
+                        }
+
+                        auto current_dev = fp32_bias->current_device();
+                        if (current_dev.has_value() && current_dev.value() == target_device)
+                        {
+                            d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                        }
+                        else if (current_dev.has_value() && current_dev->is_gpu())
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                      << i << " bias is on " << current_dev->to_string()
+                                      << " but CUDA:" << cuda_device_id_ << " is required");
+                            return false;
+                        }
+                        else
+                        {
+                            if (!fp32_bias->ensureOnDevice(target_device))
+                            {
+                                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                          << i << " failed to upload bias to CUDA:" << cuda_device_id_);
+                                return false;
+                            }
+                            d_bias = static_cast<const float *>(fp32_bias->gpu_data_ptr());
+                        }
+                    }
+
+                    cuda_kernel->setGPUStream(gpu_stream_);
+                    if (cuda_kernel->workspace_ != workspace_)
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                  << i << " is not bound to the fused shared workspace");
+                        return false;
+                    }
+
+                    cuda_kernel->ensureWeightsConverted();
+                    if (!canUseNativeVNNIBlockwise(cuda_kernel->impl_.get(), 1, k))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M native GEMV unsupported for projection "
+                                  << i << " (" << (proj.name ? proj.name : "unnamed") << ")");
+                        return false;
+                    }
+
+                    for (int row = 0; row < m; ++row)
+                    {
+                        const int8_t *row_A = d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(k);
+                        const float *row_scales =
+                            d_scales_A_blockwise + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+                        float *row_C = d_output + static_cast<size_t>(row) * static_cast<size_t>(proj.n);
+
+                        if (!runNativeVNNIBlockwiseIfSupported(
+                                cuda_kernel->impl_.get(),
+                                row_A,
+                                nullptr,
+                                row_C,
+                                row_scales,
+                                1,
+                                proj.n,
+                                k,
+                                1.0f,
+                                0.0f,
+                                nullptr,
+                                d_bias,
+                                cuda_device_id_,
+                                gpu_stream_,
+                                cuda_kernel->packed_ ? &cuda_kernel->packed_->rowmajor_ : nullptr))
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV failed for projection "
+                                      << i << " row=" << row << " (" << (proj.name ? proj.name : "unnamed") << ")");
+                            return false;
+                        }
+                    }
+                }
+
+                return true;
+            }
+            if (m > 1 && m <= 2)
+            {
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M native prefill path M="
+                          << m << " projections=" << projections.size()
+                          << " (row-wise GEMV requires K to be a multiple of 32)");
+            }
+
             // Step 2: Validate workspace and get buffer pointers
             // Use this kernel's workspace for quantized activations (shared across all projections)
             validateWorkspace();
@@ -1912,6 +2065,85 @@ namespace llaminar2
             return multiply_with_fused_swiglu(d_gate, d_up, d_C, m, n, k, alpha, beta);
         }
 
+        bool CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv(
+            const float *d_A, float *d_C, const float *d_bias,
+            int m, int n, int k,
+            float alpha, float beta)
+        {
+            if (!d_A || !d_C)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Null input or output");
+                return false;
+            }
+            if (m <= 1 || m > 2 || n <= 0 || k <= 0)
+            {
+                return false;
+            }
+            if ((k % 32) != 0)
+            {
+                return false;
+            }
+
+            validateWorkspace();
+            ensureWeightsConverted();
+
+            if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
+            {
+                return false;
+            }
+
+            int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            float *d_scales_A_blockwise =
+                static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+
+            if (!cudaQuantGemm_quantizeActivationsBlockwise(
+                    d_A,
+                    d_A_int8,
+                    d_scales_A_blockwise,
+                    m,
+                    k,
+                    cuda_device_id_,
+                    gpu_stream_))
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Blockwise activation quantization failed");
+                return false;
+            }
+
+            const int blocks_per_row = k / 32;
+            for (int row = 0; row < m; ++row)
+            {
+                const int8_t *row_A = d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(k);
+                const float *row_scales =
+                    d_scales_A_blockwise + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+                float *row_C = d_C + static_cast<size_t>(row) * static_cast<size_t>(n);
+                const float *row_existing = (beta != 0.0f) ? row_C : nullptr;
+
+                if (!runNativeVNNIBlockwiseIfSupported(
+                        impl_.get(),
+                        row_A,
+                        nullptr,
+                        row_C,
+                        row_scales,
+                        1,
+                        n,
+                        k,
+                        alpha,
+                        beta,
+                        row_existing,
+                        d_bias,
+                        cuda_device_id_,
+                        gpu_stream_,
+                        packed_ ? &packed_->rowmajor_ : nullptr))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Row "
+                              << row << " native-VNNI GEMV failed");
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
         bool CUDAQuantisedGemmKernel::multiply_fp32_to_fp32(
             const float *d_A, float *d_C,
             int m, int n, int k,
@@ -1968,6 +2200,14 @@ namespace llaminar2
                     return true;
                 }
                 LOG_WARN("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM failed, falling back");
+            }
+
+            if (m > 1 && m <= 2 &&
+                multiply_fp32_to_fp32_small_m_gemv(
+                    d_A, d_C, nullptr, m, n, k, alpha, beta))
+            {
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (small-M row-wise native payload GEMV)");
+                return true;
             }
 
             // Use blockwise quantization for prefill and for decode when a native
@@ -2031,6 +2271,14 @@ namespace llaminar2
 
             // Ensure weights converted
             ensureWeightsConverted();
+
+            if (m > 1 && m <= 2 &&
+                multiply_fp32_to_fp32_small_m_gemv(
+                    d_A, d_C, d_bias, m, n, k, alpha, beta))
+            {
+                LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (small-M row-wise native payload GEMV)");
+                return true;
+            }
 
             // Use blockwise quantization whenever K is block-aligned.
             const bool use_blockwise =
