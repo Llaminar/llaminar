@@ -5385,7 +5385,100 @@ namespace llaminar2
                     return false;
                 }
 
-                // Step 2: Native-VNNI GEMM (same dispatch as multiply_tensor M>1)
+                // Step 2: Native-VNNI small-M verifier path. MTP verifier batches
+                // are tiny (M=2..4), so do not fall through to the generic prefill
+                // GEMM once this route is selected.
+                const bool supports_native_small_m =
+                    impl_->has_native_vnni && m >= 2 && m <= 4 &&
+                    alpha == 1.0f && beta == 0.0f;
+                if (supports_native_small_m)
+                {
+                    if ((k % 32) != 0)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                                  "Native-VNNI fused SwiGLU small-M verifier requires K multiple of 32, got M="
+                                  << m << " K=" << k);
+                        return false;
+                    }
+
+                    if (!impl_->d_scatter_partial ||
+                        !impl_->d_weights_native_vnni ||
+                        !impl_->d_weights_native_scales)
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                                  "Native-VNNI fused SwiGLU small-M verifier missing graph-native buffers"
+                                  << " weights=" << static_cast<const void *>(impl_->d_weights_native_vnni)
+                                  << " scales=" << static_cast<const void *>(impl_->d_weights_native_scales)
+                                  << " partial=" << static_cast<const void *>(impl_->d_scatter_partial));
+                        return false;
+                    }
+
+                    if (!rocmGemv_native_vnni_small_m_fp32(
+                            impl_->d_A_int8,
+                            impl_->d_weights_native_vnni,
+                            impl_->d_weights_native_scales,
+                            impl_->d_weights_native_mins,
+                            impl_->d_weights_native_emins,
+                            d_C,
+                            impl_->d_scales_A_blockwise,
+                            impl_->d_scatter_partial,
+                            m, n, k,
+                            impl_->native_vnni_codebook_id,
+                            rocm_device_id_, gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
+                                  "Native-VNNI fused SwiGLU small-M verifier GEMV failed");
+                        return false;
+                    }
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_native_vnni_small_m_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
+                                {"n", std::to_string(n)},
+                                {"k", std::to_string(k)},
+                                {"source", "fused_swiglu"}});
+
+                        if (m == 2)
+                        {
+                            PerfStatsCollector::addCounter(
+                                "kernel",
+                                "rocm_native_vnni_m2_calls",
+                                1.0,
+                                "gemm",
+                                "rocm:" + std::to_string(rocm_device_id_),
+                                PerfStatsCollector::Tags{
+                                    {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
+                                    {"n", std::to_string(n)},
+                                    {"k", std::to_string(k)},
+                                    {"source", "fused_swiglu"}});
+                        }
+
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_native_vnni_small_m_rows",
+                            static_cast<double>(m),
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"codebook", std::to_string(static_cast<int>(impl_->native_vnni_codebook_id))},
+                                {"n", std::to_string(n)},
+                                {"k", std::to_string(k)},
+                                {"source", "fused_swiglu"}});
+                    }
+
+                    return true;
+                }
+
+                // Step 2 fallback for non-small-M prefill shapes.
                 if (impl_->has_native_vnni && alpha == 1.0f && beta == 0.0f)
                 {
                     const uint8_t cb_id = impl_->native_vnni_codebook_id;

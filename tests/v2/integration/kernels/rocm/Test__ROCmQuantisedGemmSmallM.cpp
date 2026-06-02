@@ -243,6 +243,139 @@ namespace
         kernel.unbindWorkspace();
     }
 
+    inline float swigluRef(float gate, float up)
+    {
+        return gate / (1.0f + std::exp(-gate)) * up;
+    }
+
+    template <typename CreateWeights>
+    void runFusedSwiGLUDownSmallMMatchesReference(
+        const char *label,
+        int M,
+        int N,
+        int K,
+        PackedPath expected_path,
+        CreateWeights createWeights,
+        float min_cosine,
+        bool graph_capture = false,
+        int graph_replays = 1)
+    {
+        ASSERT_GE(graph_replays, 1);
+
+        auto weights = createWeights(
+            {static_cast<size_t>(N), static_cast<size_t>(K)},
+            4242);
+        std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+        weights->to_fp32(W_fp32.data());
+
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        expectPackedPath(packed, expected_path);
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        kernel.prepareWeights();
+        ASSERT_TRUE(kernel.weights_converted());
+
+#ifdef HAVE_ROCM
+        hipStream_t stream = nullptr;
+        if (graph_capture)
+        {
+            ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+            kernel.setGPUStream(stream);
+        }
+#endif
+
+        auto workspace = bindWorkspace(kernel, M, N, K);
+        ASSERT_NE(workspace, nullptr);
+
+        auto gate = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.5f,
+            0.5f,
+            5151);
+        auto up = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)},
+            -0.5f,
+            0.5f,
+            6161);
+        auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        ASSERT_TRUE(gate->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(up->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+#ifdef HAVE_ROCM
+        hipGraph_t graph = nullptr;
+        hipGraphExec_t exec = nullptr;
+        if (graph_capture)
+        {
+            ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+                gate.get(),
+                up.get(),
+                output.get(),
+                M,
+                N,
+                K));
+            ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+            ASSERT_NE(graph, nullptr);
+            ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
+            ASSERT_NE(exec, nullptr);
+
+            for (int replay = 0; replay < graph_replays; ++replay)
+            {
+                ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(),
+                                         0,
+                                         static_cast<size_t>(M) * N * sizeof(float),
+                                         stream),
+                          hipSuccess);
+                ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess)
+                    << "replay=" << replay;
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
+                    << "replay=" << replay;
+            }
+        }
+        else
+#endif
+        {
+            ASSERT_TRUE(kernel.multiply_tensor_with_fused_swiglu(
+                gate.get(),
+                up.get(),
+                output.get(),
+                M,
+                N,
+                K));
+#ifdef HAVE_ROCM
+            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+#endif
+        }
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+        std::vector<float> swiglu(static_cast<size_t>(M) * K);
+        for (size_t i = 0; i < swiglu.size(); ++i)
+            swiglu[i] = swigluRef(gate->data()[i], up->data()[i]);
+
+        std::vector<float> ref(static_cast<size_t>(M) * N);
+        cpuFP32GemmRef(swiglu.data(), W_fp32.data(), ref.data(), M, N, K);
+
+        const float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+        LOG_INFO("[SmallM] " << label << " fused SwiGLU down M=" << M << " cosine=" << cos);
+        EXPECT_GT(cos, min_cosine);
+
+#ifdef HAVE_ROCM
+        if (exec)
+            EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
+        if (graph)
+            EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+        if (stream)
+        {
+            kernel.setGPUStream(nullptr);
+            EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+        }
+#endif
+        kernel.unbindWorkspace();
+    }
+
     template <typename CreateWeights>
     void runFusedQKVSmallMMatchesSeparate(
         const char *label,
@@ -740,6 +873,175 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ5KSmallMRecordsNativeRouteCounter)
     EXPECT_GE(route_record->value, 1.0);
     EXPECT_EQ(route_record->device, "rocm:0");
     EXPECT_EQ(route_record->tags.at("codebook"), "7");
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedSwiGLUDownQ4KM2RecordsNativeRouteCounter)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const int M = 2;
+    const int N = 512;
+    const int K = 1024;
+    runFusedSwiGLUDownSmallMMatchesReference(
+        "Q4_K native-VNNI fused SwiGLU down counter",
+        M,
+        N,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.985f);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    auto route_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [M, N, K](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("source") != 0 &&
+                   record.tags.at("source") == "fused_swiglu" &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == std::to_string(N) &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == std::to_string(K);
+        });
+
+    ASSERT_NE(route_record, records.end())
+        << "Q4_K M=2 fused SwiGLU down must use the graph-native ROCm small-M route";
+    EXPECT_GE(route_record->value, 1.0);
+    EXPECT_EQ(route_record->device, "rocm:0");
+    EXPECT_EQ(route_record->tags.at("codebook"), "5");
+
+    const auto m2_records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_m2_calls"});
+    auto m2_record = std::find_if(
+        m2_records.begin(),
+        m2_records.end(),
+        [N, K](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_native_vnni_m2_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("source") != 0 &&
+                   record.tags.at("source") == "fused_swiglu" &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == std::to_string(N) &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == std::to_string(K);
+        });
+    ASSERT_NE(m2_record, m2_records.end())
+        << "Q4_K M=2 fused SwiGLU down should record the two-row native route";
+    EXPECT_GE(m2_record->value, 1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, FusedSwiGLUDownQ5KM4RecordsNativeRouteCounter)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const int M = 4;
+    const int N = 512;
+    const int K = 1024;
+    runFusedSwiGLUDownSmallMMatchesReference(
+        "Q5_K native-VNNI fused SwiGLU down counter",
+        M,
+        N,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ5_KRandom(shape, seed); },
+        0.985f);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    auto route_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [M, N, K](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("source") != 0 &&
+                   record.tags.at("source") == "fused_swiglu" &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == std::to_string(N) &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == std::to_string(K);
+        });
+
+    ASSERT_NE(route_record, records.end())
+        << "Q5_K M=4 fused SwiGLU down must use the graph-native ROCm small-M route";
+    EXPECT_GE(route_record->value, 1.0);
+    EXPECT_EQ(route_record->device, "rocm:0");
+    EXPECT_EQ(route_record->tags.at("codebook"), "7");
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__ROCmQuantisedGemmSmallM, GraphCapturedFusedSwiGLUDownQ4KQwen36FFNDownM2MatchesReference)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    constexpr int M = 2;
+    constexpr int N = 5120;
+    constexpr int K = 17408;
+    runFusedSwiGLUDownSmallMMatchesReference(
+        "Q4_K native-VNNI Qwen3.6 FFN down verifier shape",
+        M,
+        N,
+        K,
+        PackedPath::NativeVNNI,
+        [](const std::vector<size_t> &shape, uint32_t seed)
+        { return TestTensorFactory::createQ4_KRandom(shape, seed); },
+        0.9999f,
+        true,
+        4);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_vnni_small_m_calls"});
+    auto route_record = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "rocm_native_vnni_small_m_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.count("source") != 0 &&
+                   record.tags.at("source") == "fused_swiglu" &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == "2" &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == "5120" &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == "17408";
+        });
+
+    ASSERT_NE(route_record, records.end())
+        << "Qwen3.6 MTP verifier FFN down must use graph-native ROCm fused SwiGLU/down small-M route";
+    EXPECT_GE(route_record->value, 1.0);
+    EXPECT_EQ(route_record->device, "rocm:0");
+    EXPECT_EQ(route_record->tags.at("codebook"), "5");
 
     PerfStatsCollector::reset();
 }
