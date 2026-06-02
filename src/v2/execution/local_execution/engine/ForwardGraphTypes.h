@@ -91,6 +91,7 @@ namespace llaminar2
         bool pp_has_lm_head = false;
         bool is_bucketed_prefill = false;
         int bucket_seq_len = 0;
+        uint64_t moe_placement_epoch = 0;
 
         bool operator==(const ForwardGraphSignature &other) const
         {
@@ -107,7 +108,8 @@ namespace llaminar2
                    pp_has_embedding == other.pp_has_embedding &&
                    pp_has_lm_head == other.pp_has_lm_head &&
                    is_bucketed_prefill == other.is_bucketed_prefill &&
-                   bucket_seq_len == other.bucket_seq_len;
+                   bucket_seq_len == other.bucket_seq_len &&
+                   moe_placement_epoch == other.moe_placement_epoch;
         }
     };
 
@@ -129,6 +131,7 @@ namespace llaminar2
             h ^= (std::hash<bool>{}(sig.pp_has_lm_head) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.is_bucketed_prefill) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.bucket_seq_len) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(sig.moe_placement_epoch) + 0x9e3779b9 + (h << 6) + (h >> 2));
             return h;
         }
     };

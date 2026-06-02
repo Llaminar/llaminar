@@ -279,7 +279,8 @@ namespace llaminar2
                 {"result", result},
                 {"seq_len", std::to_string(signature.seq_len)},
                 {"decode_has_history", boolTag(signature.decode_has_history)},
-                {"all_position_logits", boolTag(signature.all_position_logits)}};
+                {"all_position_logits", boolTag(signature.all_position_logits)},
+                {"moe_placement_epoch", std::to_string(signature.moe_placement_epoch)}};
         }
 
         /// @brief Run the full prefill graph preflight for a fixed-bucket input.
@@ -855,7 +856,8 @@ namespace llaminar2
                 pp_has_embedding,
                 pp_has_lm_head,
                 bucketed_prefill,
-                bucketed_prefill ? bucketed_prefill_seq_len : 0};
+                bucketed_prefill ? bucketed_prefill_seq_len : 0,
+                host.moePlacementEpoch()};
 
             auto cache_it = cache_.find(forward_signature);
             if (cache_it != cache_.end())

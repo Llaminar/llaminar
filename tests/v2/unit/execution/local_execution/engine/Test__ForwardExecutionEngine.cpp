@@ -1040,7 +1040,11 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
         {"LLAMINAR_FAIL_ON_ZERO", "0"},
     });
 
-    auto engine = makeEngine(/*cache_enabled=*/true);
+    ForwardExecutionEngine::Config config;
+    config.cache_config.enabled = true;
+    config.cache_config.decode_seq_len = 1;
+    config.has_unified_pp = false;
+    ForwardExecutionEngine engine(std::move(config), executor_);
     llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
     MockForwardExecutionHost host(&gpu_ctx);
     host.graph_stage_count = 1;
@@ -1385,12 +1389,14 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
         {"all_position_logits", "true"},
         {"context", "main_verifier"},
         {"decode_has_history", "true"},
+        {"moe_placement_epoch", "0"},
         {"result", "miss"},
         {"seq_len", "2"}};
     const PerfStatsCollector::Tags hit_tags = {
         {"all_position_logits", "true"},
         {"context", "main_verifier"},
         {"decode_has_history", "true"},
+        {"moe_placement_epoch", "0"},
         {"result", "hit"},
         {"seq_len", "2"}};
 
@@ -1398,6 +1404,34 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
     EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "forward_cache_lookup", hit_tags), 1.0);
 
     PerfStatsCollector::reset();
+}
+
+TEST_F(Test__ForwardExecutionEngine, MoEPlacementEpochChangeMissesDecodeCache)
+{
+    auto engine = makeEngine();
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    int token = 42;
+    int pos = 7;
+    auto input = makeTestInput(1, 1, DeviceId::cpu(), &token, &pos);
+    ForwardOutput output{};
+
+    ASSERT_TRUE(engine.execute(input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+
+    token = 43;
+    pos = 8;
+    ASSERT_TRUE(engine.execute(input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 1)
+        << "Same MoE placement epoch should reuse the cached decode graph";
+
+    host.placement_epoch = 1;
+    token = 44;
+    pos = 9;
+    ASSERT_TRUE(engine.execute(input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 2)
+        << "MoE placement changes must rebuild under a new graph identity";
 }
 
 // =========================================================================

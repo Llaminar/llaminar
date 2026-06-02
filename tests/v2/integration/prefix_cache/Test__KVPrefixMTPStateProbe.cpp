@@ -1703,6 +1703,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
         {"all_position_logits", "true"},
         {"context", "main_verifier"},
         {"decode_has_history", "true"},
+        {"moe_placement_epoch", "0"},
         {"result", "miss"},
         {"seq_len", "3"},
     };
@@ -1710,6 +1711,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
         {"all_position_logits", "true"},
         {"context", "main_verifier"},
         {"decode_has_history", "true"},
+        {"moe_placement_epoch", "0"},
         {"result", "hit"},
         {"seq_len", "3"},
     };

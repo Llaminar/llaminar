@@ -286,6 +286,17 @@ TEST(Test__ForwardGraphSignature, PPEnabledVsDisabledNotEqual)
     EXPECT_NE(a, b);
 }
 
+TEST(Test__ForwardGraphSignature, DifferentMoEPlacementEpochNotEqual)
+{
+    ForwardGraphSignature epoch0{.seq_len = 1,
+                                 .batch_size = 1,
+                                 .decode = true,
+                                 .moe_placement_epoch = 0};
+    ForwardGraphSignature epoch1 = epoch0;
+    epoch1.moe_placement_epoch = 1;
+    EXPECT_NE(epoch0, epoch1);
+}
+
 // =========================================================================
 // ForwardGraphSignatureHash
 // =========================================================================
@@ -306,11 +317,14 @@ TEST(Test__ForwardGraphSignatureHash, DifferentSignaturesLikelyDifferentHash)
     ForwardGraphSignature a{.seq_len = 1, .batch_size = 1, .decode = true};
     ForwardGraphSignature b{.seq_len = 128, .batch_size = 1, .decode = false};
     ForwardGraphSignature c{.seq_len = 1, .batch_size = 4, .decode = true};
+    ForwardGraphSignature d = a;
+    d.moe_placement_epoch = 1;
 
     // Not a hard requirement, but extremely likely for different fields
-    size_t ha = h(a), hb = h(b), hc = h(c);
+    size_t ha = h(a), hb = h(b), hc = h(c), hd = h(d);
     EXPECT_NE(ha, hb);
     EXPECT_NE(ha, hc);
+    EXPECT_NE(ha, hd);
     EXPECT_NE(hb, hc);
 }
 

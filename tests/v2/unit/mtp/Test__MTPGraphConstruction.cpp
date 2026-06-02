@@ -2207,7 +2207,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     PerfStatsCollector::reset();
 }
 
-TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestoreResetsMoEReplayState)
+TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState)
 {
     DeviceManager::instance().initialize(-1, false);
     ScopedDebugEnv perf_stats({{"LLAMINAR_PERF_STATS_JSON", "1"}});
@@ -2232,15 +2232,18 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestoreResetsMoEReplayState)
     ASSERT_TRUE(orchestrator.restoreLivePrefixState(checkpoint));
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto preserve_tags = PerfStatsCollector::Tags{
+        {"operation", "restore_logical_checkpoint"},
+        {"model", "moe"},
+        {"moe_placement_epoch", "0"}};
+    const PerfStatRecord *preserved =
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", preserve_tags);
+    ASSERT_NE(preserved, nullptr);
+    EXPECT_DOUBLE_EQ(preserved->value, 1.0);
     const auto reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};
-    const PerfStatRecord *reset =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", reset_tags);
-    ASSERT_NE(reset, nullptr);
-    EXPECT_DOUBLE_EQ(reset->value, 1.0);
-    const auto preserve_tags = PerfStatsCollector::Tags{{"operation", "restore_logical_checkpoint"}};
-    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", preserve_tags),
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }
