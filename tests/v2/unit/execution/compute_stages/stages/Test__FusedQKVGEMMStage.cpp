@@ -14,12 +14,15 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <random>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <string>
+#include <utility>
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -102,6 +105,94 @@ namespace llaminar2
                     return false;
             }
             return true;
+        }
+
+        class RecordingWorkspaceGemm final : public ITensorGemm, public IWorkspaceConsumer
+        {
+        public:
+            explicit RecordingWorkspaceGemm(std::string name)
+                : name_(std::move(name))
+            {
+            }
+
+            bool supports_device(int) const override { return true; }
+
+            bool multiply_tensor(
+                const TensorBase *,
+                TensorBase *,
+                int,
+                int,
+                int,
+                bool,
+                float,
+                float,
+                const TensorBase *,
+                const IMPIContext *,
+                int,
+                DeviceWorkspaceManager *,
+                int) override
+            {
+                return false;
+            }
+
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+            {
+                observed_m.push_back(m);
+                observed_n.push_back(n);
+                observed_k.push_back(k);
+
+                WorkspaceRequirements reqs;
+                reqs.buffers.push_back({
+                    name_ + "_n" + std::to_string(n),
+                    static_cast<size_t>(std::max(1, n)),
+                    1,
+                    true});
+                return reqs;
+            }
+
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+            bool hasWorkspace() const override { return workspace_ != nullptr; }
+            DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
+            mutable std::vector<int> observed_m;
+            mutable std::vector<int> observed_n;
+            mutable std::vector<int> observed_k;
+
+        private:
+            std::string name_;
+            DeviceWorkspaceManager *workspace_ = nullptr;
+        };
+
+        PreparedWeightRef registerRecordingGemm(
+            PreparedWeightStore &store,
+            std::shared_ptr<RecordingWorkspaceGemm> kernel,
+            const std::string &canonical_name,
+            ModelContextId model_id)
+        {
+            auto binding = test::makePreparedWeightTestBinding(
+                nullptr,
+                DeviceId::cpu(),
+                canonical_name,
+                model_id);
+
+            auto prepared_weights =
+                std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
+            prepared_weights->kind =
+                llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CPU_PACKED;
+            prepared_weights->kernel = kernel.get();
+            prepared_weights->owned_kernel = kernel;
+
+            auto handle =
+                std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+            handle->device_id = DeviceId::cpu();
+            handle->kind = llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CPU_PACKED;
+            handle->prepared_weights = std::move(prepared_weights);
+
+            return store.registerPreparedGemmHandle(
+                binding,
+                PreparedWeightKind::CpuPackedGemm,
+                DeviceId::cpu(),
+                std::move(handle));
         }
     }
 
@@ -537,6 +628,40 @@ namespace llaminar2
             2 * static_cast<size_t>(m_) * n_v_ * k_;
 
         EXPECT_EQ(stage.estimatedFlops(), expected_flops);
+    }
+
+    TEST_F(Test__FusedQKVGEMMStage, WorkspaceRequirementsUsePerProjectionN)
+    {
+        const ModelContextId model_id{9912};
+        PreparedWeightStore store(model_id);
+        auto q = std::make_shared<RecordingWorkspaceGemm>("q");
+        auto k = std::make_shared<RecordingWorkspaceGemm>("k");
+        auto v = std::make_shared<RecordingWorkspaceGemm>("v");
+
+        auto q_ref = registerRecordingGemm(store, q, "blk.0.attn_q.weight", model_id);
+        auto k_ref = registerRecordingGemm(store, k, "blk.0.attn_k.weight", model_id);
+        auto v_ref = registerRecordingGemm(store, v, "blk.0.attn_v.weight", model_id);
+
+        FusedQKVGEMMStage::Params params{
+            .m = 3,
+            .k = 128,
+            .n_q = 96,
+            .n_k = 16,
+            .n_v = 24,
+            .prepared_ref_q = q_ref,
+            .prepared_ref_k = k_ref,
+            .prepared_ref_v = v_ref,
+            .prepared_store = &store};
+
+        FusedQKVGEMMStage stage(params);
+        const auto reqs = stage.getWorkspaceRequirements(/*m=*/3, /*n=*/999, /*k=*/128);
+        (void)reqs;
+
+        EXPECT_EQ(q->observed_n, std::vector<int>({96}));
+        EXPECT_EQ(k->observed_n, std::vector<int>({16}));
+        EXPECT_EQ(v->observed_n, std::vector<int>({24}));
+        EXPECT_EQ(q->observed_m, std::vector<int>({3}));
+        EXPECT_EQ(k->observed_k, std::vector<int>({128}));
     }
 
     TEST_F(Test__FusedQKVGEMMStage, SupportsBackend)

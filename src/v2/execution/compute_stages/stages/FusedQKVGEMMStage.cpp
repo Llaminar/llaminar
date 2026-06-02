@@ -397,13 +397,25 @@ namespace llaminar2
         if (!self->resolveIndividualKernels("FusedQKVGEMMStage::getWorkspaceRequirements"))
             return {};
 
+        const int workspace_m = (m > 0) ? m : params_.m;
+        const int workspace_k = (k > 0) ? k : params_.k;
+
         WorkspaceRequirements combined;
         if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
-            combined.merge(consumer_q->getWorkspaceRequirements(m, n, k));
+            combined.merge(consumer_q->getWorkspaceRequirements(
+                workspace_m,
+                params_.n_q > 0 ? params_.n_q : n,
+                workspace_k));
         if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_k_))
-            combined.merge(consumer_k->getWorkspaceRequirements(m, n, k));
+            combined.merge(consumer_k->getWorkspaceRequirements(
+                workspace_m,
+                params_.n_k > 0 ? params_.n_k : n,
+                workspace_k));
         if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_v_))
-            combined.merge(consumer_v->getWorkspaceRequirements(m, n, k));
+            combined.merge(consumer_v->getWorkspaceRequirements(
+                workspace_m,
+                params_.n_v > 0 ? params_.n_v : n,
+                workspace_k));
         return combined;
     }
 
