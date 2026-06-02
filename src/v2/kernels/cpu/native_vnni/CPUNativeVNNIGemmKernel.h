@@ -326,8 +326,10 @@ namespace llaminar2::cpu::native_vnni
             const TensorBase *up,
             TensorBase *output,
             int m, int n, int k,
-            float alpha = 1.0f, float beta = 0.0f) override
+            float alpha = 1.0f, float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr) override
         {
+            (void)workspace;
             if (!valid_)
                 return false;
             if (!gate || !up || !output)

@@ -314,7 +314,8 @@ namespace llaminar2
             if (gemm->multiply_tensor_with_fused_swiglu(
                     gate_base, A_base_up, C_base,
                     params_.m, effective_n, params_.k,
-                    params_.alpha, params_.beta))
+                    params_.alpha, params_.beta,
+                    getWorkspace()))
             {
                 markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
                 LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
@@ -516,7 +517,7 @@ namespace llaminar2
         if (params_.gate_input)
         {
             BufferTensorType gate_type = toBufferTensorType(params_.gate_input->native_type());
-            reqs.addInput("gate_input", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, gate_type);
+            reqs.addInput("gate_input", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)}, gate_type);
         }
 
         return reqs;

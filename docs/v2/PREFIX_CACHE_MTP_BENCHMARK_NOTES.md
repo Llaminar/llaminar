@@ -90,6 +90,14 @@ Latest workspace-binding validation:
 - Dense FusedQKV and FusedGateUp execution now pass the stage-bound workspace
   explicitly into `multiply_fused_tensor()`, matching the GDN projection path
   instead of relying only on prior kernel binding.
+- `GEMMStage` fused SwiGLU/down execution now passes the stage-bound workspace
+  explicitly into `multiply_tensor_with_fused_swiglu()`. The fused gate input
+  buffer descriptor also declares `[m, k]`, matching the consumed gate tensor,
+  rather than `[m, n]`.
+- MoE expert and shared-expert fused paths now pass their bound graph workspace
+  through fused gate/up projection and fused SwiGLU/down calls. This keeps the
+  future ExpertParallel graph-captured path on the same declared-buffer contract
+  as dense verifier GEMM rather than relying on implicit kernel binding.
 - Graph-stage scratch policy for this sprint: allocations needed by captured
   stages must be declared in graph workspace requirements, bound through
   `IWorkspaceConsumer`, and hard-fail at the stage boundary when the bound
@@ -107,6 +115,10 @@ Latest workspace-binding validation:
   ShortConv/GDN recurrence workspace requirement checks. `V2_Unit_FusedQKVGEMMStage`
   and `V2_Unit_FusedGateUpGEMMStage` add `WorkspaceRequirementsUsePerProjectionN`
   and explicit `Execute*PassesBoundWorkspaceToFusedKernel` coverage.
+  `V2_Unit_GEMMStage` adds `ExecutePassesBoundWorkspaceToFusedSwigluKernel`
+  and `GetBufferRequirementsUsesKForFusedSwigluGateInput`; the MoE fused-path
+  plumbing is covered by `V2_Unit_MoEExpertComputeStage` and
+  `V2_Unit_MoELocalExpertStage_PreparedWeights`.
 - Real Qwen3.6 dense ROCm depth-1 MTP graph-capture smoke completed:
   `/tmp/llaminar-mtp-bench/dense-rocm-workspace-binding-mtp-c64-n8-bench.json`,
   `/tmp/llaminar-mtp-bench/dense-rocm-workspace-binding-mtp-c64-n8-stats.json`,

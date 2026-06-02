@@ -2210,8 +2210,26 @@ namespace llaminar2
             const TensorBase *gate, const TensorBase *up,
             TensorBase *output,
             int m, int n, int k,
-            float alpha, float beta)
+            float alpha, float beta,
+            DeviceWorkspaceManager *workspace)
         {
+            DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
+            DeviceWorkspaceManager *saved_ws = workspace_;
+            if (effective_ws && effective_ws != workspace_)
+            {
+                workspace_ = effective_ws;
+            }
+            auto restore_workspace = [&](void *)
+            {
+                if (effective_ws && effective_ws != saved_ws)
+                {
+                    workspace_ = saved_ws;
+                }
+            };
+            std::unique_ptr<void, decltype(restore_workspace)> workspace_restore_guard(
+                (effective_ws && effective_ws != saved_ws) ? static_cast<void *>(this) : nullptr,
+                restore_workspace);
+
             // Get device pointers (tensors must already be on GPU via DeviceGraphExecutor coherence)
             const float *d_gate = static_cast<const float *>(gate->gpu_data_ptr());
             const float *d_up = static_cast<const float *>(up->gpu_data_ptr());

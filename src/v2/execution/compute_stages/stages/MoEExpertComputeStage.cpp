@@ -65,12 +65,15 @@ namespace llaminar2
             FP32Tensor *gate_tensor, FP32Tensor *up_tensor, TensorBase *output,
             ITensorGemm *down_gemm, IMoEKernel *moe_kernel,
             int m, int n, int intermediate,
-            DeviceId device, void *stream)
+            DeviceId device, void *stream,
+            DeviceWorkspaceManager *workspace)
         {
             // Try fused path first (quantized GEMM engines support this)
             if (down_gemm->multiply_tensor_with_fused_swiglu(
                     gate_tensor, up_tensor, output,
-                    m, n, intermediate))
+                    m, n, intermediate,
+                    1.0f, 0.0f,
+                    workspace))
             {
                 markGpuTensorWritten(output, device, stream);
                 return true;
@@ -89,7 +92,13 @@ namespace llaminar2
 
             const bool ok = down_gemm->multiply_tensor(
                 gate_tensor, output,
-                m, n, intermediate);
+                m, n, intermediate,
+                true,
+                1.0f, 0.0f,
+                nullptr,
+                nullptr,
+                device.toKernelDeviceIndex(),
+                workspace);
             if (ok)
                 markGpuTensorWritten(output, device, stream);
             return ok;
@@ -567,7 +576,8 @@ namespace llaminar2
                     {gate_gemm, scratch_gate_.get(), intermediate, nullptr, "gate"},
                     {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"}};
                 if (!gate_gemm->multiply_fused_tensor(
-                        scratch_batch_.get(), projections, count, d_model))
+                        scratch_batch_.get(), projections, count, d_model,
+                        nullptr, getWorkspace()))
                 {
                     LOG_ERROR("[MoEExpertComputeStage] CUDA gate/up projection failed for expert "
                               << expert_id << " layer " << params_.layer_idx);
@@ -579,7 +589,7 @@ namespace llaminar2
                 if (!fusedSwigluDown(
                         scratch_gate_.get(), scratch_up_.get(), scratch_out_.get(),
                         down_gemm, kernel, count, d_model, intermediate,
-                        params_.device_id, gpuStream()))
+                        params_.device_id, gpuStream(), getWorkspace()))
                 {
                     LOG_ERROR("[MoEExpertComputeStage] CUDA SwiGLU/down projection failed for expert "
                               << expert_id << " layer " << params_.layer_idx);
@@ -738,7 +748,8 @@ namespace llaminar2
                 {up_gemm, scratch_up_.get(), intermediate, nullptr, "up"}};
             if (!gate_gemm->multiply_fused_tensor(
                     scratch_batch_.get(), projections,
-                    num_tokens, d_model))
+                    num_tokens, d_model,
+                    nullptr, getWorkspace()))
             {
                 LOG_ERROR("[MoEExpertComputeStage] Gate/up projection failed for expert "
                           << expert_id << " layer " << params_.layer_idx);
@@ -754,7 +765,7 @@ namespace llaminar2
             if (!fusedSwigluDown(
                     scratch_gate_.get(), scratch_up_.get(), scratch_out_.get(),
                     down_gemm, kernel, num_tokens, d_model, intermediate,
-                    params_.device_id, gpuStream()))
+                    params_.device_id, gpuStream(), getWorkspace()))
             {
                 LOG_ERROR("[MoEExpertComputeStage] SwiGLU/down projection failed for expert "
                           << expert_id << " layer " << params_.layer_idx);
@@ -1081,7 +1092,8 @@ namespace llaminar2
         if (num_active > 0)
         {
             if (!batch_projections_[0].kernel->multiply_fused_tensor(
-                    input_tensor, batch_projections_, /*m=*/1, d_model))
+                    input_tensor, batch_projections_, /*m=*/1, d_model,
+                    nullptr, getWorkspace()))
             {
                 LOG_ERROR("[MoEExpertComputeStage] Decode gate/up batched projection failed for layer "
                           << params_.layer_idx);
@@ -1190,7 +1202,7 @@ namespace llaminar2
                             scratch_up_batch_[info.batch_idx].get(),
                             scratch_out_.get(),
                             down_gemm, kernel, /*m=*/1, d_model, intermediate,
-                            params_.device_id, gpuStream()))
+                            params_.device_id, gpuStream(), getWorkspace()))
                     {
                         LOG_ERROR("[MoEExpertComputeStage] CUDA decode SwiGLU/down projection failed for expert "
                                   << info.expert_id << " layer " << params_.layer_idx);
@@ -1288,7 +1300,7 @@ namespace llaminar2
                             scratch_up_batch_[info.batch_idx].get(),
                             scratch_out_.get(),
                             down_gemm, kernel, /*m=*/1, d_model, intermediate,
-                            params_.device_id, gpuStream()))
+                            params_.device_id, gpuStream(), getWorkspace()))
                     {
                         LOG_ERROR("[MoEExpertComputeStage] Decode SwiGLU/down projection failed for expert "
                                   << info.expert_id << " layer " << params_.layer_idx);
@@ -2432,7 +2444,8 @@ namespace llaminar2
             {cached_up_gemm_, scratch_up_.get(), intermediate, nullptr, "shared_up"}};
         if (!cached_gate_gemm_->multiply_fused_tensor(
                 params_.input, projections,
-                seq_len, d_model))
+                seq_len, d_model,
+                nullptr, getWorkspace()))
         {
             LOG_ERROR("[SharedExpertFFNStage] Shared gate/up projection failed");
             return false;
@@ -2444,7 +2457,7 @@ namespace llaminar2
         if (!fusedSwigluDown(
                 scratch_gate_.get(), scratch_up_.get(), params_.output,
                 cached_down_gemm_, kernel, seq_len, d_model, intermediate,
-                params_.device_id, gpuStream()))
+                params_.device_id, gpuStream(), getWorkspace()))
         {
             LOG_ERROR("[SharedExpertFFNStage] Shared SwiGLU/down projection failed");
             return false;

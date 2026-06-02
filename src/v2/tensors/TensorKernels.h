@@ -460,7 +460,8 @@ namespace llaminar2
             const TensorBase *up,
             TensorBase *output,
             int m, int n, int k,
-            float alpha = 1.0f, float beta = 0.0f)
+            float alpha = 1.0f, float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr)
         {
             (void)gate;
             (void)up;
@@ -470,6 +471,7 @@ namespace llaminar2
             (void)k;
             (void)alpha;
             (void)beta;
+            (void)workspace;
             return false; // Default: not supported, fall back to separate path
         }
 

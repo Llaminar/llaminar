@@ -410,7 +410,8 @@ namespace llaminar2
                 const TensorBase *gate, const TensorBase *up,
                 TensorBase *output,
                 int m, int n, int k,
-                float alpha = 1.0f, float beta = 0.0f);
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
         private:
             // =========================================================================
