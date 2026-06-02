@@ -14,6 +14,19 @@ Use `Pending` only when no measured artifact exists yet. Use `Partial` when
 some graph-capture path is active but the whole MTP inference step still has
 manual stages, uncaptured collectives, or large host/replay overhead.
 
+For every new MTP graph-capture benchmark, export one combined perf artifact
+with:
+
+```bash
+LLAMINAR_PERF_STATS_FILTER=mtp,forward_graph
+```
+
+The `mtp` records explain draft, verifier, rollback, checkpoint, and replay
+costs. The `forward_graph` records explain capture, replay, segmented/manual
+stage policy, collective policy, and graph final-sync costs. Keeping both
+domains together prevents graph-only artifacts from hiding high-level MTP
+decode costs, or MTP-only artifacts from hiding graph-capture policy.
+
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
 | SingleDevice | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 18.25 | Blocked: ROCm MTP with `LLAMINAR_GPU_GRAPHS=1` now hard-fails before decode-side MTP launch after real HSA fault/hang reproducers | N/A | 12.32 without GPU graphs; 11.66 standard post-guard | 0.68x decode best observed; 0.64x standard post-guard | `/tmp/llaminar-mtp-bench/dense-rocm-baseline-after.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-no-graphs-long-after-guard-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-notiming-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-gpugraph-hardfail.json`, `/tmp/llaminar-mtp-bench/dense-rocm-mtp-m2rows-gpugraph-hardfail.json` | ROCm MTP GPU graph capture is not rollout-safe. Both the base graph path and the opt-in M=2 row-overlap path produced HSA memory faults/hangs in fresh real Qwen3.6 smokes and now fail with structured `failure_reason`. The supported no-graph path remains green after the guard, but still slower than baseline. Need a graph-safe ROCm MTP verifier/sidecar path, likely graph-native two-row verifier kernels plus safe replay state, before speedup work resumes for this cell. |
@@ -575,7 +588,7 @@ Command shape:
 ```bash
 LLAMINAR_PERF_STATS_JSON=/tmp/llaminar_qwen36_dense_rocm_mtp_perf_stats_phasefix.json \
 LLAMINAR_PERF_STATS_CSV=/tmp/llaminar_qwen36_dense_rocm_mtp_perf_stats_phasefix.csv \
-LLAMINAR_PERF_STATS_FILTER=mtp \
+LLAMINAR_PERF_STATS_FILTER=mtp,forward_graph \
 ./build_v2_release/llaminar2 benchmark \
   -m /opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf \
   -d rocm:0 -n 1 --mtp \
@@ -599,3 +612,24 @@ Conclusions:
 - MTP sidecar decode itself is not the decode bottleneck on this run; checkpoint capture dominates decode wall time.
 - MTP shifted-cache prefill is expensive because it performs per-token terminal hidden row selection and per-token depth-0 sidecar execution.
 - Next optimization work should target logical checkpoint capture/restore and a batched/captured shifted-cache prefill path before tuning sidecar graph execution.
+
+## 2026-06-02 MTP Matrix Telemetry Guardrail
+
+The matrix now requires combined MTP plus graph perf exports for every new MTP
+graph-capture benchmark:
+
+```bash
+LLAMINAR_PERF_STATS_FILTER=mtp,forward_graph
+```
+
+Regression coverage:
+
+- `V2_Unit_PerfStatsCollector` includes
+  `FlushFromEnvWritesMultipleFilteredDomainsForMTPGraphEvidence`, proving a
+  single JSON/CSV export keeps both `mtp.*` high-level decode timers and
+  `forward_graph.*` capture/replay timers while excluding unrelated domains.
+- Future graph-captured CUDA/ROCm dense, MoE, LocalTP, and ExpertOverlay
+  artifacts should use this combined filter before updating the speedup
+  columns. Older graph-focused artifacts remain useful for capture-policy
+  evidence, but reruns should include the high-level MTP timers in the same
+  file.

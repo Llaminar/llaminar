@@ -204,3 +204,56 @@ TEST(Test__PerfStatsCollector, FlushFromEnvWritesMachineReadableFiles)
     std::filesystem::remove(json_path);
     std::filesystem::remove(csv_path);
 }
+
+TEST(Test__PerfStatsCollector, FlushFromEnvWritesMultipleFilteredDomainsForMTPGraphEvidence)
+{
+    const auto json_path = uniqueTempPath(".json");
+    const auto csv_path = uniqueTempPath(".csv");
+    ScopedEnv json_env("LLAMINAR_PERF_STATS_JSON", json_path.string().c_str());
+    ScopedEnv csv_env("LLAMINAR_PERF_STATS_CSV", csv_path.string().c_str());
+    ScopedEnv filter_env("LLAMINAR_PERF_STATS_FILTER", "mtp,forward_graph");
+    PerfStatsCollector::reset();
+
+    PerfStatsCollector::recordTimingNs(
+        "mtp",
+        "verifier_forward",
+        2000000,
+        "decode",
+        "cuda:0");
+    PerfStatsCollector::recordTimingNs(
+        "forward_graph",
+        "segmented_replay_total",
+        750000,
+        "decode",
+        "cuda:0",
+        {{"context", "mtp_decode_sidecar"}});
+    PerfStatsCollector::addCounter("kernel", "gemm_calls", 3.0, "decode");
+
+    ASSERT_TRUE(PerfStatsCollector::flushFromEnv());
+
+    const auto json = nlohmann::json::parse(readFile(json_path));
+    ASSERT_EQ(json.at("records").size(), 2u);
+
+    bool saw_mtp_verifier = false;
+    bool saw_graph_replay = false;
+    for (const auto &record : json.at("records"))
+    {
+        const std::string domain = record.at("domain").get<std::string>();
+        const std::string name = record.at("name").get<std::string>();
+        EXPECT_NE(domain, "kernel");
+        saw_mtp_verifier = saw_mtp_verifier ||
+                           (domain == "mtp" && name == "verifier_forward");
+        saw_graph_replay = saw_graph_replay ||
+                           (domain == "forward_graph" && name == "segmented_replay_total");
+    }
+    EXPECT_TRUE(saw_mtp_verifier);
+    EXPECT_TRUE(saw_graph_replay);
+
+    const std::string csv = readFile(csv_path);
+    EXPECT_NE(csv.find("timer,mtp,verifier_forward,decode,cuda:0"), std::string::npos);
+    EXPECT_NE(csv.find("timer,forward_graph,segmented_replay_total,decode,cuda:0"), std::string::npos);
+    EXPECT_EQ(csv.find("kernel"), std::string::npos);
+
+    std::filesystem::remove(json_path);
+    std::filesystem::remove(csv_path);
+}
