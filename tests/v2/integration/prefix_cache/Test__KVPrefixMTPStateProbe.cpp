@@ -1636,7 +1636,10 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke
         {"LLAMINAR_GPU_GRAPHS", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
         {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_stochastic_mtp_stats.json"},
+        {"LLAMINAR_PERF_STATS_FILTER", "mtp"},
     });
+    PerfStatsCollector::reset();
 
     const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
     if (!env_model)
@@ -1690,7 +1693,24 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke
 
     auto result = runner->generate(prompt, 6, stochastic);
     const auto snapshot = runner->prefixStateProbe();
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
     runner->shutdown();
+
+    auto counter = [&](const std::string &name)
+    {
+        double total = 0.0;
+        for (const auto &record : records)
+        {
+            if (record.kind == PerfStatRecord::Kind::Counter &&
+                record.domain == "mtp" &&
+                record.name == name &&
+                record.phase == "decode")
+            {
+                total += record.value;
+            }
+        }
+        return total;
+    };
 
     ASSERT_TRUE(result.error.empty()) << result.error;
     ASSERT_EQ(result.tokens.size(), 6u);
@@ -1701,6 +1721,16 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke
     EXPECT_GE(snapshot.mtp_verifier_token_count, 2u);
     EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u)
         << "Speculative-sampling mode must actually verify at least one draft token";
+    EXPECT_GE(counter("first_token_stochastic_device_samples"), 1.0);
+    EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0);
+    EXPECT_GE(counter("verifier_stochastic_device_distributions"), 2.0);
+    EXPECT_GE(counter("stochastic_accept_tests"), 1.0);
+    EXPECT_EQ(counter("first_token_stochastic_samples"), 0.0)
+        << "supported GPU stochastic MTP must not sample first token from host full logits";
+    EXPECT_EQ(counter("mtp_token_stochastic_samples"), 0.0)
+        << "supported GPU stochastic MTP must not sample sidecar drafts from host full logits";
+    EXPECT_EQ(counter("verifier_stochastic_distributions"), 0.0)
+        << "supported GPU stochastic MTP must not build verifier distributions from host full logits";
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmoke)
