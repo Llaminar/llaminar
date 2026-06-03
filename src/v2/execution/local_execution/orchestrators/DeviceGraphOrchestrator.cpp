@@ -66,6 +66,10 @@ namespace llaminar2
 {
     namespace
     {
+        constexpr size_t kStochasticDistributionMaxK = 256;
+        constexpr size_t kStochasticTargetRows = 4; // verifier M=2..4 includes terminal row
+        constexpr size_t kStochasticDraftRows = 3;  // --mtp-draft-tokens max
+
         /// @brief Emit a coarse VRAM checkpoint for orchestrator allocation phases.
         void logOrchestratorVramTrace(DeviceId device, const char *label)
         {
@@ -1491,6 +1495,50 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to register ARGMAX_PARTIAL_IDXS buffer");
                 return false;
             }
+            if (!arena_->registerBuffer(BufferId::STOCHASTIC_TARGET_TOKEN_IDS,
+                                        kStochasticTargetRows,
+                                        kStochasticDistributionMaxK,
+                                        "INT32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_TARGET_PROBS,
+                                        kStochasticTargetRows,
+                                        kStochasticDistributionMaxK,
+                                        "FP32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS,
+                                        kStochasticDraftRows,
+                                        kStochasticDistributionMaxK,
+                                        "INT32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_DRAFT_PROBS,
+                                        kStochasticDraftRows,
+                                        kStochasticDistributionMaxK,
+                                        "FP32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_TOKENS,
+                                        1,
+                                        kStochasticTargetRows,
+                                        "INT32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_ACCEPTED,
+                                        1,
+                                        kStochasticTargetRows,
+                                        "INT32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS,
+                                        1,
+                                        kStochasticTargetRows,
+                                        "FP32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::STOCHASTIC_VERIFY_THRESHOLDS,
+                                        1,
+                                        kStochasticTargetRows,
+                                        "FP32",
+                                        state_.device_id))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register stochastic MTP sampling buffers");
+                return false;
+            }
         }
 
         // =====================================================================
@@ -1518,6 +1566,43 @@ namespace llaminar2
             argmax_partial_idxs_dev_ = arena_->getDevicePtr(BufferId::ARGMAX_PARTIAL_IDXS, state_.device_id);
             if (argmax_partial_vals_dev_ && argmax_partial_idxs_dev_)
                 argmax_partial_capacity_ = static_cast<int>(arena_->getCols(BufferId::ARGMAX_PARTIAL_VALS));
+        }
+
+        if (state_.device_id.is_gpu() &&
+            arena_->isRegistered(BufferId::STOCHASTIC_TARGET_TOKEN_IDS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_TARGET_PROBS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_DRAFT_PROBS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_TOKENS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_ACCEPTED) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS) &&
+            arena_->isRegistered(BufferId::STOCHASTIC_VERIFY_THRESHOLDS))
+        {
+            arena_->prepareForWrite(BufferId::STOCHASTIC_TARGET_TOKEN_IDS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_TARGET_PROBS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_DRAFT_PROBS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_TOKENS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_ACCEPTED, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS, state_.device_id);
+            arena_->prepareForWrite(BufferId::STOCHASTIC_VERIFY_THRESHOLDS, state_.device_id);
+
+            stochastic_target_token_ids_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_TARGET_TOKEN_IDS, state_.device_id);
+            stochastic_target_probs_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_TARGET_PROBS, state_.device_id);
+            stochastic_draft_token_ids_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_DRAFT_TOKEN_IDS, state_.device_id);
+            stochastic_draft_probs_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_DRAFT_PROBS, state_.device_id);
+            stochastic_verify_tokens_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_VERIFY_TOKENS, state_.device_id);
+            stochastic_verify_accepted_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_VERIFY_ACCEPTED, state_.device_id);
+            stochastic_verify_accept_probs_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS, state_.device_id);
+            stochastic_verify_thresholds_dev_ =
+                arena_->getDevicePtr(BufferId::STOCHASTIC_VERIFY_THRESHOLDS, state_.device_id);
         }
 
         // Wire arena directly to graph builder (replaces bindArenaToManagedBuffers + setBuffers shim)
@@ -6937,6 +7022,287 @@ namespace llaminar2
             token_offset,
             stream,
             "applyPenaltiesToAllPositionLogitsOnDeviceRow");
+    }
+
+    bool DeviceGraphOrchestrator::supportsDeviceStochasticMTPVerification() const
+    {
+        if (!state_.device_id.is_gpu())
+            return false;
+        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+            return false;
+        return stochastic_target_token_ids_dev_ &&
+               stochastic_target_probs_dev_ &&
+               stochastic_draft_token_ids_dev_ &&
+               stochastic_draft_probs_dev_ &&
+               stochastic_verify_tokens_dev_ &&
+               stochastic_verify_accepted_dev_ &&
+               stochastic_verify_accept_probs_dev_ &&
+               stochastic_verify_thresholds_dev_;
+    }
+
+    bool DeviceGraphOrchestrator::buildStochasticDistributionOnDevice(
+        DeviceLogitsSource source,
+        int row,
+        DeviceDistributionBuffer buffer,
+        int slot,
+        const SamplingParams &params,
+        int vocab_size)
+    {
+        if (!supportsDeviceStochasticMTPVerification() ||
+            row < 0 || slot < 0 || vocab_size <= 0 ||
+            params.top_k <= 0 ||
+            params.top_k > static_cast<int>(kStochasticDistributionMaxK))
+        {
+            return false;
+        }
+
+        TensorBase *tensor = nullptr;
+        switch (source)
+        {
+        case DeviceLogitsSource::Main:
+            tensor = state_.logits.get();
+            break;
+        case DeviceLogitsSource::MTP:
+        {
+            auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+            tensor = it == state_.extension_buffers.end() ? nullptr : it->second.get();
+            break;
+        }
+        case DeviceLogitsSource::AllPosition:
+            tensor = state_.all_position_logits.get();
+            break;
+        }
+
+        if (!tensor || !tensor->deviceValid())
+            return false;
+
+        const auto &shape = tensor->shape();
+        if (shape.empty())
+            return false;
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (cols == 0 ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            static_cast<size_t>(row) >= rows ||
+            static_cast<int>(cols) != vocab_size)
+        {
+            return false;
+        }
+
+        int *token_ids = nullptr;
+        float *probs = nullptr;
+        int max_slots = 0;
+        if (buffer == DeviceDistributionBuffer::Target)
+        {
+            token_ids = static_cast<int *>(stochastic_target_token_ids_dev_);
+            probs = static_cast<float *>(stochastic_target_probs_dev_);
+            max_slots = static_cast<int>(kStochasticTargetRows);
+        }
+        else
+        {
+            token_ids = static_cast<int *>(stochastic_draft_token_ids_dev_);
+            probs = static_cast<float *>(stochastic_draft_probs_dev_);
+            max_slots = static_cast<int>(kStochasticDraftRows);
+        }
+        if (!token_ids || !probs || slot >= max_slots)
+            return false;
+
+        void *stream = nullptr;
+        if (source == DeviceLogitsSource::MTP)
+        {
+            stream = pending_mtp_logits_stream_;
+            pending_mtp_logits_stream_ = nullptr;
+        }
+        if (!stream)
+            stream = explicitGPUStreamForOperation("buildStochasticDistributionOnDevice");
+        if (!stream)
+            return false;
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+
+        const void *gpu_ptr = tensor->gpu_data_ptr();
+        if (!gpu_ptr)
+            return false;
+        const float *row_ptr =
+            static_cast<const float *>(gpu_ptr) +
+            static_cast<size_t>(row) * cols;
+
+        const size_t slot_offset =
+            static_cast<size_t>(slot) * kStochasticDistributionMaxK;
+        const bool ok = backend->enqueueBuildTopKTopPDistributionF32Device(
+            row_ptr,
+            static_cast<int>(cols),
+            params.top_k,
+            params.top_p,
+            params.temperature,
+            state_.device_id.gpu_ordinal(),
+            stream,
+            token_ids + slot_offset,
+            probs + slot_offset);
+        if (ok)
+        {
+            if (buffer == DeviceDistributionBuffer::Target)
+                stochastic_target_top_k_[static_cast<size_t>(slot)] = params.top_k;
+            else
+                stochastic_draft_top_k_[static_cast<size_t>(slot)] = params.top_k;
+        }
+        return ok;
+    }
+
+    int DeviceGraphOrchestrator::sampleStochasticDistributionOnDevice(
+        DeviceDistributionBuffer buffer,
+        int slot,
+        float threshold)
+    {
+        if (!supportsDeviceStochasticMTPVerification() || slot < 0)
+            return -1;
+
+        int *token_ids = nullptr;
+        float *probs = nullptr;
+        int max_slots = 0;
+        if (buffer == DeviceDistributionBuffer::Target)
+        {
+            token_ids = static_cast<int *>(stochastic_target_token_ids_dev_);
+            probs = static_cast<float *>(stochastic_target_probs_dev_);
+            max_slots = static_cast<int>(kStochasticTargetRows);
+        }
+        else
+        {
+            token_ids = static_cast<int *>(stochastic_draft_token_ids_dev_);
+            probs = static_cast<float *>(stochastic_draft_probs_dev_);
+            max_slots = static_cast<int>(kStochasticDraftRows);
+        }
+        if (!token_ids || !probs || slot >= max_slots)
+            return -1;
+        const int active_top_k =
+            buffer == DeviceDistributionBuffer::Target
+                ? stochastic_target_top_k_[static_cast<size_t>(slot)]
+                : stochastic_draft_top_k_[static_cast<size_t>(slot)];
+        if (active_top_k <= 0 ||
+            active_top_k > static_cast<int>(kStochasticDistributionMaxK))
+        {
+            return -1;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return -1;
+        void *stream = explicitGPUStreamForOperation("sampleStochasticDistributionOnDevice");
+        if (!stream)
+            return -1;
+
+        int *out_token_dev = static_cast<int *>(stochastic_verify_tokens_dev_) + slot;
+        if (!backend->enqueueSampleDistributionF32Device(
+                token_ids + static_cast<size_t>(slot) * kStochasticDistributionMaxK,
+                probs + static_cast<size_t>(slot) * kStochasticDistributionMaxK,
+                active_top_k,
+                threshold,
+                state_.device_id.gpu_ordinal(),
+                stream,
+                out_token_dev))
+        {
+            return -1;
+        }
+
+        int token = -1;
+        if (!backend->deviceToHost(&token, out_token_dev, sizeof(int),
+                                   state_.device_id.gpu_ordinal(), stream))
+        {
+            return -1;
+        }
+        return token;
+    }
+
+    bool DeviceGraphOrchestrator::verifyStochasticDistributionsOnDevice(
+        int target_slot,
+        int draft_slot,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold,
+        DeviceSpeculativeVerifyResult *out)
+    {
+        if (!supportsDeviceStochasticMTPVerification() || !out ||
+            target_slot < 0 || draft_slot < 0 ||
+            target_slot >= static_cast<int>(kStochasticTargetRows) ||
+            draft_slot >= static_cast<int>(kStochasticDraftRows))
+        {
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+            return false;
+        void *stream = explicitGPUStreamForOperation("verifyStochasticDistributionsOnDevice");
+        if (!stream)
+            return false;
+
+        int *target_ids = static_cast<int *>(stochastic_target_token_ids_dev_) +
+                          static_cast<size_t>(target_slot) * kStochasticDistributionMaxK;
+        float *target_probs = static_cast<float *>(stochastic_target_probs_dev_) +
+                              static_cast<size_t>(target_slot) * kStochasticDistributionMaxK;
+        int *draft_ids = static_cast<int *>(stochastic_draft_token_ids_dev_) +
+                         static_cast<size_t>(draft_slot) * kStochasticDistributionMaxK;
+        float *draft_probs = static_cast<float *>(stochastic_draft_probs_dev_) +
+                             static_cast<size_t>(draft_slot) * kStochasticDistributionMaxK;
+        const int target_top_k = stochastic_target_top_k_[static_cast<size_t>(target_slot)];
+        const int draft_top_k = stochastic_draft_top_k_[static_cast<size_t>(draft_slot)];
+        if (target_top_k <= 0 ||
+            draft_top_k <= 0 ||
+            target_top_k != draft_top_k ||
+            target_top_k > static_cast<int>(kStochasticDistributionMaxK))
+        {
+            return false;
+        }
+
+        int *out_token_dev = static_cast<int *>(stochastic_verify_tokens_dev_) + target_slot;
+        int *out_accepted_dev = static_cast<int *>(stochastic_verify_accepted_dev_) + target_slot;
+        float *out_accept_prob_dev =
+            static_cast<float *>(stochastic_verify_accept_probs_dev_) + target_slot;
+        float *out_threshold_dev =
+            static_cast<float *>(stochastic_verify_thresholds_dev_) + target_slot;
+
+        if (!backend->enqueueSpeculativeVerifyDistributionsF32DeviceThresholds(
+                target_ids,
+                target_probs,
+                draft_ids,
+                draft_probs,
+                target_top_k,
+                draft_token,
+                accept_threshold,
+                residual_threshold,
+                state_.device_id.gpu_ordinal(),
+                stream,
+                out_token_dev,
+                out_accepted_dev,
+                out_accept_prob_dev,
+                out_threshold_dev))
+        {
+            return false;
+        }
+
+        int token = -1;
+        int accepted = 0;
+        float accept_probability = 0.0f;
+        float threshold = 0.0f;
+        if (!backend->deviceToHost(&token, out_token_dev, sizeof(int),
+                                   state_.device_id.gpu_ordinal(), stream) ||
+            !backend->deviceToHost(&accepted, out_accepted_dev, sizeof(int),
+                                   state_.device_id.gpu_ordinal(), stream) ||
+            !backend->deviceToHost(&accept_probability, out_accept_prob_dev, sizeof(float),
+                                   state_.device_id.gpu_ordinal(), stream) ||
+            !backend->deviceToHost(&threshold, out_threshold_dev, sizeof(float),
+                                   state_.device_id.gpu_ordinal(), stream))
+        {
+            return false;
+        }
+
+        out->token = token;
+        out->accepted = accepted != 0;
+        out->accept_probability = accept_probability;
+        out->accept_threshold = threshold;
+        return token >= 0;
     }
 
     // =========================================================================

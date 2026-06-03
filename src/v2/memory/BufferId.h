@@ -88,6 +88,14 @@ namespace llaminar2
         // ── Sampling scratch buffers ────────────────────────────────────────
         ARGMAX_PARTIAL_VALS, ///< Per-block partial max values for two-pass GPU argmax [1, kArgmaxPartials]
         ARGMAX_PARTIAL_IDXS, ///< Per-block partial max indices for two-pass GPU argmax [1, kArgmaxPartials]
+        STOCHASTIC_TARGET_TOKEN_IDS, ///< Compact verifier/main distribution token ids [4, 256]
+        STOCHASTIC_TARGET_PROBS,     ///< Compact verifier/main distribution probabilities [4, 256]
+        STOCHASTIC_DRAFT_TOKEN_IDS,  ///< Compact MTP draft distribution token ids [3, 256]
+        STOCHASTIC_DRAFT_PROBS,      ///< Compact MTP draft distribution probabilities [3, 256]
+        STOCHASTIC_VERIFY_TOKENS,    ///< Scalar stochastic verifier output tokens [1, 4]
+        STOCHASTIC_VERIFY_ACCEPTED,  ///< Scalar stochastic verifier accept flags [1, 4]
+        STOCHASTIC_VERIFY_ACCEPT_PROBS, ///< Scalar stochastic verifier accept probabilities [1, 4]
+        STOCHASTIC_VERIFY_THRESHOLDS,   ///< Scalar stochastic verifier thresholds [1, 4]
 
         // ── Prefix cache restore/harvest staging ───────────────────────────
         PREFIX_K_STAGING,
@@ -201,6 +209,22 @@ namespace llaminar2
             return "ARGMAX_PARTIAL_VALS";
         case BufferId::ARGMAX_PARTIAL_IDXS:
             return "ARGMAX_PARTIAL_IDXS";
+        case BufferId::STOCHASTIC_TARGET_TOKEN_IDS:
+            return "STOCHASTIC_TARGET_TOKEN_IDS";
+        case BufferId::STOCHASTIC_TARGET_PROBS:
+            return "STOCHASTIC_TARGET_PROBS";
+        case BufferId::STOCHASTIC_DRAFT_TOKEN_IDS:
+            return "STOCHASTIC_DRAFT_TOKEN_IDS";
+        case BufferId::STOCHASTIC_DRAFT_PROBS:
+            return "STOCHASTIC_DRAFT_PROBS";
+        case BufferId::STOCHASTIC_VERIFY_TOKENS:
+            return "STOCHASTIC_VERIFY_TOKENS";
+        case BufferId::STOCHASTIC_VERIFY_ACCEPTED:
+            return "STOCHASTIC_VERIFY_ACCEPTED";
+        case BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS:
+            return "STOCHASTIC_VERIFY_ACCEPT_PROBS";
+        case BufferId::STOCHASTIC_VERIFY_THRESHOLDS:
+            return "STOCHASTIC_VERIFY_THRESHOLDS";
         case BufferId::PREFIX_K_STAGING:
             return "PREFIX_K_STAGING";
         case BufferId::PREFIX_V_STAGING:

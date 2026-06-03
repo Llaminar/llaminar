@@ -58,6 +58,27 @@ namespace llaminar2
         explicit operator bool() const { return tensor != nullptr; }
     };
 
+    enum class DeviceLogitsSource : uint8_t
+    {
+        Main,
+        MTP,
+        AllPosition
+    };
+
+    enum class DeviceDistributionBuffer : uint8_t
+    {
+        Target,
+        Draft
+    };
+
+    struct DeviceSpeculativeVerifyResult
+    {
+        int32_t token = -1;
+        bool accepted = false;
+        float accept_probability = 0.0f;
+        float accept_threshold = 0.0f;
+    };
+
     /**
      * @brief Lightweight view of a captured snapshot with 2D shape metadata
      *
@@ -566,6 +587,62 @@ namespace llaminar2
             (void)row;
             (void)penalties;
             (void)vocab_size;
+            return false;
+        }
+
+        /**
+         * @brief True when compact device-side stochastic MTP distributions are available.
+         *
+         * This is intentionally narrower than generic sampling support: it means
+         * the runner can build compact top-k/top-p probability tables for main,
+         * MTP, and all-position verifier logits using explicit streams and
+         * arena-owned buffers, then verify accept/residual decisions without
+         * copying full logits to host.
+         */
+        virtual bool supportsDeviceStochasticMTPVerification() const { return false; }
+
+        virtual bool buildStochasticDistributionOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size)
+        {
+            (void)source;
+            (void)row;
+            (void)buffer;
+            (void)slot;
+            (void)params;
+            (void)vocab_size;
+            return false;
+        }
+
+        virtual int sampleStochasticDistributionOnDevice(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold)
+        {
+            (void)buffer;
+            (void)slot;
+            (void)threshold;
+            return -1;
+        }
+
+        virtual bool verifyStochasticDistributionsOnDevice(
+            int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            DeviceSpeculativeVerifyResult *out)
+        {
+            (void)target_slot;
+            (void)draft_slot;
+            (void)draft_token;
+            (void)accept_threshold;
+            (void)residual_threshold;
+            (void)out;
             return false;
         }
 

@@ -36,6 +36,7 @@
 #include "../../../mocks/MockMPIContext.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <filesystem>
 #include <map>
@@ -470,6 +471,107 @@ namespace
             return applyPenaltiesToRow(all_position_logits_, row, penalties, vocab_size);
         }
 
+        bool supportsDeviceStochasticMTPVerification() const override
+        {
+            return supports_stochastic_device_sampling_;
+        }
+
+        bool buildStochasticDistributionOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size) override
+        {
+            ++device_distribution_build_count_;
+            if (!supports_stochastic_device_sampling_ || row < 0 ||
+                vocab_size != VOCAB_SIZE || params.top_k <= 0)
+            {
+                return false;
+            }
+
+            const float *row_logits = nullptr;
+            switch (source)
+            {
+            case DeviceLogitsSource::Main:
+                if (row != 0 || logits_.size() != VOCAB_SIZE)
+                    return false;
+                row_logits = logits_.data();
+                break;
+            case DeviceLogitsSource::MTP:
+                if (row != 0 || mtp_logits_.size() != VOCAB_SIZE)
+                    return false;
+                row_logits = mtp_logits_.data();
+                break;
+            case DeviceLogitsSource::AllPosition:
+            {
+                const size_t offset = static_cast<size_t>(row) * VOCAB_SIZE;
+                if (offset + VOCAB_SIZE > all_position_logits_.size())
+                    return false;
+                row_logits = all_position_logits_.data() + offset;
+                break;
+            }
+            }
+
+            if (!row_logits)
+                return false;
+
+            auto &target = deviceDistribution(buffer, slot);
+            SamplingParams distribution_params = params;
+            distribution_params.presence_penalty = 0.0f;
+            distribution_params.frequency_penalty = 0.0f;
+            distribution_params.dry_multiplier = 0.0f;
+            distribution_params.dry_penalty_last_n = 0;
+            Sampler distribution_sampler(params.seed);
+            target = distribution_sampler.compute_distribution(
+                row_logits,
+                VOCAB_SIZE,
+                distribution_params);
+            return !target.empty();
+        }
+
+        int sampleStochasticDistributionOnDevice(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override
+        {
+            ++device_distribution_sample_count_;
+            if (!supports_stochastic_device_sampling_)
+                return -1;
+            const auto &distribution = deviceDistribution(buffer, slot);
+            return sampleWithThreshold(distribution, threshold);
+        }
+
+        bool verifyStochasticDistributionsOnDevice(
+            int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            DeviceSpeculativeVerifyResult *out) override
+        {
+            ++device_distribution_verify_count_;
+            if (!supports_stochastic_device_sampling_ || !out)
+                return false;
+
+            const auto &target = deviceDistribution(DeviceDistributionBuffer::Target, target_slot);
+            const auto &draft = deviceDistribution(DeviceDistributionBuffer::Draft, draft_slot);
+            if (target.empty() || draft.empty())
+                return false;
+
+            const float p = Sampler::probability_of_token(target, draft_token);
+            const float q = Sampler::probability_of_token(draft, draft_token);
+            const float accept_probability = q > 0.0f ? std::min(1.0f, p / q) : 0.0f;
+            out->accepted = accept_threshold < accept_probability;
+            out->accept_probability = accept_probability;
+            out->accept_threshold = accept_threshold;
+            out->token = out->accepted
+                             ? draft_token
+                             : sampleResidualWithThreshold(target, draft, residual_threshold);
+            return out->token >= 0;
+        }
+
         // =====================================================================
         // Test inspection methods
         // =====================================================================
@@ -499,6 +601,9 @@ namespace
         int applyMainPenaltiesCount() const { return apply_main_penalties_count_; }
         int applyMTPPenaltiesCount() const { return apply_mtp_penalties_count_; }
         int applyAllPositionPenaltiesCount() const { return apply_all_position_penalties_count_; }
+        int deviceDistributionBuildCount() const { return device_distribution_build_count_; }
+        int deviceDistributionSampleCount() const { return device_distribution_sample_count_; }
+        int deviceDistributionVerifyCount() const { return device_distribution_verify_count_; }
         int lastSampleAllPositionStartRow() const { return last_sample_all_position_start_row_; }
         int lastSampleAllPositionRowCount() const { return last_sample_all_position_row_count_; }
         const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
@@ -656,6 +761,85 @@ namespace
             return true;
         }
 
+        std::vector<SamplingDistributionEntry> &deviceDistribution(
+            DeviceDistributionBuffer buffer,
+            int slot)
+        {
+            if (slot < 0)
+                return invalid_distribution_;
+            if (buffer == DeviceDistributionBuffer::Target)
+            {
+                if (slot >= static_cast<int>(target_device_distributions_.size()))
+                    return invalid_distribution_;
+                return target_device_distributions_[static_cast<size_t>(slot)];
+            }
+            if (slot >= static_cast<int>(draft_device_distributions_.size()))
+                return invalid_distribution_;
+            return draft_device_distributions_[static_cast<size_t>(slot)];
+        }
+
+        const std::vector<SamplingDistributionEntry> &deviceDistribution(
+            DeviceDistributionBuffer buffer,
+            int slot) const
+        {
+            if (slot < 0)
+                return invalid_distribution_;
+            if (buffer == DeviceDistributionBuffer::Target)
+            {
+                if (slot >= static_cast<int>(target_device_distributions_.size()))
+                    return invalid_distribution_;
+                return target_device_distributions_[static_cast<size_t>(slot)];
+            }
+            if (slot >= static_cast<int>(draft_device_distributions_.size()))
+                return invalid_distribution_;
+            return draft_device_distributions_[static_cast<size_t>(slot)];
+        }
+
+        static int sampleWithThreshold(
+            const std::vector<SamplingDistributionEntry> &distribution,
+            float threshold)
+        {
+            if (distribution.empty())
+                return -1;
+            float cumulative = 0.0f;
+            for (const auto &entry : distribution)
+            {
+                cumulative += entry.probability;
+                if (threshold < cumulative)
+                    return entry.token_id;
+            }
+            return distribution.back().token_id;
+        }
+
+        static int sampleResidualWithThreshold(
+            const std::vector<SamplingDistributionEntry> &target,
+            const std::vector<SamplingDistributionEntry> &draft,
+            float threshold)
+        {
+            if (target.empty())
+                return -1;
+
+            std::vector<SamplingDistributionEntry> residual;
+            residual.reserve(target.size());
+            float total = 0.0f;
+            for (const auto &entry : target)
+            {
+                const float q = Sampler::probability_of_token(draft, entry.token_id);
+                const float p = std::max(0.0f, entry.probability - q);
+                if (p > 0.0f)
+                {
+                    residual.push_back({entry.token_id, p});
+                    total += p;
+                }
+            }
+
+            if (!(total > 0.0f))
+                return sampleWithThreshold(target, threshold);
+            for (auto &entry : residual)
+                entry.probability /= total;
+            return sampleWithThreshold(residual, threshold);
+        }
+
         void setupPrefillLogits()
         {
             logits_.assign(VOCAB_SIZE, -10.0f);
@@ -781,6 +965,9 @@ namespace
         int apply_main_penalties_count_{0};
         int apply_mtp_penalties_count_{0};
         int apply_all_position_penalties_count_{0};
+        int device_distribution_build_count_{0};
+        int device_distribution_sample_count_{0};
+        int device_distribution_verify_count_{0};
         int last_sample_all_position_start_row_{-1};
         int last_sample_all_position_row_count_{0};
         int last_mtp_condition_token_{-1};
@@ -810,6 +997,9 @@ namespace
         std::vector<std::vector<int>> forward_history_;
         std::vector<int> last_commit_mtp_tokens_;
         std::vector<int> verifier_accepted_prefix_script_;
+        std::array<std::vector<SamplingDistributionEntry>, 4> target_device_distributions_;
+        std::array<std::vector<SamplingDistributionEntry>, 3> draft_device_distributions_;
+        std::vector<SamplingDistributionEntry> invalid_distribution_;
         size_t verifier_accepted_prefix_script_index_{0};
         int last_forward_seq_len_{0};
         int position_{0};
@@ -2204,7 +2394,41 @@ namespace
         EXPECT_EQ(probe.mtp_rollbacks, 0u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingUsesDeviceSamplerForGPUFirstToken)
+    TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingGPURequiresDeviceVerifier)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::rocm(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 2;
+        sampling.top_p = 0.95f;
+        sampling.seed = 123;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_FALSE(step1.success());
+        EXPECT_THAT(step1.error, HasSubstr("device-resident distribution verification"));
+        EXPECT_EQ(mock->sampleDeviceCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionBuildCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionVerifyCount(), 0);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingUsesDeviceResidentVerifierForGPU)
     {
         auto [runner, mock] = createRunner(
             /*mtp_enabled=*/true,
@@ -2235,8 +2459,18 @@ namespace
         EXPECT_THAT(step1.tokens,
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                 MockInferenceRunner::MTP_ARGMAX_TOKEN));
-        EXPECT_EQ(mock->sampleDeviceCount(), 1);
+        EXPECT_EQ(mock->sampleDeviceCount(), 0);
         EXPECT_EQ(mock->sampleMainLogitsCount(), 0);
+        EXPECT_EQ(mock->sampleMTPLogitsCount(), 0);
+        EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
+        EXPECT_EQ(mock->deviceDistributionBuildCount(), 4)
+            << "first token, MTP draft, verifier row, and terminal ready-token distributions should stay compact/device-resident";
+        EXPECT_EQ(mock->deviceDistributionSampleCount(), 3)
+            << "first token, MTP draft, and terminal ready-token sampling should avoid host full-logit sampling";
+        EXPECT_EQ(mock->deviceDistributionVerifyCount(), 1);
+        EXPECT_EQ(mock->applyMainPenaltiesCount(), 1);
+        EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
+        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
         EXPECT_EQ(mock->forwardMTPCount(), 1);
 
         const auto probe = runner->prefixStateProbe();

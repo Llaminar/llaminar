@@ -1838,6 +1838,25 @@ namespace llaminar2
             int row,
             const std::vector<LogitPenalty> &penalties,
             int vocab_size) override;
+        bool supportsDeviceStochasticMTPVerification() const override;
+        bool buildStochasticDistributionOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size) override;
+        int sampleStochasticDistributionOnDevice(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        bool verifyStochasticDistributionsOnDevice(
+            int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            DeviceSpeculativeVerifyResult *out) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)
@@ -2463,6 +2482,17 @@ namespace llaminar2
         void *argmax_partial_vals_dev_ = nullptr; ///< FP32 [1, argmax_partial_capacity_]
         void *argmax_partial_idxs_dev_ = nullptr; ///< INT32 [1, argmax_partial_capacity_]
         int argmax_partial_capacity_ = 0;         ///< Entries in the partial scratch (0 = unavailable)
+
+        void *stochastic_target_token_ids_dev_ = nullptr; ///< INT32 [4, 256]
+        void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [4, 256]
+        void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [3, 256]
+        void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [3, 256]
+        void *stochastic_verify_tokens_dev_ = nullptr;    ///< INT32 [1, 4]
+        void *stochastic_verify_accepted_dev_ = nullptr;  ///< INT32 [1, 4]
+        void *stochastic_verify_accept_probs_dev_ = nullptr; ///< FP32 [1, 4]
+        void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, 4]
+        std::array<int, 4> stochastic_target_top_k_ = {0, 0, 0, 0};
+        std::array<int, 3> stochastic_draft_top_k_ = {0, 0, 0};
 
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
