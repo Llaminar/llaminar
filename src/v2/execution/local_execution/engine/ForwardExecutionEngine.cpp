@@ -1816,9 +1816,9 @@ namespace llaminar2
             updatePrefillReplayParamStages(effective_input, prefill_replay_param_stages);
         }
 
-        // Ensure GPU workspace is allocated for this graph. Cache hits repeat
-        // this step because another bucket can grow the shared per-device
-        // workspace and leave this cached graph's stages bound to old pointers.
+        // Ensure declared CPU/GPU workspace is allocated for this graph. Cache
+        // hits repeat this step because another bucket can grow the shared
+        // per-device workspace and leave cached stages bound to old pointers.
         if (!host.ensureDeviceWorkspaceAllocated(graph, effective_input.seq_len))
         {
             LOG_ERROR("[ForwardExecutionEngine] Failed to allocate workspace for forward graph on "

@@ -340,6 +340,20 @@ namespace llaminar2
             ctx ? ctx->deviceId().toString() : std::string{},
             {{"phase", phase_name}});
 
+        auto mark_stage_outputs_dirty = [&](ComputeNode &node, void *stream)
+        {
+            if (!arena_)
+                return;
+            const StageBufferContract contract = node.stage->bufferContract();
+            if (contract.empty())
+                return;
+            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
+            for (const auto &binding : contract.allWrites())
+            {
+                arena_->markWritten(binding.id, target_device, stream);
+            }
+        };
+
         // ===== FAST PATH: Phase 3 (Replay) =====
         // During steady-state replay, only the post_launch hook is invoked
         // (cohere_inputs is skipped for capturable segments, execute_node is
@@ -361,12 +375,12 @@ namespace llaminar2
                 },
                 [&](DeviceGraphExecutor::GraphSegment &seg, void *stream)
                 {
-                    // postCapturedSegmentLaunch uses its internal cached dirty
-                    // marking (cached_dirty_tensor_bases), so the per-node
-                    // mark_stage_outputs_dirty_cb is never called. Pass a no-op.
                     DeviceGraphCaptureController::postCapturedSegmentLaunch(
                         graph, seg, current_step, stream,
-                        [](ComputeNode &, void *) {});
+                        [&](ComputeNode &node, void *node_stream)
+                        {
+                            mark_stage_outputs_dirty(node, node_stream);
+                        });
                 }};
 
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
@@ -394,20 +408,6 @@ namespace llaminar2
         }
 
         // ===== SLOW PATH: Phase 1 (Warmup) or Phase 2 (Capture) =====
-        auto mark_stage_outputs_dirty = [&](ComputeNode &node, void *stream)
-        {
-            if (!arena_)
-                return;
-            const StageBufferContract contract = node.stage->bufferContract();
-            if (contract.empty())
-                return;
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
-            for (const auto &binding : contract.allWrites())
-            {
-                arena_->markWritten(binding.id, target_device, stream);
-            }
-        };
-
         auto post_captured_segment_launch = [&](GraphSegment &seg, void *stream)
         {
             DeviceGraphCaptureController::postCapturedSegmentLaunch(

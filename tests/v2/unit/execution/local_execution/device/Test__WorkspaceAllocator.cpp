@@ -316,6 +316,50 @@ TEST(Test__WorkspaceAllocator, GraphConsumerUsesDeclaredStageShapeForWorkspaceM)
         << "Prepared kernels keep their own output width when no explicit N is required";
 }
 
+TEST(Test__WorkspaceAllocator, GraphConsumerAllocatesCPUWorkspaceForDeclaredStage)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    WorkspaceAllocator allocator;
+    ComputeGraph graph;
+    auto hints = tinyHints();
+    hints.max_seq_len = 64;
+
+    WorkspaceBudgetConfig config;
+    config.cpu_fraction = 0.1f;
+    config.min_budget = 1 * 1024 * 1024;
+    config.max_budget = 8 * 1024 * 1024;
+    config.headroom = 0;
+
+    auto stage = std::make_unique<DeclaredShapeWorkspaceStage>(
+        DeviceId::cpu(),
+        std::vector<size_t>{3, 8},
+        std::vector<size_t>{3, 16});
+    auto *raw_stage = stage.get();
+    graph.addNode("cpu_gdn_verifier_state_like", std::move(stage), DeviceId::cpu());
+
+    ASSERT_TRUE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {},
+        config));
+
+    auto *workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
+    ASSERT_NE(workspace, nullptr)
+        << "CPU IWorkspaceConsumer stages must receive declared workspace just like GPU stages";
+    EXPECT_EQ(raw_stage->boundWorkspace(), workspace);
+    EXPECT_TRUE(workspace->hasBuffer("declared_shape_scratch"));
+    EXPECT_GE(raw_stage->requirementsCalls(), 1);
+    EXPECT_EQ(raw_stage->bindCalls(), 1);
+    EXPECT_EQ(raw_stage->lastM(), 3)
+        << "CPU verifier replay workspace must honor graph-declared M";
+    EXPECT_EQ(raw_stage->lastK(), 8);
+    EXPECT_EQ(raw_stage->lastN(), 0);
+}
+
 TEST(Test__WorkspaceAllocator, ReusesExistingWorkspaceWhenAllRequestedBuffersFit)
 {
     auto device = selectAvailableGpuWithMemory();

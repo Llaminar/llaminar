@@ -140,7 +140,7 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Allocate workspace for all GPU consumers in a graph
+         * @brief Allocate workspace for all CPU/GPU consumers in a graph
          *
          * Scans graph stages for IWorkspaceConsumer implementations, derives
          * per-stage dimension hints, allocates per-device workspace, and binds

@@ -36,7 +36,6 @@
 #include "../../../interfaces/ICollectiveContext.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
-#include "../coherence/StageCoherence.h" // For CoherenceBuffer (cached in GraphSegment)
 #include "../../../memory/BufferArena.h" // Phase 2: contract-based coherence
 #include <memory>
 #include <vector>
@@ -357,18 +356,10 @@ namespace llaminar2
             std::vector<IComputeStage *> replay_callbacks; ///< Stages needing onGraphReplayed() (precomputed)
             uint64_t last_executed_step = 0;               ///< Last decode-step where this segment executed
 
-            // ── Pre-cached coherence buffers (populated once during capture) ──
-            // Eliminates per-decode-step getDumpInfo() + extractOutputBuffers()
-            // + dynamic_cast overhead (~1352 vector allocs + 676 virtual calls
-            // per step for Qwen2.5-7B with 338 capturable stages).
-            std::vector<CoherenceBuffer> cached_all_output_buffers; ///< Flattened outputs of all stages
-            bool replay_buffers_cached = false;                     ///< True after first post-launch caching
-
-            // ── Pre-cast dirty marking cache (eliminates per-step dynamic_cast) ──
-            // For 524 stages × ~1.5 outputs = ~786 dynamic_casts per decode step.
-            // Pre-casting to TensorBase* saves ~100-200μs/step on large models.
-            std::vector<TensorBase *> cached_dirty_tensor_bases; ///< Pre-cast TensorBase pointers
-            bool dirty_bases_cached = false;                     ///< True after first dirty marking pass
+            // Output coherence is marked through StageBufferContract/BufferArena
+            // after replay. Avoid retaining raw TensorBase* caches here: prefix
+            // restore, rollback, and request clears can legally mutate tensor
+            // ownership while preserving graph topology.
         };
 
         /**

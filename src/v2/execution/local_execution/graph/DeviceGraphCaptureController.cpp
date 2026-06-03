@@ -1802,68 +1802,18 @@ namespace llaminar2
         const std::function<void(ComputeNode &, void *)> &mark_stage_outputs_dirty_cb,
         bool skip_replay_callbacks)
     {
-        // OPTIMIZATION: Cache output buffers on first replay to avoid per-step
-        // getDumpInfo() + extractOutputBuffers() + dynamic_cast overhead.
-        // For Qwen2.5-7B (338 stages), this eliminates ~1352 vector allocations
-        // and ~676 virtual calls per decode step.
-        if (!segment.replay_buffers_cached)
+        // Use arena/contract dirty marking instead of retaining raw TensorBase*
+        // pointers inside the segment cache. Prefix restore, rollback, and
+        // request clears may preserve graph topology while replacing or rewinding
+        // tensor-backed state, so replay metadata must not own a hidden pointer
+        // cache outside the graph/stage contracts.
+        for (const auto &stage_name : segment.stage_names)
         {
-            segment.cached_all_output_buffers.clear();
-            for (const auto &stage_name : segment.stage_names)
+            auto *node = graph.getNode(stage_name);
+            if (node && node->stage)
             {
-                auto *node = graph.getNode(stage_name);
-                if (!node || !node->stage)
-                {
-                    continue;
-                }
-
-                const auto &dump_info = node->stage->getDumpInfo();
-                for (const auto &output : dump_info.outputs)
-                {
-                    CoherenceBuffer buf;
-                    buf.tensor = output.tensor;
-                    buf.name = output.name;
-                    buf.data = output.data;
-                    buf.rows = output.rows;
-                    buf.cols = output.cols;
-                    buf.dtype = output.dtype;
-                    buf.is_inout = false;
-                    segment.cached_all_output_buffers.push_back(buf);
-                }
+                mark_stage_outputs_dirty_cb(*node, stream);
             }
-            segment.replay_buffers_cached = true;
-
-            LOG_DEBUG("[DeviceGraphCaptureController] Cached " << segment.cached_all_output_buffers.size()
-                                                               << " output buffers for " << segment.stage_names.size() << " stages");
-        }
-
-        // Use flags-only dirty marking — no hipEventRecord per output tensor.
-        // The final gpu_ctx->synchronize() in executeReplayPhase ensures all
-        // GPU work completes before the caller reads the output.
-        //
-        // OPTIMIZATION: On first call, cache pre-cast TensorBase* pointers to
-        // eliminate ~786 dynamic_casts per decode step (524 stages × ~1.5 outputs).
-        if (!segment.dirty_bases_cached)
-        {
-            segment.cached_dirty_tensor_bases.clear();
-            segment.cached_dirty_tensor_bases.reserve(segment.cached_all_output_buffers.size());
-            for (const auto &buf : segment.cached_all_output_buffers)
-            {
-                if (!buf.tensor)
-                    continue;
-                auto *tensor_base = dynamic_cast<TensorBase *>(buf.tensor);
-                if (tensor_base)
-                    segment.cached_dirty_tensor_bases.push_back(tensor_base);
-            }
-            segment.dirty_bases_cached = true;
-            LOG_DEBUG("[DeviceGraphCaptureController] Cached " << segment.cached_dirty_tensor_bases.size()
-                                                               << " pre-cast TensorBase* for dirty marking");
-        }
-
-        // Fast path: transition all cached bases without dynamic_cast
-        for (auto *tb : segment.cached_dirty_tensor_bases)
-        {
-            tb->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         }
 
         // Skip replay callbacks during the capture phase: execute() already ran

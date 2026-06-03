@@ -234,9 +234,16 @@ namespace llaminar2
             }
 
             DeviceId device = node->device;
-            if (!device.is_gpu() && node->stage->device().is_gpu())
+            if ((!device.is_valid() || (!device.is_gpu() && !device.is_cpu())) &&
+                node->stage->device().is_valid())
+            {
                 device = node->stage->device();
-            if (!device.is_gpu())
+            }
+            if (!device.is_gpu() && node->stage->device().is_gpu())
+            {
+                device = node->stage->device();
+            }
+            if (!device.is_gpu() && !device.is_cpu())
             {
                 continue;
             }
@@ -285,7 +292,8 @@ namespace llaminar2
 
         for (const auto &request : extra_consumers)
         {
-            if (!request.consumer || !request.device.is_gpu())
+            if (!request.consumer ||
+                (!request.device.is_gpu() && !request.device.is_cpu()))
             {
                 continue;
             }
@@ -300,7 +308,7 @@ namespace llaminar2
 
         if (consumers_by_device.empty())
         {
-            LOG_DEBUG("[WorkspaceAllocator] No GPU workspace consumers found in graph");
+            LOG_DEBUG("[WorkspaceAllocator] No CPU/GPU workspace consumers found in graph");
             return true;
         }
 
@@ -394,7 +402,9 @@ namespace llaminar2
                     combined.merge(reqs);
                 }
 
-                size_t budget = std::max(old_budget, model_floor_budget);
+                size_t budget = device.is_gpu()
+                                    ? std::max(old_budget, model_floor_budget)
+                                    : old_budget;
                 const size_t needed = combined.total_bytes_with_alignment();
                 if (needed > budget)
                 {
@@ -442,7 +452,10 @@ namespace llaminar2
             }
 
             size_t budget = computeWorkspaceBudget(device, config);
-            budget = std::max(budget, model_floor_budget);
+            if (device.is_gpu())
+            {
+                budget = std::max(budget, model_floor_budget);
+            }
 
             WorkspaceRequirements combined;
             for (const auto &consumer_binding : consumers)

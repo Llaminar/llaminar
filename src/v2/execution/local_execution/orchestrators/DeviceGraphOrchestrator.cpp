@@ -1918,7 +1918,7 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)
     {
-        // Ensure GPU workspace is allocated for GEMM kernels
+        // Ensure declared CPU/GPU workspace is allocated for kernels and stages.
         if (!ensureDeviceWorkspaceAllocated(graph))
             return false;
         return executor_.execute(graph, ctx);
