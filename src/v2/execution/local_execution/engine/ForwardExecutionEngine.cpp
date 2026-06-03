@@ -1355,6 +1355,17 @@ namespace llaminar2
             }
             else
             {
+                if (used_segmented_capture &&
+                    forward_cache.segment_cache.capture_stream &&
+                    forward_cache.gpu_ctx)
+                {
+                    // Warmup/capture phases run stage kernels on the capture
+                    // stream, but the ordinary boundary sync only covers the
+                    // device context/default stream. Synchronize the capture
+                    // stream before callers sample logits from verifier graphs.
+                    forward_cache.gpu_ctx->synchronizeStream(
+                        forward_cache.segment_cache.capture_stream);
+                }
                 host.syncLogitsAtBoundary(ctx);
             }
 
@@ -1582,7 +1593,7 @@ namespace llaminar2
             // real synchronizable events).
             bool exec_success;
             {
-                GraphCaptureGuard capture_guard;
+                GraphCaptureGuard capture_guard(/*host_bookkeeping=*/true);
                 exec_success = executor_.executeFastDecode(
                     *forward_cache.graph, ctx, &forward_cache.collective_nodes);
             }
@@ -1608,8 +1619,15 @@ namespace llaminar2
                 return false;
             }
 
+            // KV append stages advanced host metadata while recording so later
+            // captured stages could read the just-appended cache view. The
+            // immediate launch-after-capture must not advance those entries
+            // again; normal Ready-phase replay still runs every callback.
             for (auto *stage : forward_cache.replay_callback_stages)
-                stage->onGraphReplayed();
+            {
+                if (stage && stage->type() != ComputeStageType::KV_CACHE_APPEND)
+                    stage->onGraphReplayed();
+            }
 
             LOG_INFO("[ForwardExecutionEngine] Prefill graph CAPTURED seq_len=" << input.seq_len
                                                                                 << " nodes=" << cache.nodeCount(key));

@@ -5131,6 +5131,14 @@ if(ZLIB_FOUND)
         MPI_PROCS 1
         TIMEOUT 1800
     )
+    add_v2_test(V2_Integration_Parity_Qwen36_SingleDevice_MTPGreedyDepth3GraphStreamStress
+        COMMAND $<TARGET_FILE:v2_integration_parity_qwen36_single_device_prefix_mtp>
+                --gtest_filter=Qwen36SingleDevicePrefixMTPParity.MTPGreedyDepth3MatchesPyTorchDecodeTokens
+                --gtest_repeat=3
+        LABELS "V2;Integration;Parity;Qwen36;PrefixCache;MTP;RealModel;ROCm;GPU;SingleDevice;PyTorch;GraphCapture;Regression"
+        MPI_PROCS 1
+        TIMEOUT 1800
+    )
 
     add_executable(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_CPU_SingleDevice_PrefixMTP_Parity.cpp
@@ -6101,6 +6109,12 @@ add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke
 add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsBaselineThenMTPRegression
     COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmMTPGpuGraphsBaselineThenMTPRegression
     LABELS "V2;Integration;PrefixCache;MTP;RealModel;Qwen36;ROCm;GPU;Regression"
+    MPI_PROCS 1
+    TIMEOUT 900
+)
+add_v2_test(V2_Integration_PrefixCacheMTP_Qwen36ROCmPaddedPrefillBucketRegression
+    COMMAND $<TARGET_FILE:v2_integration_prefix_cache_state_probe> --gtest_filter=Test__KVPrefixMTPStateProbe.Qwen36ROCmPaddedPrefillBucketGraphCaptureRegression
+    LABELS "V2;Integration;PrefixCache;RealModel;Qwen36;ROCm;GPU;GraphCapture;Regression"
     MPI_PROCS 1
     TIMEOUT 900
 )

@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/local_execution/orchestrators/MTPSidecarStreamBinding.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"
@@ -811,4 +812,70 @@ TEST_F(Test__GraphExecutorStreamBinding, TimelineEventsUsePreBoundStageStream)
     EXPECT_EQ(worker->recordedEventStreams()[0], capture_stream);
     EXPECT_EQ(worker->recordedEventStreams()[1], capture_stream);
     EXPECT_NE(worker->recordedEventStreams()[0], rocm_default_stream_);
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarStagesBindToCaptureStream)
+{
+    const void *stale_stream = reinterpret_cast<void *>(0xBAD50000);
+    void *capture_stream = reinterpret_cast<void *>(0x1DECAFFE);
+
+    struct StageSpec
+    {
+        ComputeStageType type;
+        const char *name;
+    };
+
+    const std::vector<StageSpec> sidecar_stage_specs = {
+        {ComputeStageType::EMBEDDING, "mtp_embedding"},
+        {ComputeStageType::RMS_NORM, "mtp_input_norm"},
+        {ComputeStageType::MTP_CONCAT, "mtp_concat"},
+        {ComputeStageType::GEMM, "mtp_projection"},
+        {ComputeStageType::GDN_PROJECTION, "mtp_gdn_projection"},
+        {ComputeStageType::SHORT_CONV1D, "mtp_short_conv"},
+        {ComputeStageType::GDN_RECURRENCE, "mtp_gdn_recurrence"},
+        {ComputeStageType::ATTENTION, "mtp_attention"},
+        {ComputeStageType::KV_CACHE_APPEND, "mtp_kv_append"},
+        {ComputeStageType::GATED_RMS_NORM, "mtp_gated_norm"},
+        {ComputeStageType::LM_HEAD, "mtp_lm_head"},
+    };
+
+    ComputeGraph graph;
+    std::vector<llaminar2::testing::MockComputeStage *> stages;
+    std::string previous_node;
+    for (const StageSpec &spec : sidecar_stage_specs)
+    {
+        auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+            spec.type,
+            spec.name,
+            DeviceId::rocm(0));
+        auto *stage_raw = stage.get();
+        stage_raw->setGPUStream(const_cast<void *>(stale_stream));
+        stages.push_back(stage_raw);
+
+        graph.addNode(spec.name, std::move(stage), DeviceId::rocm(0));
+        if (!previous_node.empty())
+            graph.addDependency(spec.name, previous_node);
+        previous_node = spec.name;
+    }
+
+    std::string error;
+    ASSERT_TRUE(mtp_sidecar::bindStagesToCaptureStream(graph, capture_stream, &error)) << error;
+
+    std::string mismatch;
+    EXPECT_TRUE(mtp_sidecar::allStagesBoundToStream(graph, capture_stream, &mismatch)) << mismatch;
+    for (const auto *stage : stages)
+    {
+        ASSERT_NE(stage, nullptr);
+        EXPECT_EQ(stage->gpuStream(), capture_stream) << stage->name();
+    }
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarDeferredSamplingUsesCaptureStream)
+{
+    void *capture_stream = reinterpret_cast<void *>(0x0DADA123);
+
+    EXPECT_EQ(mtp_sidecar::deferredSamplingStream(true, true, capture_stream), capture_stream);
+    EXPECT_EQ(mtp_sidecar::deferredSamplingStream(true, true, nullptr), nullptr);
+    EXPECT_EQ(mtp_sidecar::deferredSamplingStream(true, false, capture_stream), nullptr);
+    EXPECT_EQ(mtp_sidecar::deferredSamplingStream(false, true, capture_stream), nullptr);
 }

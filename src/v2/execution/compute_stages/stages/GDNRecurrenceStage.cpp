@@ -931,15 +931,15 @@ namespace llaminar2
 
     bool GDNRecurrenceStage::isGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-        return params_.seq_len == 1 && params_.device_id.is_gpu();
-#else
         // Decode: always capturable (single kernel launch, stable pointers)
         if (params_.seq_len == 1)
             return params_.device_id.is_gpu();
 
         // Prefill: capturable only on compiled GPU backends when GPU state is pre-allocated.
         // chunk_forward() will skip its lazy allocateState() if state is ready.
+        // Snapshot capture is rejected by PrefillGraphCache when a snapshot callback is active;
+        // do not use the Integration-build macro here or focused graph tests cannot exercise
+        // the release capture path.
         if (!params_.device_id.is_gpu() || !params_.kernel)
             return false;
 
@@ -962,7 +962,6 @@ namespace llaminar2
 
         const int required_state_size = params_.n_heads * params_.d_k * params_.d_v;
         return params_.kernel->isGPUStateReady(required_state_size);
-#endif
     }
 
     StageDumpInfo GDNRecurrenceStage::buildDumpInfoImpl() const

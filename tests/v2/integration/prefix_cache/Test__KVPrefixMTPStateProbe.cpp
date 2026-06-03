@@ -1813,6 +1813,138 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsBaselineThenMTPRegressio
     EXPECT_GE(mtp_snapshot.mtp_accepted_tokens + mtp_snapshot.mtp_rejected_tokens, 2u);
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPaddedPrefillBucketGraphCaptureRegression)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "600"},
+        {"LLAMINAR_PREFILL_GRAPH_TRACE", "1"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_padded_prefill_bucket_stats.json"},
+        {"LLAMINAR_PERF_STATS_FILTER", "forward_graph"},
+    });
+    PerfStatsCollector::reset();
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 padded prefill bucket regression";
+    }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = 1024;
+    config.batch_size = 1;
+    config.tp_degree = 1;
+    config.pp_degree = 1;
+    config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
+    config.kv_cache_precision = "auto";
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    auto tokenizer = runner->tokenizer();
+    ASSERT_NE(tokenizer, nullptr);
+    const auto encoded = tokenizer->encode(" the", /*add_bos=*/false, /*add_eos=*/false);
+    ASSERT_FALSE(encoded.empty());
+    const std::vector<int32_t> prompt(595, static_cast<int32_t>(encoded.front()));
+
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+    EXPECT_EQ(runner->currentPosition(), 595);
+    runner->clearCache();
+
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+    EXPECT_EQ(runner->currentPosition(), 595);
+    runner->clearCache();
+
+    ASSERT_TRUE(runner->prefill(prompt)) << runner->lastError();
+    EXPECT_EQ(runner->currentPosition(), 595);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    runner->shutdown();
+
+    auto lifecycle_count = [&](const std::string &capture_phase,
+                               const std::string &cache_phase,
+                               const std::string &recapture_reason) -> double
+    {
+        double total = 0.0;
+        for (const auto &record : records)
+        {
+            if (record.kind != PerfStatRecord::Kind::Counter ||
+                record.domain != "forward_graph" ||
+                record.name != "prefill_graph_lifecycle" ||
+                record.phase != "prefill")
+            {
+                continue;
+            }
+
+            auto tag = [&](const std::string &key) -> std::string
+            {
+                const auto it = record.tags.find(key);
+                return it == record.tags.end() ? std::string() : it->second;
+            };
+
+            if (tag("bucket_seq_len") == "600" &&
+                tag("real_token_count") == "595" &&
+                tag("capture_phase") == capture_phase &&
+                tag("cache_phase") == cache_phase &&
+                tag("recapture_reason") == recapture_reason)
+            {
+                total += record.value;
+            }
+        }
+        return total;
+    };
+
+    auto forward_lookup_count = [&](const std::string &result) -> double
+    {
+        double total = 0.0;
+        for (const auto &record : records)
+        {
+            if (record.kind != PerfStatRecord::Kind::Counter ||
+                record.domain != "forward_graph" ||
+                record.name != "forward_cache_lookup" ||
+                record.phase != "prefill")
+            {
+                continue;
+            }
+            const auto seq_it = record.tags.find("seq_len");
+            const auto result_it = record.tags.find("result");
+            if (seq_it != record.tags.end() && seq_it->second == "600" &&
+                result_it != record.tags.end() && result_it->second == result)
+            {
+                total += record.value;
+            }
+        }
+        return total;
+    };
+
+    EXPECT_GE(forward_lookup_count("miss"), 1.0);
+    EXPECT_GE(forward_lookup_count("hit"), 1.0);
+    EXPECT_GE(lifecycle_count("warmup", "warmup", "none"), 1.0);
+    EXPECT_GE(lifecycle_count("capture", "ready", "armed_warmup"), 1.0);
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
 {
     ScopedDebugEnv env({

@@ -4,6 +4,7 @@
  */
 
 #include "app/modes/BenchmarkMode.h"
+#include "app/modes/BenchmarkPrefillBucketPolicy.h"
 #include "app/AppContext.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "execution/runner/OrchestrationRunner.h"
@@ -71,9 +72,19 @@ namespace llaminar2
             return false;
         }
 
+        bool benchmarkHasDynamicMoERebalance(IOrchestrationRunner *runner)
+        {
+            auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner);
+            if (orch_runner == nullptr)
+                return false;
+            auto *controller = orch_runner->moeRebalanceController();
+            return controller != nullptr && controller->mode() == MoERebalanceMode::DYNAMIC;
+        }
+
         /// @brief Opt benchmark mode into production bucketed prefill defaults.
         void configureBenchmarkPrefillBuckets(const std::shared_ptr<IMPIContext> &mpi_ctx,
-                                              const OrchestrationConfig &config)
+                                              const OrchestrationConfig &config,
+                                              IOrchestrationRunner *runner)
         {
             const auto &env = debugEnv();
             const bool user_selected_bucket_mode = env.presence.has("LLAMINAR_PREFILL_GRAPH_BUCKETS");
@@ -93,20 +104,17 @@ namespace llaminar2
             // makes warmup prefill fail hard, so leave bucketing disabled and run the
             // exact prefill length (the fixed benchmark prompt is still graph-captured
             // at its exact shape, so no replay benefit is lost).
-            const bool moe_rebalancing_active =
-                config.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
+            const bool moe_rebalancing_active = benchmarkHasDynamicMoERebalance(runner);
+            const BenchmarkPrefillBucketDisableReason disable_reason =
+                benchmarkPrefillBucketDisableReason(uses_collectives, moe_rebalancing_active);
 
             if (!user_selected_bucket_mode)
             {
-                if (uses_collectives || moe_rebalancing_active)
+                if (disable_reason != BenchmarkPrefillBucketDisableReason::None)
                 {
                     if (mpi_ctx && mpi_ctx->rank() == 0)
                     {
-                        const char *reason = uses_collectives
-                                                 ? "Multi-device (TP/PP) run detected; padded buckets "
-                                                   "are incompatible with collective stages"
-                                                 : "MoE dynamic rebalancing active; padded buckets are "
-                                                   "rejected by prefill graph preflight";
+                        const char *reason = benchmarkPrefillBucketDisableMessage(disable_reason);
                         LOG_INFO("[Benchmark] " << reason
                                                 << " — leaving prefill graph bucketing disabled "
                                                    "(running exact prefill length)");
@@ -190,7 +198,7 @@ namespace llaminar2
             LOG_DEBUG("Running benchmark mode...");
         }
 
-        configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config);
+        configureBenchmarkPrefillBuckets(mpi_ctx, ctx.config, runner.get());
 
         auto adapter = std::make_shared<InferenceRunnerAdapter>(runner.get());
 

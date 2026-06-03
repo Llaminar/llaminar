@@ -9,6 +9,7 @@
  */
 
 #include "DeviceGraphOrchestrator.h"
+#include "MTPSidecarStreamBinding.h"
 #include "../../config/HybridPrecisionConfig.h"
 #include "../../config/InferenceMode.h"
 #include "../../../loaders/WeightManager.h"
@@ -3805,13 +3806,14 @@ namespace llaminar2
             if (sidecar_cache.segment_cache.ensureCaptureStream(sidecar_gpu_ctx))
             {
                 void *capture_stream = sidecar_cache.segment_cache.capture_stream;
-                for (const auto &node_name : sidecar_cache.graph->getExecutionOrder())
+                std::string stream_binding_error;
+                if (!mtp_sidecar::bindStagesToCaptureStream(*sidecar_cache.graph,
+                                                             capture_stream,
+                                                             &stream_binding_error))
                 {
-                    ComputeNode *node = sidecar_cache.graph->getNode(node_name);
-                    if (node && node->stage)
-                    {
-                        node->stage->setGPUStream(capture_stream);
-                    }
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind MTP sidecar stages to capture stream: "
+                              << stream_binding_error);
+                    return false;
                 }
             }
             else
@@ -3939,9 +3941,17 @@ namespace llaminar2
                     has_sidecar_collectives ? &sidecar_cache.collective_nodes : nullptr,
                     capture_policy,
                     &used_segmented_capture);
-                if (ok && used_segmented_capture && capture_policy.defer_final_sync)
+                if (void *sample_stream = mtp_sidecar::deferredSamplingStream(
+                        ok,
+                        capture_policy.defer_final_sync,
+                        sidecar_cache.segment_cache.capture_stream))
                 {
-                    pending_mtp_logits_stream_ = sidecar_cache.segment_cache.capture_stream;
+                    // Stages are rebound to the sidecar capture stream before
+                    // executeDecodeWithCapturePolicy(). Even if the capture
+                    // controller falls back to fast decode, those kernels may
+                    // still run on that stream, so the fused sampler must use
+                    // the same stream to order against sidecar logits/state.
+                    pending_mtp_logits_stream_ = sample_stream;
                     PerfStatsCollector::addCounter(
                         "mtp",
                         "sidecar_forward_sample_sync_fusions",

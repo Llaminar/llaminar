@@ -190,8 +190,9 @@ namespace llaminar2
 
         // Determine the graph-shaped token count first, then narrow to the real
         // prefix for non-captured padded execution. Captured prefill records the
-        // fixed bucket kernel shape and relies on onGraphReplayed() to advance
-        // host metadata by the real prefix after the graph launch.
+        // fixed bucket kernel shape and advances host metadata by the real
+        // prefix while recording so later captured attention stages can see the
+        // just-appended cache view.
         int total_tokens = params_.num_tokens;
         if (total_tokens <= 0)
         {
@@ -299,7 +300,16 @@ namespace llaminar2
                 // execution. Prefill capture and collective Phase-2 capture keep
                 // this guard disabled and continue to use replay callbacks or
                 // real post-capture execution instead.
-                params_.kv_cache->advanceHead(params_.layer_idx, seq_idx, num_tokens);
+                const int advance_tokens = replay_advance_tokens_ > 0
+                                               ? replay_advance_tokens_
+                                               : num_tokens;
+                if (advance_tokens > num_tokens)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Capture bookkeeping token count exceeds append token count: real="
+                              << advance_tokens << " append=" << num_tokens);
+                    return false;
+                }
+                params_.kv_cache->advanceHead(params_.layer_idx, seq_idx, advance_tokens);
             }
 
             if (success)

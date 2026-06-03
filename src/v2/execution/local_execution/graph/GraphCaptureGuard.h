@@ -40,8 +40,9 @@ namespace llaminar2
      * Segmented decode capture skips replay callbacks on the immediate
      * launch-after-capture, so stateful stages still need to update host
      * metadata while recording for later stages in the same captured segment.
-     * Prefill capture and collective Phase-2 capture leave this disabled and
-     * rely on replay callbacks or real post-capture execution instead.
+     * Prefill capture enables this for stateful stages whose later captured
+     * stages need same-pass logical metadata, while still skipping duplicate
+     * replay callbacks after the immediate launch-after-capture.
      */
     inline thread_local bool tls_graph_capture_host_bookkeeping = false;
 

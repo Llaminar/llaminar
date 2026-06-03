@@ -15,6 +15,7 @@
 #include "app/commands/ServeCommand.h"
 #include "app/commands/PlanCommand.h"
 #include "app/commands/BenchmarkCommand.h"
+#include "app/modes/BenchmarkPrefillBucketPolicy.h"
 #include <cstring>
 #include <cstdio>
 #include <fstream>
@@ -76,6 +77,30 @@ TEST(Test__Commands, AllCommandsHaveDescriptions)
     EXPECT_GT(std::strlen(plan.description()), 0u);
     EXPECT_GT(std::strlen(describe.description()), 0u);
     EXPECT_GT(std::strlen(benchmark.description()), 0u);
+}
+
+TEST(Test__Commands, BenchmarkPrefillBucketsStayEnabledForDenseDefaultMoEConfig)
+{
+    const auto reason = benchmarkPrefillBucketDisableReason(
+        /*uses_collectives=*/false,
+        /*dynamic_moe_rebalance_active=*/false);
+    EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::None);
+}
+
+TEST(Test__Commands, BenchmarkPrefillBucketsStillDisableForActualMoERebalance)
+{
+    const auto reason = benchmarkPrefillBucketDisableReason(
+        /*uses_collectives=*/false,
+        /*dynamic_moe_rebalance_active=*/true);
+    EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::DynamicMoERebalance);
+}
+
+TEST(Test__Commands, BenchmarkPrefillBucketsStillDisableForCollectives)
+{
+    const auto reason = benchmarkPrefillBucketDisableReason(
+        /*uses_collectives=*/true,
+        /*dynamic_moe_rebalance_active=*/false);
+    EXPECT_EQ(reason, BenchmarkPrefillBucketDisableReason::Collectives);
 }
 
 // ============================================================================
