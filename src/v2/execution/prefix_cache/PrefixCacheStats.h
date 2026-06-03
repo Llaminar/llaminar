@@ -44,6 +44,10 @@ namespace llaminar2
         uint64_t bypasses = 0;
         uint64_t verifier_runs = 0;
         uint64_t verifier_token_count = 0;
+        uint64_t stochastic_accept_tests = 0;
+        uint64_t stochastic_accepts = 0;
+        uint64_t stochastic_residual_samples = 0;
+        uint64_t stochastic_terminal_samples = 0;
         uint64_t depth_policy_windows = 0;
         uint64_t depth_policy_updates = 0;
         uint64_t depth_policy_promotions = 0;
@@ -86,6 +90,8 @@ namespace llaminar2
         bool enabled = false;
         bool bypassed = false;
         std::string bypass_reason;
+        std::string verify_mode = "greedy";
+        bool stochastic_verify = false;
         bool adaptive_depth_enabled = false;
         std::string depth_policy_mode = "fixed";
         int current_depth = 0;
@@ -98,6 +104,11 @@ namespace llaminar2
         uint64_t rejected_tokens = 0;
         uint64_t rollbacks = 0;
         double acceptance_rate = 0.0;
+        uint64_t stochastic_accept_tests = 0;
+        uint64_t stochastic_accepts = 0;
+        uint64_t stochastic_residual_samples = 0;
+        uint64_t stochastic_terminal_samples = 0;
+        double stochastic_acceptance_rate = 0.0;
     };
 
 } // namespace llaminar2

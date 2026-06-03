@@ -114,7 +114,10 @@ namespace llaminar2
                    snapshot.mtp_request.draft_steps != 0 ||
                    snapshot.mtp_request.accepted_tokens != 0 ||
                    snapshot.mtp_request.rejected_tokens != 0 ||
-                   snapshot.mtp_request.rollbacks != 0;
+                   snapshot.mtp_request.rollbacks != 0 ||
+                   snapshot.mtp_request.stochastic_accept_tests != 0 ||
+                   snapshot.mtp_request.stochastic_residual_samples != 0 ||
+                   snapshot.mtp_request.stochastic_terminal_samples != 0;
         }
 
         void logRuntimeStateSummary(IOrchestrationRunner &runner, const char *mode)
@@ -198,12 +201,25 @@ namespace llaminar2
                     << (acceptance_rate * 100.0) << "%"
                     << " verifier_runs=" << snapshot.mtp_verifier_runs
                     << " verifier_tokens=" << snapshot.mtp_verifier_token_count
+                    << " verify_mode=" << request.verify_mode
                     << " depth_policy=" << request.depth_policy_mode
                     << " depth=" << current_depth
                     << " [" << min_depth << "," << max_depth << "]"
                     << " depth_updates=" << depth_updates;
                 if (!request.last_depth_policy_reason.empty())
                     mtp << " last_depth_reason=" << request.last_depth_policy_reason;
+                if (request.stochastic_accept_tests != 0 ||
+                    request.stochastic_residual_samples != 0 ||
+                    request.stochastic_terminal_samples != 0)
+                {
+                    mtp << " stochastic_accept_tests=" << request.stochastic_accept_tests
+                        << " stochastic_acceptance=" << std::fixed << std::setprecision(2)
+                        << (request.stochastic_acceptance_rate * 100.0) << "%"
+                        << " stochastic_residual_samples="
+                        << request.stochastic_residual_samples
+                        << " stochastic_terminal_samples="
+                        << request.stochastic_terminal_samples;
+                }
                 if (bypassed)
                 {
                     mtp << " bypassed=true";

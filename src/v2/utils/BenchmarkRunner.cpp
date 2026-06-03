@@ -148,6 +148,8 @@ namespace llaminar2
             {"enabled", request.enabled},
             {"bypassed", request.bypassed},
             {"bypass_reason", request.bypass_reason},
+            {"verify_mode", request.verify_mode},
+            {"stochastic_verify", request.stochastic_verify},
             {"adaptive_depth_enabled", request.adaptive_depth_enabled},
             {"depth_policy_mode", request.depth_policy_mode},
             {"current_depth", request.current_depth},
@@ -160,6 +162,11 @@ namespace llaminar2
             {"rejected_tokens", request.rejected_tokens},
             {"rollbacks", request.rollbacks},
             {"acceptance_rate", request.acceptance_rate},
+            {"stochastic_accept_tests", request.stochastic_accept_tests},
+            {"stochastic_accepts", request.stochastic_accepts},
+            {"stochastic_residual_samples", request.stochastic_residual_samples},
+            {"stochastic_terminal_samples", request.stochastic_terminal_samples},
+            {"stochastic_acceptance_rate", request.stochastic_acceptance_rate},
         };
     }
 
@@ -246,6 +253,10 @@ namespace llaminar2
                       {"bypasses", state.mtp_bypasses},
                       {"verifier_runs", state.mtp_verifier_runs},
                       {"verifier_token_count", state.mtp_verifier_token_count},
+                      {"stochastic_accept_tests", state.mtp_stochastic_accept_tests},
+                      {"stochastic_accepts", state.mtp_stochastic_accepts},
+                      {"stochastic_residual_samples", state.mtp_stochastic_residual_samples},
+                      {"stochastic_terminal_samples", state.mtp_stochastic_terminal_samples},
                       {"depth_policy_windows", state.mtp_depth_policy_windows},
                       {"depth_policy_updates", state.mtp_depth_policy_updates},
                       {"depth_policy_promotions", state.mtp_depth_policy_promotions},

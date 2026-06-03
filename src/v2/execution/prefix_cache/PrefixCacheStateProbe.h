@@ -95,6 +95,10 @@ namespace llaminar2
         uint64_t mtp_bypasses = 0;
         uint64_t mtp_verifier_runs = 0;
         uint64_t mtp_verifier_token_count = 0;
+        uint64_t mtp_stochastic_accept_tests = 0;
+        uint64_t mtp_stochastic_accepts = 0;
+        uint64_t mtp_stochastic_residual_samples = 0;
+        uint64_t mtp_stochastic_terminal_samples = 0;
         uint64_t mtp_depth_policy_windows = 0;
         uint64_t mtp_depth_policy_updates = 0;
         uint64_t mtp_depth_policy_promotions = 0;

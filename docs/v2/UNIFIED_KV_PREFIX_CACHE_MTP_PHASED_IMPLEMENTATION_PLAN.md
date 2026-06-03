@@ -1981,11 +1981,12 @@ Current implementation status, 2026-06-03:
 - `GPUSamplingTest.SpeculativeVerifyDistributionsAreGraphCapturable` proves both CUDA and ROCm can capture distribution build plus accept and residual-reject verification, and that the new APIs reject null/default streams.
 - Runner integration now requires compact device-resident stochastic verifier hooks on SingleDevice GPU paths. The first token, each MTP draft token, verifier accept/residual decisions, and the all-accepted terminal ready token use compact device distribution buffers rather than host full-logit snapshots.
 - `V2_Unit_PrefillDecodeTransition` covers the GPU hard-fail when those hooks are missing and the supported device-resident verifier path when they are present, including active presence-penalty sampling parameters. `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsStochasticSmoke` and `V2_Integration_PrefixCacheMTP_Qwen36CUDAGpuGraphsStochasticSmoke` pass with active presence penalty, proving the real Qwen3.6 stochastic MTP smokes still enter draft/verify and asserting device stochastic counters are present while host full-logit stochastic counters stay at zero.
+- `PrefixRuntimeStateSnapshot`, `MTPRequestSummary`, benchmark JSON, and serve summaries now expose verify mode plus stochastic accept-test, accepted-test, residual-sample, terminal-sample, and stochastic acceptance-rate fields for Phase 14 evidence.
 
 Observability:
 
-- Add counters for stochastic draft samples, verifier accept tests, residual samples, all-accepted terminal samples, random thresholds, and stochastic rollbacks.
-- Add request summary fields for verify mode, stochastic acceptance rate, residual-sample count, and exactness bypass/failure reasons.
+- Stochastic draft samples, verifier accept tests, residual samples, all-accepted terminal samples, and random-threshold details are emitted through profiling counters.
+- Request summaries expose verify mode, stochastic acceptance rate, residual-sample count, and exactness bypass/failure reasons.
 
 ### Files
 

@@ -1747,6 +1747,7 @@ namespace llaminar2
                         return fail_after_checkpoint("Device stochastic MTP verifier failed");
                     }
 
+                    ++mtp_stats_.stochastic_accept_tests;
                     PerfStatsCollector::addCounter(
                         "mtp",
                         "stochastic_accept_tests",
@@ -1765,6 +1766,7 @@ namespace llaminar2
                         verifier_tokens.push_back(draft_token);
                         sampled_verifier_tokens[static_cast<size_t>(row)] = draft_token;
                         ++accepted_speculative_prefix;
+                        ++mtp_stats_.stochastic_accepts;
                         PerfStatsCollector::addCounter("mtp", "stochastic_accepts", 1.0, "decode");
                         continue;
                     }
@@ -1786,6 +1788,7 @@ namespace llaminar2
                     sampled_verifier_tokens[static_cast<size_t>(row)] = rejected_verified_token;
                     verifier_tokens.push_back(rejected_verified_token);
                     accepted_tokens.push_back(rejected_verified_token);
+                    ++mtp_stats_.stochastic_residual_samples;
                     PerfStatsCollector::addCounter(
                         "mtp",
                         "stochastic_residual_device_samples",
@@ -1820,6 +1823,7 @@ namespace llaminar2
                 const float accept_probability =
                     Sampler::speculative_accept_probability(p, q);
                 const float threshold = sampler_.random_uniform_01();
+                ++mtp_stats_.stochastic_accept_tests;
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "stochastic_accept_tests",
@@ -1839,6 +1843,7 @@ namespace llaminar2
                     verifier_tokens.push_back(draft_token);
                     sampled_verifier_tokens[static_cast<size_t>(row)] = draft_token;
                     ++accepted_speculative_prefix;
+                    ++mtp_stats_.stochastic_accepts;
                     PerfStatsCollector::addCounter("mtp", "stochastic_accepts", 1.0, "decode");
                     continue;
                 }
@@ -1851,6 +1856,7 @@ namespace llaminar2
                 sampled_verifier_tokens[static_cast<size_t>(row)] = rejected_verified_token;
                 verifier_tokens.push_back(rejected_verified_token);
                 accepted_tokens.push_back(rejected_verified_token);
+                ++mtp_stats_.stochastic_residual_samples;
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "stochastic_residual_samples",
@@ -1904,6 +1910,7 @@ namespace llaminar2
                 {
                     return fail_after_checkpoint("Device stochastic MTP terminal sampling failed");
                 }
+                ++mtp_stats_.stochastic_terminal_samples;
                 PerfStatsCollector::addCounter("mtp", "stochastic_terminal_device_samples", 1.0, "decode");
             }
             else
@@ -1916,6 +1923,7 @@ namespace llaminar2
                 sampled_verifier_tokens[static_cast<size_t>(terminal_row)] =
                     sampler_.sample_from_distribution(
                         target_distributions[static_cast<size_t>(terminal_row)]);
+                ++mtp_stats_.stochastic_terminal_samples;
                 PerfStatsCollector::addCounter("mtp", "stochastic_terminal_samples", 1.0, "decode");
             }
         }
@@ -2536,6 +2544,10 @@ namespace llaminar2
                      << (mtp_bypass_reason_.empty() ? "none" : mtp_bypass_reason_)
                      << " verifier_runs=" << mtp_stats_.verifier_runs
                      << " verifier_tokens=" << mtp_stats_.verifier_token_count
+                     << " verify_mode=" << mtpVerifyModeToString(mtp.verify_mode)
+                     << " stochastic_accept_tests=" << mtp_stats_.stochastic_accept_tests
+                     << " stochastic_residual_samples=" << mtp_stats_.stochastic_residual_samples
+                     << " stochastic_terminal_samples=" << mtp_stats_.stochastic_terminal_samples
                      << " depth_policy=" << mtpDepthPolicyModeToString(mtp.depth_policy.mode)
                      << " current_depth="
                      << (mtp_depth_controller_ ? mtp_depth_controller_->currentDepth() : mtp.draft_tokens)
@@ -2650,6 +2662,10 @@ namespace llaminar2
         snapshot.mtp_bypasses = mtp_stats_.bypasses;
         snapshot.mtp_verifier_runs = mtp_stats_.verifier_runs;
         snapshot.mtp_verifier_token_count = mtp_stats_.verifier_token_count;
+        snapshot.mtp_stochastic_accept_tests = mtp_stats_.stochastic_accept_tests;
+        snapshot.mtp_stochastic_accepts = mtp_stats_.stochastic_accepts;
+        snapshot.mtp_stochastic_residual_samples = mtp_stats_.stochastic_residual_samples;
+        snapshot.mtp_stochastic_terminal_samples = mtp_stats_.stochastic_terminal_samples;
         snapshot.mtp_depth_policy_windows = mtp_stats_.depth_policy_windows;
         snapshot.mtp_depth_policy_updates = mtp_stats_.depth_policy_updates;
         snapshot.mtp_depth_policy_promotions = mtp_stats_.depth_policy_promotions;
@@ -2675,6 +2691,9 @@ namespace llaminar2
         snapshot.mtp_request.enabled = mtp.enabled;
         snapshot.mtp_request.bypassed = mtp_bypassed_;
         snapshot.mtp_request.bypass_reason = mtp_bypass_reason_;
+        snapshot.mtp_request.verify_mode = mtpVerifyModeToString(mtp.verify_mode);
+        snapshot.mtp_request.stochastic_verify =
+            mtp.verify_mode == MTPVerifyMode::SpeculativeSampling;
         snapshot.mtp_request.adaptive_depth_enabled =
             mtp.depth_policy.mode != MTPDepthPolicyMode::Fixed;
         snapshot.mtp_request.depth_policy_mode =
@@ -2696,6 +2715,17 @@ namespace llaminar2
         snapshot.mtp_request.acceptance_rate =
             mtp_total_tokens > 0
                 ? static_cast<double>(mtp_stats_.accepted_tokens) / static_cast<double>(mtp_total_tokens)
+                : 0.0;
+        snapshot.mtp_request.stochastic_accept_tests = mtp_stats_.stochastic_accept_tests;
+        snapshot.mtp_request.stochastic_accepts = mtp_stats_.stochastic_accepts;
+        snapshot.mtp_request.stochastic_residual_samples =
+            mtp_stats_.stochastic_residual_samples;
+        snapshot.mtp_request.stochastic_terminal_samples =
+            mtp_stats_.stochastic_terminal_samples;
+        snapshot.mtp_request.stochastic_acceptance_rate =
+            mtp_stats_.stochastic_accept_tests > 0
+                ? static_cast<double>(mtp_stats_.stochastic_accepts) /
+                      static_cast<double>(mtp_stats_.stochastic_accept_tests)
                 : 0.0;
         if (snapshot.architecture.empty() && model_ctx_)
         {

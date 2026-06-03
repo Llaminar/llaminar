@@ -2394,6 +2394,17 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
         EXPECT_EQ(probe.mtp_rollbacks, 0u);
+        EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_accepts, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_residual_samples, 0u);
+        EXPECT_EQ(probe.mtp_stochastic_terminal_samples, 1u);
+        EXPECT_EQ(probe.mtp_request.verify_mode, "speculative-sampling");
+        EXPECT_TRUE(probe.mtp_request.stochastic_verify);
+        EXPECT_EQ(probe.mtp_request.stochastic_accept_tests, 1u);
+        EXPECT_EQ(probe.mtp_request.stochastic_accepts, 1u);
+        EXPECT_EQ(probe.mtp_request.stochastic_residual_samples, 0u);
+        EXPECT_EQ(probe.mtp_request.stochastic_terminal_samples, 1u);
+        EXPECT_DOUBLE_EQ(probe.mtp_request.stochastic_acceptance_rate, 1.0);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingGPURequiresDeviceVerifier)
@@ -2481,6 +2492,12 @@ namespace
         EXPECT_FALSE(probe.mtp_bypassed);
         EXPECT_EQ(probe.mtp_draft_steps, 1u);
         EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_accepts, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_residual_samples, 0u);
+        EXPECT_EQ(probe.mtp_stochastic_terminal_samples, 1u);
+        EXPECT_EQ(probe.mtp_request.verify_mode, "speculative-sampling");
+        EXPECT_TRUE(probe.mtp_request.stochastic_verify);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingRejectsWithResidualCorrection)
@@ -2527,6 +2544,17 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
         EXPECT_EQ(probe.mtp_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_accept_tests, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_accepts, 0u);
+        EXPECT_EQ(probe.mtp_stochastic_residual_samples, 1u);
+        EXPECT_EQ(probe.mtp_stochastic_terminal_samples, 0u);
+        EXPECT_EQ(probe.mtp_request.verify_mode, "speculative-sampling");
+        EXPECT_TRUE(probe.mtp_request.stochastic_verify);
+        EXPECT_EQ(probe.mtp_request.stochastic_accept_tests, 1u);
+        EXPECT_EQ(probe.mtp_request.stochastic_accepts, 0u);
+        EXPECT_EQ(probe.mtp_request.stochastic_residual_samples, 1u);
+        EXPECT_EQ(probe.mtp_request.stochastic_terminal_samples, 0u);
+        EXPECT_DOUBLE_EQ(probe.mtp_request.stochastic_acceptance_rate, 0.0);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPPPTopologyFailsBeforePrefillForward)
