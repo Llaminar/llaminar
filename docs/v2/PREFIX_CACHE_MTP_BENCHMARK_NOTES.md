@@ -93,6 +93,34 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- Fresh current-revision ROCm depth-3 recheck on 2026-06-03 after the sidecar
+  MoE epoch-key narrowing: Qwen3.6 dense 27B Q4_K_S on `rocm:0`, GPU graphs
+  enabled, `The quick brown fox`, `-c 64`, `-n 48`. Baseline artifact
+  `/tmp/llaminar-mtp-bench/dense-rocm-epochkey-baseline-c64-n48-bench.json`
+  reached 30.71 decode tok/s. Depth-3 MTP artifact
+  `/tmp/llaminar-mtp-bench/dense-rocm-epochkey-mtp-d3-c64-n48-bench.json`
+  reached 54.21 decode tok/s and 54.38 overall tok/s, preserving the 1.77x
+  ROCm SingleDevice dense ratchet. Structured stats
+  `/tmp/llaminar-mtp-bench/dense-rocm-epochkey-mtp-d3-c64-n48-stats.json`
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-epochkey-mtp-d3-c64-n48-stats.csv`
+  recorded 81.02% acceptance, 111 accepted tokens, 26 rejected tokens,
+  27 rollbacks, 55 verifier runs, and 220 verifier tokens. `mtp.verifier_forward`
+  averaged about 46.96 ms in the measured window; captured `main_verifier`
+  replay averaged about 44.54 ms, and `sidecar_depth0_total` averaged about
+  1.36 ms across sidecar/catchup calls. Short diagnostic artifacts
+  `/tmp/llaminar-mtp-bench/dense-rocm-epochkey-stagegpu-mtp-d3-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-epochkey-stagegpu-mtp-d3-c64-n8-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-epochkey-stagegpu-mtp-d3-c64-n8-stats.csv`
+  refreshed the GPU buckets: `main_verifier` averaged about 50.81 ms under
+  stage timing, led by ordinary GEMM, fused Gate/Up, GDN projection, recurrence,
+  fused residual/norm, attention, and LM head. Focused parity stayed green:
+  `MTPGreedyMatchesPyTorchDecodeTokens`,
+  `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`.
+  The next speed lever is no longer rollback replay or dense sidecar rebuilds;
+  it is reducing verifier graph GPU work and, as a larger graph-native project,
+  avoiding three separate host-synchronized sidecar draft steps for depth-3.
 - Fresh dense-sidecar MoE epoch narrowing on 2026-06-03: MTP depth-0 sidecar
   graph caches now key on MoE placement epoch only when the sidecar graph
   actually contains MoE expert weights. Dense sidecars use epoch key `0`, so
