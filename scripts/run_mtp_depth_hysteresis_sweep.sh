@@ -15,7 +15,7 @@ Options:
   --binary PATH      llaminar2 binary (default: build_v2_release/llaminar2).
   --device SPEC      Device spec (default: rocm:0).
   --output-dir DIR   Output directory (default: benchmark_results/mtp_depth_hysteresis/<timestamp>-<git>).
-  --cases SET        smoke, short, long, all, or comma list (default: smoke).
+  --cases SET        smoke, short, long, code, all, or comma list (default: smoke).
   --variants SET     acceptance, grid, all, or comma list (default: acceptance).
   --dry-run          Print commands without executing.
   -h, --help         Show this help.
@@ -24,7 +24,8 @@ Case sets:
   smoke: qbf_short,default
   short: qbf_short,tech_short
   long:  qbf_long,code_long,default
-  all:   qbf_short,tech_short,qbf_long,code_long,default
+  code:  code_long,python_dataclass,python_cli,cpp_controller,cpp_tests
+  all:   qbf_short,tech_short,qbf_long,code_long,python_dataclass,python_cli,cpp_controller,cpp_tests,default
 
 Variants:
   acceptance: baseline,fixed_d1,fixed_d3,dynamic
@@ -148,7 +149,8 @@ expand_selection() {
       smoke) echo "qbf_short default" ;;
       short) echo "qbf_short tech_short" ;;
       long) echo "qbf_long code_long default" ;;
-      all) echo "qbf_short tech_short qbf_long code_long default" ;;
+      code) echo "code_long python_dataclass python_cli cpp_controller cpp_tests" ;;
+      all) echo "qbf_short tech_short qbf_long code_long python_dataclass python_cli cpp_controller cpp_tests default" ;;
       *) echo "${selection}" | tr ',' ' ' ;;
     esac
   else
@@ -177,6 +179,18 @@ describe_case() {
       ;;
     code_long)
       case_args=(-p "Write a compact C++ function that updates a rolling acceptance-rate window, applies hysteresis before changing speculative draft depth, and explains each branch with a short comment." -c 256 -n 128)
+      ;;
+    python_dataclass)
+      case_args=(-p "Write a Python module with dataclasses for a speculative decoding depth controller. Include configuration defaults, a rolling window class, update methods, serialization to JSON, and a small doctest-style example." -c 384 -n 192)
+      ;;
+    python_cli)
+      case_args=(-p "Write a Python command-line tool using argparse that reads benchmark JSON files, groups rows by prompt and MTP depth policy, computes acceptance-rate summaries, prints a table, and writes a CSV report. Include helper functions and basic error handling." -c 384 -n 192)
+      ;;
+    cpp_controller)
+      case_args=(-p "Write C++17 code for a SpeculativeDepthController class with a config struct, observation struct, stats struct, hysteresis thresholds, cooldown handling, and a recordStep method. Include header-style declarations and source-style method definitions." -c 384 -n 192)
+      ;;
+    cpp_tests)
+      case_args=(-p "Write GoogleTest unit tests for a C++ speculative depth controller. Cover fixed mode, early demotion, promotion hysteresis, cooldown, observe mode, and budget-limited observations. Use clear fixture helpers and repetitive ASSERT/EXPECT checks." -c 384 -n 192)
       ;;
     default)
       case_args=()
