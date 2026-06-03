@@ -1,6 +1,7 @@
 ---
 name: rocm-tuning
 description: Profile and tune Llaminar V2 ROCm/HIP INT8 VNNI GEMM and GEMV kernels on AMD Instinct GPUs (gfx906 MI50/MI60) using rocprof per-dispatch timing and LLVM ISA analysis (llvm-objcopy/readelf/objdump), benchmarked against AMD Composable Kernel (CK). Use when asked to find a slow HIP kernel, diagnose occupancy / VGPR pressure / register spills / waitcnt stalls, A/B kernel variants (V1-V7), close a GEMM gap vs CK, or distinguish a real GPU-kernel gap from PCIe/wallclock noise while keeping parity.
+applyTo: "src/v2/kernels/rocm/**,src/v2/backends/rocm/**,src/v2/execution/**,tests/v2/performance/kernels/rocm/**,tests/v2/integration/kernels/rocm/**"
 ---
 
 # ROCm / HIP Kernel Profiling & Tuning (Llaminar V2, gfx906)

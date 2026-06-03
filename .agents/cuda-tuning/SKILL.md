@@ -1,6 +1,7 @@
 ---
 name: cuda-kernel-profiling
 description: Profile and tune Llaminar V2 CUDA kernels using LLAMINAR_PROFILING (per-kernel + per-stage timing), Nsight Systems (nsys), and Nsight Compute (ncu), then validate with the GEMM perf-test harness, the benchmark subcommand, and parity tests. Use when asked to find the slowest CUDA kernel, diagnose occupancy / register pressure / memory-bound stalls, A/B two kernel variants, or close a prefill/decode throughput gap while keeping PyTorch parity.
+applyTo: "src/v2/kernels/cuda/**,src/v2/backends/cuda/**,src/v2/execution/**,tests/v2/performance/kernels/cuda/**,tests/v2/integration/kernels/cuda/**"
 ---
 
 # CUDA Kernel Profiling & Tuning (Llaminar V2)

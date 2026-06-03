@@ -9,6 +9,20 @@ This document provides practical guidelines for working with the **Llaminar V2**
 - For additional V2-specific implementation details, see:
     - `.github/instructions/llaminar-v2-architecture.instructions.md`
 
+## Project Agent Skills
+
+Project-local skills live under `.agents/` and are the canonical source for
+specialized agent workflows. Framework-specific discovery paths are symlinks
+back to these files so the skill content stays in one place.
+
+- `.agents/cuda-tuning/SKILL.md`: use for CUDA kernel profiling, Nsight
+  diagnostics, CUDA GEMM perf harness work, and CUDA parity-preserving tuning.
+- `.agents/rocm-tuning/SKILL.md`: use for ROCm/HIP kernel profiling, rocprof
+  diagnostics, LLVM ISA analysis, ROCm GEMM/GEMV tuning, and ROCm parity gates.
+
+Do not copy these skill bodies into framework-specific folders. Add or update
+symlinks instead so Codex, Claude, and GitHub Copilot all read the same content.
+
 ## Table of Contents
 - [Architecture Overview](#architecture-overview)
 - [Build System](#build-system)
