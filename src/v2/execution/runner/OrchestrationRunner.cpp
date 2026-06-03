@@ -635,12 +635,18 @@ namespace llaminar2
 
         if (active_mtp.enabled && runner_)
         {
-            if (active_mtp.draft_tokens < 1 || active_mtp.draft_tokens > 3)
+            mtp_depth_controller_.reset();
+            if (!ensureMTPDepthController(active_mtp))
+            {
+                return false;
+            }
+            const int effective_max_draft_tokens = effectiveMTPMaxDraftDepth(active_mtp);
+            if (effective_max_draft_tokens < 1 || effective_max_draft_tokens > 3)
             {
                 return setError(
                     "MTP decode supports --mtp-draft-tokens in the range [1, 3] for verifier M=2..4");
             }
-            if (active_mtp.draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
+            if (effective_max_draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
             {
                 return setError(
                     "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars");
@@ -716,6 +722,17 @@ namespace llaminar2
                 PrefixLookupResult common_hit = make_common_hit();
                 prefix_request_summary_.bypassed = !coordinated_hit.supported;
                 prefix_request_summary_.bypass_reason = coordinated_hit.bypass_reason;
+                if (active_mtp.enabled &&
+                    effectiveMTPMaxDraftDepth(active_mtp) > 1 &&
+                    matched_tokens == static_cast<int>(prompt_tokens.size()) &&
+                    common_hit.has_terminal_logits &&
+                    (!mtp_full_hit_requires_terminal_hidden || common_hit.has_terminal_hidden))
+                {
+                    return setError(
+                        "Prefix cache terminal restore with chained MTP drafts is not supported; "
+                        "use --mtp-draft-tokens 1 or disable prefix cache until chained MTP prefix "
+                        "state parity is implemented");
+                }
                 if (active_mtp.enabled &&
                     matched_tokens > 0 &&
                     matched_tokens < static_cast<int>(prompt_tokens.size()) &&
@@ -854,13 +871,22 @@ namespace llaminar2
         if (!mtp.enabled || !runner_)
             return {};
 
-        if (mtp.draft_tokens < 1 || mtp.draft_tokens > 3)
+        const int effective_max_draft_tokens = effectiveMTPMaxDraftDepth(mtp);
+        if (effective_max_draft_tokens < 1 || effective_max_draft_tokens > 3)
         {
             return "MTP decode supports --mtp-draft-tokens in the range [1, 3] for verifier M=2..4";
         }
-        if (mtp.draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
+        if (effective_max_draft_tokens > 1 && !runner_->supportsChainedMTPDrafts())
         {
             return "MTP decode with --mtp-draft-tokens > 1 requires runner support for chained MTP sidecars";
+        }
+        if (mtp.depth_policy.mode == MTPDepthPolicyMode::Dynamic &&
+            (plan_.usesLocalTP() ||
+             plan_.usesLocalPP() ||
+             plan_.usesGlobalTP() ||
+             (mpi_ctx_ && mpi_ctx_->world_size() > 1)))
+        {
+            return "MTP dynamic depth policy is currently implemented only for SingleDevice execution";
         }
         if (runner_->primaryDeviceId().is_rocm() && debugEnv().rocm.concurrent_decode)
         {
@@ -940,6 +966,120 @@ namespace llaminar2
             ++mtp_stats_.bypasses;
             mtp_bypass_recorded_for_request_ = true;
             LOG_DEBUG("[OrchestrationRunner] MTP bypassed: " << reason);
+        }
+    }
+
+    int OrchestrationRunner::effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const
+    {
+        if (mtp.depth_policy.mode == MTPDepthPolicyMode::Fixed)
+        {
+            return mtp.draft_tokens;
+        }
+        return mtp.depth_policy.max_depth > 0 ? mtp.depth_policy.max_depth : mtp.draft_tokens;
+    }
+
+    bool OrchestrationRunner::ensureMTPDepthController(const MTPRuntimeConfig &mtp)
+    {
+        try
+        {
+            if (!mtp_depth_controller_)
+            {
+                mtp_depth_controller_ =
+                    std::make_unique<MTPDepthController>(mtp.depth_policy, mtp.draft_tokens);
+            }
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            return setError(std::string("Invalid MTP depth policy: ") + e.what());
+        }
+    }
+
+    int OrchestrationRunner::currentMTPDraftDepth(const MTPRuntimeConfig &mtp)
+    {
+        if (!ensureMTPDepthController(mtp) || !mtp_depth_controller_)
+        {
+            return std::max(1, mtp.draft_tokens);
+        }
+        return std::max(1, mtp_depth_controller_->currentDepth());
+    }
+
+    void OrchestrationRunner::recordMTPDepthObservation(
+        int requested_depth,
+        int effective_depth,
+        int accepted_speculative_prefix,
+        bool budget_limited,
+        bool rollback)
+    {
+        if (!mtp_depth_controller_)
+        {
+            return;
+        }
+        const auto before = mtp_depth_controller_->stats();
+        const MTPDepthDecision decision = mtp_depth_controller_->recordStep(
+            MTPDepthObservation{
+                .requested_depth = requested_depth,
+                .effective_depth = effective_depth,
+                .accepted_speculative_prefix = accepted_speculative_prefix,
+                .budget_limited = budget_limited,
+                .rollback = rollback,
+            });
+        const auto after = mtp_depth_controller_->stats();
+
+        mtp_stats_.depth_policy_windows += after.windows - before.windows;
+        mtp_stats_.depth_policy_updates += after.updates - before.updates;
+        mtp_stats_.depth_policy_promotions += after.promotions - before.promotions;
+        mtp_stats_.depth_policy_demotions += after.demotions - before.demotions;
+        mtp_stats_.depth_policy_observe_recommendations +=
+            after.observe_recommendations - before.observe_recommendations;
+        mtp_stats_.current_depth = mtp_depth_controller_->currentDepth();
+        mtp_stats_.min_depth = mtp_depth_controller_->minDepth();
+        mtp_stats_.max_depth = mtp_depth_controller_->maxDepth();
+
+        if (decision.evaluated)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "depth_policy_windows",
+                1.0,
+                "decode",
+                {},
+                {{"old_depth", std::to_string(decision.old_depth)},
+                 {"new_depth", std::to_string(decision.new_depth)},
+                 {"recommended_depth", std::to_string(decision.recommended_depth)},
+                 {"reason", toString(decision.reason)},
+                 {"changed", decision.changed ? "true" : "false"},
+                 {"observe_recommendation", decision.observe_recommendation ? "true" : "false"},
+                 {"acceptance_rate", std::to_string(decision.acceptance_rate)},
+                 {"zero_accept_rate", std::to_string(decision.zero_accept_rate)},
+                 {"full_accept_rate", std::to_string(decision.full_accept_rate)},
+                 {"window_size", std::to_string(decision.window.verifier_runs)}});
+        }
+        if (decision.changed)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                decision.new_depth > decision.old_depth
+                    ? "depth_policy_promotions"
+                    : "depth_policy_demotions",
+                1.0,
+                "decode",
+                {},
+                {{"old_depth", std::to_string(decision.old_depth)},
+                 {"new_depth", std::to_string(decision.new_depth)},
+                 {"reason", toString(decision.reason)}});
+        }
+        else if (decision.observe_recommendation)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "depth_policy_observe_recommendations",
+                1.0,
+                "decode",
+                {},
+                {{"current_depth", std::to_string(decision.old_depth)},
+                 {"recommended_depth", std::to_string(decision.recommended_depth)},
+                 {"reason", toString(decision.reason)}});
         }
     }
 
@@ -1053,15 +1193,18 @@ namespace llaminar2
         }
 
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
-        const int configured_speculative_draft_count = std::max(1, mtp.draft_tokens);
-        int speculative_draft_count = configured_speculative_draft_count;
+        const int requested_speculative_draft_count = currentMTPDraftDepth(mtp);
+        int speculative_draft_count = requested_speculative_draft_count;
+        bool draft_count_budget_limited = false;
         if (decode_step_token_budget_ > 0)
         {
             const int budgeted_speculative_outputs =
                 std::max(0, decode_step_token_budget_ - 1);
             speculative_draft_count =
                 std::min(speculative_draft_count, budgeted_speculative_outputs);
-            if (speculative_draft_count != configured_speculative_draft_count)
+            draft_count_budget_limited =
+                speculative_draft_count != requested_speculative_draft_count;
+            if (draft_count_budget_limited)
             {
                 PerfStatsCollector::addCounter(
                     "mtp",
@@ -1069,13 +1212,13 @@ namespace llaminar2
                     1.0,
                     "decode",
                     {},
-                    {{"configured", std::to_string(configured_speculative_draft_count)},
+                    {{"configured", std::to_string(requested_speculative_draft_count)},
                      {"effective", std::to_string(speculative_draft_count)},
                      {"token_budget", std::to_string(decode_step_token_budget_)}});
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "draft_steps_budget_skipped",
-                    static_cast<double>(configured_speculative_draft_count - speculative_draft_count),
+                    static_cast<double>(requested_speculative_draft_count - speculative_draft_count),
                     "decode");
             }
         }
@@ -1177,6 +1320,10 @@ namespace llaminar2
                         ? "MTP sidecar forward failed"
                         : "Chained MTP sidecar forward failed");
             }
+            if (!runner_->flushPendingMTPWork())
+            {
+                return fail_after_checkpoint("MTP sidecar stream flush failed");
+            }
 
             if (draft_idx == 0)
             {
@@ -1212,6 +1359,11 @@ namespace llaminar2
 
             ++mtp_stats_.draft_steps;
             PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
+        }
+
+        if (!runner_->flushPendingMTPWork())
+        {
+            return fail_after_checkpoint("MTP sidecar stream flush failed before verification");
         }
 
         bool all_position_enabled = false;
@@ -1340,6 +1492,13 @@ namespace llaminar2
                 already_appended_for_output + accepted_speculative_prefix + 1);
         const bool verifier_state_matches_output =
             all_speculative_accepted && accepted_tokens.size() == draft_tokens.size();
+
+        recordMTPDepthObservation(
+            requested_speculative_draft_count,
+            speculative_draft_count,
+            accepted_speculative_prefix,
+            draft_count_budget_limited,
+            !verifier_state_matches_output);
 
         auto join_tokens = [](const std::vector<int32_t> &tokens) -> std::string
         {
@@ -1910,7 +2069,11 @@ namespace llaminar2
                      << " last_bypass_reason="
                      << (mtp_bypass_reason_.empty() ? "none" : mtp_bypass_reason_)
                      << " verifier_runs=" << mtp_stats_.verifier_runs
-                     << " verifier_tokens=" << mtp_stats_.verifier_token_count);
+                     << " verifier_tokens=" << mtp_stats_.verifier_token_count
+                     << " depth_policy=" << mtpDepthPolicyModeToString(mtp.depth_policy.mode)
+                     << " current_depth="
+                     << (mtp_depth_controller_ ? mtp_depth_controller_->currentDepth() : mtp.draft_tokens)
+                     << " depth_updates=" << mtp_stats_.depth_policy_updates);
         }
 
         return result;
@@ -2001,6 +2164,7 @@ namespace llaminar2
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();
+        mtp_depth_controller_.reset();
     }
 
     PrefixRuntimeStateSnapshot OrchestrationRunner::prefixStateProbe() const
@@ -2021,6 +2185,21 @@ namespace llaminar2
         snapshot.mtp_bypasses = mtp_stats_.bypasses;
         snapshot.mtp_verifier_runs = mtp_stats_.verifier_runs;
         snapshot.mtp_verifier_token_count = mtp_stats_.verifier_token_count;
+        snapshot.mtp_depth_policy_windows = mtp_stats_.depth_policy_windows;
+        snapshot.mtp_depth_policy_updates = mtp_stats_.depth_policy_updates;
+        snapshot.mtp_depth_policy_promotions = mtp_stats_.depth_policy_promotions;
+        snapshot.mtp_depth_policy_demotions = mtp_stats_.depth_policy_demotions;
+        snapshot.mtp_depth_policy_observe_recommendations =
+            mtp_stats_.depth_policy_observe_recommendations;
+        snapshot.mtp_current_depth =
+            mtp_depth_controller_ ? mtp_depth_controller_->currentDepth()
+                                  : std::max(0, mtp.draft_tokens);
+        snapshot.mtp_min_depth =
+            mtp_depth_controller_ ? mtp_depth_controller_->minDepth()
+                                  : std::max(0, mtp.draft_tokens);
+        snapshot.mtp_max_depth =
+            mtp_depth_controller_ ? mtp_depth_controller_->maxDepth()
+                                  : std::max(0, mtp.draft_tokens);
         snapshot.prefill_chunk_schedules = prefill_chunk_stats_.schedules;
         snapshot.prefill_chunk_successful_schedules = prefill_chunk_stats_.successful_schedules;
         snapshot.prefill_chunks = prefill_chunk_stats_.chunks;
@@ -2031,6 +2210,19 @@ namespace llaminar2
         snapshot.mtp_request.enabled = mtp.enabled;
         snapshot.mtp_request.bypassed = mtp_bypassed_;
         snapshot.mtp_request.bypass_reason = mtp_bypass_reason_;
+        snapshot.mtp_request.adaptive_depth_enabled =
+            mtp.depth_policy.mode != MTPDepthPolicyMode::Fixed;
+        snapshot.mtp_request.depth_policy_mode =
+            mtpDepthPolicyModeToString(mtp.depth_policy.mode);
+        snapshot.mtp_request.current_depth = snapshot.mtp_current_depth;
+        snapshot.mtp_request.min_depth = snapshot.mtp_min_depth;
+        snapshot.mtp_request.max_depth = snapshot.mtp_max_depth;
+        snapshot.mtp_request.depth_policy_updates = mtp_stats_.depth_policy_updates;
+        if (mtp_depth_controller_)
+        {
+            snapshot.mtp_request.last_depth_policy_reason =
+                toString(mtp_depth_controller_->lastDecision().reason);
+        }
         snapshot.mtp_request.draft_steps = mtp_stats_.draft_steps;
         snapshot.mtp_request.accepted_tokens = mtp_stats_.accepted_tokens;
         snapshot.mtp_request.rejected_tokens = mtp_stats_.rejected_tokens;

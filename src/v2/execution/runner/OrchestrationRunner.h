@@ -26,6 +26,7 @@
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../mpi_orchestration/DeviceInventory.h"
 #include "../prefix_cache/PrefixCacheStats.h"
+#include "../mtp/MTPDepthController.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../../planning/MemoryPlanner.h"
 #include "../../collective/ILocalTPContext.h"
@@ -439,6 +440,15 @@ namespace llaminar2
         std::string mtpDecodeHardFailureReason() const;
         std::string mtpDecodeBypassReason() const;
         void recordMTPBypass(const std::string &reason);
+        bool ensureMTPDepthController(const MTPRuntimeConfig &mtp);
+        int effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const;
+        int currentMTPDraftDepth(const MTPRuntimeConfig &mtp);
+        void recordMTPDepthObservation(
+            int requested_depth,
+            int effective_depth,
+            int accepted_speculative_prefix,
+            bool budget_limited,
+            bool rollback);
         GenerationResult decodeStepMTP();
         bool forwardPrefillTokens(
             const int *tokens,
@@ -494,6 +504,7 @@ namespace llaminar2
         bool mpi_coordinated_mode_{false};                              // When true, rank 0 broadcasts commands for worker loop
         std::shared_ptr<ITokenizer> tokenizer_;
         MTPStats mtp_stats_;
+        std::unique_ptr<MTPDepthController> mtp_depth_controller_;
         PrefillChunkStats prefill_chunk_stats_;
         PrefixCacheRequestSummary prefix_request_summary_;
         bool mtp_bypassed_{false};

@@ -116,11 +116,11 @@ namespace llaminar2
             return false;
         }
 
-        void ensureStageGPUStreamBound(ComputeNode &node, IDeviceContext *ctx)
+        bool ensureStageGPUStreamBound(ComputeNode &node, IDeviceContext *ctx)
         {
             if (!node.stage || node.stage->gpuStream() != nullptr)
             {
-                return;
+                return true;
             }
 
             DeviceId device = node.device.is_valid() ? node.device : node.stage->device();
@@ -129,11 +129,22 @@ namespace llaminar2
                 device = ctx->deviceId();
             }
 
+            if (!device.is_gpu())
+            {
+                return true;
+            }
+
             void *stream = resolveWorkerDefaultStream(device);
             if (stream)
             {
                 node.stage->setGPUStream(stream);
+                return true;
             }
+
+            LOG_ERROR("[DeviceGraphExecutor] GPU stage '" << node.name
+                                                         << "' has no explicit stream for device "
+                                                         << device.to_string());
+            return false;
         }
 
         bool contractReadsNeedTransfer(
@@ -570,7 +581,11 @@ namespace llaminar2
             if (cancellationRequested(node->name))
                 return false;
 
-            ensureStageGPUStreamBound(*node, ctx);
+            if (!ensureStageGPUStreamBound(*node, ctx))
+            {
+                notifyStageFailure(node->name, "GPU stage has no explicit stream");
+                return false;
+            }
             void *stage_timeline_stream = nullptr;
             if (timeline_active && timeline_gpu_ctx)
             {
@@ -717,7 +732,8 @@ namespace llaminar2
 
             if (!policy.coherence && !force_contract_coherence)
             {
-                ensureStageGPUStreamBound(node, ctx);
+                if (!ensureStageGPUStreamBound(node, ctx))
+                    return false;
 
                 const bool profiling_fast = policy.profiling && config_.enable_profiling;
                 std::chrono::high_resolution_clock::time_point t0{};
@@ -849,7 +865,8 @@ namespace llaminar2
 
         // Bind GPU stream early so coherence operations (H2D/D2H) run on
         // the same stream as the stage's compute kernels.
-        ensureStageGPUStreamBound(node, ctx);
+        if (!ensureStageGPUStreamBound(node, ctx))
+            return false;
         void *stage_stream = node.stage ? node.stage->gpuStream() : nullptr;
 
         if (policy.coherence || force_contract_coherence)

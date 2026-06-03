@@ -91,6 +91,12 @@ namespace llaminar2
                 IBackend *backend = getBackendFor(*info.device);
                 if (!backend)
                     return -1;
+                if (!info.stream)
+                {
+                    LOG_ERROR("[DeviceSampler::sampleGreedyFromLocalInfos] explicit GPU stream required for device "
+                              << info.device->toString());
+                    return -1;
+                }
 
                 const auto &shape = info.tensor->shape();
                 const size_t rows = shape.size() >= 2 ? shape[0] : 1;

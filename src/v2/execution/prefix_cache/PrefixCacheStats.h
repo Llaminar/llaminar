@@ -44,6 +44,14 @@ namespace llaminar2
         uint64_t bypasses = 0;
         uint64_t verifier_runs = 0;
         uint64_t verifier_token_count = 0;
+        uint64_t depth_policy_windows = 0;
+        uint64_t depth_policy_updates = 0;
+        uint64_t depth_policy_promotions = 0;
+        uint64_t depth_policy_demotions = 0;
+        uint64_t depth_policy_observe_recommendations = 0;
+        int current_depth = 0;
+        int min_depth = 0;
+        int max_depth = 0;
     };
 
     struct PrefillChunkStats
@@ -78,6 +86,13 @@ namespace llaminar2
         bool enabled = false;
         bool bypassed = false;
         std::string bypass_reason;
+        bool adaptive_depth_enabled = false;
+        std::string depth_policy_mode = "fixed";
+        int current_depth = 0;
+        int min_depth = 0;
+        int max_depth = 0;
+        uint64_t depth_policy_updates = 0;
+        std::string last_depth_policy_reason;
         uint64_t draft_steps = 0;
         uint64_t accepted_tokens = 0;
         uint64_t rejected_tokens = 0;

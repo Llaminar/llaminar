@@ -1490,6 +1490,7 @@ namespace llaminar2
             int32_t draft_condition_token,
             int position_id,
             int32_t *out_token) override;
+        bool flushPendingMTPWork() override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -2252,6 +2253,7 @@ namespace llaminar2
 
         bool ensurePrefixCacheReady();
         bool isPrefixCacheMoEModel() const;
+        void *explicitGPUStreamForOperation(const char *operation) const;
         void handleLivePrefixReplayStateAfterMutation(const char *operation);
         PrefixCacheFingerprintResult buildCurrentPrefixFingerprint(
             const PrefixCacheRuntimeConfig &prefix_config) const;

@@ -339,6 +339,61 @@ namespace llaminar2
             {
                 config.mtp.require_terminal_hidden_for_full_hit = parseBoolValue(value);
             }
+            else if (key == "depth_policy")
+            {
+                auto parsed = parseMTPDepthPolicyMode(value);
+                if (!parsed)
+                    throw std::invalid_argument("Invalid mtp depth_policy: '" + value + "'");
+                config.mtp.depth_policy.mode = *parsed;
+            }
+            else if (key == "min_draft_tokens")
+            {
+                config.mtp.depth_policy.min_depth = std::stoi(value);
+                if (config.mtp.depth_policy.min_depth <= 0)
+                    throw std::invalid_argument("mtp min_draft_tokens must be > 0");
+            }
+            else if (key == "max_draft_tokens")
+            {
+                config.mtp.depth_policy.max_depth = std::stoi(value);
+                if (config.mtp.depth_policy.max_depth <= 0)
+                    throw std::invalid_argument("mtp max_draft_tokens must be > 0");
+            }
+            else if (key == "initial_draft_tokens")
+            {
+                config.mtp.depth_policy.initial_depth = std::stoi(value);
+                if (config.mtp.depth_policy.initial_depth <= 0)
+                    throw std::invalid_argument("mtp initial_draft_tokens must be > 0");
+            }
+            else if (key == "depth_window")
+            {
+                config.mtp.depth_policy.window_size = std::stoi(value);
+                if (config.mtp.depth_policy.window_size <= 0)
+                    throw std::invalid_argument("mtp depth_window must be > 0");
+            }
+            else if (key == "depth_min_samples")
+            {
+                config.mtp.depth_policy.min_samples = std::stoi(value);
+                if (config.mtp.depth_policy.min_samples <= 0)
+                    throw std::invalid_argument("mtp depth_min_samples must be > 0");
+            }
+            else if (key == "depth_cooldown")
+            {
+                config.mtp.depth_policy.cooldown_steps = std::stoi(value);
+                if (config.mtp.depth_policy.cooldown_steps < 0)
+                    throw std::invalid_argument("mtp depth_cooldown must be >= 0");
+            }
+            else if (key == "depth_promote_full_accept")
+            {
+                config.mtp.depth_policy.promote_full_accept_rate = std::stod(value);
+            }
+            else if (key == "depth_demote_zero_accept")
+            {
+                config.mtp.depth_policy.demote_zero_accept_rate = std::stod(value);
+            }
+            else if (key == "depth_demote_acceptance")
+            {
+                config.mtp.depth_policy.demote_acceptance_rate = std::stod(value);
+            }
         }
 
         std::shared_ptr<MoEExpertParallelPlan> ensureMoEExpertParallelPlan(OrchestrationConfig &config)
@@ -1669,6 +1724,148 @@ namespace llaminar2
                             "' (valid: greedy, speculative-sampling)");
                     }
                     c.mtp.verify_mode = *parsed;
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-policy",
+            .category = "MTP",
+            .value_label = "<mode>",
+            .description = "MTP draft-depth policy: fixed, observe, dynamic",
+            .valid_values = {"fixed", "observe", "dynamic"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto parsed = parseMTPDepthPolicyMode(v);
+                    if (!parsed)
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --mtp-depth-policy: '" + v +
+                            "' (valid: fixed, observe, dynamic)");
+                    }
+                    c.mtp.depth_policy.mode = *parsed;
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-min-draft-tokens",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Minimum MTP draft depth for observe/dynamic depth policy",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.min_depth = std::stoi(v);
+                    if (c.mtp.depth_policy.min_depth <= 0)
+                    {
+                        throw std::invalid_argument("--mtp-min-draft-tokens must be > 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-max-draft-tokens",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Maximum MTP draft depth for observe/dynamic depth policy",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.max_depth = std::stoi(v);
+                    if (c.mtp.depth_policy.max_depth <= 0)
+                    {
+                        throw std::invalid_argument("--mtp-max-draft-tokens must be > 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-window",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Verifier decision window for observe/dynamic MTP depth policy",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.window_size = std::stoi(v);
+                    if (c.mtp.depth_policy.window_size <= 0)
+                    {
+                        throw std::invalid_argument("--mtp-depth-window must be > 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-min-samples",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Minimum verifier samples before observe/dynamic MTP depth decisions",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.min_samples = std::stoi(v);
+                    if (c.mtp.depth_policy.min_samples <= 0)
+                    {
+                        throw std::invalid_argument("--mtp-depth-min-samples must be > 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-cooldown",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Decode-step cooldown after an adaptive MTP depth update",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.cooldown_steps = std::stoi(v);
+                    if (c.mtp.depth_policy.cooldown_steps < 0)
+                    {
+                        throw std::invalid_argument("--mtp-depth-cooldown must be >= 0");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-promote-full-accept",
+            .category = "MTP",
+            .value_label = "<f>",
+            .description = "Full-depth accept-rate threshold for adaptive MTP depth promotion",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.promote_full_accept_rate = std::stod(v);
+                    if (c.mtp.depth_policy.promote_full_accept_rate < 0.0 ||
+                        c.mtp.depth_policy.promote_full_accept_rate > 1.0)
+                    {
+                        throw std::invalid_argument("--mtp-depth-promote-full-accept must be in [0, 1]");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-demote-zero-accept",
+            .category = "MTP",
+            .value_label = "<f>",
+            .description = "Zero-accept-rate threshold for adaptive MTP depth demotion",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.demote_zero_accept_rate = std::stod(v);
+                    if (c.mtp.depth_policy.demote_zero_accept_rate < 0.0 ||
+                        c.mtp.depth_policy.demote_zero_accept_rate > 1.0)
+                    {
+                        throw std::invalid_argument("--mtp-depth-demote-zero-accept must be in [0, 1]");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-demote-acceptance",
+            .category = "MTP",
+            .value_label = "<f>",
+            .description = "Draft-token acceptance-rate threshold for adaptive MTP depth demotion",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.demote_acceptance_rate = std::stod(v);
+                    if (c.mtp.depth_policy.demote_acceptance_rate < 0.0 ||
+                        c.mtp.depth_policy.demote_acceptance_rate > 1.0)
+                    {
+                        throw std::invalid_argument("--mtp-depth-demote-acceptance must be in [0, 1]");
+                    }
                 }),
         });
 

@@ -436,6 +436,7 @@ namespace llaminar2
             int already_appended_tokens,
             int main_forward_token_count,
             bool allow_speculative_discard = false) override;
+        bool flushPendingMTPWork() override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;

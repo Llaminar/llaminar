@@ -2477,6 +2477,16 @@ namespace llaminar2
         return all_success;
     }
 
+    bool RankOrchestrator::flushPendingMTPWork()
+    {
+        bool ok = true;
+        for (const auto &runner : device_runners_)
+        {
+            ok = runner && runner->flushPendingMTPWork() && ok;
+        }
+        return ok;
+    }
+
     const float *RankOrchestrator::mtpLogits() const
     {
         if (device_runners_.empty())
@@ -3416,6 +3426,24 @@ namespace llaminar2
             snapshot.mtp_bypasses += child.mtp_bypasses;
             snapshot.mtp_verifier_runs += child.mtp_verifier_runs;
             snapshot.mtp_verifier_token_count += child.mtp_verifier_token_count;
+            snapshot.mtp_depth_policy_windows += child.mtp_depth_policy_windows;
+            snapshot.mtp_depth_policy_updates += child.mtp_depth_policy_updates;
+            snapshot.mtp_depth_policy_promotions += child.mtp_depth_policy_promotions;
+            snapshot.mtp_depth_policy_demotions += child.mtp_depth_policy_demotions;
+            snapshot.mtp_depth_policy_observe_recommendations +=
+                child.mtp_depth_policy_observe_recommendations;
+            snapshot.mtp_current_depth =
+                snapshot.mtp_current_depth == 0
+                    ? child.mtp_current_depth
+                    : std::min(snapshot.mtp_current_depth, child.mtp_current_depth);
+            snapshot.mtp_min_depth =
+                snapshot.mtp_min_depth == 0
+                    ? child.mtp_min_depth
+                    : std::min(snapshot.mtp_min_depth, child.mtp_min_depth);
+            snapshot.mtp_max_depth =
+                snapshot.mtp_max_depth == 0
+                    ? child.mtp_max_depth
+                    : std::min(snapshot.mtp_max_depth, child.mtp_max_depth);
             snapshot.prefill_chunk_schedules += child.prefill_chunk_schedules;
             snapshot.prefill_chunk_successful_schedules +=
                 child.prefill_chunk_successful_schedules;

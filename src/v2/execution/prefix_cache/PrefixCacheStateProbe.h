@@ -95,6 +95,14 @@ namespace llaminar2
         uint64_t mtp_bypasses = 0;
         uint64_t mtp_verifier_runs = 0;
         uint64_t mtp_verifier_token_count = 0;
+        uint64_t mtp_depth_policy_windows = 0;
+        uint64_t mtp_depth_policy_updates = 0;
+        uint64_t mtp_depth_policy_promotions = 0;
+        uint64_t mtp_depth_policy_demotions = 0;
+        uint64_t mtp_depth_policy_observe_recommendations = 0;
+        int mtp_current_depth = 0;
+        int mtp_min_depth = 0;
+        int mtp_max_depth = 0;
         uint64_t prefill_chunk_schedules = 0;
         uint64_t prefill_chunk_successful_schedules = 0;
         uint64_t prefill_chunks = 0;

@@ -6026,6 +6026,18 @@ add_v2_test(V2_Unit_PrefixCachePrefillFlow
     MPI_PROCS 1
 )
 
+# Test: MTP adaptive draft-depth policy
+add_executable(v2_test_mtp_depth_controller unit/mtp/Test__MTPDepthController.cpp)
+target_link_libraries(v2_test_mtp_depth_controller llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_mtp_depth_controller PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPDepthController
+    COMMAND $<TARGET_FILE:v2_test_mtp_depth_controller>
+    LABELS "V2;Unit;MTP;DepthPolicy"
+    MPI_PROCS 1
+)
+
 # Test: MTP sidecar weight discovery and graph-facing bindings
 add_executable(v2_test_mtp_weight_manifest unit/mtp/Test__MTPWeightManifest.cpp)
 target_link_libraries(v2_test_mtp_weight_manifest llaminar2_core GTest::gtest GTest::gtest_main)

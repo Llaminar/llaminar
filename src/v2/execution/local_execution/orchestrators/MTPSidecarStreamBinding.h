@@ -71,13 +71,28 @@ namespace llaminar2
             return true;
         }
 
-        inline void *deferredSamplingStream(bool forward_ok,
-                                            bool defer_final_sync,
-                                            void *capture_stream)
+        inline bool deferredSamplingStream(bool forward_ok,
+                                           bool defer_final_sync,
+                                           void *capture_stream,
+                                           void **stream_out,
+                                           std::string *error = nullptr)
         {
+            if (stream_out)
+                *stream_out = nullptr;
+
             if (!forward_ok || !defer_final_sync)
-                return nullptr;
-            return capture_stream;
+                return true;
+
+            if (!capture_stream)
+            {
+                if (error)
+                    *error = "MTP sidecar deferred sampling requires a non-null capture stream";
+                return false;
+            }
+
+            if (stream_out)
+                *stream_out = capture_stream;
+            return true;
         }
     }
 }

@@ -637,16 +637,14 @@ TEST(Test__PrefixCachePrefillFlow, MTPStatsRecordRejectedDraftToken)
     EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
 }
 
-TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthThreeCommitsAcceptedVerifierState)
+TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeCommitsAcceptedVerifierState)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
     auto *mock_ptr = mock.get();
     mock_ptr->lookup_result.supported = true;
     mock_ptr->lookup_result.cache_enabled = true;
     mock_ptr->lookup_result.block_size = 2;
-    mock_ptr->lookup_result.cached_tokens = 4;
-    mock_ptr->lookup_result.has_terminal_logits = true;
-    mock_ptr->lookup_result.has_terminal_hidden = true;
+    mock_ptr->lookup_result.cached_tokens = 2;
     mock_ptr->mtp_argmax_tokens = {11, 12, 13};
     mock_ptr->verify_argmax_tokens = {11, 12, 13, 14};
 
@@ -674,7 +672,7 @@ TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthThreeCommitsAcceptedVerif
     EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
 }
 
-TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthThreeRestoresMatchingSidecarCheckpointOnReject)
+TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreHardFailsForChainedMTPDrafts)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
     auto *mock_ptr = mock.get();
@@ -684,6 +682,24 @@ TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthThreeRestoresMatchingSide
     mock_ptr->lookup_result.cached_tokens = 4;
     mock_ptr->lookup_result.has_terminal_logits = true;
     mock_ptr->lookup_result.has_terminal_hidden = true;
+
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true, /*mtp_draft_tokens=*/2);
+    ASSERT_FALSE(runner->prefill({1, 2, 3, 4}));
+    EXPECT_THAT(runner->lastError(),
+                HasSubstr("Prefix cache terminal restore with chained MTP drafts is not supported"));
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 0);
+    EXPECT_EQ(mock_ptr->forward_mtp_calls, 0);
+    EXPECT_EQ(mock_ptr->harvest_calls, 0);
+}
+
+TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeRestoresMatchingSidecarCheckpointOnReject)
+{
+    auto mock = std::make_unique<PrefixFlowMockRunner>();
+    auto *mock_ptr = mock.get();
+    mock_ptr->lookup_result.supported = true;
+    mock_ptr->lookup_result.cache_enabled = true;
+    mock_ptr->lookup_result.block_size = 2;
+    mock_ptr->lookup_result.cached_tokens = 2;
     mock_ptr->mtp_argmax_tokens = {11, 12, 13};
     mock_ptr->verify_argmax_tokens = {11, 15, 13, 14};
 
@@ -700,7 +716,7 @@ TEST(Test__PrefixCachePrefillFlow, ChainedMTPDraftDepthThreeRestoresMatchingSide
     ASSERT_THAT(mock_ptr->restored_mtp_rows, Not(IsEmpty()));
     EXPECT_EQ(mock_ptr->restored_mtp_rows.back(), 1);
     EXPECT_EQ(mock_ptr->restore_live_calls, 1);
-    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(9, 11, 15));
+    EXPECT_THAT(mock_ptr->last_forward_tokens, ElementsAre(9, 11));
     EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
     EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
     EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 15));

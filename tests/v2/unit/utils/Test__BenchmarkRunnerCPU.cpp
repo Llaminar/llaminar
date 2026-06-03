@@ -471,9 +471,22 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     runner->snapshot.mtp_bypasses = 1;
     runner->snapshot.mtp_verifier_runs = 4;
     runner->snapshot.mtp_verifier_token_count = 8;
+    runner->snapshot.mtp_depth_policy_windows = 2;
+    runner->snapshot.mtp_depth_policy_updates = 1;
+    runner->snapshot.mtp_depth_policy_demotions = 1;
+    runner->snapshot.mtp_current_depth = 1;
+    runner->snapshot.mtp_min_depth = 1;
+    runner->snapshot.mtp_max_depth = 3;
     runner->snapshot.mtp_request.enabled = true;
     runner->snapshot.mtp_request.bypassed = true;
     runner->snapshot.mtp_request.bypass_reason = "sampling is not greedy";
+    runner->snapshot.mtp_request.adaptive_depth_enabled = true;
+    runner->snapshot.mtp_request.depth_policy_mode = "dynamic";
+    runner->snapshot.mtp_request.current_depth = 1;
+    runner->snapshot.mtp_request.min_depth = 1;
+    runner->snapshot.mtp_request.max_depth = 3;
+    runner->snapshot.mtp_request.depth_policy_updates = 1;
+    runner->snapshot.mtp_request.last_depth_policy_reason = "demote_zero_accept_rate";
     runner->snapshot.mtp_request.draft_steps = 3;
     runner->snapshot.mtp_request.accepted_tokens = 2;
     runner->snapshot.mtp_request.rejected_tokens = 1;
@@ -515,6 +528,9 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     EXPECT_DOUBLE_EQ(result.prefix_state.mtp_request.acceptance_rate, 2.0 / 3.0);
     EXPECT_EQ(result.prefix_state.mtp_verifier_runs, 4u);
     EXPECT_EQ(result.prefix_state.mtp_verifier_token_count, 8u);
+    EXPECT_EQ(result.prefix_state.mtp_depth_policy_updates, 1u);
+    EXPECT_EQ(result.prefix_state.mtp_current_depth, 1);
+    EXPECT_EQ(result.prefix_state.mtp_max_depth, 3);
     EXPECT_EQ(result.prefix_state.prefill_chunk_schedules, 2u);
     EXPECT_EQ(result.prefix_state.prefill_chunk_successful_schedules, 1u);
     EXPECT_EQ(result.prefix_state.prefill_chunks, 3u);
@@ -535,6 +551,8 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
     EXPECT_NE(output.find("sampling is not greedy"), std::string::npos);
     EXPECT_NE(output.find("MTP request"), std::string::npos);
     EXPECT_NE(output.find("66.67% acceptance"), std::string::npos);
+    EXPECT_NE(output.find("depth_policy=dynamic"), std::string::npos);
+    EXPECT_NE(output.find("updates=1"), std::string::npos);
     EXPECT_NE(output.find("MTP decode"), std::string::npos);
     EXPECT_NE(output.find("Prefill chunks"), std::string::npos);
     EXPECT_NE(output.find("1/2 schedules"), std::string::npos);
@@ -594,7 +612,20 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     snapshot.mtp_rollbacks = 1;
     snapshot.mtp_verifier_runs = 2;
     snapshot.mtp_verifier_token_count = 5;
+    snapshot.mtp_depth_policy_windows = 2;
+    snapshot.mtp_depth_policy_updates = 1;
+    snapshot.mtp_depth_policy_promotions = 1;
+    snapshot.mtp_current_depth = 2;
+    snapshot.mtp_min_depth = 1;
+    snapshot.mtp_max_depth = 3;
     snapshot.mtp_request.enabled = true;
+    snapshot.mtp_request.adaptive_depth_enabled = true;
+    snapshot.mtp_request.depth_policy_mode = "dynamic";
+    snapshot.mtp_request.current_depth = 2;
+    snapshot.mtp_request.min_depth = 1;
+    snapshot.mtp_request.max_depth = 3;
+    snapshot.mtp_request.depth_policy_updates = 1;
+    snapshot.mtp_request.last_depth_policy_reason = "promote_full_accept_rate";
     snapshot.mtp_request.draft_steps = 4;
     snapshot.mtp_request.accepted_tokens = 3;
     snapshot.mtp_request.rejected_tokens = 1;
@@ -612,6 +643,10 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     config.n_predict = 2;
     config.prefix_cache.enabled = true;
     config.mtp.enabled = true;
+    config.mtp.draft_tokens = 3;
+    config.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    config.mtp.depth_policy.max_depth = 3;
+    config.mtp.depth_policy.window_size = 8;
     config.benchmark_json_output_path = "/tmp/bench.json";
 
     const auto doc = nlohmann::json::parse(benchmarkResultToJsonString(result, &config));
@@ -638,11 +673,22 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_EQ(mtp.at("draft_steps"), 4);
     EXPECT_EQ(mtp.at("accepted_tokens"), 3);
     EXPECT_DOUBLE_EQ(mtp.at("acceptance_rate").get<double>(), 0.75);
+    EXPECT_EQ(mtp.at("current_depth"), 2);
+    EXPECT_EQ(mtp.at("max_depth"), 3);
+    EXPECT_EQ(mtp.at("depth_policy_updates"), 1);
+    EXPECT_EQ(mtp.at("depth_policy_promotions"), 1);
+    EXPECT_TRUE(mtp.at("request").at("adaptive_depth_enabled").get<bool>());
+    EXPECT_EQ(mtp.at("request").at("depth_policy_mode"), "dynamic");
+    EXPECT_EQ(mtp.at("request").at("last_depth_policy_reason"), "promote_full_accept_rate");
     EXPECT_EQ(mtp.at("request").at("accepted_tokens"), 3);
 
     EXPECT_EQ(doc.at("prefill_chunks").at("chunks"), 5);
     EXPECT_EQ(doc.at("prefill_chunks").at("padded_tokens"), 64);
     EXPECT_TRUE(doc.at("config").at("prefix_cache_enabled").get<bool>());
     EXPECT_TRUE(doc.at("config").at("mtp_enabled").get<bool>());
+    EXPECT_EQ(doc.at("config").at("mtp_draft_tokens"), 3);
+    EXPECT_EQ(doc.at("config").at("mtp_depth_policy"), "dynamic");
+    EXPECT_EQ(doc.at("config").at("mtp_max_draft_tokens"), 3);
+    EXPECT_EQ(doc.at("config").at("mtp_depth_window"), 8);
     EXPECT_EQ(doc.at("config").at("benchmark_json_output_path"), "/tmp/bench.json");
 }

@@ -436,12 +436,61 @@ namespace llaminar2
         return std::nullopt;
     }
 
+    enum class MTPDepthPolicyMode
+    {
+        Fixed,
+        Observe,
+        Dynamic,
+    };
+
+    inline const char *mtpDepthPolicyModeToString(MTPDepthPolicyMode mode)
+    {
+        switch (mode)
+        {
+        case MTPDepthPolicyMode::Fixed:
+            return "fixed";
+        case MTPDepthPolicyMode::Observe:
+            return "observe";
+        case MTPDepthPolicyMode::Dynamic:
+            return "dynamic";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MTPDepthPolicyMode> parseMTPDepthPolicyMode(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "fixed" || normalized == "off")
+            return MTPDepthPolicyMode::Fixed;
+        if (normalized == "observe" || normalized == "profile")
+            return MTPDepthPolicyMode::Observe;
+        if (normalized == "dynamic" || normalized == "adaptive")
+            return MTPDepthPolicyMode::Dynamic;
+        return std::nullopt;
+    }
+
+    struct MTPDepthPolicyConfig
+    {
+        MTPDepthPolicyMode mode = MTPDepthPolicyMode::Fixed;
+        int min_depth = 1;
+        int max_depth = 0;     ///< 0 derives from MTPRuntimeConfig::draft_tokens.
+        int initial_depth = 0; ///< 0 derives from max_depth.
+        int window_size = 16;
+        int min_samples = 8;
+        int cooldown_steps = 8;
+        double promote_full_accept_rate = 1.0;
+        double demote_zero_accept_rate = 0.30;
+        double demote_acceptance_rate = 0.70;
+    };
+
     struct MTPRuntimeConfig
     {
         bool enabled = false;
         int draft_tokens = 1;
         MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
         bool require_terminal_hidden_for_full_hit = true;
+        MTPDepthPolicyConfig depth_policy;
     };
 
     /**

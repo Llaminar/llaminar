@@ -302,7 +302,8 @@ namespace llaminar2::test::parity::qwen36
         bool enable_prefix_cache,
         int block_size,
         bool enable_mtp = false,
-        int mtp_draft_tokens = 1)
+        int mtp_draft_tokens = 1,
+        MTPDepthPolicyConfig depth_policy = {})
     {
         OrchestrationConfig config = OrchestrationConfig::defaults();
         config.model_path = model_path;
@@ -319,6 +320,7 @@ namespace llaminar2::test::parity::qwen36
         config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
         config.mtp.draft_tokens = mtp_draft_tokens;
+        config.mtp.depth_policy = depth_policy;
 
         switch (test_case.topology)
         {
@@ -609,7 +611,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runDenseMTPParity(
         const DensePrefixRestoreParityCase &test_case,
         bool enable_prefix_cache,
-        int mtp_draft_tokens = 1)
+        int mtp_draft_tokens = 1,
+        MTPDepthPolicyConfig depth_policy = {})
     {
         ASSERT_GE(mtp_draft_tokens, 1);
         ASSERT_LE(mtp_draft_tokens, 3);
@@ -647,7 +650,8 @@ namespace llaminar2::test::parity::qwen36
                 enable_prefix_cache,
                 block_size,
                 true,
-                mtp_draft_tokens));
+                mtp_draft_tokens,
+                depth_policy));
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
 
@@ -696,6 +700,90 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
         EXPECT_GT(after_second.mtp_draft_steps, after_first.mtp_draft_steps);
         EXPECT_GT(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs);
+    }
+
+    inline void runDenseDynamicMTPParity(
+        DensePrefixRestoreParityCase test_case,
+        bool enable_prefix_cache = false)
+    {
+        const int adaptive_max_depth = enable_prefix_cache ? 1 : 2;
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = adaptive_max_depth;
+        depth_policy.initial_depth = adaptive_max_depth;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        const int block_size = enable_prefix_cache
+                                   ? static_cast<int>(prompt_tokens.size())
+                                   : 2;
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        auto baseline = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(test_case, model_path, false, block_size, false));
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto baseline_result = baseline->generate(prompt_tokens, test_case.decode_steps, greedy);
+        baseline->shutdown();
+
+        ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+        ASSERT_EQ(baseline_result.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(baseline_result.tokens, expected_tokens);
+
+        auto mtp = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                enable_prefix_cache,
+                block_size,
+                true,
+                adaptive_max_depth,
+                depth_policy));
+        ASSERT_NE(mtp, nullptr);
+        ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+
+        auto first = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto after_first = mtp->prefixStateProbe();
+        ASSERT_TRUE(first.error.empty()) << first.error;
+        ASSERT_EQ(first.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(first.tokens, expected_tokens);
+        EXPECT_EQ(first.tokens, baseline_result.tokens);
+        EXPECT_FALSE(after_first.mtp_bypassed) << after_first.mtp_bypass_reason;
+        EXPECT_TRUE(after_first.mtp_request.adaptive_depth_enabled);
+        EXPECT_EQ(after_first.mtp_request.depth_policy_mode, "dynamic");
+        EXPECT_GE(after_first.mtp_depth_policy_windows, 1u);
+        EXPECT_GE(after_first.mtp_min_depth, 1);
+        EXPECT_EQ(after_first.mtp_max_depth, adaptive_max_depth);
+        EXPECT_GE(after_first.mtp_current_depth, 1);
+        EXPECT_LE(after_first.mtp_current_depth, adaptive_max_depth);
+
+        if (!enable_prefix_cache)
+        {
+            mtp->shutdown();
+            return;
+        }
+
+        auto second = mtp->generate(prompt_tokens, test_case.decode_steps, greedy);
+        const auto after_second = mtp->prefixStateProbe();
+        mtp->shutdown();
+
+        ASSERT_TRUE(second.error.empty()) << second.error;
+        ASSERT_EQ(second.tokens.size(), expected_tokens.size());
+        EXPECT_EQ(second.tokens, expected_tokens);
+        EXPECT_EQ(second.tokens, baseline_result.tokens);
+        EXPECT_TRUE(after_second.prefix_request.hit);
+        EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
+        EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
+        EXPECT_GT(after_second.mtp_depth_policy_windows, after_first.mtp_depth_policy_windows);
     }
 
 } // namespace llaminar2::test::parity::qwen36

@@ -896,6 +896,53 @@ namespace llaminar2
         {
             errors.push_back("MTP draft tokens must be > 0");
         }
+        if (mtp.depth_policy.min_depth <= 0)
+        {
+            errors.push_back("MTP depth policy min depth must be > 0");
+        }
+        if (mtp.depth_policy.max_depth < 0)
+        {
+            errors.push_back("MTP depth policy max depth must be >= 0");
+        }
+        if (mtp.depth_policy.initial_depth < 0)
+        {
+            errors.push_back("MTP depth policy initial depth must be >= 0");
+        }
+        const int effective_max_depth =
+            mtp.depth_policy.max_depth > 0 ? mtp.depth_policy.max_depth : mtp.draft_tokens;
+        const int effective_initial_depth =
+            mtp.depth_policy.initial_depth > 0 ? mtp.depth_policy.initial_depth : effective_max_depth;
+        if (effective_max_depth < mtp.depth_policy.min_depth)
+        {
+            errors.push_back("MTP depth policy max depth must be >= min depth");
+        }
+        if (effective_initial_depth < mtp.depth_policy.min_depth ||
+            effective_initial_depth > effective_max_depth)
+        {
+            errors.push_back("MTP depth policy initial depth must be within [min depth, max depth]");
+        }
+        if (mtp.depth_policy.window_size <= 0)
+        {
+            errors.push_back("MTP depth policy window size must be > 0");
+        }
+        if (mtp.depth_policy.min_samples <= 0)
+        {
+            errors.push_back("MTP depth policy min samples must be > 0");
+        }
+        if (mtp.depth_policy.cooldown_steps < 0)
+        {
+            errors.push_back("MTP depth policy cooldown steps must be >= 0");
+        }
+        auto valid_rate = [](double value)
+        {
+            return value >= 0.0 && value <= 1.0;
+        };
+        if (!valid_rate(mtp.depth_policy.promote_full_accept_rate) ||
+            !valid_rate(mtp.depth_policy.demote_zero_accept_rate) ||
+            !valid_rate(mtp.depth_policy.demote_acceptance_rate))
+        {
+            errors.push_back("MTP depth policy thresholds must be in [0, 1]");
+        }
 
         return errors;
     }
@@ -996,6 +1043,16 @@ namespace llaminar2
         oss << "    enabled: " << (mtp.enabled ? "true" : "false") << "\n";
         oss << "    draft_tokens: " << mtp.draft_tokens << "\n";
         oss << "    verify_mode: " << mtpVerifyModeToString(mtp.verify_mode) << "\n";
+        oss << "    depth_policy: " << mtpDepthPolicyModeToString(mtp.depth_policy.mode) << "\n";
+        oss << "    min_draft_tokens: " << mtp.depth_policy.min_depth << "\n";
+        oss << "    max_draft_tokens: " << mtp.depth_policy.max_depth << "\n";
+        oss << "    initial_draft_tokens: " << mtp.depth_policy.initial_depth << "\n";
+        oss << "    depth_window: " << mtp.depth_policy.window_size << "\n";
+        oss << "    depth_min_samples: " << mtp.depth_policy.min_samples << "\n";
+        oss << "    depth_cooldown: " << mtp.depth_policy.cooldown_steps << "\n";
+        oss << "    depth_promote_full_accept: " << mtp.depth_policy.promote_full_accept_rate << "\n";
+        oss << "    depth_demote_zero_accept: " << mtp.depth_policy.demote_zero_accept_rate << "\n";
+        oss << "    depth_demote_acceptance: " << mtp.depth_policy.demote_acceptance_rate << "\n";
         oss << "    require_terminal_hidden_for_full_hit: "
             << (mtp.require_terminal_hidden_for_full_hit ? "true" : "false") << "\n";
 

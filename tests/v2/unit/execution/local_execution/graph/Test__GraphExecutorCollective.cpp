@@ -716,6 +716,34 @@ TEST_F(Test__GraphExecutorStreamBinding, NullStageStream_BindsToNodeDeviceDefaul
     EXPECT_EQ(stage_raw->gpuStream(), cuda_default_stream_);
 }
 
+TEST_F(Test__GraphExecutorStreamBinding, NullWorkerStreamForGPUStage_FailsInsteadOfUsingDefaultDeviceStream)
+{
+    GPUDeviceContextPool::instance().shutdown();
+    GPUDeviceContextPool::instance().registerNvidiaFactory(
+        [](int ordinal)
+        {
+            return std::make_unique<MockWorkerGPUContext>(ordinal, nullptr);
+        },
+        1);
+
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM,
+        "null_worker_stream_stage",
+        DeviceId::cuda(0));
+    auto *stage_raw = stage.get();
+
+    ComputeGraph graph;
+    graph.addNode("null_worker_stream_stage", std::move(stage), DeviceId::cuda(0));
+
+    EXPECT_FALSE(executor.execute(graph, &ctx));
+    EXPECT_EQ(stage_raw->gpuStream(), nullptr);
+}
+
 TEST_F(Test__GraphExecutorStreamBinding, PreBoundStageStream_IsNotOverwritten)
 {
     GraphExecutorConfig config;
@@ -873,9 +901,23 @@ TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarStagesBindToCaptureStream)
 TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarDeferredSamplingUsesCaptureStream)
 {
     void *capture_stream = reinterpret_cast<void *>(0x0DADA123);
+    void *sample_stream = nullptr;
+    std::string error;
 
-    EXPECT_EQ(mtp_sidecar::deferredSamplingStream(true, true, capture_stream), capture_stream);
-    EXPECT_EQ(mtp_sidecar::deferredSamplingStream(true, true, nullptr), nullptr);
-    EXPECT_EQ(mtp_sidecar::deferredSamplingStream(true, false, capture_stream), nullptr);
-    EXPECT_EQ(mtp_sidecar::deferredSamplingStream(false, true, capture_stream), nullptr);
+    EXPECT_TRUE(mtp_sidecar::deferredSamplingStream(true, true, capture_stream, &sample_stream, &error));
+    EXPECT_EQ(sample_stream, capture_stream);
+
+    sample_stream = reinterpret_cast<void *>(0xBADF00D);
+    error.clear();
+    EXPECT_FALSE(mtp_sidecar::deferredSamplingStream(true, true, nullptr, &sample_stream, &error));
+    EXPECT_EQ(sample_stream, nullptr);
+    EXPECT_FALSE(error.empty());
+
+    sample_stream = reinterpret_cast<void *>(0xBADF00D);
+    EXPECT_TRUE(mtp_sidecar::deferredSamplingStream(true, false, capture_stream, &sample_stream, &error));
+    EXPECT_EQ(sample_stream, nullptr);
+
+    sample_stream = reinterpret_cast<void *>(0xBADF00D);
+    EXPECT_TRUE(mtp_sidecar::deferredSamplingStream(false, true, capture_stream, &sample_stream, &error));
+    EXPECT_EQ(sample_stream, nullptr);
 }

@@ -103,8 +103,14 @@ namespace llaminar2
                snapshot.mtp_bypasses != 0 ||
                snapshot.mtp_verifier_runs != 0 ||
                snapshot.mtp_verifier_token_count != 0 ||
+               snapshot.mtp_depth_policy_windows != 0 ||
+               snapshot.mtp_depth_policy_updates != 0 ||
+               snapshot.mtp_depth_policy_promotions != 0 ||
+               snapshot.mtp_depth_policy_demotions != 0 ||
+               snapshot.mtp_depth_policy_observe_recommendations != 0 ||
                snapshot.mtp_request.enabled ||
                snapshot.mtp_request.bypassed ||
+               snapshot.mtp_request.adaptive_depth_enabled ||
                snapshot.mtp_request.draft_steps != 0 ||
                snapshot.mtp_request.accepted_tokens != 0 ||
                snapshot.mtp_request.rejected_tokens != 0 ||
@@ -142,6 +148,13 @@ namespace llaminar2
             {"enabled", request.enabled},
             {"bypassed", request.bypassed},
             {"bypass_reason", request.bypass_reason},
+            {"adaptive_depth_enabled", request.adaptive_depth_enabled},
+            {"depth_policy_mode", request.depth_policy_mode},
+            {"current_depth", request.current_depth},
+            {"min_depth", request.min_depth},
+            {"max_depth", request.max_depth},
+            {"depth_policy_updates", request.depth_policy_updates},
+            {"last_depth_policy_reason", request.last_depth_policy_reason},
             {"draft_steps", request.draft_steps},
             {"accepted_tokens", request.accepted_tokens},
             {"rejected_tokens", request.rejected_tokens},
@@ -233,6 +246,14 @@ namespace llaminar2
                       {"bypasses", state.mtp_bypasses},
                       {"verifier_runs", state.mtp_verifier_runs},
                       {"verifier_token_count", state.mtp_verifier_token_count},
+                      {"depth_policy_windows", state.mtp_depth_policy_windows},
+                      {"depth_policy_updates", state.mtp_depth_policy_updates},
+                      {"depth_policy_promotions", state.mtp_depth_policy_promotions},
+                      {"depth_policy_demotions", state.mtp_depth_policy_demotions},
+                      {"depth_policy_observe_recommendations", state.mtp_depth_policy_observe_recommendations},
+                      {"current_depth", state.mtp_current_depth},
+                      {"min_depth", state.mtp_min_depth},
+                      {"max_depth", state.mtp_max_depth},
                       {"acceptance_rate", mtpTokenAcceptanceRate(
                                               state.mtp_accepted_tokens,
                                               state.mtp_rejected_tokens)},
@@ -252,6 +273,11 @@ namespace llaminar2
                 {"n_predict", config->n_predict},
                 {"prefix_cache_enabled", config->prefix_cache.enabled},
                 {"mtp_enabled", config->mtp.enabled},
+                {"mtp_draft_tokens", config->mtp.draft_tokens},
+                {"mtp_depth_policy", mtpDepthPolicyModeToString(config->mtp.depth_policy.mode)},
+                {"mtp_min_draft_tokens", config->mtp.depth_policy.min_depth},
+                {"mtp_max_draft_tokens", config->mtp.depth_policy.max_depth},
+                {"mtp_depth_window", config->mtp.depth_policy.window_size},
             };
             if (!config->model_path.empty())
                 config_json["model_path"] = config->model_path;
@@ -1234,6 +1260,7 @@ namespace llaminar2
                 }
                 if (prefix_state.mtp_request.enabled ||
                     prefix_state.mtp_request.bypassed ||
+                    prefix_state.mtp_request.adaptive_depth_enabled ||
                     prefix_state.mtp_request.draft_steps != 0 ||
                     prefix_state.mtp_request.accepted_tokens != 0 ||
                     prefix_state.mtp_request.rejected_tokens != 0 ||
@@ -1247,6 +1274,15 @@ namespace llaminar2
                                 << request.rollbacks << " rollbacks, "
                                 << std::fixed << std::setprecision(2)
                                 << (request.acceptance_rate * 100.0) << "% acceptance";
+                    if (request.adaptive_depth_enabled)
+                    {
+                        mtp_request << ", depth_policy=" << request.depth_policy_mode
+                                    << " depth=" << request.current_depth
+                                    << " [" << request.min_depth << "," << request.max_depth << "]"
+                                    << " updates=" << request.depth_policy_updates;
+                        if (!request.last_depth_policy_reason.empty())
+                            mtp_request << " last=" << request.last_depth_policy_reason;
+                    }
                     if (request.bypassed)
                     {
                         mtp_request << ", bypassed";
@@ -1263,7 +1299,12 @@ namespace llaminar2
                         << prefix_state.mtp_rollbacks << " rollbacks, "
                         << prefix_state.mtp_bypasses << " bypasses, "
                         << prefix_state.mtp_verifier_runs << " verifier runs, "
-                        << prefix_state.mtp_verifier_token_count << " verifier tokens";
+                        << prefix_state.mtp_verifier_token_count << " verifier tokens, "
+                        << "depth=" << prefix_state.mtp_current_depth
+                        << " [" << prefix_state.mtp_min_depth << "," << prefix_state.mtp_max_depth << "]"
+                        << " depth_updates=" << prefix_state.mtp_depth_policy_updates
+                        << " promotions=" << prefix_state.mtp_depth_policy_promotions
+                        << " demotions=" << prefix_state.mtp_depth_policy_demotions;
                     state_table << "MTP decode" << mtp.str() << fort::endr;
                 }
             }

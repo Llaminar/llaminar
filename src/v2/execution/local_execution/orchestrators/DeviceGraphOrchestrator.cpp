@@ -265,6 +265,11 @@ namespace llaminar2
             auto device_opt = tensor->current_device();
             if (device_opt.has_value() && device_opt->is_gpu() && tensor->deviceValid())
             {
+                if (!stream)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] GPU greedy sampling requires an explicit non-null stream");
+                    return candidate;
+                }
                 IBackend *backend = getBackendFor(*device_opt);
                 const void *gpu_ptr = tensor->gpu_data_ptr();
                 if (backend && gpu_ptr)
@@ -452,7 +457,8 @@ namespace llaminar2
         bool exportMTPPrefixPayload(const IKVCache &mtp_cache,
                                     int seq_idx,
                                     const PrefixCacheKey &key,
-                                    PrefixBlockHandle *handle)
+                                    PrefixBlockHandle *handle,
+                                    void *stream = nullptr)
         {
             if (!handle || !handle->layout.includes_mtp_state)
             {
@@ -487,6 +493,7 @@ namespace llaminar2
                 desc.seq_idx = seq_idx;
                 desc.logical_token_start = mtpTokenStartForPrefixBlock(key);
                 desc.token_count = token_count;
+                desc.stream = stream;
                 if (!mtp_cache.exportLogicalBlock(desc, k_dst, v_dst))
                 {
                     return false;
@@ -497,7 +504,8 @@ namespace llaminar2
 
         bool importMTPPrefixPayload(IKVCache &mtp_cache,
                                     int seq_idx,
-                                    const PrefixBlockHandle &handle)
+                                    const PrefixBlockHandle &handle,
+                                    void *stream = nullptr)
         {
             if (!handle.layout.includes_mtp_state)
             {
@@ -532,6 +540,7 @@ namespace llaminar2
                 desc.seq_idx = seq_idx;
                 desc.logical_token_start = mtpTokenStartForPrefixBlock(handle.key);
                 desc.token_count = token_count;
+                desc.stream = stream;
                 if (!mtp_cache.importLogicalBlock(desc, k_src, v_src))
                 {
                     return false;
@@ -583,7 +592,8 @@ namespace llaminar2
             int seq_idx,
             int logical_token_count,
             PrefixBlockHandle *handle,
-            bool synchronize = true)
+            bool synchronize = true,
+            void *stream = nullptr)
         {
             if (!handle || !handle->layout.includes_hybrid_state)
             {
@@ -600,6 +610,7 @@ namespace llaminar2
             HybridPrefixStateDescriptor desc;
             desc.seq_idx = seq_idx;
             desc.logical_token_count = logical_token_count;
+            desc.stream = stream;
             desc.synchronize = synchronize;
             desc.include_host_state = handle->layout.hybrid_host_state_bytes > 0;
             desc.include_device_state = handle->layout.hybrid_device_state_bytes > 0;
@@ -618,7 +629,8 @@ namespace llaminar2
             IKVCache &cache,
             const PrefixBlockHandle &handle,
             int seq_idx,
-            bool synchronize = true)
+            bool synchronize = true,
+            void *stream = nullptr)
         {
             if (!handle.layout.includes_hybrid_state)
             {
@@ -635,6 +647,7 @@ namespace llaminar2
             HybridPrefixStateDescriptor desc;
             desc.seq_idx = seq_idx;
             desc.logical_token_count = handle.key.token_start + handle.key.token_count;
+            desc.stream = stream;
             desc.synchronize = synchronize;
             desc.include_host_state = handle.layout.hybrid_host_state_bytes > 0;
             desc.include_device_state = handle.layout.hybrid_device_state_bytes > 0;
@@ -3941,10 +3954,19 @@ namespace llaminar2
                     has_sidecar_collectives ? &sidecar_cache.collective_nodes : nullptr,
                     capture_policy,
                     &used_segmented_capture);
-                if (void *sample_stream = mtp_sidecar::deferredSamplingStream(
+                void *sample_stream = nullptr;
+                std::string deferred_stream_error;
+                if (!mtp_sidecar::deferredSamplingStream(
                         ok,
                         capture_policy.defer_final_sync,
-                        sidecar_cache.segment_cache.capture_stream))
+                        sidecar_cache.segment_cache.capture_stream,
+                        &sample_stream,
+                        &deferred_stream_error))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] " << deferred_stream_error);
+                    return false;
+                }
+                if (sample_stream)
                 {
                     // Stages are rebound to the sidecar capture stream before
                     // executeDecodeWithCapturePolicy(). Even if the capture
@@ -4087,12 +4109,28 @@ namespace llaminar2
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled || state_.mtp_kv_caches.empty())
             return;
 
+        void *stream = explicitGPUStreamForOperation("updateMTPShiftedCacheMetadata");
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            return;
+        }
+
         const int seq_count = std::min(active_batch_size, state_.batch_size);
         for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
         {
             auto &cache = state_.mtp_kv_caches[depth];
             if (!cache)
                 continue;
+
+            for (int seq = 0; seq < seq_count; ++seq)
+            {
+                if (!cache->truncateSequence(seq, 0, stream))
+                {
+                    LOG_WARN("[DeviceGraphOrchestrator] Failed to reset MTP shifted cache metadata for depth="
+                             << depth << " seq=" << seq);
+                    continue;
+                }
+            }
 
             for (int layer = 0; layer < cache->n_layers(); ++layer)
             {
@@ -4106,7 +4144,6 @@ namespace llaminar2
                     // Phase 5 wires the request-local shifted state contract before
                     // decode consumes it. The sidecar execution slice will replace
                     // this metadata-only update with real MTP K/V appends.
-                    cache->clear_sequence(layer, seq);
                     if (bounded_count > 0)
                         cache->advanceHead(layer, seq, bounded_count);
                 }
@@ -4292,6 +4329,41 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::flushPendingMTPWork()
+    {
+        void *stream = pending_mtp_logits_stream_;
+        if (!stream)
+        {
+            return true;
+        }
+        pending_mtp_logits_stream_ = nullptr;
+
+        if (!state_.device_id.is_gpu())
+        {
+            return true;
+        }
+
+        try
+        {
+            GPUDeviceContextPool::instance()
+                .getContext(state_.device_id)
+                .synchronizeStream(stream);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "sidecar_deferred_stream_flushes",
+                1.0,
+                "decode",
+                state_.device_id.toString());
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Failed to flush pending MTP sidecar stream on "
+                      << state_.device_id.toString() << ": " << e.what());
+            return false;
+        }
+    }
+
     bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromLastForward(
         const int32_t *tokens,
         int token_count,
@@ -4376,7 +4448,13 @@ namespace llaminar2
                           << " already_appended=" << already_appended_tokens);
                 return false;
             }
-            if (!cache->truncateSequence(0, expected_cached_tokens))
+            void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowsFromPartialForward");
+            if (state_.device_id.is_gpu() && !stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires an explicit GPU stream");
+                return false;
+            }
+            if (!cache->truncateSequence(0, expected_cached_tokens, stream))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit failed to discard speculative rows: current="
                           << current_cached_tokens << " expected=" << expected_cached_tokens);
@@ -4530,8 +4608,21 @@ namespace llaminar2
                                      : 0;
         void *pending_stream = pending_mtp_logits_stream_;
         pending_mtp_logits_stream_ = nullptr;
+        TensorBase *mtp_logits = it->second.get();
+        if (!pending_stream && mtp_logits)
+        {
+            auto device_opt = mtp_logits->current_device();
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                pending_stream = explicitGPUStreamForOperation("sampleGreedyOnMTPLogits");
+                if (!pending_stream)
+                {
+                    return -1;
+                }
+            }
+        }
         return coordinateGreedyCandidate(
-            sampleGreedyCandidateFromTensor(it->second.get(), 0, token_offset,
+            sampleGreedyCandidateFromTensor(mtp_logits, 0, token_offset,
                                             argmax_partial_vals_dev_,
                                             argmax_partial_idxs_dev_,
                                             argmax_partial_capacity_,
@@ -4548,11 +4639,22 @@ namespace llaminar2
 
         if (state_.all_position_logits)
         {
+            void *stream = nullptr;
+            auto device_opt = state_.all_position_logits->current_device();
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsOnDevice");
+                if (!stream)
+                {
+                    return -1;
+                }
+            }
             return coordinateGreedyCandidate(
                 sampleGreedyCandidateFromTensor(state_.all_position_logits.get(), row, 0,
                                                 argmax_partial_vals_dev_,
                                                 argmax_partial_idxs_dev_,
-                                                argmax_partial_capacity_),
+                                                argmax_partial_capacity_,
+                                                stream),
                 globalTPContextForMTPCoordination());
         }
 
@@ -4561,11 +4663,22 @@ namespace llaminar2
             const int token_offset = graph_builder_
                                          ? vocabOffsetForTPConfig(graph_builder_->config())
                                          : 0;
+            void *stream = nullptr;
+            auto device_opt = state_.all_position_logits_local->current_device();
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsLocalOnDevice");
+                if (!stream)
+                {
+                    return -1;
+                }
+            }
             return coordinateGreedyCandidate(
                 sampleGreedyCandidateFromTensor(state_.all_position_logits_local.get(), row, token_offset,
                                                 argmax_partial_vals_dev_,
                                                 argmax_partial_idxs_dev_,
-                                                argmax_partial_capacity_),
+                                                argmax_partial_capacity_,
+                                                stream),
                 globalTPContextForMTPCoordination());
         }
 
@@ -4631,6 +4744,12 @@ namespace llaminar2
             if (!backend || !gpu_ptr)
                 return false;
 
+            void *stream = explicitGPUStreamForOperation("sampleGreedyFromAllPositionLogitsOnDeviceRows");
+            if (!stream)
+            {
+                return false;
+            }
+
             const auto *base = static_cast<const float *>(gpu_ptr);
             const void *first_row =
                 base + static_cast<size_t>(start_row) * static_cast<size_t>(cols);
@@ -4643,7 +4762,7 @@ namespace llaminar2
                 device_opt->gpu_ordinal(),
                 values.data(),
                 indices.data(),
-                nullptr,
+                stream,
                 argmax_partial_vals_dev_,
                 argmax_partial_idxs_dev_,
                 argmax_partial_capacity_);
@@ -4820,6 +4939,37 @@ namespace llaminar2
                architecture.find("MoE") != std::string::npos;
     }
 
+    void *DeviceGraphOrchestrator::explicitGPUStreamForOperation(const char *operation) const
+    {
+        if (!state_.device_id.is_gpu())
+        {
+            return nullptr;
+        }
+
+        try
+        {
+            void *stream = GPUDeviceContextPool::instance()
+                               .getContext(state_.device_id)
+                               .defaultStream();
+            if (!stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] "
+                          << (operation ? operation : "gpu_operation")
+                          << " requires an explicit non-null GPU stream on "
+                          << state_.device_id.toString());
+            }
+            return stream;
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] "
+                      << (operation ? operation : "gpu_operation")
+                      << " could not acquire an explicit GPU stream on "
+                      << state_.device_id.toString() << ": " << e.what());
+            return nullptr;
+        }
+    }
+
     void DeviceGraphOrchestrator::handleLivePrefixReplayStateAfterMutation(const char *operation)
     {
         PerfStatsCollector::Tags tags{{"operation", operation ? operation : "unknown"}};
@@ -4828,8 +4978,26 @@ namespace llaminar2
             tags["model"] = "moe";
             tags["moe_placement_epoch"] = std::to_string(moePlacementEpoch());
         }
+        if (state_.device_id.is_gpu() && forward_engine_)
+        {
+            forward_engine_->resetCapturedReplayState();
+            mtp_sidecar_depth0_cache_.resetReplayState();
+            mtp_sidecar_depth0_chained_cache_.resetReplayState();
+            mtp_sidecar_depth0_kv_only_cache_.resetReplayState();
+            for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+            {
+                cache.resetReplayState();
+            }
+            tags["replay_state"] = "reset";
+            tags["sidecar_replay_state"] = "reset";
+        }
+        else
+        {
+            tags["replay_state"] = "preserved";
+            tags["sidecar_replay_state"] = "preserved";
+        }
         PerfStatsCollector::addCounter("mtp",
-                                       "live_prefix_replay_state_preserved",
+                                       "live_prefix_replay_state_after_mutation",
                                        1.0,
                                        "decode",
                                        state_.device_id.toString(),
@@ -5230,6 +5398,12 @@ namespace llaminar2
             return false;
         }
 
+        void *stream = explicitGPUStreamForOperation("populatePrefix");
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            return false;
+        }
+
         for (const auto &handle : hit.blocks)
         {
             if (!handle.valid() || !handle.layout.compatiblePayloadShape(prefix_layout_) ||
@@ -5254,6 +5428,7 @@ namespace llaminar2
                 desc.seq_idx = seq_idx;
                 desc.logical_token_start = handle.key.token_start;
                 desc.token_count = handle.key.token_count;
+                desc.stream = stream;
                 if (!state_.kv_cache->importLogicalBlock(desc, k_src, v_src))
                 {
                     return false;
@@ -5266,7 +5441,7 @@ namespace llaminar2
                 {
                     return false;
                 }
-                if (!importMTPPrefixPayload(*state_.mtp_kv_caches[0], seq_idx, handle))
+                if (!importMTPPrefixPayload(*state_.mtp_kv_caches[0], seq_idx, handle, stream))
                 {
                     return false;
                 }
@@ -5274,7 +5449,7 @@ namespace llaminar2
         }
 
         if (prefix_layout_.includes_hybrid_state &&
-            !importHybridPrefixPayload(*state_.kv_cache, hit.blocks.back(), seq_idx))
+            !importHybridPrefixPayload(*state_.kv_cache, hit.blocks.back(), seq_idx, /*synchronize=*/true, stream))
         {
             return false;
         }
@@ -5432,6 +5607,12 @@ namespace llaminar2
             return false;
         }
 
+        void *stream = explicitGPUStreamForOperation("harvestPrefix");
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            return false;
+        }
+
         const int complete_blocks =
             (prompt_token_count + prefix_layout_.block_size - 1) /
             prefix_layout_.block_size;
@@ -5498,6 +5679,7 @@ namespace llaminar2
                 desc.seq_idx = 0;
                 desc.logical_token_start = key.token_start;
                 desc.token_count = key.token_count;
+                desc.stream = stream;
                 ok = state_.kv_cache->exportLogicalBlock(desc, k_dst, v_dst);
                 if (!ok)
                 {
@@ -5521,7 +5703,7 @@ namespace llaminar2
                 }
                 else
                 {
-                    ok = exportMTPPrefixPayload(*state_.mtp_kv_caches[0], 0, key, &handle);
+                    ok = exportMTPPrefixPayload(*state_.mtp_kv_caches[0], 0, key, &handle, stream);
                     if (!ok)
                     {
                         LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: MTP payload export failed");
@@ -5535,7 +5717,9 @@ namespace llaminar2
                     *state_.kv_cache,
                     0,
                     key.token_start + key.token_count,
-                    &handle);
+                    &handle,
+                    /*synchronize=*/true,
+                    stream);
                 if (!ok)
                 {
                     LOG_DEBUG("[DeviceGraphOrchestrator] Prefix harvest failed: hybrid payload export failed");
@@ -5663,6 +5847,12 @@ namespace llaminar2
             return snapshot;
         }
 
+        void *stream = explicitGPUStreamForOperation("captureLivePrefixState");
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            return {};
+        }
+
         snapshot.valid = true;
         snapshot.cached_tokens = cached_tokens;
         if (cached_tokens > 0)
@@ -5710,6 +5900,7 @@ namespace llaminar2
                 desc.seq_idx = seq_idx;
                 desc.logical_token_start = 0;
                 desc.token_count = cached_tokens;
+                desc.stream = stream;
                 if (!state_.kv_cache->exportLogicalBlock(desc, k_dst, v_dst))
                 {
                     return {};
@@ -5720,7 +5911,9 @@ namespace llaminar2
                     *state_.kv_cache,
                     seq_idx,
                     cached_tokens,
-                    &handle))
+                    &handle,
+                    /*synchronize=*/true,
+                    stream))
             {
                 return {};
             }
@@ -5784,6 +5977,7 @@ namespace llaminar2
                 desc.seq_idx = seq_idx;
                 desc.logical_token_start = 0;
                 desc.token_count = mtp_cached_tokens;
+                desc.stream = stream;
                 if (!cache->exportLogicalBlock(desc, k_dst, v_dst))
                 {
                     return {};
@@ -5863,6 +6057,12 @@ namespace llaminar2
             return snapshot;
         }
 
+        void *stream = explicitGPUStreamForOperation("captureLivePrefixCheckpoint");
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            return {};
+        }
+
         const int draft_tokens =
             graph_builder_ ? std::max(1, graph_builder_->config().mtp.draft_tokens) : 1;
         const int main_headroom = draft_tokens + 2;
@@ -5940,7 +6140,8 @@ namespace llaminar2
                         seq_idx,
                         cached_tokens,
                         &handle,
-                        /*synchronize=*/false))
+                        /*synchronize=*/false,
+                        stream))
                 {
                     return {};
                 }
@@ -6020,6 +6221,12 @@ namespace llaminar2
                         " max_seq_len=" + std::to_string(state_.kv_cache->max_seq_len()));
         }
 
+        void *stream = explicitGPUStreamForOperation("restoreLivePrefixState");
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            return fail("missing explicit GPU stream");
+        }
+
         if (snapshot.logical_checkpoint)
         {
             if (!snapshot.mtp_blocks.empty())
@@ -6048,13 +6255,18 @@ namespace llaminar2
             {
                 return fail("logical checkpoint MTP cache count does not match runner state");
             }
-            if (!state_.kv_cache->truncateSequence(seq_idx, snapshot.cached_tokens))
+            if (!state_.kv_cache->truncateSequence(seq_idx, snapshot.cached_tokens, stream))
             {
                 return fail("main KV logical checkpoint truncate failed for tokens=" +
                             std::to_string(snapshot.cached_tokens));
             }
             if (snapshot.cached_tokens == 0)
             {
+                if (state_.device_id.is_gpu() &&
+                    dynamic_cast<IHybridKVCache *>(state_.kv_cache.get()))
+                {
+                    return fail("zero-token hybrid logical checkpoint restore requires streamful GDN reset");
+                }
                 resetHybridPrefixPayloadState(*state_.kv_cache);
             }
             else if (hybrid_handle)
@@ -6067,7 +6279,8 @@ namespace llaminar2
                         *state_.kv_cache,
                         *hybrid_handle,
                         seq_idx,
-                        /*synchronize=*/false))
+                        /*synchronize=*/false,
+                        stream))
                 {
                     return fail("logical checkpoint hybrid payload import failed");
                 }
@@ -6091,7 +6304,7 @@ namespace llaminar2
                                 std::to_string(depth) +
                                 " tokens=" + std::to_string(mtp_cached_tokens));
                 }
-                if (!cache->truncateSequence(seq_idx, mtp_cached_tokens))
+                if (!cache->truncateSequence(seq_idx, mtp_cached_tokens, stream))
                 {
                     return fail("MTP KV logical checkpoint truncate failed for depth=" +
                                 std::to_string(depth) +
@@ -6105,12 +6318,18 @@ namespace llaminar2
             return true;
         }
 
-        state_.kv_cache->clear_sequence(seq_idx);
+        if (!state_.kv_cache->truncateSequence(seq_idx, 0, stream))
+        {
+            return fail("main KV payload checkpoint clear failed");
+        }
         for (auto &cache : state_.mtp_kv_caches)
         {
             if (cache)
             {
-                cache->clear_sequence(seq_idx);
+                if (!cache->truncateSequence(seq_idx, 0, stream))
+                {
+                    return fail("MTP KV payload checkpoint clear failed");
+                }
             }
         }
 
@@ -6120,9 +6339,15 @@ namespace llaminar2
             {
                 return fail("zero-token snapshot unexpectedly contains MTP blocks");
             }
+            if (state_.device_id.is_gpu() &&
+                dynamic_cast<IHybridKVCache *>(state_.kv_cache.get()))
+            {
+                return fail("zero-token hybrid payload checkpoint restore requires streamful GDN reset");
+            }
             resetHybridPrefixPayloadState(*state_.kv_cache);
             state_.positions[seq_idx] = 0;
             state_.sequence_lengths[seq_idx] = 0;
+            handleLivePrefixReplayStateAfterMutation("restore_payload_checkpoint_zero");
             return true;
         }
 
@@ -6159,6 +6384,7 @@ namespace llaminar2
                 desc.seq_idx = seq_idx;
                 desc.logical_token_start = handle.key.token_start;
                 desc.token_count = handle.key.token_count;
+                desc.stream = stream;
                 if (!state_.kv_cache->importLogicalBlock(desc, k_src, v_src))
                 {
                     return fail("main KV logical block import failed for layer=" +
@@ -6169,7 +6395,12 @@ namespace llaminar2
         }
 
         if (!snapshot.blocks.empty() &&
-            !importHybridPrefixPayload(*state_.kv_cache, snapshot.blocks.back(), seq_idx))
+            !importHybridPrefixPayload(
+                *state_.kv_cache,
+                snapshot.blocks.back(),
+                seq_idx,
+                /*synchronize=*/true,
+                stream))
         {
             return fail("hybrid payload import failed");
         }
@@ -6221,6 +6452,7 @@ namespace llaminar2
                 desc.seq_idx = seq_idx;
                 desc.logical_token_start = handle.key.token_start;
                 desc.token_count = handle.key.token_count;
+                desc.stream = stream;
                 if (!cache->importLogicalBlock(desc, k_src, v_src))
                 {
                     return fail("MTP KV logical block import failed for layer=" +
@@ -6242,7 +6474,12 @@ namespace llaminar2
         {
             return false;
         }
-        if (!state_.kv_cache->truncateSequence(seq_idx, cached_tokens))
+        void *stream = explicitGPUStreamForOperation("truncateLivePrefixState");
+        if (state_.device_id.is_gpu() && !stream)
+        {
+            return false;
+        }
+        if (!state_.kv_cache->truncateSequence(seq_idx, cached_tokens, stream))
         {
             return false;
         }
@@ -6257,7 +6494,7 @@ namespace llaminar2
                 0,
                 cached_tokens - static_cast<int>(depth) - 1);
             const int bounded_count = std::min(shifted_count, cache->max_seq_len());
-            if (!cache->truncateSequence(seq_idx, bounded_count))
+            if (!cache->truncateSequence(seq_idx, bounded_count, stream))
             {
                 return false;
             }
@@ -6306,10 +6543,10 @@ namespace llaminar2
             return fail("non_hybrid_cache");
         }
 
-        void *stream = nullptr;
-        if (state_.device_id.is_gpu())
+        void *stream = explicitGPUStreamForOperation("restoreMTPVerifierStateRow");
+        if (state_.device_id.is_gpu() && !stream)
         {
-            stream = GPUDeviceContextPool::instance().getContext(state_.device_id).defaultStream();
+            return fail("missing_explicit_gpu_stream");
         }
 
         int restored_layers = 0;
@@ -6372,26 +6609,48 @@ namespace llaminar2
             state_.logits_local)
         {
             const int token_offset = vocabOffsetForTPConfig(graph_builder_->config());
+            void *stream = nullptr;
+            auto device_opt = state_.logits_local->current_device();
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = explicitGPUStreamForOperation("sampleGreedyOnDeviceLocal");
+                if (!stream)
+                {
+                    return -1;
+                }
+            }
             return coordinateGreedyCandidate(
                 sampleGreedyCandidateFromTensor(state_.logits_local.get(),
                                                 0,
                                                 token_offset,
                                                 argmax_partial_vals_dev_,
                                                 argmax_partial_idxs_dev_,
-                                                argmax_partial_capacity_),
+                                                argmax_partial_capacity_,
+                                                stream),
                 globalTPContextForMTPCoordination());
         }
 
         if (!state_.logits)
             return -1;
 
+        void *stream = nullptr;
+        auto device_opt = state_.logits->current_device();
+        if (device_opt.has_value() && device_opt->is_gpu())
+        {
+            stream = explicitGPUStreamForOperation("sampleGreedyOnDevice");
+            if (!stream)
+            {
+                return -1;
+            }
+        }
         return coordinateGreedyCandidate(
             sampleGreedyCandidateFromTensor(state_.logits.get(),
                                             0,
                                             0,
                                             argmax_partial_vals_dev_,
                                             argmax_partial_idxs_dev_,
-                                            argmax_partial_capacity_),
+                                            argmax_partial_capacity_,
+                                            stream),
             globalTPContextForMTPCoordination());
     }
 

@@ -508,6 +508,11 @@ namespace
             captured_snapshot_ = std::move(snapshot);
             use_captured_snapshot_ = true;
         }
+        void setVerifierAcceptedPrefixScript(std::vector<int> script)
+        {
+            verifier_accepted_prefix_script_ = std::move(script);
+            verifier_accepted_prefix_script_index_ = 0;
+        }
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
         {
             (void)seq_idx;
@@ -618,19 +623,42 @@ namespace
         void setupAllPositionLogits(int seq_len)
         {
             all_position_logits_.assign(static_cast<size_t>(seq_len) * VOCAB_SIZE, -10.0f);
-            const int row0_token = accept_mtp_token_ ? MTP_ARGMAX_TOKEN : VERIFY_REJECT_TOKEN;
-            all_position_logits_[row0_token] = 10.0f;
-            if (seq_len > 1)
+            int accepted_prefix = accept_mtp_token_ ? 1 : 0;
+            if (verifier_accepted_prefix_script_index_ < verifier_accepted_prefix_script_.size())
             {
-                all_position_logits_[VOCAB_SIZE + DECODE_ARGMAX_TOKEN] = 10.0f;
+                accepted_prefix =
+                    verifier_accepted_prefix_script_[verifier_accepted_prefix_script_index_++];
+            }
+            const int speculative_depth = std::max(0, seq_len - 1);
+            accepted_prefix = std::clamp(accepted_prefix, 0, speculative_depth);
+
+            for (int row = 0; row < seq_len; ++row)
+            {
+                int token = DECODE_ARGMAX_TOKEN;
+                if (row < speculative_depth)
+                {
+                    if (row < accepted_prefix)
+                        token = MTP_ARGMAX_TOKEN;
+                    else
+                        token = row == 0 ? VERIFY_REJECT_TOKEN : DECODE_ARGMAX_TOKEN;
+                }
+                all_position_logits_[static_cast<size_t>(row) * VOCAB_SIZE +
+                                     static_cast<size_t>(token)] = 10.0f;
             }
             if (column_parallel_logits_)
             {
                 resetLocalTensor(all_position_logits_local_, seq_len);
-                setLocalToken(all_position_logits_local_, 0, row0_token, 10.0f);
-                if (seq_len > 1)
+                for (int row = 0; row < seq_len; ++row)
                 {
-                    setLocalToken(all_position_logits_local_, 1, DECODE_ARGMAX_TOKEN, 10.0f);
+                    int token = DECODE_ARGMAX_TOKEN;
+                    if (row < speculative_depth)
+                    {
+                        if (row < accepted_prefix)
+                            token = MTP_ARGMAX_TOKEN;
+                        else
+                            token = row == 0 ? VERIFY_REJECT_TOKEN : DECODE_ARGMAX_TOKEN;
+                    }
+                    setLocalToken(all_position_logits_local_, row, token, 10.0f);
                 }
             }
         }
@@ -718,6 +746,8 @@ namespace
         std::vector<int> last_forward_tokens_;
         std::vector<std::vector<int>> forward_history_;
         std::vector<int> last_commit_mtp_tokens_;
+        std::vector<int> verifier_accepted_prefix_script_;
+        size_t verifier_accepted_prefix_script_index_{0};
         int last_forward_seq_len_{0};
         int position_{0};
     };
@@ -763,7 +793,8 @@ namespace
                                                                              DeviceId primary_device = DeviceId::cpu(),
                                                                              int mtp_draft_tokens = 1,
                                                                              bool chained_mtp_support = false,
-                                                                             bool sidecar_sample_fusion = false)
+                                                                             bool sidecar_sample_fusion = false,
+                                                                             MTPDepthPolicyConfig depth_policy = {})
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -796,6 +827,7 @@ namespace
             config.mtp.enabled = mtp_enabled;
             config.mtp.draft_tokens = mtp_draft_tokens;
             config.mtp.verify_mode = MTPVerifyMode::Greedy;
+            config.mtp.depth_policy = depth_policy;
 
             std::unique_ptr<OrchestrationRunner> runner;
             if (mpi_ctx)
@@ -1156,6 +1188,145 @@ namespace
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthDemotesAfterZeroAcceptWindow)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = 3;
+        depth_policy.initial_depth = 3;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+        depth_policy.demote_zero_accept_rate = 0.30;
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            depth_policy);
+        mock->setVerifierAcceptedPrefixScript({0, 0});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 2);
+        auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 2);
+        EXPECT_EQ(probe.mtp_depth_policy_demotions, 1u);
+        EXPECT_EQ(probe.mtp_depth_policy_updates, 1u);
+
+        GenerationResult step2 = runner->decodeStep();
+        ASSERT_TRUE(step2.success()) << step2.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 2);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 3)
+            << "second step should use depth 2 after the first demotion";
+        probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 1);
+        EXPECT_EQ(probe.mtp_depth_policy_demotions, 2u);
+        EXPECT_EQ(probe.mtp_request.depth_policy_mode, "dynamic");
+        EXPECT_TRUE(probe.mtp_request.adaptive_depth_enabled);
+        EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "demote_zero_accept_rate");
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthPromotesAfterFullAcceptWindows)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = 3;
+        depth_policy.initial_depth = 1;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+        depth_policy.promote_full_accept_rate = 0.75;
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            depth_policy);
+        mock->setVerifierAcceptedPrefixScript({1, 2});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 0);
+        auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 2);
+        EXPECT_EQ(probe.mtp_depth_policy_promotions, 1u);
+
+        GenerationResult step2 = runner->decodeStep();
+        ASSERT_TRUE(step2.success()) << step2.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 2);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 1)
+            << "second step should use depth 2 before promoting to depth 3";
+        probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 3);
+        EXPECT_EQ(probe.mtp_depth_policy_promotions, 2u);
+        EXPECT_EQ(probe.mtp_depth_policy_updates, 2u);
+        EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "promote_full_accept_rate");
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, FixedMTPDepthRemainsHardPinned)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Fixed;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = 1;
+        depth_policy.initial_depth = 1;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            depth_policy);
+        mock->setVerifierAcceptedPrefixScript({0});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 2)
+            << "fixed depth must use the hard-pinned --mtp-draft-tokens value";
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 3);
+        EXPECT_EQ(probe.mtp_min_depth, 3);
+        EXPECT_EQ(probe.mtp_max_depth, 3);
+        EXPECT_EQ(probe.mtp_depth_policy_windows, 0u);
+        EXPECT_EQ(probe.mtp_depth_policy_updates, 0u);
+        EXPECT_FALSE(probe.mtp_request.adaptive_depth_enabled);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPChainedFirstSpecRejectUsesLaggedCorrectionReplay)

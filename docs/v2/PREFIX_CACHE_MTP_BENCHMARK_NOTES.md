@@ -18,48 +18,47 @@ speedup. Detailed tuning history belongs in commit messages or perf artifacts.
 
 ## Latest ROCm Dense Evidence
 
-Fresh Release captures on 2026-06-03 used no ROCm tuning env overrides beyond
-perf export and logging. Benchmark mode auto-enabled the production prefill
-bucket defaults for single-device runs and GPU graphs were left at their code
-default.
-
-- Long lane baseline: `/tmp/llaminar-mtp-bench/dense-rocm-final-baseline-c64-n48-bench.json`
-- Long lane MTP depth 3: `/tmp/llaminar-mtp-bench/dense-rocm-final-mtp-d3-c64-n48-bench.json`
-- Default baseline: `/tmp/llaminar-mtp-bench/dense-rocm-final-default-baseline-bench.json`
-- Default MTP depth 3: `/tmp/llaminar-mtp-bench/dense-rocm-final-default-mtp-d3-bench.json`
-- Matching perf stats: same prefixes with `-stats.json` and `-stats.csv`.
-
-Long lane MTP telemetry: 86.33% acceptance, 120 accepted tokens, 19 rejected
-tokens, 19 rollbacks, 53 verifier runs, and 210 verifier tokens. Structured
-stats show fully segmented graph replay for the dense verifier path, sidecar
-sample-sync fusion, batched verifier-token sampling, GDN rollback-row shortcuts,
-and graph-native small-M ROCm VNNI routes.
-
-Default MTP telemetry: 61.99% acceptance, 212 accepted tokens, 130 rejected
-tokens, 130 rollbacks, 170 verifier runs, and 675 verifier tokens. The lower
-speedup is mainly acceptance-limited rather than graph-capture-limited.
+Fresh Release captures on 2026-06-03 used code-default GPU graphs and production
+prefill buckets. The long lane shows graph-captured depth-3 MTP is speed-positive
+but still short of the 2x target. The default benchmark prompt remains
+acceptance-limited: depth 3 drops to about 62-63% acceptance, so adaptive depth is
+needed instead of hard-pinning the deepest draft.
 
 ## Adaptive Depth Motivation
 
-The default benchmark prompt is open-ended technical prose, and fixed depth 3
-overreaches compared with shallower drafts:
+`MTPDepthController` is now implemented with fixed, observe, and dynamic modes.
+The first reusable hysteresis sweep is
+`scripts/run_mtp_depth_hysteresis_sweep.sh`.
 
-| Depth | Decode | Speedup | Acceptance | Accepted | Rejected | Rollbacks |
-|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 39.72 tok/s | 1.33x | 73.44% | 188 | 68 | 68 |
-| 2 | 39.42 tok/s | 1.32x | 65.84% | 212 | 110 | 110 |
-| 3 | 34.96 tok/s | 1.17x | 61.99% | 212 | 130 | 130 |
+Latest ROCm release sweep, Qwen3.6 27B Q4_K_S on `rocm:0`, 2026-06-03:
 
-Phase 14 should add an observe/dynamic MTP depth controller that demotes on
-zero-accept or low-acceptance windows and promotes when full-depth accepts are
-stable. The policy must only choose proposal depth; verifier output remains the
-correctness source.
+| Case | Depth policy | Decode | Acceptance | Final depth | Updates | Notes |
+|---|---|---:|---:|---:|---:|---|
+| `qbf_short` | fixed d1 | 45.52 tok/s | 89.58% | 1 | 0 | reference |
+| `qbf_short` | fixed d3 | 43.76 tok/s | 85.61% | 3 | 0 | reference |
+| `qbf_short` | dynamic max d3 | 49.08 tok/s | 85.61% | 3 | 0 | stayed deep |
+| default benchmark prompt | fixed d1 | 35.58 tok/s | 69.92% | 1 | 0 | best fixed in this sweep |
+| default benchmark prompt | fixed d3 | 31.50 tok/s | 63.48% | 3 | 0 | overreaches |
+| default benchmark prompt | dynamic max d3 | 33.50 tok/s | 67.53% | 1 | 8 | demotes, but pays learning cost |
+| `qbf_long` | fixed d1 | 47.49 tok/s | 92.97% | 1 | 0 | best fixed in this sweep |
+| `qbf_long` | fixed d3 | 40.83 tok/s | 78.15% | 3 | 0 | overreaches here |
+| `qbf_long` | dynamic max d3 | 38.75 tok/s | 78.79% | 2 | 5 | stable after stream fix |
+
+Artifacts live under
+`/tmp/llaminar-mtp-bench/adaptive-depth-20260603/`. Dynamic mode now makes the
+right qualitative choices: it stays deep for high-acceptance short prompts and
+demotes acceptance-limited prompts. Whole-run speed on the default prompt still
+trails fixed d1 because the controller starts at max depth and spends early
+windows learning; tuning initial depth/window policy is the next adaptive slice.
 
 ## Main Tuning Actions Landed
 
 - Stabilized ROCm graph-captured MTP sidecar stream binding and fused sampling
   ordering; regression: `V2_Unit_GraphExecutorCollective` plus the focused
   draft-3 graph-stream stress parity test.
+- Added hard failures for GPU stage execution, MTP deferred sampling, and greedy
+  GPU sampling when an explicit non-null stream is unavailable; regression:
+  `V2_Unit_Static_NoDefaultStreamInGPUCode`.
 - Added stable verifier graph lifetime handling for all-position logits and
   budget-aware draft-depth clamping.
 - Added batched ROCm verifier-row argmax through declared graph workspace.
@@ -70,8 +69,5 @@ correctness source.
 
 ## Next Work
 
-ROCm dense is speed-positive but not at the 2x Phase 14 target. The next dense
-work is reducing captured verifier replay cost and implementing adaptive MTP
-depth so general prompts avoid regressive fixed-depth choices. After that, move
-to Qwen3.6 MoE MTP tuning on ROCm, then back through CUDA, CPU, and the
-multi-participant matrix.
+Tune adaptive initial/window policy, then move to Qwen3.6 MoE MTP on ROCm before
+returning through CUDA, CPU, and the multi-participant matrix.

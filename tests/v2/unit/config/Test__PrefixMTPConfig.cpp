@@ -50,6 +50,16 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
     EXPECT_EQ(config.mtp.draft_tokens, 1);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
     EXPECT_TRUE(config.mtp.require_terminal_hidden_for_full_hit);
+    EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Fixed);
+    EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
+    EXPECT_EQ(config.mtp.depth_policy.max_depth, 0);
+    EXPECT_EQ(config.mtp.depth_policy.initial_depth, 0);
+    EXPECT_EQ(config.mtp.depth_policy.window_size, 16);
+    EXPECT_EQ(config.mtp.depth_policy.min_samples, 8);
+    EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 8);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 1.0);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.30);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.70);
 }
 
 TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
@@ -68,6 +78,15 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
         "--mtp",
         "--mtp-draft-tokens", "2",
         "--mtp-verify-mode", "speculative-sampling",
+        "--mtp-depth-policy", "dynamic",
+        "--mtp-min-draft-tokens", "1",
+        "--mtp-max-draft-tokens", "3",
+        "--mtp-depth-window", "8",
+        "--mtp-depth-min-samples", "4",
+        "--mtp-depth-cooldown", "2",
+        "--mtp-depth-promote-full-accept", "0.70",
+        "--mtp-depth-demote-zero-accept", "0.25",
+        "--mtp-depth-demote-acceptance", "0.60",
     });
 
     auto parser = createOrchestrationConfigParser();
@@ -86,6 +105,15 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
     EXPECT_TRUE(config.mtp.enabled);
     EXPECT_EQ(config.mtp.draft_tokens, 2);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
+    EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+    EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
+    EXPECT_EQ(config.mtp.depth_policy.max_depth, 3);
+    EXPECT_EQ(config.mtp.depth_policy.window_size, 8);
+    EXPECT_EQ(config.mtp.depth_policy.min_samples, 4);
+    EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 2);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 0.70);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.25);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.60);
 }
 
 TEST(Test__PrefixMTPConfig, ParserRejectsInvalidPrefixAndMTPEnums)
@@ -110,6 +138,16 @@ TEST(Test__PrefixMTPConfig, ParserRejectsInvalidPrefixAndMTPEnums)
         auto parser = createOrchestrationConfigParser();
         EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
     }
+    {
+        ArgvHelper args({"llaminar2", "--mtp-depth-policy", "random-walk"});
+        auto parser = createOrchestrationConfigParser();
+        EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args({"llaminar2", "--mtp-depth-demote-zero-accept", "1.5"});
+        auto parser = createOrchestrationConfigParser();
+        EXPECT_THROW(parser->parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
 }
 
 TEST(Test__PrefixMTPConfig, YamlSectionsParsePrefixCacheAndMTP)
@@ -130,6 +168,16 @@ mtp:
   draft_tokens: 3
   verify_mode: greedy
   require_terminal_hidden_for_full_hit: false
+  depth_policy: observe
+  min_draft_tokens: 1
+  max_draft_tokens: 3
+  initial_draft_tokens: 2
+  depth_window: 12
+  depth_min_samples: 6
+  depth_cooldown: 3
+  depth_promote_full_accept: 0.8
+  depth_demote_zero_accept: 0.2
+  depth_demote_acceptance: 0.55
 )yaml";
 
     OrchestrationConfigParser parser;
@@ -149,6 +197,16 @@ mtp:
     EXPECT_EQ(config.mtp.draft_tokens, 3);
     EXPECT_EQ(config.mtp.verify_mode, MTPVerifyMode::Greedy);
     EXPECT_FALSE(config.mtp.require_terminal_hidden_for_full_hit);
+    EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Observe);
+    EXPECT_EQ(config.mtp.depth_policy.min_depth, 1);
+    EXPECT_EQ(config.mtp.depth_policy.max_depth, 3);
+    EXPECT_EQ(config.mtp.depth_policy.initial_depth, 2);
+    EXPECT_EQ(config.mtp.depth_policy.window_size, 12);
+    EXPECT_EQ(config.mtp.depth_policy.min_samples, 6);
+    EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 3);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 0.8);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.2);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
 }
 
 TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
@@ -166,6 +224,9 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     source.mtp.enabled = true;
     source.mtp.draft_tokens = 2;
     source.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+    source.mtp.depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+    source.mtp.depth_policy.max_depth = 3;
+    source.mtp.depth_policy.window_size = 8;
 
     RuntimeConfig runtime = RuntimeConfig::fromOrchestrationConfig(
         source.max_seq_len,
@@ -199,6 +260,9 @@ TEST(Test__PrefixMTPConfig, RuntimeConfigSurvivesPlanRunnerAndGraphCopies)
     EXPECT_TRUE(graph_config.mtp.enabled);
     EXPECT_EQ(graph_config.mtp.draft_tokens, 2);
     EXPECT_EQ(graph_config.mtp.verify_mode, MTPVerifyMode::SpeculativeSampling);
+    EXPECT_EQ(graph_config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+    EXPECT_EQ(graph_config.mtp.depth_policy.max_depth, 3);
+    EXPECT_EQ(graph_config.mtp.depth_policy.window_size, 8);
 }
 
 TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings)
@@ -217,6 +281,9 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     config.mtp.draft_tokens = 2;
     config.mtp.verify_mode = MTPVerifyMode::Greedy;
     config.mtp.require_terminal_hidden_for_full_hit = false;
+    config.mtp.depth_policy.mode = MTPDepthPolicyMode::Observe;
+    config.mtp.depth_policy.max_depth = 3;
+    config.mtp.depth_policy.window_size = 8;
 
     const std::string explanation = config.toString();
 
@@ -233,5 +300,8 @@ TEST(Test__PrefixMTPConfig, ExplanationIncludesResolvedPrefixCacheAndMTPSettings
     EXPECT_NE(explanation.find("mtp:"), std::string::npos);
     EXPECT_NE(explanation.find("draft_tokens: 2"), std::string::npos);
     EXPECT_NE(explanation.find("verify_mode: greedy"), std::string::npos);
+    EXPECT_NE(explanation.find("depth_policy: observe"), std::string::npos);
+    EXPECT_NE(explanation.find("max_draft_tokens: 3"), std::string::npos);
+    EXPECT_NE(explanation.find("depth_window: 8"), std::string::npos);
     EXPECT_NE(explanation.find("require_terminal_hidden_for_full_hit: false"), std::string::npos);
 }

@@ -43,9 +43,19 @@ TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeToken
     runDenseMTPParity(singleDeviceCase(), false, 3);
 }
 
+TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
+{
+    runDenseDynamicMTPParity(singleDeviceCase(), false);
+}
+
 TEST(Qwen36SingleDevicePrefixMTPParity, PrefixCacheMTPRestore)
 {
     runDenseMTPParity(singleDeviceCase(), true);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, PrefixCacheMTPDynamicDepthRestore)
+{
+    runDenseDynamicMTPParity(singleDeviceCase(), true);
 }
 
 int main(int argc, char **argv)

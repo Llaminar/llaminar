@@ -238,6 +238,16 @@ namespace llaminar2
         }
 
         /**
+         * @brief Flush deferred sidecar GPU work before checkpoint/verifier reads.
+         *
+         * Graph-captured MTP sidecars may defer their final stream sync so a
+         * fused sampler can run on the same stream. Callers that need to read
+         * or checkpoint sidecar-mutated KV/GDN state before sampling must make
+         * that ordering explicit through this hook.
+         */
+        virtual bool flushPendingMTPWork() { return true; }
+
+        /**
          * @brief Commit shifted MTP KV rows from the most recent main forward.
          *
          * MTP decode calls forwardMTP() before verifier/replay; that sidecar

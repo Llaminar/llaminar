@@ -556,6 +556,7 @@ namespace llaminar2
             ss << "    mtp.enabled: " << (runtime.mtp.enabled ? "true" : "false") << "\n";
             ss << "    mtp.draft_tokens: " << runtime.mtp.draft_tokens << "\n";
             ss << "    mtp.verify_mode: " << mtpVerifyModeToString(runtime.mtp.verify_mode) << "\n";
+            ss << "    mtp.depth_policy: " << mtpDepthPolicyModeToString(runtime.mtp.depth_policy.mode) << "\n";
             ss << "}";
             return ss.str();
         }
