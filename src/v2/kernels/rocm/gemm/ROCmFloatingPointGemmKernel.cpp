@@ -33,6 +33,17 @@
 #include <atomic>
 #include <hip/hip_runtime.h>
 
+extern "C" bool rocmFp32_tiny_batched_projection(
+    const float *const *d_A_array,
+    const float *const *d_B_array,
+    float *const *d_C_array,
+    int M,
+    int N,
+    int K,
+    int batch_count,
+    int device_id,
+    void *stream);
+
 namespace llaminar2
 {
     namespace rocm
@@ -611,38 +622,83 @@ namespace llaminar2
                 if (!uploadBatchedPointersIfChanged(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
                     return false;
 
-                if (!hipblas_kernel_->execute_batched(
-                        d_batch_A_ptrs_,
-                        d_batch_B_ptrs_,
-                        d_batch_C_ptrs_,
-                        m,
-                        seed.n,
-                        k,
-                        static_cast<int>(group_indices.size()),
-                        false,
-                        true,
-                        1.0f,
-                        0.0f))
-                {
-                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] hipBLAS batched SGEMM failed"
-                              << " group_size=" << group_indices.size()
-                              << " M=" << m << " N=" << seed.n << " K=" << k);
-                    return false;
-                }
+                const int batch_count = static_cast<int>(group_indices.size());
+                const bool use_tiny_fp32 =
+                    m > 0 && m <= 4 &&
+                    seed.n > 0 && seed.n <= 64 &&
+                    k > 0 &&
+                    batch_count > 0 &&
+                    batch_count <= static_cast<int>(MAX_FP32_BATCHED_PROJECTIONS);
 
-                if (PerfStatsCollector::isEnabled())
+                if (use_tiny_fp32)
                 {
-                    PerfStatsCollector::addCounter(
-                        "kernel",
-                        "rocm_fp32_batched_projection_calls",
-                        1.0,
-                        "gemm",
-                        "rocm:" + std::to_string(rocm_device_id_),
-                        PerfStatsCollector::Tags{
-                            {"m", std::to_string(m)},
-                            {"n", std::to_string(seed.n)},
-                            {"k", std::to_string(k)},
-                            {"batch", std::to_string(group_indices.size())}});
+                    if (!rocmFp32_tiny_batched_projection(
+                            d_batch_A_ptrs_,
+                            d_batch_B_ptrs_,
+                            d_batch_C_ptrs_,
+                            m,
+                            seed.n,
+                            k,
+                            batch_count,
+                            rocm_device_id_,
+                            gpu_stream_))
+                    {
+                        LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Tiny FP32 batched projection failed"
+                                  << " group_size=" << batch_count
+                                  << " M=" << m << " N=" << seed.n << " K=" << k);
+                        return false;
+                    }
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_fp32_tiny_batched_projection_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"n", std::to_string(seed.n)},
+                                {"k", std::to_string(k)},
+                                {"batch", std::to_string(batch_count)}});
+                    }
+                }
+                else
+                {
+                    if (!hipblas_kernel_->execute_batched(
+                            d_batch_A_ptrs_,
+                            d_batch_B_ptrs_,
+                            d_batch_C_ptrs_,
+                            m,
+                            seed.n,
+                            k,
+                            batch_count,
+                            false,
+                            true,
+                            1.0f,
+                            0.0f))
+                    {
+                        LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] hipBLAS batched SGEMM failed"
+                                  << " group_size=" << batch_count
+                                  << " M=" << m << " N=" << seed.n << " K=" << k);
+                        return false;
+                    }
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "rocm_fp32_batched_projection_calls",
+                            1.0,
+                            "gemm",
+                            "rocm:" + std::to_string(rocm_device_id_),
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"n", std::to_string(seed.n)},
+                                {"k", std::to_string(k)},
+                                {"batch", std::to_string(batch_count)}});
+                    }
                 }
 
                 for (size_t index : group_indices)

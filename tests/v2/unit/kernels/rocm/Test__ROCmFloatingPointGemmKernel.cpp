@@ -20,16 +20,55 @@
 #include "tensors/Tensors.h"
 #include "backends/ComputeBackend.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <random>
+#include <string>
 #include <vector>
 #include <chrono>
 #include <numeric>
 
 using namespace llaminar2;
 using namespace llaminar2::rocm;
+
+namespace
+{
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old_value = std::getenv(name);
+            if (old_value)
+            {
+                had_old_value_ = true;
+                old_value_ = old_value;
+            }
+            setenv(name_.c_str(), value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_value_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        bool had_old_value_ = false;
+        std::string old_value_;
+    };
+}
 
 // ============================================================================
 // Test Fixture
@@ -410,6 +449,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionWorkspaceNamesMe
 
 TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedBatchedFusedProjectionAlphaBetaM2MatchesReference)
 {
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
     const size_t M = 2, N = 32, K = 256;
 
     auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
@@ -495,6 +537,49 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedBatchedFusedProjectionAlp
     const float beta_cosine = compute_cosine_similarity(ref_beta, got_beta);
     EXPECT_GT(alpha_cosine, 0.9999f);
     EXPECT_GT(beta_cosine, 0.9999f);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    const auto tiny_route = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.kind == PerfStatRecord::Kind::Counter &&
+                   record.domain == "kernel" &&
+                   record.name == "rocm_fp32_tiny_batched_projection_calls" &&
+                   record.device == "rocm:0" &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == "2" &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == "32" &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == "256" &&
+                   record.tags.count("batch") != 0 &&
+                   record.tags.at("batch") == "2";
+        });
+    ASSERT_NE(tiny_route, records.end())
+        << "Graph-captured M=2 alpha/beta projections should use the ROCm tiny FP32 batched route";
+    EXPECT_GE(tiny_route->value, 1.0);
+
+    const auto hipblas_route = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.kind == PerfStatRecord::Kind::Counter &&
+                   record.domain == "kernel" &&
+                   record.name == "rocm_fp32_batched_projection_calls" &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == "2" &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == "32" &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == "256" &&
+                   record.tags.count("batch") != 0 &&
+                   record.tags.at("batch") == "2";
+        });
+    EXPECT_EQ(hipblas_route, records.end())
+        << "Tiny graph-captured FP32 projection shapes should not pay hipBLAS batched launch overhead";
 
     EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
     EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
