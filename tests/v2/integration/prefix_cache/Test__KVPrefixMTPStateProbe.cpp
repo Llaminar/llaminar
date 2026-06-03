@@ -370,6 +370,108 @@ namespace
             0);
     }
 
+    int qwen36CudaSingleDeviceOrdinal()
+    {
+        return firstIntEnvOrDefault(
+            {"LLAMINAR_QWEN36_CUDA_DEVICE", "LLAMINAR_TEST_CUDA_DEVICE"},
+            0);
+    }
+
+    void runQwen36MTPGpuGraphsStochasticRealModelSmoke(
+        GlobalDeviceAddress device,
+        const std::string &backend_name)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+            {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_stochastic_mtp_stats.json"},
+            {"LLAMINAR_PERF_STATS_FILTER", "mtp"},
+        });
+        PerfStatsCollector::reset();
+
+        const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+        if (!env_model)
+            env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+        const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+        }
+
+        OrchestrationConfig config = OrchestrationConfig::defaults();
+        config.model_path = model_path;
+        config.max_seq_len = 32;
+        config.batch_size = 1;
+        config.tp_degree = 1;
+        config.pp_degree = 1;
+        config.device_for_this_rank = device;
+        config.kv_cache_precision = "auto";
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+        config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(config);
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        auto tokenizer = runner->tokenizer();
+        ASSERT_NE(tokenizer, nullptr);
+        const auto encoded = tokenizer->encode("The quick brown fox", /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded.empty());
+        const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+
+        SamplingParams stochastic;
+        stochastic.temperature = 0.6f;
+        stochastic.top_k = 20;
+        stochastic.top_p = 0.95f;
+        stochastic.seed = 123;
+
+        auto result = runner->generate(prompt, 6, stochastic);
+        const auto snapshot = runner->prefixStateProbe();
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        runner->shutdown();
+
+        auto counter = [&](const std::string &name)
+        {
+            double total = 0.0;
+            for (const auto &record : records)
+            {
+                if (record.kind == PerfStatRecord::Kind::Counter &&
+                    record.domain == "mtp" &&
+                    record.name == name &&
+                    record.phase == "decode")
+                {
+                    total += record.value;
+                }
+            }
+            return total;
+        };
+
+        ASSERT_TRUE(result.error.empty()) << result.error;
+        ASSERT_EQ(result.tokens.size(), 6u);
+        EXPECT_TRUE(snapshot.mtp_config_enabled);
+        EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
+        EXPECT_GE(snapshot.mtp_draft_steps, 1u);
+        EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
+        EXPECT_GE(snapshot.mtp_verifier_token_count, 2u);
+        EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u)
+            << "Speculative-sampling mode must actually verify at least one draft token on "
+            << backend_name;
+        EXPECT_GE(counter("first_token_stochastic_device_samples"), 1.0);
+        EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0);
+        EXPECT_GE(counter("verifier_stochastic_device_distributions"), 2.0);
+        EXPECT_GE(counter("stochastic_accept_tests"), 1.0);
+        EXPECT_EQ(counter("first_token_stochastic_samples"), 0.0)
+            << backend_name << " stochastic MTP must not sample first token from host full logits";
+        EXPECT_EQ(counter("mtp_token_stochastic_samples"), 0.0)
+            << backend_name << " stochastic MTP must not sample sidecar drafts from host full logits";
+        EXPECT_EQ(counter("verifier_stochastic_distributions"), 0.0)
+            << backend_name << " stochastic MTP must not build verifier distributions from host full logits";
+    }
+
     int mpiWorldSize()
     {
         int world_size = 1;
@@ -1632,25 +1734,6 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsRealModelSmoke)
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke)
 {
-    ScopedDebugEnv env({
-        {"LLAMINAR_GPU_GRAPHS", "1"},
-        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
-        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
-        {"LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_qwen36_stochastic_mtp_stats.json"},
-        {"LLAMINAR_PERF_STATS_FILTER", "mtp"},
-    });
-    PerfStatsCollector::reset();
-
-    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
-    if (!env_model)
-        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
-    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
-
-    if (!std::filesystem::exists(model_path))
-    {
-        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
-    }
-
     auto &dm = DeviceManager::instance();
     dm.initialize(-1, false);
     if (dm.rocm_device_count() <= 0)
@@ -1661,76 +1744,26 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke
     ASSERT_GE(rocm_ordinal, 0);
     ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
         << "Selected ROCm device ordinal is outside the available device range";
+    runQwen36MTPGpuGraphsStochasticRealModelSmoke(
+        GlobalDeviceAddress::rocm(rocm_ordinal),
+        "ROCm");
+}
 
-    OrchestrationConfig config = OrchestrationConfig::defaults();
-    config.model_path = model_path;
-    config.max_seq_len = 32;
-    config.batch_size = 1;
-    config.tp_degree = 1;
-    config.pp_degree = 1;
-    config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
-    config.kv_cache_precision = "auto";
-    config.mtp.enabled = true;
-    config.mtp.draft_tokens = 1;
-    config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
-
-    auto factory = createOrchestrationRunnerFactory();
-    auto runner = factory->createFromOrchestrationConfig(config);
-    ASSERT_NE(runner, nullptr);
-    ASSERT_TRUE(runner->initialize()) << runner->lastError();
-
-    auto tokenizer = runner->tokenizer();
-    ASSERT_NE(tokenizer, nullptr);
-    const auto encoded = tokenizer->encode("The quick brown fox", /*add_bos=*/false, /*add_eos=*/false);
-    ASSERT_FALSE(encoded.empty());
-    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
-
-    SamplingParams stochastic;
-    stochastic.temperature = 0.6f;
-    stochastic.top_k = 20;
-    stochastic.top_p = 0.95f;
-    stochastic.seed = 123;
-
-    auto result = runner->generate(prompt, 6, stochastic);
-    const auto snapshot = runner->prefixStateProbe();
-    const auto records = PerfStatsCollector::snapshot({"mtp"});
-    runner->shutdown();
-
-    auto counter = [&](const std::string &name)
+TEST(Test__KVPrefixMTPStateProbe, Qwen36CUDAMTPGpuGraphsStochasticRealModelSmoke)
+{
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.cuda_device_count() <= 0)
     {
-        double total = 0.0;
-        for (const auto &record : records)
-        {
-            if (record.kind == PerfStatRecord::Kind::Counter &&
-                record.domain == "mtp" &&
-                record.name == name &&
-                record.phase == "decode")
-            {
-                total += record.value;
-            }
-        }
-        return total;
-    };
-
-    ASSERT_TRUE(result.error.empty()) << result.error;
-    ASSERT_EQ(result.tokens.size(), 6u);
-    EXPECT_TRUE(snapshot.mtp_config_enabled);
-    EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
-    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
-    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
-    EXPECT_GE(snapshot.mtp_verifier_token_count, 2u);
-    EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u)
-        << "Speculative-sampling mode must actually verify at least one draft token";
-    EXPECT_GE(counter("first_token_stochastic_device_samples"), 1.0);
-    EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0);
-    EXPECT_GE(counter("verifier_stochastic_device_distributions"), 2.0);
-    EXPECT_GE(counter("stochastic_accept_tests"), 1.0);
-    EXPECT_EQ(counter("first_token_stochastic_samples"), 0.0)
-        << "supported GPU stochastic MTP must not sample first token from host full logits";
-    EXPECT_EQ(counter("mtp_token_stochastic_samples"), 0.0)
-        << "supported GPU stochastic MTP must not sample sidecar drafts from host full logits";
-    EXPECT_EQ(counter("verifier_stochastic_distributions"), 0.0)
-        << "supported GPU stochastic MTP must not build verifier distributions from host full logits";
+        GTEST_SKIP() << "No CUDA device available for Qwen3.6 stochastic MTP GPU-graphs smoke";
+    }
+    const int cuda_ordinal = qwen36CudaSingleDeviceOrdinal();
+    ASSERT_GE(cuda_ordinal, 0);
+    ASSERT_LT(cuda_ordinal, dm.cuda_device_count())
+        << "Selected CUDA device ordinal is outside the available device range";
+    runQwen36MTPGpuGraphsStochasticRealModelSmoke(
+        GlobalDeviceAddress::cuda(cuda_ordinal),
+        "CUDA");
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmoke)
