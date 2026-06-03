@@ -29,28 +29,29 @@ deepest draft.
 The first reusable hysteresis sweep is
 `scripts/run_mtp_depth_hysteresis_sweep.sh`.
 
-Latest ROCm release sweep after early-demotion tuning, Qwen3.6 27B Q4_K_S on
-`rocm:0`, 2026-06-03:
+Latest ROCm release sweeps after the controller lifetime fix, Qwen3.6 27B
+Q4_K_S on `rocm:0`, 2026-06-03:
 
 | Case | Depth policy | Decode | Acceptance | Final depth | Updates | Notes |
 |---|---|---:|---:|---:|---:|---|
-| `qbf_short` | fixed d1 | 48.22 tok/s | 92.71% | 1 | 0 | reference |
-| `qbf_short` | fixed d3 | 52.91 tok/s | 85.61% | 3 | 0 | best fixed |
-| `qbf_short` | dynamic max d3 | 52.70 tok/s | 87.41% | 3 | 1 | tied with d3 |
-| default benchmark prompt | fixed d1 | 36.36 tok/s | 71.88% | 1 | 0 | best fixed |
-| default benchmark prompt | fixed d3 | 33.62 tok/s | 60.76% | 3 | 0 | overreaches |
-| default benchmark prompt | dynamic max d3 | 37.81 tok/s | 73.45% | 1 | 5 | beats fixed in this sweep |
-| `qbf_long` | fixed d1 | 47.49 tok/s | 92.97% | 1 | 0 | best fixed in this sweep |
-| `qbf_long` | fixed d3 | 40.83 tok/s | 78.15% | 3 | 0 | overreaches here |
-| `qbf_long` | dynamic max d3 | 41.50 tok/s | 79.30% | 1 | 9 | improved, still trails d1 |
+| `qbf_short`, `-n 48` | fixed d1 | 45.96 tok/s | 90.62% | 1 | 0 | shallow reference |
+| `qbf_short`, `-n 48` | fixed d3 | 48.29 tok/s | 86.33% | 3 | 0 | best fixed |
+| `qbf_short`, `-n 48` | dynamic max d3 | 48.36 tok/s | 86.33% | 3 | 0 | preserves depth 3 |
+| default prompt, `-c 768 -n 64` | fixed d1 | 45.78 tok/s | 90.62% | 1 | 0 | best fixed |
+| default prompt, `-c 768 -n 64` | fixed d3 | 31.50 tok/s | 63.53% | 3 | 0 | overreaches |
+| default prompt, `-c 768 -n 64` | dynamic max d3 | 45.09 tok/s | 85.82% | 1 | 2 | learns depth 1 |
+| code prompts, five-case mean | fixed d1 | 45.61 tok/s | 92.81% | 1 | 0 | best fixed |
+| code prompts, five-case mean | fixed d3 | 35.52 tok/s | 72.98% | 3 | 0 | overreaches |
+| code prompts, five-case mean | dynamic max d3 | 44.89 tok/s | 86.35% | 1 | 2 | near fixed d1 |
 
 Artifacts live under
-`/tmp/llaminar-mtp-bench/adaptive-depth-20260603/`. Dynamic mode now evaluates
-bad partial windows after `min_samples`, so acceptance-limited prompts demote
-before a full window elapses. The default prompt improved from the previous
-33.50 tok/s dynamic capture to 37.81 tok/s. qbf-long still trails fixed d1,
-mostly because occasional perfect shallow windows can promote and then demote
-again; promotion hysteresis is the next adaptive slice.
+`benchmark_results/mtp_depth_hysteresis/20260603T171951Z-b526c702`,
+`20260603T173035Z-b526c702`, and `20260603T173202Z-b526c702`.
+The useful tuning change was lifecycle, not another threshold tweak:
+`clearCache()` and repeated benchmark prefills no longer reset the controller,
+so dynamic mode keeps the running tally it needs. No further hysteresis change
+is required for this slice; promotion tuning can wait until we see a lane where
+fixed depth 3 clearly wins but dynamic fails to climb.
 
 ## ROCm Attention Param-Copy Safety
 

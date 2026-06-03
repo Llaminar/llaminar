@@ -635,7 +635,6 @@ namespace llaminar2
 
         if (active_mtp.enabled && runner_)
         {
-            mtp_depth_controller_.reset();
             if (!ensureMTPDepthController(active_mtp))
             {
                 return false;
@@ -657,6 +656,10 @@ namespace llaminar2
                 return setError(
                     "MTP is not enabled for PP topologies; disable MTP or use a supported SingleDevice/TP topology");
             }
+        }
+        else
+        {
+            mtp_depth_controller_.reset();
         }
 
         if (prefix_cache_enabled)
@@ -2164,7 +2167,6 @@ namespace llaminar2
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();
-        mtp_depth_controller_.reset();
     }
 
     PrefixRuntimeStateSnapshot OrchestrationRunner::prefixStateProbe() const

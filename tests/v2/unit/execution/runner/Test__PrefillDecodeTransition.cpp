@@ -1240,6 +1240,57 @@ namespace
         EXPECT_EQ(probe.mtp_request.last_depth_policy_reason, "demote_zero_accept_rate");
     }
 
+    TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthPersistsAcrossClearCachePrefillCycles)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        depth_policy.min_depth = 1;
+        depth_policy.max_depth = 3;
+        depth_policy.initial_depth = 3;
+        depth_policy.window_size = 1;
+        depth_policy.min_samples = 1;
+        depth_policy.cooldown_steps = 0;
+        depth_policy.demote_zero_accept_rate = 0.30;
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/3,
+            /*chained_mtp_support=*/true,
+            /*sidecar_sample_fusion=*/false,
+            depth_policy);
+        mock->setVerifierAcceptedPrefixScript({0, 0});
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 2);
+
+        auto probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 2);
+        EXPECT_EQ(probe.mtp_depth_policy_demotions, 1u);
+
+        runner->clearCache();
+        ASSERT_TRUE(runner->prefill({6, 7, 8, 9, 10}));
+        GenerationResult step2 = runner->decodeStep();
+        ASSERT_TRUE(step2.success()) << step2.error;
+
+        EXPECT_EQ(mock->forwardMTPCount(), 2);
+        EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 3)
+            << "the second request should start from the learned depth 2, not reset to depth 3";
+
+        probe = runner->prefixStateProbe();
+        EXPECT_EQ(probe.mtp_current_depth, 1);
+        EXPECT_EQ(probe.mtp_depth_policy_demotions, 2u);
+        EXPECT_EQ(probe.mtp_depth_policy_updates, 2u);
+    }
+
     TEST_F(Test__PrefillDecodeTransition, DynamicMTPDepthPromotesAfterFullAcceptWindows)
     {
         MTPDepthPolicyConfig depth_policy;

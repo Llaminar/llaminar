@@ -305,8 +305,9 @@ namespace llaminar2
         /// GPU graph capture/replay for eliminating per-kernel launch overhead
         std::unique_ptr<IGPUGraphCapture> gpu_graph;
 
-        /// Segmented GPU graph cache — excludes non-capturable stages (attention, KV cache)
-        /// and captures contiguous runs of capturable stages into separate graphs
+        /// Segmented GPU graph cache. Capturable stages, including attention
+        /// when its dynamic launch variant is stable, can live inside one
+        /// segment; non-capturable stages and manual boundaries split it.
         DeviceGraphExecutor::GraphSegmentCache segment_cache;
 
         /// GPU stream (from IWorkerGPUContext::defaultStream()) for kernel dispatch
