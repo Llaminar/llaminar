@@ -202,6 +202,8 @@ namespace llaminar2
         std::shared_ptr<TensorBase> logits; ///< [batch_size * seq_len, vocab_size]
         std::shared_ptr<TensorBase> all_position_logits; ///< Runtime verifier logits [tokens, vocab_size]
         std::shared_ptr<TensorBase> all_position_logits_local; ///< Runtime verifier logits [tokens, vocab_local]
+        std::unordered_map<int, std::shared_ptr<TensorBase>> all_position_logits_by_rows; ///< Stable verifier logits by row count.
+        std::unordered_map<int, std::shared_ptr<TensorBase>> all_position_logits_local_by_rows; ///< Stable local verifier logits by row count.
 
         /// Local logits for column-parallel LM head [batch_size * seq_len, vocab_local]
         /// Only allocated when lm_head_column_parallel is enabled

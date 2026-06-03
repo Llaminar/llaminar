@@ -3001,17 +3001,20 @@ namespace llaminar2
                     return nullptr;
                 }
 
-                bool needs_allocate = !state_.all_position_logits_local;
-                if (state_.all_position_logits_local)
+                const int rows_key = static_cast<int>(rows);
+                auto &local_logits_owner = state_.all_position_logits_local_by_rows[rows_key];
+                bool needs_allocate = !local_logits_owner;
+                if (local_logits_owner)
                 {
-                    const auto &shape = state_.all_position_logits_local->shape();
+                    const auto &shape = local_logits_owner->shape();
                     needs_allocate = shape.size() != 2 || shape[0] != rows || shape[1] != local_vocab;
                 }
                 if (needs_allocate)
                 {
                     auto tensor = tensor_factory_->createFP32({rows, local_vocab}, state_.device_id);
-                    state_.all_position_logits_local = std::shared_ptr<TensorBase>(tensor.release());
+                    local_logits_owner = std::shared_ptr<TensorBase>(tensor.release());
                 }
+                state_.all_position_logits_local = local_logits_owner;
                 logits_local_output = state_.all_position_logits_local.get();
                 if (!arena_ ||
                     !arena_->bindExternalBuffer(BufferId::ALL_POSITION_LOGITS_LOCAL,
@@ -3022,17 +3025,19 @@ namespace llaminar2
                 }
 
                 const size_t vocab = static_cast<size_t>(state_.vocab_size);
-                needs_allocate = !state_.all_position_logits;
-                if (state_.all_position_logits)
+                auto &logits_owner = state_.all_position_logits_by_rows[rows_key];
+                needs_allocate = !logits_owner;
+                if (logits_owner)
                 {
-                    const auto &shape = state_.all_position_logits->shape();
+                    const auto &shape = logits_owner->shape();
                     needs_allocate = shape.size() != 2 || shape[0] != rows || shape[1] != vocab;
                 }
                 if (needs_allocate)
                 {
                     auto tensor = tensor_factory_->createFP32({rows, vocab}, state_.device_id);
-                    state_.all_position_logits = std::shared_ptr<TensorBase>(tensor.release());
+                    logits_owner = std::shared_ptr<TensorBase>(tensor.release());
                 }
+                state_.all_position_logits = logits_owner;
                 logits_output = state_.all_position_logits.get();
                 if (!arena_ ||
                     !arena_->bindExternalBuffer(BufferId::ALL_POSITION_LOGITS,
@@ -3052,17 +3057,20 @@ namespace llaminar2
 
                 const size_t rows = static_cast<size_t>(total_tokens);
                 const size_t vocab = static_cast<size_t>(state_.vocab_size);
-                bool needs_allocate = !state_.all_position_logits;
-                if (state_.all_position_logits)
+                const int rows_key = static_cast<int>(rows);
+                auto &logits_owner = state_.all_position_logits_by_rows[rows_key];
+                bool needs_allocate = !logits_owner;
+                if (logits_owner)
                 {
-                    const auto &shape = state_.all_position_logits->shape();
+                    const auto &shape = logits_owner->shape();
                     needs_allocate = shape.size() != 2 || shape[0] != rows || shape[1] != vocab;
                 }
                 if (needs_allocate)
                 {
                     auto tensor = tensor_factory_->createFP32({rows, vocab}, state_.device_id);
-                    state_.all_position_logits = std::shared_ptr<TensorBase>(tensor.release());
+                    logits_owner = std::shared_ptr<TensorBase>(tensor.release());
                 }
+                state_.all_position_logits = logits_owner;
                 logits_output = state_.all_position_logits.get();
                 if (!arena_ ||
                     !arena_->bindExternalBuffer(BufferId::ALL_POSITION_LOGITS,

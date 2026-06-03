@@ -2310,27 +2310,49 @@ namespace
 
     TEST_F(Test__PrefillDecodeTransition, MTPGenerateHonorsMaxNewTokenBudget)
     {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_budget_clamp_generate_unit.json";
+        ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+        PerfStatsCollector::reset();
+
         auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/true);
 
         SamplingParams greedy;
         greedy.temperature = 0.0f;
-
         std::vector<int32_t> prompt = {1, 2, 3};
         GenerationResult result = runner->generate(prompt, 1, greedy);
 
         ASSERT_TRUE(result.success()) << result.error;
         EXPECT_THAT(result.tokens,
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
-        EXPECT_EQ(mock->forwardMTPCount(), 1);
-        EXPECT_EQ(mock->captureCheckpointCount(), 2);
+        EXPECT_EQ(mock->forwardMTPCount(), 0)
+            << "budget-one MTP should emit the first greedy token without sidecar/verifier work";
+        EXPECT_EQ(mock->captureCheckpointCount(), 1);
         EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+                    ElementsAreArray(prompt));
 
         const auto probe = runner->prefixStateProbe();
-        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_draft_steps, 0u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 0u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 0u);
         EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
-        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 0u);
+
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        const PerfStatRecord *direct_emit =
+            findPerfRecord(records, PerfStatRecord::Kind::Counter, "budget_limited_direct_emits");
+        ASSERT_NE(direct_emit, nullptr);
+        EXPECT_DOUBLE_EQ(direct_emit->value, 1.0);
+        const PerfStatRecord *clamped =
+            findPerfRecordWithTags(records,
+                                   PerfStatRecord::Kind::Counter,
+                                   "draft_steps_budget_clamped",
+                                   {{"configured", "1"}, {"effective", "0"}, {"token_budget", "1"}});
+        ASSERT_NE(clamped, nullptr);
+
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPDecodeStepHonorsExplicitTokenBudget)
@@ -2345,19 +2367,81 @@ namespace
         ASSERT_TRUE(step.success()) << step.error;
         EXPECT_THAT(step.tokens,
                     ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
-        EXPECT_EQ(mock->forwardMTPCount(), 1);
-        EXPECT_EQ(mock->captureCheckpointCount(), 2);
+        EXPECT_EQ(mock->forwardMTPCount(), 0);
+        EXPECT_EQ(mock->captureCheckpointCount(), 1);
         EXPECT_THAT(mock->lastForwardTokens(),
-                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+                    ElementsAre(1, 2, 3));
 
         const auto probe = runner->prefixStateProbe();
-        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_draft_steps, 0u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 0u);
+        EXPECT_EQ(probe.mtp_verifier_token_count, 0u);
         EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
-        EXPECT_EQ(probe.mtp_rollbacks, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 0u);
     }
 
-    TEST_F(Test__PrefillDecodeTransition, MTPBudgetTruncationRestoresVerifierRowAndSkipsReplay)
+    TEST_F(Test__PrefillDecodeTransition, MTPBudgetClampReducesChainedDraftDepthBeforeVerifier)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_budget_depth_clamp_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/3,
+                /*chained_mtp_support=*/true);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3}));
+            runner->setDecodeStepTokenBudget(2);
+            GenerationResult step = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
+
+            ASSERT_TRUE(step.success()) << step.error;
+            EXPECT_THAT(step.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+            EXPECT_EQ(mock->forwardMTPCount(), 1);
+            EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 0)
+                << "token budget leaves room for only one speculative output";
+            EXPECT_THAT(mock->lastForwardTokens(),
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            const auto probe = runner->prefixStateProbe();
+            EXPECT_EQ(probe.mtp_draft_steps, 1u);
+            EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+            EXPECT_EQ(probe.mtp_verifier_token_count, 2u);
+            EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+            EXPECT_EQ(probe.mtp_rollbacks, 0u);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *clamped =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "draft_steps_budget_clamped",
+                                       {{"configured", "3"},
+                                        {"effective", "1"},
+                                        {"token_budget", "2"}});
+            ASSERT_NE(clamped, nullptr);
+            const PerfStatRecord *skipped =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "draft_steps_budget_skipped");
+            ASSERT_NE(skipped, nullptr);
+            EXPECT_DOUBLE_EQ(skipped->value, 2.0);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPBudgetClampSkipsVerifierRowRestoreAndReplay)
     {
         const std::filesystem::path export_path =
             std::filesystem::temp_directory_path() / "llaminar_mtp_budget_row_restore_unit.json";
@@ -2379,30 +2463,32 @@ namespace
             EXPECT_THAT(step.tokens,
                         ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
             EXPECT_EQ(mock->restoreCount(), 0);
-            EXPECT_EQ(mock->restoreVerifierRowCount(), 1);
-            EXPECT_FALSE(mock->verifierRestoreAfterCheckpointRestore());
-            EXPECT_EQ(mock->lastVerifierRestoreRow(), 0);
-            EXPECT_EQ(mock->lastVerifierRestoreTargetTokens(), 4);
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
-            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
-            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
-            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 1)
-                << "the verifier-row shortcut should avoid replaying the truncated prefix";
+            EXPECT_EQ(mock->restoreVerifierRowCount(), 0);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 0);
+            EXPECT_EQ(mock->forwardMTPCount(), 0);
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill)
+                << "budget-one decode should not run verifier or replay work";
             EXPECT_THAT(mock->lastForwardTokens(),
-                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+                        ElementsAre(1, 2, 3));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
-            const PerfStatRecord *shortcut =
+            const PerfStatRecord *direct_emit =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "budget_limited_direct_emits");
+            ASSERT_NE(direct_emit, nullptr);
+            EXPECT_DOUBLE_EQ(direct_emit->value, 1.0);
+
+            const PerfStatRecord *clamped =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
-                                       "rollback_verifier_state_row_shortcuts",
-                                       {{"reason", "partial_commit"},
-                                        {"row", "0"},
-                                        {"main_forward_token_count", "1"}});
-            ASSERT_NE(shortcut, nullptr);
-            EXPECT_DOUBLE_EQ(shortcut->value, 1.0);
+                                       "draft_steps_budget_clamped",
+                                       {{"configured", "1"},
+                                        {"effective", "0"},
+                                        {"token_budget", "1"}});
+            ASSERT_NE(clamped, nullptr);
+
+            const PerfStatRecord *shortcut =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "rollback_verifier_state_row_shortcuts");
+            EXPECT_EQ(shortcut, nullptr);
 
             const PerfStatRecord *replay_tokens =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");

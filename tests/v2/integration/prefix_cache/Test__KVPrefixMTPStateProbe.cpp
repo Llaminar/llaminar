@@ -1671,7 +1671,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
     config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
     config.kv_cache_precision = "auto";
     config.mtp.enabled = true;
-    config.mtp.draft_tokens = 2;
+    config.mtp.draft_tokens = 3;
 
     auto factory = createOrchestrationRunnerFactory();
     auto runner = factory->createFromOrchestrationConfig(config);
@@ -1686,7 +1686,14 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
 
     SamplingParams greedy;
     greedy.temperature = 0.0f;
-    auto result = runner->generate(prompt, 4, greedy);
+    // Reproduce the verifier graph-cache lifetime pattern from the ROCm MTP
+    // benchmark: full-depth verifier, smaller tail verifier, request reset, then
+    // full-depth verifier cache reuse. The all-position logits buffers must stay
+    // alive per verifier row count across the reset.
+    auto warm_result = runner->generate(prompt, 6, greedy);
+    ASSERT_TRUE(warm_result.error.empty()) << warm_result.error;
+    runner->clearCache();
+    auto result = runner->generate(prompt, 6, greedy);
     const auto snapshot = runner->prefixStateProbe();
     runner->shutdown();
 
@@ -1696,7 +1703,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
     EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
     EXPECT_GE(snapshot.mtp_draft_steps, 2u);
     EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
-    EXPECT_GE(snapshot.mtp_verifier_token_count, 3u);
+    EXPECT_GE(snapshot.mtp_verifier_token_count, 4u);
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags miss_tags = {
@@ -1705,7 +1712,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
         {"decode_has_history", "true"},
         {"moe_placement_epoch", "0"},
         {"result", "miss"},
-        {"seq_len", "3"},
+        {"seq_len", "4"},
     };
     const PerfStatsCollector::Tags hit_tags = {
         {"all_position_logits", "true"},
@@ -1713,7 +1720,7 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmo
         {"decode_has_history", "true"},
         {"moe_placement_epoch", "0"},
         {"result", "hit"},
-        {"seq_len", "3"},
+        {"seq_len", "4"},
     };
     EXPECT_GE(findPerfCounterValue(records, "forward_graph", "forward_cache_lookup", "decode", miss_tags), 1.0);
     EXPECT_GE(findPerfCounterValue(records, "forward_graph", "forward_cache_lookup", "decode", hit_tags), 1.0);

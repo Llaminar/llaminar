@@ -658,9 +658,14 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(first.tokens, expected_tokens);
         EXPECT_EQ(first.tokens, baseline_result.tokens);
         EXPECT_FALSE(after_first.mtp_bypassed) << after_first.mtp_bypass_reason;
-        EXPECT_GE(after_first.mtp_draft_steps, static_cast<uint64_t>(mtp_draft_tokens));
-        EXPECT_GE(after_first.mtp_verifier_runs, 1u);
-        EXPECT_GE(after_first.mtp_verifier_token_count, static_cast<uint64_t>(mtp_draft_tokens + 1));
+        const uint64_t expected_first_step_drafts = static_cast<uint64_t>(
+            std::min(mtp_draft_tokens, std::max(0, test_case.decode_steps - 1)));
+        EXPECT_GE(after_first.mtp_draft_steps, expected_first_step_drafts);
+        if (expected_first_step_drafts > 0)
+        {
+            EXPECT_GE(after_first.mtp_verifier_runs, 1u);
+            EXPECT_GE(after_first.mtp_verifier_token_count, expected_first_step_drafts + 1);
+        }
 
         if (!enable_prefix_cache)
         {

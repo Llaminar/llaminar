@@ -1053,7 +1053,48 @@ namespace llaminar2
         }
 
         const MTPRuntimeConfig &mtp = plan_.runtime.mtp.enabled ? plan_.runtime.mtp : config_.mtp;
-        const int speculative_draft_count = std::max(1, mtp.draft_tokens);
+        const int configured_speculative_draft_count = std::max(1, mtp.draft_tokens);
+        int speculative_draft_count = configured_speculative_draft_count;
+        if (decode_step_token_budget_ > 0)
+        {
+            const int budgeted_speculative_outputs =
+                std::max(0, decode_step_token_budget_ - 1);
+            speculative_draft_count =
+                std::min(speculative_draft_count, budgeted_speculative_outputs);
+            if (speculative_draft_count != configured_speculative_draft_count)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "draft_steps_budget_clamped",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"configured", std::to_string(configured_speculative_draft_count)},
+                     {"effective", std::to_string(speculative_draft_count)},
+                     {"token_budget", std::to_string(decode_step_token_budget_)}});
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "draft_steps_budget_skipped",
+                    static_cast<double>(configured_speculative_draft_count - speculative_draft_count),
+                    "decode");
+            }
+        }
+
+        if (speculative_draft_count == 0)
+        {
+            PerfStatsCollector::addCounter("mtp", "budget_limited_direct_emits", 1.0, "decode");
+            PerfStatsCollector::addCounter("mtp", "output_tokens", 1.0, "decode");
+
+            sampler_.record_token(first_token);
+            result.tokens.push_back(first_token);
+            last_token_ = first_token;
+            if (std::find(stop_tokens_.begin(), stop_tokens_.end(), first_token) != stop_tokens_.end())
+            {
+                result.is_complete = true;
+            }
+            return result;
+        }
+
         const int base_sidecar_position = runner_->get_position();
 
         std::vector<int32_t> draft_tokens;
