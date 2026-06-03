@@ -5236,6 +5236,22 @@ if(ZLIB_FOUND)
         TIMEOUT 2400
     )
 
+    add_executable(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp
+        integration/parity/qwen36/Test__Qwen36MoE_CUDA_SingleDevice_PrefixMTP_Parity.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp
+        llaminar2_core GTest::gtest
+    )
+    target_include_directories(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    discover_v2_parity_tests(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp
+        TEST_PREFIX V2_Integration_Parity_Qwen36MoE_CUDA_SingleDevice
+        LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;CUDA;GPU;SingleDevice;PyTorch"
+        MPI_PROCS 1
+        TIMEOUT 2400
+    )
+
     add_executable(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
         integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_PrefixMTP_Parity.cpp
     )

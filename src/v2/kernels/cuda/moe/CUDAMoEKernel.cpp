@@ -242,6 +242,13 @@ extern "C"
         int total_slots, int top_k, int num_experts,
         int device_idx, void *stream);
 
+    bool cudaMoE_scatter_tokens_deterministic(
+        const int *routing_indices, const float *routing_weights,
+        const int *expert_offsets, const int *expert_counts,
+        int *grouped_token_indices, float *grouped_weights,
+        int total_slots, int top_k, int num_experts,
+        int device_idx, void *stream);
+
     bool cudaMoE_gather_expert_fixed(
         const float *hidden, float *batch_buffer,
         const int *expert_offsets, const int *expert_counts,
@@ -1489,11 +1496,11 @@ namespace llaminar2
                                         num_experts, device_ordinal_, stream) &&
                cudaMoE_exclusive_scan(d_expert_counts, d_expert_offsets,
                                        num_experts, device_ordinal_, stream) &&
-               cudaMoE_scatter_tokens(d_routing_indices, d_routing_weights,
-                                      d_group_write_heads_, d_expert_offsets,
-                                      d_grouped_token_indices, d_grouped_weights,
-                                      total_slots, top_k, num_experts,
-                                      device_ordinal_, stream);
+               cudaMoE_scatter_tokens_deterministic(d_routing_indices, d_routing_weights,
+                                                    d_expert_offsets, d_expert_counts,
+                                                    d_grouped_token_indices, d_grouped_weights,
+                                                    total_slots, top_k, num_experts,
+                                                    device_ordinal_, stream);
     }
 
     bool CUDAMoEKernel::prepareExpertGroups(ITensor *routing_indices, ITensor *routing_weights,

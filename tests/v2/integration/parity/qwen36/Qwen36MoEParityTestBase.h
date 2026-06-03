@@ -4,10 +4,21 @@
 #include "backends/BackendManager.h"
 #include "backends/HardwareInventory.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
+#include "kernels/KernelFactory.h"
+#include "utils/DebugEnv.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <numeric>
+
+#ifdef HAVE_CUDA
+extern "C"
+{
+    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
+    bool cudaNativeVNNIPrefill_getDeterministicMode();
+}
+#endif
 
 namespace llaminar2::test::parity::qwen36
 {
@@ -31,6 +42,7 @@ namespace llaminar2::test::parity::qwen36
         std::string kv_cache_precision = "auto";
         int decode_steps = 3;
         int max_seq_len = 96;
+        int required_cuda_devices = 0;
         int required_rocm_devices = 0;
         int required_cpu_sockets = 0;
         std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
@@ -68,6 +80,75 @@ namespace llaminar2::test::parity::qwen36
         std::cerr << "[qwen36-moe-parity] case=" << test_case.name
                   << " phase=" << phase
                   << " elapsed_ms=" << ms << '\n';
+    }
+
+    class ScopedMoEParityDeterministicMode
+    {
+    public:
+        explicit ScopedMoEParityDeterministicMode(bool enabled)
+            : enabled_(enabled)
+        {
+            if (!enabled_)
+            {
+                return;
+            }
+
+            if (const char *old_value = std::getenv("LLAMINAR_DETERMINISTIC"))
+            {
+                had_old_deterministic_env_ = true;
+                old_deterministic_env_ = old_value;
+            }
+
+#ifdef HAVE_CUDA
+            old_cuda_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
+#endif
+
+            setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+            mutableDebugEnv().reload();
+#ifdef HAVE_CUDA
+            cudaNativeVNNIPrefill_setDeterministicMode(true);
+#endif
+            llaminar::v2::kernels::KernelFactory::clearCache();
+        }
+
+        ~ScopedMoEParityDeterministicMode()
+        {
+            if (!enabled_)
+            {
+                return;
+            }
+
+#ifdef HAVE_CUDA
+            cudaNativeVNNIPrefill_setDeterministicMode(old_cuda_prefill_deterministic_);
+#endif
+            if (had_old_deterministic_env_)
+            {
+                setenv("LLAMINAR_DETERMINISTIC", old_deterministic_env_.c_str(), 1);
+            }
+            else
+            {
+                unsetenv("LLAMINAR_DETERMINISTIC");
+            }
+            mutableDebugEnv().reload();
+            llaminar::v2::kernels::KernelFactory::clearCache();
+        }
+
+        ScopedMoEParityDeterministicMode(const ScopedMoEParityDeterministicMode &) = delete;
+        ScopedMoEParityDeterministicMode &operator=(const ScopedMoEParityDeterministicMode &) = delete;
+
+    private:
+        bool enabled_ = false;
+        bool had_old_deterministic_env_ = false;
+        std::string old_deterministic_env_;
+#ifdef HAVE_CUDA
+        bool old_cuda_prefill_deterministic_ = false;
+#endif
+    };
+
+    inline bool shouldUseMoEParityDeterministicMode(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        return test_case.required_cuda_devices > 0;
     }
 
     inline ExpertComputeDomain localTPMoEDomain(
@@ -236,10 +317,18 @@ namespace llaminar2::test::parity::qwen36
             return test_case.name + " is a local topology test and must run with one MPI rank";
         }
 
-        if (test_case.required_rocm_devices > 0)
+        if (test_case.required_cuda_devices > 0 || test_case.required_rocm_devices > 0)
         {
             auto &dm = DeviceManager::instance();
             dm.initialize(-1, false);
+            if (dm.cuda_device_count() < test_case.required_cuda_devices)
+            {
+                std::ostringstream oss;
+                oss << test_case.name << " requires "
+                    << test_case.required_cuda_devices
+                    << " CUDA device(s)";
+                return oss.str();
+            }
             if (dm.rocm_device_count() < test_case.required_rocm_devices)
             {
                 std::ostringstream oss;
@@ -467,6 +556,8 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case,
         PrefixRestoreParityMode mode)
     {
+        ScopedMoEParityDeterministicMode deterministic_mode(
+            shouldUseMoEParityDeterministicMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -568,6 +659,8 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case,
         bool enable_prefix_cache)
     {
+        ScopedMoEParityDeterministicMode deterministic_mode(
+            shouldUseMoEParityDeterministicMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -663,6 +756,157 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GT(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs);
     }
 
+    inline void runMoEGreedyFreshRunnerDeterminism(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        ScopedMoEParityDeterministicMode deterministic_mode(
+            shouldUseMoEParityDeterministicMode(test_case));
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        auto phase_start = parityPhaseStart();
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        logMoEParityPhase(test_case, "determinism.reference-inputs", phase_start);
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        struct FreshRunnerTrace
+        {
+            GenerationResult result;
+            std::vector<int> logits_argmax;
+            std::vector<std::string> logits_topk;
+        };
+
+        auto local_argmax = [](const float *logits, int vocab_size) -> int
+        {
+            if (!logits || vocab_size <= 0)
+                return -1;
+            return static_cast<int>(std::max_element(logits, logits + vocab_size) - logits);
+        };
+
+        auto local_topk = [](const float *logits, int vocab_size, int k = 8) -> std::string
+        {
+            if (!logits || vocab_size <= 0 || k <= 0)
+                return "<no logits>";
+            std::vector<int> indices(static_cast<size_t>(vocab_size));
+            std::iota(indices.begin(), indices.end(), 0);
+            const int limit = std::min(k, vocab_size);
+            std::partial_sort(
+                indices.begin(),
+                indices.begin() + limit,
+                indices.end(),
+                [logits](int lhs, int rhs)
+                {
+                    if (logits[lhs] == logits[rhs])
+                        return lhs < rhs;
+                    return logits[lhs] > logits[rhs];
+                });
+
+            std::ostringstream oss;
+            for (int i = 0; i < limit; ++i)
+            {
+                if (i > 0)
+                    oss << ", ";
+                const int idx = indices[static_cast<size_t>(i)];
+                oss << idx << ":" << logits[idx];
+            }
+            return oss.str();
+        };
+
+        auto trace_string = [](const FreshRunnerTrace &trace) -> std::string
+        {
+            std::ostringstream oss;
+            oss << "tokens={";
+            for (size_t i = 0; i < trace.result.tokens.size(); ++i)
+            {
+                if (i > 0)
+                    oss << ", ";
+                oss << trace.result.tokens[i];
+            }
+            oss << "}";
+            for (size_t i = 0; i < trace.logits_topk.size(); ++i)
+            {
+                oss << "\n  step " << i
+                    << " sampled="
+                    << (i < trace.result.tokens.size() ? trace.result.tokens[i] : -1)
+                    << " argmax="
+                    << (i < trace.logits_argmax.size() ? trace.logits_argmax[i] : -1)
+                    << " topk=[" << trace.logits_topk[i] << "]";
+            }
+            return oss.str();
+        };
+
+        auto run_once = [&](const char *phase) -> FreshRunnerTrace
+        {
+            FreshRunnerTrace trace;
+            auto runner = factory->createFromOrchestrationConfig(
+                makeMoEPrefixRestoreConfig(test_case, model_path, false, 2, false));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                trace.result.error = "failed to create runner";
+                return trace;
+            }
+            auto start = parityPhaseStart();
+            EXPECT_TRUE(runner->initialize()) << runner->lastError();
+            logMoEParityPhase(test_case, phase, start);
+            runner->setSamplingParams(greedy);
+            runner->setSkipLogitsGatherDecode(false);
+            if (!runner->prefill(prompt_tokens))
+            {
+                trace.result.error = runner->lastError();
+                runner->shutdown();
+                return trace;
+            }
+            const int vocab_size = runner->vocabSize();
+            for (int step = 0; step < test_case.decode_steps; ++step)
+            {
+                auto step_result = runner->decodeStep();
+                if (!step_result.error.empty())
+                {
+                    trace.result.error = step_result.error;
+                    break;
+                }
+                if (!step_result.tokens.empty())
+                {
+                    trace.result.tokens.insert(
+                        trace.result.tokens.end(),
+                        step_result.tokens.begin(),
+                        step_result.tokens.end());
+                }
+                const float *logits = runner->lastLogits();
+                trace.logits_argmax.push_back(local_argmax(logits, vocab_size));
+                trace.logits_topk.push_back(local_topk(logits, vocab_size));
+            }
+            runner->shutdown();
+            return trace;
+        };
+
+        auto first = run_once("determinism.first.initialize");
+        ASSERT_TRUE(first.result.error.empty()) << first.result.error;
+        ASSERT_EQ(first.result.tokens.size(), expected_tokens.size())
+            << trace_string(first);
+
+        auto second = run_once("determinism.second.initialize");
+        ASSERT_TRUE(second.result.error.empty()) << second.result.error;
+        ASSERT_EQ(second.result.tokens.size(), first.result.tokens.size())
+            << "first:\n"
+            << trace_string(first)
+            << "\nsecond:\n"
+            << trace_string(second);
+        EXPECT_EQ(second.result.tokens, first.result.tokens)
+            << "first:\n"
+            << trace_string(first)
+            << "\nsecond:\n"
+            << trace_string(second);
+    }
+
     inline int argmaxToken(const float *logits, int vocab_size)
     {
         if (!logits || vocab_size <= 0)
@@ -704,6 +948,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runMoEIncrementalDecodeMatchesFullContext(
         const MoEPrefixRestoreParityCase &test_case)
     {
+        ScopedMoEParityDeterministicMode deterministic_mode(
+            shouldUseMoEParityDeterministicMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;

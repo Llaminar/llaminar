@@ -734,6 +734,34 @@ namespace
         grouped_weights[dest] = routing_weights[idx];
     }
 
+    __global__ void scatter_tokens_deterministic_kernel(
+        const int *__restrict__ routing_indices,
+        const float *__restrict__ routing_weights,
+        const int *__restrict__ expert_offsets,
+        const int *__restrict__ expert_counts,
+        int *__restrict__ grouped_token_indices,
+        float *__restrict__ grouped_weights,
+        int total_slots, int top_k, int num_experts)
+    {
+        const int expert = blockIdx.x;
+        if (expert >= num_experts || threadIdx.x != 0)
+            return;
+
+        int write = expert_offsets[expert];
+        const int end = write + expert_counts[expert];
+        for (int slot = 0; slot < total_slots; ++slot)
+        {
+            if (routing_indices[slot] != expert)
+                continue;
+            if (write >= end)
+                return;
+
+            grouped_token_indices[write] = slot / top_k;
+            grouped_weights[write] = routing_weights[slot];
+            ++write;
+        }
+    }
+
     __global__ void gather_expert_fixed_kernel(
         const float *__restrict__ hidden,
         float *__restrict__ batch_buffer,
@@ -1431,6 +1459,33 @@ namespace
         atomicAdd(output + static_cast<size_t>(token) * d_model + col, weight * value);
     }
 
+    __global__ void grouped_prefill_scatter_weighted_deterministic_kernel(
+        float *__restrict__ output,
+        const float *__restrict__ expert_output,
+        const int *__restrict__ grouped_token_indices,
+        const float *__restrict__ grouped_weights,
+        int seq_len,
+        int total_slots,
+        int d_model)
+    {
+        constexpr int kTileN = 64;
+        const int col = blockIdx.x * kTileN + threadIdx.x;
+        const int token = blockIdx.y;
+        if (token >= seq_len || col >= d_model)
+            return;
+
+        float sum = 0.0f;
+        for (int slot = 0; slot < total_slots; ++slot)
+        {
+            if (grouped_token_indices[slot] != token)
+                continue;
+            sum += grouped_weights[slot] *
+                   expert_output[static_cast<size_t>(slot) * d_model + col];
+        }
+
+        output[static_cast<size_t>(token) * d_model + col] = sum;
+    }
+
     /**
      * @brief Compute a partial dot product over a K-block subrange [b_start, b_end).
      *
@@ -2054,6 +2109,19 @@ extern "C"
         return finishLaunch("cudaMoE_scatter_tokens");
     }
 
+    bool cudaMoE_scatter_tokens_deterministic(const int *routing_indices, const float *routing_weights,
+                                              const int *expert_offsets, const int *expert_counts,
+                                              int *grouped_token_indices, float *grouped_weights,
+                                              int total_slots, int top_k, int num_experts,
+                                              int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        scatter_tokens_deterministic_kernel<<<num_experts, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            routing_indices, routing_weights, expert_offsets, expert_counts,
+            grouped_token_indices, grouped_weights, total_slots, top_k, num_experts);
+        return finishLaunch("cudaMoE_scatter_tokens_deterministic");
+    }
+
     bool cudaMoE_gather_expert_fixed(const float *hidden, float *batch_buffer,
                                      const int *expert_offsets, const int *expert_counts,
                                      const int *grouped_token_indices,
@@ -2586,13 +2654,13 @@ extern "C"
 
         {
             constexpr int kTileN = 64;
-            dim3 grid((d_model + kTileN - 1) / kTileN, total_slots);
+            dim3 grid((d_model + kTileN - 1) / kTileN, max_tokens_per_expert);
             dim3 block(kTileN);
-            grouped_prefill_scatter_weighted_kernel<<<grid, block, 0, cuda_stream>>>(
+            grouped_prefill_scatter_weighted_deterministic_kernel<<<grid, block, 0, cuda_stream>>>(
                 d_output, d_scratch_down_out,
                 d_group_token_indices, d_group_weights,
-                total_slots, d_model);
-            if (!finishLaunch("cudaMoE_grouped_scatter_prefill"))
+                max_tokens_per_expert, total_slots, d_model);
+            if (!finishLaunch("cudaMoE_grouped_scatter_prefill_deterministic"))
                 return false;
         }
 

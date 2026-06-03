@@ -34,6 +34,7 @@
 #endif
 
 #include "../../../utils/CUDATestUtils.h"
+#include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/TestTensorFactory.h"
 
 #include <vector>
@@ -72,8 +73,58 @@ namespace
     constexpr const char *MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
     constexpr int NUM_REPETITIONS = 10;
 
+#ifdef HAVE_CUDA
+    class ScopedCudaPrefillModes
+    {
+    public:
+        ScopedCudaPrefillModes()
+            : streamk_(cudaNativeVNNIPrefill_getStreamKMode()),
+              bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
+              deterministic_(cudaNativeVNNIPrefill_getDeterministicMode())
+        {
+            cudaNativeVNNIPrefill_getForceTile(&force_tile_, &force_split_k_);
+        }
+
+        ~ScopedCudaPrefillModes()
+        {
+            cudaNativeVNNIPrefill_setForceTile(force_tile_, force_split_k_);
+            cudaNativeVNNIPrefill_setStreamKMode(streamk_);
+            cudaNativeVNNIPrefill_setBK256Mode(bk256_);
+            cudaNativeVNNIPrefill_setDeterministicMode(deterministic_);
+        }
+
+        ScopedCudaPrefillModes(const ScopedCudaPrefillModes &) = delete;
+        ScopedCudaPrefillModes &operator=(const ScopedCudaPrefillModes &) = delete;
+
+    private:
+        int force_tile_ = -1;
+        int force_split_k_ = 0;
+        int streamk_ = 0;
+        int bk256_ = 0;
+        bool deterministic_ = false;
+    };
+#endif
+
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
     {
+        auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
+        const bool is_gpu_quantized =
+            (device_id.is_cuda() || device_id.is_rocm()) &&
+            unpackable != nullptr &&
+            const_cast<IINT8Unpackable *>(unpackable)->vnniFormatInfo() != nullptr;
+
+        if (is_gpu_quantized)
+        {
+            static std::vector<GpuPreparedGemm> gpu_prepared;
+            const uint64_t prepared_id = static_cast<uint64_t>(gpu_prepared.size());
+            gpu_prepared.push_back(makeGpuPreparedGemm(
+                const_cast<TensorBase *>(tensor),
+                device_id,
+                "test.cuda_gemm_nondet.weight." + std::to_string(prepared_id),
+                ModelContextId{11100 + prepared_id}));
+            return gpu_prepared.back().kernel;
+        }
+
         static std::vector<std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>> handles;
         auto prepared = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(tensor, device_id);
         if (!prepared)
@@ -900,6 +951,11 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
 #else
     // NativeVNNI is now the sole CUDA GEMM path. Verify it produces
     // bitwise-identical results across repeated invocations.
+    ScopedCudaPrefillModes mode_guard;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     const int M = 9;
     const int N = 896;
@@ -966,6 +1022,89 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
     EXPECT_EQ(max_diffs, 0u) << "NativeVNNI path changed bitwise across repeats";
     EXPECT_FLOAT_EQ(max_abs, 0.0f) << "NativeVNNI path drift should be zero";
     EXPECT_GE(min_cos, 0.999999) << "NativeVNNI path should be deterministic";
+
+    int selected_tile = -1;
+    int selected_split_k = 0;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(
+        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+    std::cout << "NativeVNNI final auto selection: tile=" << selected_tile
+              << " split_k=" << selected_split_k
+              << " bk256=" << used_bk256
+              << " streamk=" << used_streamk << "\n";
+    EXPECT_EQ(selected_split_k, 1)
+        << "auto tiny-M prefill must avoid split-K accumulation-order drift";
+    EXPECT_EQ(used_streamk, 0)
+        << "auto tiny-M prefill must avoid stream-K atomic accumulation";
+
+    ws->unbindWorkspace();
+    workspace_.reset();
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMAutoSelectionIsStable)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    const int M = 72;
+    const int N = 4864;
+    const int K = 896;
+
+    auto weight = TestTensorFactory::createQ4_0Random(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 23);
+    auto *w_down = dynamic_cast<Q4_0Tensor *>(weight.get());
+    ASSERT_NE(w_down, nullptr);
+    ASSERT_TRUE(w_down->ensureOnDevice(gpu_device_));
+
+    auto *kernel = getPreparedKernel(w_down, gpu_device_);
+    ASSERT_NE(kernel, nullptr);
+
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
+    ASSERT_NE(ws, nullptr);
+    auto reqs = ws->getWorkspaceRequirements(M, N, K);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    ws->bindWorkspace(workspace_.get());
+
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    for (int i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = dist_(rng_);
+
+    auto output = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input.get()},
+        {output.get()},
+        [&]
+        {
+            return kernel->multiply_tensor(
+                input.get(), output.get(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+        }));
+
+    int selected_tile = -1;
+    int selected_split_k = 0;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(
+        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+    std::cout << "NativeVNNI grouped-small-M auto selection: tile=" << selected_tile
+              << " split_k=" << selected_split_k
+              << " bk256=" << used_bk256
+              << " streamk=" << used_streamk << "\n";
+    EXPECT_EQ(selected_split_k, 1)
+        << "auto grouped-small-M prefill must avoid split-K accumulation-order drift";
+    EXPECT_EQ(used_streamk, 0)
+        << "auto grouped-small-M prefill must avoid stream-K atomic accumulation";
 
     ws->unbindWorkspace();
     workspace_.reset();
