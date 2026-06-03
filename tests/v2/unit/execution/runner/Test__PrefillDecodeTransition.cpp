@@ -439,6 +439,14 @@ namespace
             return greedyArgmax(logits_.data(), VOCAB_SIZE);
         }
 
+        int sampleOnDevice(const SamplingParams &params) override
+        {
+            ++sample_device_count_;
+            if (!supports_stochastic_device_sampling_ || params.is_greedy())
+                return -1;
+            return greedyArgmax(logits_.data(), VOCAB_SIZE);
+        }
+
         bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
                                     int vocab_size) override
         {
@@ -484,6 +492,7 @@ namespace
         bool lastCommitMTPAllowSpeculativeDiscard() const { return last_commit_mtp_allow_speculative_discard_; }
         const std::vector<int> &lastCommitMTPTokens() const { return last_commit_mtp_tokens_; }
         int sampleMainLogitsCount() const { return sample_main_logits_count_; }
+        int sampleDeviceCount() const { return sample_device_count_; }
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
         int sampleAllPositionLogitsCount() const { return sample_all_position_logits_count_; }
         int sampleAllPositionLogitsBatchedCount() const { return sample_all_position_logits_batched_count_; }
@@ -528,6 +537,10 @@ namespace
         void enableMTPSidecarSampleFusion()
         {
             supports_mtp_sidecar_sample_fusion_ = true;
+        }
+        void enableStochasticDeviceSampling()
+        {
+            supports_stochastic_device_sampling_ = true;
         }
         void setCapturedSnapshot(PrefixStateSnapshot snapshot)
         {
@@ -761,6 +774,7 @@ namespace
         int last_verifier_restore_row_{-1};
         int last_verifier_restore_target_tokens_{-1};
         int sample_main_logits_count_{0};
+        int sample_device_count_{0};
         int sample_mtp_logits_count_{0};
         int sample_all_position_logits_count_{0};
         int sample_all_position_logits_batched_count_{0};
@@ -780,6 +794,7 @@ namespace
         bool supports_mtp_token_coordination_{false};
         bool supports_chained_mtp_drafts_{false};
         bool supports_mtp_sidecar_sample_fusion_{false};
+        bool supports_stochastic_device_sampling_{false};
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
         bool last_commit_mtp_allow_speculative_discard_{false};
@@ -2187,6 +2202,47 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
         EXPECT_EQ(probe.mtp_rollbacks, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingUsesDeviceSamplerForGPUFirstToken)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::rocm(0),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+        mock->enableStochasticDeviceSampling();
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 2;
+        sampling.top_p = 0.95f;
+        sampling.seed = 123;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->sampleDeviceCount(), 1);
+        EXPECT_EQ(mock->sampleMainLogitsCount(), 0);
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingRejectsWithResidualCorrection)

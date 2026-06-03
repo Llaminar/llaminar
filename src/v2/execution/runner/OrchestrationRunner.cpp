@@ -1180,19 +1180,52 @@ namespace llaminar2
         {
             if (stochastic_verify)
             {
-                const float *main_logits = runner_->logits();
-                if (!main_logits)
+                if (runner_->primaryDeviceId().is_gpu())
                 {
-                    return fail_after_checkpoint("No logits available for stochastic MTP first token");
+                    if (active_sampling_params_.top_k <= 0 ||
+                        active_sampling_params_.top_k > 256)
+                    {
+                        return fail_after_checkpoint(
+                            "GPU stochastic MTP sampling requires 1 <= top_k <= 256");
+                    }
+                    auto penalty_map = sampler_.compute_penalty_map(active_sampling_params_, vocab);
+                    if (!runner_->applyPenaltiesOnDevice(penalty_map, vocab))
+                    {
+                        return fail_after_checkpoint("MTP stochastic first-token GPU penalty application failed");
+                    }
+                    {
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "sample_first_token_stochastic_device",
+                            "decode");
+                        first_token = runner_->sampleOnDevice(active_sampling_params_);
+                    }
+                    if (first_token < 0)
+                    {
+                        return fail_after_checkpoint("MTP stochastic first-token GPU sampling failed");
+                    }
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "first_token_stochastic_device_samples",
+                        1.0,
+                        "decode");
                 }
+                else
                 {
-                    PerfStatsCollector::ScopedTimer timer("mtp", "sample_first_token_stochastic", "decode");
-                    first_token = sampler_.sample(
-                        main_logits,
-                        static_cast<size_t>(vocab),
-                        active_sampling_params_);
+                    const float *main_logits = runner_->logits();
+                    if (!main_logits)
+                    {
+                        return fail_after_checkpoint("No logits available for stochastic MTP first token");
+                    }
+                    {
+                        PerfStatsCollector::ScopedTimer timer("mtp", "sample_first_token_stochastic", "decode");
+                        first_token = sampler_.sample(
+                            main_logits,
+                            static_cast<size_t>(vocab),
+                            active_sampling_params_);
+                    }
+                    PerfStatsCollector::addCounter("mtp", "first_token_stochastic_samples", 1.0, "decode");
                 }
-                PerfStatsCollector::addCounter("mtp", "first_token_stochastic_samples", 1.0, "decode");
             }
             else
             {
