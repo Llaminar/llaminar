@@ -12,7 +12,7 @@ speedup. Detailed tuning history belongs in commit messages or perf artifacts.
 | Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 46.74 tok/s | 1.56x | Bucketed attention graph capture, depth-sensitive |
 | Dense long lane | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.44 tok/s | 54.02 tok/s | 1.34x | Correctness green, needs verifier work |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
-| MoE short lane, `The quick brown fox`, `-c 64 -n 16` | ROCm `rocm:0` | Qwen3.6 35B A3B | 15.96 tok/s | 31.64 tok/s | 1.98x | Correctness green; dynamic demotes to depth 1 |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 15.76 tok/s | 26.66 tok/s | 1.69x | Dynamic best; d3 overreaches |
 | MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Needs longer confirmation |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | Phase 14 after single-device lanes |
 
@@ -77,5 +77,5 @@ ERROR/WARN param-copy diagnostics, 36.64 decode tok/s, and 65.85% acceptance.
 
 ## Next Work
 
-Extend Qwen3.6 MoE MTP from the short ROCm proof to longer prompts/context,
-then return through CUDA, CPU, and the multi-participant matrix.
+Tune Qwen3.6 MoE ROCm toward the 1.5x target at longer context, then return
+through CUDA, CPU, and the multi-participant matrix.
