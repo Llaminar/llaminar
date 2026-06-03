@@ -1637,6 +1637,86 @@ namespace
         return result;
     }
 
+    static int expectedSampleDistributionWithThreshold(
+        const std::vector<ExpectedDistributionEntry> &distribution,
+        float threshold)
+    {
+        float total = 0.0f;
+        for (const auto &entry : distribution)
+        {
+            if (entry.token_id >= 0 && entry.probability > 0.0f)
+                total += entry.probability;
+        }
+        if (!(total > 0.0f))
+            return -1;
+
+        const float clamped = std::min(std::max(threshold, 0.0f), 0.99999994f);
+        const float r = clamped * total;
+        float cumulative = 0.0f;
+        int selected = -1;
+        for (const auto &entry : distribution)
+        {
+            if (entry.token_id < 0 || !(entry.probability > 0.0f))
+                continue;
+            if (selected < 0)
+                selected = entry.token_id;
+            cumulative += entry.probability;
+            if (r <= cumulative)
+            {
+                selected = entry.token_id;
+                break;
+            }
+        }
+        return selected;
+    }
+
+    static ExpectedSpeculativeVerify expectedSpeculativeVerifyDistributionWithThresholds(
+        const std::vector<ExpectedDistributionEntry> &target,
+        const std::vector<ExpectedDistributionEntry> &draft,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold)
+    {
+        ExpectedSpeculativeVerify result;
+        const float p = distributionProbability(target, draft_token);
+        const float q = distributionProbability(draft, draft_token);
+        result.accept_probability = q > 0.0f ? std::min(1.0f, p / q) : 0.0f;
+        result.accept_threshold = std::min(std::max(accept_threshold, 0.0f), 0.99999994f);
+
+        if (result.accept_threshold < result.accept_probability)
+        {
+            result.token_id = draft_token;
+            result.accepted = 1;
+            return result;
+        }
+
+        std::vector<ExpectedDistributionEntry> residual;
+        residual.reserve(target.size());
+        float total = 0.0f;
+        for (const auto &entry : target)
+        {
+            if (entry.token_id < 0)
+            {
+                residual.push_back({});
+                continue;
+            }
+            const float q_i = distributionProbability(draft, entry.token_id);
+            const float p_i = std::max(0.0f, entry.probability - q_i);
+            residual.push_back({entry.token_id, p_i});
+            total += p_i;
+        }
+        if (!(total > 0.0f))
+        {
+            result.token_id = expectedSampleDistributionWithThreshold(target, residual_threshold);
+        }
+        else
+        {
+            result.token_id = expectedSampleDistributionWithThreshold(residual, residual_threshold);
+        }
+        result.accepted = 0;
+        return result;
+    }
+
     TEST_P(GPUSamplingTest, Penalty_SingleToken_Subtracted)
     {
         // Apply a penalty to token 2 and verify logit is reduced
@@ -2229,6 +2309,11 @@ namespace
         void *d_reject_flag = nullptr;
         void *d_reject_probability = nullptr;
         void *d_reject_threshold = nullptr;
+        void *d_threshold_sample_token = nullptr;
+        void *d_threshold_verify_token = nullptr;
+        void *d_threshold_verify_flag = nullptr;
+        void *d_threshold_verify_probability = nullptr;
+        void *d_threshold_verify_threshold = nullptr;
 
         auto cleanup = [&]()
         {
@@ -2249,7 +2334,12 @@ namespace
                 d_reject_token,
                 d_reject_flag,
                 d_reject_probability,
-                d_reject_threshold};
+                d_reject_threshold,
+                d_threshold_sample_token,
+                d_threshold_verify_token,
+                d_threshold_verify_flag,
+                d_threshold_verify_probability,
+                d_threshold_verify_threshold};
             for (void *ptr : ptrs)
             {
                 if (ptr)
@@ -2274,6 +2364,11 @@ namespace
         d_reject_flag = backend_->allocate(sizeof(int), device_id_);
         d_reject_probability = backend_->allocate(sizeof(float), device_id_);
         d_reject_threshold = backend_->allocate(sizeof(float), device_id_);
+        d_threshold_sample_token = backend_->allocate(sizeof(int), device_id_);
+        d_threshold_verify_token = backend_->allocate(sizeof(int), device_id_);
+        d_threshold_verify_flag = backend_->allocate(sizeof(int), device_id_);
+        d_threshold_verify_probability = backend_->allocate(sizeof(float), device_id_);
+        d_threshold_verify_threshold = backend_->allocate(sizeof(float), device_id_);
 
         ASSERT_NE(d_target_logits, nullptr);
         ASSERT_NE(d_draft_accept_logits, nullptr);
@@ -2292,6 +2387,11 @@ namespace
         ASSERT_NE(d_reject_flag, nullptr);
         ASSERT_NE(d_reject_probability, nullptr);
         ASSERT_NE(d_reject_threshold, nullptr);
+        ASSERT_NE(d_threshold_sample_token, nullptr);
+        ASSERT_NE(d_threshold_verify_token, nullptr);
+        ASSERT_NE(d_threshold_verify_flag, nullptr);
+        ASSERT_NE(d_threshold_verify_probability, nullptr);
+        ASSERT_NE(d_threshold_verify_threshold, nullptr);
 
         auto run_capture = [&](IWorkerGPUContext &ctx)
         {
@@ -2349,6 +2449,31 @@ namespace
                     d_accept_probability,
                     d_accept_threshold))
                     << "speculative verifier must reject the legacy default/null stream";
+                EXPECT_FALSE(backend_->enqueueSampleDistributionF32Device(
+                    d_target_ids,
+                    d_target_probs,
+                    top_k,
+                    0.25f,
+                    device_id_,
+                    nullptr,
+                    d_threshold_sample_token))
+                    << "compact distribution sampler must reject the legacy default/null stream";
+                EXPECT_FALSE(backend_->enqueueSpeculativeVerifyDistributionsF32DeviceThresholds(
+                    d_target_ids,
+                    d_target_probs,
+                    d_draft_reject_ids,
+                    d_draft_reject_probs,
+                    top_k,
+                    reject_draft_token,
+                    0.99f,
+                    0.0f,
+                    device_id_,
+                    nullptr,
+                    d_threshold_verify_token,
+                    d_threshold_verify_flag,
+                    d_threshold_verify_probability,
+                    d_threshold_verify_threshold))
+                    << "threshold verifier must reject the legacy default/null stream";
 
                 auto capture = ctx.createGraphCapture(stream);
                 ASSERT_NE(capture, nullptr);
@@ -2417,6 +2542,29 @@ namespace
                     d_reject_flag,
                     d_reject_probability,
                     d_reject_threshold));
+                ASSERT_TRUE(backend_->enqueueSampleDistributionF32Device(
+                    d_target_ids,
+                    d_target_probs,
+                    top_k,
+                    0.25f,
+                    device_id_,
+                    stream,
+                    d_threshold_sample_token));
+                ASSERT_TRUE(backend_->enqueueSpeculativeVerifyDistributionsF32DeviceThresholds(
+                    d_target_ids,
+                    d_target_probs,
+                    d_draft_reject_ids,
+                    d_draft_reject_probs,
+                    top_k,
+                    reject_draft_token,
+                    0.99f,
+                    0.0f,
+                    device_id_,
+                    stream,
+                    d_threshold_verify_token,
+                    d_threshold_verify_flag,
+                    d_threshold_verify_probability,
+                    d_threshold_verify_threshold));
                 ASSERT_TRUE(capture->endCapture());
                 ASSERT_TRUE(capture->instantiate());
                 ASSERT_TRUE(capture->launch());
@@ -2445,6 +2593,11 @@ namespace
         int reject_flag = -1;
         float reject_probability = -1.0f;
         float reject_threshold = -1.0f;
+        int threshold_sample_token = -1;
+        int threshold_verify_token = -1;
+        int threshold_verify_flag = -1;
+        float threshold_verify_probability = -1.0f;
+        float threshold_verify_threshold = -1.0f;
 
         ASSERT_TRUE(backend_->deviceToHost(target_ids.data(), d_target_ids, top_k * sizeof(int), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(target_probs.data(), d_target_probs, top_k * sizeof(float), device_id_));
@@ -2456,6 +2609,11 @@ namespace
         ASSERT_TRUE(backend_->deviceToHost(&reject_flag, d_reject_flag, sizeof(int), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(&reject_probability, d_reject_probability, sizeof(float), device_id_));
         ASSERT_TRUE(backend_->deviceToHost(&reject_threshold, d_reject_threshold, sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&threshold_sample_token, d_threshold_sample_token, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_token, d_threshold_verify_token, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_flag, d_threshold_verify_flag, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_probability, d_threshold_verify_probability, sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&threshold_verify_threshold, d_threshold_verify_threshold, sizeof(float), device_id_));
 
         cleanup();
 
@@ -2479,6 +2637,21 @@ namespace
         EXPECT_EQ(reject_token, expected_reject.token_id);
         EXPECT_NEAR(reject_probability, expected_reject.accept_probability, 1e-5f);
         EXPECT_NEAR(reject_threshold, expected_reject.accept_threshold, 1e-6f);
+
+        const int expected_threshold_sample =
+            expectedSampleDistributionWithThreshold(expected_target, 0.25f);
+        const auto expected_threshold_verify =
+            expectedSpeculativeVerifyDistributionWithThresholds(
+                expected_target,
+                expected_draft_reject,
+                reject_draft_token,
+                0.99f,
+                0.0f);
+        EXPECT_EQ(threshold_sample_token, expected_threshold_sample);
+        EXPECT_EQ(threshold_verify_flag, expected_threshold_verify.accepted);
+        EXPECT_EQ(threshold_verify_token, expected_threshold_verify.token_id);
+        EXPECT_NEAR(threshold_verify_probability, expected_threshold_verify.accept_probability, 1e-5f);
+        EXPECT_NEAR(threshold_verify_threshold, expected_threshold_verify.accept_threshold, 1e-6f);
     }
 
     TEST_P(GPUSamplingTest, DRYParity_SimpleRepeat)

@@ -510,6 +510,53 @@ __device__ float rocm_distribution_probability(
     return 0.0f;
 }
 
+__device__ int rocm_sample_distribution_with_threshold(
+    const int *__restrict__ token_ids,
+    const float *__restrict__ probs,
+    int k,
+    float threshold)
+{
+    float total = 0.0f;
+    for (int i = 0; i < k; ++i)
+    {
+        if (token_ids[i] >= 0 && probs[i] > 0.0f)
+            total += probs[i];
+    }
+    if (!(total > 0.0f))
+        return -1;
+
+    const float clamped = fminf(fmaxf(threshold, 0.0f), 0.99999994f);
+    const float r = clamped * total;
+    float cumulative = 0.0f;
+    int selected = -1;
+    for (int i = 0; i < k; ++i)
+    {
+        if (token_ids[i] < 0 || !(probs[i] > 0.0f))
+            continue;
+        if (selected < 0)
+            selected = token_ids[i];
+        cumulative += probs[i];
+        if (r <= cumulative)
+        {
+            selected = token_ids[i];
+            break;
+        }
+    }
+    return selected;
+}
+
+__global__ void rocm_sample_distribution_f32_kernel(
+    const int *__restrict__ token_ids,
+    const float *__restrict__ probs,
+    int k,
+    float threshold,
+    int *__restrict__ out_token)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+    *out_token = rocm_sample_distribution_with_threshold(token_ids, probs, k, threshold);
+}
+
 __global__ void rocm_speculative_verify_distribution_kernel(
     const int *__restrict__ target_token_ids,
     const float *__restrict__ target_probs,
@@ -576,6 +623,87 @@ __global__ void rocm_speculative_verify_distribution_kernel(
     }
 
     const float r = rocm_sampling_uniform01(residual_seed, residual_offset) * residual_total;
+    float cumulative = 0.0f;
+    int selected = target_token_ids[0] >= 0 ? target_token_ids[0] : draft_token;
+    for (int i = 0; i < k; ++i)
+    {
+        cumulative += residual_weights[i];
+        if (r <= cumulative)
+        {
+            selected = target_token_ids[i] >= 0 ? target_token_ids[i] : selected;
+            break;
+        }
+    }
+
+    *out_token = selected;
+    *out_accepted = 0;
+}
+
+__global__ void rocm_speculative_verify_distribution_threshold_kernel(
+    const int *__restrict__ target_token_ids,
+    const float *__restrict__ target_probs,
+    const int *__restrict__ draft_token_ids,
+    const float *__restrict__ draft_probs,
+    int k,
+    int draft_token,
+    float accept_threshold,
+    float residual_threshold,
+    int *__restrict__ out_token,
+    int *__restrict__ out_accepted,
+    float *__restrict__ out_accept_probability,
+    float *__restrict__ out_accept_threshold)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    const float p = rocm_distribution_probability(target_token_ids, target_probs, k, draft_token);
+    const float q = rocm_distribution_probability(draft_token_ids, draft_probs, k, draft_token);
+    const float accept_probability = q > 0.0f ? fminf(1.0f, p / q) : 0.0f;
+    const float threshold = fminf(fmaxf(accept_threshold, 0.0f), 0.99999994f);
+
+    if (out_accept_probability)
+        *out_accept_probability = accept_probability;
+    if (out_accept_threshold)
+        *out_accept_threshold = threshold;
+
+    if (threshold < accept_probability)
+    {
+        *out_token = draft_token;
+        *out_accepted = 1;
+        return;
+    }
+
+    float residual_weights[TOPK_MAX_K];
+    float residual_total = 0.0f;
+    for (int i = 0; i < k; ++i)
+    {
+        if (target_token_ids[i] < 0)
+        {
+            residual_weights[i] = 0.0f;
+            continue;
+        }
+        const float q_i = rocm_distribution_probability(
+            draft_token_ids,
+            draft_probs,
+            k,
+            target_token_ids[i]);
+        const float w = fmaxf(0.0f, target_probs[i] - q_i);
+        residual_weights[i] = w;
+        residual_total += w;
+    }
+
+    if (!(residual_total > 0.0f))
+    {
+        residual_total = 0.0f;
+        for (int i = 0; i < k; ++i)
+        {
+            residual_weights[i] = target_token_ids[i] >= 0 ? target_probs[i] : 0.0f;
+            residual_total += residual_weights[i];
+        }
+    }
+
+    const float residual_clamped = fminf(fmaxf(residual_threshold, 0.0f), 0.99999994f);
+    const float r = residual_clamped * residual_total;
     float cumulative = 0.0f;
     int selected = target_token_ids[0] >= 0 ? target_token_ids[0] : draft_token;
     for (int i = 0; i < k; ++i)
@@ -773,6 +901,87 @@ bool rocmOps_speculative_verify_distribution_f32(
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Speculative Verify Distribution FP32 kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_sample_distribution_f32(
+    const int *token_ids,
+    const float *probs,
+    int k,
+    float threshold,
+    int *out_token,
+    int device_idx,
+    void *stream)
+{
+    if (k <= 0 || k > TOPK_MAX_K || !token_ids || !probs || !out_token || !stream)
+        return false;
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    hipLaunchKernelGGL(
+        rocm_sample_distribution_f32_kernel,
+        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
+        token_ids,
+        probs,
+        k,
+        threshold,
+        out_token);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Sample Distribution FP32 kernel launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_speculative_verify_distribution_threshold_f32(
+    const int *target_token_ids,
+    const float *target_probs,
+    const int *draft_token_ids,
+    const float *draft_probs,
+    int k,
+    int draft_token,
+    float accept_threshold,
+    float residual_threshold,
+    int *out_token,
+    int *out_accepted,
+    float *out_accept_probability,
+    float *out_accept_threshold,
+    int device_idx,
+    void *stream)
+{
+    if (k <= 0 || k > TOPK_MAX_K || !target_token_ids || !target_probs ||
+        !draft_token_ids || !draft_probs || !out_token || !out_accepted || !stream)
+        return false;
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    hipLaunchKernelGGL(
+        rocm_speculative_verify_distribution_threshold_kernel,
+        dim3(1), dim3(1), 0, static_cast<hipStream_t>(stream),
+        target_token_ids,
+        target_probs,
+        draft_token_ids,
+        draft_probs,
+        k,
+        draft_token,
+        accept_threshold,
+        residual_threshold,
+        out_token,
+        out_accepted,
+        out_accept_probability,
+        out_accept_threshold);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Speculative Verify Distribution Threshold FP32 kernel launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

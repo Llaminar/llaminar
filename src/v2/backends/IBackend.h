@@ -758,6 +758,33 @@ namespace llaminar2
         }
 
         /**
+         * @brief Enqueue graph-capturable sampling from a compact probability table.
+         *
+         * The threshold is a host-provided random draw in [0, 1), allowing callers
+         * to preserve their existing deterministic RNG stream while keeping logits
+         * and distribution math on the device. The output token is written to a
+         * scalar device buffer. Requires an explicit non-null stream.
+         */
+        virtual bool enqueueSampleDistributionF32Device(
+            const void *token_ids_device,
+            const void *probs_device,
+            int top_k,
+            float threshold,
+            int device_id,
+            void *stream,
+            void *out_token_device)
+        {
+            (void)token_ids_device;
+            (void)probs_device;
+            (void)top_k;
+            (void)threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            return false;
+        }
+
+        /**
          * @brief Enqueue graph-capturable speculative verify from compact distributions.
          *
          * target/draft distributions must be the top-k probability tables
@@ -794,6 +821,46 @@ namespace llaminar2
             (void)accept_offset;
             (void)residual_seed;
             (void)residual_offset;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable speculative verify using caller RNG draws.
+         *
+         * Equivalent to enqueueSpeculativeVerifyDistributionsF32Device(), but
+         * consumes explicit accept/residual thresholds instead of deriving random
+         * numbers from seed/offset pairs.
+         */
+        virtual bool enqueueSpeculativeVerifyDistributionsF32DeviceThresholds(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)draft_token_ids_device;
+            (void)draft_probs_device;
+            (void)top_k;
+            (void)draft_token;
+            (void)accept_threshold;
+            (void)residual_threshold;
             (void)device_id;
             (void)stream;
             (void)out_token_device;
