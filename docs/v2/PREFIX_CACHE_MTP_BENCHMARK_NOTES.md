@@ -91,6 +91,31 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- Fresh GDN projection stage route-ordering hardening on 2026-06-02:
+  `GDNProjectionStage` now prefers a full native small-M mixed-codebook
+  fused group before greedily splitting same-codebook subgroups. The focused
+  regression
+  `Test__ROCmQuantisedGemmSmallM.GDNProjectionStageMixedCodebookM4UsesSingleFullBatchedRoute`
+  drives the stage itself, captures it in a HIP graph, compares every
+  projection against separate GEMM outputs, and asserts one
+  `rocm_native_vnni_small_m_batched_calls` counter with
+  `m=4,k=5120,projections=4,codebook=mixed` plus no same-codebook
+  `projections=2` split. The full
+  `V2_Integration_ROCmQuantisedGemmSmallM` target passed after the change.
+  Real Qwen3.6 dense smoke/parity also passed:
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`,
+  `V2_Integration_Parity_Qwen36_SingleDevice_...PrefixCacheMTPRestore`, and
+  `...MTPGreedyMatchesPyTorchDecodeTokens`. The current machine had
+  `rocm:0` occupied, so same-source long-lane benchmark evidence used
+  `rocm:1`: baseline
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnstage-fullmixed-baseline-c64-n48-rocm1-bench.json`
+  reached 20.32 decode tok/s, and the confirming MTP rerun
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnstage-fullmixed-mtp-d1-c64-n48-rocm1-rerun-bench.json`
+  reached 33.11 decode tok/s, or 1.63x, with structured stats in
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnstage-fullmixed-mtp-d1-c64-n48-rocm1-rerun-stats.json`.
+  This keeps the ROCm speedup lane healthy but does not replace the 34.28 tok/s
+  ratchet; `mtp.verifier_forward` still averaged about 52.10 ms, and the
+  next speed work remains the verifier graph itself.
 - Fresh both-shortcuts recheck after rebuilding `build_v2_release`, Qwen3.6
   27B Q4_K_S on `rocm:0`, GPU graphs enabled, `The quick brown fox`,
   `-c 64`, `-n 48`: baseline
