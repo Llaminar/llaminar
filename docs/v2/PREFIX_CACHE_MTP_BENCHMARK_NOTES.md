@@ -135,9 +135,10 @@ Latest graph-atomic small-M hardening validation:
   shortcut, not just speculative-reject rollback. This covers max-token and
   stop-token truncation cases where the verifier accepted drafts but the request
   commits fewer rows than the verifier terminal state. The sidecar depth-0 graph
-  cache also stopped rebuilding solely because the MoE placement epoch changed;
-  main forward graphs still hard-miss on epoch changes and placement-changing
-  maintenance invalidates sidecar caches explicitly. Focused validation:
+  cache now keys its captured graph identity on the MoE placement epoch: stable
+  placement reuses the graph, while actual placement-epoch changes hard-miss and
+  rebuild instead of silently replaying an incompatible sidecar. Placement-changing
+  maintenance still invalidates sidecar caches explicitly. Focused validation:
   `V2_Unit_PrefillDecodeTransition`,
   `V2_Unit_MTPGraphConstruction`, `V2_Unit_ForwardExecutionEngine`,
   `V2_Unit_ForwardGraphTypes`, and
