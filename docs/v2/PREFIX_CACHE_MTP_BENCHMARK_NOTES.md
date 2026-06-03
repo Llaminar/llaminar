@@ -9,7 +9,7 @@ speedup. Detailed tuning history belongs in commit messages or perf artifacts.
 | Scope | Device | Model | Baseline decode | Best MTP decode | Speedup | Status |
 |---|---|---|---:|---:|---:|---|
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 30.76 tok/s | 53.81 tok/s | 1.75x | Correctness green, graph captured, short of 2x target |
-| Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 34.96 tok/s | 1.17x | Graph captured, acceptance-limited |
+| Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 39.72 tok/s | 1.33x | Graph captured, depth-sensitive |
 | Dense long lane | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.44 tok/s | 54.02 tok/s | 1.34x | Correctness green, needs verifier work |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE single-device | ROCm `rocm:0` | Qwen3.6 35B A3B | 21.23 tok/s | 10.89 tok/s | 0.51x | Next tuning target |
@@ -39,6 +39,22 @@ Default MTP telemetry: 61.99% acceptance, 212 accepted tokens, 130 rejected
 tokens, 130 rollbacks, 170 verifier runs, and 675 verifier tokens. The lower
 speedup is mainly acceptance-limited rather than graph-capture-limited.
 
+## Adaptive Depth Motivation
+
+The default benchmark prompt is open-ended technical prose, and fixed depth 3
+overreaches compared with shallower drafts:
+
+| Depth | Decode | Speedup | Acceptance | Accepted | Rejected | Rollbacks |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 39.72 tok/s | 1.33x | 73.44% | 188 | 68 | 68 |
+| 2 | 39.42 tok/s | 1.32x | 65.84% | 212 | 110 | 110 |
+| 3 | 34.96 tok/s | 1.17x | 61.99% | 212 | 130 | 130 |
+
+Phase 14 should add an observe/dynamic MTP depth controller that demotes on
+zero-accept or low-acceptance windows and promotes when full-depth accepts are
+stable. The policy must only choose proposal depth; verifier output remains the
+correctness source.
+
 ## Main Tuning Actions Landed
 
 - Stabilized ROCm graph-captured MTP sidecar stream binding and fused sampling
@@ -55,6 +71,7 @@ speedup is mainly acceptance-limited rather than graph-capture-limited.
 ## Next Work
 
 ROCm dense is speed-positive but not at the 2x Phase 14 target. The next dense
-work is reducing captured verifier replay cost and improving acceptance on
-general prompts. After that, move to Qwen3.6 MoE MTP tuning on ROCm, then back
-through CUDA, CPU, and the multi-participant matrix.
+work is reducing captured verifier replay cost and implementing adaptive MTP
+depth so general prompts avoid regressive fixed-depth choices. After that, move
+to Qwen3.6 MoE MTP tuning on ROCm, then back through CUDA, CPU, and the
+multi-participant matrix.

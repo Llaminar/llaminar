@@ -31,6 +31,8 @@ This section is updated as phases are proven against the current worktree. A pha
 | Phase 13.5: Small-M GEMV-Many Kernel Prerequisite | In progress | ROCm now has graph-capturable native-VNNI small-M verifier routes for M=2/3/4 across Q/K/IQ codebooks, fused QKV/GateUp shared-quant dispatch, same-codebook and mixed-codebook GDN projection subgroups, heterogeneous-N Qwen3.6 qkv/z batching, fused-SwiGLU/FFN-down routing, declared-workspace FP32 GDN projection batching, a graph-capturable tiny FP32 GDN alpha/beta projection route for M=1/2/3/4, and focused ROCm small-M integration/perf coverage. The latest ROCm small-M hardening slice precomputes quantized activation block sums in declared GEMM workspace for plain/fused/batched verifier routes, fixes stale asymmetric min-correction for native-VNNI formats such as Q4_1/Q5_1, and adds `DispatchPlainAsymmetricNativeSmallMUsesFreshBlockSums` plus the `GemmWorkspaceConsumer` sums-buffer contract. The latest hardening slices added graph-capturable atomic K-partitioning for `kb>1`, preserved captured replay state across live prefix restore/truncate by keying decode/sidecar graph identity on the MoE placement epoch instead of blanket-resetting MoE replay state, preserved sidecar and verifier graph topology across request-local cache clears when workspace generation and MoE placement epoch are stable, implemented verifier-row GDN recurrence/short-conv state capture so reject rollback can restore the accepted verifier row instead of replaying accepted tokens, prevented non-verifier GDN graph paths from clearing shared verifier capture bindings, added an explicit warmup-dependent graph-capture contract so supported MoE router/expert/shared stages are planned capturable before warmup and hard-fail if they are still not capturable at capture time, then removed the legacy post-warmup resegment API/counter entirely, removed the GDN mixed-codebook batched-route bypass for native small-M-compatible subgroups, added `kernel.gdn_projection_route` counters that prove real Qwen3.6 uses qkv/z quantized pairs plus alpha/beta FP32 batched projections instead of a synthetic four-projection full mixed-codebook bundle, added `NativeVNNIGEMMPerfTest.MTP_SmallM_BatchedGDNProjectionShapes` for Qwen3.6-style heterogeneous GDN projection groups at M=2/3/4, and added direct ROCm recurrence/short-conv verifier-row restore regressions. Current same-binary long-lane ROCm evidence ratcheted again: the latest `rocm:0` depth-3 MTP run reached 54.78 decode tok/s versus a 30.93 same-binary graph-enabled baseline at `The quick brown fox`, `-c 64`, `-n 48`, with 81.02% acceptance, 111 accepted tokens, 26 rejected tokens, 27 request rollbacks, 55 verifier runs, and 220 verifier tokens. The same artifact recorded zero `forward_graph.post_warmup_resegment` records after the legacy path removal, 12 verifier-row shortcut restores over 48 GDN layers, captured `main_verifier` replay around 44.39 ms, and `mtp.verifier_forward` around 46.76 ms. The prior depth-3 ratchet reached 54.69 tok/s after batched verifier-backed shifted-cache catchup; depth-2 also reached 48.66 tok/s and depth-1 reached 47.59 tok/s on the same lane. Focused validation passed on 2026-06-03 for the latest ROCm block-sum/capture-contract slice: `V2_Unit_GemmWorkspaceConsumer`, `V2_Integration_ROCmQuantisedGemmSmallM` all-codebook and asymmetric-sums regressions, `NativeVNNIGEMMPerfTest.MTP_SmallM_DirectPrefillRouteComparison`, `V2_Unit_ForwardGraphTypes`, `V2_Unit_MoERoutingStage`, `V2_Unit_PrefillGraphCapturability`, `V2_Unit_MTPGraphConstruction`, `V2_Unit_PrefillDecodeTransition`, `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`, and the focused Qwen3.6 ROCm PyTorch parity cells `MTPGreedyMatchesPyTorchDecodeTokens`, `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`. Earlier focused validation for the small-M/GDN route also passed: `V2_Integration_HipBLASGemm` and `V2_Integration_ROCmGDNPaddedRealLength`. CPU native VNNI now has explicit all-codebook M=2/3/4 fused projection integration coverage, includes the previously missing `Q4_K` and `Q5_K` CPU smoke/sweep entries, records `kernel.cpu_native_vnni_small_m_fused_projection_calls`, and has a focused `V2_Perf_CPUNativeVNNI_GEMV` row for the MTP small-M fused route. A CPU SingleDevice real Qwen3.6 depth-3 smoke now passes after CPU graph workspace binding for declared GDN verifier-state capture buffers, reaching 9.50 decode tok/s versus a prior 5.80 same-prompt baseline with 100% acceptance and active M=4 CPU fused-projection counters. The latest replay hardening also removes raw `TensorBase *` dirty caches from segmented replay metadata, marks replay outputs through cached stable arena write ids, and keeps the hot path flags-only, fixing a ROCm chained-draft shutdown crash after prefix/MTP state mutation while preserving and slightly improving the ROCm depth-3 speed ratchet. CUDA now records `kernel.cuda_native_vnni_small_m_fused_projection_calls`, and `V2_Integration_CUDAGemmParity` covers CUDA native-format M=2/3/4 two-projection fused verifier routes across Q/K/IQ codebooks, including Q4_K/Q5_K aliases used by Qwen3.6. | Keep ROCm SingleDevice dense in Phase 13.5 until profiling shrinks the remaining verifier budget enough to approach the 2x target, especially ordinary GEMM, fused Gate/Up, GDN projection, LM head, verifier graph overhead, and deeper-draft rollback/acceptance cost. Broaden CPU real-model MTP evidence beyond the short 100%-acceptance smoke before treating CPU as Phase 14 benchmark-acceptance ready. |
 | Phase 14: Benchmark Acceptance And Default-Enablement Readiness | Waiting on Phase 13.5 | `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md` tracks real Qwen3.6 dense/MoE baseline, graph-capture status, and best observed MTP speedups by domain. CUDA SingleDevice dense currently has direct Qwen3.6 evidence for a graph-captured depth-1 MTP speedup after the native M=2 verifier route: 54.02 tok/s versus 40.44 tok/s baseline at `-c 128 -n 64`, with 96.88% acceptance and aligned shifted KV state. CUDA SingleDevice MoE currently has direct Qwen3.6 evidence for the same native M=2 route: 50.89 tok/s versus 31.20 tok/s baseline at `-c 64 -n 16`, with 78.12% acceptance and aligned shifted KV state. ROCm SingleDevice dense now has stronger long-lane Qwen3.6 dense evidence after the tiny FP32 GDN alpha/beta route, GDN verifier-row shortcut regressions, safe arena-write replay caching, warmup-dependent capture planning, legacy resegment-path removal, batched verifier-backed shifted-cache catchup, and verifier-row batched argmax: 55.04 tok/s depth-3 MTP versus 30.64 same-binary baseline at `-c 64 -n 48`, with 85.61% acceptance, but Phase 13.5 remains open until the verifier budget approaches the Phase 14 2x target and CUDA/CPU small-M contracts are covered. `V2_Integration_PrefixCacheMTP_Qwen36ROCmLocalPPHardFail` pins the current LocalPP matrix blocker as an early real-model hard fail with zero MTP draft/verifier counters, preventing recurrence of the old late stage-1 shifted-cache crash while the real PP-aware MTP path is still unimplemented. | Do not use Phase 14 to paper over kernel deficits. Resume benchmark acceptance after Phase 13.5 provides graph-capturable M=2/3/4 GEMV-many coverage and perf evidence for the supported backend/codebook matrix; then continue matrix-driven benchmark work until remaining supported domains show concrete speedups or documented blockers with traces. |
 
+Latest adaptive MTP depth planning note, 2026-06-03: fixed-depth ROCm Qwen3.6 dense default-prompt benchmarks showed depth 1 at 39.72 tok/s, depth 2 at 39.42 tok/s, and depth 3 at 34.96 tok/s versus a 29.91 tok/s baseline, while the long lane still prefers depth 3 at 53.81 tok/s versus 30.76 tok/s baseline. Phase 14 now includes an observe/dynamic `MTPDepthController` design so runtime acceptance windows can demote regressive prompts and promote back to deeper drafts when full-depth acceptance is stable.
+
 Latest ROCm verifier graph lifetime note, 2026-06-03: all-position verifier
 logits now have stable per-row-count tensor owners so cached full-depth verifier
 graphs can survive a smaller tail verifier and request-local `clearCache()`
@@ -1253,6 +1255,14 @@ struct MTPStats
     uint64_t bypasses = 0;
     uint64_t verifier_runs = 0;
     uint64_t verifier_token_count = 0;
+    uint64_t depth_policy_windows = 0;
+    uint64_t depth_policy_updates = 0;
+    uint64_t depth_policy_promotions = 0;
+    uint64_t depth_policy_demotions = 0;
+    uint64_t depth_policy_observe_recommendations = 0;
+    int current_depth = 0;
+    int min_depth = 0;
+    int max_depth = 0;
 };
 ```
 
@@ -1281,6 +1291,13 @@ struct MTPRequestSummary
     bool enabled = false;
     bool bypassed = false;
     std::string bypass_reason;
+    bool adaptive_depth_enabled = false;
+    std::string depth_policy_mode; // fixed, observe, dynamic
+    int current_depth = 0;
+    int min_depth = 0;
+    int max_depth = 0;
+    uint64_t depth_policy_updates = 0;
+    std::string last_depth_policy_reason;
     uint64_t draft_steps = 0;
     uint64_t accepted_tokens = 0;
     uint64_t rejected_tokens = 0;
@@ -1954,6 +1971,91 @@ Metrics:
 - Peak RAM, device-hot bytes, and disk bytes.
 - Disabled-feature overhead compared with baseline.
 
+Add an adaptive MTP depth policy after fixed-depth correctness is green:
+
+```cpp
+enum class MTPDepthPolicyMode
+{
+    Fixed,
+    Observe,
+    Dynamic,
+};
+
+enum class MTPDepthDecisionReason
+{
+    FixedMode,
+    WindowNotReady,
+    CooldownActive,
+    PromoteFullAcceptRate,
+    DemoteZeroAcceptRate,
+    DemoteLowAcceptanceRate,
+    Hold,
+};
+
+struct MTPDepthPolicyConfig
+{
+    MTPDepthPolicyMode mode = MTPDepthPolicyMode::Fixed;
+    int min_depth = 1;
+    int max_depth = 1;      // defaults to --mtp-draft-tokens
+    int initial_depth = 1;  // defaults to max_depth
+    int window_size = 64;   // verifier decisions, not raw tokens
+    int min_samples = 32;
+    int cooldown_steps = 16;
+    double promote_full_accept_rate = 0.55;
+    double demote_zero_accept_rate = 0.30;
+    double demote_acceptance_rate = 0.65;
+};
+
+struct MTPDepthWindow
+{
+    uint64_t verifier_runs = 0;
+    uint64_t attempted_draft_tokens = 0;
+    uint64_t accepted_draft_tokens = 0;
+    uint64_t rejected_draft_tokens = 0;
+    uint64_t rollbacks = 0;
+    uint64_t full_accepts = 0;
+    uint64_t zero_accepts = 0;
+    uint64_t accepted_prefix_sum = 0;
+};
+```
+
+Policy rules:
+
+- `--mtp-draft-tokens` remains exact depth in `Fixed` mode. In `Dynamic` and `Observe` modes it becomes `max_depth`.
+- The controller changes depth only at decode-step boundaries, after rollback/commit state is complete.
+- The first implementation is SingleDevice. LocalTP, NodeLocalTP/GlobalTP, LocalPP, and ExpertParallel require a domain-common depth decision before enabling dynamic mode. Participant-local depth changes are a hard failure.
+- `Observe` mode records the same windows and recommended decision but never changes the effective depth.
+- `Dynamic` mode changes depth by at most one level per decision window and uses cooldown/hysteresis to prevent oscillation.
+- Demote when a ready window has high zero-accept rate, high rollback/rejection pressure, or low accepted-draft-token rate for the current depth.
+- Promote when the current depth's full-accept rate is high, zero-accept rate is low, the cooldown has elapsed, and the current depth is below `max_depth`.
+- Budget clamping remains separate: the controller's chosen depth is the requested depth, and the per-step token budget may still clamp the effective depth without teaching the policy that the prompt rejected tokens.
+- Graph caches must be keyed by effective verifier length and sidecar mode so changing depth reuses or builds the correct captured graph without reconstructing unrelated graph state.
+- The policy must never bypass MTP correctness checks. It only chooses how many sidecar tokens to propose; the main verifier remains the source of accepted output.
+- Multi-participant support uses the same coordination style as Phase 10/11: each participant contributes window counters, the domain computes one decision, then all participants apply the same next depth before the next sidecar step.
+- MTP depth decisions emit structured `PerfStatsCollector` counters with tags for old depth, new depth, reason, acceptance rate, zero-accept rate, full-accept rate, and window size.
+
+Suggested CLI/config additions:
+
+- `--mtp-depth-policy fixed|observe|dynamic`
+- `--mtp-min-draft-tokens <n>`
+- `--mtp-depth-window <n>`
+- `--mtp-depth-min-samples <n>`
+- `--mtp-depth-cooldown <n>`
+- `--mtp-depth-promote-full-accept <f>`
+- `--mtp-depth-demote-zero-accept <f>`
+- `--mtp-depth-demote-acceptance <f>`
+
+Initial ROCm dense evidence motivating the policy:
+
+| Benchmark lane | Fixed depth | Decode | Speedup vs baseline | Acceptance | Full-depth accepts | Zero accepts |
+|----------------|-------------|-------:|--------------------:|-----------:|-------------------:|-------------:|
+| Default prompt, 128 decode | 1 | 39.72 tok/s | 1.33x | 73.44% | 136 | 56 |
+| Default prompt, 128 decode | 2 | 39.42 tok/s | 1.32x | 65.84% | 56 | 40 |
+| Default prompt, 128 decode | 3 | 34.96 tok/s | 1.17x | 61.99% | 23 | 44 |
+| Long lane, `The quick brown fox` | 3 | 53.81 tok/s | 1.75x | 86.33% | high enough to retain depth 3 | low |
+
+This suggests the controller should demote the default prompt from depth 3 toward depth 1/2, while preserving the long-lane depth-3 ratchet when the recent acceptance window supports it.
+
 Acceptance targets before considering default enablement:
 
 - Prefix disabled overhead is within noise of baseline, target less than 2% median regression.
@@ -1961,6 +2063,9 @@ Acceptance targets before considering default enablement:
 - Device-hot tier is faster than RAM hydrate for GPU restore or is documented as not worth enabling for that backend.
 - Disk warm path improves repeated process startup or cross-process reuse workloads, or remains opt-in only.
 - MTP decode benchmarks must identify the Phase 13.5 small-M GEMV-many route used for the verifier backend/codebook mix.
+- Adaptive depth must not reduce correctness coverage: dynamic-depth accepted token streams must match fixed-depth greedy verifier output and the MTP-disabled greedy baseline for each parity lane.
+- On acceptance-limited prompts, adaptive depth should avoid known-regressive fixed depths and stay within noise of the best fixed depth observed for that lane.
+- On high-acceptance prompts, adaptive depth should promote back to the fastest safe depth and preserve the existing speedup ratchet.
 - Dense MTP target is approximately 2x decode throughput versus disabled on Qwen3.6 27B for the supported GPU backend.
 - MoE MTP target is approximately 1.5x decode throughput versus disabled on Qwen3.6 35B MoE for the supported ExpertParallel topology.
 - Prefix plus MTP must not regress versus the faster of prefix-only and MTP-only for the benchmarked prompt class without an explicit documented reason.
@@ -1988,15 +2093,22 @@ Required benchmark topology coverage, when hardware is present:
 ### Files
 
 - `src/v2/utils/BenchmarkRunner.cpp`
+- `src/v2/execution/mtp/MTPDepthController.h/.cpp`
+- `src/v2/execution/config/RuntimeConfig.h`
+- `src/v2/config/OrchestrationConfigParser.cpp`
 - `src/v2/app/` benchmark CLI plumbing if new flags are needed.
 - `tests/v2/performance/`
 - `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md`
 
 ### Tests
 
+- Unit tests for fixed/observe/dynamic depth decisions, promotion, demotion, cooldown, min/max clamps, budget-clamp separation, and reset-on-new-request behavior.
 - Benchmark smoke tests with tiny fixtures and no large model requirement.
 - JSON schema test for benchmark output.
 - Disabled-feature overhead smoke test.
+- Focused SingleDevice integration test with scripted MTP accept-prefix outcomes proving dynamic depth changes without changing emitted greedy tokens.
+- Qwen3.6 ROCm parity cell for dynamic-depth MTP greedy decode and prefix-cache restore.
+- Future LocalTP/NodeLocalTP tests proving all participants apply the same domain-common depth decision.
 - Model-gated dense Qwen3.6 benchmark.
 - Model-gated MoE Qwen3.6 ExpertParallel benchmark.
 
@@ -2018,6 +2130,7 @@ ctest --test-dir build_v2_release -R "^V2_Perf_.*Qwen36" --output-on-failure --p
 
 - Benchmark JSON contains enough counters to explain every reported speedup.
 - Dense and MoE target speedups are met or blockers are documented with traces.
+- Adaptive depth decisions are visible in stats and benchmark JSON, and dynamic mode preserves greedy parity.
 - Graph replay, sparse collective, histogram merge, rebalance, and recapture timings are separated in output.
 - No feature is considered for default enablement until its matching parity phase and benchmark phase have passed.
 
