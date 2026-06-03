@@ -172,6 +172,23 @@ Latest graph-atomic small-M hardening validation:
   This removes one avoidable sidecar/sample synchronization, but it does not
   move the bottleneck: captured `main_verifier` GPU work remains the Phase 13.5
   pressure before Phase 14 can claim the 2x dense target.
+- Fresh ROCm dense stage-timed diagnostic on 2026-06-03 after sidecar/sample
+  fusion: Qwen3.6 dense 27B Q4_K_S on `rocm:0`, GPU graphs enabled,
+  `The quick brown fox`, `-c 64`, `-n 8`, depth-3 MTP completed in 33.71
+  decode tok/s with 70.00% acceptance. Artifacts are
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-stage-mtp-d3-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-stage-mtp-d3-c64-n8-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-current-stage-mtp-d3-c64-n8-stats.csv`.
+  With `LLAMINAR_GPU_STAGE_TIMING=1`, decode GPU stage time averaged
+  22.33 ms/iteration while wall time averaged 50.72 ms/iteration. The top
+  decode GPU buckets were ordinary `GEMM` at 7.39 ms/iteration (33.1%),
+  `GEMM_FUSED_GATE_UP` at 5.72 ms/iteration (25.6%), `GDN_PROJECTION` at
+  3.01 ms/iteration (13.5%), `FUSED_RESIDUAL_NORM` at 1.45 ms/iteration
+  (6.5%), `GDN_RECURRENCE` at 1.24 ms/iteration (5.5%), and `GEMM_FUSED_QKV`
+  at 0.83 ms/iteration (3.7%). The next ROCm Phase 13.5 slice should attack
+  verifier main-graph GEMM/GateUp/GDN projection work rather than sidecar
+  synchronization.
 - Fresh current-revision ROCm depth-3 recheck on 2026-06-03 after the sidecar
   MoE epoch-key narrowing: Qwen3.6 dense 27B Q4_K_S on `rocm:0`, GPU graphs
   enabled, `The quick brown fox`, `-c 64`, `-n 48`. Baseline artifact
