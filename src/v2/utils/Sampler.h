@@ -221,6 +221,12 @@ namespace llaminar2
         int sample_from_residual_distribution(
             const std::vector<SamplingDistributionEntry> &target,
             const std::vector<SamplingDistributionEntry> &draft);
+        static std::vector<SamplingDistributionEntry> residual_distribution(
+            const std::vector<SamplingDistributionEntry> &target,
+            const std::vector<SamplingDistributionEntry> &draft);
+        static float speculative_accept_probability(
+            float target_probability,
+            float draft_probability);
         static float probability_of_token(
             const std::vector<SamplingDistributionEntry> &distribution,
             int token_id);

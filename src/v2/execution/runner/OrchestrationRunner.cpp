@@ -1817,7 +1817,8 @@ namespace llaminar2
                     return fail_after_checkpoint("Stochastic MTP draft token missing from sidecar distribution");
                 }
 
-                const float accept_probability = std::min(1.0f, p / q);
+                const float accept_probability =
+                    Sampler::speculative_accept_probability(p, q);
                 const float threshold = sampler_.random_uniform_01();
                 PerfStatsCollector::addCounter(
                     "mtp",

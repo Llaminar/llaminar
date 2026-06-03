@@ -1976,6 +1976,7 @@ GPU requirements:
 Current implementation status, 2026-06-03:
 
 - Host exactness is implemented for SingleDevice full-logit stochastic MTP and has unit coverage for accept, reject, residual sampling, and terminal ready-token sampling.
+- `V2_Unit_Sampler` now exposes and tests `speculative_accept_probability()` and `residual_distribution()`, including a deterministic proof that the accept/reject/residual algorithm reconstructs the target distribution exactly from draft distribution `q` and verifier distribution `p`.
 - CUDA and ROCm have explicit-stream graph-capturable top-k/top-p sampling, compact distribution construction, and speculative accept/residual verifier enqueue APIs.
 - `GPUSamplingTest.SpeculativeVerifyDistributionsAreGraphCapturable` proves both CUDA and ROCm can capture distribution build plus accept and residual-reject verification, and that the new APIs reject null/default streams.
 - Runner integration now requires compact device-resident stochastic verifier hooks on SingleDevice GPU paths. The first token, each MTP draft token, verifier accept/residual decisions, and the all-accepted terminal ready token use compact device distribution buffers rather than host full-logit snapshots.

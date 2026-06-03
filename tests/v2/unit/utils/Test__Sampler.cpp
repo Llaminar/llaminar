@@ -399,6 +399,98 @@ namespace
         }
     }
 
+    TEST_F(SamplerTest, SpeculativeAcceptProbabilityUsesTargetOverDraftMass)
+    {
+        EXPECT_FLOAT_EQ(Sampler::speculative_accept_probability(0.8f, 0.2f), 1.0f)
+            << "p >= q should always accept the draft token";
+        EXPECT_NEAR(Sampler::speculative_accept_probability(0.2f, 0.5f), 0.4f, 1e-6f);
+        EXPECT_FLOAT_EQ(Sampler::speculative_accept_probability(0.2f, 0.0f), 0.0f)
+            << "a draft token absent from q cannot be accepted";
+        EXPECT_FLOAT_EQ(Sampler::speculative_accept_probability(-0.2f, 0.5f), 0.0f)
+            << "negative probability inputs should clamp to no accept";
+    }
+
+    TEST_F(SamplerTest, ResidualDistributionNormalizesTargetMinusDraftMass)
+    {
+        std::vector<SamplingDistributionEntry> target = {
+            {1, 0.2f},
+            {2, 0.3f},
+            {3, 0.5f},
+        };
+        std::vector<SamplingDistributionEntry> draft = {
+            {1, 0.1f},
+            {2, 0.5f},
+            {4, 0.4f},
+        };
+
+        const auto residual = Sampler::residual_distribution(target, draft);
+
+        ASSERT_EQ(residual.size(), 2u);
+        EXPECT_EQ(residual[0].token_id, 1);
+        EXPECT_EQ(residual[1].token_id, 3);
+        EXPECT_NEAR(residual[0].probability, 1.0f / 6.0f, 1e-6f);
+        EXPECT_NEAR(residual[1].probability, 5.0f / 6.0f, 1e-6f);
+        EXPECT_FLOAT_EQ(Sampler::probability_of_token(residual, 2), 0.0f)
+            << "tokens where q exceeds p must not appear in the residual";
+        EXPECT_FLOAT_EQ(Sampler::probability_of_token(residual, 4), 0.0f)
+            << "draft-only tokens must not appear in the residual";
+    }
+
+    TEST_F(SamplerTest, SpeculativeAcceptRejectReconstructsTargetDistribution)
+    {
+        std::vector<SamplingDistributionEntry> target = {
+            {1, 0.2f},
+            {2, 0.3f},
+            {3, 0.5f},
+        };
+        std::vector<SamplingDistributionEntry> draft = {
+            {1, 0.5f},
+            {2, 0.25f},
+            {3, 0.25f},
+        };
+        const auto residual = Sampler::residual_distribution(target, draft);
+
+        std::vector<SamplingDistributionEntry> reconstructed = {
+            {1, 0.0f},
+            {2, 0.0f},
+            {3, 0.0f},
+        };
+        auto add_probability = [&](int token_id, float mass) {
+            for (auto &entry : reconstructed)
+            {
+                if (entry.token_id == token_id)
+                {
+                    entry.probability += mass;
+                    return;
+                }
+            }
+        };
+
+        for (const auto &draft_entry : draft)
+        {
+            const float p = Sampler::probability_of_token(target, draft_entry.token_id);
+            const float q = draft_entry.probability;
+            const float accept_probability =
+                Sampler::speculative_accept_probability(p, q);
+            add_probability(draft_entry.token_id, q * accept_probability);
+
+            const float reject_mass = q * (1.0f - accept_probability);
+            for (const auto &residual_entry : residual)
+            {
+                add_probability(residual_entry.token_id,
+                                reject_mass * residual_entry.probability);
+            }
+        }
+
+        for (const auto &target_entry : target)
+        {
+            EXPECT_NEAR(Sampler::probability_of_token(reconstructed, target_entry.token_id),
+                        target_entry.probability,
+                        1e-6f)
+                << "speculative accept/reject path must preserve the target distribution";
+        }
+    }
+
     // =============================================================================
     // Seed Reproducibility Tests
     // =============================================================================

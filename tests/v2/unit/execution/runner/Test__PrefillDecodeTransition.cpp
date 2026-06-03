@@ -562,7 +562,8 @@ namespace
 
             const float p = Sampler::probability_of_token(target, draft_token);
             const float q = Sampler::probability_of_token(draft, draft_token);
-            const float accept_probability = q > 0.0f ? std::min(1.0f, p / q) : 0.0f;
+            const float accept_probability =
+                Sampler::speculative_accept_probability(p, q);
             out->accepted = accept_threshold < accept_probability;
             out->accept_probability = accept_probability;
             out->accept_threshold = accept_threshold;
@@ -2502,6 +2503,7 @@ namespace
         sampling.temperature = 0.8f;
         sampling.top_k = 2;
         sampling.top_p = 0.95f;
+        sampling.presence_penalty = 0.25f;
         sampling.seed = 456;
         runner->setSamplingParams(sampling);
 

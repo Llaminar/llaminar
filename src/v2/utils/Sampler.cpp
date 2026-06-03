@@ -343,6 +343,23 @@ namespace llaminar2
             throw std::invalid_argument("Cannot sample residual from empty target distribution");
         }
 
+        auto residual = residual_distribution(target, draft);
+        if (residual.empty())
+        {
+            return sample_from_distribution(target);
+        }
+        return sample_from_distribution(residual);
+    }
+
+    std::vector<SamplingDistributionEntry> Sampler::residual_distribution(
+        const std::vector<SamplingDistributionEntry> &target,
+        const std::vector<SamplingDistributionEntry> &draft)
+    {
+        if (target.empty())
+        {
+            throw std::invalid_argument("Cannot compute residual from empty target distribution");
+        }
+
         std::unordered_map<int, float> draft_probs;
         draft_probs.reserve(draft.size());
         for (const auto &entry : draft)
@@ -367,13 +384,22 @@ namespace llaminar2
 
         if (!(total > 0.0f))
         {
-            return sample_from_distribution(target);
+            return {};
         }
         for (auto &entry : residual)
         {
             entry.probability /= total;
         }
-        return sample_from_distribution(residual);
+        return residual;
+    }
+
+    float Sampler::speculative_accept_probability(
+        float target_probability,
+        float draft_probability)
+    {
+        return draft_probability > 0.0f
+                   ? std::min(1.0f, std::max(0.0f, target_probability) / draft_probability)
+                   : 0.0f;
     }
 
     float Sampler::probability_of_token(
