@@ -47,6 +47,11 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, PrefixCacheMTPRestore)
     runDenseMTPParity(cudaSingleDeviceCase(), true);
 }
 
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPStochasticSamplingVerifierRuns)
+{
+    runDenseStochasticMTPVerifierParity(cudaSingleDeviceCase());
+}
+
 int main(int argc, char **argv)
 {
     int provided;

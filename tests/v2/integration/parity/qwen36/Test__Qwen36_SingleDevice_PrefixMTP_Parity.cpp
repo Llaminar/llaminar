@@ -58,6 +58,11 @@ TEST(Qwen36SingleDevicePrefixMTPParity, PrefixCacheMTPDynamicDepthRestore)
     runDenseDynamicMTPParity(singleDeviceCase(), true);
 }
 
+TEST(Qwen36SingleDevicePrefixMTPParity, MTPStochasticSamplingVerifierRuns)
+{
+    runDenseStochasticMTPVerifierParity(singleDeviceCase());
+}
+
 int main(int argc, char **argv)
 {
     int provided;

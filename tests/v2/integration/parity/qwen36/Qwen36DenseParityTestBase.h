@@ -18,6 +18,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace llaminar2::test::parity::qwen36
@@ -72,6 +73,55 @@ namespace llaminar2::test::parity::qwen36
         quoted += "'";
         return quoted;
     }
+
+    class ScopedEnvironmentValues
+    {
+    public:
+        explicit ScopedEnvironmentValues(
+            std::initializer_list<std::pair<const char *, const char *>> values)
+        {
+            for (const auto &[name, value] : values)
+            {
+                Entry entry;
+                entry.name = name;
+                if (const char *old_value = std::getenv(name))
+                {
+                    entry.had_old_value = true;
+                    entry.old_value = old_value;
+                }
+                entries_.push_back(std::move(entry));
+                setenv(name, value, 1);
+            }
+        }
+
+        ~ScopedEnvironmentValues()
+        {
+            for (auto it = entries_.rbegin(); it != entries_.rend(); ++it)
+            {
+                if (it->had_old_value)
+                {
+                    setenv(it->name.c_str(), it->old_value.c_str(), 1);
+                }
+                else
+                {
+                    unsetenv(it->name.c_str());
+                }
+            }
+        }
+
+        ScopedEnvironmentValues(const ScopedEnvironmentValues &) = delete;
+        ScopedEnvironmentValues &operator=(const ScopedEnvironmentValues &) = delete;
+
+    private:
+        struct Entry
+        {
+            std::string name;
+            bool had_old_value = false;
+            std::string old_value;
+        };
+
+        std::vector<Entry> entries_;
+    };
 
     inline std::string firstEnvOrDefault(
         const std::vector<std::string> &names,
@@ -784,6 +834,96 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
         EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
         EXPECT_GT(after_second.mtp_depth_policy_windows, after_first.mtp_depth_policy_windows);
+    }
+
+    inline void runDenseStochasticMTPVerifierParity(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        ASSERT_EQ(test_case.topology, DensePrefixParityTopology::SingleDevice)
+            << "Phase 13.7 stochastic MTP verifier parity is currently single-device only";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+            {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+        });
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        constexpr int block_size = 2;
+        constexpr int stochastic_decode_steps = 3;
+        auto factory = createOrchestrationRunnerFactory();
+
+        SamplingParams stochastic;
+        stochastic.temperature = 0.6f;
+        stochastic.top_k = 20;
+        stochastic.top_p = 0.95f;
+        stochastic.presence_penalty = 0.25f;
+        stochastic.seed = 123;
+
+        auto baseline_config =
+            makeDensePrefixRestoreConfig(test_case, model_path, false, block_size, false);
+        auto baseline = factory->createFromOrchestrationConfig(baseline_config);
+        ASSERT_NE(baseline, nullptr);
+        ASSERT_TRUE(baseline->initialize()) << baseline->lastError();
+        auto baseline_result =
+            baseline->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+        const auto baseline_snapshot = baseline->prefixStateProbe();
+        baseline->shutdown();
+
+        ASSERT_TRUE(baseline_result.error.empty()) << baseline_result.error;
+        ASSERT_EQ(baseline_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
+        EXPECT_EQ(baseline_snapshot.mtp_draft_steps, 0u);
+        EXPECT_EQ(baseline_snapshot.mtp_stochastic_accept_tests, 0u);
+
+        auto mtp_config =
+            makeDensePrefixRestoreConfig(test_case, model_path, false, block_size, true, 1);
+        mtp_config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+
+        auto mtp = factory->createFromOrchestrationConfig(mtp_config);
+        ASSERT_NE(mtp, nullptr);
+        ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+        auto mtp_result = mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
+        const auto after_mtp = mtp->prefixStateProbe();
+        mtp->shutdown();
+
+        ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
+        ASSERT_EQ(mtp_result.tokens.size(), static_cast<size_t>(stochastic_decode_steps));
+        EXPECT_FALSE(after_mtp.mtp_bypassed) << after_mtp.mtp_bypass_reason;
+        EXPECT_EQ(after_mtp.mtp_request.verify_mode, "speculative-sampling");
+        EXPECT_TRUE(after_mtp.mtp_request.stochastic_verify);
+        EXPECT_GE(after_mtp.mtp_draft_steps, 1u);
+        EXPECT_GE(after_mtp.mtp_verifier_runs, 1u);
+        EXPECT_GE(after_mtp.mtp_verifier_token_count, 2u);
+        EXPECT_GE(after_mtp.mtp_stochastic_accept_tests, 1u);
+        EXPECT_EQ(after_mtp.mtp_stochastic_accept_tests,
+                  after_mtp.mtp_stochastic_accepts +
+                      after_mtp.mtp_stochastic_residual_samples);
+        EXPECT_GE(after_mtp.mtp_stochastic_residual_samples +
+                      after_mtp.mtp_stochastic_terminal_samples,
+                  1u);
+        EXPECT_EQ(after_mtp.mtp_request.stochastic_accept_tests,
+                  after_mtp.mtp_stochastic_accept_tests);
+        EXPECT_EQ(after_mtp.mtp_request.stochastic_accepts,
+                  after_mtp.mtp_stochastic_accepts);
+        EXPECT_EQ(after_mtp.mtp_request.stochastic_residual_samples,
+                  after_mtp.mtp_stochastic_residual_samples);
+        EXPECT_EQ(after_mtp.mtp_request.stochastic_terminal_samples,
+                  after_mtp.mtp_stochastic_terminal_samples);
+        EXPECT_GE(after_mtp.mtp_request.stochastic_acceptance_rate, 0.0);
+        EXPECT_LE(after_mtp.mtp_request.stochastic_acceptance_rate, 1.0);
+        if (after_mtp.mtp_stochastic_accept_tests > 0)
+        {
+            const double expected_rate =
+                static_cast<double>(after_mtp.mtp_stochastic_accepts) /
+                static_cast<double>(after_mtp.mtp_stochastic_accept_tests);
+            EXPECT_NEAR(after_mtp.mtp_request.stochastic_acceptance_rate,
+                        expected_rate,
+                        1e-12);
+        }
     }
 
 } // namespace llaminar2::test::parity::qwen36
