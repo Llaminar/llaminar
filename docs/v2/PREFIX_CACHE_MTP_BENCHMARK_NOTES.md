@@ -131,6 +131,26 @@ Latest graph-atomic small-M hardening validation:
   ordinary GEMM, fused Gate/Up, GDN projection/recurrence, and LM head; a few
   partial-commit suffix replays still cost full verifier forwards when the
   accepted prefix does not cover the whole output set.
+- Fresh accepted-prefix reject lag shortcut on 2026-06-03: the rejected
+  correction lag path was generalized from "first speculative token rejected"
+  to "any rejected correction token after a restored accepted verifier prefix".
+  CPU regression `V2_Unit_PrefillDecodeTransition` now covers depth-3 MTP where
+  row 0 accepts, row 1 rejects, row 1 verifier state is restored, and the
+  correction is consumed by the next condition forward instead of a suffix
+  replay. Real Qwen3.6 dense 27B Q4_K_S ROCm artifacts:
+  `/tmp/llaminar-mtp-bench/dense-rocm-lagged-prefixreject-mtp-d3-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-lagged-prefixreject-mtp-d3-c64-n8-stats.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-lagged-prefixreject-mtp-d3-c64-n48-bench.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-lagged-prefixreject-mtp-d3-c64-n48-stats.json`.
+  The short counter lane proved no `verifier_state_row_replay_suffix_tokens` and
+  no `replay_tokens`. The long lane reached 53.67 tok/s, below the 54.32 tok/s
+  ratchet but still speed-positive; stats recorded 12 lagged correction tokens,
+  zero suffix/replay counters, verifier-row restores for rows 0/1/2 across 48
+  GDN layers, and `restore_verifier_state_row` around 175-187 us. Focused
+  PyTorch parity stayed green with GPU graphs enabled for
+  `MTPGreedyMatchesPyTorchDecodeTokens`,
+  `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`.
 - Fresh ROCm tiny FP32 alpha/beta plus GDN verifier-row shortcut evidence on
   2026-06-03: Qwen3.6 dense 27B Q4_K_S on `rocm:0`, GPU graphs enabled,
   `The quick brown fox`, `-c 64`, `-n 48`, depth-1 MTP. Baseline artifact

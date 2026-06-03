@@ -1273,9 +1273,9 @@ namespace llaminar2
             static_cast<int>(accepted_tokens.size()) > accepted_speculative_prefix + 1;
         const bool can_lag_rejected_correction =
             rejected_speculative_token &&
-            accepted_speculative_prefix == 0 &&
-            accepted_tokens.size() == 2 &&
-            already_appended_for_output == 1;
+            already_appended_for_output == 1 &&
+            accepted_tokens.size() == static_cast<size_t>(
+                already_appended_for_output + accepted_speculative_prefix + 1);
         const bool verifier_state_matches_output =
             all_speculative_accepted && accepted_tokens.size() == draft_tokens.size();
 
@@ -1561,7 +1561,7 @@ namespace llaminar2
 
         std::vector<int32_t> replay_tokens;
         const int main_forward_token_count =
-            can_lag_rejected_correction ? already_appended_for_output
+            can_lag_rejected_correction ? accepted_verifier_input_count
                                         : static_cast<int>(accepted_tokens.size());
         replay_tokens.reserve(static_cast<size_t>(main_forward_token_count));
         for (int i = 0; i < main_forward_token_count; ++i)
