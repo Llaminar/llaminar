@@ -20,6 +20,7 @@
 #include <algorithm>
 
 #include "utils/Sampler.h"
+#include "kernels/common/SamplingMath.h"
 
 using namespace llaminar2;
 
@@ -379,6 +380,129 @@ namespace
                     1e-6f);
         EXPECT_GT(distribution[0].probability, distribution[1].probability);
         EXPECT_FLOAT_EQ(Sampler::probability_of_token(distribution, 2), 0.0f);
+    }
+
+    TEST_F(SamplerTest, ComputeDistributionMatchesSharedCompactSamplingMath)
+    {
+        std::vector<float> logits = {0.1f, 4.5f, 3.8f, 0.0f,
+                                     2.2f, 5.0f, -1.0f, 3.2f};
+
+        SamplingParams params;
+        params.temperature = 0.6f;
+        params.top_k = 5;
+        params.top_p = 0.85f;
+
+        std::vector<std::pair<float, int>> sorted;
+        sorted.reserve(logits.size());
+        for (size_t i = 0; i < logits.size(); ++i)
+        {
+            sorted.emplace_back(logits[i], static_cast<int>(i));
+        }
+        std::partial_sort(
+            sorted.begin(),
+            sorted.begin() + params.top_k,
+            sorted.end(),
+            [](const auto &a, const auto &b)
+            {
+                return a.first > b.first;
+            });
+
+        std::vector<float> sorted_logits(static_cast<size_t>(params.top_k));
+        std::vector<int> sorted_ids(static_cast<size_t>(params.top_k));
+        for (int i = 0; i < params.top_k; ++i)
+        {
+            sorted_logits[static_cast<size_t>(i)] = sorted[static_cast<size_t>(i)].first;
+            sorted_ids[static_cast<size_t>(i)] = sorted[static_cast<size_t>(i)].second;
+        }
+
+        std::vector<float> scratch(static_cast<size_t>(params.top_k), 0.0f);
+        std::vector<int> expected_ids(static_cast<size_t>(params.top_k), -1);
+        std::vector<float> expected_probs(static_cast<size_t>(params.top_k), 0.0f);
+        sampling_math::build_topk_topp_distribution_from_sorted(
+            sorted_logits.data(),
+            sorted_ids.data(),
+            params.top_k,
+            params.top_p,
+            params.temperature,
+            expected_ids.data(),
+            expected_probs.data(),
+            scratch.data());
+
+        const auto distribution =
+            sampler_->compute_distribution(logits.data(), logits.size(), params);
+
+        std::vector<int> actual_ids;
+        std::vector<float> actual_probs;
+        for (const auto &entry : distribution)
+        {
+            actual_ids.push_back(entry.token_id);
+            actual_probs.push_back(entry.probability);
+        }
+
+        size_t expected_active = 0;
+        for (int i = 0; i < params.top_k; ++i)
+        {
+            if (expected_ids[static_cast<size_t>(i)] >= 0)
+            {
+                ASSERT_LT(expected_active, actual_ids.size());
+                EXPECT_EQ(actual_ids[expected_active], expected_ids[static_cast<size_t>(i)]);
+                EXPECT_NEAR(actual_probs[expected_active],
+                            expected_probs[static_cast<size_t>(i)],
+                            1e-6f);
+                ++expected_active;
+            }
+        }
+        EXPECT_EQ(actual_ids.size(), expected_active);
+    }
+
+    TEST_F(SamplerTest, SharedSamplingMathSpeculativeVerifyMatchesSamplerHelpers)
+    {
+        const int target_ids[] = {10, 20, 30, -1};
+        const float target_probs[] = {0.2f, 0.3f, 0.5f, 0.0f};
+        const int draft_ids[] = {10, 20, 40, -1};
+        const float draft_probs[] = {0.4f, 0.1f, 0.5f, 0.0f};
+
+        int out_token = -1;
+        int out_accepted = -1;
+        float out_accept_probability = -1.0f;
+        float out_accept_threshold = -1.0f;
+        sampling_math::speculative_verify_with_thresholds(
+            target_ids,
+            target_probs,
+            draft_ids,
+            draft_probs,
+            4,
+            10,
+            0.75f,
+            0.25f,
+            &out_token,
+            &out_accepted,
+            &out_accept_probability,
+            &out_accept_threshold);
+
+        EXPECT_EQ(out_accepted, 0);
+        EXPECT_EQ(out_token, 20);
+        EXPECT_NEAR(out_accept_probability,
+                    Sampler::speculative_accept_probability(0.2f, 0.4f),
+                    1e-6f);
+        EXPECT_NEAR(out_accept_threshold, 0.75f, 1e-6f);
+
+        std::vector<SamplingDistributionEntry> residual =
+            Sampler::residual_distribution({{10, 0.2f}, {20, 0.3f}, {30, 0.5f}},
+                                           {{10, 0.4f}, {20, 0.1f}, {40, 0.5f}});
+        std::vector<int> residual_ids;
+        std::vector<float> residual_probs;
+        for (const auto &entry : residual)
+        {
+            residual_ids.push_back(entry.token_id);
+            residual_probs.push_back(entry.probability);
+        }
+        EXPECT_EQ(sampling_math::sample_distribution_with_threshold(
+                      residual_ids.data(),
+                      residual_probs.data(),
+                      static_cast<int>(residual_ids.size()),
+                      0.25f),
+                  out_token);
     }
 
     TEST_F(SamplerTest, ResidualDistributionSamplesPositiveTargetMinusDraftMass)

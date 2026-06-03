@@ -33,6 +33,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
 #include "backends/IGPUGraphCapture.h"
+#include "kernels/common/SamplingMath.h"
 #include "utils/Sampler.h"
 
 #include <vector>
@@ -1404,18 +1405,9 @@ namespace
         return result;
     }
 
-    static uint64_t samplingSplitmix64(uint64_t x)
-    {
-        x += 0x9E3779B97F4A7C15ull;
-        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
-        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
-        return x ^ (x >> 31);
-    }
-
     static float samplingUniform01(uint64_t seed, uint64_t offset)
     {
-        const uint64_t bits = samplingSplitmix64(seed + offset);
-        return static_cast<float>((bits >> 40) & 0xFFFFFFull) * (1.0f / 16777216.0f);
+        return sampling_math::uniform01(seed, offset);
     }
 
     static int expectedTopKTopPSample(const std::vector<float> &logits,
@@ -1440,48 +1432,22 @@ namespace
                           });
         candidates.resize(static_cast<size_t>(top_k));
 
-        const float temp = temperature > 0.0f ? temperature : 1.0f;
-        const float max_logit = candidates.front().first;
-        std::vector<float> weights(candidates.size(), 0.0f);
-        float total = 0.0f;
+        std::vector<float> sorted_logits(static_cast<size_t>(top_k));
+        std::vector<int> sorted_ids(static_cast<size_t>(top_k));
         for (size_t i = 0; i < candidates.size(); ++i)
         {
-            weights[i] = std::exp((candidates[i].first - max_logit) / temp);
-            total += weights[i];
+            sorted_logits[i] = candidates[i].first;
+            sorted_ids[i] = candidates[i].second;
         }
-
-        int nucleus = top_k;
-        if (top_p > 0.0f && top_p < 1.0f)
-        {
-            float cumulative = 0.0f;
-            for (int i = 0; i < top_k; ++i)
-            {
-                cumulative += weights[static_cast<size_t>(i)] / total;
-                if (cumulative >= top_p)
-                {
-                    nucleus = i + 1;
-                    break;
-                }
-            }
-        }
-
-        float nucleus_total = 0.0f;
-        for (int i = 0; i < nucleus; ++i)
-            nucleus_total += weights[static_cast<size_t>(i)];
-
-        const float r = samplingUniform01(seed, offset) * nucleus_total;
-        float cumulative = 0.0f;
-        int selected = candidates.front().second;
-        for (int i = 0; i < nucleus; ++i)
-        {
-            cumulative += weights[static_cast<size_t>(i)];
-            if (r <= cumulative)
-            {
-                selected = candidates[static_cast<size_t>(i)].second;
-                break;
-            }
-        }
-        return selected;
+        std::vector<float> scratch(static_cast<size_t>(top_k), 0.0f);
+        return sampling_math::sample_topk_topp_from_sorted_with_threshold(
+            sorted_logits.data(),
+            sorted_ids.data(),
+            top_k,
+            top_p,
+            temperature,
+            samplingUniform01(seed, offset),
+            scratch.data());
     }
 
     struct ExpectedDistributionEntry
@@ -1511,46 +1477,32 @@ namespace
                           });
         candidates.resize(static_cast<size_t>(top_k));
 
-        const float temp = temperature > 0.0f ? temperature : 1.0f;
-        const float max_logit = candidates.front().first;
-        std::vector<float> weights(candidates.size(), 0.0f);
-        float total = 0.0f;
+        std::vector<float> sorted_logits(static_cast<size_t>(top_k));
+        std::vector<int> sorted_ids(static_cast<size_t>(top_k));
         for (size_t i = 0; i < candidates.size(); ++i)
         {
-            weights[i] = std::exp((candidates[i].first - max_logit) / temp);
-            total += weights[i];
+            sorted_logits[i] = candidates[i].first;
+            sorted_ids[i] = candidates[i].second;
         }
 
-        int nucleus = top_k;
-        if (total > 0.0f && top_p > 0.0f && top_p < 1.0f)
-        {
-            float cumulative = 0.0f;
-            for (int i = 0; i < top_k; ++i)
-            {
-                cumulative += weights[static_cast<size_t>(i)] / total;
-                if (cumulative >= top_p)
-                {
-                    nucleus = i + 1;
-                    break;
-                }
-            }
-        }
+        std::vector<int> out_ids(static_cast<size_t>(top_k), -1);
+        std::vector<float> out_probs(static_cast<size_t>(top_k), 0.0f);
+        std::vector<float> scratch(static_cast<size_t>(top_k), 0.0f);
+        sampling_math::build_topk_topp_distribution_from_sorted(
+            sorted_logits.data(),
+            sorted_ids.data(),
+            top_k,
+            top_p,
+            temperature,
+            out_ids.data(),
+            out_probs.data(),
+            scratch.data());
 
-        float nucleus_total = 0.0f;
-        for (int i = 0; i < nucleus; ++i)
-            nucleus_total += weights[static_cast<size_t>(i)];
-
-        std::vector<ExpectedDistributionEntry> distribution(
-            static_cast<size_t>(top_k));
+        std::vector<ExpectedDistributionEntry> distribution(static_cast<size_t>(top_k));
         for (int i = 0; i < top_k; ++i)
         {
-            if (i < nucleus && nucleus_total > 0.0f)
-            {
-                distribution[static_cast<size_t>(i)].token_id =
-                    candidates[static_cast<size_t>(i)].second;
-                distribution[static_cast<size_t>(i)].probability =
-                    weights[static_cast<size_t>(i)] / nucleus_total;
-            }
+            distribution[static_cast<size_t>(i)].token_id = out_ids[static_cast<size_t>(i)];
+            distribution[static_cast<size_t>(i)].probability = out_probs[static_cast<size_t>(i)];
         }
         return distribution;
     }
@@ -1559,12 +1511,18 @@ namespace
         const std::vector<ExpectedDistributionEntry> &distribution,
         int token_id)
     {
-        for (const auto &entry : distribution)
+        std::vector<int> token_ids(distribution.size(), -1);
+        std::vector<float> probs(distribution.size(), 0.0f);
+        for (size_t i = 0; i < distribution.size(); ++i)
         {
-            if (entry.token_id == token_id)
-                return entry.probability;
+            token_ids[i] = distribution[i].token_id;
+            probs[i] = distribution[i].probability;
         }
-        return 0.0f;
+        return sampling_math::distribution_probability(
+            token_ids.data(),
+            probs.data(),
+            static_cast<int>(distribution.size()),
+            token_id);
     }
 
     struct ExpectedSpeculativeVerify
@@ -1575,6 +1533,13 @@ namespace
         float accept_threshold = 0.0f;
     };
 
+    static ExpectedSpeculativeVerify expectedSpeculativeVerifyDistributionWithThresholds(
+        const std::vector<ExpectedDistributionEntry> &target,
+        const std::vector<ExpectedDistributionEntry> &draft,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold);
+
     static ExpectedSpeculativeVerify expectedSpeculativeVerifyDistribution(
         const std::vector<ExpectedDistributionEntry> &target,
         const std::vector<ExpectedDistributionEntry> &draft,
@@ -1584,90 +1549,30 @@ namespace
         uint64_t residual_seed,
         uint64_t residual_offset)
     {
-        ExpectedSpeculativeVerify result;
-        const float p = distributionProbability(target, draft_token);
-        const float q = distributionProbability(draft, draft_token);
-        result.accept_probability = q > 0.0f ? std::min(1.0f, p / q) : 0.0f;
-        result.accept_threshold = samplingUniform01(accept_seed, accept_offset);
-
-        if (result.accept_threshold < result.accept_probability)
-        {
-            result.token_id = draft_token;
-            result.accepted = 1;
-            return result;
-        }
-
-        std::vector<float> residual_weights(target.size(), 0.0f);
-        float residual_total = 0.0f;
-        for (size_t i = 0; i < target.size(); ++i)
-        {
-            if (target[i].token_id < 0)
-                continue;
-            const float q_i = distributionProbability(draft, target[i].token_id);
-            residual_weights[i] = std::max(0.0f, target[i].probability - q_i);
-            residual_total += residual_weights[i];
-        }
-
-        if (!(residual_total > 0.0f))
-        {
-            residual_total = 0.0f;
-            for (size_t i = 0; i < target.size(); ++i)
-            {
-                residual_weights[i] =
-                    target[i].token_id >= 0 ? target[i].probability : 0.0f;
-                residual_total += residual_weights[i];
-            }
-        }
-
-        const float r = samplingUniform01(residual_seed, residual_offset) * residual_total;
-        float cumulative = 0.0f;
-        result.token_id = !target.empty() && target.front().token_id >= 0
-                              ? target.front().token_id
-                              : draft_token;
-        for (size_t i = 0; i < target.size(); ++i)
-        {
-            cumulative += residual_weights[i];
-            if (r <= cumulative)
-            {
-                if (target[i].token_id >= 0)
-                    result.token_id = target[i].token_id;
-                break;
-            }
-        }
-        return result;
+        return expectedSpeculativeVerifyDistributionWithThresholds(
+            target,
+            draft,
+            draft_token,
+            samplingUniform01(accept_seed, accept_offset),
+            samplingUniform01(residual_seed, residual_offset));
     }
 
     static int expectedSampleDistributionWithThreshold(
         const std::vector<ExpectedDistributionEntry> &distribution,
         float threshold)
     {
-        float total = 0.0f;
-        for (const auto &entry : distribution)
+        std::vector<int> token_ids(distribution.size(), -1);
+        std::vector<float> probs(distribution.size(), 0.0f);
+        for (size_t i = 0; i < distribution.size(); ++i)
         {
-            if (entry.token_id >= 0 && entry.probability > 0.0f)
-                total += entry.probability;
+            token_ids[i] = distribution[i].token_id;
+            probs[i] = distribution[i].probability;
         }
-        if (!(total > 0.0f))
-            return -1;
-
-        const float clamped = std::min(std::max(threshold, 0.0f), 0.99999994f);
-        const float r = clamped * total;
-        float cumulative = 0.0f;
-        int selected = -1;
-        for (const auto &entry : distribution)
-        {
-            if (entry.token_id < 0 || !(entry.probability > 0.0f))
-                continue;
-            if (selected < 0)
-                selected = entry.token_id;
-            cumulative += entry.probability;
-            if (r <= cumulative)
-            {
-                selected = entry.token_id;
-                break;
-            }
-        }
-        return selected;
+        return sampling_math::sample_distribution_with_threshold(
+            token_ids.data(),
+            probs.data(),
+            static_cast<int>(distribution.size()),
+            threshold);
     }
 
     static ExpectedSpeculativeVerify expectedSpeculativeVerifyDistributionWithThresholds(
@@ -1678,42 +1583,34 @@ namespace
         float residual_threshold)
     {
         ExpectedSpeculativeVerify result;
-        const float p = distributionProbability(target, draft_token);
-        const float q = distributionProbability(draft, draft_token);
-        result.accept_probability = q > 0.0f ? std::min(1.0f, p / q) : 0.0f;
-        result.accept_threshold = std::min(std::max(accept_threshold, 0.0f), 0.99999994f);
-
-        if (result.accept_threshold < result.accept_probability)
+        std::vector<int> target_ids(target.size(), -1);
+        std::vector<float> target_probs(target.size(), 0.0f);
+        std::vector<int> draft_ids(draft.size(), -1);
+        std::vector<float> draft_probs(draft.size(), 0.0f);
+        for (size_t i = 0; i < target.size(); ++i)
         {
-            result.token_id = draft_token;
-            result.accepted = 1;
-            return result;
+            target_ids[i] = target[i].token_id;
+            target_probs[i] = target[i].probability;
+        }
+        for (size_t i = 0; i < draft.size(); ++i)
+        {
+            draft_ids[i] = draft[i].token_id;
+            draft_probs[i] = draft[i].probability;
         }
 
-        std::vector<ExpectedDistributionEntry> residual;
-        residual.reserve(target.size());
-        float total = 0.0f;
-        for (const auto &entry : target)
-        {
-            if (entry.token_id < 0)
-            {
-                residual.push_back({});
-                continue;
-            }
-            const float q_i = distributionProbability(draft, entry.token_id);
-            const float p_i = std::max(0.0f, entry.probability - q_i);
-            residual.push_back({entry.token_id, p_i});
-            total += p_i;
-        }
-        if (!(total > 0.0f))
-        {
-            result.token_id = expectedSampleDistributionWithThreshold(target, residual_threshold);
-        }
-        else
-        {
-            result.token_id = expectedSampleDistributionWithThreshold(residual, residual_threshold);
-        }
-        result.accepted = 0;
+        sampling_math::speculative_verify_with_thresholds(
+            target_ids.data(),
+            target_probs.data(),
+            draft_ids.data(),
+            draft_probs.data(),
+            static_cast<int>(target.size()),
+            draft_token,
+            accept_threshold,
+            residual_threshold,
+            &result.token_id,
+            &result.accepted,
+            &result.accept_probability,
+            &result.accept_threshold);
         return result;
     }
 
@@ -2245,6 +2142,113 @@ namespace
 
         EXPECT_EQ(actual, expected)
             << "Graph-captured top-k/top-p sampler selected the wrong token";
+    }
+
+    TEST_P(GPUSamplingTest, TopKTopPDistributionMatchesCPUSampler)
+    {
+        const std::vector<float> logits = {0.1f, 4.5f, 3.8f, 0.0f, 2.2f,
+                                           5.0f, -1.0f, 3.2f, 4.1f, 1.3f};
+        constexpr int top_k = 6;
+        constexpr float top_p = 0.78f;
+        constexpr float temperature = 0.7f;
+
+        Sampler cpu_sampler(123);
+        SamplingParams params;
+        params.temperature = temperature;
+        params.top_k = top_k;
+        params.top_p = top_p;
+        const auto cpu_distribution =
+            cpu_sampler.compute_distribution(logits.data(), logits.size(), params);
+
+        void *d_logits = nullptr;
+        void *d_token_ids = nullptr;
+        void *d_probs = nullptr;
+
+        auto cleanup = [&]()
+        {
+            if (d_logits)
+                backend_->free(d_logits, device_id_);
+            if (d_token_ids)
+                backend_->free(d_token_ids, device_id_);
+            if (d_probs)
+                backend_->free(d_probs, device_id_);
+        };
+
+        d_logits = backend_->allocate(logits.size() * sizeof(float), device_id_);
+        d_token_ids = backend_->allocate(top_k * sizeof(int), device_id_);
+        d_probs = backend_->allocate(top_k * sizeof(float), device_id_);
+        ASSERT_NE(d_logits, nullptr);
+        ASSERT_NE(d_token_ids, nullptr);
+        ASSERT_NE(d_probs, nullptr);
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_logits,
+                    static_cast<int>(logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    d_token_ids,
+                    d_probs));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        std::vector<int> gpu_ids(top_k, -1);
+        std::vector<float> gpu_probs(top_k, 0.0f);
+        ASSERT_TRUE(backend_->deviceToHost(gpu_ids.data(), d_token_ids, top_k * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(gpu_probs.data(), d_probs, top_k * sizeof(float), device_id_));
+        cleanup();
+
+        for (int i = 0; i < top_k; ++i)
+        {
+            if (i < static_cast<int>(cpu_distribution.size()))
+            {
+                EXPECT_EQ(gpu_ids[static_cast<size_t>(i)],
+                          cpu_distribution[static_cast<size_t>(i)].token_id)
+                    << "CPU/GPU compact distribution token mismatch at slot " << i;
+                EXPECT_NEAR(gpu_probs[static_cast<size_t>(i)],
+                            cpu_distribution[static_cast<size_t>(i)].probability,
+                            1e-5f)
+                    << "CPU/GPU compact distribution probability mismatch at slot " << i;
+            }
+            else
+            {
+                EXPECT_EQ(gpu_ids[static_cast<size_t>(i)], -1)
+                    << "GPU should mark inactive top-p slots with token -1";
+                EXPECT_FLOAT_EQ(gpu_probs[static_cast<size_t>(i)], 0.0f)
+                    << "GPU should zero inactive top-p probability slots";
+            }
+        }
     }
 
     TEST_P(GPUSamplingTest, SpeculativeVerifyDistributionsAreGraphCapturable)

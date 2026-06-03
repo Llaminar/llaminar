@@ -6,6 +6,7 @@
  */
 
 #include "Sampler.h"
+#include "kernels/common/SamplingMath.h"
 #include <limits>
 #include <stdexcept>
 
@@ -234,6 +235,67 @@ namespace llaminar2
             temperature = 1.0f;
         }
 
+        if (params.top_k > 0 &&
+            params.top_k <= sampling_math::kMaxTopK &&
+            params.top_k <= static_cast<int>(vocab_size))
+        {
+            std::vector<std::pair<float, int>> candidates;
+            candidates.reserve(vocab_size);
+            for (size_t i = 0; i < vocab_size; ++i)
+            {
+                candidates.emplace_back(logits_vec[i], static_cast<int>(i));
+            }
+
+            const int k = std::min<int>(params.top_k, static_cast<int>(candidates.size()));
+            std::partial_sort(
+                candidates.begin(),
+                candidates.begin() + k,
+                candidates.end(),
+                [](const auto &a, const auto &b)
+                {
+                    return a.first > b.first;
+                });
+
+            std::vector<float> sorted_logits(static_cast<size_t>(k));
+            std::vector<int> sorted_ids(static_cast<size_t>(k));
+            for (int i = 0; i < k; ++i)
+            {
+                sorted_logits[static_cast<size_t>(i)] = candidates[static_cast<size_t>(i)].first;
+                sorted_ids[static_cast<size_t>(i)] = candidates[static_cast<size_t>(i)].second;
+            }
+
+            std::vector<float> scratch(static_cast<size_t>(k), 0.0f);
+            std::vector<int> out_ids(static_cast<size_t>(k), -1);
+            std::vector<float> out_probs(static_cast<size_t>(k), 0.0f);
+            sampling_math::build_topk_topp_distribution_from_sorted(
+                sorted_logits.data(),
+                sorted_ids.data(),
+                k,
+                params.top_p,
+                temperature,
+                out_ids.data(),
+                out_probs.data(),
+                scratch.data());
+
+            std::vector<SamplingDistributionEntry> distribution;
+            distribution.reserve(static_cast<size_t>(k));
+            for (int i = 0; i < k; ++i)
+            {
+                if (out_ids[static_cast<size_t>(i)] >= 0 &&
+                    out_probs[static_cast<size_t>(i)] > 0.0f)
+                {
+                    distribution.push_back({
+                        out_ids[static_cast<size_t>(i)],
+                        out_probs[static_cast<size_t>(i)]});
+                }
+            }
+            if (!distribution.empty())
+            {
+                return distribution;
+            }
+            return {{sorted_ids.front(), 1.0f}};
+        }
+
         std::vector<std::pair<int, float>> candidates;
         candidates.reserve(vocab_size);
         for (size_t i = 0; i < vocab_size; ++i)
@@ -322,16 +384,20 @@ namespace llaminar2
         }
 
         const float r = random_uniform_01();
-        float cumulative = 0.0f;
-        for (const auto &entry : distribution)
+        std::vector<int> token_ids(distribution.size(), -1);
+        std::vector<float> probs(distribution.size(), 0.0f);
+        for (size_t i = 0; i < distribution.size(); ++i)
         {
-            cumulative += entry.probability;
-            if (r < cumulative)
-            {
-                return entry.token_id;
-            }
+            token_ids[i] = distribution[i].token_id;
+            probs[i] = distribution[i].probability;
         }
-        return distribution.back().token_id;
+
+        const int sampled = sampling_math::sample_distribution_with_threshold(
+            token_ids.data(),
+            probs.data(),
+            static_cast<int>(distribution.size()),
+            r);
+        return sampled >= 0 ? sampled : distribution.back().token_id;
     }
 
     int Sampler::sample_from_residual_distribution(
@@ -398,7 +464,9 @@ namespace llaminar2
         float draft_probability)
     {
         return draft_probability > 0.0f
-                   ? std::min(1.0f, std::max(0.0f, target_probability) / draft_probability)
+                   ? sampling_math::speculative_accept_probability(
+                         target_probability,
+                         draft_probability)
                    : 0.0f;
     }
 
