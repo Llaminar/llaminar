@@ -350,16 +350,24 @@ namespace llaminar2
          */
         struct GraphSegment
         {
+            struct ArenaWriteBinding
+            {
+                BufferId id;
+                DeviceId device;
+            };
+
             std::vector<std::string> stage_names;          ///< Ordered stage names in this segment
             bool capturable = true;                        ///< Whether this segment can be graph-captured
             std::unique_ptr<IGPUGraphCapture> capture;     ///< GPU graph (only for capturable segments)
             std::vector<IComputeStage *> replay_callbacks; ///< Stages needing onGraphReplayed() (precomputed)
             uint64_t last_executed_step = 0;               ///< Last decode-step where this segment executed
 
-            // Output coherence is marked through StageBufferContract/BufferArena
-            // after replay. Avoid retaining raw TensorBase* caches here: prefix
+            // Output coherence is marked through stable BufferArena ids after
+            // replay. Avoid retaining raw TensorBase* caches here: prefix
             // restore, rollback, and request clears can legally mutate tensor
             // ownership while preserving graph topology.
+            std::vector<ArenaWriteBinding> cached_arena_writes;
+            bool arena_writes_cached = false;
         };
 
         /**

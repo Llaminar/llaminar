@@ -358,7 +358,7 @@ namespace llaminar2
             DeviceGraphExecutor::GraphSegment &segment,
             uint64_t current_step,
             void *stream,
-            const std::function<void(ComputeNode &, void *)> &mark_stage_outputs_dirty_cb,
+            const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb,
             bool skip_replay_callbacks = false);
     };
 

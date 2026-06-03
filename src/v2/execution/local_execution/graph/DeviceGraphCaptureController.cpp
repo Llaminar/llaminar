@@ -1798,22 +1798,64 @@ namespace llaminar2
         ComputeGraph &graph,
         DeviceGraphExecutor::GraphSegment &segment,
         uint64_t current_step,
-        void *stream,
-        const std::function<void(ComputeNode &, void *)> &mark_stage_outputs_dirty_cb,
+        void * /*stream*/,
+        const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb,
         bool skip_replay_callbacks)
     {
-        // Use arena/contract dirty marking instead of retaining raw TensorBase*
-        // pointers inside the segment cache. Prefix restore, rollback, and
-        // request clears may preserve graph topology while replacing or rewinding
-        // tensor-backed state, so replay metadata must not own a hidden pointer
-        // cache outside the graph/stage contracts.
-        for (const auto &stage_name : segment.stage_names)
+        if (!segment.arena_writes_cached)
         {
-            auto *node = graph.getNode(stage_name);
-            if (node && node->stage)
+            segment.cached_arena_writes.clear();
+
+            auto add_write = [&](BufferId id, DeviceId device)
             {
-                mark_stage_outputs_dirty_cb(*node, stream);
+                for (const auto &existing : segment.cached_arena_writes)
+                {
+                    if (existing.id == id && existing.device == device)
+                    {
+                        return;
+                    }
+                }
+                segment.cached_arena_writes.push_back({id, device});
+            };
+
+            for (const auto &stage_name : segment.stage_names)
+            {
+                auto *node = graph.getNode(stage_name);
+                if (!node || !node->stage)
+                {
+                    continue;
+                }
+
+                const StageBufferContract contract = node->stage->bufferContract();
+                if (contract.empty())
+                {
+                    continue;
+                }
+
+                const DeviceId target_device = node->device.is_valid() ? node->device : node->stage->device();
+                for (const auto &binding : contract.outputs)
+                {
+                    add_write(binding.id, target_device);
+                }
+                for (const auto &binding : contract.inouts)
+                {
+                    add_write(binding.id, target_device);
+                }
             }
+
+            segment.arena_writes_cached = true;
+            LOG_DEBUG("[DeviceGraphCaptureController] Cached "
+                      << segment.cached_arena_writes.size()
+                      << " unique arena writes for " << segment.stage_names.size()
+                      << " replay stages");
+        }
+
+        // Use arena ids instead of retaining raw TensorBase* pointers. Prefix
+        // restore, rollback, and request clears may preserve graph topology
+        // while replacing or rewinding tensor-backed state.
+        for (const auto &write : segment.cached_arena_writes)
+        {
+            mark_arena_write_dirty_cb(write.id, write.device);
         }
 
         // Skip replay callbacks during the capture phase: execute() already ran

@@ -340,18 +340,11 @@ namespace llaminar2
             ctx ? ctx->deviceId().toString() : std::string{},
             {{"phase", phase_name}});
 
-        auto mark_stage_outputs_dirty = [&](ComputeNode &node, void *stream)
+        auto mark_arena_write_dirty = [&](BufferId id, DeviceId device)
         {
             if (!arena_)
                 return;
-            const StageBufferContract contract = node.stage->bufferContract();
-            if (contract.empty())
-                return;
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
-            for (const auto &binding : contract.allWrites())
-            {
-                arena_->markWritten(binding.id, target_device, stream);
-            }
+            arena_->markWrittenFlagsOnly(id, device);
         };
 
         // ===== FAST PATH: Phase 3 (Replay) =====
@@ -377,9 +370,9 @@ namespace llaminar2
                 {
                     DeviceGraphCaptureController::postCapturedSegmentLaunch(
                         graph, seg, current_step, stream,
-                        [&](ComputeNode &node, void *node_stream)
+                        [&](BufferId id, DeviceId device)
                         {
-                            mark_stage_outputs_dirty(node, node_stream);
+                            mark_arena_write_dirty(id, device);
                         });
                 }};
 
@@ -415,9 +408,9 @@ namespace llaminar2
                 seg,
                 current_step,
                 stream,
-                [&](ComputeNode &node, void *node_stream)
+                [&](BufferId id, DeviceId device)
                 {
-                    mark_stage_outputs_dirty(node, node_stream);
+                    mark_arena_write_dirty(id, device);
                 });
         };
 
@@ -515,9 +508,9 @@ namespace llaminar2
                     segment,
                     current_step,
                     stream,
-                    [&](ComputeNode &node, void *node_stream)
+                    [&](BufferId id, DeviceId device)
                     {
-                        mark_stage_outputs_dirty(node, node_stream);
+                        mark_arena_write_dirty(id, device);
                     },
                     /*skip_replay_callbacks=*/true);
             }};
