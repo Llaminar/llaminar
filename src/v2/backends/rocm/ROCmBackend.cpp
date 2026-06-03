@@ -369,7 +369,9 @@ namespace llaminar2
             return false;
         }
 
-        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
+        // The argmax kernel and the two tiny D2H copies are enqueued on the
+        // same stream. Stream ordering guarantees the copies observe the kernel
+        // results, so only the final synchronize is needed.
         HIP_CHECK_OR_THROW(hipMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), hipMemcpyDeviceToHost, s));
         HIP_CHECK_OR_THROW(hipMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost, s));
         HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
