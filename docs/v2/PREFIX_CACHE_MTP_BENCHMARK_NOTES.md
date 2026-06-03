@@ -71,6 +71,26 @@ stage buckets, not to update best graph-captured speedup columns. Speedup
 evidence should come from runs without `LLAMINAR_PROFILING`; `PerfStats` export
 can remain enabled because it does not by itself disable segmented graph replay.
 
+Latest ROCm native-VNNI asymmetric block-sum hardening, 2026-06-03: the small-M
+verifier route now computes Q8 activation block sums during blockwise
+quantization and stores them in the declared `gemm_sums_a_blockwise` workspace.
+Plain, batched, mixed-codebook, fused-projection, and fused-SwiGLU/FFN-down
+small-M paths can pass those sums into the native-VNNI GEMV kernels, fixing
+stale min-correction for asymmetric formats such as Q4_1 and Q5_1 without
+adding graph-unsafe scratch allocation. This is correctness/perf-contract
+evidence, not a new speed ratchet. The focused
+`NativeVNNIGEMMPerfTest.MTP_SmallM_DirectPrefillRouteComparison` passed after
+the fix and showed Q4_1/Q5_1 cosine 1.0 on M=2/M=4 FFN-down and GDN-output
+shapes; representative hot latencies were Q4_1 FFN-down M=2 95.7 us and M=4
+126.9 us, Q5_1 FFN-down M=2 124.3 us and M=4 166.2 us, Q4_1 GDN-output M=2
+52.2 us and M=4 57.3 us, and Q5_1 GDN-output M=2 59.2 us and M=4 71.2 us.
+Regression coverage passed: `V2_Unit_GemmWorkspaceConsumer`,
+`DispatchPlainAsymmetricNativeSmallMUsesFreshBlockSums`,
+`DispatchNativeSmallMAllCodebooksMatchReference`, the Qwen3.6 ROCm parity cells
+`MTPGreedyMatchesPyTorchDecodeTokens`, `MTPGreedyDepth3MatchesPyTorchDecodeTokens`,
+and `PrefixCacheMTPRestore`, plus
+`V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`.
+
 | Domain type | Device/backend target | Model class | Baseline decode tok/s | Graph-capture status | Collective capture status | Best MTP decode tok/s | Best MTP speedup | Evidence artifact | Current blocker |
 |-------------|-----------------------|-------------|------------------------|----------------------|---------------------------|-----------------------|------------------|-------------------|-----------------|
 | SingleDevice latest ROCm dense depth-3 sidecar/sample sync fusion ratchet | ROCm `rocm:0` | Qwen3.6 dense 27B Q4_K_S | 30.93 same-binary graph-enabled baseline, `The quick brown fox`, `-c 64`, `-n 48` | Fully captured for dense MTP through verifier M=4. The sidecar path now exposes a runner-native forward+greedy-sample API; GPU sidecar segmented replay can defer its final capture-stream sync and let the same-stream argmax D2H sync close the operation. The path still includes GDN verifier-row rollback restore, no legacy post-warmup resegment API/counter, stable arena write-id replay marking, correct `HIDDEN_STATE` terminal-hidden binding for non-prefix sidecars, and batched depth-0 `kv_cache_only` catchup graphs for verifier-backed shifted rows at `seq_len=2/3`. | N/A | 54.99 best observed graph-enabled depth-3 MTP; rebuilt-code recheck reached 54.32 with the same prompt/context/decode length | 1.78x best observed, 1.76x rebuilt-code recheck versus the 30.93 same-binary baseline | Baseline `/tmp/llaminar-mtp-bench/dense-rocm-baseline-current-c64-n48-bench.json`; sidecar/sample fusion current-code MTP `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-samplefusion-current-mtp-d3-c64-n48-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-samplefusion-current-mtp-d3-c64-n48-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-samplefusion-current-mtp-d3-c64-n48-stats.csv`; best observed sidecar/sample fusion MTP `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-samplefusion-mtp-d3-c64-n48-bench.json`, `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-samplefusion-mtp-d3-c64-n48-stats.json`, `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-samplefusion-mtp-d3-c64-n48-stats.csv`; focused regressions `V2_Unit_PrefillDecodeTransition`, `V2_Unit_MTPGraphConstruction`, `V2_Unit_PrefillGraphCapturability`, `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`, and focused Qwen3.6 ROCm PyTorch parity cells `MTPGreedyMatchesPyTorchDecodeTokens`, `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore` | The sidecar/sample sync fusion is active and covered: current stats recorded 117 `mtp_token_device_samples`, 39 first-sidecar plus 78 chained-sidecar `sidecar_forward_sample_sync_fusions`, and deferred sidecar final sync counters for both `mtp_decode_sidecar` and `mtp_decode_sidecar_chain`. This removes an intermediate host sync but does not change the main blocker: captured verifier replay still dominates with current `mtp.verifier_forward` around 47.60 ms and captured `main_verifier` final sync around 42.00 ms in the measured window. Remaining work is shrinking captured `main_verifier` GPU work, especially ordinary GEMM, fused Gate/Up, GDN projection/recurrence, attention, and LM head. |

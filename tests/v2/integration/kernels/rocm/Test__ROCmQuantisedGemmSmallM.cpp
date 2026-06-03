@@ -936,6 +936,37 @@ TEST(Test__ROCmQuantisedGemmSmallM, DispatchNativeSmallMAllCodebooksMatchReferen
     }
 }
 
+TEST(Test__ROCmQuantisedGemmSmallM, DispatchPlainAsymmetricNativeSmallMUsesFreshBlockSums)
+{
+    if (!hasROCmDevice())
+        GTEST_SKIP() << "No ROCm device available";
+
+    const int N = 384;
+    const int K = 768;
+    for (int M : {2, 4})
+    {
+        runDispatchSmallMMatchesReference(
+            "Q4_1 native-VNNI asymmetric min correction",
+            M,
+            N,
+            K,
+            PackedPath::NativeVNNI,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ4_1Random(shape, seed); },
+            0.985f);
+
+        runDispatchSmallMMatchesReference(
+            "Q5_1 native-VNNI asymmetric min correction",
+            M,
+            N,
+            K,
+            PackedPath::NativeVNNI,
+            [](const std::vector<size_t> &shape, uint32_t seed)
+            { return TestTensorFactory::createQ5_1Random(shape, seed); },
+            0.985f);
+    }
+}
+
 TEST(Test__ROCmQuantisedGemmSmallM, DispatchQ4KM2RecordsNativeRouteCounter)
 {
     if (!hasROCmDevice())

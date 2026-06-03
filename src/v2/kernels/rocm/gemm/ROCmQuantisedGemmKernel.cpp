@@ -225,6 +225,15 @@ namespace llaminar2
                 int rocm_device_id, void *stream,
                 int block_size = 32);
 
+            bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+                const float *d_A_fp32,       // [M x K]
+                int8_t *d_A_int8,            // [M x K] output
+                float *d_scales_blockwise,   // [M x blocks_per_row] output
+                int32_t *d_sums_blockwise,   // [M x blocks_per_row] output
+                int M, int K,
+                int rocm_device_id, void *stream,
+                int block_size = 32);
+
             // Allocate INT8 buffer (common .hip)
             bool rocmQuantGemm_allocInt8(int8_t **d_ptr, size_t count, int rocm_device_id);
 
@@ -381,6 +390,20 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
+            bool rocmGemv_native_vnni_small_m_fp32_with_sums(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const void *d_block_scales, // __half* (FP16 d)
+                const void *d_block_mins,   // __half* auxiliary mins/scales, nullable for symmetric formats
+                const void *d_block_emins,  // uint32_t* packed emins, Q2_K only
+                float *d_C_fp32,
+                const float *d_scale_A_blockwise, // [M × blocks_per_row]
+                const int32_t *d_sum_A_blockwise, // [M × blocks_per_row], nullable
+                float *d_partial_fp32,            // [KB_MAX × M × N]
+                int M, int N, int K,
+                uint8_t codebook_id,
+                int device_id, void *stream);
+
             bool rocmGemv_native_vnni_small_m_batched_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *const *d_payloads,
@@ -397,6 +420,23 @@ namespace llaminar2
                 uint8_t codebook_id,
                 int device_id, void *stream);
 
+            bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
+                const int8_t *d_A_int8,
+                const uint8_t *const *d_payloads,
+                const uint16_t *const *d_block_scales,
+                const uint16_t *const *d_block_mins,
+                const uint32_t *const *d_block_emins,
+                const float *const *d_biases,
+                float *const *d_outputs,
+                const float *d_scale_A_blockwise, // [M × blocks_per_row]
+                const int32_t *d_sum_A_blockwise, // [M × blocks_per_row], nullable
+                float *const *d_partials,         // per-projection [KB_MAX × M × N]
+                const int *Ns,
+                int num_projections,
+                int M, int K,
+                uint8_t codebook_id,
+                int device_id, void *stream);
+
             bool rocmGemv_native_vnni_small_m_batched_mixed_fp32(
                 const int8_t *d_A_int8,
                 const uint8_t *const *d_payloads,
@@ -406,6 +446,23 @@ namespace llaminar2
                 const float *const *d_biases,
                 float *const *d_outputs,
                 const float *d_scale_A_blockwise, // [M × blocks_per_row]
+                float *const *d_partials,         // per-projection [KB_MAX × M × N]
+                const int *Ns,
+                const uint8_t *codebook_ids,
+                int num_projections,
+                int M, int K,
+                int device_id, void *stream);
+
+            bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
+                const int8_t *d_A_int8,
+                const uint8_t *const *d_payloads,
+                const uint16_t *const *d_block_scales,
+                const uint16_t *const *d_block_mins,
+                const uint32_t *const *d_block_emins,
+                const float *const *d_biases,
+                float *const *d_outputs,
+                const float *d_scale_A_blockwise, // [M × blocks_per_row]
+                const int32_t *d_sum_A_blockwise, // [M × blocks_per_row], nullable
                 float *const *d_partials,         // per-projection [KB_MAX × M × N]
                 const int *Ns,
                 const uint8_t *codebook_ids,
@@ -685,6 +742,7 @@ namespace llaminar2
             int8_t *d_A_int8 = nullptr;            // [M x K] quantized activations
             float *d_scales_A = nullptr;           // [M] per-row scales (row-wise mode)
             float *d_scales_A_blockwise = nullptr; // [M x blocks_per_row] per-block scales (blockwise mode)
+            int32_t *d_sums_A_blockwise = nullptr; // [M x blocks_per_row] per-block quantized activation sums
             int32_t *d_C_int32 = nullptr;          // [M x N] INT32 accumulator
 
             // Transfer work buffers - also from workspace
@@ -2343,10 +2401,11 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                    if (!rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
                             d_input,
                             impl_->d_A_int8,
                             impl_->d_scales_A_blockwise,
+                            impl_->d_sums_A_blockwise,
                             m,
                             k,
                             rocm_device_id_,
@@ -2472,10 +2531,11 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (!rocmQuantGemm_quantizeActivationsBlockwise(
+                    if (!rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
                             d_input,
                             impl_->d_A_int8,
                             impl_->d_scales_A_blockwise,
+                            impl_->d_sums_A_blockwise,
                             m,
                             k,
                             rocm_device_id_,
@@ -2485,7 +2545,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32(
+                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums(
                             impl_->d_A_int8,
                             impl_->d_weights_native_vnni,
                             impl_->d_weights_native_scales,
@@ -2493,6 +2553,7 @@ namespace llaminar2
                             impl_->d_weights_native_emins,
                             d_output,
                             impl_->d_scales_A_blockwise,
+                            impl_->d_sums_A_blockwise,
                             impl_->d_scatter_partial,
                             m, n, k,
                             impl_->native_vnni_codebook_id,
@@ -3370,11 +3431,21 @@ namespace llaminar2
             {
                 LOG_DEBUG("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Quantizing activations once, m=" << m << " k=" << k);
 
-                if (!rocmQuantGemm_quantizeActivationsBlockwise(
-                        const_cast<float *>(d_input),
-                        impl_->d_A_int8,
-                        impl_->d_scales_A_blockwise,
-                        m, k, rocm_device_id_, gpu_stream_))
+                const bool needs_block_sums =
+                    all_projections_native_vnni && m >= 2 && m <= 4 && (k % 32) == 0;
+                const bool quant_ok = needs_block_sums
+                    ? rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+                          const_cast<float *>(d_input),
+                          impl_->d_A_int8,
+                          impl_->d_scales_A_blockwise,
+                          impl_->d_sums_A_blockwise,
+                          m, k, rocm_device_id_, gpu_stream_)
+                    : rocmQuantGemm_quantizeActivationsBlockwise(
+                          const_cast<float *>(d_input),
+                          impl_->d_A_int8,
+                          impl_->d_scales_A_blockwise,
+                          m, k, rocm_device_id_, gpu_stream_);
+                if (!quant_ok)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Blockwise activation quantization failed");
                     return false;
@@ -4063,7 +4134,7 @@ namespace llaminar2
                     }
 
                     const bool gemv_ok = mixed_codebooks
-                        ? rocmGemv_native_vnni_small_m_batched_mixed_fp32(
+                        ? rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
                               impl_->d_A_int8,
                               payloads.data(),
                               scales.data(),
@@ -4072,6 +4143,7 @@ namespace llaminar2
                               biases.data(),
                               outputs.data(),
                               impl_->d_scales_A_blockwise,
+                              impl_->d_sums_A_blockwise,
                               partials.data(),
                               Ns.data(),
                               codebooks.data(),
@@ -4079,7 +4151,7 @@ namespace llaminar2
                               m, k,
                               rocm_device_id_,
                               gpu_stream_)
-                        : rocmGemv_native_vnni_small_m_batched_fp32(
+                        : rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
                               impl_->d_A_int8,
                               payloads.data(),
                               scales.data(),
@@ -4088,6 +4160,7 @@ namespace llaminar2
                               biases.data(),
                               outputs.data(),
                               impl_->d_scales_A_blockwise,
+                              impl_->d_sums_A_blockwise,
                               partials.data(),
                               Ns.data(),
                               static_cast<int>(projections.size()),
@@ -4481,7 +4554,7 @@ namespace llaminar2
                         all_success = false;
                         break;
                     }
-                    if (!impl_->d_A_int8 || !impl_->d_scales_A_blockwise ||
+                    if (!impl_->d_A_int8 || !impl_->d_scales_A_blockwise || !impl_->d_sums_A_blockwise ||
                         !rocm_kernel->impl_->d_weights_native_vnni ||
                         !rocm_kernel->impl_->d_weights_native_scales ||
                         !rocm_kernel->impl_->d_scatter_partial)
@@ -4489,6 +4562,7 @@ namespace llaminar2
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fused_tensor] Native-VNNI fused small-M verifier missing graph-native buffers"
                                   << " A=" << static_cast<const void *>(impl_->d_A_int8)
                                   << " scale_A_blockwise=" << static_cast<const void *>(impl_->d_scales_A_blockwise)
+                                  << " sum_A_blockwise=" << static_cast<const void *>(impl_->d_sums_A_blockwise)
                                   << " weights=" << static_cast<const void *>(rocm_kernel->impl_->d_weights_native_vnni)
                                   << " scales=" << static_cast<const void *>(rocm_kernel->impl_->d_weights_native_scales)
                                   << " partial=" << static_cast<const void *>(rocm_kernel->impl_->d_scatter_partial));
@@ -4496,7 +4570,7 @@ namespace llaminar2
                         break;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32(
+                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums(
                             impl_->d_A_int8,
                             rocm_kernel->impl_->d_weights_native_vnni,
                             rocm_kernel->impl_->d_weights_native_scales,
@@ -4504,6 +4578,7 @@ namespace llaminar2
                             rocm_kernel->impl_->d_weights_native_emins,
                             d_prefill_output,
                             impl_->d_scales_A_blockwise,
+                            impl_->d_sums_A_blockwise,
                             rocm_kernel->impl_->d_scatter_partial,
                             m, n, k,
                             rocm_kernel->impl_->native_vnni_codebook_id,
@@ -4788,6 +4863,7 @@ namespace llaminar2
             // Blockwise activation scales: [M × ceil(K/32)] for blockwise quantization mode
             const int blocks_per_row = (k + 31) / 32;
             size_t scales_a_blockwise_bytes = static_cast<size_t>(m) * blocks_per_row * sizeof(float);
+            size_t sums_a_blockwise_bytes = static_cast<size_t>(m) * blocks_per_row * sizeof(int32_t);
 
             // Also need FP32 temp buffers for host→device transfer
             size_t temp_a_fp32_bytes = static_cast<size_t>(m) * k * sizeof(float);
@@ -4796,6 +4872,7 @@ namespace llaminar2
             reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, sums_a_blockwise_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
             // Shared buffer names (matching CUDA).  Concurrent paths use
             // ConcurrentPrefillPool's per-stream scratch — these workspace
@@ -5481,6 +5558,11 @@ namespace llaminar2
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: SCALES_A_BLOCKWISE");
             }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: SUMS_A_BLOCKWISE");
+            }
             if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ACC_INT32))
             {
                 throw std::runtime_error(
@@ -5519,6 +5601,7 @@ namespace llaminar2
             impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
             impl_->d_scales_A = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A));
             impl_->d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+            impl_->d_sums_A_blockwise = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE));
             impl_->d_C_int32 = static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
             impl_->d_A_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_A_FP32));
             impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
@@ -5568,6 +5651,11 @@ namespace llaminar2
             bool hipOps_fused_swiglu_quantize_blockwise(
                 const float *gate, const float *up,
                 int8_t *A_int8, float *scales_A_blockwise,
+                int M, int K, int device_idx, void *stream);
+            bool hipOps_fused_swiglu_quantize_blockwise_with_sums(
+                const float *gate, const float *up,
+                int8_t *A_int8, float *scales_A_blockwise,
+                int32_t *sums_A_blockwise,
                 int M, int K, int device_idx, void *stream);
         }
 
@@ -5631,10 +5719,19 @@ namespace llaminar2
                 }
 
                 // Step 1: Fused SwiGLU + blockwise quantize → d_A_int8 + d_scales_A_blockwise
-                if (!hipOps_fused_swiglu_quantize_blockwise(
-                        d_gate, d_up,
-                        impl_->d_A_int8, impl_->d_scales_A_blockwise,
-                        m, k, rocm_device_id_, gpu_stream_))
+                const bool needs_block_sums =
+                    impl_->has_native_vnni && m >= 2 && m <= 4 && (k % 32) == 0;
+                const bool swiglu_quant_ok = needs_block_sums
+                    ? hipOps_fused_swiglu_quantize_blockwise_with_sums(
+                          d_gate, d_up,
+                          impl_->d_A_int8, impl_->d_scales_A_blockwise,
+                          impl_->d_sums_A_blockwise,
+                          m, k, rocm_device_id_, gpu_stream_)
+                    : hipOps_fused_swiglu_quantize_blockwise(
+                          d_gate, d_up,
+                          impl_->d_A_int8, impl_->d_scales_A_blockwise,
+                          m, k, rocm_device_id_, gpu_stream_);
+                if (!swiglu_quant_ok)
                 {
                     LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor_with_fused_swiglu] "
                               "Fused SwiGLU+quantize kernel failed");
@@ -5669,7 +5766,7 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (!rocmGemv_native_vnni_small_m_fp32(
+                    if (!rocmGemv_native_vnni_small_m_fp32_with_sums(
                             impl_->d_A_int8,
                             impl_->d_weights_native_vnni,
                             impl_->d_weights_native_scales,
@@ -5677,6 +5774,7 @@ namespace llaminar2
                             impl_->d_weights_native_emins,
                             d_C,
                             impl_->d_scales_A_blockwise,
+                            impl_->d_sums_A_blockwise,
                             impl_->d_scatter_partial,
                             m, n, k,
                             impl_->native_vnni_codebook_id,

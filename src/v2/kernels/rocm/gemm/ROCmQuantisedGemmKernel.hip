@@ -446,6 +446,77 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     }
 }
 
+template <int BLOCKS_PER_WG = 8>
+__global__ __launch_bounds__(256, 4)
+void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
+    const float *__restrict__ d_A_fp32,
+    int8_t *__restrict__ d_A_int8,
+    float *__restrict__ d_scales,
+    int32_t *__restrict__ d_sums,
+    int M, int K, int blocks_per_row, int total_blocks)
+{
+    constexpr int QUANT_BLOCK = 32;
+    const int tid = threadIdx.x;
+    const int sub_group = tid / QUANT_BLOCK;
+    const int sub_tid = tid & (QUANT_BLOCK - 1);
+
+    const int global_block = blockIdx.x * BLOCKS_PER_WG + sub_group;
+    if (global_block >= total_blocks)
+        return;
+
+    const int row = global_block / blocks_per_row;
+    const int block_idx = global_block % blocks_per_row;
+    if (row >= M)
+        return;
+
+    const int k_start = block_idx * QUANT_BLOCK;
+    const int k_end = min(k_start + QUANT_BLOCK, K);
+    const int block_len = k_end - k_start;
+
+    const float *src = d_A_fp32 + static_cast<size_t>(row) * K + k_start;
+    int8_t *dst = d_A_int8 + static_cast<size_t>(row) * K + k_start;
+
+    float val = 0.0f;
+    float local_max = 0.0f;
+    if (sub_tid < block_len)
+    {
+        val = src[sub_tid];
+        local_max = fabsf(val);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+    local_max = __shfl(local_max, sub_group * QUANT_BLOCK);
+
+    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    int q = 0;
+    if (sub_tid < block_len)
+    {
+        q = static_cast<int>(rintf(val * inv_scale));
+        q = max(-127, min(127, q));
+        dst[sub_tid] = static_cast<int8_t>(q);
+    }
+
+    int q_sum = q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        q_sum += __shfl_down(q_sum, offset);
+    }
+
+    if (sub_tid == 0)
+    {
+        const size_t out_idx = static_cast<size_t>(row) * blocks_per_row + block_idx;
+        d_scales[out_idx] = scale;
+        d_sums[out_idx] = q_sum;
+    }
+}
+
 /**
  * Variant V3: Coarsened — each workgroup processes an entire row (or chunk of rows).
  *
@@ -1157,6 +1228,60 @@ extern "C"
         {
             fprintf(stderr, "[rocmQuantGemm_quantizeActivationsBlockwise] Kernel V%d launch failed: %s\n",
                     variant, hipGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
+    bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_blockwise,
+        int32_t *d_sums_blockwise,
+        int M, int K,
+        int rocm_device_id, void *stream,
+        int block_size)
+    {
+        if (!d_sums_blockwise)
+        {
+            return rocmQuantGemm_quantizeActivationsBlockwise(
+                d_A_fp32, d_A_int8, d_scales_blockwise,
+                M, K, rocm_device_id, stream, block_size);
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        if (M <= 0 || K <= 0)
+            return true;
+
+        if (block_size != 32)
+        {
+            fprintf(stderr,
+                    "[rocmQuantGemm_quantizeActivationsBlockwiseWithSums] block_size=%d is unsupported; expected 32 (M=%d K=%d)\n",
+                    block_size, M, K);
+            return false;
+        }
+
+        constexpr int QUANT_BLOCK = 32;
+        constexpr int BLOCKS_PER_WG = 8;
+        const int blocks_per_row = (K + QUANT_BLOCK - 1) / QUANT_BLOCK;
+        const int total_blocks = M * blocks_per_row;
+        dim3 grid((total_blocks + BLOCKS_PER_WG - 1) / BLOCKS_PER_WG, 1, 1);
+        dim3 block(256, 1, 1);
+
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(quantizeActivationsQ8_blockwise_v2_with_sums_kernel<BLOCKS_PER_WG>),
+            grid, block, 0, static_cast<hipStream_t>(stream),
+            d_A_fp32, d_A_int8, d_scales_blockwise, d_sums_blockwise,
+            M, K, blocks_per_row, total_blocks);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_quantizeActivationsBlockwiseWithSums] Kernel launch failed: %s\n",
+                    hipGetErrorString(err));
             return false;
         }
 

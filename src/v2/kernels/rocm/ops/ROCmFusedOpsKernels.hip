@@ -58,6 +58,7 @@ __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
     const float *__restrict__ up,
     int8_t *__restrict__ A_int8,
     float *__restrict__ scales_A_blockwise,
+    int32_t *__restrict__ sums_A_blockwise,
     int M, int K)
 {
     const int row = blockIdx.x;
@@ -74,6 +75,7 @@ __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
     const float *row_up = up + row * K;
     int8_t *row_int8 = A_int8 + row * K;
     float *row_scales = scales_A_blockwise + row * num_blocks;
+    int32_t *row_sums = sums_A_blockwise ? sums_A_blockwise + row * num_blocks : nullptr;
 
     for (int b = warp_id; b < num_blocks; b += NUM_WARPS)
     {
@@ -96,12 +98,24 @@ __global__ void rocm_fused_swiglu_quantize_blockwise_kernel(
         float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
         float inv_scale = 1.0f / scale;
 
-        if (lane == 0)
-            row_scales[b] = scale;
-
         float qval = val * inv_scale;
-        row_int8[k_start + lane] = static_cast<int8_t>(
+        const int q = static_cast<int>(
             rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        row_int8[k_start + lane] = static_cast<int8_t>(q);
+
+        int q_sum = q;
+        #pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+        {
+            q_sum += __shfl_xor(q_sum, mask);
+        }
+
+        if (lane == 0)
+        {
+            row_scales[b] = scale;
+            if (row_sums)
+                row_sums[b] = q_sum;
+        }
     }
 }
 
@@ -326,12 +340,46 @@ extern "C"
 
         hipLaunchKernelGGL(rocm_fused_swiglu_quantize_blockwise_kernel,
                            grid, block, 0, static_cast<hipStream_t>(stream),
-                           gate, up, A_int8, scales_A_blockwise, M, K);
+                           gate, up, A_int8, scales_A_blockwise, nullptr, M, K);
 
         hipError_t err = hipGetLastError();
         if (err != hipSuccess)
         {
             fprintf(stderr, "[ROCmFusedOps] fused_swiglu_quantize_blockwise launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool hipOps_fused_swiglu_quantize_blockwise_with_sums(
+        const float *gate,
+        const float *up,
+        int8_t *A_int8,
+        float *scales_A_blockwise,
+        int32_t *sums_A_blockwise,
+        int M, int K,
+        int device_idx,
+        void *stream)
+    {
+        if (!sums_A_blockwise)
+            return hipOps_fused_swiglu_quantize_blockwise(
+                gate, up, A_int8, scales_A_blockwise, M, K, device_idx, stream);
+
+        llaminar2::HipDeviceGuard::setDevice(device_idx);
+        (void)hipGetLastError();
+
+        dim3 grid(M);
+        dim3 block(256);
+
+        hipLaunchKernelGGL(rocm_fused_swiglu_quantize_blockwise_kernel,
+                           grid, block, 0, static_cast<hipStream_t>(stream),
+                           gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[ROCmFusedOps] fused_swiglu_quantize_blockwise_with_sums launch failed: %s\n",
                     hipGetErrorString(err));
             return false;
         }

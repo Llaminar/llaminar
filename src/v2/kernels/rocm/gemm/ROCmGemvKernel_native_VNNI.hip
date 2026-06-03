@@ -2282,6 +2282,22 @@ __device__ __forceinline__ int native_vnni_batched_projection_for_tile(
 }
 
 template <NativeVNNIFormat FMT>
+__device__ __forceinline__ int32_t native_vnni_activation_sum_a(
+    const int32_t* __restrict__ a4)
+{
+    using Traits = NVNNITraits<FMT>;
+    int32_t sum_a = 0;
+    if constexpr (Traits::is_asymmetric)
+    {
+        constexpr int32_t ones = 0x01010101;
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+            sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
+    }
+    return sum_a;
+}
+
+template <NativeVNNIFormat FMT>
 __device__ __forceinline__ float native_vnni_small_m_dot_decoded_block(
     const int32_t* __restrict__ a4,
     const int32_t* __restrict__ packed_groups,
@@ -2290,7 +2306,8 @@ __device__ __forceinline__ float native_vnni_small_m_dot_decoded_block(
     const uint16_t* __restrict__ min_base,
     const uint32_t* __restrict__ emin_base,
     size_t linear,
-    float scale_ab)
+    float scale_ab,
+    int32_t sum_a)
 {
     using Traits = NVNNITraits<FMT>;
 
@@ -2328,12 +2345,6 @@ __device__ __forceinline__ float native_vnni_small_m_dot_decoded_block(
 
         if constexpr (Traits::is_asymmetric)
         {
-            constexpr int32_t ones = 0x01010101;
-            int32_t sum_a = 0;
-            #pragma unroll
-            for (int g = 0; g < 8; ++g)
-                sum_a = __builtin_amdgcn_sdot4(a4[g], ones, sum_a, false);
-
             const uint16_t min_bits = min_base[linear];
             const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
             acc += static_cast<float>(sum_a) * block_m * scale_ab;
@@ -2346,6 +2357,7 @@ template <int TILE_N, int CPT, int SMALL_M, NativeVNNIFormat FMT>
 __device__ __forceinline__ void gemv_native_vnni_small_m_batched_body(
     const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
     const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
+    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
     NativeVNNISmallMBatchedArgs args,
     int K,
     int kblocks)
@@ -2406,9 +2418,16 @@ __device__ __forceinline__ void gemv_native_vnni_small_m_batched_body(
                     d_A_int8 + static_cast<size_t>(row) * K + static_cast<size_t>(b) * 32);
                 const float scale_ab =
                     d_scale_A_blockwise[static_cast<size_t>(row) * blocks_per_row + b];
+                int32_t sum_a = 0;
+                if constexpr (NVNNITraits<FMT>::is_asymmetric)
+                {
+                    sum_a = d_sum_A_blockwise
+                        ? d_sum_A_blockwise[static_cast<size_t>(row) * blocks_per_row + b]
+                        : native_vnni_activation_sum_a<FMT>(a4);
+                }
                 acc[row][c] += native_vnni_small_m_dot_decoded_block<FMT>(
                     a4, packed_groups, payload, scale_base, min_base,
-                    emin_base, linear, scale_ab);
+                    emin_base, linear, scale_ab, sum_a);
             }
         }
     }
@@ -2445,18 +2464,20 @@ template <int TILE_N, int CPT, int SMALL_M, NativeVNNIFormat FMT>
 __global__ void gemv_native_vnni_small_m_batched_kernel_t(
     const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
     const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
+    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
     NativeVNNISmallMBatchedArgs args,
     int K,
     int kblocks)
 {
     gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, FMT>(
-        d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+        d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
 }
 
 template <int TILE_N, int CPT, int SMALL_M>
 __global__ void gemv_native_vnni_small_m_batched_mixed_kernel_t(
     const int8_t* __restrict__ d_A_int8,                // [SMALL_M x K]
     const float* __restrict__ d_scale_A_blockwise,      // [SMALL_M x blocks_per_row]
+    const int32_t* __restrict__ d_sum_A_blockwise,      // [SMALL_M x blocks_per_row], nullable
     NativeVNNISmallMBatchedArgs args,
     int K,
     int kblocks)
@@ -2466,67 +2487,67 @@ __global__ void gemv_native_vnni_small_m_batched_mixed_kernel_t(
     {
     case NVNNI_Q4_0:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q4_0>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_IQ4_NL:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ4_NL>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_Q4_1:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q4_1>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_Q5_0:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q5_0>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_Q5_1:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q5_1>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_Q6_K:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q6_K>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_Q3_K:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q3_K>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_Q2_K:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q2_K>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_IQ3_S:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ3_S>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_IQ3_XXS:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ3_XXS>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_IQ2_S:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_S>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_IQ2_XS:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_XS>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_IQ2_XXS:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ2_XXS>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_IQ1_S:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ1_S>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_IQ1_M:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_IQ1_M>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     case NVNNI_Q8_0:
         gemv_native_vnni_small_m_batched_body<TILE_N, CPT, SMALL_M, NVNNI_Q8_0>(
-            d_A_int8, d_scale_A_blockwise, args, K, kblocks);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kblocks);
         return;
     default:
         return;
@@ -2537,6 +2558,7 @@ template <int TILE_N, int CPT, NativeVNNIFormat FMT>
 __global__ void gemv_native_vnni_q4_m2_batched_kernel_t(
     const int8_t* __restrict__ d_A_int8,                // [2 x K]
     const float* __restrict__ d_scale_A_blockwise,      // [2 x blocks_per_row]
+    const int32_t* __restrict__ d_sum_A_blockwise,      // [2 x blocks_per_row], nullable
     NativeVNNISmallMBatchedArgs args,
     int K,
     int kblocks)
@@ -2636,15 +2658,12 @@ __global__ void gemv_native_vnni_q4_m2_batched_kernel_t(
 
             if constexpr (Traits::is_asymmetric)
             {
-                constexpr int32_t ones = 0x01010101;
-                int32_t sum0 = 0;
-                int32_t sum1 = 0;
-                #pragma unroll
-                for (int g = 0; g < 8; ++g)
-                {
-                    sum0 = __builtin_amdgcn_sdot4(a0[g], ones, sum0, false);
-                    sum1 = __builtin_amdgcn_sdot4(a1[g], ones, sum1, false);
-                }
+                const int32_t sum0 = d_sum_A_blockwise
+                    ? d_sum_A_blockwise[b]
+                    : native_vnni_activation_sum_a<FMT>(a0);
+                const int32_t sum1 = d_sum_A_blockwise
+                    ? d_sum_A_blockwise[blocks_per_row + b]
+                    : native_vnni_activation_sum_a<FMT>(a1);
 
                 const uint16_t min_bits = min_base[linear];
                 const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
@@ -2731,6 +2750,7 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
     float*           __restrict__ d_C_fp32,       // [SMALL_M × N] output
     float*           __restrict__ d_partial_fp32, // [KB × SMALL_M × N] partials
     const float*     __restrict__ d_scale_A_blockwise, // [SMALL_M × blocks_per_row]
+    const int32_t*   __restrict__ d_sum_A_blockwise,   // [SMALL_M × blocks_per_row], nullable
     int N, int K, int kblocks)
 {
     static_assert(SMALL_M >= 2 && SMALL_M <= 4, "small-M native-VNNI supports M in {2,3,4}");
@@ -2776,9 +2796,16 @@ __global__ void gemv_native_vnni_small_m_kernel_t(
                     d_A_int8 + static_cast<size_t>(row) * K + static_cast<size_t>(b) * 32);
                 const float scale_ab =
                     d_scale_A_blockwise[static_cast<size_t>(row) * blocks_per_row + b];
+                int32_t sum_a = 0;
+                if constexpr (NVNNITraits<FMT>::is_asymmetric)
+                {
+                    sum_a = d_sum_A_blockwise
+                        ? d_sum_A_blockwise[static_cast<size_t>(row) * blocks_per_row + b]
+                        : native_vnni_activation_sum_a<FMT>(a4);
+                }
                 acc[row][c] += native_vnni_small_m_dot_decoded_block<FMT>(
                     a4, packed_groups, payload, d_block_scales, d_block_mins,
-                    d_block_emins, linear, scale_ab);
+                    d_block_emins, linear, scale_ab, sum_a);
             }
         }
     }
@@ -2824,6 +2851,7 @@ __global__ void gemv_native_vnni_q4_m2_kernel_t(
     float*           __restrict__ d_C_fp32,       // [2 × N] output
     float*           __restrict__ d_partial_fp32, // [KB × 2 × N] partials
     const float*     __restrict__ d_scale_A_blockwise, // [2 × blocks_per_row]
+    const int32_t*   __restrict__ d_sum_A_blockwise,   // [2 × blocks_per_row], nullable
     int N, int K, int kblocks)
 {
     using Traits = NVNNITraits<FMT>;
@@ -2906,15 +2934,12 @@ __global__ void gemv_native_vnni_q4_m2_kernel_t(
 
             if constexpr (Traits::is_asymmetric)
             {
-                constexpr int32_t ones = 0x01010101;
-                int32_t sum0 = 0;
-                int32_t sum1 = 0;
-                #pragma unroll
-                for (int g = 0; g < 8; ++g)
-                {
-                    sum0 = __builtin_amdgcn_sdot4(a0[g], ones, sum0, false);
-                    sum1 = __builtin_amdgcn_sdot4(a1[g], ones, sum1, false);
-                }
+                const int32_t sum0 = d_sum_A_blockwise
+                    ? d_sum_A_blockwise[b]
+                    : native_vnni_activation_sum_a<FMT>(a0);
+                const int32_t sum1 = d_sum_A_blockwise
+                    ? d_sum_A_blockwise[blocks_per_row + b]
+                    : native_vnni_activation_sum_a<FMT>(a1);
 
                 const uint16_t min_bits = d_block_mins[linear];
                 const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
@@ -3548,6 +3573,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     const uint32_t* d_block_emins,
     float* d_C_fp32,
     const float* d_scale_A_blockwise,
+    const int32_t* d_sum_A_blockwise,
     float* d_partial_fp32,
     int N, int K,
     int device_id, void* stream)
@@ -3643,7 +3669,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
             HIP_KERNEL_NAME(gemv_native_vnni_q4_m2_kernel_t<TN, CPT, FMT>),
             grid, block, 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_payload, d_block_scales, d_block_mins,
-            d_C_fp32, partial_arg, d_scale_A_blockwise, N, K, kb);
+            d_C_fp32, partial_arg, d_scale_A_blockwise, d_sum_A_blockwise, N, K, kb);
     }
     else
     {
@@ -3651,7 +3677,7 @@ bool rocmLaunch_native_vnni_small_m_fp32(
             HIP_KERNEL_NAME(gemv_native_vnni_small_m_kernel_t<TN, CPT, SMALL_M, FMT>),
             grid, block, 0, static_cast<hipStream_t>(stream),
             d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
-            d_C_fp32, partial_arg, d_scale_A_blockwise, N, K, kb);
+            d_C_fp32, partial_arg, d_scale_A_blockwise, d_sum_A_blockwise, N, K, kb);
     }
 
     hipError_t err = hipGetLastError();
@@ -3691,6 +3717,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
+    const int32_t* d_sum_A_blockwise,
     float* const* d_partials,
     const int* Ns,
     int num_projections,
@@ -3824,14 +3851,14 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
             hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(gemv_native_vnni_q4_m2_batched_kernel_t<TN, CPT, FMT>),
                 grid, block, 0, static_cast<hipStream_t>(stream),
-                d_A_int8, d_scale_A_blockwise, args, K, kb);
+                d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kb);
         }
         else
         {
             hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_kernel_t<TN, CPT, SMALL_M, FMT>),
                 grid, block, 0, static_cast<hipStream_t>(stream),
-                d_A_int8, d_scale_A_blockwise, args, K, kb);
+                d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kb);
         }
     }
     else
@@ -3839,7 +3866,7 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_kernel_t<TN, CPT, SMALL_M, FMT>),
             grid, block, 0, static_cast<hipStream_t>(stream),
-            d_A_int8, d_scale_A_blockwise, args, K, kb);
+            d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kb);
     }
 
     hipError_t err = hipGetLastError();
@@ -3954,6 +3981,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
+    const int32_t* d_sum_A_blockwise,
     float* const* d_partials,
     const int* Ns,
     const uint8_t* codebook_ids,
@@ -4080,7 +4108,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(gemv_native_vnni_small_m_batched_mixed_kernel_t<TN, CPT, SMALL_M>),
         grid, block, 0, static_cast<hipStream_t>(stream),
-        d_A_int8, d_scale_A_blockwise, args, K, kb);
+        d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise, args, K, kb);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -4136,7 +4164,7 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
 
 extern "C" {
 
-bool rocmGemv_native_vnni_small_m_fp32(
+bool rocmGemv_native_vnni_small_m_fp32_with_sums(
     const int8_t* d_A_int8,
     const uint8_t* d_payload,
     const void* d_block_scales,
@@ -4144,6 +4172,7 @@ bool rocmGemv_native_vnni_small_m_fp32(
     const void* d_block_emins,
     float* d_C_fp32,
     const float* d_scale_A_blockwise,
+    const int32_t* d_sum_A_blockwise,
     float* d_partial_fp32,
     int M, int N, int K,
     uint8_t codebook_id,
@@ -4196,13 +4225,13 @@ bool rocmGemv_native_vnni_small_m_fp32(
             {                                                                                     \
             case 2: return rocmLaunch_native_vnni_small_m_fp32<2, FMT_TAG>(                       \
                         d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, d_C_fp32,     \
-                        d_scale_A_blockwise, d_partial_fp32, N, K, device_id, stream);            \
+                        d_scale_A_blockwise, d_sum_A_blockwise, d_partial_fp32, N, K, device_id, stream); \
             case 3: return rocmLaunch_native_vnni_small_m_fp32<3, FMT_TAG>(                       \
                         d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, d_C_fp32,     \
-                        d_scale_A_blockwise, d_partial_fp32, N, K, device_id, stream);            \
+                        d_scale_A_blockwise, d_sum_A_blockwise, d_partial_fp32, N, K, device_id, stream); \
             case 4: return rocmLaunch_native_vnni_small_m_fp32<4, FMT_TAG>(                       \
                         d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, d_C_fp32,     \
-                        d_scale_A_blockwise, d_partial_fp32, N, K, device_id, stream);            \
+                        d_scale_A_blockwise, d_sum_A_blockwise, d_partial_fp32, N, K, device_id, stream); \
             default: return false;                                                                \
             }                                                                                     \
         } while (0)
@@ -4235,7 +4264,26 @@ bool rocmGemv_native_vnni_small_m_fp32(
     return false;
 }
 
-bool rocmGemv_native_vnni_small_m_batched_fp32(
+bool rocmGemv_native_vnni_small_m_fp32(
+    const int8_t* d_A_int8,
+    const uint8_t* d_payload,
+    const void* d_block_scales,
+    const void* d_block_mins,
+    const void* d_block_emins,
+    float* d_C_fp32,
+    const float* d_scale_A_blockwise,
+    float* d_partial_fp32,
+    int M, int N, int K,
+    uint8_t codebook_id,
+    int device_id, void* stream)
+{
+    return rocmGemv_native_vnni_small_m_fp32_with_sums(
+        d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
+        d_C_fp32, d_scale_A_blockwise, nullptr, d_partial_fp32,
+        M, N, K, codebook_id, device_id, stream);
+}
+
+bool rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
     const uint16_t* const* d_block_scales,
@@ -4244,6 +4292,7 @@ bool rocmGemv_native_vnni_small_m_batched_fp32(
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
+    const int32_t* d_sum_A_blockwise,
     float* const* d_partials,
     const int* Ns,
     int num_projections,
@@ -4333,13 +4382,13 @@ bool rocmGemv_native_vnni_small_m_batched_fp32(
         switch (M) {                                                                                    \
             case 2: return rocmLaunch_native_vnni_small_m_batched_fp32<2, FMT_TAG>(                     \
                 d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins, d_biases, d_outputs, \
-                d_scale_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream);             \
+                d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream); \
             case 3: return rocmLaunch_native_vnni_small_m_batched_fp32<3, FMT_TAG>(                     \
                 d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins, d_biases, d_outputs, \
-                d_scale_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream);             \
+                d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream); \
             case 4: return rocmLaunch_native_vnni_small_m_batched_fp32<4, FMT_TAG>(                     \
                 d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins, d_biases, d_outputs, \
-                d_scale_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream);             \
+                d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, num_projections, K, device_id, stream); \
             default: return false;                                                                      \
         }                                                                                               \
     } while (0)
@@ -4371,7 +4420,7 @@ bool rocmGemv_native_vnni_small_m_batched_fp32(
 #undef DISPATCH_BATCHED_FMT
 }
 
-bool rocmGemv_native_vnni_small_m_batched_mixed_fp32(
+bool rocmGemv_native_vnni_small_m_batched_fp32(
     const int8_t* d_A_int8,
     const uint8_t* const* d_payloads,
     const uint16_t* const* d_block_scales,
@@ -4380,6 +4429,30 @@ bool rocmGemv_native_vnni_small_m_batched_mixed_fp32(
     const float* const* d_biases,
     float* const* d_outputs,
     const float* d_scale_A_blockwise,
+    float* const* d_partials,
+    const int* Ns,
+    int num_projections,
+    int M, int K,
+    uint8_t codebook_id,
+    int device_id,
+    void* stream)
+{
+    return rocmGemv_native_vnni_small_m_batched_fp32_with_sums(
+        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
+        d_biases, d_outputs, d_scale_A_blockwise, nullptr, d_partials,
+        Ns, num_projections, M, K, codebook_id, device_id, stream);
+}
+
+bool rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
+    const int8_t* d_A_int8,
+    const uint8_t* const* d_payloads,
+    const uint16_t* const* d_block_scales,
+    const uint16_t* const* d_block_mins,
+    const uint32_t* const* d_block_emins,
+    const float* const* d_biases,
+    float* const* d_outputs,
+    const float* d_scale_A_blockwise,
+    const int32_t* d_sum_A_blockwise,
     float* const* d_partials,
     const int* Ns,
     const uint8_t* codebook_ids,
@@ -4462,21 +4535,44 @@ bool rocmGemv_native_vnni_small_m_batched_mixed_fp32(
     case 2:
         return rocmLaunch_native_vnni_small_m_batched_mixed_fp32<2>(
             d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
-            d_biases, d_outputs, d_scale_A_blockwise, d_partials, Ns, codebook_ids,
+            d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, codebook_ids,
             num_projections, K, device_id, stream);
     case 3:
         return rocmLaunch_native_vnni_small_m_batched_mixed_fp32<3>(
             d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
-            d_biases, d_outputs, d_scale_A_blockwise, d_partials, Ns, codebook_ids,
+            d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, codebook_ids,
             num_projections, K, device_id, stream);
     case 4:
         return rocmLaunch_native_vnni_small_m_batched_mixed_fp32<4>(
             d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
-            d_biases, d_outputs, d_scale_A_blockwise, d_partials, Ns, codebook_ids,
+            d_biases, d_outputs, d_scale_A_blockwise, d_sum_A_blockwise, d_partials, Ns, codebook_ids,
             num_projections, K, device_id, stream);
     default:
         return false;
     }
+}
+
+bool rocmGemv_native_vnni_small_m_batched_mixed_fp32(
+    const int8_t* d_A_int8,
+    const uint8_t* const* d_payloads,
+    const uint16_t* const* d_block_scales,
+    const uint16_t* const* d_block_mins,
+    const uint32_t* const* d_block_emins,
+    const float* const* d_biases,
+    float* const* d_outputs,
+    const float* d_scale_A_blockwise,
+    float* const* d_partials,
+    const int* Ns,
+    const uint8_t* codebook_ids,
+    int num_projections,
+    int M, int K,
+    int device_id,
+    void* stream)
+{
+    return rocmGemv_native_vnni_small_m_batched_mixed_fp32_with_sums(
+        d_A_int8, d_payloads, d_block_scales, d_block_mins, d_block_emins,
+        d_biases, d_outputs, d_scale_A_blockwise, nullptr, d_partials,
+        Ns, codebook_ids, num_projections, M, K, device_id, stream);
 }
 
 bool rocmGemv_native_vnni_q4_m2_fp32(

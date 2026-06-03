@@ -48,6 +48,8 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, StandardBufferNamesAreDefined)
     // Verify all standard buffer names are non-null
     EXPECT_NE(GemmWorkspaceBuffers::QUANT_A, nullptr);
     EXPECT_NE(GemmWorkspaceBuffers::SCALES_A, nullptr);
+    EXPECT_NE(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, nullptr);
+    EXPECT_NE(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, nullptr);
     EXPECT_NE(GemmWorkspaceBuffers::ACC_INT32, nullptr);
     EXPECT_NE(GemmWorkspaceBuffers::TEMP_A_FP32, nullptr);
     EXPECT_NE(GemmWorkspaceBuffers::TEMP_C_FP32, nullptr);
@@ -65,6 +67,8 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, StandardBufferNamesAreUnique)
     std::vector<const char *> names = {
         GemmWorkspaceBuffers::QUANT_A,
         GemmWorkspaceBuffers::SCALES_A,
+        GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
+        GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
         GemmWorkspaceBuffers::ACC_INT32,
         GemmWorkspaceBuffers::TEMP_A_FP32,
         GemmWorkspaceBuffers::TEMP_C_FP32,
@@ -98,6 +102,8 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, INT8PathRequirementsSizesCorrect
 
     size_t quant_a_bytes = static_cast<size_t>(m) * k * sizeof(int8_t);
     size_t scales_a_bytes = static_cast<size_t>(m) * sizeof(float);
+    size_t scales_a_blockwise_bytes = static_cast<size_t>(m) * ((k + 31) / 32) * sizeof(float);
+    size_t sums_a_blockwise_bytes = static_cast<size_t>(m) * ((k + 31) / 32) * sizeof(int32_t);
     size_t acc_int32_bytes = static_cast<size_t>(m) * n * sizeof(int32_t);
     size_t temp_a_fp32_bytes = static_cast<size_t>(m) * k * sizeof(float);
     size_t temp_c_fp32_bytes = static_cast<size_t>(m) * n * sizeof(float);
@@ -105,6 +111,8 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, INT8PathRequirementsSizesCorrect
     WorkspaceRequirements reqs;
     reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
     reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
+    reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
+    reqs.buffers.push_back({GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, sums_a_blockwise_bytes, 256, true});
     reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
     reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_A_FP32, temp_a_fp32_bytes, 256, true});
     reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
@@ -115,12 +123,14 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, INT8PathRequirementsSizesCorrect
     EXPECT_EQ(acc_int32_bytes, 128 * 4096 * 4); // 2,097,152 bytes
 
     // Verify requirements structure
-    EXPECT_EQ(reqs.buffers.size(), 5);
+    EXPECT_EQ(reqs.buffers.size(), 7);
     EXPECT_GT(reqs.total_bytes(), 0);
 
     // Can find each buffer
     EXPECT_NE(reqs.find(GemmWorkspaceBuffers::QUANT_A), nullptr);
     EXPECT_NE(reqs.find(GemmWorkspaceBuffers::SCALES_A), nullptr);
+    EXPECT_NE(reqs.find(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE), nullptr);
+    EXPECT_NE(reqs.find(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE), nullptr);
     EXPECT_NE(reqs.find(GemmWorkspaceBuffers::ACC_INT32), nullptr);
 }
 
@@ -163,6 +173,10 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, WorkspaceManagerCanAllocateINT8B
                             static_cast<size_t>(m) * k * sizeof(int8_t), 256, true});
     reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A,
                             static_cast<size_t>(m) * sizeof(float), 256, true});
+    reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
+                            static_cast<size_t>(m) * ((k + 31) / 32) * sizeof(float), 256, true});
+    reqs.buffers.push_back({GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
+                            static_cast<size_t>(m) * ((k + 31) / 32) * sizeof(int32_t), 256, true});
     reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32,
                             static_cast<size_t>(m) * n * sizeof(int32_t), 256, true});
 
@@ -171,11 +185,15 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, WorkspaceManagerCanAllocateINT8B
     // Verify buffers exist
     EXPECT_TRUE(mgr.hasBuffer(GemmWorkspaceBuffers::QUANT_A));
     EXPECT_TRUE(mgr.hasBuffer(GemmWorkspaceBuffers::SCALES_A));
+    EXPECT_TRUE(mgr.hasBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+    EXPECT_TRUE(mgr.hasBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE));
     EXPECT_TRUE(mgr.hasBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
     // Verify pointers are valid
     EXPECT_NE(mgr.getBuffer(GemmWorkspaceBuffers::QUANT_A), nullptr);
     EXPECT_NE(mgr.getBuffer(GemmWorkspaceBuffers::SCALES_A), nullptr);
+    EXPECT_NE(mgr.getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE), nullptr);
+    EXPECT_NE(mgr.getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE), nullptr);
     EXPECT_NE(mgr.getBuffer(GemmWorkspaceBuffers::ACC_INT32), nullptr);
 
     // Verify sizes match
@@ -183,6 +201,10 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, WorkspaceManagerCanAllocateINT8B
               static_cast<size_t>(m) * k * sizeof(int8_t));
     EXPECT_EQ(mgr.getBufferSize(GemmWorkspaceBuffers::SCALES_A),
               static_cast<size_t>(m) * sizeof(float));
+    EXPECT_EQ(mgr.getBufferSize(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE),
+              static_cast<size_t>(m) * ((k + 31) / 32) * sizeof(float));
+    EXPECT_EQ(mgr.getBufferSize(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE),
+              static_cast<size_t>(m) * ((k + 31) / 32) * sizeof(int32_t));
     EXPECT_EQ(mgr.getBufferSize(GemmWorkspaceBuffers::ACC_INT32),
               static_cast<size_t>(m) * n * sizeof(int32_t));
 }
@@ -255,14 +277,15 @@ TEST_F(Test__ROCmQuantisedGemmKernel_Workspace, ForQuantizedGemmCreateCorrectBuf
     int m = 128, n = 4096, k = 896;
     auto reqs = WorkspaceRequirements::forQuantizedGemm(m, n, k);
 
-    // Should have 4 buffers (quant_a, scales_a, acc_int32, scales_a_blockwise)
-    EXPECT_EQ(reqs.buffers.size(), 4);
+    // Should have 5 buffers (quant_a, scales_a, scales/sums blockwise, acc_int32)
+    EXPECT_EQ(reqs.buffers.size(), 5);
 
     // Verify buffer names match constants
     EXPECT_NE(reqs.find("gemm_quant_a"), nullptr);
     EXPECT_NE(reqs.find("gemm_scales_a"), nullptr);
     EXPECT_NE(reqs.find("gemm_acc_int32"), nullptr);
     EXPECT_NE(reqs.find("gemm_scales_a_blockwise"), nullptr);
+    EXPECT_NE(reqs.find("gemm_sums_a_blockwise"), nullptr);
 
     // Verify all are required
     for (const auto &buf : reqs.buffers)

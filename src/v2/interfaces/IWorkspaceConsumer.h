@@ -152,6 +152,7 @@ namespace llaminar2
         constexpr const char *QUANT_A = "gemm_quant_a";                       ///< [M × K] INT8 quantized activations
         constexpr const char *SCALES_A = "gemm_scales_a";                     ///< [M] FP32 per-row activation scales (row-wise mode)
         constexpr const char *SCALES_A_BLOCKWISE = "gemm_scales_a_blockwise"; ///< [M × blocks_per_row] FP32 per-block activation scales (blockwise mode)
+        constexpr const char *SUMS_A_BLOCKWISE = "gemm_sums_a_blockwise";     ///< [M × blocks_per_row] INT32 per-block activation sums
         constexpr const char *ACC_INT32 = "gemm_acc_int32";                   ///< [M × N] INT32 accumulator
 
         // FP32 temporary buffers
