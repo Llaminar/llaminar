@@ -250,6 +250,17 @@ Latest graph-atomic small-M hardening validation:
   `./build_v2_release/tests/v2/v2_perf_cpu_native_vnni_gemv --gtest_filter="*MTP_SmallM_FusedProjection_AllFormats"`.
   This closes a CPU coverage gap in the Phase 13.5 GEMV-many contract, but not
   the CPU real-model speed gate.
+- Fresh Phase 13.5 CUDA native-format small-M fused projection coverage on
+  2026-06-03: CUDA now records
+  `kernel.cuda_native_vnni_small_m_fused_projection_calls` when the
+  `M=2/3/4` fused projection route quantizes FP32 activations once and runs
+  multiple native-VNNI projections. Focused validation passed:
+  `ctest --test-dir build_v2_integration -R "^V2_Integration_CUDAGemmParity$" --output-on-failure --parallel`.
+  The suite now includes `MTP_SmallM_FusedProjection_AllNativeFormats`,
+  covering two-projection fused verifier shapes at `M=2/3/4` across CUDA's
+  native codebook inventory, including the Q4_K/Q5_K aliases used by Qwen3.6.
+  This closes the CUDA M=3/4 coverage gap in the Phase 13.5 GEMV-many
+  contract, but not the CUDA real-model 2x speed target.
 - Fresh Phase 13.5 real GDN projection perf coverage on 2026-06-03:
   `NativeVNNIGEMMPerfTest.MTP_SmallM_BatchedGDNProjectionShapes` now includes
   the measured Qwen3.6 hot-path groups `Q4_K/Q5_K qkv+z` with

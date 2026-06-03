@@ -46,9 +46,11 @@
 #include "../../../utils/GpuPreparedGemmHarness.h"
 
 #include <vector>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <random>
 #include <numeric>
 #include <filesystem>
@@ -96,6 +98,39 @@ namespace
         std::string old_value_;
         bool had_old_ = false;
     };
+
+    struct CUDASmallMFormatSpec
+    {
+        const char *name;
+        double cosine_threshold;
+        std::function<std::unique_ptr<TensorBase>(size_t, size_t)> create;
+    };
+
+    const std::vector<CUDASmallMFormatSpec> &cudaSmallMNativeFormats()
+    {
+        static const std::vector<CUDASmallMFormatSpec> formats = {
+            {"Q4_0", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_0Random({n, k}); }},
+            {"IQ4_NL", 0.985, [](size_t n, size_t k) { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+            {"Q4_1", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_1Random({n, k}); }},
+            {"IQ4_XS", 0.985, [](size_t n, size_t k) { return TestTensorFactory::createIQ4_XSRandom({n, k}); }},
+            {"Q5_0", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_0Random({n, k}); }},
+            {"Q5_1", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_1Random({n, k}); }},
+            {"Q4_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_KRandom({n, k}); }},
+            {"Q5_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_KRandom({n, k}); }},
+            {"Q6_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ6_KRandom({n, k}); }},
+            {"Q3_K", 0.980, [](size_t n, size_t k) { return TestTensorFactory::createQ3_KRandom({n, k}); }},
+            {"Q2_K", 0.960, [](size_t n, size_t k) { return TestTensorFactory::createQ2_KRandom({n, k}); }},
+            {"IQ3_S", 0.970, [](size_t n, size_t k) { return TestTensorFactory::createIQ3_SRandom({n, k}); }},
+            {"IQ3_XXS", 0.960, [](size_t n, size_t k) { return TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
+            {"IQ2_S", 0.920, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_SRandom({n, k}); }},
+            {"IQ2_XS", 0.900, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_XSRandom({n, k}); }},
+            {"IQ2_XXS", 0.880, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
+            {"IQ1_S", 0.800, [](size_t n, size_t k) { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
+            {"IQ1_M", 0.800, [](size_t n, size_t k) { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
+            {"Q8_0", 0.999, [](size_t n, size_t k) { return TestTensorFactory::createQ8_0Random({n, k}); }},
+        };
+        return formats;
+    }
 
 
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
@@ -1306,6 +1341,125 @@ TEST_F(Test__CUDAGemmParity, Q4_K_FusedVerifierSmallM_2RowsTwoProjections)
         << "Small-M fused verifier projection 1 must not leak CUDA dynamic state after workspace cleanup";
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights0.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
+}
+
+TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)
+{
+    const int K = 256;
+    const int N0 = 192;
+    const int N1 = 128;
+    const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    for (const auto &fmt : cudaSmallMNativeFormats())
+    {
+        auto weights0 = fmt.create(N0, K);
+        auto weights1 = fmt.create(N1, K);
+        ASSERT_NE(weights0, nullptr) << "Failed to create " << fmt.name << " first projection";
+        ASSERT_NE(weights1, nullptr) << "Failed to create " << fmt.name << " second projection";
+
+        auto cpu_kernel0 = llaminar::v2::kernels::KernelFactory::createGemm(
+            weights0.get(), KernelDeviceType::CPU);
+        auto cpu_kernel1 = llaminar::v2::kernels::KernelFactory::createGemm(
+            weights1.get(), KernelDeviceType::CPU);
+        ASSERT_NE(cpu_kernel0, nullptr) << fmt.name << " CPU projection 0 kernel";
+        ASSERT_NE(cpu_kernel1, nullptr) << fmt.name << " CPU projection 1 kernel";
+
+        auto *cuda_kernel0 = getPreparedKernel(weights0.get(), gpu_device_);
+        auto *cuda_kernel1 = getPreparedKernel(weights1.get(), gpu_device_);
+        ASSERT_NE(cuda_kernel0, nullptr) << fmt.name << " CUDA projection 0 kernel";
+        ASSERT_NE(cuda_kernel1, nullptr) << fmt.name << " CUDA projection 1 kernel";
+
+        ASSERT_TRUE(setupSharedWorkspace({cuda_kernel0, cuda_kernel1}, 4, {N0, N1}, K))
+            << fmt.name << " shared workspace";
+
+        for (int M : verifier_rows)
+        {
+            auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+            std::vector<float> C0_cpu(static_cast<size_t>(M) * N0, 0.0f);
+            std::vector<float> C1_cpu(static_cast<size_t>(M) * N1, 0.0f);
+            ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel0.get(), A_data.data(), C0_cpu.data(), M, N0, K))
+                << fmt.name << " CPU projection 0 at M=" << M;
+            ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel1.get(), A_data.data(), C1_cpu.data(), M, N1, K))
+                << fmt.name << " CPU projection 1 at M=" << M;
+
+            auto A_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+            std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+            auto C0_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N0)});
+            auto C1_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N1)});
+
+            std::vector<TensorProjectionDesc> projections = {
+                {cuda_kernel0, C0_tensor.get(), N0, nullptr, "small_m_proj0"},
+                {cuda_kernel1, C1_tensor.get(), N1, nullptr, "small_m_proj1"}};
+
+            ASSERT_TRUE(with_gpu_coherence(
+                gpu_device_,
+                {A_tensor.get()},
+                {C0_tensor.get(), C1_tensor.get()},
+                [&]
+                {
+                    return cuda_kernel0->multiply_fused_tensor(
+                        A_tensor.get(), projections, M, K);
+                }))
+                << fmt.name << " CUDA fused projection failed at M=" << M;
+
+            const float *C0_cuda = C0_tensor->data();
+            const float *C1_cuda = C1_tensor->data();
+            const auto result0 =
+                checkParity(C0_cuda, C0_cpu.data(), C0_cpu.size(), fmt.cosine_threshold, 0.20);
+            const auto result1 =
+                checkParity(C1_cuda, C1_cpu.data(), C1_cpu.size(), fmt.cosine_threshold, 0.20);
+            EXPECT_FALSE(result0.has_nan_inf)
+                << fmt.name << " projection 0 produced non-finite output at M=" << M;
+            EXPECT_FALSE(result1.has_nan_inf)
+                << fmt.name << " projection 1 produced non-finite output at M=" << M;
+            EXPECT_GE(result0.cosine_similarity, fmt.cosine_threshold)
+                << fmt.name << " projection 0 cosine too low at M=" << M
+                << " rel_l2=" << result0.relative_l2_error
+                << " max_abs=" << result0.max_abs_error;
+            EXPECT_GE(result1.cosine_similarity, fmt.cosine_threshold)
+                << fmt.name << " projection 1 cosine too low at M=" << M
+                << " rel_l2=" << result1.relative_l2_error
+                << " max_abs=" << result1.max_abs_error;
+            EXPECT_LE(result0.relative_l2_error, 0.20)
+                << fmt.name << " projection 0 relative L2 too high at M=" << M;
+            EXPECT_LE(result1.relative_l2_error, 0.20)
+                << fmt.name << " projection 1 relative L2 too high at M=" << M;
+        }
+
+        cleanupSharedWorkspace({cuda_kernel0, cuda_kernel1});
+        EXPECT_FALSE(cuda_kernel0->hasDynamicStateActive())
+            << fmt.name << " projection 0 leaked CUDA dynamic state";
+        EXPECT_FALSE(cuda_kernel1->hasDynamicStateActive())
+            << fmt.name << " projection 1 leaked CUDA dynamic state";
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights0.get());
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
+    }
+
+    const auto records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+    uint64_t total_count = 0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter)
+        {
+            total_count += record.count;
+            EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"), "2");
+        }
+    }
+    EXPECT_EQ(total_count, cudaSmallMNativeFormats().size() * verifier_rows.size())
+        << "Every CUDA native format and M=2/3/4 verifier shape should use the fused small-M route";
+
+    PerfStatsCollector::reset();
 }
 
 TEST_F(Test__CUDAGemmParity, Q4_K_FusedSwiGLUDownSmallM_2x896x768)

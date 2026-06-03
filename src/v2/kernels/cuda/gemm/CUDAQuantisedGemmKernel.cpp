@@ -1590,6 +1590,21 @@ namespace llaminar2
                     }
                 }
 
+                if (PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cuda_native_vnni_small_m_fused_projection_calls",
+                        1.0,
+                        "gemm",
+                        "cuda:" + std::to_string(cuda_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"m", std::to_string(m)},
+                            {"k", std::to_string(k)},
+                            {"projections", std::to_string(projections.size())},
+                            {"route", m == 2 ? "m2_or_rowwise" : "rowwise"}});
+                }
+
                 return true;
             }
             if (m > 1 && m <= 4)
