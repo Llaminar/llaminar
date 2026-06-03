@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -581,6 +582,21 @@ namespace llaminar2
          *         and parameters across decode steps
          */
         virtual bool isGraphCapturable() const { return true; }
+
+        /**
+         * @brief Variant signature for graph-captured launch topology.
+         *
+         * Most stages have a single stable graph-capture topology and return 0.
+         * Stages whose kernel launch shape is bucketed by runtime values may
+         * return a nonzero signature. Segmented graph replay uses this to
+         * intentionally warm/capture a new graph variant before replaying a
+         * graph whose baked launch topology no longer matches the current step.
+         *
+         * This is deliberately about launch topology, not mathematical inputs:
+         * dynamic scalar values that are read from device-side params should not
+         * change this signature unless they also alter grid/block/smem shape.
+         */
+        virtual uint64_t graphCaptureVariantSignature() const { return 0; }
 
         /**
          * @brief Whether warmup can make a cold stage graph-capturable.

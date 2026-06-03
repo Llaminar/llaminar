@@ -119,23 +119,6 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override
         {
-            if (params_.device_id.is_rocm() && params_.kv_cache && params_.layer_idx >= 0)
-            {
-                const bool decode_like =
-                    params_.attention_mode == AttentionMode::DECODE ||
-                    params_.attention_mode == AttentionMode::BATCHED_DECODE ||
-                    (params_.auto_detect_mode && params_.seq_len <= 4);
-                if (decode_like)
-                {
-                    // ROCm native decode attention currently chooses grid shape,
-                    // split count, and block size from the host-side kv_len during
-                    // capture. Device-side params update the logical values for
-                    // replay, but cannot change the captured launch topology as
-                    // the KV cache grows.
-                    return false;
-                }
-            }
-
             // TQ KV cache dequant runs inside execute() via get_kv_converted() with
             // iteration-varying arguments (ring_pos, out_offset grow each step).
             // With device-side dynamic params, the captured H2D + kernel can be
@@ -148,6 +131,7 @@ namespace llaminar2
             }
             return true; // Device-side params buffer handles dynamic kv_len/position
         }
+        uint64_t graphCaptureVariantSignature() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;

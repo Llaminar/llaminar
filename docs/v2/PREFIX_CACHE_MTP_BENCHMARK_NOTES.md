@@ -9,7 +9,7 @@ speedup. Detailed tuning history belongs in commit messages or perf artifacts.
 | Scope | Device | Model | Baseline decode | Best MTP decode | Speedup | Status |
 |---|---|---|---:|---:|---:|---|
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 30.76 tok/s | 53.81 tok/s | 1.75x | Correctness green, mostly graph captured, short of 2x target |
-| Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 39.72 tok/s | 1.33x | Mostly graph captured, depth-sensitive |
+| Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 46.74 tok/s | 1.56x | Bucketed attention graph capture, depth-sensitive |
 | Dense long lane | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.44 tok/s | 54.02 tok/s | 1.34x | Correctness green, needs verifier work |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE single-device | ROCm `rocm:0` | Qwen3.6 35B A3B | 21.23 tok/s | 10.89 tok/s | 0.51x | Next tuning target |
@@ -56,15 +56,18 @@ again; promotion hysteresis is the next adaptive slice.
 ## ROCm Graph Replay Safety
 
 A long dynamic-depth QBF run faulted during cached HIP graph replay of
-`layer0_attention`. Stream-only and per-step recapture passed, so ROCm dynamic
-decode attention is now deliberately non-capturable until it has fixed launch
-topology across changing `kv_len`.
+`layer0_attention`. ROCm decode attention now remains graph-capturable while
+reporting a launch-topology variant signature keyed to split-count buckets.
+Segmented replay warms and recaptures when the bucket changes, while ordinary
+within-bucket KV growth uses device-side dynamic params.
 
-Validation: `V2_Unit_AttentionComputeStage_DynamicKVLen` pins the contract; the
-old one-stage repro now traces `layer0_attention` as `[MANUAL]`; Qwen3.6 ROCm
-graph-stream stress, dynamic-depth MTP parity, and prefix+MTP dynamic restore
-passed; the original crash repro now completes at 47.21 tok/s decode with
-85.14% acceptance and no new `gpucore.*`.
+Validation: `V2_Unit_AttentionComputeStage_DynamicKVLen` pins the bucket
+signature, `V2_Unit_ForwardGraphTypes` pins variant recapture, and
+`FlashDecode_FP32_GraphReplayUsesUpdatedKVLenWithinBucket` proves graph replay
+uses updated device-side KV length. The old one-stage trace shows
+`layer0_attention` as `[GRAPH]`; graph-stream stress, dynamic MTP parity, and
+prefix+dynamic restore passed. The original crash repro now completes at 46.74
+tok/s, 85.67% acceptance, and no new `gpucore.*`.
 
 ## Main Tuning Actions Landed
 
@@ -80,6 +83,5 @@ passed; the original crash repro now completes at 47.21 tok/s decode with
 
 ## Next Work
 
-Implement stable-topology ROCm decode attention capture to remove the manual
-segment, tune promotion hysteresis, then move to Qwen3.6 MoE MTP on ROCm before
-returning through CUDA, CPU, and the multi-participant matrix.
+Tune promotion hysteresis, then move to Qwen3.6 MoE MTP on ROCm before returning
+through CUDA, CPU, and the multi-participant matrix.

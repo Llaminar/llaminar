@@ -31,12 +31,14 @@ namespace
         FakeSegmentStage(bool capturable,
                          bool manual_boundary = false,
                          ComputeStageType stage_type = ComputeStageType::COPY,
-                         bool warmup_dependent_capture = false)
+                         bool warmup_dependent_capture = false,
+                         const uint64_t *variant_signature = nullptr)
             : IComputeStage(DeviceId::cpu()),
               capturable_(capturable),
               manual_boundary_(manual_boundary),
               stage_type_(stage_type),
-              warmup_dependent_capture_(warmup_dependent_capture)
+              warmup_dependent_capture_(warmup_dependent_capture),
+              variant_signature_(variant_signature)
         {
         }
 
@@ -45,6 +47,10 @@ namespace
         std::string name() const override { return "fake_segment_stage"; }
         bool supportsBackend(ComputeBackendType) const override { return true; }
         bool isGraphCapturable() const override { return capturable_; }
+        uint64_t graphCaptureVariantSignature() const override
+        {
+            return variant_signature_ ? *variant_signature_ : 0;
+        }
         bool supportsWarmupDependentGraphCapture() const override { return warmup_dependent_capture_; }
         bool isManualGraphBoundary() const override { return manual_boundary_; }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
@@ -54,6 +60,7 @@ namespace
         bool manual_boundary_ = false;
         ComputeStageType stage_type_ = ComputeStageType::COPY;
         bool warmup_dependent_capture_ = false;
+        const uint64_t *variant_signature_ = nullptr;
     };
 
     class FakeReplayGraphCapture final : public IGPUGraphCapture
@@ -147,7 +154,8 @@ namespace
                              bool capturable,
                              bool manual_boundary = false,
                              ComputeStageType stage_type = ComputeStageType::COPY,
-                             bool warmup_dependent_capture = false)
+                             bool warmup_dependent_capture = false,
+                             const uint64_t *variant_signature = nullptr)
     {
         graph.addNode(
             name,
@@ -155,7 +163,8 @@ namespace
                 capturable,
                 manual_boundary,
                 stage_type,
-                warmup_dependent_capture),
+                warmup_dependent_capture,
+                variant_signature),
             DeviceId::cpu());
     }
 
@@ -838,6 +847,64 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", aggregate_tags), 1u);
 
     PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
+{
+    ComputeGraph graph;
+    uint64_t variant = 0x11;
+    addFakeSegmentStage(
+        graph,
+        "bucketed_attention",
+        true,
+        false,
+        ComputeStageType::ATTENTION,
+        false,
+        &variant);
+
+    DeviceGraphExecutor executor;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    FakeReplayGPUContext gpu_ctx;
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx));
+    EXPECT_TRUE(cache.initialized);
+    EXPECT_TRUE(cache.needs_capture);
+    EXPECT_EQ(cache.decode_step, 1u);
+    const uint64_t first_signature = cache.capture_variant_signature;
+    ASSERT_NE(first_signature, 0u);
+
+    graph.reset();
+    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx));
+    EXPECT_TRUE(cache.initialized);
+    EXPECT_FALSE(cache.needs_capture);
+    EXPECT_EQ(cache.decode_step, 2u);
+
+    variant = 0x22;
+    graph.reset();
+    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+        graph,
+        &ctx,
+        cache,
+        gpu_ctx.defaultStream(),
+        &gpu_ctx));
+
+    EXPECT_TRUE(cache.initialized);
+    EXPECT_TRUE(cache.needs_capture)
+        << "variant changes must go through warmup/capture instead of stale replay";
+    EXPECT_EQ(cache.decode_step, 1u);
+    EXPECT_EQ(cache.variant_recapture_count, 1u);
+    EXPECT_NE(cache.capture_variant_signature, first_signature);
 }
 
 TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)

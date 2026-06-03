@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <map>
 
 namespace llaminar2
@@ -103,6 +104,41 @@ namespace llaminar2
     {
         if (ctx)
             ctx->activateDevice();
+    }
+
+    uint64_t DeviceGraphCaptureController::computeCaptureVariantSignature(ComputeGraph &graph)
+    {
+        constexpr uint64_t kFnvOffset = 1469598103934665603ull;
+        constexpr uint64_t kFnvPrime = 1099511628211ull;
+
+        uint64_t h = kFnvOffset;
+        bool has_variant = false;
+        const auto &order = graph.getExecutionOrder();
+        for (const auto &name : order)
+        {
+            auto *node = graph.getNode(name);
+            if (!node || !node->stage)
+            {
+                continue;
+            }
+
+            const uint64_t stage_variant = node->stage->graphCaptureVariantSignature();
+            if (stage_variant == 0)
+            {
+                continue;
+            }
+
+            has_variant = true;
+            const uint64_t name_hash = static_cast<uint64_t>(std::hash<std::string>{}(name));
+            const uint64_t type_hash = static_cast<uint64_t>(static_cast<int>(node->stage->type()));
+            for (uint64_t part : {name_hash, type_hash, stage_variant})
+            {
+                h ^= part;
+                h *= kFnvPrime;
+            }
+        }
+
+        return has_variant ? h : 0;
     }
 
     void DeviceGraphCaptureController::executeWarmupPhase(

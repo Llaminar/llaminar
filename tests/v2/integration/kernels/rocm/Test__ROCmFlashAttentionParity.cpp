@@ -29,6 +29,7 @@
 #include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "loaders/ModelContext.h"
 #include "transfer/TransferEngine.h"
 #include "utils/MPIContext.h"
@@ -985,6 +986,115 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
     EXPECT_LE(l2_error, 0.05) << "L2 error too high";
 
     LOG_INFO("[FlashDecode_FP32_LargeKVLen_GQA] PASSED");
+}
+
+TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedKVLenWithinBucket)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    constexpr int capture_kv_len = 65;
+    constexpr int replay_kv_len = 66;
+    constexpr int max_kv_len = 80;
+    constexpr int n_heads = 4;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    constexpr int seq_len = 1;
+
+    const DeviceId device = DeviceId::rocm(0);
+    const size_t q_size = static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size = static_cast<size_t>(max_kv_len) * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    auto Q_data = randomFP32Scaled(q_size, 0.25f);
+    auto K_data = randomFP32Scaled(kv_size, 0.25f);
+    auto V_data = randomFP32Scaled(kv_size, 0.25f);
+
+    FP32Tensor q_tensor({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    FP32Tensor k_tensor({static_cast<size_t>(max_kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    FP32Tensor v_tensor({static_cast<size_t>(max_kv_len), static_cast<size_t>(n_kv_heads * head_dim)});
+    FP32Tensor captured_output({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    FP32Tensor direct_output({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads * head_dim)});
+    std::copy(Q_data.begin(), Q_data.end(), q_tensor.mutable_data());
+    std::copy(K_data.begin(), K_data.end(), k_tensor.mutable_data());
+    std::copy(V_data.begin(), V_data.end(), v_tensor.mutable_data());
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+
+    auto &transfer = TransferEngine::instance();
+    ASSERT_TRUE(transfer.uploadFull(&q_tensor, device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&k_tensor, device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&v_tensor, device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&captured_output, device, stream).success);
+    ASSERT_TRUE(transfer.uploadFull(&direct_output, device, stream).success);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
+    rocm_kernel.setGPUStream(stream);
+    ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
+
+    // Warmup allocates pinned dynamic-param storage before capture.
+    ASSERT_TRUE(rocm_kernel.compute_tensor(
+        &q_tensor, &k_tensor, &v_tensor, &captured_output,
+        1, seq_len, capture_kv_len, n_heads, n_kv_heads, head_dim,
+        false, -1, nullptr, nullptr, &mpi_ctx_, 0));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+        ASSERT_TRUE(rocm_kernel.compute_tensor(
+            &q_tensor, &k_tensor, &v_tensor, &captured_output,
+            1, seq_len, capture_kv_len, n_heads, n_kv_heads, head_dim,
+            false, -1, nullptr, nullptr, &mpi_ctx_, 0));
+        ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
+
+    rocm_kernel.setDynamicAttnParams(replay_kv_len, replay_kv_len - 1, 1);
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    std::vector<float> captured(out_size, 0.0f);
+    ASSERT_EQ(hipMemcpyAsync(captured.data(), captured_output.gpu_data_ptr(),
+                             out_size * sizeof(float), hipMemcpyDeviceToHost, stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    ASSERT_TRUE(rocm_kernel.compute_tensor(
+        &q_tensor, &k_tensor, &v_tensor, &direct_output,
+        1, seq_len, replay_kv_len, n_heads, n_kv_heads, head_dim,
+        false, -1, nullptr, nullptr, &mpi_ctx_, 0));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    std::vector<float> direct(out_size, 0.0f);
+    ASSERT_EQ(hipMemcpyAsync(direct.data(), direct_output.gpu_data_ptr(),
+                             out_size * sizeof(float), hipMemcpyDeviceToHost, stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    ASSERT_FALSE(hasNaNOrInf(captured.data(), out_size));
+    ASSERT_FALSE(hasNaNOrInf(direct.data(), out_size));
+
+    const double cosine = cosineSimilarity(captured.data(), direct.data(), out_size);
+    const double l2_error = relativeL2Error(captured.data(), direct.data(), out_size);
+    const double max_error = maxAbsError(captured.data(), direct.data(), out_size);
+    printComparisonStats("FlashDecode FP32 graph replay updated kv_len", cosine, l2_error, max_error, out_size);
+
+    EXPECT_GE(cosine, 0.9999);
+    EXPECT_LE(l2_error, 1e-4);
+    EXPECT_LE(max_error, 1e-4);
+
+    hipGraphExecDestroy(graph_exec);
+    hipGraphDestroy(graph);
+    cleanupWorkspace(rocm_kernel);
+    hipStreamDestroy(stream);
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen35LongKVLen)

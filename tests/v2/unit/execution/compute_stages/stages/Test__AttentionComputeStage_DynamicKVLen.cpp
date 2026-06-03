@@ -300,7 +300,7 @@ namespace llaminar2
             std::unique_ptr<FP32Tensor> workspace_mask_;
         };
 
-        TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionIsNotGraphCapturable)
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionIsGraphCapturable)
         {
             AttentionComputeStage::Params params;
             params.Q = Q_.get();
@@ -319,7 +319,42 @@ namespace llaminar2
             params.device_id = DeviceId::rocm(0);
 
             AttentionComputeStage stage(params);
-            EXPECT_FALSE(stage.isGraphCapturable());
+            EXPECT_TRUE(stage.isGraphCapturable());
+        }
+
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionVariantChangesAtSplitBucket)
+        {
+            AttentionComputeStage::Params params;
+            params.Q = Q_.get();
+            params.K = kv_cache_->get_k(0, 0);
+            params.V = kv_cache_->get_v(0, 0);
+            params.output = output_.get();
+            params.batch_size = 1;
+            params.seq_len = 1;
+            params.kv_len = 64;
+            params.n_heads = kNumHeads;
+            params.n_kv_heads = kNumKVHeads;
+            params.head_dim = kHeadDim;
+            params.auto_detect_mode = true;
+            params.kv_cache = kv_cache_.get();
+            params.layer_idx = 0;
+            params.device_id = DeviceId::rocm(0);
+
+            AttentionComputeStage stage(params);
+
+            kv_cache_->setCachedTokens(0, 62); // post-append kv_len=63
+            const uint64_t bucket_a = stage.graphCaptureVariantSignature();
+            ASSERT_NE(bucket_a, 0u);
+
+            kv_cache_->setCachedTokens(0, 63); // post-append kv_len=64
+            const uint64_t bucket_a_edge = stage.graphCaptureVariantSignature();
+            EXPECT_EQ(bucket_a_edge, bucket_a);
+
+            kv_cache_->setCachedTokens(0, 64); // post-append kv_len=65
+            const uint64_t bucket_b = stage.graphCaptureVariantSignature();
+            EXPECT_NE(bucket_b, 0u);
+            EXPECT_NE(bucket_b, bucket_a)
+                << "ROCm split-K decode must recapture when crossing the 64-token launch bucket";
         }
 
         TEST_F(Test__AttentionComputeStage_DynamicKVLen, CPUAndROCmPrefillGraphCaptureContractsRemainUnchanged)

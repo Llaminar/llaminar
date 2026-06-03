@@ -315,6 +315,32 @@ namespace llaminar2
 
         const bool has_collective_nodes = (collective_nodes && !collective_nodes->empty());
 
+        const uint64_t current_variant_signature =
+            DeviceGraphCaptureController::computeCaptureVariantSignature(graph);
+        if (segment_cache.initialized &&
+            segment_cache.capture_variant_signature != current_variant_signature)
+        {
+            LOG_DEBUG("[DeviceGraphExecutor] Segmented graph launch-topology variant changed from "
+                      << segment_cache.capture_variant_signature << " to "
+                      << current_variant_signature << "; recapturing");
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "decode_segmented_variant_recapture",
+                1.0,
+                "decode",
+                ctx ? ctx->deviceId().toString() : std::string{},
+                {{"old_signature", std::to_string(segment_cache.capture_variant_signature)},
+                 {"new_signature", std::to_string(current_variant_signature)},
+                 {"context", segment_cache.perf_context}});
+            segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
+            segment_cache.capture_variant_signature = current_variant_signature;
+            segment_cache.variant_recapture_count++;
+        }
+        else if (!segment_cache.initialized)
+        {
+            segment_cache.capture_variant_signature = current_variant_signature;
+        }
+
         // Monotonic step counter + phase transition selection for segmented mode.
         const auto phase_transition = DeviceGraphCaptureController::beginStep(
             segment_cache.initialized,

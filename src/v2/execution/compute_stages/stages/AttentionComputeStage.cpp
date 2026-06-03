@@ -19,6 +19,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../kernels/KernelFactory.h"
 #include <algorithm>
+#include <cstdint>
 #include <fstream>
 #include <filesystem>
 
@@ -127,6 +128,24 @@ namespace llaminar2
                 return false;
             }
         }
+
+        int rocmAttentionRequestedDecodeSplitCap(int kv_len)
+        {
+            if (kv_len <= 64)
+                return 1;
+            if (kv_len < 128)
+                return 2;
+            if (kv_len < 256)
+                return 4;
+            return 8;
+        }
+
+        void combineAttentionVariant(uint64_t &h, uint64_t value)
+        {
+            constexpr uint64_t kPrime = 1099511628211ull;
+            h ^= value;
+            h *= kPrime;
+        }
     } // namespace
 
     // =============================================================================
@@ -136,6 +155,84 @@ namespace llaminar2
     AttentionComputeStage::AttentionComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    uint64_t AttentionComputeStage::graphCaptureVariantSignature() const
+    {
+        if (!params_.device_id.is_rocm() ||
+            !params_.kv_cache ||
+            params_.layer_idx < 0 ||
+            params_.batch_size != 1 ||
+            params_.seq_len <= 0 ||
+            params_.head_dim <= 0 ||
+            debugEnv().rocm.fa_decode_via_prefill)
+        {
+            return 0;
+        }
+
+        int effective_kv_len = params_.seq_len;
+        const int cached_tokens = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+        if (cached_tokens > 0)
+        {
+            // graphCaptureVariantSignature() is queried before KVCacheAppendStage
+            // executes for this step. Attention execution sees the post-append
+            // length, so mirror updateDynamicParams() and add this query row count.
+            effective_kv_len = cached_tokens + params_.seq_len;
+        }
+
+        AttentionMode mode = params_.attention_mode;
+        if (params_.auto_detect_mode)
+        {
+            mode = detect_attention_mode(params_.batch_size, params_.seq_len, effective_kv_len);
+        }
+
+        const bool decode_like =
+            mode == AttentionMode::DECODE ||
+            mode == AttentionMode::BATCHED_DECODE ||
+            (params_.seq_len < effective_kv_len && params_.batch_size == 1);
+        if (!decode_like)
+        {
+            return 0;
+        }
+
+        // ROCm split-K decode launches are used for one-row decode and the
+        // native-KV M=2 verifier path. M>=3 falls through to prefill-style
+        // attention, whose launch topology is fixed by seq_len rather than KV
+        // growth and therefore does not need a replay variant.
+        const int decode_rows = std::min(params_.seq_len, 2);
+        if (decode_rows <= 0 || params_.seq_len > 2)
+        {
+            return 0;
+        }
+
+        uint64_t signature = 1469598103934665603ull;
+        combineAttentionVariant(signature, 0xA77E0001ull);
+        combineAttentionVariant(signature, static_cast<uint64_t>(params_.seq_len));
+        combineAttentionVariant(signature, static_cast<uint64_t>(params_.n_heads));
+        combineAttentionVariant(signature, static_cast<uint64_t>(params_.n_kv_heads));
+        combineAttentionVariant(signature, static_cast<uint64_t>(params_.head_dim));
+        combineAttentionVariant(signature, static_cast<uint64_t>(params_.kv_cache->k_precision()));
+        combineAttentionVariant(signature, static_cast<uint64_t>(params_.kv_cache->v_precision()));
+
+        const auto &rocm_env = debugEnv().rocm;
+        combineAttentionVariant(signature, rocm_env.fa_decode_num_splits_present ? 1ull : 0ull);
+        combineAttentionVariant(signature, rocm_env.fa_decode_num_splits
+                                               ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_num_splits))
+                                               : 0ull);
+        combineAttentionVariant(signature, rocm_env.fa_decode_tpb
+                                               ? static_cast<uint64_t>(std::max(0, *rocm_env.fa_decode_tpb))
+                                               : 0ull);
+
+        for (int row = 0; row < decode_rows; ++row)
+        {
+            const int row_kv_len =
+                std::max(1, effective_kv_len - (decode_rows - 1 - row));
+            const int requested_split_cap = rocmAttentionRequestedDecodeSplitCap(row_kv_len);
+            combineAttentionVariant(signature, static_cast<uint64_t>(row));
+            combineAttentionVariant(signature, static_cast<uint64_t>(requested_split_cap));
+        }
+
+        return signature;
     }
 
     // =============================================================================

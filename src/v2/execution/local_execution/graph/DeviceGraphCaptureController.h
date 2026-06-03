@@ -147,6 +147,16 @@ namespace llaminar2
         static void prepareDeviceForSegmentedCapture(IDeviceContext *ctx);
 
         /**
+         * @brief Compute a graph-wide launch-topology variant signature.
+         *
+         * The signature is zero when every stage reports the default variant.
+         * Nonzero stage signatures are folded with stage identity so the
+         * segmented cache can recapture before replaying a graph whose baked
+         * launch topology no longer matches current dynamic parameters.
+         */
+        static uint64_t computeCaptureVariantSignature(ComputeGraph &graph);
+
+        /**
          * @brief Execute warmup-phase bookkeeping (segment build + state transition).
          */
         static void executeWarmupPhase(

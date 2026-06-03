@@ -397,6 +397,8 @@ namespace llaminar2
             bool needs_capture = false;               ///< True after warmup, before capture
             int consecutive_failures = 0;             ///< Segment-level failure counter
             uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
+            uint64_t capture_variant_signature = 0;   ///< Stage-reported launch-topology variant for this cache
+            uint64_t variant_recapture_count = 0;     ///< Resets caused by launch-topology variant changes
             std::string perf_context;                 ///< Optional structured stats tag for the replay caller
             void *capture_stream = nullptr;           ///< Locally-created blocking stream for capture/replay
             void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
@@ -416,6 +418,8 @@ namespace llaminar2
                   needs_capture(other.needs_capture),
                   consecutive_failures(other.consecutive_failures),
                   decode_step(other.decode_step),
+                  capture_variant_signature(other.capture_variant_signature),
+                  variant_recapture_count(other.variant_recapture_count),
                   perf_context(std::move(other.perf_context)),
                   capture_stream(other.capture_stream),
                   sync_event(other.sync_event),
@@ -424,6 +428,8 @@ namespace llaminar2
                 other.capture_stream = nullptr;
                 other.sync_event = nullptr;
                 other.gpu_ctx_ref = nullptr;
+                other.capture_variant_signature = 0;
+                other.variant_recapture_count = 0;
             }
             GraphSegmentCache &operator=(GraphSegmentCache &&other) noexcept
             {
@@ -435,6 +441,8 @@ namespace llaminar2
                     needs_capture = other.needs_capture;
                     consecutive_failures = other.consecutive_failures;
                     decode_step = other.decode_step;
+                    capture_variant_signature = other.capture_variant_signature;
+                    variant_recapture_count = other.variant_recapture_count;
                     perf_context = std::move(other.perf_context);
                     capture_stream = other.capture_stream;
                     sync_event = other.sync_event;
@@ -442,6 +450,8 @@ namespace llaminar2
                     other.capture_stream = nullptr;
                     other.sync_event = nullptr;
                     other.gpu_ctx_ref = nullptr;
+                    other.capture_variant_signature = 0;
+                    other.variant_recapture_count = 0;
                 }
                 return *this;
             }
@@ -456,6 +466,7 @@ namespace llaminar2
                 needs_capture = false;
                 consecutive_failures = 0;
                 decode_step = 0;
+                capture_variant_signature = 0;
                 destroySyncEvent();
                 if (stream_policy == StreamResetPolicy::Destroy)
                     destroyCaptureStream();
