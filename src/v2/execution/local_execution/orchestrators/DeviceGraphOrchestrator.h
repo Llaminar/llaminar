@@ -59,6 +59,7 @@
 #include "../../../collective/IGlobalTPContext.h"      // For shared_ptr<IGlobalTPContext> ownership
 #include <memory>
 #include <optional>
+#include <array>
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
@@ -1854,6 +1855,8 @@ namespace llaminar2
             mtp_sidecar_depth0_cache_.resetSessionState();
             mtp_sidecar_depth0_chained_cache_.resetSessionState();
             mtp_sidecar_depth0_kv_only_cache_.resetSessionState();
+            for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+                cache.resetSessionState();
             mtp_terminal_hidden_row_select_cache_.resetSessionState();
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
@@ -2263,6 +2266,13 @@ namespace llaminar2
                               const char *sidecar_perf_context,
                               bool kv_cache_only = false,
                               BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN);
+        bool executeMTPDepth0Batched(const int32_t *draft_condition_tokens,
+                                     int token_count,
+                                     TensorBase *terminal_hidden,
+                                     int position_id,
+                                     const char *sidecar_perf_context,
+                                     bool kv_cache_only = false,
+                                     BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,
@@ -2279,8 +2289,11 @@ namespace llaminar2
             uint64_t workspace_generation = 0;
             uint64_t moe_placement_epoch = 0;
             bool moe_epoch_sensitive = false;
+            std::vector<int32_t> token_ids;
+            std::vector<int> position_ids;
             int32_t token_id = 0;
             int position_id = 0;
+            int seq_len = 0;
             bool valid = false;
 
             void resetReplayState()
@@ -2318,8 +2331,11 @@ namespace llaminar2
                 workspace_generation = 0;
                 moe_placement_epoch = 0;
                 moe_epoch_sensitive = false;
+                token_ids.clear();
+                position_ids.clear();
                 token_id = 0;
                 position_id = 0;
+                seq_len = 0;
                 valid = false;
             }
         };
@@ -2327,6 +2343,7 @@ namespace llaminar2
         MTPSidecarGraphCache mtp_sidecar_depth0_cache_;
         MTPSidecarGraphCache mtp_sidecar_depth0_chained_cache_;
         MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_cache_;
+        std::array<MTPSidecarGraphCache, 5> mtp_sidecar_depth0_kv_only_batch_caches_;
 
         struct MTPTerminalHiddenRowSelectGraphCache
         {

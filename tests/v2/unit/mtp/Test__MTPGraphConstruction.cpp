@@ -25,6 +25,7 @@
 #include "utils/TestTensorFactory.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -284,30 +285,30 @@ namespace
             fill_moe(*moe_up_exps, 0.0009f);
             fill_moe(*moe_down_exps, 0.0005f);
 
-            terminal_hidden = TestTensorFactory::createFP32Random({1, d});
-            embedding = TestTensorFactory::createFP32({1, d});
-            norm_hidden = TestTensorFactory::createFP32({1, d});
-            norm_embedding = TestTensorFactory::createFP32({1, d});
-            concat = TestTensorFactory::createFP32({1, d * 2});
-            projected = TestTensorFactory::createFP32({1, d});
-            hidden = TestTensorFactory::createFP32({1, d});
-            q = TestTensorFactory::createFP32({1, q_dim});
-            k = TestTensorFactory::createFP32({1, kv_dim});
-            v = TestTensorFactory::createFP32({1, kv_dim});
-            q_raw = TestTensorFactory::createFP32({1, q_dim * 2});
-            q_gate = TestTensorFactory::createFP32({1, q_dim});
-            attn_output = TestTensorFactory::createFP32({1, q_dim});
-            attn_proj = TestTensorFactory::createFP32({1, d});
-            gate = TestTensorFactory::createFP32({1, ff});
-            up = TestTensorFactory::createFP32({1, ff});
-            ffn_output = TestTensorFactory::createFP32({1, d});
-            moe_expert_indices = TestTensorFactory::createFP32({1, moe_top_k});
-            moe_expert_weights = TestTensorFactory::createFP32({1, moe_top_k});
-            moe_combined_output = TestTensorFactory::createFP32({1, d});
-            moe_shared_expert_output = TestTensorFactory::createFP32({1, d});
-            moe_gate_scratch = TestTensorFactory::createFP32({1, moe_experts});
-            moe_up_scratch = TestTensorFactory::createFP32({1, moe_experts});
-            logits = TestTensorFactory::createFP32({1, vocab});
+            terminal_hidden = TestTensorFactory::createFP32Random({4, d});
+            embedding = TestTensorFactory::createFP32({4, d});
+            norm_hidden = TestTensorFactory::createFP32({4, d});
+            norm_embedding = TestTensorFactory::createFP32({4, d});
+            concat = TestTensorFactory::createFP32({4, d * 2});
+            projected = TestTensorFactory::createFP32({4, d});
+            hidden = TestTensorFactory::createFP32({4, d});
+            q = TestTensorFactory::createFP32({4, q_dim});
+            k = TestTensorFactory::createFP32({4, kv_dim});
+            v = TestTensorFactory::createFP32({4, kv_dim});
+            q_raw = TestTensorFactory::createFP32({4, q_dim * 2});
+            q_gate = TestTensorFactory::createFP32({4, q_dim});
+            attn_output = TestTensorFactory::createFP32({4, q_dim});
+            attn_proj = TestTensorFactory::createFP32({4, d});
+            gate = TestTensorFactory::createFP32({4, ff});
+            up = TestTensorFactory::createFP32({4, ff});
+            ffn_output = TestTensorFactory::createFP32({4, d});
+            moe_expert_indices = TestTensorFactory::createFP32({4, moe_top_k});
+            moe_expert_weights = TestTensorFactory::createFP32({4, moe_top_k});
+            moe_combined_output = TestTensorFactory::createFP32({4, d});
+            moe_shared_expert_output = TestTensorFactory::createFP32({4, d});
+            moe_gate_scratch = TestTensorFactory::createFP32({4, moe_experts});
+            moe_up_scratch = TestTensorFactory::createFP32({4, moe_experts});
+            logits = TestTensorFactory::createFP32({4, vocab});
 
             kv_cache = createCPURingKVCache(
                 ActivationPrecision::FP32,
@@ -1206,6 +1207,69 @@ TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCa
     EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_rope"));
 }
 
+TEST(Test__MTPGraphConstruction, BuildsMultiRowKVOnlyQwen35SidecarGraphForShiftedCacheCatchup)
+{
+    DenseMTPGraphFixture fixture;
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    const std::array<int, 3> draft_tokens = {17, 23, 41};
+    const std::array<int, 3> positions = {5, 6, 7};
+
+    auto weights = fixture.mtpWeights();
+    auto input = fixture.input();
+    input.draft_token_ids = draft_tokens.data();
+    input.position_ids = positions.data();
+    input.seq_len = static_cast<int>(draft_tokens.size());
+    input.kv_cache_only = true;
+    input.terminal_hidden_buffer_id = BufferId::HIDDEN_STATE;
+    auto output = fixture.output();
+    output.logits = nullptr;
+    output.hidden = nullptr;
+    output.attn_output = nullptr;
+    output.attn_proj = nullptr;
+    output.gate = nullptr;
+    output.up = nullptr;
+    output.ffn_output = nullptr;
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    ASSERT_GT(graph.size(), 0u);
+    EXPECT_EQ(graph.terminalNode(), "layer0_kv_append");
+    ASSERT_NE(graph.getNode("mtp0_embedding"), nullptr);
+    ASSERT_NE(graph.getNode("mtp0_norm_hidden"), nullptr);
+    ASSERT_NE(graph.getNode("layer0_kv_append"), nullptr);
+    EXPECT_EQ(graph.getNode("layer0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
+
+    const auto norm_hidden_contract = graph.getNode("mtp0_norm_hidden")->stage->bufferContract();
+    EXPECT_TRUE(contractReads(norm_hidden_contract, BufferId::HIDDEN_STATE));
+    EXPECT_TRUE(contractWrites(norm_hidden_contract, BufferId::MTP_NORM_HIDDEN));
+    EXPECT_EQ(graph.getNode("layer0_attention"), nullptr);
+    EXPECT_EQ(graph.getNode("mtp0_lm_head"), nullptr);
+}
+
+TEST(Test__MTPGraphConstruction, RejectsMultiRowFullQwen35SidecarGraph)
+{
+    DenseMTPGraphFixture fixture;
+    Qwen35Graph graph_builder(fixture.config, fixture.mpi);
+    graph_builder.setWeights(fixture.modelWeights());
+
+    const std::array<int, 2> draft_tokens = {17, 23};
+    const std::array<int, 2> positions = {5, 6};
+
+    auto weights = fixture.mtpWeights();
+    auto input = fixture.input();
+    input.draft_token_ids = draft_tokens.data();
+    input.position_ids = positions.data();
+    input.seq_len = static_cast<int>(draft_tokens.size());
+    input.kv_cache_only = false;
+    auto output = fixture.output();
+
+    ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
+
+    EXPECT_EQ(graph.size(), 0u);
+}
+
 TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWeights)
 {
     DenseMTPGraphFixture fixture;
@@ -1689,13 +1753,13 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto plain_after_build_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}, {"seq_len", "1"}};
     const auto plain_reuse_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}, {"seq_len", "1"}};
     const auto epoch0_depth_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
     const auto dense_collective_scan_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"has_collectives", "false"}, {"node_count", "0"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"has_collectives", "false"}, {"node_count", "0"}, {"seq_len", "1"}};
 
     const PerfStatRecord *plain_after_build = findMTPRecord(
         records,
@@ -1782,11 +1846,11 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto epoch0_depth_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
     const auto plain_after_build_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}, {"seq_len", "1"}};
     const auto plain_reuse_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}, {"seq_len", "1"}};
 
     const PerfStatRecord *cache_misses = findMTPRecord(
         records,
@@ -1879,7 +1943,7 @@ TEST(Test__MTPGraphConstruction, DenseSidecarGraphCacheIgnoresMoEPlacementEpochC
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto epoch0_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
     const PerfStatRecord *epoch0_miss = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
@@ -1970,9 +2034,9 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto epoch0_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}, {"seq_len", "1"}};
     const auto epoch1_tags =
-        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "1"}};
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "1"}, {"seq_len", "1"}};
 
     const PerfStatRecord *epoch0_miss = findMTPRecord(
         records,
@@ -2066,8 +2130,8 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
     EXPECT_GT(abs_sum, 0.0f);
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
-    const auto plain_tags = PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}};
-    const auto segmented_tags = PerfStatsCollector::Tags{{"depth", "0"}, {"path", "segmented"}};
+    const auto plain_tags = PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}, {"seq_len", "1"}};
+    const auto segmented_tags = PerfStatsCollector::Tags{{"depth", "0"}, {"path", "segmented"}, {"seq_len", "1"}};
 
     const PerfStatRecord *plain_path = findMTPRecord(
         records,
@@ -2091,7 +2155,8 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_decode_sidecar"},
         {"force_recapture", "false"},
-        {"has_collectives", "false"}};
+        {"has_collectives", "false"},
+        {"seq_len", "1"}};
     const PerfStatRecord *policy_record = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
@@ -2146,7 +2211,8 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_shifted_prefill"},
         {"force_recapture", "false"},
-        {"has_collectives", "false"}};
+        {"has_collectives", "false"},
+        {"seq_len", "1"}};
     const PerfStatRecord *policy_record = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,

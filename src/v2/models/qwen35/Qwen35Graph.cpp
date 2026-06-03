@@ -334,9 +334,11 @@ namespace llaminar2
             return true;
         };
 
-        if (input.batch_size != 1 || input.seq_len != 1)
+        if (input.batch_size != 1 || input.seq_len <= 0 || input.seq_len > 4 ||
+            (!input.kv_cache_only && input.seq_len != 1))
         {
-            LOG_ERROR("[Qwen35Graph::buildMTPGraph] Phase 5 supports one-token MTP sidecar graphs only");
+            LOG_ERROR("[Qwen35Graph::buildMTPGraph] MTP sidecar graphs require batch_size=1, seq_len<=4, "
+                      "and multi-row execution only for kv_cache_only catchup");
             return graph;
         }
 

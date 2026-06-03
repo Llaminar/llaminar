@@ -1014,6 +1014,8 @@ namespace llaminar2
             mtp_sidecar_depth0_cache_.invalidate();
             mtp_sidecar_depth0_chained_cache_.invalidate();
             mtp_sidecar_depth0_kv_only_cache_.invalidate();
+            for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+                cache.invalidate();
             mtp_terminal_hidden_row_select_cache_.invalidate();
             for (auto &cache : layer_graph_cache_)
                 cache.invalidate();
@@ -2338,6 +2340,8 @@ namespace llaminar2
         mtp_sidecar_depth0_cache_.invalidate();
         mtp_sidecar_depth0_chained_cache_.invalidate();
         mtp_sidecar_depth0_kv_only_cache_.invalidate();
+        for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+            cache.invalidate();
         mtp_terminal_hidden_row_select_cache_.invalidate();
 
         // Clear device contexts
@@ -3488,25 +3492,54 @@ namespace llaminar2
         bool kv_cache_only,
         BufferId terminal_hidden_buffer_id)
     {
+        return executeMTPDepth0Batched(
+            &draft_condition_token,
+            1,
+            terminal_hidden,
+            position_id,
+            sidecar_perf_context,
+            kv_cache_only,
+            terminal_hidden_buffer_id);
+    }
+
+    bool DeviceGraphOrchestrator::executeMTPDepth0Batched(
+        const int32_t *draft_condition_tokens,
+        int token_count,
+        TensorBase *terminal_hidden,
+        int position_id,
+        const char *sidecar_perf_context,
+        bool kv_cache_only,
+        BufferId terminal_hidden_buffer_id)
+    {
         const std::string device_key = state_.device_id.toString();
         const std::string phase = perfPhaseName();
         const std::string sidecar_context =
             (sidecar_perf_context && sidecar_perf_context[0] != '\0')
                 ? sidecar_perf_context
                 : ((phase == "prefill") ? "mtp_shifted_prefill" : "mtp_decode_sidecar");
+        if (!draft_condition_tokens || token_count <= 0 || token_count > 4)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar received invalid token_count=" << token_count);
+            return false;
+        }
+        if (!kv_cache_only && token_count != 1)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Batched MTP sidecar is only supported for kv_cache_only catchup");
+            return false;
+        }
         PerfStatsCollector::ScopedTimer total_timer(
             "mtp",
             "sidecar_depth0_total",
             phase,
             device_key,
-            {{"depth", "0"}});
+            {{"depth", "0"}, {"seq_len", std::to_string(token_count)}});
         PerfStatsCollector::addCounter(
             "mtp",
             "sidecar_depth0_calls",
             1.0,
             phase,
             device_key,
-            {{"depth", "0"}});
+            {{"depth", "0"}, {"seq_len", std::to_string(token_count)}});
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return false;
         if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
@@ -3596,13 +3629,13 @@ namespace llaminar2
         }
 
         MTPForwardInput input;
-        input.draft_token_ids = &draft_condition_token;
+        input.draft_token_ids = draft_condition_tokens;
         input.terminal_hidden = terminal_hidden;
         input.kv_cache = state_.mtp_kv_caches[0].get();
         input.position_ids = &position_id;
         input.sequence_lengths = nullptr;
         input.batch_size = 1;
-        input.seq_len = 1;
+        input.seq_len = token_count;
         input.device = state_.device_id;
         input.terminal_hidden_buffer_id = terminal_hidden_buffer_id;
         input.kv_cache_only = kv_cache_only;
@@ -3633,7 +3666,9 @@ namespace llaminar2
         output.moe_up_scratch = mtp_moe_up_scratch;
 
         auto &sidecar_cache = kv_cache_only
-            ? mtp_sidecar_depth0_kv_only_cache_
+            ? (token_count == 1
+                   ? mtp_sidecar_depth0_kv_only_cache_
+                   : mtp_sidecar_depth0_kv_only_batch_caches_[static_cast<size_t>(token_count)])
             : (terminal_hidden_buffer_id == BufferId::MTP_HIDDEN
                    ? mtp_sidecar_depth0_chained_cache_
                    : mtp_sidecar_depth0_cache_);
@@ -3645,6 +3680,7 @@ namespace llaminar2
             !sidecar_cache.valid ||
             !sidecar_cache.graph ||
             sidecar_cache.terminal_hidden != terminal_hidden ||
+            sidecar_cache.seq_len != token_count ||
             sidecar_cache.moe_epoch_sensitive != sidecar_moe_epoch_sensitive ||
             sidecar_cache.moe_placement_epoch != sidecar_moe_epoch_key;
 
@@ -3652,22 +3688,25 @@ namespace llaminar2
         if (needs_graph_rebuild)
         {
             sidecar_cache.invalidate();
-            sidecar_cache.token_id = draft_condition_token;
+            sidecar_cache.token_id = draft_condition_tokens[0];
+            sidecar_cache.token_ids.assign(static_cast<size_t>(token_count), 0);
+            sidecar_cache.position_ids.assign(static_cast<size_t>(token_count), 0);
             sidecar_cache.position_id = position_id;
+            sidecar_cache.seq_len = token_count;
             sidecar_cache.terminal_hidden = terminal_hidden;
             sidecar_cache.moe_placement_epoch = sidecar_moe_epoch_key;
             sidecar_cache.moe_epoch_sensitive = sidecar_moe_epoch_sensitive;
 
             MTPForwardInput cached_input = input;
-            cached_input.draft_token_ids = &sidecar_cache.token_id;
-            cached_input.position_ids = &sidecar_cache.position_id;
+            cached_input.draft_token_ids = sidecar_cache.token_ids.data();
+            cached_input.position_ids = sidecar_cache.position_ids.data();
 
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
                 "sidecar_build_graph",
                 phase,
                 device_key,
-                {{"depth", "0"}});
+                {{"depth", "0"}, {"seq_len", std::to_string(token_count)}});
             ComputeGraph graph = graph_builder_->buildMTPGraph(
                 0,
                 bindings.mtp.depths[0],
@@ -3706,6 +3745,7 @@ namespace llaminar2
                 phase,
                 device_key,
                 {{"depth", "0"},
+                 {"seq_len", std::to_string(token_count)},
                  {"has_collectives", boolTag(!sidecar_cache.collective_nodes.empty())},
                  {"node_count", std::to_string(sidecar_cache.collective_nodes.size())}});
             PerfStatsCollector::addCounter(
@@ -3715,6 +3755,7 @@ namespace llaminar2
                 phase,
                 device_key,
                 {{"depth", "0"},
+                 {"seq_len", std::to_string(token_count)},
                  {"moe_placement_epoch", std::to_string(sidecar_moe_epoch_key)}});
         }
         else
@@ -3726,6 +3767,7 @@ namespace llaminar2
                 phase,
                 device_key,
                 {{"depth", "0"},
+                 {"seq_len", std::to_string(token_count)},
                  {"moe_placement_epoch", std::to_string(sidecar_moe_epoch_key)}});
         }
 
@@ -3794,18 +3836,30 @@ namespace llaminar2
                         1.0,
                         phase,
                         device_key,
-                        {{"depth", "0"}});
+                        {{"depth", "0"}, {"seq_len", std::to_string(token_count)}});
                 }
                 sidecar_cache.workspace_generation = new_workspace_generation;
             }
         }
 
-        sidecar_cache.token_id = draft_condition_token;
+        sidecar_cache.token_id = draft_condition_tokens[0];
+        if (sidecar_cache.token_ids.size() != static_cast<size_t>(token_count) ||
+            sidecar_cache.position_ids.size() != static_cast<size_t>(token_count))
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar cache has unstable token/position storage for seq_len="
+                      << token_count);
+            return false;
+        }
+        std::copy(draft_condition_tokens,
+                  draft_condition_tokens + token_count,
+                  sidecar_cache.token_ids.begin());
         sidecar_cache.position_id = position_id;
+        for (int i = 0; i < token_count; ++i)
+            sidecar_cache.position_ids[static_cast<size_t>(i)] = position_id + i;
         for (auto *stage : sidecar_cache.dynamic_param_stages)
         {
             if (stage)
-                stage->updateDynamicParams(position_id, 1);
+                stage->updateDynamicParams(position_id, token_count);
         }
         sidecar_cache.graph->reset();
 
@@ -3818,7 +3872,7 @@ namespace llaminar2
                 "sidecar_execute_graph",
                 phase,
                 device_key,
-                {{"depth", "0"}});
+                {{"depth", "0"}, {"seq_len", std::to_string(token_count)}});
 
             bool used_segmented_capture = false;
             if (try_gpu_graph_capture && !rebuilt_graph)
@@ -3840,6 +3894,7 @@ namespace llaminar2
                     phase,
                     device_key,
                     {{"context", sidecar_cache.segment_cache.perf_context},
+                     {"seq_len", std::to_string(token_count)},
                      {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
                      {"force_recapture", boolTag(capture_policy.force_recapture)},
                      {"has_collectives", boolTag(has_sidecar_collectives)},
@@ -3867,6 +3922,7 @@ namespace llaminar2
                 phase,
                 device_key,
                 {{"depth", "0"},
+                 {"seq_len", std::to_string(token_count)},
                  {"path", used_segmented_capture ? "segmented" : (rebuilt_graph ? "plain_after_build" : "plain")}});
         }
         if (ok && state_.device_id.is_gpu() &&
@@ -4197,16 +4253,28 @@ namespace llaminar2
             perfPhaseName(),
             state_.device_id.toString());
 
-        for (int token_index = already_appended_tokens; token_index < token_count; ++token_index)
+        const int catchup_token_count = token_count - already_appended_tokens;
+        if (catchup_token_count > 0)
         {
-            const int hidden_row = token_index - 1;
-            if (!selectMTPTerminalHiddenRow(hidden_row, main_forward_token_count))
+            if (catchup_token_count > 4)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row batched catchup exceeds graph capacity: "
+                          << catchup_token_count);
                 return false;
-            if (!executeMTPDepth0(tokens[token_index],
-                                  state_.prefix_terminal_hidden.get(),
-                                  position_offset + token_index,
-                                  "mtp_decode_catchup",
-                                  true))
+            }
+            if (catchup_token_count > main_forward_token_count)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row batched catchup exceeds available verifier hidden rows: "
+                          << catchup_token_count << " > " << main_forward_token_count);
+                return false;
+            }
+            if (!executeMTPDepth0Batched(tokens + already_appended_tokens,
+                                         catchup_token_count,
+                                         state_.hidden.get(),
+                                         position_offset + already_appended_tokens,
+                                         "mtp_decode_catchup",
+                                         true,
+                                         BufferId::HIDDEN_STATE))
             {
                 return false;
             }
@@ -6205,6 +6273,8 @@ namespace llaminar2
         mtp_sidecar_depth0_cache_.resetSessionState();
         mtp_sidecar_depth0_chained_cache_.resetSessionState();
         mtp_sidecar_depth0_kv_only_cache_.resetSessionState();
+        for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+            cache.resetSessionState();
         mtp_terminal_hidden_row_select_cache_.resetSessionState();
 
         for (auto &cache : layer_graph_cache_)
