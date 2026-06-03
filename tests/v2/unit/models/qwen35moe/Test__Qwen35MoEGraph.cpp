@@ -44,6 +44,18 @@ namespace
                            });
     }
 
+    bool hasFingerprintFieldWithPrefix(
+        const PrefixFingerprintMaterial &material,
+        const std::string &prefix)
+    {
+        return std::any_of(material.moe.begin(),
+                           material.moe.end(),
+                           [&](const PrefixFingerprintField &field)
+                           {
+                               return field.name.rfind(prefix, 0) == 0;
+                           });
+    }
+
     GraphConfig makeMoEConfig(ITPContext *tp_ctx = nullptr)
     {
         GraphConfig config;
@@ -385,4 +397,20 @@ TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopolog
 
     EXPECT_NE(changed_hash, original_hash)
         << "Changing routed expert overlay domains must invalidate MoE prefix-cache payloads";
+}
+
+TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialExcludesTransientRuntimeTables)
+{
+    GraphConfig config = makeMoEConfig();
+    Qwen35MoEGraph graph_builder(config, nullptr);
+
+    PrefixFingerprintMaterial material;
+    graph_builder.appendPrefixCacheFingerprintMaterial(material);
+
+    EXPECT_FALSE(hasFingerprintFieldWithPrefix(material, "graph.runtime_table"))
+        << "MoE runtime tables are lazy graph-execution state and must not drift prefix keys";
+    EXPECT_FALSE(hasFingerprintFieldWithPrefix(material, "runtime_table."))
+        << "Prefix compatibility is represented by overlay/rebalance placement material instead";
+    EXPECT_TRUE(hasFingerprintField(material, "graph.num_experts", "2"));
+    EXPECT_TRUE(hasFingerprintField(material, "graph.top_k", "1"));
 }

@@ -494,7 +494,6 @@ namespace llaminar2
     {
         material.moe.push_back({"graph.num_experts", std::to_string(config_.moe.num_experts)});
         material.moe.push_back({"graph.top_k", std::to_string(config_.moe.top_k)});
-        material.moe.push_back({"graph.runtime_table_count", std::to_string(moe_runtime_tables_.size())});
 
         if (config_.moe.expert_parallel_plan)
         {
@@ -518,17 +517,6 @@ namespace llaminar2
         else
         {
             material.moe.push_back({"expert_overlay.runtime.enabled", "false"});
-        }
-
-        for (const auto &[key, table] : moe_runtime_tables_)
-        {
-            if (!table)
-                continue;
-            appendMoEPlacementFingerprintFields(
-                material.moe,
-                *table,
-                table->layerCount(),
-                "runtime_table." + key);
         }
     }
 
