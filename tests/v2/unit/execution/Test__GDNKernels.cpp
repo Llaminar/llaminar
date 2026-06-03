@@ -574,6 +574,117 @@ public:
                 (override));
 };
 
+class RecordingShortConvolution final : public ITensorShortConvolution
+{
+public:
+    float *capture_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x1234));
+    int capture_rows = 7;
+    int capture_state_size = 9;
+    int capture_bind_calls = 0;
+
+    void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
+    {
+        ++capture_bind_calls;
+        capture_workspace = workspace;
+        capture_rows = rows;
+        capture_state_size = state_size;
+    }
+
+    bool forward(
+        const float *, const float *, const float *,
+        float *, float *,
+        int, int, int,
+        bool) override
+    {
+        return true;
+    }
+};
+
+class RecordingGatedDeltaNet final : public ITensorGatedDeltaNet
+{
+public:
+    float *capture_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x5678));
+    int capture_rows = 11;
+    int capture_state_size = 13;
+    int capture_bind_calls = 0;
+
+    void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
+    {
+        ++capture_bind_calls;
+        capture_workspace = workspace;
+        capture_rows = rows;
+        capture_state_size = state_size;
+    }
+
+    bool chunk_forward(
+        const float *, const float *, const float *,
+        const float *, const float *,
+        const float *, const float *,
+        float *, float *,
+        int, int, int, int,
+        int, bool) override
+    {
+        return true;
+    }
+
+    bool recurrent_step(
+        const float *, const float *, const float *,
+        const float *, const float *,
+        const float *, const float *,
+        float *, float *,
+        int, int, int,
+        bool) override
+    {
+        return true;
+    }
+};
+
+TEST(Test__GDNKernels, NonVerifierShortConvStageDoesNotClearSharedVerifierCaptureWorkspace)
+{
+    RecordingShortConvolution kernel;
+    float *const existing_capture = kernel.capture_workspace;
+
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 1;
+    p.channels = 16;
+    p.kernel_size = 4;
+    p.verifier_state_capture_rows = 0;
+    p.kernel = &kernel;
+
+    ShortConv1dStage stage(p);
+    stage.bindWorkspace(nullptr);
+
+    EXPECT_EQ(kernel.capture_bind_calls, 0);
+    EXPECT_EQ(kernel.capture_workspace, existing_capture);
+    EXPECT_EQ(kernel.capture_rows, 7);
+    EXPECT_EQ(kernel.capture_state_size, 9);
+}
+
+TEST(Test__GDNKernels, NonVerifierRecurrenceStageDoesNotClearSharedVerifierCaptureWorkspace)
+{
+    RecordingGatedDeltaNet kernel;
+    float *const existing_capture = kernel.capture_workspace;
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 1;
+    p.n_heads = 2;
+    p.n_k_heads = 2;
+    p.d_k = 4;
+    p.d_v = 4;
+    p.verifier_state_capture_rows = 0;
+    p.kernel = &kernel;
+
+    GDNRecurrenceStage stage(p);
+    stage.bindWorkspace(nullptr);
+
+    EXPECT_EQ(kernel.capture_bind_calls, 0);
+    EXPECT_EQ(kernel.capture_workspace, existing_capture);
+    EXPECT_EQ(kernel.capture_rows, 11);
+    EXPECT_EQ(kernel.capture_state_size, 13);
+}
+
 TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch)
 {
 #ifdef HAVE_ROCM

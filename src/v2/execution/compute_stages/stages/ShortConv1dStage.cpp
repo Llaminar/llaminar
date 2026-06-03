@@ -124,12 +124,17 @@ namespace llaminar2
 
         params_.kernel->bindScratchWorkspace(scratch, scratch_floats);
 
+        const int capture_state_size = params_.channels * std::max(0, params_.kernel_size - 1);
+        verifier_capture_workspace_bound_ = false;
+        verifier_capture_rows_bound_ = 0;
+        verifier_capture_state_size_bound_ = capture_state_size;
+
+        if (params_.verifier_state_capture_rows <= 0)
+            return;
+
         float *capture = nullptr;
         int capture_rows = 0;
-        const int capture_state_size = params_.channels * std::max(0, params_.kernel_size - 1);
-        if (params_.verifier_state_capture_rows > 0 &&
-            bound_workspace_ &&
-            bound_workspace_->hasBuffer(verifierStateCaptureBufferName()))
+        if (bound_workspace_ && bound_workspace_->hasBuffer(verifierStateCaptureBufferName()))
         {
             const std::string capture_name = verifierStateCaptureBufferName();
             capture = static_cast<float *>(bound_workspace_->getBuffer(capture_name));
@@ -142,6 +147,9 @@ namespace llaminar2
                     available_floats / static_cast<size_t>(capture_state_size)));
             }
         }
+        verifier_capture_workspace_bound_ =
+            capture != nullptr && capture_rows > 0 && capture_state_size > 0;
+        verifier_capture_rows_bound_ = capture_rows;
         params_.kernel->bindVerifierStateCaptureWorkspace(
             capture,
             capture_rows,
@@ -199,8 +207,31 @@ namespace llaminar2
     bool ShortConv1dStage::hasVerifierStateCapture() const
     {
         return params_.kernel &&
-               params_.verifier_state_capture_rows > 0 &&
+               verifierStateCaptureWorkspaceRequired() &&
                params_.conv_state != nullptr;
+    }
+
+    bool ShortConv1dStage::verifierStateCaptureWorkspaceRequired() const
+    {
+        return params_.verifier_state_capture_rows > 0 &&
+               params_.kernel_size > 1;
+    }
+
+    bool ShortConv1dStage::ensureVerifierStateCaptureWorkspaceBound() const
+    {
+        if (!verifierStateCaptureWorkspaceRequired())
+            return true;
+        if (verifier_capture_workspace_bound_)
+            return true;
+
+        LOG_ERROR("[ShortConv1dStage] Missing required verifier state capture workspace '"
+                  << verifierStateCaptureBufferName()
+                  << "' (requested_rows=" << params_.verifier_state_capture_rows
+                  << ", bound_rows=" << verifier_capture_rows_bound_
+                  << ", state_size=" << verifier_capture_state_size_bound_
+                  << ", layer=" << params_.layer_idx
+                  << ", device=" << params_.device_id.toString() << ")");
+        return false;
     }
 
     bool ShortConv1dStage::restoreVerifierStateCaptureRow(int row, void *stream)
@@ -354,6 +385,8 @@ namespace llaminar2
         // Bind stage stream to kernel before execution
         params_.kernel->setGPUStream(gpuStream());
         bindKernelWorkspace();
+        if (!ensureVerifierStateCaptureWorkspaceBound())
+            return false;
 
         auto *input_base = requireTensorBasePtr(params_.input, "input");
         auto *output_base = requireTensorBasePtr(params_.output, "output");

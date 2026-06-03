@@ -170,6 +170,9 @@ namespace llaminar2
         std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
         DeviceWorkspaceManager *bound_workspace_ = nullptr;
         uint32_t workspace_slice_id_ = 0;
+        bool verifier_capture_workspace_bound_ = false;
+        int verifier_capture_rows_bound_ = 0;
+        int verifier_capture_state_size_bound_ = 0;
 
         // Reusable scratch for QKV deinterleaving (grow-only)
         mutable std::vector<float> q_deinterleave_;
@@ -181,6 +184,8 @@ namespace llaminar2
         std::string workspaceStableId() const;
         std::string effectiveSeqLenScalarBufferName() const;
         std::string verifierStateCaptureBufferName() const;
+        bool verifierStateCaptureWorkspaceRequired() const;
+        bool ensureVerifierStateCaptureWorkspaceBound() const;
         bool ensureGpuEffectiveSeqLenStateInitialized();
         bool uploadGpuEffectiveSeqLen();
         void refreshPinnedEffectiveSeqLen();
