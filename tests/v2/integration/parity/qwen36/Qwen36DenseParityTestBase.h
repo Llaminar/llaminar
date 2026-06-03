@@ -301,7 +301,8 @@ namespace llaminar2::test::parity::qwen36
         const std::string &model_path,
         bool enable_prefix_cache,
         int block_size,
-        bool enable_mtp = false)
+        bool enable_mtp = false,
+        int mtp_draft_tokens = 1)
     {
         OrchestrationConfig config = OrchestrationConfig::defaults();
         config.model_path = model_path;
@@ -317,7 +318,7 @@ namespace llaminar2::test::parity::qwen36
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.ram_budget_bytes = 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
-        config.mtp.draft_tokens = 1;
+        config.mtp.draft_tokens = mtp_draft_tokens;
 
         switch (test_case.topology)
         {
@@ -607,8 +608,12 @@ namespace llaminar2::test::parity::qwen36
 
     inline void runDenseMTPParity(
         const DensePrefixRestoreParityCase &test_case,
-        bool enable_prefix_cache)
+        bool enable_prefix_cache,
+        int mtp_draft_tokens = 1)
     {
+        ASSERT_GE(mtp_draft_tokens, 1);
+        ASSERT_LE(mtp_draft_tokens, 3);
+
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -641,7 +646,8 @@ namespace llaminar2::test::parity::qwen36
                 model_path,
                 enable_prefix_cache,
                 block_size,
-                true));
+                true,
+                mtp_draft_tokens));
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
 
@@ -652,8 +658,9 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(first.tokens, expected_tokens);
         EXPECT_EQ(first.tokens, baseline_result.tokens);
         EXPECT_FALSE(after_first.mtp_bypassed) << after_first.mtp_bypass_reason;
-        EXPECT_GE(after_first.mtp_draft_steps, 1u);
+        EXPECT_GE(after_first.mtp_draft_steps, static_cast<uint64_t>(mtp_draft_tokens));
         EXPECT_GE(after_first.mtp_verifier_runs, 1u);
+        EXPECT_GE(after_first.mtp_verifier_token_count, static_cast<uint64_t>(mtp_draft_tokens + 1));
 
         if (!enable_prefix_cache)
         {

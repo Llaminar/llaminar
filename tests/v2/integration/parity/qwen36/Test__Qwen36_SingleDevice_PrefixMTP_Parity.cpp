@@ -38,6 +38,11 @@ TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
     runDenseMTPParity(singleDeviceCase(), false);
 }
 
+TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesPyTorchDecodeTokens)
+{
+    runDenseMTPParity(singleDeviceCase(), false, 3);
+}
+
 TEST(Qwen36SingleDevicePrefixMTPParity, PrefixCacheMTPRestore)
 {
     runDenseMTPParity(singleDeviceCase(), true);
