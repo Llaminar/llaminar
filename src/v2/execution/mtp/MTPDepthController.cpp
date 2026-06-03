@@ -110,7 +110,27 @@ namespace llaminar2
     {
         const uint64_t required = static_cast<uint64_t>(
             std::max(config_.window_size, config_.min_samples));
-        return window_.verifier_runs >= required;
+        if (window_.verifier_runs >= required)
+            return true;
+
+        if (config_.mode == MTPDepthPolicyMode::Fixed ||
+            current_depth_ <= config_.min_depth ||
+            steps_since_change_ < config_.cooldown_steps ||
+            window_.verifier_runs < static_cast<uint64_t>(config_.min_samples) ||
+            window_.attempted_draft_tokens == 0)
+        {
+            return false;
+        }
+
+        const double acceptance_rate =
+            static_cast<double>(window_.accepted_draft_tokens) /
+            static_cast<double>(window_.attempted_draft_tokens);
+        const double zero_accept_rate =
+            static_cast<double>(window_.zero_accepts) /
+            static_cast<double>(window_.verifier_runs);
+
+        return zero_accept_rate >= config_.demote_zero_accept_rate ||
+               acceptance_rate < config_.demote_acceptance_rate;
     }
 
     MTPDepthDecision MTPDepthController::evaluateWindow() const

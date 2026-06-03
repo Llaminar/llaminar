@@ -30,26 +30,28 @@ needed instead of hard-pinning the deepest draft.
 The first reusable hysteresis sweep is
 `scripts/run_mtp_depth_hysteresis_sweep.sh`.
 
-Latest ROCm release sweep, Qwen3.6 27B Q4_K_S on `rocm:0`, 2026-06-03:
+Latest ROCm release sweep after early-demotion tuning, Qwen3.6 27B Q4_K_S on
+`rocm:0`, 2026-06-03:
 
 | Case | Depth policy | Decode | Acceptance | Final depth | Updates | Notes |
 |---|---|---:|---:|---:|---:|---|
-| `qbf_short` | fixed d1 | 45.52 tok/s | 89.58% | 1 | 0 | reference |
-| `qbf_short` | fixed d3 | 43.76 tok/s | 85.61% | 3 | 0 | reference |
-| `qbf_short` | dynamic max d3 | 49.08 tok/s | 85.61% | 3 | 0 | stayed deep |
-| default benchmark prompt | fixed d1 | 35.58 tok/s | 69.92% | 1 | 0 | best fixed in this sweep |
-| default benchmark prompt | fixed d3 | 31.50 tok/s | 63.48% | 3 | 0 | overreaches |
-| default benchmark prompt | dynamic max d3 | 33.50 tok/s | 67.53% | 1 | 8 | demotes, but pays learning cost |
+| `qbf_short` | fixed d1 | 48.22 tok/s | 92.71% | 1 | 0 | reference |
+| `qbf_short` | fixed d3 | 52.91 tok/s | 85.61% | 3 | 0 | best fixed |
+| `qbf_short` | dynamic max d3 | 52.70 tok/s | 87.41% | 3 | 1 | tied with d3 |
+| default benchmark prompt | fixed d1 | 36.36 tok/s | 71.88% | 1 | 0 | best fixed |
+| default benchmark prompt | fixed d3 | 33.62 tok/s | 60.76% | 3 | 0 | overreaches |
+| default benchmark prompt | dynamic max d3 | 37.81 tok/s | 73.45% | 1 | 5 | beats fixed in this sweep |
 | `qbf_long` | fixed d1 | 47.49 tok/s | 92.97% | 1 | 0 | best fixed in this sweep |
 | `qbf_long` | fixed d3 | 40.83 tok/s | 78.15% | 3 | 0 | overreaches here |
-| `qbf_long` | dynamic max d3 | 38.75 tok/s | 78.79% | 2 | 5 | stable after stream fix |
+| `qbf_long` | dynamic max d3 | 41.50 tok/s | 79.30% | 1 | 9 | improved, still trails d1 |
 
 Artifacts live under
-`/tmp/llaminar-mtp-bench/adaptive-depth-20260603/`. Dynamic mode now makes the
-right qualitative choices: it stays deep for high-acceptance short prompts and
-demotes acceptance-limited prompts. Whole-run speed on the default prompt still
-trails fixed d1 because the controller starts at max depth and spends early
-windows learning; tuning initial depth/window policy is the next adaptive slice.
+`/tmp/llaminar-mtp-bench/adaptive-depth-20260603/`. Dynamic mode now evaluates
+bad partial windows after `min_samples`, so acceptance-limited prompts demote
+before a full window elapses. The default prompt improved from the previous
+33.50 tok/s dynamic capture to 37.81 tok/s. qbf-long still trails fixed d1,
+mostly because occasional perfect shallow windows can promote and then demote
+again; promotion hysteresis is the next adaptive slice.
 
 ## Main Tuning Actions Landed
 
@@ -69,5 +71,5 @@ windows learning; tuning initial depth/window policy is the next adaptive slice.
 
 ## Next Work
 
-Tune adaptive initial/window policy, then move to Qwen3.6 MoE MTP on ROCm before
-returning through CUDA, CPU, and the multi-participant matrix.
+Tune promotion hysteresis, then move to Qwen3.6 MoE MTP on ROCm before returning
+through CUDA, CPU, and the multi-participant matrix.

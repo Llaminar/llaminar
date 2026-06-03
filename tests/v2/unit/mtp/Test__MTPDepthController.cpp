@@ -84,6 +84,68 @@ TEST(Test__MTPDepthController, DynamicDemotesOnZeroAcceptWindows)
     EXPECT_EQ(controller.stats().demotions, 1u);
 }
 
+TEST(Test__MTPDepthController, DynamicEarlyDemotesAfterMinSamplesWithoutFullWindow)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/3,
+        /*max_depth=*/3,
+        /*window_size=*/8,
+        /*cooldown_steps=*/0);
+    config.min_samples = 4;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    for (int i = 0; i < 3; ++i)
+    {
+        auto decision = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+        EXPECT_FALSE(decision.evaluated);
+        EXPECT_EQ(controller.currentDepth(), 3);
+    }
+
+    auto early = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/1));
+    ASSERT_TRUE(early.evaluated);
+    ASSERT_TRUE(early.changed);
+    EXPECT_EQ(early.reason, MTPDepthDecisionReason::DemoteLowAcceptanceRate);
+    EXPECT_EQ(early.window.verifier_runs, 4u);
+    EXPECT_EQ(early.new_depth, 1);
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().windows, 1u);
+    EXPECT_EQ(controller.stats().demotions, 1u);
+}
+
+TEST(Test__MTPDepthController, DynamicHealthyPartialWindowWaitsForFullWindow)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/3,
+        /*max_depth=*/3,
+        /*window_size=*/8,
+        /*cooldown_steps=*/0);
+    config.min_samples = 4;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    for (int i = 0; i < 4; ++i)
+    {
+        auto decision = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/3));
+        EXPECT_FALSE(decision.evaluated);
+        EXPECT_EQ(controller.currentDepth(), 3);
+    }
+
+    for (int i = 0; i < 3; ++i)
+    {
+        auto decision = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/3));
+        EXPECT_FALSE(decision.evaluated);
+    }
+
+    auto full = controller.recordStep(observation(/*depth=*/3, /*accepted_prefix=*/3));
+    ASSERT_TRUE(full.evaluated);
+    EXPECT_FALSE(full.changed);
+    EXPECT_EQ(full.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(full.window.verifier_runs, 8u);
+    EXPECT_EQ(controller.currentDepth(), 3);
+    EXPECT_EQ(controller.stats().windows, 1u);
+}
+
 TEST(Test__MTPDepthController, DynamicPromotesOnStableFullAcceptWindows)
 {
     MTPDepthController controller(
