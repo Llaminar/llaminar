@@ -237,6 +237,19 @@ Latest graph-atomic small-M hardening validation:
   `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`, and
   the focused Qwen3.6 ROCm PyTorch parity cells
   `MTPGreedyMatchesPyTorchDecodeTokens` and `PrefixCacheMTPRestore`.
+- Fresh Phase 13.5 CPU all-codebook small-M fused projection coverage on
+  2026-06-03: CPU native VNNI now records
+  `kernel.cpu_native_vnni_small_m_fused_projection_calls` when the `M>1`
+  fused projection path quantizes activation rows once and feeds multiple
+  native-VNNI projections. Focused integration passed:
+  `ctest --test-dir build_v2_integration -R "^V2_Integration_CPUNativeVNNI_GEMV$" --output-on-failure --parallel`.
+  That suite now includes `MTP_SmallM_FusedProjection_AllFormats`, covering
+  `M=2/3/4` fused-vs-separate projection parity across the CPU native-VNNI
+  Q/IQ/K codebook inventory, and adds the previously missing `Q4_K` and
+  `Q5_K` CPU smoke/sweep entries. The focused CPU perf row passed directly:
+  `./build_v2_release/tests/v2/v2_perf_cpu_native_vnni_gemv --gtest_filter="*MTP_SmallM_FusedProjection_AllFormats"`.
+  This closes a CPU coverage gap in the Phase 13.5 GEMV-many contract, but not
+  the CPU real-model speed gate.
 - Fresh Phase 13.5 real GDN projection perf coverage on 2026-06-03:
   `NativeVNNIGEMMPerfTest.MTP_SmallM_BatchedGDNProjectionShapes` now includes
   the measured Qwen3.6 hot-path groups `Q4_K/Q5_K qkv+z` with

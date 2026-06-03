@@ -34,6 +34,7 @@
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 
 namespace llaminar2::cpu::native_vnni
 {
@@ -647,6 +648,19 @@ namespace llaminar2::cpu::native_vnni
                     const float *bias_data = proj.bias->data();
                     apply_bias_epilogue(out_data, bias_data, m, proj.n, proj.n);
                 }
+            }
+            if (q8_quantized && PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_small_m_fused_projection_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"k", std::to_string(k)},
+                        {"projections", std::to_string(projections.size())}});
             }
             return true;
         }

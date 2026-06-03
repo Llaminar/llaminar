@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
+#include <array>
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -30,6 +31,7 @@
 #include "kernels/cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "fort.hpp"
 
 // TestTensorFactory for creating random quantized tensors
@@ -682,6 +684,10 @@ namespace
             return TestTensorFactory::createQ5_0Random({N, K});
         if (fmt_name == "Q5_1")
             return TestTensorFactory::createQ5_1Random({N, K});
+        if (fmt_name == "Q4_K")
+            return TestTensorFactory::createQ4_KRandom({N, K});
+        if (fmt_name == "Q5_K")
+            return TestTensorFactory::createQ5_KRandom({N, K});
         if (fmt_name == "Q6_K")
             return TestTensorFactory::createQ6_KRandom({N, K});
         if (fmt_name == "Q3_K")
@@ -722,6 +728,8 @@ namespace
         {"Q5_0", 0.990f},
         {"Q5_1", 0.990f},
         // INT8 pre-decoded path (superblock formats)
+        {"Q4_K", 0.990f},
+        {"Q5_K", 0.990f},
         {"Q6_K", 0.990f},
         {"Q3_K", 0.980f},
         {"Q2_K", 0.960f},
@@ -781,6 +789,8 @@ namespace
     TEST_F(CPUNativeVNNIGemvTest, IQ4_XS_SmallMatrix) { smokeTestFormat("IQ4_XS", 0.985f); }
     TEST_F(CPUNativeVNNIGemvTest, Q5_0_SmallMatrix) { smokeTestFormat("Q5_0", 0.990f); }
     TEST_F(CPUNativeVNNIGemvTest, Q5_1_SmallMatrix) { smokeTestFormat("Q5_1", 0.990f); }
+    TEST_F(CPUNativeVNNIGemvTest, Q4_K_SmallMatrix) { smokeTestFormat("Q4_K", 0.990f); }
+    TEST_F(CPUNativeVNNIGemvTest, Q5_K_SmallMatrix) { smokeTestFormat("Q5_K", 0.990f); }
     TEST_F(CPUNativeVNNIGemvTest, Q6_K_SmallMatrix) { smokeTestFormat("Q6_K", 0.990f); }
     TEST_F(CPUNativeVNNIGemvTest, Q3_K_SmallMatrix) { smokeTestFormat("Q3_K", 0.980f); }
     TEST_F(CPUNativeVNNIGemvTest, Q2_K_SmallMatrix) { smokeTestFormat("Q2_K", 0.960f); }
@@ -793,6 +803,80 @@ namespace
     TEST_F(CPUNativeVNNIGemvTest, IQ1_M_SmallMatrix) { smokeTestFormat("IQ1_M", 0.800f); }
     TEST_F(CPUNativeVNNIGemvTest, Q8_0_SmallMatrix) { smokeTestFormat("Q8_0", 0.999f); }
     TEST_F(CPUNativeVNNIGemvTest, Q8_1_SmallMatrix) { smokeTestFormat("Q8_1", 0.999f); }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_FusedProjection_AllFormats)
+    {
+        const int K = 256;
+        const std::array<int, 3> verifier_rows = {2, 3, 4};
+        const int N0 = 384;
+        const int N1 = 256;
+
+        setenv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_cpu_native_vnni_mtp_smallm.json", 1);
+        PerfStatsCollector::reset();
+
+        for (const auto &fmt : ALL_FORMATS)
+        {
+            auto weights0 = createWeightsForFormat(fmt.name, N0, K);
+            auto weights1 = createWeightsForFormat(fmt.name, N1, K);
+            ASSERT_NE(weights0, nullptr) << "Failed to create " << fmt.name << " first projection";
+            ASSERT_NE(weights1, nullptr) << "Failed to create " << fmt.name << " second projection";
+
+            CPUNativeVNNIGemmKernel kernel0(weights0.get());
+            CPUNativeVNNIGemmKernel kernel1(weights1.get());
+            ASSERT_TRUE(kernel0.isValid()) << fmt.name << " first projection failed to pack";
+            ASSERT_TRUE(kernel1.isValid()) << fmt.name << " second projection failed to pack";
+
+            for (int M : verifier_rows)
+            {
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f,
+                    static_cast<uint32_t>(1000 + M + K + N0 + fmt.name.size()));
+                ASSERT_NE(input, nullptr);
+
+                FP32Tensor fused0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor fused1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                FP32Tensor separate0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor separate1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel0, &fused0, N0, nullptr, "mtp_proj0"},
+                    {&kernel1, &fused1, N1, nullptr, "mtp_proj1"}};
+
+                ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K))
+                    << fmt.name << " fused projection failed at M=" << M;
+                ASSERT_TRUE(kernel0.multiply_tensor(input.get(), &separate0, M, N0, K))
+                    << fmt.name << " separate projection 0 failed at M=" << M;
+                ASSERT_TRUE(kernel1.multiply_tensor(input.get(), &separate1, M, N1, K))
+                    << fmt.name << " separate projection 1 failed at M=" << M;
+
+                const size_t count0 = static_cast<size_t>(M) * N0;
+                const size_t count1 = static_cast<size_t>(M) * N1;
+                const float cos0 = cosineSimilarity(fused0.data(), separate0.data(), count0);
+                const float cos1 = cosineSimilarity(fused1.data(), separate1.data(), count1);
+                const float err0 = maxAbsError(fused0.data(), separate0.data(), count0);
+                const float err1 = maxAbsError(fused1.data(), separate1.data(), count1);
+
+                EXPECT_GE(cos0, 0.9999f)
+                    << fmt.name << " projection 0 fused/separate mismatch at M=" << M
+                    << " max_err=" << err0;
+                EXPECT_GE(cos1, 0.9999f)
+                    << fmt.name << " projection 1 fused/separate mismatch at M=" << M
+                    << " max_err=" << err1;
+                EXPECT_LE(err0, 1e-4f)
+                    << fmt.name << " projection 0 fused/separate max error at M=" << M;
+                EXPECT_LE(err1, 1e-4f)
+                    << fmt.name << " projection 1 fused/separate max error at M=" << M;
+            }
+        }
+
+        const auto records = PerfStatsCollector::snapshot({"kernel.cpu_native_vnni_small_m_fused_projection_calls"});
+        uint64_t total_count = 0;
+        for (const auto &record : records)
+            total_count += record.count;
+        EXPECT_EQ(total_count, ALL_FORMATS.size() * verifier_rows.size())
+            << "Every format and M=2/3/4 verifier shape should use the CPU fused small-M projection route";
+        unsetenv("LLAMINAR_PERF_STATS_JSON");
+    }
 
     // =========================================================================
     // Full shape sweep across ALL formats

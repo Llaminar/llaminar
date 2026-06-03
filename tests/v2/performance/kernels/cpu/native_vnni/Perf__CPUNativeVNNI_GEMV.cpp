@@ -32,6 +32,7 @@
 #include <mpi.h>
 #include <omp.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <csignal>
@@ -207,6 +208,65 @@ namespace
         {"14B", 5120, 40, 8, 128, 13824, 152064},
         {"32B", 5120, 40, 8, 128, 27648, 152064},
     };
+
+    struct FormatSpec
+    {
+        std::string name;
+    };
+
+    static const std::vector<FormatSpec> MTP_SMALL_M_FORMATS = {
+        {"Q4_0"}, {"Q4_1"}, {"Q5_0"}, {"Q5_1"},
+        {"Q8_0"}, {"Q8_1"}, {"Q2_K"}, {"Q3_K"},
+        {"Q4_K"}, {"Q5_K"}, {"Q6_K"}, {"IQ4_NL"},
+        {"IQ4_XS"}, {"IQ3_S"}, {"IQ3_XXS"}, {"IQ2_S"},
+        {"IQ2_XS"}, {"IQ2_XXS"}, {"IQ1_S"}, {"IQ1_M"},
+    };
+
+    std::unique_ptr<TensorBase> createWeightsForFormat(
+        const std::string &fmt_name, size_t N, size_t K)
+    {
+        if (fmt_name == "Q4_0")
+            return TestTensorFactory::createQ4_0Random({N, K});
+        if (fmt_name == "Q4_1")
+            return TestTensorFactory::createQ4_1Random({N, K});
+        if (fmt_name == "Q5_0")
+            return TestTensorFactory::createQ5_0Random({N, K});
+        if (fmt_name == "Q5_1")
+            return TestTensorFactory::createQ5_1Random({N, K});
+        if (fmt_name == "Q8_0")
+            return TestTensorFactory::createQ8_0Random({N, K});
+        if (fmt_name == "Q8_1")
+            return TestTensorFactory::createQ8_1Random({N, K});
+        if (fmt_name == "Q2_K")
+            return TestTensorFactory::createQ2_KRandom({N, K});
+        if (fmt_name == "Q3_K")
+            return TestTensorFactory::createQ3_KRandom({N, K});
+        if (fmt_name == "Q4_K")
+            return TestTensorFactory::createQ4_KRandom({N, K});
+        if (fmt_name == "Q5_K")
+            return TestTensorFactory::createQ5_KRandom({N, K});
+        if (fmt_name == "Q6_K")
+            return TestTensorFactory::createQ6_KRandom({N, K});
+        if (fmt_name == "IQ4_NL")
+            return TestTensorFactory::createIQ4_NLRandom({N, K});
+        if (fmt_name == "IQ4_XS")
+            return TestTensorFactory::createIQ4_XSRandom({N, K});
+        if (fmt_name == "IQ3_S")
+            return TestTensorFactory::createIQ3_SRandom({N, K});
+        if (fmt_name == "IQ3_XXS")
+            return TestTensorFactory::createIQ3_XXSRandom({N, K});
+        if (fmt_name == "IQ2_S")
+            return TestTensorFactory::createIQ2_SRandom({N, K});
+        if (fmt_name == "IQ2_XS")
+            return TestTensorFactory::createIQ2_XSRandom({N, K});
+        if (fmt_name == "IQ2_XXS")
+            return TestTensorFactory::createIQ2_XXSRandom({N, K});
+        if (fmt_name == "IQ1_S")
+            return TestTensorFactory::createIQ1_SRandom({N, K});
+        if (fmt_name == "IQ1_M")
+            return TestTensorFactory::createIQ1_MRandom({N, K});
+        return nullptr;
+    }
 
     // =========================================================================
     // Shape definitions
@@ -964,6 +1024,74 @@ namespace
                   << "Quant = FP32\xe2\x86\x92Q8_1 activation quantization only\n"
                   << "VNNI = packed INT8 path (FP32\xe2\x86\x92Q8_1 quant + VNNI compute)\n"
                   << "Q8_0 = native blocks (FP32 dequant + FMA)\n\n"
+                  << table.to_string() << std::endl;
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_FusedProjection_AllFormats)
+    {
+        constexpr int K = 512;
+        constexpr int N0 = 768;
+        constexpr int N1 = 512;
+        constexpr int LOCAL_WARMUP = 3;
+        constexpr int LOCAL_ITERS = 10;
+        const std::array<int, 3> rows = {2, 3, 4};
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header << "Format" << "M" << "K" << "N0" << "N1"
+              << "Fused us" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int c = 1; c <= 5; ++c)
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        for (const auto &fmt : MTP_SMALL_M_FORMATS)
+        {
+            auto weights0 = createWeightsForFormat(fmt.name, N0, K);
+            auto weights1 = createWeightsForFormat(fmt.name, N1, K);
+            ASSERT_NE(weights0, nullptr) << fmt.name;
+            ASSERT_NE(weights1, nullptr) << fmt.name;
+
+            CPUNativeVNNIGemmKernel kernel0(weights0.get());
+            CPUNativeVNNIGemmKernel kernel1(weights1.get());
+            ASSERT_TRUE(kernel0.isValid()) << fmt.name;
+            ASSERT_TRUE(kernel1.isValid()) << fmt.name;
+
+            for (int M : rows)
+            {
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)},
+                    -1.0f,
+                    1.0f,
+                    static_cast<uint32_t>(3000 + M + fmt.name.size()));
+                FP32Tensor out0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor out1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel0, &out0, N0, nullptr, "mtp_projection_0"},
+                    {&kernel1, &out1, N1, nullptr, "mtp_projection_1"}};
+
+                for (int i = 0; i < LOCAL_WARMUP; ++i)
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+
+                std::vector<double> times;
+                times.reserve(LOCAL_ITERS);
+                for (int i = 0; i < LOCAL_ITERS; ++i)
+                {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    times.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                }
+                std::sort(times.begin(), times.end());
+                const double p10 = times[std::max(0, static_cast<int>(times.size() / 10) - 1)];
+
+                char fused_us[32];
+                std::snprintf(fused_us, sizeof(fused_us), "%.1f", p10);
+                table << fmt.name << M << K << N0 << N1 << fused_us << fort::endr;
+            }
+        }
+
+        std::cout << "\n=== MTP Small-M CPU NativeVNNI Fused Projection Perf ===\n"
+                  << "Rows M=2/3/4, two projections, activation quantized once per fused call.\n\n"
                   << table.to_string() << std::endl;
     }
 
