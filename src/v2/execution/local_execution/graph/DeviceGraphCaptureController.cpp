@@ -1609,7 +1609,8 @@ namespace llaminar2
         bool has_collective_nodes,
         uint64_t current_step,
         const ReplayHooks &hooks,
-        bool force_recapture)
+        bool force_recapture,
+        bool defer_final_sync)
     {
         ReplayPhaseResult result{};
 
@@ -1652,6 +1653,15 @@ namespace llaminar2
         const auto &device_id = ctx->deviceId();
         const std::string device_name = device_id.toString();
         const int total_segments = static_cast<int>(segment_cache.segments.size());
+        const bool can_defer_final_sync =
+            defer_final_sync &&
+            !has_collective_nodes &&
+            std::all_of(segment_cache.segments.begin(),
+                        segment_cache.segments.end(),
+                        [](const DeviceGraphExecutor::GraphSegment &segment)
+                        {
+                            return segment.capturable;
+                        });
         PerfStatsCollector::ScopedTimer replay_timer(
             "forward_graph",
             "segmented_replay_total",
@@ -1741,6 +1751,26 @@ namespace llaminar2
         // Graph segments replayed on capture_stream; manual segments (embedding)
         // ran on defaultStream. Syncing only these two is cheaper than a
         // device-wide barrier and avoids interference with global capture mode.
+        //
+        // A caller may explicitly defer this sync when it will immediately enqueue
+        // a dependent GPU operation on the same capture stream and synchronize
+        // through that operation instead. This is used for MTP sidecar replay plus
+        // greedy argmax sampling.
+        if (can_defer_final_sync)
+        {
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "segmented_replay_final_sync_deferred",
+                    1.0,
+                    "decode",
+                    device_name,
+                    replayCacheTags(segment_cache));
+            }
+            result.success = true;
+            return result;
+        }
         {
             auto sync_t0 = std::chrono::high_resolution_clock::now();
             gpu_ctx->synchronizeStream(capture_stream);

@@ -1092,20 +1092,41 @@ namespace llaminar2
             return token;
         };
 
+        const bool use_sidecar_sample_fusion = runner_->supportsMTPSidecarSampleFusion();
         for (int draft_idx = 0; draft_idx < speculative_draft_count; ++draft_idx)
         {
             bool sidecar_ok = false;
+            int32_t mtp_token = -1;
             {
                 PerfStatsCollector::ScopedTimer timer("mtp", "sidecar_forward", "decode");
                 if (draft_idx == 0)
                 {
-                    sidecar_ok = runner_->forwardMTP(draft_tokens.back());
+                    if (use_sidecar_sample_fusion)
+                    {
+                        sidecar_ok = runner_->forwardMTPAndSampleGreedy(
+                            draft_tokens.back(),
+                            &mtp_token);
+                    }
+                    else
+                    {
+                        sidecar_ok = runner_->forwardMTP(draft_tokens.back());
+                    }
                 }
                 else
                 {
-                    sidecar_ok = runner_->forwardMTPFromLastDraft(
-                        draft_tokens.back(),
-                        base_sidecar_position + draft_idx);
+                    if (use_sidecar_sample_fusion)
+                    {
+                        sidecar_ok = runner_->forwardMTPFromLastDraftAndSampleGreedy(
+                            draft_tokens.back(),
+                            base_sidecar_position + draft_idx,
+                            &mtp_token);
+                    }
+                    else
+                    {
+                        sidecar_ok = runner_->forwardMTPFromLastDraft(
+                            draft_tokens.back(),
+                            base_sidecar_position + draft_idx);
+                    }
                 }
             }
             if (!sidecar_ok)
@@ -1134,10 +1155,17 @@ namespace llaminar2
                     "decode");
             }
 
-            int32_t mtp_token = sample_mtp_token();
+            if (!use_sidecar_sample_fusion)
+            {
+                mtp_token = sample_mtp_token();
+            }
             if (mtp_token < 0)
             {
                 return fail_after_checkpoint("No MTP logits available");
+            }
+            if (use_sidecar_sample_fusion)
+            {
+                PerfStatsCollector::addCounter("mtp", "mtp_token_device_samples", 1.0, "decode");
             }
             draft_tokens.push_back(mtp_token);
 

@@ -319,6 +319,42 @@ namespace
             return supports_mtp_token_coordination_;
         }
 
+        bool supportsMTPSidecarSampleFusion() const override
+        {
+            return supports_mtp_sidecar_sample_fusion_;
+        }
+
+        bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override
+        {
+            ++forward_mtp_and_sample_count_;
+            if (!out_token)
+                return false;
+            if (!forwardMTP(draft_condition_token) || mtp_logits_.empty())
+                return false;
+            const int token = greedyArgmax(mtp_logits_.data(), VOCAB_SIZE);
+            if (token < 0)
+                return false;
+            *out_token = token;
+            return true;
+        }
+
+        bool forwardMTPFromLastDraftAndSampleGreedy(
+            int32_t draft_condition_token,
+            int position_id,
+            int32_t *out_token) override
+        {
+            ++forward_mtp_from_last_draft_and_sample_count_;
+            if (!out_token)
+                return false;
+            if (!forwardMTPFromLastDraft(draft_condition_token, position_id) || mtp_logits_.empty())
+                return false;
+            const int token = greedyArgmax(mtp_logits_.data(), VOCAB_SIZE);
+            if (token < 0)
+                return false;
+            *out_token = token;
+            return true;
+        }
+
         int sampleGreedyFromMTPLogitsOnDevice() override
         {
             ++sample_mtp_logits_count_;
@@ -380,6 +416,8 @@ namespace
         int clearCacheCount() const { return clear_cache_count_; }
         int forwardMTPCount() const { return forward_mtp_count_; }
         int forwardMTPFromLastDraftCount() const { return forward_mtp_from_last_draft_count_; }
+        int forwardMTPAndSampleCount() const { return forward_mtp_and_sample_count_; }
+        int forwardMTPFromLastDraftAndSampleCount() const { return forward_mtp_from_last_draft_and_sample_count_; }
         int restoreCount() const { return restore_count_; }
         int captureCheckpointCount() const { return capture_checkpoint_count_; }
         int setAllPositionCount() const { return set_all_position_count_; }
@@ -426,6 +464,10 @@ namespace
         {
             supports_mtp_token_coordination_ = true;
             hide_local_logits_ = hide_local_logits;
+        }
+        void enableMTPSidecarSampleFusion()
+        {
+            supports_mtp_sidecar_sample_fusion_ = true;
         }
         void setCapturedSnapshot(PrefixStateSnapshot snapshot)
         {
@@ -599,6 +641,8 @@ namespace
         int forward_call_count_{0};
         int forward_mtp_count_{0};
         int forward_mtp_from_last_draft_count_{0};
+        int forward_mtp_and_sample_count_{0};
+        int forward_mtp_from_last_draft_and_sample_count_{0};
         int clear_cache_count_{0};
         int restore_count_{0};
         mutable int capture_checkpoint_count_{0};
@@ -622,6 +666,7 @@ namespace
         bool column_parallel_logits_{false};
         bool supports_mtp_token_coordination_{false};
         bool supports_chained_mtp_drafts_{false};
+        bool supports_mtp_sidecar_sample_fusion_{false};
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
         bool last_commit_mtp_allow_speculative_discard_{false};
@@ -680,7 +725,8 @@ namespace
                                                                              bool hide_local_logits = false,
                                                                              DeviceId primary_device = DeviceId::cpu(),
                                                                              int mtp_draft_tokens = 1,
-                                                                             bool chained_mtp_support = false)
+                                                                             bool chained_mtp_support = false,
+                                                                             bool sidecar_sample_fusion = false)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -691,6 +737,10 @@ namespace
             if (chained_mtp_support)
             {
                 mock_ptr->enableChainedMTPDrafts();
+            }
+            if (sidecar_sample_fusion)
+            {
+                mock_ptr->enableMTPSidecarSampleFusion();
             }
             mock_ptr->setMTPUnsupportedReason(std::move(mtp_unsupported_reason));
             mock_ptr->setPrimaryDevice(primary_device);
@@ -1015,6 +1065,57 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "post_sidecar_checkpoint_skipped_speculative");
             ASSERT_NE(skipped_speculative, nullptr);
             EXPECT_DOUBLE_EQ(skipped_speculative->value, 2.0);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPSidecarSampleFusionUsesCombinedFirstAndChainedDraftCalls)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_sidecar_sample_fusion_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/true,
+                DeviceId::cpu(),
+                /*mtp_draft_tokens=*/3,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/true);
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+
+            EXPECT_EQ(mock->forwardMTPAndSampleCount(), 1);
+            EXPECT_EQ(mock->forwardMTPFromLastDraftAndSampleCount(), 2);
+            EXPECT_EQ(mock->forwardMTPCount(), 1);
+            EXPECT_EQ(mock->forwardMTPFromLastDraftCount(), 2);
+            EXPECT_EQ(mock->sampleMTPLogitsCount(), 0)
+                << "the orchestrator should not do a separate MTP logits sample after fused calls";
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *device_samples =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "mtp_token_device_samples");
+            ASSERT_NE(device_samples, nullptr);
+            EXPECT_DOUBLE_EQ(device_samples->value, 3.0);
+
+            const PerfStatRecord *sidecar_timer =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "sidecar_forward");
+            ASSERT_NE(sidecar_timer, nullptr);
+            EXPECT_EQ(sidecar_timer->count, 3u);
+
+            const PerfStatRecord *host_sample =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "sample_mtp_token_host");
+            EXPECT_EQ(host_sample, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

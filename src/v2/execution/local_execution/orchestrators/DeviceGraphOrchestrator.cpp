@@ -237,7 +237,8 @@ namespace llaminar2
             int token_offset,
             void *argmax_partial_vals = nullptr,
             void *argmax_partial_idxs = nullptr,
-            int argmax_partial_capacity = 0)
+            int argmax_partial_capacity = 0,
+            void *stream = nullptr)
         {
             GreedyLogitCandidate candidate;
             if (!tensor || row < 0)
@@ -273,7 +274,7 @@ namespace llaminar2
                                            device_opt->gpu_ordinal(),
                                            &max_val,
                                            &max_idx,
-                                           nullptr,
+                                           stream,
                                            argmax_partial_vals,
                                            argmax_partial_idxs,
                                            argmax_partial_capacity))
@@ -283,6 +284,12 @@ namespace llaminar2
                         candidate.valid = 1;
                         return candidate;
                     }
+                }
+
+                if (stream)
+                {
+                    auto &pool = GPUDeviceContextPool::instance();
+                    pool.getContext(*device_opt).synchronizeStream(stream);
                 }
             }
 
@@ -3490,7 +3497,8 @@ namespace llaminar2
         int position_id,
         const char *sidecar_perf_context,
         bool kv_cache_only,
-        BufferId terminal_hidden_buffer_id)
+        BufferId terminal_hidden_buffer_id,
+        bool defer_final_sync)
     {
         return executeMTPDepth0Batched(
             &draft_condition_token,
@@ -3499,7 +3507,8 @@ namespace llaminar2
             position_id,
             sidecar_perf_context,
             kv_cache_only,
-            terminal_hidden_buffer_id);
+            terminal_hidden_buffer_id,
+            defer_final_sync);
     }
 
     bool DeviceGraphOrchestrator::executeMTPDepth0Batched(
@@ -3509,7 +3518,8 @@ namespace llaminar2
         int position_id,
         const char *sidecar_perf_context,
         bool kv_cache_only,
-        BufferId terminal_hidden_buffer_id)
+        BufferId terminal_hidden_buffer_id,
+        bool defer_final_sync)
     {
         const std::string device_key = state_.device_id.toString();
         const std::string phase = perfPhaseName();
@@ -3875,6 +3885,15 @@ namespace llaminar2
                 {{"depth", "0"}, {"seq_len", std::to_string(token_count)}});
 
             bool used_segmented_capture = false;
+            const bool can_defer_sidecar_sync =
+                defer_final_sync &&
+                !kv_cache_only &&
+                try_gpu_graph_capture &&
+                !rebuilt_graph &&
+                !has_sidecar_collectives &&
+                !debugEnv().gpu_stage_timing &&
+                !debugEnv().gpu_stage_timing_detail;
+            pending_mtp_logits_stream_ = nullptr;
             if (try_gpu_graph_capture && !rebuilt_graph)
             {
                 if (!sidecar_gpu_ctx)
@@ -3887,6 +3906,7 @@ namespace llaminar2
                     has_sidecar_collectives,
                     ctx,
                     sidecar_cache.segment_cache.consecutive_failures);
+                capture_policy.defer_final_sync = can_defer_sidecar_sync;
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "sidecar_decode_capture_policy",
@@ -3897,6 +3917,7 @@ namespace llaminar2
                      {"seq_len", std::to_string(token_count)},
                      {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
                      {"force_recapture", boolTag(capture_policy.force_recapture)},
+                     {"defer_final_sync", boolTag(capture_policy.defer_final_sync)},
                      {"has_collectives", boolTag(has_sidecar_collectives)},
                      {"collective_segmented", boolTag(capture_policy.collective_segmented_enabled)},
                      {"collectives_graph_capturable", boolTag(capture_policy.collectives_graph_capturable)}});
@@ -3909,6 +3930,18 @@ namespace llaminar2
                     has_sidecar_collectives ? &sidecar_cache.collective_nodes : nullptr,
                     capture_policy,
                     &used_segmented_capture);
+                if (ok && used_segmented_capture && capture_policy.defer_final_sync)
+                {
+                    pending_mtp_logits_stream_ = sidecar_cache.segment_cache.capture_stream;
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "sidecar_forward_sample_sync_fusions",
+                        1.0,
+                        phase,
+                        device_key,
+                        {{"context", sidecar_context},
+                         {"seq_len", std::to_string(token_count)}});
+                }
             }
             else
             {
@@ -4143,6 +4176,103 @@ namespace llaminar2
             BufferId::MTP_HIDDEN);
     }
 
+    bool DeviceGraphOrchestrator::forwardMTPAndSampleGreedy(
+        int32_t draft_condition_token,
+        int32_t *out_token)
+    {
+        if (!out_token)
+            return false;
+        *out_token = -1;
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+        if (state_.mtp_kv_caches.empty() || !state_.mtp_kv_caches[0])
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTPAndSampleGreedy requires an initialized MTP KV cache");
+            return false;
+        }
+        if (!frozen_weight_set_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTPAndSampleGreedy requires frozen MTP weight bindings");
+            return false;
+        }
+
+        int position_id = state_.positions.empty() ? 0 : state_.positions[0];
+        const bool using_prefix_terminal_hidden = static_cast<bool>(state_.prefix_terminal_hidden);
+        TensorBase *terminal_hidden =
+            using_prefix_terminal_hidden ? state_.prefix_terminal_hidden.get() : state_.hidden.get();
+        if (!terminal_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] forwardMTPAndSampleGreedy requires a terminal hidden row");
+            return false;
+        }
+
+        if (!executeMTPDepth0(
+                draft_condition_token,
+                terminal_hidden,
+                position_id,
+                "mtp_decode_sidecar",
+                false,
+                using_prefix_terminal_hidden ? BufferId::PREFIX_TERMINAL_HIDDEN : BufferId::HIDDEN_STATE,
+                /*defer_final_sync=*/true))
+        {
+            return false;
+        }
+
+        const int token = sampleGreedyFromMTPLogitsOnDevice();
+        if (token < 0)
+            return false;
+        *out_token = token;
+        return true;
+    }
+
+    bool DeviceGraphOrchestrator::forwardMTPFromLastDraftAndSampleGreedy(
+        int32_t draft_condition_token,
+        int position_id,
+        int32_t *out_token)
+    {
+        if (!out_token)
+            return false;
+        *out_token = -1;
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+        if (position_id < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Chained MTP sidecar+sample requires a non-negative position_id");
+            return false;
+        }
+
+        auto it = state_.extension_buffers.find(BufferId::MTP_HIDDEN);
+        TensorBase *mtp_hidden =
+            (it == state_.extension_buffers.end() || !it->second) ? nullptr : it->second.get();
+        if (!mtp_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Chained MTP sidecar+sample requires previous MTP hidden state");
+            return false;
+        }
+
+        if (!executeMTPDepth0(
+                draft_condition_token,
+                mtp_hidden,
+                position_id,
+                "mtp_decode_sidecar_chain",
+                false,
+                BufferId::MTP_HIDDEN,
+                /*defer_final_sync=*/true))
+        {
+            return false;
+        }
+
+        const int token = sampleGreedyFromMTPLogitsOnDevice();
+        if (token < 0)
+            return false;
+        *out_token = token;
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromLastForward(
         const int32_t *tokens,
         int token_count,
@@ -4342,9 +4472,14 @@ namespace llaminar2
         return ctx && ctx->degree() > 1;
     }
 
+    bool DeviceGraphOrchestrator::supportsMTPSidecarSampleFusion() const
+    {
+        return state_.device_id.is_gpu();
+    }
+
     IGlobalTPContext *DeviceGraphOrchestrator::globalTPContextForMTPCoordination() const
     {
-        if (global_tp_ctx_ && global_tp_ctx_->degree() > 1)
+        if (global_tp_ctx_)
         {
             return global_tp_ctx_.get();
         }
@@ -4374,11 +4509,14 @@ namespace llaminar2
         const int token_offset = graph_builder_
                                      ? vocabOffsetForTPConfig(graph_builder_->config())
                                      : 0;
+        void *pending_stream = pending_mtp_logits_stream_;
+        pending_mtp_logits_stream_ = nullptr;
         return coordinateGreedyCandidate(
             sampleGreedyCandidateFromTensor(it->second.get(), 0, token_offset,
                                             argmax_partial_vals_dev_,
                                             argmax_partial_idxs_dev_,
-                                            argmax_partial_capacity_),
+                                            argmax_partial_capacity_,
+                                            pending_stream),
             globalTPContextForMTPCoordination());
     }
 

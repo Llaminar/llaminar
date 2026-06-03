@@ -179,6 +179,12 @@ namespace llaminar2
         virtual bool supportsChainedMTPDrafts() const { return false; }
 
         /**
+         * @brief True when forwardMTPAndSampleGreedy() can provide a runner-native
+         *        combined sidecar/sample path.
+         */
+        virtual bool supportsMTPSidecarSampleFusion() const { return false; }
+
+        /**
          * @brief Run a chained MTP sidecar step from the previous sidecar hidden.
          *
          * @param draft_condition_token Token whose shifted MTP KV row is appended.
@@ -189,6 +195,46 @@ namespace llaminar2
             (void)draft_condition_token;
             (void)position_id;
             return false;
+        }
+
+        /**
+         * @brief Run a sidecar step and greedily sample its logits as one logical
+         *        operation.
+         *
+         * GPU runners may use this to keep captured sidecar replay and the argmax
+         * reduction on one stream, avoiding an intermediate host synchronization.
+         * The default implementation preserves the existing synchronous contract.
+         */
+        virtual bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token)
+        {
+            if (!out_token)
+                return false;
+            if (!forwardMTP(draft_condition_token))
+                return false;
+            const int token = sampleGreedyFromMTPLogitsOnDevice();
+            if (token < 0)
+                return false;
+            *out_token = token;
+            return true;
+        }
+
+        /**
+         * @brief Chained sidecar variant of forwardMTPAndSampleGreedy().
+         */
+        virtual bool forwardMTPFromLastDraftAndSampleGreedy(
+            int32_t draft_condition_token,
+            int position_id,
+            int32_t *out_token)
+        {
+            if (!out_token)
+                return false;
+            if (!forwardMTPFromLastDraft(draft_condition_token, position_id))
+                return false;
+            const int token = sampleGreedyFromMTPLogitsOnDevice();
+            if (token < 0)
+                return false;
+            *out_token = token;
+            return true;
         }
 
         /**

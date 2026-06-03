@@ -333,7 +333,8 @@ namespace llaminar2
             bool has_collective_nodes,
             uint64_t current_step,
             const ReplayHooks &hooks,
-            bool force_recapture = false);
+            bool force_recapture = false,
+            bool defer_final_sync = false);
 
         /**
          * @brief Coherence helper for all stages in one replay segment.

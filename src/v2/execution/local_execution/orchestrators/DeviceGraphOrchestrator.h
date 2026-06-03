@@ -1481,7 +1481,13 @@ namespace llaminar2
 
         bool forwardMTP(int32_t draft_condition_token) override;
         bool supportsChainedMTPDrafts() const override { return true; }
+        bool supportsMTPSidecarSampleFusion() const override;
         bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
+        bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override;
+        bool forwardMTPFromLastDraftAndSampleGreedy(
+            int32_t draft_condition_token,
+            int position_id,
+            int32_t *out_token) override;
         bool commitMTPShiftedRowsFromLastForward(
             const int32_t *tokens,
             int token_count,
@@ -2265,14 +2271,16 @@ namespace llaminar2
                               int position_id,
                               const char *sidecar_perf_context,
                               bool kv_cache_only = false,
-                              BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN);
+                              BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
+                              bool defer_final_sync = false);
         bool executeMTPDepth0Batched(const int32_t *draft_condition_tokens,
                                      int token_count,
                                      TensorBase *terminal_hidden,
                                      int position_id,
                                      const char *sidecar_perf_context,
                                      bool kv_cache_only = false,
-                                     BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN);
+                                     BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
+                                     bool defer_final_sync = false);
         bool populateMTPShiftedCacheFromPrefill(const int *tokens,
                                                 int seq_len,
                                                 int batch_size,
@@ -2344,6 +2352,7 @@ namespace llaminar2
         MTPSidecarGraphCache mtp_sidecar_depth0_chained_cache_;
         MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_cache_;
         std::array<MTPSidecarGraphCache, 5> mtp_sidecar_depth0_kv_only_batch_caches_;
+        void *pending_mtp_logits_stream_ = nullptr;
 
         struct MTPTerminalHiddenRowSelectGraphCache
         {

@@ -274,7 +274,8 @@ namespace llaminar2
                 gpu_ctx,
                 collective_nodes,
                 policy.collectives_graph_capturable,
-                policy.force_recapture);
+                policy.force_recapture,
+                policy.defer_final_sync);
 
             if (success)
             {
@@ -303,7 +304,8 @@ namespace llaminar2
                                                                IWorkerGPUContext *gpu_ctx,
                                                                const std::unordered_set<std::string> *collective_nodes,
                                                                bool collectives_graph_capturable,
-                                                               bool force_recapture)
+                                                               bool force_recapture,
+                                                               bool defer_final_sync)
     {
         if (!gpu_stream || !gpu_ctx)
         {
@@ -378,7 +380,9 @@ namespace llaminar2
 
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
                 graph, segment_cache, ctx, gpu_ctx,
-                has_collective_nodes, current_step, fast_hooks);
+                has_collective_nodes, current_step, fast_hooks,
+                /*force_recapture=*/false,
+                defer_final_sync);
 
             if (!replay_result.success)
             {
@@ -519,7 +523,8 @@ namespace llaminar2
         {
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
                 graph, segment_cache, ctx, gpu_ctx,
-                has_collective_nodes, current_step, replay_hooks, force_recapture);
+                has_collective_nodes, current_step, replay_hooks, force_recapture,
+                defer_final_sync);
 
             if (!replay_result.success)
             {

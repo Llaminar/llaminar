@@ -507,7 +507,8 @@ namespace llaminar2
                                               IWorkerGPUContext *gpu_ctx,
                                               const std::unordered_set<std::string> *collective_nodes = nullptr,
                                               bool collectives_graph_capturable = false,
-                                              bool force_recapture = false);
+                                              bool force_recapture = false,
+                                              bool defer_final_sync = false);
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
@@ -519,6 +520,7 @@ namespace llaminar2
             bool collective_segmented_enabled = false;
             bool collectives_graph_capturable = false; ///< True only for explicit future graph-captured collective paths
             bool force_recapture = false;              ///< Re-record graph segments on replay for callers with dynamic params not yet replay-safe
+            bool defer_final_sync = false;             ///< Caller will synchronize the replay stream through a following operation.
             int max_segment_failures = 4;
         };
 
