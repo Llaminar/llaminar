@@ -595,15 +595,6 @@ namespace llaminar2
         virtual bool supportsWarmupDependentGraphCapture() const { return false; }
 
         /**
-         * @brief Whether segmented capture should rebuild its segment plan after warmup.
-         *
-         * This is a legacy escape hatch for stages whose cold plan cannot be
-         * predicted safely. Prefer supportsWarmupDependentGraphCapture() for
-         * fixed-topology stages so warmup and capture use one segment plan.
-         */
-        virtual bool requiresPostWarmupGraphSegmentRebuild() const { return false; }
-
-        /**
          * @brief Whether this manual stage must complete before a following graph segment may run.
          *
          * Segmented GPU graph execution runs non-capturable stages between

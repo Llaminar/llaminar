@@ -589,40 +589,7 @@ namespace llaminar2
             // Warmup executes all stages normally (no capture) to ensure
             // lazy kernel initialization and workspace allocation complete
             // on the capture stream.
-            const bool warmup_ok = executeFastDecode(graph, ctx, collective_nodes);
-            if (warmup_ok && segment_cache.post_warmup_resegment_required)
-            {
-                // Some stages become capturable only after warmup seeds their
-                // persistent runtime state. MoE decode is the important case:
-                // its first execution uploads runtime placement banks and grouped
-                // descriptor tables, after which routing/expert stages can be
-                // captured safely. Rebuild the segment plan before Phase 2 so
-                // capture sees the warmed capabilities instead of the cold ones.
-                DeviceGraphCaptureController::buildWarmupSegments(
-                    graph,
-                    segment_cache,
-                    collective_nodes,
-                    has_collective_nodes,
-                    collectives_graph_capturable);
-                PerfStatsCollector::addCounter(
-                    "forward_graph",
-                    "post_warmup_resegment",
-                    1.0,
-                    "decode",
-                    ctx ? ctx->deviceId().toString() : std::string{},
-                    {{"reason", "stage_warmup_dependency"}});
-            }
-            else if (warmup_ok)
-            {
-                PerfStatsCollector::addCounter(
-                    "forward_graph",
-                    "post_warmup_resegment",
-                    1.0,
-                    "decode",
-                    ctx ? ctx->deviceId().toString() : std::string{},
-                    {{"reason", "not_required"}});
-            }
-            return warmup_ok;
+            return executeFastDecode(graph, ctx, collective_nodes);
         }
 
         // ===== Phase 2: Capture (second call) — record capturable segments =====

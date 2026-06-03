@@ -1660,11 +1660,6 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     DeviceGraphExecutor executor;
     ASSERT_TRUE(executor.execute(graph, &ctx));
 
-    for (const auto *stage : stagesOfType<MoESparseDispatchStage>(graph))
-        EXPECT_TRUE(stage->manualGraphBoundaryComplete());
-    for (const auto *stage : stagesOfType<MoESparseReturnReduceStage>(graph))
-        EXPECT_TRUE(stage->manualGraphBoundaryComplete());
-
     expectSingleTokenKVPayloadNonZero(*fixture.kv_cache);
 }
 

@@ -131,7 +131,6 @@ namespace llaminar2
         bool collectives_graph_capturable)
     {
         segment_cache.segments.clear();
-        segment_cache.post_warmup_resegment_required = false;
 
         const auto &order = graph.getExecutionOrder();
         const auto &segmented_collective_capture_allow =
@@ -178,10 +177,6 @@ namespace llaminar2
             if (warmup_dependent_capture)
             {
                 stage_capturable = true;
-            }
-            else if (node->stage->requiresPostWarmupGraphSegmentRebuild())
-            {
-                segment_cache.post_warmup_resegment_required = true;
             }
             const bool collective_by_type = is_collective_stage(node->stage->type());
             const bool collective_by_name = (collective_nodes && collective_nodes->count(name));

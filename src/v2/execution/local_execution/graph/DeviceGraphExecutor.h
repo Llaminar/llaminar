@@ -395,7 +395,6 @@ namespace llaminar2
             std::vector<GraphSegment> segments;       ///< Ordered segments
             bool initialized = false;                 ///< Whether segments have been built
             bool needs_capture = false;               ///< True after warmup, before capture
-            bool post_warmup_resegment_required = false; ///< True when warmup can change stage capturability.
             int consecutive_failures = 0;             ///< Segment-level failure counter
             uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
             std::string perf_context;                 ///< Optional structured stats tag for the replay caller
@@ -415,7 +414,6 @@ namespace llaminar2
                 : segments(std::move(other.segments)),
                   initialized(other.initialized),
                   needs_capture(other.needs_capture),
-                  post_warmup_resegment_required(other.post_warmup_resegment_required),
                   consecutive_failures(other.consecutive_failures),
                   decode_step(other.decode_step),
                   perf_context(std::move(other.perf_context)),
@@ -435,7 +433,6 @@ namespace llaminar2
                     segments = std::move(other.segments);
                     initialized = other.initialized;
                     needs_capture = other.needs_capture;
-                    post_warmup_resegment_required = other.post_warmup_resegment_required;
                     consecutive_failures = other.consecutive_failures;
                     decode_step = other.decode_step;
                     perf_context = std::move(other.perf_context);
@@ -457,7 +454,6 @@ namespace llaminar2
                 segments.clear();
                 initialized = false;
                 needs_capture = false;
-                post_warmup_resegment_required = false;
                 consecutive_failures = 0;
                 decode_step = 0;
                 destroySyncEvent();

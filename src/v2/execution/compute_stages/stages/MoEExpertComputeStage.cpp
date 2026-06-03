@@ -2074,11 +2074,6 @@ namespace llaminar2
 #endif
     }
 
-    bool MoEExpertComputeStage::requiresPostWarmupGraphSegmentRebuild() const
-    {
-        return false;
-    }
-
     bool MoEExpertComputeStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
         return supportsFixedTopologyPrefillGraphCapturePreflight();
@@ -2546,11 +2541,6 @@ namespace llaminar2
 #endif
     }
 
-    bool SharedExpertFFNStage::requiresPostWarmupGraphSegmentRebuild() const
-    {
-        return false;
-    }
-
     bool SharedExpertFFNStage::supportsWarmupDependentGraphCapture() const
     {
         return supportsPaddedPrefillGraphCapturePreflight();
@@ -2777,11 +2767,6 @@ namespace llaminar2
                params_.gate_inp &&
                params_.shared_output;
 #endif
-    }
-
-    bool SharedExpertGateStage::requiresPostWarmupGraphSegmentRebuild() const
-    {
-        return false;
     }
 
     bool SharedExpertGateStage::supportsPaddedPrefillGraphCapturePreflight() const

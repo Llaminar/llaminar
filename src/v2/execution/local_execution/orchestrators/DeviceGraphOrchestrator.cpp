@@ -4096,8 +4096,9 @@ namespace llaminar2
         }
 
         int position_id = state_.positions.empty() ? 0 : state_.positions[0];
+        const bool using_prefix_terminal_hidden = static_cast<bool>(state_.prefix_terminal_hidden);
         TensorBase *terminal_hidden =
-            state_.prefix_terminal_hidden ? state_.prefix_terminal_hidden.get() : state_.hidden.get();
+            using_prefix_terminal_hidden ? state_.prefix_terminal_hidden.get() : state_.hidden.get();
         if (!terminal_hidden)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] forwardMTP requires a terminal hidden row");
@@ -4107,7 +4108,9 @@ namespace llaminar2
             draft_condition_token,
             terminal_hidden,
             position_id,
-            "mtp_decode_sidecar");
+            "mtp_decode_sidecar",
+            false,
+            using_prefix_terminal_hidden ? BufferId::PREFIX_TERMINAL_HIDDEN : BufferId::HIDDEN_STATE);
     }
 
     bool DeviceGraphOrchestrator::forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id)

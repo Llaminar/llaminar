@@ -270,11 +270,6 @@ namespace llaminar2
 #endif
     }
 
-    bool MoERoutingStage::requiresPostWarmupGraphSegmentRebuild() const
-    {
-        return false;
-    }
-
     bool MoERoutingStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
         return isDeviceRoutedPrefillGraphCaptureSupported();
