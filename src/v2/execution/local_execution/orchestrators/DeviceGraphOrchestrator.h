@@ -2274,6 +2274,7 @@ namespace llaminar2
             std::unique_ptr<ComputeGraph> graph;
             DeviceGraphExecutor::GraphSegmentCache segment_cache;
             std::vector<IComputeStage *> dynamic_param_stages;
+            std::unordered_set<std::string> collective_nodes;
             TensorBase *terminal_hidden = nullptr;
             uint64_t workspace_generation = 0;
             uint64_t moe_placement_epoch = 0;
@@ -2311,6 +2312,7 @@ namespace llaminar2
                 segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
                 graph.reset();
                 dynamic_param_stages.clear();
+                collective_nodes.clear();
                 terminal_hidden = nullptr;
                 workspace_generation = 0;
                 moe_placement_epoch = 0;

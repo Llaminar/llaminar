@@ -1694,6 +1694,8 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
         PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}};
     const auto epoch0_depth_tags =
         PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
+    const auto dense_collective_scan_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"has_collectives", "false"}, {"node_count", "0"}};
 
     const PerfStatRecord *plain_after_build = findMTPRecord(
         records,
@@ -1726,6 +1728,14 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
         epoch0_depth_tags);
     ASSERT_NE(cache_hits, nullptr);
     EXPECT_DOUBLE_EQ(cache_hits->value, 1.0);
+
+    const PerfStatRecord *collective_scans = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_collective_node_scans",
+        dense_collective_scan_tags);
+    ASSERT_NE(collective_scans, nullptr);
+    EXPECT_DOUBLE_EQ(collective_scans->value, 1.0);
 
     PerfStatsCollector::reset();
 }

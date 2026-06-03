@@ -151,6 +151,23 @@ Latest graph-atomic small-M hardening validation:
   PyTorch parity stayed green with GPU graphs enabled for
   `MTPGreedyMatchesPyTorchDecodeTokens`,
   `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`.
+- Fresh dense sidecar collective-metadata cache on 2026-06-03: MTP depth-0
+  sidecar execution now discovers collective nodes once when the sidecar graph
+  cache is built, stores the set in the cache, and reuses it for GPU graph
+  capture policy instead of rescanning the sidecar graph on every token for the
+  benefit of possible MoE/TP collectives. Unit regression
+  `V2_Unit_MTPGraphConstruction` asserts the dense path records exactly one
+  `sidecar_collective_node_scans` counter across two sidecar forwards. Focused
+  real Qwen3.6 ROCm parity stayed green for `MTPGreedyMatchesPyTorchDecodeTokens`,
+  `MTPGreedyDepth3MatchesPyTorchDecodeTokens`, and `PrefixCacheMTPRestore`.
+  A same-lane depth-3 benchmark reached 51.32 tok/s decode, below the 54.32
+  tok/s ratchet, with measured stats showing 224 decode-sidecar cache hits,
+  zero measured sidecar graph cache misses after the benchmark warmup reset,
+  and no steady-state collective discovery counter. Artifacts:
+  `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-collectivescached-mtp-d3-c64-n48-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-collectivescached-mtp-d3-c64-n48-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-sidecar-collectivescached-mtp-d3-c64-n48-stats.csv`.
 - Fresh ROCm tiny FP32 alpha/beta plus GDN verifier-row shortcut evidence on
   2026-06-03: Qwen3.6 dense 27B Q4_K_S on `rocm:0`, GPU graphs enabled,
   `The quick brown fox`, `-c 64`, `-n 48`, depth-1 MTP. Baseline artifact

@@ -3676,13 +3676,33 @@ namespace llaminar2
 
             sidecar_cache.graph = std::make_unique<ComputeGraph>(std::move(graph));
             sidecar_cache.dynamic_param_stages.clear();
+            sidecar_cache.collective_nodes.clear();
             for (const auto &node_name : sidecar_cache.graph->getExecutionOrder())
             {
                 ComputeNode *node = sidecar_cache.graph->getNode(node_name);
-                if (node && node->stage && node->stage->hasDynamicParams())
+                if (!node || !node->stage)
+                    continue;
+                if (node->stage->hasDynamicParams())
                     sidecar_cache.dynamic_param_stages.push_back(node->stage.get());
+
+                const ComputeStageType type = node->stage->type();
+                if (type == ComputeStageType::ALLREDUCE ||
+                    type == ComputeStageType::ALLGATHER ||
+                    type == ComputeStageType::ALLGATHER_V)
+                {
+                    sidecar_cache.collective_nodes.insert(node_name);
+                }
             }
             sidecar_cache.valid = true;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "sidecar_collective_node_scans",
+                1.0,
+                phase,
+                device_key,
+                {{"depth", "0"},
+                 {"has_collectives", boolTag(!sidecar_cache.collective_nodes.empty())},
+                 {"node_count", std::to_string(sidecar_cache.collective_nodes.size())}});
             PerfStatsCollector::addCounter(
                 "mtp",
                 "sidecar_graph_cache_misses",
@@ -3784,20 +3804,7 @@ namespace llaminar2
         }
         sidecar_cache.graph->reset();
 
-        std::unordered_set<std::string> collective_nodes;
-        for (const auto &node_name : sidecar_cache.graph->getExecutionOrder())
-        {
-            ComputeNode *node = sidecar_cache.graph->getNode(node_name);
-            if (!node || !node->stage)
-                continue;
-            const ComputeStageType type = node->stage->type();
-            if (type == ComputeStageType::ALLREDUCE ||
-                type == ComputeStageType::ALLGATHER ||
-                type == ComputeStageType::ALLGATHER_V)
-            {
-                collective_nodes.insert(node_name);
-            }
-        }
+        const bool has_sidecar_collectives = !sidecar_cache.collective_nodes.empty();
 
         bool ok = false;
         {
@@ -3818,7 +3825,7 @@ namespace llaminar2
                 }
                 sidecar_cache.segment_cache.perf_context = sidecar_context;
                 auto capture_policy = buildDecodeCapturePolicy(
-                    !collective_nodes.empty(),
+                    has_sidecar_collectives,
                     ctx,
                     sidecar_cache.segment_cache.consecutive_failures);
                 PerfStatsCollector::addCounter(
@@ -3830,7 +3837,7 @@ namespace llaminar2
                     {{"context", sidecar_cache.segment_cache.perf_context},
                      {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
                      {"force_recapture", boolTag(capture_policy.force_recapture)},
-                     {"has_collectives", boolTag(!collective_nodes.empty())},
+                     {"has_collectives", boolTag(has_sidecar_collectives)},
                      {"collective_segmented", boolTag(capture_policy.collective_segmented_enabled)},
                      {"collectives_graph_capturable", boolTag(capture_policy.collectives_graph_capturable)}});
                 ok = executor_.executeDecodeWithCapturePolicy(
@@ -3839,7 +3846,7 @@ namespace llaminar2
                     &sidecar_cache.segment_cache,
                     sidecar_gpu_ctx->defaultStream(),
                     sidecar_gpu_ctx,
-                    collective_nodes.empty() ? nullptr : &collective_nodes,
+                    has_sidecar_collectives ? &sidecar_cache.collective_nodes : nullptr,
                     capture_policy,
                     &used_segmented_capture);
             }
