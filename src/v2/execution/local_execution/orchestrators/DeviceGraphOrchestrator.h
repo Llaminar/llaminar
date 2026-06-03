@@ -1825,12 +1825,19 @@ namespace llaminar2
          * @return Token ID (>= 0) on success, -1 if not GPU or backend unavailable
          */
         int sampleGreedyOnDevice() override;
+        int sampleOnDevice(const SamplingParams &params) override;
 
         /**
          * @brief Apply sparse logit penalties on device
          */
         bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
                                     int vocab_size) override;
+        bool applyPenaltiesToMTPLogitsOnDevice(const std::vector<LogitPenalty> &penalties,
+                                               int vocab_size) override;
+        bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
+            int row,
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override;
 
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)
@@ -1886,6 +1893,7 @@ namespace llaminar2
                 graph_builder_->resetState();
             // Note: host_resident_released_ is NOT reset here —
             // the host data is gone and cannot be re-uploaded.
+            device_sampling_counter_ = 0;
             ++session_epoch_;
         }
 
@@ -2593,6 +2601,7 @@ namespace llaminar2
         /// Session epoch counter — incremented on each clear_cache() call
         /// Used to detect stale kernel state across inference sessions
         uint64_t session_epoch_ = 0;
+        uint64_t device_sampling_counter_ = 0;
 
         bool compute_all_position_logits_ = false;
 

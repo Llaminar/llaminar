@@ -259,6 +259,185 @@ __global__ void cuda_topk_f32_kernel(
 }
 
 // ============================================================================
+// Top-K / Top-P / Temperature Sampling Kernel
+// ============================================================================
+
+__device__ unsigned long long cuda_sampling_splitmix64(unsigned long long x)
+{
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+
+__device__ float cuda_sampling_uniform01(unsigned long long seed, unsigned long long offset)
+{
+    const unsigned long long bits = cuda_sampling_splitmix64(seed + offset);
+    return static_cast<float>((bits >> 40) & 0xFFFFFFull) * (1.0f / 16777216.0f);
+}
+
+__global__ void cuda_topk_topp_sample_f32_kernel(
+    const float *__restrict__ data,
+    int n,
+    int k,
+    float top_p,
+    float temperature,
+    unsigned long long rng_seed,
+    unsigned long long rng_offset,
+    int *__restrict__ out_token)
+{
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    float local_vals[TOPK_MAX_K];
+    int local_idxs[TOPK_MAX_K];
+    int local_count = 0;
+
+    for (int i = 0; i < k; ++i)
+    {
+        local_vals[i] = -FLT_MAX;
+        local_idxs[i] = -1;
+    }
+
+    for (int i = tid; i < n; i += num_threads)
+    {
+        const float val = data[i];
+        if (local_count >= k && val <= local_vals[k - 1])
+            continue;
+
+        int pos = (local_count < k) ? local_count : k - 1;
+        for (int j = pos - 1; j >= 0; --j)
+        {
+            if (val > local_vals[j])
+            {
+                local_vals[j + 1] = local_vals[j];
+                local_idxs[j + 1] = local_idxs[j];
+                pos = j;
+            }
+            else
+            {
+                break;
+            }
+        }
+        local_vals[pos] = val;
+        local_idxs[pos] = i;
+        if (local_count < k)
+            ++local_count;
+    }
+
+    extern __shared__ char shared_mem[];
+    float *s_vals = reinterpret_cast<float *>(shared_mem);
+    int *s_idxs = reinterpret_cast<int *>(shared_mem + num_threads * k * sizeof(float));
+
+    const int base = tid * k;
+    for (int i = 0; i < k; ++i)
+    {
+        s_vals[base + i] = local_vals[i];
+        s_idxs[base + i] = local_idxs[i];
+    }
+    __syncthreads();
+
+    if (tid == 0)
+    {
+        float merged_vals[TOPK_MAX_K];
+        int merged_idxs[TOPK_MAX_K];
+        int ptrs[TOPK_THREADS];
+        for (int t = 0; t < num_threads; ++t)
+            ptrs[t] = 0;
+
+        for (int out_i = 0; out_i < k; ++out_i)
+        {
+            float best_val = -FLT_MAX;
+            int best_thread = -1;
+            for (int t = 0; t < num_threads; ++t)
+            {
+                if (ptrs[t] < k)
+                {
+                    const float v = s_vals[t * k + ptrs[t]];
+                    if (v > best_val)
+                    {
+                        best_val = v;
+                        best_thread = t;
+                    }
+                }
+            }
+
+            if (best_thread >= 0)
+            {
+                merged_vals[out_i] = best_val;
+                merged_idxs[out_i] = s_idxs[best_thread * k + ptrs[best_thread]];
+                ++ptrs[best_thread];
+            }
+            else
+            {
+                merged_vals[out_i] = -FLT_MAX;
+                merged_idxs[out_i] = -1;
+            }
+        }
+
+        const float temp = temperature > 0.0f ? temperature : 1.0f;
+        const float max_logit = merged_vals[0];
+        float weights[TOPK_MAX_K];
+        float total = 0.0f;
+        for (int i = 0; i < k; ++i)
+        {
+            if (merged_idxs[i] < 0)
+            {
+                weights[i] = 0.0f;
+                continue;
+            }
+            const float w = expf((merged_vals[i] - max_logit) / temp);
+            weights[i] = w;
+            total += w;
+        }
+
+        if (!(total > 0.0f))
+        {
+            *out_token = merged_idxs[0] >= 0 ? merged_idxs[0] : 0;
+            return;
+        }
+
+        int nucleus = k;
+        if (top_p > 0.0f && top_p < 1.0f)
+        {
+            float cumulative = 0.0f;
+            for (int i = 0; i < k; ++i)
+            {
+                cumulative += weights[i] / total;
+                if (cumulative >= top_p)
+                {
+                    nucleus = i + 1;
+                    break;
+                }
+            }
+        }
+
+        float nucleus_total = 0.0f;
+        for (int i = 0; i < nucleus; ++i)
+            nucleus_total += weights[i];
+        if (!(nucleus_total > 0.0f))
+        {
+            *out_token = merged_idxs[0] >= 0 ? merged_idxs[0] : 0;
+            return;
+        }
+
+        const float r = cuda_sampling_uniform01(rng_seed, rng_offset) * nucleus_total;
+        float cumulative = 0.0f;
+        int selected = merged_idxs[0] >= 0 ? merged_idxs[0] : 0;
+        for (int i = 0; i < nucleus; ++i)
+        {
+            cumulative += weights[i];
+            if (r <= cumulative)
+            {
+                selected = merged_idxs[i] >= 0 ? merged_idxs[i] : selected;
+                break;
+            }
+        }
+        *out_token = selected;
+    }
+}
+
+// ============================================================================
 // Logit Penalty Application Kernel — Subtract sparse penalties from logits
 // ============================================================================
 
@@ -378,6 +557,42 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Top-K FP32 kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_sample_topk_topp_f32(
+        const float *data,
+        int n,
+        int k,
+        float top_p,
+        float temperature,
+        unsigned long long rng_seed,
+        unsigned long long rng_offset,
+        int *out_token,
+        int device_idx,
+        void *stream)
+    {
+        if (n <= 0 || k <= 0 || k > TOPK_MAX_K || !data || !out_token || !stream)
+            return false;
+
+        if (k > n)
+            k = n;
+
+        cudaSetDevice(device_idx);
+
+        const int threads = TOPK_THREADS;
+        const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
+
+        cuda_topk_topp_sample_f32_kernel<<<1, threads, smem_size, static_cast<cudaStream_t>(stream)>>>(
+            data, n, k, top_p, temperature, rng_seed, rng_offset, out_token);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Top-K/Top-P Sample FP32 kernel launch failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

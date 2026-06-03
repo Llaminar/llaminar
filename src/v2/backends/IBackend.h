@@ -20,6 +20,7 @@
 
 #include "DeviceType.h"
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <string>
 
@@ -668,6 +669,69 @@ namespace llaminar2
         }
 
         /**
+         * @brief GPU-side top-k/top-p/temperature sampling over FP32 logits.
+         *
+         * This synchronous convenience wrapper only copies the selected token
+         * back to the host. It must not materialize full logits on the CPU.
+         *
+         * @param data_device Device pointer to FP32 logits [n]
+         * @param n Vocabulary size
+         * @param top_k Top-k candidate limit (1..256, clamped by backend)
+         * @param top_p Nucleus probability threshold (<=0 or >=1 disables)
+         * @param temperature Sampling temperature (<=0 treated as 1)
+         * @param rng_seed Deterministic RNG seed
+         * @param rng_offset Per-sample RNG offset/counter
+         * @param device_id Device where data resides
+         * @param out_token Host pointer for selected token
+         * @param stream Explicit GPU stream
+         * @return true if sampled on device
+         */
+        virtual bool sampleTopKTopPF32(const void *data_device, int n,
+                                       int top_k, float top_p, float temperature,
+                                       uint64_t rng_seed, uint64_t rng_offset,
+                                       int device_id, int *out_token,
+                                       void *stream = nullptr)
+        {
+            (void)data_device;
+            (void)n;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)rng_seed;
+            (void)rng_offset;
+            (void)device_id;
+            (void)out_token;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable top-k/top-p/temperature sampling.
+         *
+         * The selected token is written to out_token_device. This method performs
+         * no allocation, host/device copies, or synchronization, and requires an
+         * explicit non-null stream.
+         */
+        virtual bool enqueueSampleTopKTopPF32Device(const void *data_device, int n,
+                                                    int top_k, float top_p, float temperature,
+                                                    uint64_t rng_seed, uint64_t rng_offset,
+                                                    int device_id, void *stream,
+                                                    void *out_token_device)
+        {
+            (void)data_device;
+            (void)n;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)rng_seed;
+            (void)rng_offset;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            return false;
+        }
+
+        /**
          * @brief GPU-side sparse logit penalty application
          *
          * Applies a sparse set of additive penalties to logits in-place on the GPU.
@@ -698,6 +762,39 @@ namespace llaminar2
             (void)device_id;
             (void)stream;
             return false; // Not supported by default
+        }
+
+        /**
+         * @brief Enqueue sparse logit penalties from device-resident inputs.
+         *
+         * This is the graph-capturable form of applyLogitPenaltiesF32(): token IDs
+         * and penalty values already live on the target device, the caller supplies
+         * an explicit non-null stream, and the backend only enqueues the penalty
+         * kernel. It performs no allocation, host/device copies, or synchronization.
+         *
+         * @param logits_device Device pointer to FP32 logits [vocab_size], modified in-place
+         * @param token_ids_device Device pointer to int token IDs [num_penalties]
+         * @param penalties_device Device pointer to FP32 penalties [num_penalties]
+         * @param num_penalties Number of entries in token_ids_device and penalties_device
+         * @param vocab_size Total vocabulary size for bounds checking
+         * @param device_id Device where all pointers reside
+         * @param stream Explicit non-null GPU stream
+         * @return true if the kernel launch was enqueued
+         */
+        virtual bool enqueueLogitPenaltiesF32Device(void *logits_device,
+                                                    const void *token_ids_device,
+                                                    const void *penalties_device,
+                                                    int num_penalties, int vocab_size,
+                                                    int device_id, void *stream)
+        {
+            (void)logits_device;
+            (void)token_ids_device;
+            (void)penalties_device;
+            (void)num_penalties;
+            (void)vocab_size;
+            (void)device_id;
+            (void)stream;
+            return false;
         }
 
         // ====================================================================

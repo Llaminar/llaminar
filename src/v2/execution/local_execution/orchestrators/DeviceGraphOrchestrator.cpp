@@ -87,6 +87,79 @@ namespace llaminar2
                                      << " total_mib=" << (total_bytes / (1024 * 1024)));
         }
 
+        bool applyPenaltiesToTensorRowOnDevice(
+            TensorBase *tensor,
+            DeviceId device,
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size,
+            int row,
+            int token_offset,
+            void *stream,
+            const char *operation)
+        {
+            if (penalties.empty())
+                return true;
+            if (!tensor || !device.is_gpu() || !stream || vocab_size <= 0 || row < 0)
+                return false;
+            if (!tensor->deviceValid())
+                return false;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+                return false;
+
+            void *gpu_ptr = tensor->gpu_data_ptr();
+            if (!gpu_ptr)
+                return false;
+
+            const auto &shape = tensor->shape();
+            if (shape.empty())
+                return false;
+            const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+            const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+            if (cols == 0 || static_cast<size_t>(row) >= rows ||
+                cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return false;
+            }
+
+            std::vector<int> local_token_ids;
+            std::vector<float> local_penalties;
+            local_token_ids.reserve(penalties.size());
+            local_penalties.reserve(penalties.size());
+            const int local_vocab = static_cast<int>(cols);
+            const int local_begin = std::max(0, token_offset);
+            const int local_end = local_begin + local_vocab;
+            for (const auto &penalty : penalties)
+            {
+                if (penalty.token_id < local_begin || penalty.token_id >= local_end)
+                    continue;
+                local_token_ids.push_back(penalty.token_id - local_begin);
+                local_penalties.push_back(penalty.penalty);
+            }
+
+            if (local_token_ids.empty())
+                return true;
+
+            float *row_ptr = static_cast<float *>(gpu_ptr) +
+                             static_cast<size_t>(row) * cols;
+            const bool ok = backend->applyLogitPenaltiesF32(
+                row_ptr,
+                local_token_ids.data(),
+                local_penalties.data(),
+                static_cast<int>(local_token_ids.size()),
+                local_vocab,
+                device.gpu_ordinal(),
+                stream);
+            if (!ok)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] "
+                          << (operation ? operation : "applyPenaltiesToTensorRowOnDevice")
+                          << " failed on " << device.toString());
+            }
+            return ok;
+        }
+
         bool prefixCacheTraceEnabled()
         {
             const char *value = std::getenv("LLAMINAR_PREFIX_CACHE_TRACE");
@@ -6669,38 +6742,201 @@ namespace llaminar2
             globalTPContextForMTPCoordination());
     }
 
+    int DeviceGraphOrchestrator::sampleOnDevice(const SamplingParams &params)
+    {
+        if (params.is_greedy())
+        {
+            return sampleGreedyOnDevice();
+        }
+        if (!state_.device_id.is_gpu() || !state_.logits)
+        {
+            return -1;
+        }
+        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+        {
+            return -1;
+        }
+        if (params.top_k <= 0 || params.top_k > 256)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] GPU stochastic sampling requires 1 <= top_k <= 256; got top_k="
+                      << params.top_k);
+            return -1;
+        }
+        if (!state_.logits->deviceValid())
+        {
+            return -1;
+        }
+
+        void *gpu_ptr = state_.logits->gpu_data_ptr();
+        if (!gpu_ptr)
+        {
+            return -1;
+        }
+
+        const auto &shape = state_.logits->shape();
+        if (shape.empty())
+        {
+            return -1;
+        }
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (rows < 1 || cols == 0 || cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return -1;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            return -1;
+        }
+        void *stream = explicitGPUStreamForOperation("sampleOnDevice");
+        if (!stream)
+        {
+            return -1;
+        }
+
+        int token = -1;
+        const uint64_t seed =
+            params.seed != 0
+                ? static_cast<uint64_t>(params.seed)
+                : (0xD1B54A32D192ED03ull ^
+                   (session_epoch_ * 0x9E3779B97F4A7C15ull));
+        const uint64_t offset = device_sampling_counter_++;
+        const bool ok = backend->sampleTopKTopPF32(
+            static_cast<const float *>(gpu_ptr),
+            static_cast<int>(cols),
+            params.top_k,
+            params.top_p,
+            params.temperature,
+            seed,
+            offset,
+            state_.device_id.gpu_ordinal(),
+            &token,
+            stream);
+        if (!ok)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] GPU stochastic sampling failed on "
+                      << state_.device_id.toString());
+            return -1;
+        }
+        return token;
+    }
+
     bool DeviceGraphOrchestrator::applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
                                                          int vocab_size)
     {
         if (penalties.empty())
             return true; // Nothing to apply, success
 
-        if (!state_.device_id.is_gpu() || !state_.logits)
+        if (!state_.device_id.is_gpu())
             return false;
-        if (!state_.logits->deviceValid())
-            return false;
-
-        IBackend *backend = getBackendFor(state_.device_id);
-        if (!backend)
+        void *stream = explicitGPUStreamForOperation("applyPenaltiesOnDevice");
+        if (!stream)
             return false;
 
-        void *gpu_ptr = state_.logits->gpu_data_ptr();
-        if (!gpu_ptr)
-            return false;
-
-        // Build SoA arrays for the backend
-        std::vector<int> token_ids(penalties.size());
-        std::vector<float> penalty_values(penalties.size());
-        for (size_t i = 0; i < penalties.size(); ++i)
+        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel &&
+            state_.logits_local)
         {
-            token_ids[i] = penalties[i].token_id;
-            penalty_values[i] = penalties[i].penalty;
+            const int token_offset = vocabOffsetForTPConfig(graph_builder_->config());
+            return applyPenaltiesToTensorRowOnDevice(
+                state_.logits_local.get(),
+                state_.device_id,
+                penalties,
+                vocab_size,
+                0,
+                token_offset,
+                stream,
+                "applyPenaltiesOnDeviceLocal");
         }
 
-        return backend->applyLogitPenaltiesF32(
-            gpu_ptr, token_ids.data(), penalty_values.data(),
-            static_cast<int>(penalties.size()), vocab_size,
-            state_.device_id.gpu_ordinal());
+        return applyPenaltiesToTensorRowOnDevice(
+            state_.logits.get(),
+            state_.device_id,
+            penalties,
+            vocab_size,
+            0,
+            0,
+            stream,
+            "applyPenaltiesOnDevice");
+    }
+
+    bool DeviceGraphOrchestrator::applyPenaltiesToMTPLogitsOnDevice(
+        const std::vector<LogitPenalty> &penalties,
+        int vocab_size)
+    {
+        if (penalties.empty())
+            return true;
+        if (!state_.device_id.is_gpu())
+            return false;
+
+        auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+        if (it == state_.extension_buffers.end() || !it->second)
+            return false;
+
+        void *stream = pending_mtp_logits_stream_;
+        pending_mtp_logits_stream_ = nullptr;
+        if (!stream)
+        {
+            stream = explicitGPUStreamForOperation("applyPenaltiesToMTPLogitsOnDevice");
+        }
+        if (!stream)
+            return false;
+
+        const int token_offset = graph_builder_
+                                     ? vocabOffsetForTPConfig(graph_builder_->config())
+                                     : 0;
+        return applyPenaltiesToTensorRowOnDevice(
+            it->second.get(),
+            state_.device_id,
+            penalties,
+            vocab_size,
+            0,
+            token_offset,
+            stream,
+            "applyPenaltiesToMTPLogitsOnDevice");
+    }
+
+    bool DeviceGraphOrchestrator::applyPenaltiesToAllPositionLogitsOnDeviceRow(
+        int row,
+        const std::vector<LogitPenalty> &penalties,
+        int vocab_size)
+    {
+        if (penalties.empty())
+            return true;
+        if (!state_.device_id.is_gpu() || row < 0)
+            return false;
+
+        TensorBase *tensor = nullptr;
+        int token_offset = 0;
+        if (state_.all_position_logits)
+        {
+            tensor = state_.all_position_logits.get();
+        }
+        else if (state_.all_position_logits_local)
+        {
+            tensor = state_.all_position_logits_local.get();
+            token_offset = graph_builder_
+                               ? vocabOffsetForTPConfig(graph_builder_->config())
+                               : 0;
+        }
+        if (!tensor)
+            return false;
+
+        void *stream = explicitGPUStreamForOperation(
+            "applyPenaltiesToAllPositionLogitsOnDeviceRow");
+        if (!stream)
+            return false;
+
+        return applyPenaltiesToTensorRowOnDevice(
+            tensor,
+            state_.device_id,
+            penalties,
+            vocab_size,
+            row,
+            token_offset,
+            stream,
+            "applyPenaltiesToAllPositionLogitsOnDeviceRow");
     }
 
     // =========================================================================

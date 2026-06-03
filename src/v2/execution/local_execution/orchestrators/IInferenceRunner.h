@@ -545,6 +545,31 @@ namespace llaminar2
         }
 
         /**
+         * @brief Apply sparse logit penalties to MTP sidecar logits on device.
+         */
+        virtual bool applyPenaltiesToMTPLogitsOnDevice(const std::vector<LogitPenalty> &penalties,
+                                                       int vocab_size)
+        {
+            (void)penalties;
+            (void)vocab_size;
+            return false;
+        }
+
+        /**
+         * @brief Apply sparse logit penalties to one all-position verifier row on device.
+         */
+        virtual bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
+            int row,
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size)
+        {
+            (void)row;
+            (void)penalties;
+            (void)vocab_size;
+            return false;
+        }
+
+        /**
          * @brief Enable GPU-side decode sampling mode
          *
          * When enabled, forward() may skip gathering logits to host for decode calls.

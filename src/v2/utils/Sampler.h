@@ -40,6 +40,12 @@ namespace llaminar2
         float penalty;    ///< Amount to subtract from logit (positive = penalize)
     };
 
+    struct SamplingDistributionEntry
+    {
+        int token_id = -1;
+        float probability = 0.0f;
+    };
+
     /**
      * @brief Parameters for sampling configuration
      */
@@ -198,6 +204,27 @@ namespace llaminar2
          * @return Sampled token ID from nucleus
          */
         int sample_top_p(const std::vector<float> &logits, float p, float temperature = 1.0f);
+
+        /**
+         * @brief Build the normalized sampling distribution for the current history.
+         *
+         * Applies additive penalties, temperature, top-k, and top-p. When both
+         * top_k and top_p are set, top_p is applied within the top-k candidate
+         * set; this matches common chat defaults and the GPU sampler path.
+         */
+        std::vector<SamplingDistributionEntry> compute_distribution(
+            const float *logits,
+            size_t vocab_size,
+            const SamplingParams &params);
+
+        int sample_from_distribution(const std::vector<SamplingDistributionEntry> &distribution);
+        int sample_from_residual_distribution(
+            const std::vector<SamplingDistributionEntry> &target,
+            const std::vector<SamplingDistributionEntry> &draft);
+        static float probability_of_token(
+            const std::vector<SamplingDistributionEntry> &distribution,
+            int token_id);
+        float random_uniform_01();
 
         /**
          * @brief Set random seed for reproducibility

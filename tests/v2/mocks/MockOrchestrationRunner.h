@@ -47,6 +47,7 @@ namespace llaminar2::test
             ON_CALL(*this, config()).WillByDefault(testing::ReturnRef(default_config_));
             ON_CALL(*this, setDecodeStepTokenBudget(testing::_)).WillByDefault(testing::Return());
             ON_CALL(*this, maybeApplyMoERebalance()).WillByDefault(testing::Return(true));
+            ON_CALL(*this, prefixStateProbe()).WillByDefault(testing::Return(PrefixRuntimeStateSnapshot{}));
         }
 
         // Lifecycle
@@ -96,6 +97,7 @@ namespace llaminar2::test
         MOCK_METHOD(void, setSkipLogitsGatherPrefill, (bool skip), (override));
         MOCK_METHOD(std::string, getStopThinkingPrompt, (), (const, override));
         MOCK_METHOD(ToolCallFormat, getToolCallFormat, (), (const, override));
+        MOCK_METHOD(PrefixRuntimeStateSnapshot, prefixStateProbe, (), (const, override));
 
         // MPI worker coordination
         MOCK_METHOD(void, runMPIWorkerLoop, (), (override));

@@ -44,6 +44,9 @@ protected:
         EXPECT_CALL(*runner_, maybeApplyMoERebalance())
             .Times(AnyNumber())
             .WillRepeatedly(Return(true));
+        EXPECT_CALL(*runner_, prefixStateProbe())
+            .Times(AnyNumber())
+            .WillRepeatedly(Return(PrefixRuntimeStateSnapshot{}));
 
         ON_CALL(*tokenizer_, encodeChat(_, _, _, _))
             .WillByDefault(Invoke([this](const std::vector<ChatMessage> &messages,
@@ -591,6 +594,51 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ConsumesMultiTokenDecodeStep)
     auto body = json::parse(response.json_body);
     EXPECT_EQ(body["choices"][0]["message"]["content"], "AB");
     EXPECT_EQ(body["usage"]["completion_tokens"], 2);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ProbesRuntimeStateForServeSummary)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("A"));
+
+    PrefixRuntimeStateSnapshot snapshot;
+    snapshot.mtp_config_enabled = true;
+    snapshot.mtp_request.enabled = true;
+    snapshot.mtp_request.adaptive_depth_enabled = true;
+    snapshot.mtp_request.depth_policy_mode = "dynamic";
+    snapshot.mtp_request.current_depth = 1;
+    snapshot.mtp_request.min_depth = 1;
+    snapshot.mtp_request.max_depth = 3;
+    snapshot.mtp_request.draft_steps = 2;
+    snapshot.mtp_request.accepted_tokens = 1;
+    snapshot.mtp_request.rejected_tokens = 1;
+    snapshot.mtp_request.acceptance_rate = 0.5;
+    snapshot.mtp_verifier_runs = 2;
+    snapshot.mtp_verifier_token_count = 4;
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)));
+    EXPECT_CALL(*runner_, prefixStateProbe())
+        .Times(1)
+        .WillOnce(Return(snapshot));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.max_tokens = 1;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+
+    EXPECT_TRUE(response.ok);
+    EXPECT_EQ(response.http_status, 200);
 }
 
 TEST_F(Test__ChatCompletionHandler, HandleRequest_ReplacesInvalidUtf8InGeneratedContent)
@@ -1944,6 +1992,54 @@ TEST_F(Test__ChatCompletionHandler, Streaming_FirstChunk_HasRoleAssistant)
     auto first_json = json::parse(first.substr(6, first.find("\n\n") - 6));
     EXPECT_EQ(first_json["choices"][0]["delta"]["role"], "assistant");
     EXPECT_EQ(first_json["object"], "chat.completion.chunk");
+}
+
+TEST_F(Test__ChatCompletionHandler, Streaming_ProbesRuntimeStateForServeSummary)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("A"));
+
+    PrefixRuntimeStateSnapshot snapshot;
+    snapshot.prefix_cache_config_enabled = true;
+    snapshot.prefix_request.enabled = true;
+    snapshot.prefix_request.requested_tokens = 1;
+    snapshot.prefix_request.matched_tokens = 1;
+    snapshot.prefix_request.hit = true;
+    snapshot.prefix_request.storage_tier = "ram";
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)));
+    EXPECT_CALL(*runner_, prefixStateProbe())
+        .Times(1)
+        .WillOnce(Return(snapshot));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+    request.max_tokens = 1;
+    request.enable_thinking = false;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    EXPECT_EQ(response.http_status, 200);
+    ASSERT_FALSE(chunks.empty());
+    EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
 }
 
 TEST_F(Test__ChatCompletionHandler, Streaming_TokenByToken_ContentInDelta)

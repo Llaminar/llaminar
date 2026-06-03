@@ -358,6 +358,47 @@ namespace
         EXPECT_LT(token, static_cast<int>(standard_logits_.size()));
     }
 
+    TEST_F(SamplerTest, ComputeDistributionCombinesTopKAndTopP)
+    {
+        std::vector<float> logits = {4.0f, 3.0f, 2.0f, 1.0f};
+
+        SamplingParams params;
+        params.temperature = 1.0f;
+        params.top_k = 3;
+        params.top_p = 0.8f;
+
+        auto distribution =
+            sampler_->compute_distribution(logits.data(), logits.size(), params);
+
+        ASSERT_EQ(distribution.size(), 2u)
+            << "top-p should be applied inside the top-k candidate set";
+        EXPECT_EQ(distribution[0].token_id, 0);
+        EXPECT_EQ(distribution[1].token_id, 1);
+        EXPECT_NEAR(distribution[0].probability + distribution[1].probability,
+                    1.0f,
+                    1e-6f);
+        EXPECT_GT(distribution[0].probability, distribution[1].probability);
+        EXPECT_FLOAT_EQ(Sampler::probability_of_token(distribution, 2), 0.0f);
+    }
+
+    TEST_F(SamplerTest, ResidualDistributionSamplesPositiveTargetMinusDraftMass)
+    {
+        Sampler sampler(123);
+        std::vector<SamplingDistributionEntry> target = {
+            {1, 0.2f},
+            {2, 0.8f},
+        };
+        std::vector<SamplingDistributionEntry> draft = {
+            {1, 0.9f},
+            {2, 0.1f},
+        };
+
+        for (int i = 0; i < 20; ++i)
+        {
+            EXPECT_EQ(sampler.sample_from_residual_distribution(target, draft), 2);
+        }
+    }
+
     // =============================================================================
     // Seed Reproducibility Tests
     // =============================================================================

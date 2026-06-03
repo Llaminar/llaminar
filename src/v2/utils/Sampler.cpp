@@ -49,42 +49,8 @@ namespace llaminar2
             return sample_greedy(logits, vocab_size);
         }
 
-        // Non-greedy paths (or greedy with penalties) need a mutable vector
-        std::vector<float> logits_vec(logits, logits + vocab_size);
-
-        // Apply presence/frequency penalties before temperature and filtering
-        if (params.has_penalties())
-        {
-            apply_penalties(logits_vec, params);
-        }
-
-        // Greedy with penalties: argmax on penalized logits
-        if (params.is_greedy())
-        {
-            return sample_greedy(logits_vec);
-        }
-
-        // Apply top-k if specified (takes precedence over top-p when both set)
-        if (params.top_k > 0 && params.top_k < static_cast<int>(vocab_size))
-        {
-            return sample_top_k(logits_vec, params.top_k, params.temperature);
-        }
-
-        // Apply top-p if specified
-        if (params.top_p < 1.0f)
-        {
-            return sample_top_p(logits_vec, params.top_p, params.temperature);
-        }
-
-        // Temperature sampling only
-        if (params.temperature != 1.0f)
-        {
-            return sample_temperature(logits_vec, params.temperature);
-        }
-
-        // Standard sampling (temperature = 1.0, no filtering)
-        auto probs = softmax(logits_vec);
-        return sample_from_probs(probs);
+        auto distribution = compute_distribution(logits, vocab_size, params);
+        return sample_from_distribution(distribution);
     }
 
     int Sampler::sample_greedy(const std::vector<float> &logits)
@@ -241,6 +207,195 @@ namespace llaminar2
         return indices[sampled_idx];
     }
 
+    std::vector<SamplingDistributionEntry> Sampler::compute_distribution(
+        const float *logits,
+        size_t vocab_size,
+        const SamplingParams &params)
+    {
+        if (!logits || vocab_size == 0)
+        {
+            throw std::invalid_argument("Cannot build distribution from empty logits");
+        }
+
+        std::vector<float> logits_vec(logits, logits + vocab_size);
+        if (params.has_penalties())
+        {
+            apply_penalties(logits_vec, params);
+        }
+
+        if (params.is_greedy())
+        {
+            return {{sample_greedy(logits_vec), 1.0f}};
+        }
+
+        float temperature = params.temperature;
+        if (temperature <= 0.0f)
+        {
+            temperature = 1.0f;
+        }
+
+        std::vector<std::pair<int, float>> candidates;
+        candidates.reserve(vocab_size);
+        for (size_t i = 0; i < vocab_size; ++i)
+        {
+            candidates.emplace_back(static_cast<int>(i), logits_vec[i] / temperature);
+        }
+
+        int candidate_count = static_cast<int>(candidates.size());
+        if (params.top_k > 0 && params.top_k < candidate_count)
+        {
+            candidate_count = params.top_k;
+            std::partial_sort(
+                candidates.begin(),
+                candidates.begin() + candidate_count,
+                candidates.end(),
+                [](const auto &a, const auto &b)
+                {
+                    return a.second > b.second;
+                });
+            candidates.resize(static_cast<size_t>(candidate_count));
+        }
+        else
+        {
+            std::sort(
+                candidates.begin(),
+                candidates.end(),
+                [](const auto &a, const auto &b)
+                {
+                    return a.second > b.second;
+                });
+        }
+
+        const float max_logit = candidates.front().second;
+        std::vector<float> exp_vals(candidates.size(), 0.0f);
+        float total_exp = 0.0f;
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            exp_vals[i] = std::exp(candidates[i].second - max_logit);
+            total_exp += exp_vals[i];
+        }
+        if (!(total_exp > 0.0f))
+        {
+            return {{candidates.front().first, 1.0f}};
+        }
+
+        size_t nucleus_count = candidates.size();
+        if (params.top_p > 0.0f && params.top_p < 1.0f)
+        {
+            float cumulative = 0.0f;
+            for (size_t i = 0; i < candidates.size(); ++i)
+            {
+                cumulative += exp_vals[i] / total_exp;
+                if (cumulative >= params.top_p)
+                {
+                    nucleus_count = i + 1;
+                    break;
+                }
+            }
+        }
+
+        float nucleus_exp = 0.0f;
+        for (size_t i = 0; i < nucleus_count; ++i)
+        {
+            nucleus_exp += exp_vals[i];
+        }
+        if (!(nucleus_exp > 0.0f))
+        {
+            return {{candidates.front().first, 1.0f}};
+        }
+
+        std::vector<SamplingDistributionEntry> distribution;
+        distribution.reserve(nucleus_count);
+        for (size_t i = 0; i < nucleus_count; ++i)
+        {
+            distribution.push_back({candidates[i].first, exp_vals[i] / nucleus_exp});
+        }
+        return distribution;
+    }
+
+    int Sampler::sample_from_distribution(
+        const std::vector<SamplingDistributionEntry> &distribution)
+    {
+        if (distribution.empty())
+        {
+            throw std::invalid_argument("Cannot sample from empty distribution");
+        }
+
+        const float r = random_uniform_01();
+        float cumulative = 0.0f;
+        for (const auto &entry : distribution)
+        {
+            cumulative += entry.probability;
+            if (r < cumulative)
+            {
+                return entry.token_id;
+            }
+        }
+        return distribution.back().token_id;
+    }
+
+    int Sampler::sample_from_residual_distribution(
+        const std::vector<SamplingDistributionEntry> &target,
+        const std::vector<SamplingDistributionEntry> &draft)
+    {
+        if (target.empty())
+        {
+            throw std::invalid_argument("Cannot sample residual from empty target distribution");
+        }
+
+        std::unordered_map<int, float> draft_probs;
+        draft_probs.reserve(draft.size());
+        for (const auto &entry : draft)
+        {
+            draft_probs[entry.token_id] = entry.probability;
+        }
+
+        std::vector<SamplingDistributionEntry> residual;
+        residual.reserve(target.size());
+        float total = 0.0f;
+        for (const auto &entry : target)
+        {
+            const auto it = draft_probs.find(entry.token_id);
+            const float q = it == draft_probs.end() ? 0.0f : it->second;
+            const float p = std::max(0.0f, entry.probability - q);
+            if (p > 0.0f)
+            {
+                residual.push_back({entry.token_id, p});
+                total += p;
+            }
+        }
+
+        if (!(total > 0.0f))
+        {
+            return sample_from_distribution(target);
+        }
+        for (auto &entry : residual)
+        {
+            entry.probability /= total;
+        }
+        return sample_from_distribution(residual);
+    }
+
+    float Sampler::probability_of_token(
+        const std::vector<SamplingDistributionEntry> &distribution,
+        int token_id)
+    {
+        for (const auto &entry : distribution)
+        {
+            if (entry.token_id == token_id)
+            {
+                return entry.probability;
+            }
+        }
+        return 0.0f;
+    }
+
+    float Sampler::random_uniform_01()
+    {
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        return dist(rng_);
+    }
+
     std::vector<float> Sampler::apply_temperature(const std::vector<float> &logits, float temperature)
     {
         if (temperature == 1.0f)
@@ -293,8 +448,7 @@ namespace llaminar2
         }
 
         // Generate random value in [0, 1)
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float r = dist(rng_);
+        float r = random_uniform_01();
 
         // Cumulative sampling
         float cumsum = 0.0f;

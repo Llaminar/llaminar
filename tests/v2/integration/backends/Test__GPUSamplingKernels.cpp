@@ -30,7 +30,9 @@
 
 #include <gtest/gtest.h>
 #include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
+#include "backends/IGPUGraphCapture.h"
 #include "utils/Sampler.h"
 
 #include <vector>
@@ -1402,6 +1404,86 @@ namespace
         return result;
     }
 
+    static uint64_t samplingSplitmix64(uint64_t x)
+    {
+        x += 0x9E3779B97F4A7C15ull;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+        return x ^ (x >> 31);
+    }
+
+    static float samplingUniform01(uint64_t seed, uint64_t offset)
+    {
+        const uint64_t bits = samplingSplitmix64(seed + offset);
+        return static_cast<float>((bits >> 40) & 0xFFFFFFull) * (1.0f / 16777216.0f);
+    }
+
+    static int expectedTopKTopPSample(const std::vector<float> &logits,
+                                      int top_k,
+                                      float top_p,
+                                      float temperature,
+                                      uint64_t seed,
+                                      uint64_t offset)
+    {
+        std::vector<std::pair<float, int>> candidates;
+        candidates.reserve(logits.size());
+        for (size_t i = 0; i < logits.size(); ++i)
+            candidates.emplace_back(logits[i], static_cast<int>(i));
+
+        top_k = std::min<int>(top_k, static_cast<int>(candidates.size()));
+        std::partial_sort(candidates.begin(),
+                          candidates.begin() + top_k,
+                          candidates.end(),
+                          [](const auto &a, const auto &b)
+                          {
+                              return a.first > b.first;
+                          });
+        candidates.resize(static_cast<size_t>(top_k));
+
+        const float temp = temperature > 0.0f ? temperature : 1.0f;
+        const float max_logit = candidates.front().first;
+        std::vector<float> weights(candidates.size(), 0.0f);
+        float total = 0.0f;
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            weights[i] = std::exp((candidates[i].first - max_logit) / temp);
+            total += weights[i];
+        }
+
+        int nucleus = top_k;
+        if (top_p > 0.0f && top_p < 1.0f)
+        {
+            float cumulative = 0.0f;
+            for (int i = 0; i < top_k; ++i)
+            {
+                cumulative += weights[static_cast<size_t>(i)] / total;
+                if (cumulative >= top_p)
+                {
+                    nucleus = i + 1;
+                    break;
+                }
+            }
+        }
+
+        float nucleus_total = 0.0f;
+        for (int i = 0; i < nucleus; ++i)
+            nucleus_total += weights[static_cast<size_t>(i)];
+
+        const float r = samplingUniform01(seed, offset) * nucleus_total;
+        float cumulative = 0.0f;
+        int selected = candidates.front().second;
+        for (int i = 0; i < nucleus; ++i)
+        {
+            cumulative += weights[static_cast<size_t>(i)];
+            if (r <= cumulative)
+            {
+                selected = candidates[static_cast<size_t>(i)].second;
+                break;
+            }
+        }
+        return selected;
+    }
+
     TEST_P(GPUSamplingTest, Penalty_SingleToken_Subtracted)
     {
         // Apply a penalty to token 2 and verify logit is reduced
@@ -1753,6 +1835,183 @@ namespace
                                      static_cast<int>(logits.size()), device_id);
         backend->free(d_ptr, device_id);
         return result;
+    }
+
+    TEST_P(GPUSamplingTest, LogitPenaltyDeviceInputsAreGraphCapturable)
+    {
+        const std::vector<float> logits = {1.0f, 8.0f, 4.0f, 3.0f, 6.0f};
+        const std::vector<int> token_ids = {1, 4};
+        const std::vector<float> penalty_vals = {7.0f, 2.5f};
+        std::vector<float> expected = logits;
+        expected[1] -= penalty_vals[0];
+        expected[4] -= penalty_vals[1];
+
+        void *d_logits = nullptr;
+        void *d_token_ids = nullptr;
+        void *d_penalties = nullptr;
+
+        auto cleanup = [&]()
+        {
+            if (d_logits)
+                backend_->free(d_logits, device_id_);
+            if (d_token_ids)
+                backend_->free(d_token_ids, device_id_);
+            if (d_penalties)
+                backend_->free(d_penalties, device_id_);
+        };
+
+        d_logits = backend_->allocate(logits.size() * sizeof(float), device_id_);
+        d_token_ids = backend_->allocate(token_ids.size() * sizeof(int), device_id_);
+        d_penalties = backend_->allocate(penalty_vals.size() * sizeof(float), device_id_);
+        ASSERT_NE(d_logits, nullptr);
+        ASSERT_NE(d_token_ids, nullptr);
+        ASSERT_NE(d_penalties, nullptr);
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_token_ids, token_ids.data(), token_ids.size() * sizeof(int), device_id_, stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_penalties, penalty_vals.data(), penalty_vals.size() * sizeof(float), device_id_, stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueLogitPenaltiesF32Device(
+                    d_logits,
+                    d_token_ids,
+                    d_penalties,
+                    static_cast<int>(token_ids.size()),
+                    static_cast<int>(logits.size()),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        auto result = downloadLogits(
+            backend_, d_logits, static_cast<int>(logits.size()), device_id_);
+        cleanup();
+
+        ASSERT_EQ(result.size(), expected.size());
+        for (size_t i = 0; i < expected.size(); ++i)
+        {
+            EXPECT_FLOAT_EQ(result[i], expected[i])
+                << "Graph-captured penalty mismatch at token " << i;
+        }
+    }
+
+    TEST_P(GPUSamplingTest, TopKTopPSampleDeviceOutputIsGraphCapturable)
+    {
+        const std::vector<float> logits = {0.1f, 4.5f, 3.8f, 0.0f,
+                                           2.2f, 5.0f, -1.0f, 3.2f};
+        constexpr int top_k = 4;
+        constexpr float top_p = 0.85f;
+        constexpr float temperature = 0.6f;
+        constexpr uint64_t seed = 1234;
+        constexpr uint64_t offset = 7;
+        const int expected = expectedTopKTopPSample(
+            logits, top_k, top_p, temperature, seed, offset);
+
+        void *d_logits = nullptr;
+        void *d_token = nullptr;
+
+        auto cleanup = [&]()
+        {
+            if (d_logits)
+                backend_->free(d_logits, device_id_);
+            if (d_token)
+                backend_->free(d_token, device_id_);
+        };
+
+        d_logits = backend_->allocate(logits.size() * sizeof(float), device_id_);
+        d_token = backend_->allocate(sizeof(int), device_id_);
+        ASSERT_NE(d_logits, nullptr);
+        ASSERT_NE(d_token, nullptr);
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_logits, logits.data(), logits.size() * sizeof(float), device_id_, stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+                EXPECT_FALSE(backend_->enqueueSampleTopKTopPF32Device(
+                    d_logits,
+                    static_cast<int>(logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    seed,
+                    offset,
+                    device_id_,
+                    nullptr,
+                    d_token))
+                    << "graph-capturable sampler must reject the legacy default/null stream";
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueSampleTopKTopPF32Device(
+                    d_logits,
+                    static_cast<int>(logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    seed,
+                    offset,
+                    device_id_,
+                    stream,
+                    d_token));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        int actual = -1;
+        ASSERT_TRUE(backend_->deviceToHost(&actual, d_token, sizeof(int), device_id_));
+        cleanup();
+
+        EXPECT_EQ(actual, expected)
+            << "Graph-captured top-k/top-p sampler selected the wrong token";
     }
 
     TEST_P(GPUSamplingTest, DRYParity_SimpleRepeat)

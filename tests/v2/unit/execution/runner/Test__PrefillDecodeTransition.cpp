@@ -439,6 +439,29 @@ namespace
             return greedyArgmax(logits_.data(), VOCAB_SIZE);
         }
 
+        bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
+                                    int vocab_size) override
+        {
+            ++apply_main_penalties_count_;
+            return applyPenaltiesToRow(logits_, 0, penalties, vocab_size);
+        }
+
+        bool applyPenaltiesToMTPLogitsOnDevice(const std::vector<LogitPenalty> &penalties,
+                                               int vocab_size) override
+        {
+            ++apply_mtp_penalties_count_;
+            return applyPenaltiesToRow(mtp_logits_, 0, penalties, vocab_size);
+        }
+
+        bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
+            int row,
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override
+        {
+            ++apply_all_position_penalties_count_;
+            return applyPenaltiesToRow(all_position_logits_, row, penalties, vocab_size);
+        }
+
         // =====================================================================
         // Test inspection methods
         // =====================================================================
@@ -464,6 +487,9 @@ namespace
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
         int sampleAllPositionLogitsCount() const { return sample_all_position_logits_count_; }
         int sampleAllPositionLogitsBatchedCount() const { return sample_all_position_logits_batched_count_; }
+        int applyMainPenaltiesCount() const { return apply_main_penalties_count_; }
+        int applyMTPPenaltiesCount() const { return apply_mtp_penalties_count_; }
+        int applyAllPositionPenaltiesCount() const { return apply_all_position_penalties_count_; }
         int lastSampleAllPositionStartRow() const { return last_sample_all_position_start_row_; }
         int lastSampleAllPositionRowCount() const { return last_sample_all_position_row_count_; }
         const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
@@ -598,6 +624,25 @@ namespace
             return token;
         }
 
+        static bool applyPenaltiesToRow(std::vector<float> &logits,
+                                        int row,
+                                        const std::vector<LogitPenalty> &penalties,
+                                        int vocab_size)
+        {
+            if (vocab_size != VOCAB_SIZE || row < 0)
+                return false;
+            const size_t offset = static_cast<size_t>(row) * VOCAB_SIZE;
+            if (logits.size() < offset + VOCAB_SIZE)
+                return false;
+            for (const auto &penalty : penalties)
+            {
+                if (penalty.token_id < 0 || penalty.token_id >= VOCAB_SIZE)
+                    continue;
+                logits[offset + static_cast<size_t>(penalty.token_id)] -= penalty.penalty;
+            }
+            return true;
+        }
+
         void setupPrefillLogits()
         {
             logits_.assign(VOCAB_SIZE, -10.0f);
@@ -719,6 +764,9 @@ namespace
         int sample_mtp_logits_count_{0};
         int sample_all_position_logits_count_{0};
         int sample_all_position_logits_batched_count_{0};
+        int apply_main_penalties_count_{0};
+        int apply_mtp_penalties_count_{0};
+        int apply_all_position_penalties_count_{0};
         int last_sample_all_position_start_row_{-1};
         int last_sample_all_position_row_count_{0};
         int last_mtp_condition_token_{-1};
@@ -794,7 +842,8 @@ namespace
                                                                              int mtp_draft_tokens = 1,
                                                                              bool chained_mtp_support = false,
                                                                              bool sidecar_sample_fusion = false,
-                                                                             MTPDepthPolicyConfig depth_policy = {})
+                                                                             MTPDepthPolicyConfig depth_policy = {},
+                                                                             MTPVerifyMode verify_mode = MTPVerifyMode::Greedy)
         {
             auto mock = std::make_unique<MockInferenceRunner>();
             auto *mock_ptr = mock.get(); // Keep raw pointer for inspection
@@ -826,7 +875,7 @@ namespace
                 config.device_for_this_rank = GlobalDeviceAddress::cpu();
             config.mtp.enabled = mtp_enabled;
             config.mtp.draft_tokens = mtp_draft_tokens;
-            config.mtp.verify_mode = MTPVerifyMode::Greedy;
+            config.mtp.verify_mode = verify_mode;
             config.mtp.depth_policy = depth_policy;
 
             std::unique_ptr<OrchestrationRunner> runner;
@@ -1074,6 +1123,41 @@ namespace
         EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
         EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
         EXPECT_EQ(probe.mtp_rollbacks, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPGreedyPenaltiesUseDevicePenaltyHooks)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/true);
+
+        SamplingParams sampling;
+        sampling.temperature = 0.0f;
+        sampling.presence_penalty = 1.0f;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->applyMainPenaltiesCount(), 1);
+        EXPECT_EQ(mock->applyMTPPenaltiesCount(), 1);
+        EXPECT_EQ(mock->applyAllPositionPenaltiesCount(), 2);
+        EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
+        EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 2);
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_EQ(probe.mtp_bypasses, 0u);
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPDraftDepthGreaterThanOneHardFailsBeforePrefillForward)
@@ -2057,6 +2141,97 @@ namespace
         ASSERT_TRUE(step2.success());
         EXPECT_EQ(mock->forwardMTPCount(), 0);
         EXPECT_EQ(runner->prefixStateProbe().mtp_bypasses, 1u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingModeRunsNonGreedyVerifier)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 2;
+        sampling.top_p = 0.95f;
+        sampling.seed = 123;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::MTP_ARGMAX_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->sampleMainLogitsCount(), 0)
+            << "stochastic verifier should use host distributions in this CPU unit path";
+        EXPECT_EQ(mock->sampleMTPLogitsCount(), 0);
+        EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_EQ(probe.mtp_bypasses, 0u);
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 1u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+        EXPECT_EQ(probe.mtp_rollbacks, 0u);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, MTPSpeculativeSamplingRejectsWithResidualCorrection)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true,
+            /*mtp_accept=*/false,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cpu(),
+            /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false,
+            /*sidecar_sample_fusion=*/false,
+            {},
+            MTPVerifyMode::SpeculativeSampling);
+
+        SamplingParams sampling;
+        sampling.temperature = 0.8f;
+        sampling.top_k = 2;
+        sampling.top_p = 0.95f;
+        sampling.seed = 456;
+        runner->setSamplingParams(sampling);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step1 = runner->decodeStep();
+        ASSERT_TRUE(step1.success()) << step1.error;
+        EXPECT_THAT(step1.tokens,
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+        EXPECT_EQ(mock->forwardMTPCount(), 1);
+        EXPECT_EQ(mock->restoreCount(), 1);
+        EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+        EXPECT_THAT(mock->lastCommitMTPTokens(),
+                    ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+        const auto probe = runner->prefixStateProbe();
+        EXPECT_FALSE(probe.mtp_bypassed);
+        EXPECT_EQ(probe.mtp_draft_steps, 1u);
+        EXPECT_EQ(probe.mtp_accepted_tokens, 0u);
+        EXPECT_EQ(probe.mtp_rejected_tokens, 1u);
+        EXPECT_EQ(probe.mtp_rollbacks, 1u);
     }
 
     TEST_F(Test__PrefillDecodeTransition, MTPPPTopologyFailsBeforePrefillForward)

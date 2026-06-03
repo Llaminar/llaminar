@@ -72,6 +72,148 @@ namespace llaminar2
         private:
             IOrchestrationRunner &runner_;
         };
+
+        const char *boolString(bool value)
+        {
+            return value ? "true" : "false";
+        }
+
+        bool hasPrefixCacheSummary(const PrefixRuntimeStateSnapshot &snapshot)
+        {
+            return snapshot.prefix_cache_config_enabled ||
+                   snapshot.prefix_cache_ready ||
+                   snapshot.prefix_cache_bypassed ||
+                   snapshot.prefix_cache_lookups != 0 ||
+                   snapshot.prefix_cache_hits != 0 ||
+                   snapshot.prefix_cache_partial_hits != 0 ||
+                   snapshot.prefix_cache_misses != 0 ||
+                   snapshot.prefix_cache_matched_tokens != 0 ||
+                   snapshot.prefix_cache_stores != 0 ||
+                   snapshot.prefix_cache_bypasses != 0 ||
+                   snapshot.prefix_request.enabled ||
+                   snapshot.prefix_request.bypassed ||
+                   snapshot.prefix_request.requested_tokens != 0 ||
+                   snapshot.prefix_request.matched_tokens != 0;
+        }
+
+        bool hasMTPSummary(const PrefixRuntimeStateSnapshot &snapshot)
+        {
+            return snapshot.mtp_config_enabled ||
+                   snapshot.mtp_bypassed ||
+                   snapshot.mtp_draft_steps != 0 ||
+                   snapshot.mtp_accepted_tokens != 0 ||
+                   snapshot.mtp_rejected_tokens != 0 ||
+                   snapshot.mtp_rollbacks != 0 ||
+                   snapshot.mtp_bypasses != 0 ||
+                   snapshot.mtp_verifier_runs != 0 ||
+                   snapshot.mtp_verifier_token_count != 0 ||
+                   snapshot.mtp_depth_policy_updates != 0 ||
+                   snapshot.mtp_request.enabled ||
+                   snapshot.mtp_request.bypassed ||
+                   snapshot.mtp_request.adaptive_depth_enabled ||
+                   snapshot.mtp_request.draft_steps != 0 ||
+                   snapshot.mtp_request.accepted_tokens != 0 ||
+                   snapshot.mtp_request.rejected_tokens != 0 ||
+                   snapshot.mtp_request.rollbacks != 0;
+        }
+
+        void logRuntimeStateSummary(IOrchestrationRunner &runner, const char *mode)
+        {
+            const PrefixRuntimeStateSnapshot snapshot = runner.prefixStateProbe();
+
+            if (hasPrefixCacheSummary(snapshot))
+            {
+                const auto &request = snapshot.prefix_request;
+                const bool bypassed = request.bypassed || snapshot.prefix_cache_bypassed;
+                const std::string &bypass_reason =
+                    !request.bypass_reason.empty() ? request.bypass_reason
+                                                   : snapshot.prefix_cache_bypass_reason;
+
+                std::ostringstream prefix;
+                prefix << "enabled=" << boolString(request.enabled || snapshot.prefix_cache_config_enabled)
+                       << " ready=" << boolString(snapshot.prefix_cache_ready)
+                       << " hit=" << boolString(request.hit)
+                       << " partial_hit=" << boolString(request.partial_hit)
+                       << " requested_tokens=" << request.requested_tokens
+                       << " matched_tokens=" << request.matched_tokens
+                       << " matched_blocks=" << request.matched_blocks
+                       << " tier=" << request.storage_tier
+                       << " lookups=" << snapshot.prefix_cache_lookups
+                       << " hits=" << snapshot.prefix_cache_hits
+                       << " partial_hits=" << snapshot.prefix_cache_partial_hits
+                       << " misses=" << snapshot.prefix_cache_misses;
+                if (bypassed)
+                {
+                    prefix << " bypassed=true";
+                    if (!bypass_reason.empty())
+                        prefix << " bypass_reason=" << bypass_reason;
+                }
+
+                LOG_INFO("[ChatCompletion] Prefix cache summary (" << mode << "): "
+                                                                   << prefix.str());
+            }
+
+            if (hasMTPSummary(snapshot))
+            {
+                const auto &request = snapshot.mtp_request;
+                const uint64_t accepted = request.accepted_tokens != 0
+                                              ? request.accepted_tokens
+                                              : snapshot.mtp_accepted_tokens;
+                const uint64_t rejected = request.rejected_tokens != 0
+                                              ? request.rejected_tokens
+                                              : snapshot.mtp_rejected_tokens;
+                const uint64_t attempted = accepted + rejected;
+                const double acceptance_rate = attempted != 0
+                                                   ? static_cast<double>(accepted) /
+                                                         static_cast<double>(attempted)
+                                                   : request.acceptance_rate;
+                const int current_depth = request.current_depth != 0
+                                              ? request.current_depth
+                                              : snapshot.mtp_current_depth;
+                const int min_depth = request.min_depth != 0
+                                          ? request.min_depth
+                                          : snapshot.mtp_min_depth;
+                const int max_depth = request.max_depth != 0
+                                          ? request.max_depth
+                                          : snapshot.mtp_max_depth;
+                const uint64_t depth_updates = request.depth_policy_updates != 0
+                                                   ? request.depth_policy_updates
+                                                   : snapshot.mtp_depth_policy_updates;
+                const bool bypassed = request.bypassed || snapshot.mtp_bypassed;
+                const std::string &bypass_reason =
+                    !request.bypass_reason.empty() ? request.bypass_reason
+                                                   : snapshot.mtp_bypass_reason;
+
+                std::ostringstream mtp;
+                mtp << "enabled=" << boolString(request.enabled || snapshot.mtp_config_enabled)
+                    << " draft_steps=" << (request.draft_steps != 0
+                                               ? request.draft_steps
+                                               : snapshot.mtp_draft_steps)
+                    << " accepted_tokens=" << accepted
+                    << " rejected_tokens=" << rejected
+                    << " rollbacks=" << (request.rollbacks != 0
+                                             ? request.rollbacks
+                                             : snapshot.mtp_rollbacks)
+                    << " acceptance=" << std::fixed << std::setprecision(2)
+                    << (acceptance_rate * 100.0) << "%"
+                    << " verifier_runs=" << snapshot.mtp_verifier_runs
+                    << " verifier_tokens=" << snapshot.mtp_verifier_token_count
+                    << " depth_policy=" << request.depth_policy_mode
+                    << " depth=" << current_depth
+                    << " [" << min_depth << "," << max_depth << "]"
+                    << " depth_updates=" << depth_updates;
+                if (!request.last_depth_policy_reason.empty())
+                    mtp << " last_depth_reason=" << request.last_depth_policy_reason;
+                if (bypassed)
+                {
+                    mtp << " bypassed=true";
+                    if (!bypass_reason.empty())
+                        mtp << " bypass_reason=" << bypass_reason;
+                }
+
+                LOG_INFO("[ChatCompletion] MTP summary (" << mode << "): " << mtp.str());
+            }
+        }
     }
 
     // =========================================================================
@@ -678,6 +820,7 @@ namespace llaminar2
         }
 
         runner_.flushStageTimeline();
+        logRuntimeStateSummary(runner_, "non-streaming");
 
         // Post-process output: use ChatParser to extract thinking content
         std::string reasoning_content;
@@ -1035,6 +1178,7 @@ namespace llaminar2
         }
 
         runner_.flushStageTimeline();
+        logRuntimeStateSummary(runner_, "streaming");
 
         // Post-generation: if tools were provided, parse for tool calls and emit
         if (has_tools)

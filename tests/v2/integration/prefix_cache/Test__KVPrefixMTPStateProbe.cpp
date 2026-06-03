@@ -1630,6 +1630,79 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsRealModelSmoke)
     EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u);
 }
 
+TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsStochasticRealModelSmoke)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
+        {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+    });
+
+    const char *env_model = std::getenv("LLAMINAR_QWEN36_DENSE_MODEL");
+    if (!env_model)
+        env_model = std::getenv("LLAMINAR_PARITY_DENSE_MODEL");
+    const std::string model_path = env_model ? env_model : "/opt/llaminar-models/Qwen3.6-27B-Q4_K_S.gguf";
+
+    if (!std::filesystem::exists(model_path))
+    {
+        GTEST_SKIP() << "Qwen3.6 dense smoke model not found: " << model_path;
+    }
+
+    auto &dm = DeviceManager::instance();
+    dm.initialize(-1, false);
+    if (dm.rocm_device_count() <= 0)
+    {
+        GTEST_SKIP() << "No ROCm device available for Qwen3.6 stochastic MTP GPU-graphs smoke";
+    }
+    const int rocm_ordinal = qwen36RocmSingleDeviceOrdinal();
+    ASSERT_GE(rocm_ordinal, 0);
+    ASSERT_LT(rocm_ordinal, dm.rocm_device_count())
+        << "Selected ROCm device ordinal is outside the available device range";
+
+    OrchestrationConfig config = OrchestrationConfig::defaults();
+    config.model_path = model_path;
+    config.max_seq_len = 32;
+    config.batch_size = 1;
+    config.tp_degree = 1;
+    config.pp_degree = 1;
+    config.device_for_this_rank = GlobalDeviceAddress::rocm(rocm_ordinal);
+    config.kv_cache_precision = "auto";
+    config.mtp.enabled = true;
+    config.mtp.draft_tokens = 1;
+    config.mtp.verify_mode = MTPVerifyMode::SpeculativeSampling;
+
+    auto factory = createOrchestrationRunnerFactory();
+    auto runner = factory->createFromOrchestrationConfig(config);
+    ASSERT_NE(runner, nullptr);
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    auto tokenizer = runner->tokenizer();
+    ASSERT_NE(tokenizer, nullptr);
+    const auto encoded = tokenizer->encode("The quick brown fox", /*add_bos=*/false, /*add_eos=*/false);
+    ASSERT_FALSE(encoded.empty());
+    const std::vector<int32_t> prompt(encoded.begin(), encoded.end());
+
+    SamplingParams stochastic;
+    stochastic.temperature = 0.6f;
+    stochastic.top_k = 20;
+    stochastic.top_p = 0.95f;
+    stochastic.seed = 123;
+
+    auto result = runner->generate(prompt, 6, stochastic);
+    const auto snapshot = runner->prefixStateProbe();
+    runner->shutdown();
+
+    ASSERT_TRUE(result.error.empty()) << result.error;
+    ASSERT_EQ(result.tokens.size(), 6u);
+    EXPECT_TRUE(snapshot.mtp_config_enabled);
+    EXPECT_FALSE(snapshot.mtp_bypassed) << snapshot.mtp_bypass_reason;
+    EXPECT_GE(snapshot.mtp_draft_steps, 1u);
+    EXPECT_GE(snapshot.mtp_verifier_runs, 1u);
+    EXPECT_GE(snapshot.mtp_verifier_token_count, 2u);
+    EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u)
+        << "Speculative-sampling mode must actually verify at least one draft token";
+}
+
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmMTPGpuGraphsChainedDraftRealModelSmoke)
 {
     ScopedDebugEnv env({

@@ -68,6 +68,16 @@ namespace llaminar2
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,
                      float *out_values, int *out_indices, void *stream = nullptr) override;
+        bool sampleTopKTopPF32(const void *data_device, int n,
+                               int top_k, float top_p, float temperature,
+                               uint64_t rng_seed, uint64_t rng_offset,
+                               int device_id, int *out_token,
+                               void *stream = nullptr) override;
+        bool enqueueSampleTopKTopPF32Device(const void *data_device, int n,
+                                            int top_k, float top_p, float temperature,
+                                            uint64_t rng_seed, uint64_t rng_offset,
+                                            int device_id, void *stream,
+                                            void *out_token_device) override;
 
         // GPU-side sparse logit penalty application
         bool applyLogitPenaltiesF32(void *logits_device,
@@ -75,6 +85,11 @@ namespace llaminar2
                                     const float *penalties_host,
                                     int num_penalties, int vocab_size,
                                     int device_id, void *stream = nullptr) override;
+        bool enqueueLogitPenaltiesF32Device(void *logits_device,
+                                            const void *token_ids_device,
+                                            const void *penalties_device,
+                                            int num_penalties, int vocab_size,
+                                            int device_id, void *stream) override;
 
         // Event operations (fine-grained synchronization)
         void *createEvent(int device_id) override;
@@ -300,6 +315,13 @@ namespace llaminar2
             int allocated_k = 0;         // Current allocation size
         };
         std::vector<TopKDeviceBuffers> topk_buffers_;
+
+        // Per-device sampled-token result buffers (lazily allocated)
+        struct SampleTokenDeviceBuffers
+        {
+            void *token_ptr = nullptr; // int on device
+        };
+        std::vector<SampleTokenDeviceBuffers> sample_token_buffers_;
 
         // Per-device penalty upload buffers (lazily allocated)
         struct PenaltyDeviceBuffers

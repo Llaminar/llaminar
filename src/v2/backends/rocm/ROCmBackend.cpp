@@ -466,6 +466,10 @@ namespace llaminar2
     extern "C" bool rocmOps_topk_f32(
         const float *data, int n, int k, float *out_values, int *out_indices,
         int device_idx, void *stream);
+    extern "C" bool rocmOps_sample_topk_topp_f32(
+        const float *data, int n, int k, float top_p, float temperature,
+        unsigned long long rng_seed, unsigned long long rng_offset,
+        int *out_token, int device_idx, void *stream);
 
     bool ROCmBackend::topKF32(const void *data_device, int n, int k, int device_id,
                               float *out_values, int *out_indices, void *stream)
@@ -527,6 +531,87 @@ namespace llaminar2
         HIP_CHECK_OR_THROW(hipMemcpyAsync(out_indices, bufs.indices_ptr, k * sizeof(int), hipMemcpyDeviceToHost, s));
         HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
 
+        return true;
+    }
+
+    bool ROCmBackend::enqueueSampleTopKTopPF32Device(const void *data_device, int n,
+                                                     int top_k, float top_p, float temperature,
+                                                     uint64_t rng_seed, uint64_t rng_offset,
+                                                     int device_id, void *stream,
+                                                     void *out_token_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            n <= 0 || top_k <= 0 || !stream || !out_token_device)
+        {
+            return false;
+        }
+
+        if (top_k > 256)
+            top_k = 256;
+        if (top_k > n)
+            top_k = n;
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_sample_topk_topp_f32(
+            static_cast<const float *>(data_device),
+            n,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<unsigned long long>(rng_seed),
+            static_cast<unsigned long long>(rng_offset),
+            static_cast<int *>(out_token_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::sampleTopKTopPF32(const void *data_device, int n,
+                                        int top_k, float top_p, float temperature,
+                                        uint64_t rng_seed, uint64_t rng_offset,
+                                        int device_id, int *out_token,
+                                        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            n <= 0 || top_k <= 0 || !out_token || !stream)
+        {
+            return false;
+        }
+
+        if (sample_token_buffers_.empty())
+            sample_token_buffers_.resize(device_count_);
+
+        auto &bufs = sample_token_buffers_[device_id];
+        if (!bufs.token_ptr)
+        {
+            HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+            hipError_t err = hipMalloc(&bufs.token_ptr, sizeof(int));
+            if (err != hipSuccess)
+            {
+                bufs.token_ptr = nullptr;
+                return false;
+            }
+        }
+
+        if (!enqueueSampleTopKTopPF32Device(data_device,
+                                            n,
+                                            top_k,
+                                            top_p,
+                                            temperature,
+                                            rng_seed,
+                                            rng_offset,
+                                            device_id,
+                                            stream,
+                                            bufs.token_ptr))
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(out_token,
+                                          bufs.token_ptr,
+                                          sizeof(int),
+                                          hipMemcpyDeviceToHost,
+                                          static_cast<hipStream_t>(stream)));
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(static_cast<hipStream_t>(stream)));
         return true;
     }
 
@@ -601,6 +686,32 @@ namespace llaminar2
 
         HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
         return true;
+    }
+
+    bool ROCmBackend::enqueueLogitPenaltiesF32Device(void *logits_device,
+                                                     const void *token_ids_device,
+                                                     const void *penalties_device,
+                                                     int num_penalties,
+                                                     int vocab_size,
+                                                     int device_id,
+                                                     void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !logits_device ||
+            !token_ids_device || !penalties_device || num_penalties <= 0 ||
+            vocab_size <= 0 || !stream)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_apply_logit_penalties_f32(
+            static_cast<float *>(logits_device),
+            static_cast<const int *>(token_ids_device),
+            static_cast<const float *>(penalties_device),
+            num_penalties,
+            vocab_size,
+            device_id,
+            stream);
     }
 
     bool ROCmBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
