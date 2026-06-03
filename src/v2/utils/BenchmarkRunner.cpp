@@ -278,6 +278,8 @@ namespace llaminar2
                 {"mtp_min_draft_tokens", config->mtp.depth_policy.min_depth},
                 {"mtp_max_draft_tokens", config->mtp.depth_policy.max_depth},
                 {"mtp_depth_window", config->mtp.depth_policy.window_size},
+                {"mtp_depth_promote_windows",
+                 config->mtp.depth_policy.promote_consecutive_windows},
             };
             if (!config->model_path.empty())
                 config_json["model_path"] = config->model_path;

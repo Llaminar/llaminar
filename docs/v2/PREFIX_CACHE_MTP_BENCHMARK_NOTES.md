@@ -8,8 +8,8 @@ speedup. Detailed tuning history belongs in commit messages or perf artifacts.
 
 | Scope | Device | Model | Baseline decode | Best MTP decode | Speedup | Status |
 |---|---|---|---:|---:|---:|---|
-| Dense long lane, `The quick brown fox`, `-c 64 -n 48` | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 30.76 tok/s | 53.81 tok/s | 1.75x | Correctness green, graph captured, short of 2x target |
-| Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 39.72 tok/s | 1.33x | Graph captured, depth-sensitive |
+| Dense long lane, `The quick brown fox`, `-c 64 -n 48` | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 30.76 tok/s | 53.81 tok/s | 1.75x | Correctness green, mostly graph captured, short of 2x target |
+| Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 39.72 tok/s | 1.33x | Mostly graph captured, depth-sensitive |
 | Dense long lane | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.44 tok/s | 54.02 tok/s | 1.34x | Correctness green, needs verifier work |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE single-device | ROCm `rocm:0` | Qwen3.6 35B A3B | 21.23 tok/s | 10.89 tok/s | 0.51x | Next tuning target |
@@ -53,23 +53,33 @@ before a full window elapses. The default prompt improved from the previous
 mostly because occasional perfect shallow windows can promote and then demote
 again; promotion hysteresis is the next adaptive slice.
 
+## ROCm Graph Replay Safety
+
+A long dynamic-depth QBF run faulted during cached HIP graph replay of
+`layer0_attention`. Stream-only and per-step recapture passed, so ROCm dynamic
+decode attention is now deliberately non-capturable until it has fixed launch
+topology across changing `kv_len`.
+
+Validation: `V2_Unit_AttentionComputeStage_DynamicKVLen` pins the contract; the
+old one-stage repro now traces `layer0_attention` as `[MANUAL]`; Qwen3.6 ROCm
+graph-stream stress, dynamic-depth MTP parity, and prefix+MTP dynamic restore
+passed; the original crash repro now completes at 47.21 tok/s decode with
+85.14% acceptance and no new `gpucore.*`.
+
 ## Main Tuning Actions Landed
 
-- Stabilized ROCm graph-captured MTP sidecar stream binding and fused sampling
-  ordering; regression: `V2_Unit_GraphExecutorCollective` plus the focused
-  draft-3 graph-stream stress parity test.
+- Stabilized ROCm MTP sidecar stream binding and fused sampling ordering.
 - Added hard failures for GPU stage execution, MTP deferred sampling, and greedy
   GPU sampling when an explicit non-null stream is unavailable; regression:
   `V2_Unit_Static_NoDefaultStreamInGPUCode`.
-- Added stable verifier graph lifetime handling for all-position logits and
-  budget-aware draft-depth clamping.
+- Added stable verifier graph lifetime handling and draft-depth clamping.
 - Added batched ROCm verifier-row argmax through declared graph workspace.
-- Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, fused
-  QKV/GateUp/GDN projections, fused SwiGLU/down, and tiny FP32 alpha/beta.
+- Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks.
 - Added GDN verifier-row rollback restore for short-conv and recurrence state.
 - Moved touched graph scratch paths onto declared workspace buffers.
 
 ## Next Work
 
-Tune promotion hysteresis, then move to Qwen3.6 MoE MTP on ROCm before returning
-through CUDA, CPU, and the multi-participant matrix.
+Implement stable-topology ROCm decode attention capture to remove the manual
+segment, tune promotion hysteresis, then move to Qwen3.6 MoE MTP on ROCm before
+returning through CUDA, CPU, and the multi-participant matrix.

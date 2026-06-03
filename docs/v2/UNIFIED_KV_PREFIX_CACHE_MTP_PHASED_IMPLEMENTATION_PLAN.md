@@ -35,6 +35,8 @@ Latest adaptive MTP depth implementation note, 2026-06-03: `MTPDepthController` 
 
 Latest explicit GPU stream note, 2026-06-03: GPU execution must never rely on the device-default null stream. `DeviceGraphExecutor` now hard-fails a GPU stage that cannot bind to a non-null worker stream, MTP deferred sampling hard-fails if final-sync deferral lacks a capture stream, and GPU greedy sampling rejects null-stream paths. Focused validation passed: `V2_Unit_GraphExecutorCollective` and `V2_Unit_Static_NoDefaultStreamInGPUCode`. The ROCm dynamic qbf-long repro that previously required stage-timing synchronization now completes without that crutch; the clean sweep artifact is `/tmp/llaminar-mtp-bench/adaptive-depth-20260603/qbf-long-explicit-stream-comparison/summary.tsv`.
 
+Latest ROCm decode-attention graph replay safety note, 2026-06-03: a Qwen3.6 dense ROCm dynamic-depth long run exposed an HSA memory fault during cached HIP graph replay. Controls isolated the fault to cached replay, not ordinary explicit-stream execution: stream-only execution passed, per-step recapture passed, and the one-stage trace failed at `[GRAPH] first=layer0_attention`. ROCm native decode attention still captures launch topology from host-side `kv_len` while replay updates logical KV length through device params, so ROCm dynamic decode attention is now deliberately non-capturable until a fixed-topology decode attention graph path lands. `V2_Unit_AttentionComputeStage_DynamicKVLen` pins this contract. The previous one-stage repro now passes and traces `layer0_attention` as `[MANUAL]`, the original crash repro now completes at 47.21 decode tok/s with 85.14% acceptance and no new `gpucore.*`, and focused ROCm parity passed for `V2_Integration_Parity_Qwen36_SingleDevice_MTPGreedyDepth3GraphStreamStress`, `MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens`, and `PrefixCacheMTPDynamicDepthRestore`. Phase 13.5 remains open to remove this manual segment with a stable graph-capturable decode-attention kernel path.
+
 Latest ROCm verifier graph lifetime note, 2026-06-03: all-position verifier
 logits now have stable per-row-count tensor owners so cached full-depth verifier
 graphs can survive a smaller tail verifier and request-local `clearCache()`
@@ -2001,11 +2003,12 @@ struct MTPDepthPolicyConfig
     int max_depth = 1;      // defaults to --mtp-draft-tokens
     int initial_depth = 1;  // defaults to max_depth
     int window_size = 16;   // verifier decisions, not raw tokens
-    int min_samples = 8;
+    int min_samples = 4;
     int cooldown_steps = 8;
+    int promote_consecutive_windows = 3;
     double promote_full_accept_rate = 1.0;
     double demote_zero_accept_rate = 0.30;
-    double demote_acceptance_rate = 0.70;
+    double demote_acceptance_rate = 0.55;
 };
 
 struct MTPDepthWindow
@@ -2043,6 +2046,7 @@ Suggested CLI/config additions:
 - `--mtp-depth-window <n>`
 - `--mtp-depth-min-samples <n>`
 - `--mtp-depth-cooldown <n>`
+- `--mtp-depth-promote-windows <n>`
 - `--mtp-depth-promote-full-accept <f>`
 - `--mtp-depth-demote-zero-accept <f>`
 - `--mtp-depth-demote-acceptance <f>`

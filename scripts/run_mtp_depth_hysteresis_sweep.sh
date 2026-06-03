@@ -207,6 +207,24 @@ describe_variant() {
     dynamic)
       variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic)
       ;;
+    dynamic_promote1)
+      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-promote-windows 1)
+      ;;
+    dynamic_promote3)
+      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-promote-windows 3)
+      ;;
+    dynamic_ms4)
+      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-min-samples 4)
+      ;;
+    dynamic_ms4_promote1)
+      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-min-samples 4 --mtp-depth-promote-windows 1)
+      ;;
+    dynamic_ms4_d60)
+      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-min-samples 4 --mtp-depth-demote-acceptance 0.60)
+      ;;
+    dynamic_ms4_d55)
+      variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-min-samples 4 --mtp-depth-demote-acceptance 0.55)
+      ;;
     dynamic_p70)
       variant_args=(--mtp --mtp-draft-tokens 3 --mtp-depth-policy dynamic --mtp-depth-promote-full-accept 0.70)
       ;;

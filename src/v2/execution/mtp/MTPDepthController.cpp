@@ -18,6 +18,8 @@ namespace llaminar2
             return "budget_limited";
         case MTPDepthDecisionReason::CooldownActive:
             return "cooldown_active";
+        case MTPDepthDecisionReason::PromotionHysteresisActive:
+            return "promotion_hysteresis_active";
         case MTPDepthDecisionReason::PromoteFullAcceptRate:
             return "promote_full_accept_rate";
         case MTPDepthDecisionReason::DemoteZeroAcceptRate:
@@ -72,6 +74,11 @@ namespace llaminar2
             throw std::invalid_argument("MTP depth policy min_samples must be > 0");
         if (config.cooldown_steps < 0)
             throw std::invalid_argument("MTP depth policy cooldown_steps must be >= 0");
+        if (config.promote_consecutive_windows <= 0)
+        {
+            throw std::invalid_argument(
+                "MTP depth policy promote_consecutive_windows must be > 0");
+        }
         auto rate_valid = [](double value)
         {
             return value >= 0.0 && value <= 1.0;
@@ -86,6 +93,7 @@ namespace llaminar2
         config_ = config;
         current_depth_ = config_.initial_depth;
         steps_since_change_ = config_.cooldown_steps;
+        promotion_streak_ = 0;
         window_ = {};
         last_decision_ = {};
         last_decision_.old_depth = current_depth_;
@@ -98,6 +106,7 @@ namespace llaminar2
     {
         current_depth_ = config_.initial_depth;
         steps_since_change_ = config_.cooldown_steps;
+        promotion_streak_ = 0;
         window_ = {};
         last_decision_ = {};
         last_decision_.old_depth = current_depth_;
@@ -186,8 +195,15 @@ namespace llaminar2
                  decision.full_accept_rate >= config_.promote_full_accept_rate &&
                  decision.zero_accept_rate < config_.demote_zero_accept_rate)
         {
-            proposed_depth = current_depth_ + 1;
-            decision.reason = MTPDepthDecisionReason::PromoteFullAcceptRate;
+            if (promotion_streak_ + 1 >= config_.promote_consecutive_windows)
+            {
+                proposed_depth = current_depth_ + 1;
+                decision.reason = MTPDepthDecisionReason::PromoteFullAcceptRate;
+            }
+            else
+            {
+                decision.reason = MTPDepthDecisionReason::PromotionHysteresisActive;
+            }
         }
         else
         {
@@ -264,6 +280,17 @@ namespace llaminar2
         if (decision.observe_recommendation)
         {
             ++stats_.observe_recommendations;
+        }
+        if (decision.reason == MTPDepthDecisionReason::PromotionHysteresisActive)
+        {
+            ++promotion_streak_;
+        }
+        else if (decision.reason == MTPDepthDecisionReason::PromoteFullAcceptRate ||
+                 decision.reason == MTPDepthDecisionReason::DemoteZeroAcceptRate ||
+                 decision.reason == MTPDepthDecisionReason::DemoteLowAcceptanceRate ||
+                 decision.reason == MTPDepthDecisionReason::Hold)
+        {
+            promotion_streak_ = 0;
         }
         if (decision.changed)
         {

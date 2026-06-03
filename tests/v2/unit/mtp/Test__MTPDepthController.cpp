@@ -20,6 +20,7 @@ namespace
         config.window_size = window_size;
         config.min_samples = window_size;
         config.cooldown_steps = cooldown_steps;
+        config.promote_consecutive_windows = 1;
         config.promote_full_accept_rate = 0.75;
         config.demote_zero_accept_rate = 0.30;
         config.demote_acceptance_rate = 0.65;
@@ -148,9 +149,9 @@ TEST(Test__MTPDepthController, DynamicHealthyPartialWindowWaitsForFullWindow)
 
 TEST(Test__MTPDepthController, DynamicPromotesOnStableFullAcceptWindows)
 {
-    MTPDepthController controller(
-        dynamicConfig(/*initial_depth=*/1, /*max_depth=*/3),
-        /*configured_draft_tokens=*/3);
+    auto config = dynamicConfig(/*initial_depth=*/1, /*max_depth=*/3);
+    config.promote_consecutive_windows = 1;
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
 
     auto d1a = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
     EXPECT_FALSE(d1a.evaluated);
@@ -166,6 +167,70 @@ TEST(Test__MTPDepthController, DynamicPromotesOnStableFullAcceptWindows)
     EXPECT_EQ(d2b.reason, MTPDepthDecisionReason::PromoteFullAcceptRate);
     EXPECT_EQ(controller.currentDepth(), 3);
     EXPECT_EQ(controller.stats().promotions, 2u);
+}
+
+TEST(Test__MTPDepthController, DynamicRequiresConsecutivePromotableWindows)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/2,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 2;
+    config.promote_full_accept_rate = 1.0;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto first_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(first_window.evaluated);
+    EXPECT_FALSE(first_window.changed);
+    EXPECT_EQ(first_window.reason, MTPDepthDecisionReason::PromotionHysteresisActive);
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().promotions, 0u);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto second_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(second_window.evaluated);
+    ASSERT_TRUE(second_window.changed);
+    EXPECT_EQ(second_window.reason, MTPDepthDecisionReason::PromoteFullAcceptRate);
+    EXPECT_EQ(second_window.old_depth, 1);
+    EXPECT_EQ(second_window.new_depth, 2);
+    EXPECT_EQ(controller.currentDepth(), 2);
+    EXPECT_EQ(controller.stats().promotions, 1u);
+}
+
+TEST(Test__MTPDepthController, DynamicPromotionStreakResetsAfterBadWindow)
+{
+    auto config = dynamicConfig(
+        /*initial_depth=*/1,
+        /*max_depth=*/3,
+        /*window_size=*/2,
+        /*cooldown_steps=*/0);
+    config.promote_consecutive_windows = 2;
+    config.promote_full_accept_rate = 1.0;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto first_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(first_window.evaluated);
+    EXPECT_EQ(first_window.reason, MTPDepthDecisionReason::PromotionHysteresisActive);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto broken_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/0));
+    ASSERT_TRUE(broken_window.evaluated);
+    EXPECT_FALSE(broken_window.changed);
+    EXPECT_EQ(broken_window.reason, MTPDepthDecisionReason::Hold);
+    EXPECT_EQ(controller.currentDepth(), 1);
+
+    controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    auto restart_window = controller.recordStep(observation(/*depth=*/1, /*accepted_prefix=*/1));
+    ASSERT_TRUE(restart_window.evaluated);
+    EXPECT_FALSE(restart_window.changed);
+    EXPECT_EQ(restart_window.reason, MTPDepthDecisionReason::PromotionHysteresisActive);
+    EXPECT_EQ(controller.currentDepth(), 1);
+    EXPECT_EQ(controller.stats().promotions, 0u);
 }
 
 TEST(Test__MTPDepthController, DefaultHysteresisHoldsAfterMiddlingAcceptanceWindow)

@@ -300,6 +300,54 @@ namespace llaminar2
             std::unique_ptr<FP32Tensor> workspace_mask_;
         };
 
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionIsNotGraphCapturable)
+        {
+            AttentionComputeStage::Params params;
+            params.Q = Q_.get();
+            params.K = kv_cache_->get_k(0, 0);
+            params.V = kv_cache_->get_v(0, 0);
+            params.output = output_.get();
+            params.batch_size = 1;
+            params.seq_len = 1;
+            params.kv_len = 127;
+            params.n_heads = kNumHeads;
+            params.n_kv_heads = kNumKVHeads;
+            params.head_dim = kHeadDim;
+            params.auto_detect_mode = true;
+            params.kv_cache = kv_cache_.get();
+            params.layer_idx = 0;
+            params.device_id = DeviceId::rocm(0);
+
+            AttentionComputeStage stage(params);
+            EXPECT_FALSE(stage.isGraphCapturable());
+        }
+
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, CPUAndROCmPrefillGraphCaptureContractsRemainUnchanged)
+        {
+            AttentionComputeStage::Params params;
+            params.Q = Q_.get();
+            params.K = kv_cache_->get_k(0, 0);
+            params.V = kv_cache_->get_v(0, 0);
+            params.output = output_.get();
+            params.batch_size = 1;
+            params.seq_len = 8;
+            params.kv_len = 8;
+            params.n_heads = kNumHeads;
+            params.n_kv_heads = kNumKVHeads;
+            params.head_dim = kHeadDim;
+            params.auto_detect_mode = true;
+            params.kv_cache = kv_cache_.get();
+            params.layer_idx = 0;
+
+            params.device_id = DeviceId::cpu();
+            AttentionComputeStage cpu_stage(params);
+            EXPECT_TRUE(cpu_stage.isGraphCapturable());
+
+            params.device_id = DeviceId::rocm(0);
+            AttentionComputeStage rocm_prefill_stage(params);
+            EXPECT_TRUE(rocm_prefill_stage.isGraphCapturable());
+        }
+
         /// @brief Reference FP32 single-query GQA attention over a caller-selected KV prefix.
         std::vector<float> referenceSingleQueryGQAAttention(
             const float *q_data,

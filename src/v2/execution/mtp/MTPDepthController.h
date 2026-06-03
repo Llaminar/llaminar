@@ -14,6 +14,7 @@ namespace llaminar2
         WindowNotReady,
         BudgetLimited,
         CooldownActive,
+        PromotionHysteresisActive,
         PromoteFullAcceptRate,
         DemoteZeroAcceptRate,
         DemoteLowAcceptanceRate,
@@ -92,6 +93,7 @@ namespace llaminar2
         MTPDepthPolicyConfig config_;
         int current_depth_ = 1;
         int steps_since_change_ = 0;
+        int promotion_streak_ = 0;
         MTPDepthWindow window_;
         MTPDepthDecision last_decision_;
         MTPDepthControllerStats stats_;

@@ -382,6 +382,12 @@ namespace llaminar2
                 if (config.mtp.depth_policy.cooldown_steps < 0)
                     throw std::invalid_argument("mtp depth_cooldown must be >= 0");
             }
+            else if (key == "depth_promote_windows")
+            {
+                config.mtp.depth_policy.promote_consecutive_windows = std::stoi(value);
+                if (config.mtp.depth_policy.promote_consecutive_windows <= 0)
+                    throw std::invalid_argument("mtp depth_promote_windows must be > 0");
+            }
             else if (key == "depth_promote_full_accept")
             {
                 config.mtp.depth_policy.promote_full_accept_rate = std::stod(value);
@@ -1833,6 +1839,21 @@ namespace llaminar2
                         c.mtp.depth_policy.promote_full_accept_rate > 1.0)
                     {
                         throw std::invalid_argument("--mtp-depth-promote-full-accept must be in [0, 1]");
+                    }
+                }),
+        });
+        spec.add({
+            .long_name = "--mtp-depth-promote-windows",
+            .category = "MTP",
+            .value_label = "<n>",
+            .description = "Consecutive promotable windows required before adaptive MTP depth promotion",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.mtp.depth_policy.promote_consecutive_windows = std::stoi(v);
+                    if (c.mtp.depth_policy.promote_consecutive_windows <= 0)
+                    {
+                        throw std::invalid_argument("--mtp-depth-promote-windows must be > 0");
                     }
                 }),
         });

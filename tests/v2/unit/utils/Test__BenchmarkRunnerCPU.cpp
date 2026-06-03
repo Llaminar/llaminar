@@ -690,5 +690,6 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_EQ(doc.at("config").at("mtp_depth_policy"), "dynamic");
     EXPECT_EQ(doc.at("config").at("mtp_max_draft_tokens"), 3);
     EXPECT_EQ(doc.at("config").at("mtp_depth_window"), 8);
+    EXPECT_EQ(doc.at("config").at("mtp_depth_promote_windows"), 3);
     EXPECT_EQ(doc.at("config").at("benchmark_json_output_path"), "/tmp/bench.json");
 }

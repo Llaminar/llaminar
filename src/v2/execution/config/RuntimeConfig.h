@@ -477,11 +477,12 @@ namespace llaminar2
         int max_depth = 0;     ///< 0 derives from MTPRuntimeConfig::draft_tokens.
         int initial_depth = 0; ///< 0 derives from max_depth.
         int window_size = 16;
-        int min_samples = 8;
+        int min_samples = 4;
         int cooldown_steps = 8;
+        int promote_consecutive_windows = 3;
         double promote_full_accept_rate = 1.0;
         double demote_zero_accept_rate = 0.30;
-        double demote_acceptance_rate = 0.70;
+        double demote_acceptance_rate = 0.55;
     };
 
     struct MTPRuntimeConfig

@@ -55,11 +55,12 @@ TEST(Test__PrefixMTPConfig, DefaultsAreDisabled)
     EXPECT_EQ(config.mtp.depth_policy.max_depth, 0);
     EXPECT_EQ(config.mtp.depth_policy.initial_depth, 0);
     EXPECT_EQ(config.mtp.depth_policy.window_size, 16);
-    EXPECT_EQ(config.mtp.depth_policy.min_samples, 8);
+    EXPECT_EQ(config.mtp.depth_policy.min_samples, 4);
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 8);
+    EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 3);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 1.0);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.30);
-    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.70);
+    EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);
 }
 
 TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
@@ -84,6 +85,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
         "--mtp-depth-window", "8",
         "--mtp-depth-min-samples", "4",
         "--mtp-depth-cooldown", "2",
+        "--mtp-depth-promote-windows", "3",
         "--mtp-depth-promote-full-accept", "0.70",
         "--mtp-depth-demote-zero-accept", "0.25",
         "--mtp-depth-demote-acceptance", "0.60",
@@ -111,6 +113,7 @@ TEST(Test__PrefixMTPConfig, ParserAcceptsPrefixCacheAndMTPFlags)
     EXPECT_EQ(config.mtp.depth_policy.window_size, 8);
     EXPECT_EQ(config.mtp.depth_policy.min_samples, 4);
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 2);
+    EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 3);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 0.70);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.25);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.60);
@@ -175,6 +178,7 @@ mtp:
   depth_window: 12
   depth_min_samples: 6
   depth_cooldown: 3
+  depth_promote_windows: 4
   depth_promote_full_accept: 0.8
   depth_demote_zero_accept: 0.2
   depth_demote_acceptance: 0.55
@@ -204,6 +208,7 @@ mtp:
     EXPECT_EQ(config.mtp.depth_policy.window_size, 12);
     EXPECT_EQ(config.mtp.depth_policy.min_samples, 6);
     EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, 3);
+    EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows, 4);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.promote_full_accept_rate, 0.8);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_zero_accept_rate, 0.2);
     EXPECT_DOUBLE_EQ(config.mtp.depth_policy.demote_acceptance_rate, 0.55);

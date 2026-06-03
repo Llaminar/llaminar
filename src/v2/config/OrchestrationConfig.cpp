@@ -933,6 +933,10 @@ namespace llaminar2
         {
             errors.push_back("MTP depth policy cooldown steps must be >= 0");
         }
+        if (mtp.depth_policy.promote_consecutive_windows <= 0)
+        {
+            errors.push_back("MTP depth policy promote consecutive windows must be > 0");
+        }
         auto valid_rate = [](double value)
         {
             return value >= 0.0 && value <= 1.0;
@@ -1050,6 +1054,8 @@ namespace llaminar2
         oss << "    depth_window: " << mtp.depth_policy.window_size << "\n";
         oss << "    depth_min_samples: " << mtp.depth_policy.min_samples << "\n";
         oss << "    depth_cooldown: " << mtp.depth_policy.cooldown_steps << "\n";
+        oss << "    depth_promote_windows: "
+            << mtp.depth_policy.promote_consecutive_windows << "\n";
         oss << "    depth_promote_full_accept: " << mtp.depth_policy.promote_full_accept_rate << "\n";
         oss << "    depth_demote_zero_accept: " << mtp.depth_policy.demote_zero_accept_rate << "\n";
         oss << "    depth_demote_acceptance: " << mtp.depth_policy.demote_acceptance_rate << "\n";

@@ -1250,6 +1250,7 @@ namespace
         depth_policy.window_size = 1;
         depth_policy.min_samples = 1;
         depth_policy.cooldown_steps = 0;
+        depth_policy.promote_consecutive_windows = 1;
         depth_policy.promote_full_accept_rate = 0.75;
 
         auto [runner, mock] = createRunner(
