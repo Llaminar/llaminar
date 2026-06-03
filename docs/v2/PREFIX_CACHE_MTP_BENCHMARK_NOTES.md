@@ -93,6 +93,19 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- Fresh dense-sidecar MoE epoch narrowing on 2026-06-03: MTP depth-0 sidecar
+  graph caches now key on MoE placement epoch only when the sidecar graph
+  actually contains MoE expert weights. Dense sidecars use epoch key `0`, so
+  attached rebalance controllers or unrelated MoE placement churn no longer
+  force dense MTP graph reconstruction. Real MoE MTP sidecars remain
+  epoch-sensitive and rebuild on actual placement changes. Focused regressions
+  passed:
+  `V2_Unit_MTPGraphConstruction` and `V2_Unit_PrefillDecodeTransition`.
+  `V2_Unit_MTPGraphConstruction` now includes paired cache-counter tests:
+  `DenseSidecarGraphCacheIgnoresMoEPlacementEpochChanges` expects one miss and
+  two hits under epoch `0`, while
+  `MoESidecarGraphCacheMissesWhenMoEPlacementEpochChanges` expects a fresh miss
+  under epoch `1`.
 - Fresh ROCm deeper-draft ratchet on 2026-06-03: after the tiny FP32 GDN
   alpha/beta path, the same Qwen3.6 dense 27B Q4_K_S lane was rechecked for
   depth-2 and depth-3 MTP on `rocm:0`, GPU graphs enabled,
