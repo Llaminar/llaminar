@@ -351,6 +351,51 @@ namespace llaminar2
         }
 
         /**
+         * @brief Sample several contiguous verifier-logit rows in greedy mode.
+         *
+         * Implementations may use a backend batched argmax to avoid one
+         * host/device synchronization per row. The default preserves the
+         * existing contract by sampling each row individually, with a host-side
+         * greedy scan fallback when all-position logits are already CPU-visible.
+         */
+        virtual bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            int start_row,
+            int row_count,
+            int32_t *out_tokens)
+        {
+            if (start_row < 0 || row_count <= 0 || !out_tokens)
+                return false;
+
+            const float *all_logits = getAllPositionLogits();
+            const int vocab = vocab_size();
+            for (int i = 0; i < row_count; ++i)
+            {
+                const int row = start_row + i;
+                int token = sampleGreedyFromAllPositionLogitsOnDevice(row);
+                if (token < 0 && all_logits && vocab > 0)
+                {
+                    const float *row_logits =
+                        all_logits + static_cast<size_t>(row) * static_cast<size_t>(vocab);
+                    int best = 0;
+                    float best_value = row_logits[0];
+                    for (int col = 1; col < vocab; ++col)
+                    {
+                        if (row_logits[col] > best_value)
+                        {
+                            best_value = row_logits[col];
+                            best = col;
+                        }
+                    }
+                    token = best;
+                }
+                if (token < 0)
+                    return false;
+                out_tokens[i] = static_cast<int32_t>(token);
+            }
+            return true;
+        }
+
+        /**
          * @brief Batched forward pass
          *
          * Process multiple sequences in parallel with automatic padding.

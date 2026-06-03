@@ -321,6 +321,11 @@ namespace llaminar2
         const float *data, int n, float *out_value, int *out_index,
         float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream);
+    extern "C" bool rocmOps_argmax_f32_batched_rows(
+        const float *data, int rows, int cols, int row_stride,
+        float *out_values, int *out_indices,
+        float *partial_vals, int *partial_idxs, int partial_capacity,
+        int device_idx, void *stream);
 
     bool ROCmBackend::argmaxF32(const void *data_device, int n, int device_id,
                                 float *out_value, int *out_index, void *stream,
@@ -349,6 +354,7 @@ namespace llaminar2
                 bufs.value_ptr = nullptr;
                 return false;
             }
+            bufs.allocated_count = 1;
         }
 
         // Launch kernel on device's managed stream
@@ -376,6 +382,83 @@ namespace llaminar2
         HIP_CHECK_OR_THROW(hipMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost, s));
         HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
 
+        return true;
+    }
+
+    bool ROCmBackend::argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
+                                           float *out_values, int *out_indices, void *stream,
+                                           void *partial_vals, void *partial_idxs, int partial_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            rows <= 0 || cols <= 0 || !out_values || !out_indices)
+        {
+            return false;
+        }
+
+        if (!partial_vals || !partial_idxs || partial_capacity < rows)
+        {
+            LOG_ERROR("[ROCmBackend::argmaxF32BatchedRows] missing arena-owned partial scratch "
+                      << "(rows=" << rows << " capacity=" << partial_capacity << ")");
+            return false;
+        }
+
+        if (argmax_buffers_.empty())
+            argmax_buffers_.resize(device_count_);
+
+        auto &bufs = argmax_buffers_[device_id];
+        if (!bufs.value_ptr || bufs.allocated_count < rows)
+        {
+            HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+            if (bufs.value_ptr)
+                HIP_WARN_IF_FAIL(hipFree(bufs.value_ptr));
+            if (bufs.index_ptr)
+                HIP_WARN_IF_FAIL(hipFree(bufs.index_ptr));
+            bufs.value_ptr = nullptr;
+            bufs.index_ptr = nullptr;
+            bufs.allocated_count = 0;
+
+            HIP_CHECK_OR_THROW(hipMalloc(&bufs.value_ptr, static_cast<size_t>(rows) * sizeof(float)));
+            hipError_t err = hipMalloc(&bufs.index_ptr, static_cast<size_t>(rows) * sizeof(int));
+            if (err != hipSuccess)
+            {
+                HIP_WARN_IF_FAIL(hipFree(bufs.value_ptr));
+                bufs.value_ptr = nullptr;
+                LOG_ERROR("[ROCmBackend::argmaxF32BatchedRows] hipMalloc indices failed: "
+                          << hipGetErrorString(err));
+                return false;
+            }
+            bufs.allocated_count = rows;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        hipStream_t s = resolveStream(device_id, stream);
+        if (!rocmOps_argmax_f32_batched_rows(
+                static_cast<const float *>(data_device),
+                rows,
+                cols,
+                cols,
+                static_cast<float *>(bufs.value_ptr),
+                static_cast<int *>(bufs.index_ptr),
+                static_cast<float *>(partial_vals),
+                static_cast<int *>(partial_idxs),
+                partial_capacity,
+                device_id,
+                s))
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(out_values,
+                                          bufs.value_ptr,
+                                          static_cast<size_t>(rows) * sizeof(float),
+                                          hipMemcpyDeviceToHost,
+                                          s));
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(out_indices,
+                                          bufs.index_ptr,
+                                          static_cast<size_t>(rows) * sizeof(int),
+                                          hipMemcpyDeviceToHost,
+                                          s));
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
         return true;
     }
 

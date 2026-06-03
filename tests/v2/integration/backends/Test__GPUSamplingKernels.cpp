@@ -156,6 +156,29 @@ namespace
                                        argmax_partial_idxs_, argmax_partial_capacity_);
         }
 
+        bool argmaxF32BatchedRows(void *d_ptr, int rows, int cols, int device_id,
+                                  float *out_values, int *out_indices)
+        {
+            if (!argmax_partial_vals_)
+            {
+                argmax_partial_capacity_ = 1024;
+                argmax_partial_vals_ =
+                    backend_->allocate(argmax_partial_capacity_ * sizeof(float), device_id_);
+                argmax_partial_idxs_ =
+                    backend_->allocate(argmax_partial_capacity_ * sizeof(int), device_id_);
+            }
+            return backend_->argmaxF32BatchedRows(d_ptr,
+                                                  rows,
+                                                  cols,
+                                                  device_id,
+                                                  out_values,
+                                                  out_indices,
+                                                  nullptr,
+                                                  argmax_partial_vals_,
+                                                  argmax_partial_idxs_,
+                                                  argmax_partial_capacity_);
+        }
+
         IBackend *backend_ = nullptr;
         int device_id_ = 0;
 
@@ -503,6 +526,42 @@ namespace
 
         EXPECT_EQ(out_index, 0);
         EXPECT_FLOAT_EQ(out_value, 42.0f);
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Argmax_BatchedRows)
+    {
+        constexpr int rows = 4;
+        constexpr int cols = 4096;
+        std::vector<float> logits(static_cast<size_t>(rows) * static_cast<size_t>(cols), -7.0f);
+        const int expected[rows] = {17, 2048, 4095, 0};
+        for (int row = 0; row < rows; ++row)
+        {
+            logits[static_cast<size_t>(row) * static_cast<size_t>(cols) +
+                   static_cast<size_t>(expected[row])] =
+                100.0f + static_cast<float>(row);
+        }
+        logits[static_cast<size_t>(3) * static_cast<size_t>(cols) + 1234] =
+            logits[static_cast<size_t>(3) * static_cast<size_t>(cols)];
+
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        float out_values[rows] = {};
+        int out_indices[rows] = {-1, -1, -1, -1};
+        ASSERT_TRUE(argmaxF32BatchedRows(d_ptr, rows, cols, device_id_, out_values, out_indices))
+            << "argmaxF32BatchedRows not supported on " << GetParam();
+
+        for (int row = 0; row < rows; ++row)
+        {
+            EXPECT_EQ(out_indices[row], expected[row]) << "row=" << row;
+            EXPECT_FLOAT_EQ(
+                out_values[row],
+                logits[static_cast<size_t>(row) * static_cast<size_t>(cols) +
+                       static_cast<size_t>(expected[row])])
+                << "row=" << row;
+        }
 
         freeDevice(d_ptr);
     }

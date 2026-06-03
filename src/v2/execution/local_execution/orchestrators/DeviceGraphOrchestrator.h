@@ -1505,6 +1505,10 @@ namespace llaminar2
         bool supportsMTPTokenCoordination() const override;
         int sampleGreedyFromMTPLogitsOnDevice() override;
         int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
+        bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            int start_row,
+            int row_count,
+            int32_t *out_tokens) override;
 
         /**
          * @brief Get current position offset for a sequence

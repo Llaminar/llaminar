@@ -794,6 +794,7 @@ namespace llaminar2
                 bufs.value_ptr = nullptr;
                 return false;
             }
+            bufs.allocated_count = 1;
         }
 
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));

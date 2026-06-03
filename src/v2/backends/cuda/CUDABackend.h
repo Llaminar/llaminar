@@ -140,6 +140,7 @@ namespace llaminar2
         {
             void *value_ptr = nullptr;
             void *index_ptr = nullptr;
+            int allocated_count = 0;
         };
         std::vector<ArgmaxDeviceBuffers> argmax_buffers_;
 

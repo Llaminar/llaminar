@@ -374,6 +374,37 @@ namespace
             return greedyArgmax(all_position_logits_.data() + offset, VOCAB_SIZE);
         }
 
+        bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            int start_row,
+            int row_count,
+            int32_t *out_tokens) override
+        {
+            ++sample_all_position_logits_batched_count_;
+            last_sample_all_position_start_row_ = start_row;
+            last_sample_all_position_row_count_ = row_count;
+            if (!supports_mtp_token_coordination_)
+            {
+                return IInferenceRunner::sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                    start_row, row_count, out_tokens);
+            }
+            if (start_row < 0 || row_count <= 0 || !out_tokens || all_position_logits_.empty())
+            {
+                return false;
+            }
+            for (int i = 0; i < row_count; ++i)
+            {
+                const int row = start_row + i;
+                const size_t offset = static_cast<size_t>(row) * static_cast<size_t>(VOCAB_SIZE);
+                if (offset + static_cast<size_t>(VOCAB_SIZE) > all_position_logits_.size())
+                    return false;
+                const int token = greedyArgmax(all_position_logits_.data() + offset, VOCAB_SIZE);
+                if (token < 0)
+                    return false;
+                out_tokens[i] = static_cast<int32_t>(token);
+            }
+            return true;
+        }
+
         int vocab_size() const override { return VOCAB_SIZE; }
 
         void clear_cache() override
@@ -432,6 +463,9 @@ namespace
         int sampleMainLogitsCount() const { return sample_main_logits_count_; }
         int sampleMTPLogitsCount() const { return sample_mtp_logits_count_; }
         int sampleAllPositionLogitsCount() const { return sample_all_position_logits_count_; }
+        int sampleAllPositionLogitsBatchedCount() const { return sample_all_position_logits_batched_count_; }
+        int lastSampleAllPositionStartRow() const { return last_sample_all_position_start_row_; }
+        int lastSampleAllPositionRowCount() const { return last_sample_all_position_row_count_; }
         const PrefixStateSnapshot &lastRestoredSnapshot() const { return last_restored_snapshot_; }
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
         const std::vector<std::vector<int>> &forwardHistory() const { return forward_history_; }
@@ -656,6 +690,9 @@ namespace
         int sample_main_logits_count_{0};
         int sample_mtp_logits_count_{0};
         int sample_all_position_logits_count_{0};
+        int sample_all_position_logits_batched_count_{0};
+        int last_sample_all_position_start_row_{-1};
+        int last_sample_all_position_row_count_{0};
         int last_mtp_condition_token_{-1};
         int last_chained_mtp_condition_token_{-1};
         int last_chained_mtp_position_id_{-1};
@@ -1893,7 +1930,10 @@ namespace
         EXPECT_EQ(mock->lastMTPConditionToken(), MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
         EXPECT_GE(mock->sampleMainLogitsCount(), 1);
         EXPECT_EQ(mock->sampleMTPLogitsCount(), 1);
-        EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 2);
+        EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 0);
+        EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
+        EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
+        EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 2);
 
         auto probe = runner->prefixStateProbe();
         EXPECT_FALSE(probe.mtp_bypassed);

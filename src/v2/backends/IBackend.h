@@ -595,6 +595,51 @@ namespace llaminar2
         }
 
         /**
+         * @brief GPU-side greedy argmax for several contiguous FP32 rows.
+         *
+         * @param data_device Device pointer to row-major FP32 data.
+         * @param rows Number of rows to sample.
+         * @param cols Number of columns per row.
+         * @param device_id Device where data resides.
+         * @param out_values Host buffer [rows] for max values.
+         * @param out_indices Host buffer [rows] for row-local argmax indices.
+         * @param stream Optional device stream to enqueue work on.
+         * @param partial_vals Device scratch shared across rows. Backends that
+         *        implement a fused batched kernel should partition this scratch
+         *        internally. The default implementation calls argmaxF32() once
+         *        per row, preserving existing backend behavior.
+         * @param partial_idxs Device scratch paired with @p partial_vals.
+         * @param partial_capacity Number of entries in each scratch buffer.
+         * @return true if every row was sampled on device.
+         */
+        virtual bool argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
+                                          float *out_values, int *out_indices, void *stream = nullptr,
+                                          void *partial_vals = nullptr, void *partial_idxs = nullptr,
+                                          int partial_capacity = 0)
+        {
+            if (!data_device || rows <= 0 || cols <= 0 || !out_values || !out_indices)
+                return false;
+
+            const auto *base = static_cast<const float *>(data_device);
+            for (int row = 0; row < rows; ++row)
+            {
+                if (!argmaxF32(base + static_cast<size_t>(row) * static_cast<size_t>(cols),
+                               cols,
+                               device_id,
+                               out_values + row,
+                               out_indices + row,
+                               stream,
+                               partial_vals,
+                               partial_idxs,
+                               partial_capacity))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
          * @brief GPU-side top-k selection over FP32 data
          *
          * Finds the k largest elements (value and index) entirely on the GPU.

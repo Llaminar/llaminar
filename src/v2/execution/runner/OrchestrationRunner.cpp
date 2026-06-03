@@ -1210,32 +1210,22 @@ namespace llaminar2
             return fail_after_checkpoint("Failed to disable all-position logits after MTP verification");
         }
 
-        auto sample_verifier_row = [&](int row) -> int32_t
+        std::vector<int32_t> sampled_verifier_tokens(draft_tokens.size(), -1);
         {
+            PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_tokens_batched", "decode");
+            if (!runner_->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                    0,
+                    static_cast<int>(sampled_verifier_tokens.size()),
+                    sampled_verifier_tokens.data()))
             {
-                PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_token_device", "decode");
-                const int32_t token = runner_->sampleGreedyFromAllPositionLogitsOnDevice(row);
-                if (token >= 0)
-                {
-                    PerfStatsCollector::addCounter("mtp", "verifier_token_device_samples", 1.0, "decode");
-                    return token;
-                }
+                return fail_after_checkpoint("All-position logits unavailable after MTP verification");
             }
-
-            PerfStatsCollector::addCounter("mtp", "verifier_token_host_sampling_fallbacks", 1.0, "decode");
-            const float *all_logits = runner_->getAllPositionLogits();
-            if (!all_logits)
-            {
-                return -1;
-            }
-            const float *verify_row =
-                all_logits + static_cast<size_t>(row) * static_cast<size_t>(vocab);
-            PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_token_host", "decode");
-            return sampler_.sample(
-                verify_row,
-                static_cast<size_t>(vocab),
-                active_sampling_params_);
-        };
+        }
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "verifier_token_samples_batched",
+            static_cast<double>(sampled_verifier_tokens.size()),
+            "decode");
 
         std::vector<int32_t> accepted_tokens;
         accepted_tokens.push_back(first_token);
@@ -1248,7 +1238,10 @@ namespace llaminar2
         for (int draft_idx = 1; draft_idx < static_cast<int>(draft_tokens.size()); ++draft_idx)
         {
             const int row = draft_idx - 1;
-            const int32_t verified_token = sample_verifier_row(row);
+            const int32_t verified_token =
+                (row >= 0 && row < static_cast<int>(sampled_verifier_tokens.size()))
+                    ? sampled_verifier_tokens[static_cast<size_t>(row)]
+                    : -1;
             if (verified_token < 0)
             {
                 return fail_after_checkpoint("All-position logits unavailable after MTP verification");
@@ -1371,32 +1364,16 @@ namespace llaminar2
         {
             int32_t next_ready_token = -1;
             const int terminal_row = static_cast<int>(draft_tokens.size()) - 1;
+            if (terminal_row >= 0 &&
+                terminal_row < static_cast<int>(sampled_verifier_tokens.size()))
             {
-                PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_terminal_token_device", "decode");
-                next_ready_token = runner_->sampleGreedyFromAllPositionLogitsOnDevice(terminal_row);
+                next_ready_token = sampled_verifier_tokens[static_cast<size_t>(terminal_row)];
             }
             if (next_ready_token < 0)
             {
-                PerfStatsCollector::addCounter("mtp", "verifier_terminal_token_host_sampling_fallbacks", 1.0, "decode");
-                const float *all_logits = runner_->getAllPositionLogits();
-                if (!all_logits)
-                {
-                    return fail_after_checkpoint("All-position terminal logits unavailable after accepted MTP verification");
-                }
-                const float *terminal_logits =
-                    all_logits + static_cast<size_t>(terminal_row) * static_cast<size_t>(vocab);
-                {
-                    PerfStatsCollector::ScopedTimer timer("mtp", "sample_verifier_terminal_token_host", "decode");
-                    next_ready_token = sampler_.sample(
-                        terminal_logits,
-                        static_cast<size_t>(vocab),
-                        active_sampling_params_);
-                }
+                return fail_after_checkpoint("All-position terminal logits unavailable after accepted MTP verification");
             }
-            else
-            {
-                PerfStatsCollector::addCounter("mtp", "verifier_terminal_token_device_samples", 1.0, "decode");
-            }
+            PerfStatsCollector::addCounter("mtp", "verifier_terminal_token_batch_hits", 1.0, "decode");
 
             if (!runner_->commitMTPShiftedRowsFromLastForward(
                     accepted_tokens.data(),

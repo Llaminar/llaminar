@@ -150,6 +150,117 @@ __global__ void rocm_argmax_finalize_f32_kernel(
     }
 }
 
+__global__ void rocm_argmax_partial_f32_batched_rows_kernel(
+    const float *__restrict__ data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *__restrict__ partial_vals,
+    int *__restrict__ partial_idxs,
+    int row_partial_capacity)
+{
+    extern __shared__ char shared_mem[];
+    float *smax = reinterpret_cast<float *>(shared_mem);
+    int *sidx = reinterpret_cast<int *>(shared_mem + blockDim.x * sizeof(float));
+
+    const int row = blockIdx.y;
+    if (row >= rows)
+        return;
+
+    const int tid = threadIdx.x;
+    const int gid = blockIdx.x * blockDim.x + tid;
+    const int grid_stride = blockDim.x * gridDim.x;
+    const float *row_data = data + static_cast<size_t>(row) * static_cast<size_t>(row_stride);
+
+    float local_max = -FLT_MAX;
+    int local_idx = 0;
+    for (int i = gid; i < cols; i += grid_stride)
+    {
+        const float val = row_data[i];
+        if (val > local_max)
+        {
+            local_max = val;
+            local_idx = i;
+        }
+    }
+
+    smax[tid] = local_max;
+    sidx[tid] = local_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            if (smax[tid + stride] > smax[tid])
+            {
+                smax[tid] = smax[tid + stride];
+                sidx[tid] = sidx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+        const int offset = row * row_partial_capacity + blockIdx.x;
+        partial_vals[offset] = smax[0];
+        partial_idxs[offset] = sidx[0];
+    }
+}
+
+__global__ void rocm_argmax_finalize_f32_batched_rows_kernel(
+    const float *__restrict__ partial_vals,
+    const int *__restrict__ partial_idxs,
+    int num_partials,
+    int row_partial_capacity,
+    float *__restrict__ out_values,
+    int *__restrict__ out_indices)
+{
+    extern __shared__ char shared_mem[];
+    float *smax = reinterpret_cast<float *>(shared_mem);
+    int *sidx = reinterpret_cast<int *>(shared_mem + blockDim.x * sizeof(float));
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int base = row * row_partial_capacity;
+
+    float local_max = -FLT_MAX;
+    int local_idx = 0;
+    for (int i = tid; i < num_partials; i += blockDim.x)
+    {
+        const float val = partial_vals[base + i];
+        if (val > local_max)
+        {
+            local_max = val;
+            local_idx = partial_idxs[base + i];
+        }
+    }
+
+    smax[tid] = local_max;
+    sidx[tid] = local_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
+    {
+        if (tid < stride)
+        {
+            if (smax[tid + stride] > smax[tid])
+            {
+                smax[tid] = smax[tid + stride];
+                sidx[tid] = sidx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+        out_values[row] = smax[0];
+        out_indices[row] = sidx[0];
+    }
+}
+
 // ============================================================================
 // Extern "C" Wrapper
 // ============================================================================
@@ -236,6 +347,67 @@ bool rocmOps_argmax_f32(
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Argmax FP32 (multi-block) launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_argmax_f32_batched_rows(
+    const float *data,
+    int rows,
+    int cols,
+    int row_stride,
+    float *out_values,
+    int *out_indices,
+    float *partial_vals,
+    int *partial_idxs,
+    int partial_capacity,
+    int device_idx,
+    void *stream)
+{
+    if (rows <= 0 || cols <= 0 || row_stride < cols ||
+        !data || !out_values || !out_indices ||
+        !partial_vals || !partial_idxs || partial_capacity < rows)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipStream_t s = static_cast<hipStream_t>(stream);
+
+    const int row_partial_capacity = partial_capacity / rows;
+    if (row_partial_capacity < 1)
+        return false;
+
+    const int threads = ARGMAX_REDUCE_THREADS;
+    const long per_block = static_cast<long>(threads) * ARGMAX_ELEMS_PER_THREAD;
+    long blocks = (static_cast<long>(cols) + per_block - 1) / per_block;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > row_partial_capacity)
+        blocks = row_partial_capacity;
+    const int num_blocks = static_cast<int>(blocks);
+
+    const size_t smem1 = threads * (sizeof(float) + sizeof(int));
+    hipLaunchKernelGGL(
+        rocm_argmax_partial_f32_batched_rows_kernel,
+        dim3(num_blocks, rows), dim3(threads), smem1, s,
+        data, rows, cols, row_stride, partial_vals, partial_idxs,
+        row_partial_capacity);
+
+    const int fthreads = ARGMAX_FINALIZE_THREADS;
+    const size_t smem2 = fthreads * (sizeof(float) + sizeof(int));
+    hipLaunchKernelGGL(
+        rocm_argmax_finalize_f32_batched_rows_kernel,
+        dim3(rows), dim3(fthreads), smem2, s,
+        partial_vals, partial_idxs, num_blocks, row_partial_capacity,
+        out_values, out_indices);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm Argmax FP32 batched rows launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }

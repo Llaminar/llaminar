@@ -51,6 +51,7 @@
 #include "transfer/TransferEngine.h"
 #include <chrono>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -4551,6 +4552,113 @@ namespace llaminar2
         }
 
         return -1;
+    }
+
+    bool DeviceGraphOrchestrator::sampleGreedyFromAllPositionLogitsOnDeviceRows(
+        int start_row,
+        int row_count,
+        int32_t *out_tokens)
+    {
+        if (start_row < 0 || row_count <= 0 || !out_tokens)
+            return false;
+
+        const IGlobalTPContext *global_ctx = globalTPContextForMTPCoordination();
+        if (global_ctx && global_ctx->degree() > 1)
+        {
+            return IInferenceRunner::sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                start_row, row_count, out_tokens);
+        }
+
+        TensorBase *tensor = nullptr;
+        int token_offset = 0;
+        if (state_.all_position_logits)
+        {
+            tensor = state_.all_position_logits.get();
+        }
+        else if (state_.all_position_logits_local)
+        {
+            tensor = state_.all_position_logits_local.get();
+            token_offset = graph_builder_
+                               ? vocabOffsetForTPConfig(graph_builder_->config())
+                               : 0;
+        }
+        if (!tensor)
+            return false;
+
+        constexpr int kMaxStackVerifierRows = 16;
+        if (row_count > kMaxStackVerifierRows)
+        {
+            return IInferenceRunner::sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                start_row, row_count, out_tokens);
+        }
+
+        const auto &shape = tensor->shape();
+        if (shape.empty())
+            return false;
+        const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+        const size_t cols = shape.size() >= 2 ? shape[1] : shape[0];
+        if (cols == 0 ||
+            static_cast<size_t>(start_row) >= rows ||
+            static_cast<size_t>(start_row + row_count) > rows ||
+            cols > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            return false;
+        }
+
+        auto device_opt = tensor->current_device();
+        if (device_opt.has_value() && device_opt->is_gpu() && tensor->deviceValid())
+        {
+            IBackend *backend = getBackendFor(*device_opt);
+            const void *gpu_ptr = tensor->gpu_data_ptr();
+            if (!backend || !gpu_ptr)
+                return false;
+
+            const auto *base = static_cast<const float *>(gpu_ptr);
+            const void *first_row =
+                base + static_cast<size_t>(start_row) * static_cast<size_t>(cols);
+            std::array<float, kMaxStackVerifierRows> values{};
+            std::array<int, kMaxStackVerifierRows> indices{};
+            const bool ok = backend->argmaxF32BatchedRows(
+                first_row,
+                row_count,
+                static_cast<int>(cols),
+                device_opt->gpu_ordinal(),
+                values.data(),
+                indices.data(),
+                nullptr,
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_);
+            if (!ok)
+            {
+                if (backend->backendDeviceType() == DeviceType::ROCm)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] ROCm batched verifier argmax failed");
+                    return false;
+                }
+                return IInferenceRunner::sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                    start_row, row_count, out_tokens);
+            }
+
+            for (int i = 0; i < row_count; ++i)
+            {
+                if (indices[static_cast<size_t>(i)] < 0)
+                    return false;
+                out_tokens[i] = static_cast<int32_t>(
+                    token_offset + indices[static_cast<size_t>(i)]);
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "verifier_token_device_batch_samples",
+                static_cast<double>(row_count),
+                "decode",
+                state_.device_id.toString(),
+                {{"rows", std::to_string(row_count)}});
+            return true;
+        }
+
+        return IInferenceRunner::sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            start_row, row_count, out_tokens);
     }
 
     PrefixRuntimeStateSnapshot DeviceGraphOrchestrator::prefixStateProbe() const
