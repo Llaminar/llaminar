@@ -112,6 +112,25 @@ Latest graph-atomic small-M hardening validation:
   passed with GPU graphs enabled, and the existing depth-1
   `MTPGreedyMatchesPyTorchDecodeTokens` plus `PrefixCacheMTPRestore` cells also
   stayed green after the helper change.
+- Fresh both-shortcuts diagnostic counter check on 2026-06-03: Qwen3.6 dense
+  27B Q4_K_S on `rocm:0`, GPU graphs and GPU stage timing enabled,
+  `The quick brown fox`, `-c 64`, `-n 8`, depth-3 MTP. Artifacts are
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnshortcut-noresegment-stagegpu-mtp-d3-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnshortcut-noresegment-stagegpu-mtp-d3-c64-n8-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnshortcut-noresegment-stagegpu-mtp-d3-c64-n8-stats.csv`.
+  This is not a speed-ratchet run because stage timing intentionally adds
+  overhead; it reached 33.91 decode tok/s only as a diagnostic lane. Structured
+  counters proved both current fast paths in the real dense verifier:
+  `forward_graph.post_warmup_resegment{reason=not_required}=15`, six
+  `rollback_verifier_state_row_shortcuts`, six
+  `verifier_state_row_restores` over 48 GDN layers, and
+  `restore_verifier_state_row` averaging about 211 us. The same artifact also
+  proved active M=4 native-VNNI small-M batched routes and tiny FP32 alpha/beta
+  projection calls. The remaining measured GPU buckets under stage timing are
+  ordinary GEMM, fused Gate/Up, GDN projection/recurrence, and LM head; a few
+  partial-commit suffix replays still cost full verifier forwards when the
+  accepted prefix does not cover the whole output set.
 - Fresh ROCm tiny FP32 alpha/beta plus GDN verifier-row shortcut evidence on
   2026-06-03: Qwen3.6 dense 27B Q4_K_S on `rocm:0`, GPU graphs enabled,
   `The quick brown fox`, `-c 64`, `-n 48`, depth-1 MTP. Baseline artifact
