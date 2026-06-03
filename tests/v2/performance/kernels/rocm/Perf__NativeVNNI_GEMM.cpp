@@ -130,7 +130,7 @@ namespace
     static int NUM_GPUS = 1;
 
     // =============================================================================
-    // Format descriptors (sprint: Q4_0 and IQ4_NL only)
+    // Format descriptors covered by the native-VNNI small-M perf matrix.
     // =============================================================================
 
     struct GEMMFormatSpec
@@ -152,6 +152,10 @@ namespace
          { return TestTensorFactory::createQ5_0Random({N, K}); }},
         {"Q5_1", 6.0, [](size_t N, size_t K)
          { return TestTensorFactory::createQ5_1Random({N, K}); }},
+        {"Q4_K", 4.5, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ4_KRandom({N, K}); }},
+        {"Q5_K", 5.5, [](size_t N, size_t K)
+         { return TestTensorFactory::createQ5_KRandom({N, K}); }},
         {"Q6_K", 6.5625, [](size_t N, size_t K)
          { return TestTensorFactory::createQ6_KRandom({N, K}); }},
         {"Q3_K", 3.4375, [](size_t N, size_t K)
@@ -1873,6 +1877,8 @@ namespace
         };
 
         const std::vector<GDNProjectionGroup> groups = {
+            {"Qwen36_GDN_Q4K_qkv_z", "Q4_K", {10240, 6144}},
+            {"Qwen36_GDN_Q5K_qkv_z", "Q5_K", {10240, 6144}},
             {"Qwen36_GDN_Q4_1_qkv_z_a", "Q4_1", {12288, 6144, 1024}},
             {"Qwen36_GDN_Q5_1_z_a", "Q5_1", {10240, 1024}},
         };
@@ -1966,7 +1972,7 @@ namespace
         fprintf(stderr, "[NativeVNNI GEMM] Device: %s\n", device_name_.c_str());
         fprintf(stderr, "[NativeVNNI GEMM] Signal: speedup = small-M route / direct prefill+quant route (>1 means direct prefill is faster)\n");
 
-        const std::vector<std::string> selected_formats = {"Q4_1", "Q5_1"};
+        const std::vector<std::string> selected_formats = {"Q4_1", "Q5_1", "Q4_K", "Q5_K"};
         const std::vector<std::string> selected_shapes = {
             "Qwen36_FFN_DownProjection",
             "Qwen36_GDN_OutputProjection",

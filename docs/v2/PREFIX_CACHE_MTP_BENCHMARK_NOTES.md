@@ -91,6 +91,18 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- Fresh Phase 13.5 real GDN projection perf coverage on 2026-06-03:
+  `NativeVNNIGEMMPerfTest.MTP_SmallM_BatchedGDNProjectionShapes` now includes
+  the measured Qwen3.6 hot-path groups `Q4_K/Q5_K qkv+z` with
+  `N={10240,6144}`, not only synthetic `Q4_1/Q5_1` projection bundles. The
+  focused release perf test passed on ROCm. Minimum timings on the current MI60
+  lane were Q4_K `qkv+z`: 109.6 us at M=2, 122.4 us at M=3/M=4; and Q5_K
+  `qkv+z`: 153.9 us at M=2, 170.6 us at M=3, 182.4 us at M=4, all with cosine
+  1.0. `NativeVNNIGEMMPerfTest.MTP_SmallM_DirectPrefillRouteComparison` now
+  also includes Q4_K/Q5_K and passed: small-M stays much faster than direct
+  prefill+quant for the FFN-down and GDN-output verifier shapes. This locks in
+  the next optimization target as native small-M throughput, especially Q5_K and
+  mixed-codebook GDN, rather than a fallback to generic prefill routing.
 - Fresh dense post-warmup resegment-skip recheck on `rocm:0`, 2026-06-03:
   Qwen3.6 dense 27B Q4_K_S, GPU graphs enabled, `The quick brown fox`,
   `-c 64`, `-n 48`, depth-1 MTP. Benchmark artifact
