@@ -2368,6 +2368,7 @@ namespace
         sampling.temperature = 0.8f;
         sampling.top_k = 2;
         sampling.top_p = 0.95f;
+        sampling.presence_penalty = 0.25f;
         sampling.seed = 123;
         runner->setSamplingParams(sampling);
 
@@ -2414,6 +2415,7 @@ namespace
         sampling.temperature = 0.8f;
         sampling.top_k = 2;
         sampling.top_p = 0.95f;
+        sampling.presence_penalty = 0.25f;
         sampling.seed = 123;
         runner->setSamplingParams(sampling);
 
@@ -2449,6 +2451,7 @@ namespace
         sampling.temperature = 0.8f;
         sampling.top_k = 2;
         sampling.top_p = 0.95f;
+        sampling.presence_penalty = 0.25f;
         sampling.seed = 123;
         runner->setSamplingParams(sampling);
 

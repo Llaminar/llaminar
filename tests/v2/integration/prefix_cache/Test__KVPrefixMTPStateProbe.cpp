@@ -427,6 +427,7 @@ namespace
         stochastic.temperature = 0.6f;
         stochastic.top_k = 20;
         stochastic.top_p = 0.95f;
+        stochastic.presence_penalty = 0.25f;
         stochastic.seed = 123;
 
         auto result = runner->generate(prompt, 6, stochastic);
