@@ -427,6 +427,11 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
 
     MoERoutingStage unprepared_stage(params);
     EXPECT_FALSE(unprepared_stage.isGraphCapturable());
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(unprepared_stage.requiresPostWarmupGraphSegmentRebuild());
+#else
+    EXPECT_FALSE(unprepared_stage.requiresPostWarmupGraphSegmentRebuild());
+#endif
 
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
     ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
@@ -434,8 +439,10 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
     MoERoutingStage prepared_stage(params);
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
     EXPECT_TRUE(prepared_stage.isGraphCapturable());
+    EXPECT_FALSE(prepared_stage.requiresPostWarmupGraphSegmentRebuild());
 #else
     EXPECT_FALSE(prepared_stage.isGraphCapturable());
+    EXPECT_FALSE(prepared_stage.requiresPostWarmupGraphSegmentRebuild());
 #endif
 }
 

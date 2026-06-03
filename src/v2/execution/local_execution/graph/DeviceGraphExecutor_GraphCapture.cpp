@@ -597,7 +597,7 @@ namespace llaminar2
             // lazy kernel initialization and workspace allocation complete
             // on the capture stream.
             const bool warmup_ok = executeFastDecode(graph, ctx, collective_nodes);
-            if (warmup_ok)
+            if (warmup_ok && segment_cache.post_warmup_resegment_required)
             {
                 // Some stages become capturable only after warmup seeds their
                 // persistent runtime state. MoE decode is the important case:
@@ -611,6 +611,23 @@ namespace llaminar2
                     collective_nodes,
                     has_collective_nodes,
                     collectives_graph_capturable);
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "post_warmup_resegment",
+                    1.0,
+                    "decode",
+                    ctx ? ctx->deviceId().toString() : std::string{},
+                    {{"reason", "stage_warmup_dependency"}});
+            }
+            else if (warmup_ok)
+            {
+                PerfStatsCollector::addCounter(
+                    "forward_graph",
+                    "post_warmup_resegment",
+                    1.0,
+                    "decode",
+                    ctx ? ctx->deviceId().toString() : std::string{},
+                    {{"reason", "not_required"}});
             }
             return warmup_ok;
         }

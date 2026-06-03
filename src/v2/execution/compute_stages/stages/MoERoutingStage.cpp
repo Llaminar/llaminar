@@ -246,6 +246,31 @@ namespace llaminar2
                isDeviceRoutedPrefillGraphCapturable();
     }
 
+    bool MoERoutingStage::requiresPostWarmupGraphSegmentRebuild() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+        return false;
+#else
+        const bool decode_supported =
+            supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+            params_.seq_len == 1 &&
+            params_.d_model > 0 &&
+            params_.num_experts > 0 &&
+            params_.top_k > 0 &&
+            params_.top_k <= params_.num_experts &&
+            params_.top_k <= DecodeExpertHistogram::MAX_TOP_K &&
+            params_.input &&
+            params_.gate_weights &&
+            params_.output_indices &&
+            params_.output_weights &&
+            params_.moe_runtime_table &&
+            params_.layer_idx >= 0;
+
+        return (decode_supported || isDeviceRoutedPrefillGraphCaptureSupported()) &&
+               !isGraphCapturable();
+#endif
+    }
+
     bool MoERoutingStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
         return isDeviceRoutedPrefillGraphCaptureSupported();

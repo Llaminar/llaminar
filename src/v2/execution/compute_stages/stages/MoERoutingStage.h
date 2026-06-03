@@ -74,6 +74,7 @@ namespace llaminar2
 
         bool allowsZeroOutput() const override { return false; }
         bool isGraphCapturable() const override;
+        bool requiresPostWarmupGraphSegmentRebuild() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override;

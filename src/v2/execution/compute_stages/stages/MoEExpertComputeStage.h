@@ -225,6 +225,7 @@ namespace llaminar2
 
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+        bool requiresPostWarmupGraphSegmentRebuild() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
@@ -394,6 +395,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+        bool requiresPostWarmupGraphSegmentRebuild() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
@@ -488,6 +490,7 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
+        bool requiresPostWarmupGraphSegmentRebuild() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;

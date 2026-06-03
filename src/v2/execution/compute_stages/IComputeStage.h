@@ -583,6 +583,18 @@ namespace llaminar2
         virtual bool isGraphCapturable() const { return true; }
 
         /**
+         * @brief Whether segmented capture should rebuild its segment plan after warmup.
+         *
+         * Most stages have stable capturability as soon as the graph is built, so
+         * the warmup plan can be used directly for the capture pass. A few MoE
+         * stages intentionally become capturable only after the first warmup
+         * execution seeds device runtime tables, descriptor tables, or scratch.
+         * Those stages return true here while they are warmup-dependent so dense
+         * decode/MTP graphs do not pay a second full graph scan for MoE readiness.
+         */
+        virtual bool requiresPostWarmupGraphSegmentRebuild() const { return false; }
+
+        /**
          * @brief Whether this manual stage must complete before a following graph segment may run.
          *
          * Segmented GPU graph execution runs non-capturable stages between

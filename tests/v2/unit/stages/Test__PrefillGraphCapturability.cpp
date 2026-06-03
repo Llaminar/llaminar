@@ -234,6 +234,11 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
 #endif
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Prefill routing should not be capturable without cached kernel";
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.requiresPostWarmupGraphSegmentRebuild());
+#else
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
+#endif
 }
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsOnCPU)
@@ -458,6 +463,11 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
 #endif
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Should not be capturable without MoE kernel";
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.requiresPostWarmupGraphSegmentRebuild());
+#else
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
+#endif
 }
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsOnCPU)
@@ -470,6 +480,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsOnCPU)
     stage.setMoEKernelForTesting(&stub_kernel_);
 
     EXPECT_FALSE(stage.isGraphCapturable());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 }
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWhenGroupedPrefillDisabled)
@@ -481,6 +492,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWhenGroupedPrefillDisabled)
     stage.setMoEKernelForTesting(&stub_kernel_);
 
     EXPECT_FALSE(stage.isGraphCapturable());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 }
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithPartialExpertOwnership)
@@ -602,6 +614,11 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportDoesNotRequire
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
 #endif
     EXPECT_FALSE(stage.isGraphCapturable());
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.requiresPostWarmupGraphSegmentRebuild());
+#else
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
+#endif
 }
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)
@@ -669,6 +686,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsInsufficientScratch)
 
     EXPECT_FALSE(stage.isGraphCapturable())
         << "SharedExpertFFN should reject when scratch is undersized for prefill";
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 }
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsWithoutKernel)
@@ -688,6 +706,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsWithoutKernel)
     // moe_kernel_ left nullptr
 
     EXPECT_FALSE(stage.isGraphCapturable());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 }
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsOnCPU)
@@ -707,6 +726,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsOnCPU)
     stage.setScratchSeqLenForTesting(SEQ_LEN);
 
     EXPECT_FALSE(stage.isGraphCapturable());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 }
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, DecodeAlwaysCapturableOnRocmWithoutScratch)
@@ -800,6 +820,11 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
 #endif
     EXPECT_FALSE(stage.isGraphCapturable());
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.requiresPostWarmupGraphSegmentRebuild());
+#else
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
+#endif
 }
 
 TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)
@@ -816,6 +841,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightSupportRejectsDisabl
 
     SharedExpertGateStage stage(params);
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 }
 
 TEST_F(SharedExpertGatePrefillGraphCapture, RejectsOnCPU)
@@ -834,6 +860,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, RejectsOnCPU)
     stage.setMoEKernelForTesting(&stub_kernel_);
 
     EXPECT_FALSE(stage.isGraphCapturable());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 }
 
 // =========================================================================
