@@ -235,8 +235,10 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Prefill routing should not be capturable without cached kernel";
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
-    EXPECT_TRUE(stage.requiresPostWarmupGraphSegmentRebuild());
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 #else
+    EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
     EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 #endif
 }
@@ -464,8 +466,10 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Should not be capturable without MoE kernel";
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
-    EXPECT_TRUE(stage.requiresPostWarmupGraphSegmentRebuild());
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 #else
+    EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
     EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 #endif
 }
@@ -615,8 +619,10 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportDoesNotRequire
 #endif
     EXPECT_FALSE(stage.isGraphCapturable());
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
-    EXPECT_TRUE(stage.requiresPostWarmupGraphSegmentRebuild());
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 #else
+    EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
     EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 #endif
 }
@@ -821,10 +827,37 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)
 #endif
     EXPECT_FALSE(stage.isGraphCapturable());
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
-    EXPECT_TRUE(stage.requiresPostWarmupGraphSegmentRebuild());
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 #else
+    EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
     EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 #endif
+}
+
+TEST_F(SharedExpertGatePrefillGraphCapture, DecodePlansWarmupDependentCaptureWithoutKernel)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    SharedExpertGateStage::Params params;
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.input = input_.get();
+    params.gate_inp = gate_inp_.get();
+    params.shared_output = shared_output_.get();
+
+    SharedExpertGateStage stage(params);
+    // moe_kernel_ left nullptr until warmup execution.
+
+    EXPECT_FALSE(stage.isGraphCapturable());
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture())
+        << "Decode shared gate should be planned capturable before warmup";
+#else
+    EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
+#endif
+    EXPECT_FALSE(stage.requiresPostWarmupGraphSegmentRebuild());
 }
 
 TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)

@@ -583,14 +583,23 @@ namespace llaminar2
         virtual bool isGraphCapturable() const { return true; }
 
         /**
+         * @brief Whether warmup can make a cold stage graph-capturable.
+         *
+         * Stages return true here when their backend and shape support graph
+         * capture in principle, but their cold isGraphCapturable() answer may
+         * remain false until the first warmup execution creates runtime tables,
+         * descriptor banks, kernels, or scratch. The segmented planner may place
+         * these stages in capturable segments before warmup; the capture phase
+         * then hard-fails if isGraphCapturable() is still false.
+         */
+        virtual bool supportsWarmupDependentGraphCapture() const { return false; }
+
+        /**
          * @brief Whether segmented capture should rebuild its segment plan after warmup.
          *
-         * Most stages have stable capturability as soon as the graph is built, so
-         * the warmup plan can be used directly for the capture pass. A few MoE
-         * stages intentionally become capturable only after the first warmup
-         * execution seeds device runtime tables, descriptor tables, or scratch.
-         * Those stages return true here while they are warmup-dependent so dense
-         * decode/MTP graphs do not pay a second full graph scan for MoE readiness.
+         * This is a legacy escape hatch for stages whose cold plan cannot be
+         * predicted safely. Prefer supportsWarmupDependentGraphCapture() for
+         * fixed-topology stages so warmup and capture use one segment plan.
          */
         virtual bool requiresPostWarmupGraphSegmentRebuild() const { return false; }
 

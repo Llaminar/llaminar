@@ -246,7 +246,7 @@ namespace llaminar2
                isDeviceRoutedPrefillGraphCapturable();
     }
 
-    bool MoERoutingStage::requiresPostWarmupGraphSegmentRebuild() const
+    bool MoERoutingStage::supportsWarmupDependentGraphCapture() const
     {
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
@@ -266,9 +266,13 @@ namespace llaminar2
             params_.moe_runtime_table &&
             params_.layer_idx >= 0;
 
-        return (decode_supported || isDeviceRoutedPrefillGraphCaptureSupported()) &&
-               !isGraphCapturable();
+        return decode_supported || isDeviceRoutedPrefillGraphCaptureSupported();
 #endif
+    }
+
+    bool MoERoutingStage::requiresPostWarmupGraphSegmentRebuild() const
+    {
+        return false;
     }
 
     bool MoERoutingStage::supportsPaddedPrefillGraphCapturePreflight() const

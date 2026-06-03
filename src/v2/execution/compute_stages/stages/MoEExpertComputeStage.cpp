@@ -2048,7 +2048,7 @@ namespace llaminar2
 #endif
     }
 
-    bool MoEExpertComputeStage::requiresPostWarmupGraphSegmentRebuild() const
+    bool MoEExpertComputeStage::supportsWarmupDependentGraphCapture() const
     {
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
@@ -2070,9 +2070,13 @@ namespace llaminar2
             hasFullLocalExpertOwnership() &&
             expertMaskAllEnabled();
 
-        return (decode_supported || supportsFixedTopologyPrefillGraphCapturePreflight()) &&
-               !isGraphCapturable();
+        return decode_supported || supportsFixedTopologyPrefillGraphCapturePreflight();
 #endif
+    }
+
+    bool MoEExpertComputeStage::requiresPostWarmupGraphSegmentRebuild() const
+    {
+        return false;
     }
 
     bool MoEExpertComputeStage::supportsPaddedPrefillGraphCapturePreflight() const
@@ -2544,7 +2548,12 @@ namespace llaminar2
 
     bool SharedExpertFFNStage::requiresPostWarmupGraphSegmentRebuild() const
     {
-        return supportsPaddedPrefillGraphCapturePreflight() && !isGraphCapturable();
+        return false;
+    }
+
+    bool SharedExpertFFNStage::supportsWarmupDependentGraphCapture() const
+    {
+        return supportsPaddedPrefillGraphCapturePreflight();
     }
 
     bool SharedExpertFFNStage::supportsPaddedPrefillGraphCapturePreflight() const
@@ -2756,9 +2765,23 @@ namespace llaminar2
 #endif
     }
 
+    bool SharedExpertGateStage::supportsWarmupDependentGraphCapture() const
+    {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+        return false;
+#else
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
+               params_.seq_len > 0 &&
+               params_.d_model > 0 &&
+               params_.input &&
+               params_.gate_inp &&
+               params_.shared_output;
+#endif
+    }
+
     bool SharedExpertGateStage::requiresPostWarmupGraphSegmentRebuild() const
     {
-        return supportsPaddedPrefillGraphCapturePreflight() && !isGraphCapturable();
+        return false;
     }
 
     bool SharedExpertGateStage::supportsPaddedPrefillGraphCapturePreflight() const

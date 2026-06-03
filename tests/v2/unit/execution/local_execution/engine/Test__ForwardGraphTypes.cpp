@@ -31,12 +31,14 @@ namespace
         FakeSegmentStage(bool capturable,
                          bool manual_boundary = false,
                          ComputeStageType stage_type = ComputeStageType::COPY,
-                         bool post_warmup_resegment = false)
+                         bool post_warmup_resegment = false,
+                         bool warmup_dependent_capture = false)
             : IComputeStage(DeviceId::cpu()),
               capturable_(capturable),
               manual_boundary_(manual_boundary),
               stage_type_(stage_type),
-              post_warmup_resegment_(post_warmup_resegment)
+              post_warmup_resegment_(post_warmup_resegment),
+              warmup_dependent_capture_(warmup_dependent_capture)
         {
         }
 
@@ -45,6 +47,7 @@ namespace
         std::string name() const override { return "fake_segment_stage"; }
         bool supportsBackend(ComputeBackendType) const override { return true; }
         bool isGraphCapturable() const override { return capturable_; }
+        bool supportsWarmupDependentGraphCapture() const override { return warmup_dependent_capture_; }
         bool requiresPostWarmupGraphSegmentRebuild() const override { return post_warmup_resegment_; }
         bool isManualGraphBoundary() const override { return manual_boundary_; }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
@@ -54,6 +57,7 @@ namespace
         bool manual_boundary_ = false;
         ComputeStageType stage_type_ = ComputeStageType::COPY;
         bool post_warmup_resegment_ = false;
+        bool warmup_dependent_capture_ = false;
     };
 
     class FakeReplayGraphCapture final : public IGPUGraphCapture
@@ -147,7 +151,8 @@ namespace
                              bool capturable,
                              bool manual_boundary = false,
                              ComputeStageType stage_type = ComputeStageType::COPY,
-                             bool post_warmup_resegment = false)
+                             bool post_warmup_resegment = false,
+                             bool warmup_dependent_capture = false)
     {
         graph.addNode(
             name,
@@ -155,7 +160,8 @@ namespace
                 capturable,
                 manual_boundary,
                 stage_type,
-                post_warmup_resegment),
+                post_warmup_resegment,
+                warmup_dependent_capture),
             DeviceId::cpu());
     }
 
@@ -525,7 +531,7 @@ TEST(Test__GraphSegmentCache, WarmupSegmentsSkipPostWarmupResegmentForStableDens
     EXPECT_TRUE(cache.segments[0].capturable);
 }
 
-TEST(Test__GraphSegmentCache, WarmupSegmentsTrackMoEStylePostWarmupResegmentRequest)
+TEST(Test__GraphSegmentCache, WarmupSegmentsPlanWarmupDependentStagesWithoutResegment)
 {
     ComputeGraph graph;
     addFakeSegmentStage(graph, "before", true);
@@ -535,6 +541,7 @@ TEST(Test__GraphSegmentCache, WarmupSegmentsTrackMoEStylePostWarmupResegmentRequ
         false,
         false,
         ComputeStageType::MOE_EXPERT_FFN,
+        false,
         true);
     addFakeSegmentStage(graph, "after", true);
     graph.addDependency("warmup_dependent", "before");
@@ -550,11 +557,10 @@ TEST(Test__GraphSegmentCache, WarmupSegmentsTrackMoEStylePostWarmupResegmentRequ
 
     EXPECT_TRUE(cache.initialized);
     EXPECT_TRUE(cache.needs_capture);
-    EXPECT_TRUE(cache.post_warmup_resegment_required);
-    ASSERT_EQ(cache.segments.size(), 3u);
+    EXPECT_FALSE(cache.post_warmup_resegment_required);
+    ASSERT_EQ(cache.segments.size(), 1u);
     EXPECT_TRUE(cache.segments[0].capturable);
-    EXPECT_FALSE(cache.segments[1].capturable);
-    EXPECT_TRUE(cache.segments[2].capturable);
+    ASSERT_EQ(cache.segments[0].stage_names.size(), 3u);
 }
 
 TEST(Test__GraphSegmentCache, ResetCanDestroyCaptureStream)

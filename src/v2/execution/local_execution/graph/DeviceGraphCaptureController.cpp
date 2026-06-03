@@ -173,7 +173,13 @@ namespace llaminar2
 
             // Start from stage capability, then layer on safety gates.
             bool stage_capturable = node->stage->isGraphCapturable();
-            if (node->stage->requiresPostWarmupGraphSegmentRebuild())
+            const bool warmup_dependent_capture =
+                !stage_capturable && node->stage->supportsWarmupDependentGraphCapture();
+            if (warmup_dependent_capture)
+            {
+                stage_capturable = true;
+            }
+            else if (node->stage->requiresPostWarmupGraphSegmentRebuild())
             {
                 segment_cache.post_warmup_resegment_required = true;
             }
@@ -1396,6 +1402,23 @@ namespace llaminar2
                     if (node && node->stage)
                     {
                         node->stage->setGPUStream(capture_stream);
+                    }
+                }
+                for (const auto &stage_name : seg.stage_names)
+                {
+                    auto *node = graph.getNode(stage_name);
+                    if (!node || !node->stage)
+                    {
+                        continue;
+                    }
+                    if (node->stage->supportsWarmupDependentGraphCapture() &&
+                        !node->stage->isGraphCapturable())
+                    {
+                        LOG_ERROR("[DeviceGraphCaptureController] Warmup-dependent stage '"
+                                  << stage_name
+                                  << "' is still not graph-capturable after warmup");
+                        result.reset_cache = true;
+                        return result;
                     }
                 }
 
