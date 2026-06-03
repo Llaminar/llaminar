@@ -768,6 +768,18 @@ namespace llaminar2
         const float *data, int n, int k, float top_p, float temperature,
         unsigned long long rng_seed, unsigned long long rng_offset,
         int *out_token, int device_idx, void *stream);
+    extern "C" bool cudaOps_topk_topp_distribution_f32(
+        const float *data, int n, int k, float top_p, float temperature,
+        int *out_token_ids, float *out_probs, int device_idx, void *stream);
+    extern "C" bool cudaOps_speculative_verify_distribution_f32(
+        const int *target_token_ids, const float *target_probs,
+        const int *draft_token_ids, const float *draft_probs,
+        int k, int draft_token,
+        unsigned long long accept_seed, unsigned long long accept_offset,
+        unsigned long long residual_seed, unsigned long long residual_offset,
+        int *out_token, int *out_accepted,
+        float *out_accept_probability, float *out_accept_threshold,
+        int device_idx, void *stream);
 
     bool CUDABackend::argmaxF32(const void *data_device, int n, int device_id,
                                 float *out_value, int *out_index, void *stream,
@@ -969,6 +981,87 @@ namespace llaminar2
                                             static_cast<cudaStream_t>(stream)));
         CUDA_CHECK_OR_THROW(cudaStreamSynchronize(static_cast<cudaStream_t>(stream)));
         return true;
+    }
+
+    bool CUDABackend::enqueueBuildTopKTopPDistributionF32Device(
+        const void *data_device,
+        int n,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_token_ids_device,
+        void *out_probs_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            n <= 0 || top_k <= 0 || !stream || !out_token_ids_device || !out_probs_device)
+        {
+            return false;
+        }
+
+        if (top_k > 256)
+            top_k = 256;
+        if (top_k > n)
+            top_k = n;
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_topk_topp_distribution_f32(
+            static_cast<const float *>(data_device),
+            n,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<int *>(out_token_ids_device),
+            static_cast<float *>(out_probs_device),
+            device_id,
+            stream);
+    }
+
+    bool CUDABackend::enqueueSpeculativeVerifyDistributionsF32Device(
+        const void *target_token_ids_device,
+        const void *target_probs_device,
+        const void *draft_token_ids_device,
+        const void *draft_probs_device,
+        int top_k,
+        int draft_token,
+        uint64_t accept_seed,
+        uint64_t accept_offset,
+        uint64_t residual_seed,
+        uint64_t residual_offset,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_token_ids_device || !target_probs_device ||
+            !draft_token_ids_device || !draft_probs_device ||
+            top_k <= 0 || top_k > 256 || !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        return cudaOps_speculative_verify_distribution_f32(
+            static_cast<const int *>(target_token_ids_device),
+            static_cast<const float *>(target_probs_device),
+            static_cast<const int *>(draft_token_ids_device),
+            static_cast<const float *>(draft_probs_device),
+            top_k,
+            draft_token,
+            static_cast<unsigned long long>(accept_seed),
+            static_cast<unsigned long long>(accept_offset),
+            static_cast<unsigned long long>(residual_seed),
+            static_cast<unsigned long long>(residual_offset),
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
     }
 
     // Forward declaration for CUDA penalty kernel

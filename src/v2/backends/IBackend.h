@@ -732,6 +732,78 @@ namespace llaminar2
         }
 
         /**
+         * @brief Enqueue graph-capturable top-k/top-p distribution construction.
+         *
+         * Writes a compact probability table of length top_k to device buffers.
+         * Entries outside the selected top-p nucleus are marked with token id -1
+         * and probability 0. This method performs no allocation, host/device
+         * copies, or synchronization, and requires an explicit non-null stream.
+         */
+        virtual bool enqueueBuildTopKTopPDistributionF32Device(const void *data_device, int n,
+                                                               int top_k, float top_p, float temperature,
+                                                               int device_id, void *stream,
+                                                               void *out_token_ids_device,
+                                                               void *out_probs_device)
+        {
+            (void)data_device;
+            (void)n;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_ids_device;
+            (void)out_probs_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable speculative verify from compact distributions.
+         *
+         * target/draft distributions must be the top-k probability tables
+         * produced by enqueueBuildTopKTopPDistributionF32Device(). The kernel
+         * accepts draft_token with min(1, p/q), otherwise samples from the
+         * residual max(p - q, 0). It writes only small scalar outputs to device
+         * buffers and requires an explicit non-null stream.
+         */
+        virtual bool enqueueSpeculativeVerifyDistributionsF32Device(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int draft_token,
+            uint64_t accept_seed,
+            uint64_t accept_offset,
+            uint64_t residual_seed,
+            uint64_t residual_offset,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)draft_token_ids_device;
+            (void)draft_probs_device;
+            (void)top_k;
+            (void)draft_token;
+            (void)accept_seed;
+            (void)accept_offset;
+            (void)residual_seed;
+            (void)residual_offset;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            return false;
+        }
+
+        /**
          * @brief GPU-side sparse logit penalty application
          *
          * Applies a sparse set of additive penalties to logits in-place on the GPU.

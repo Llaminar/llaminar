@@ -437,6 +437,252 @@ __global__ void cuda_topk_topp_sample_f32_kernel(
     }
 }
 
+__global__ void cuda_topk_topp_distribution_f32_kernel(
+    const float *__restrict__ data,
+    int n,
+    int k,
+    float top_p,
+    float temperature,
+    int *__restrict__ out_token_ids,
+    float *__restrict__ out_probs)
+{
+    const int tid = threadIdx.x;
+    const int num_threads = blockDim.x;
+
+    float local_vals[TOPK_MAX_K];
+    int local_idxs[TOPK_MAX_K];
+    int local_count = 0;
+
+    for (int i = 0; i < k; ++i)
+    {
+        local_vals[i] = -FLT_MAX;
+        local_idxs[i] = -1;
+    }
+
+    for (int i = tid; i < n; i += num_threads)
+    {
+        const float val = data[i];
+        if (local_count >= k && val <= local_vals[k - 1])
+            continue;
+
+        int pos = (local_count < k) ? local_count : k - 1;
+        for (int j = pos - 1; j >= 0; --j)
+        {
+            if (val > local_vals[j])
+            {
+                local_vals[j + 1] = local_vals[j];
+                local_idxs[j + 1] = local_idxs[j];
+                pos = j;
+            }
+            else
+            {
+                break;
+            }
+        }
+        local_vals[pos] = val;
+        local_idxs[pos] = i;
+        if (local_count < k)
+            ++local_count;
+    }
+
+    extern __shared__ char shared_mem[];
+    float *s_vals = reinterpret_cast<float *>(shared_mem);
+    int *s_idxs = reinterpret_cast<int *>(shared_mem + num_threads * k * sizeof(float));
+
+    const int base = tid * k;
+    for (int i = 0; i < k; ++i)
+    {
+        s_vals[base + i] = local_vals[i];
+        s_idxs[base + i] = local_idxs[i];
+    }
+    __syncthreads();
+
+    if (tid == 0)
+    {
+        float merged_vals[TOPK_MAX_K];
+        int merged_idxs[TOPK_MAX_K];
+        int ptrs[TOPK_THREADS];
+        for (int t = 0; t < num_threads; ++t)
+            ptrs[t] = 0;
+
+        for (int out_i = 0; out_i < k; ++out_i)
+        {
+            float best_val = -FLT_MAX;
+            int best_thread = -1;
+            for (int t = 0; t < num_threads; ++t)
+            {
+                if (ptrs[t] < k)
+                {
+                    const float v = s_vals[t * k + ptrs[t]];
+                    if (v > best_val)
+                    {
+                        best_val = v;
+                        best_thread = t;
+                    }
+                }
+            }
+
+            if (best_thread >= 0)
+            {
+                merged_vals[out_i] = best_val;
+                merged_idxs[out_i] = s_idxs[best_thread * k + ptrs[best_thread]];
+                ++ptrs[best_thread];
+            }
+            else
+            {
+                merged_vals[out_i] = -FLT_MAX;
+                merged_idxs[out_i] = -1;
+            }
+        }
+
+        const float temp = temperature > 0.0f ? temperature : 1.0f;
+        const float max_logit = merged_vals[0];
+        float weights[TOPK_MAX_K];
+        float total = 0.0f;
+        for (int i = 0; i < k; ++i)
+        {
+            if (merged_idxs[i] < 0)
+            {
+                weights[i] = 0.0f;
+                continue;
+            }
+            const float w = expf((merged_vals[i] - max_logit) / temp);
+            weights[i] = w;
+            total += w;
+        }
+
+        int nucleus = k;
+        if (total > 0.0f && top_p > 0.0f && top_p < 1.0f)
+        {
+            float cumulative = 0.0f;
+            for (int i = 0; i < k; ++i)
+            {
+                cumulative += weights[i] / total;
+                if (cumulative >= top_p)
+                {
+                    nucleus = i + 1;
+                    break;
+                }
+            }
+        }
+
+        float nucleus_total = 0.0f;
+        for (int i = 0; i < nucleus; ++i)
+            nucleus_total += weights[i];
+
+        for (int i = 0; i < k; ++i)
+        {
+            if (i < nucleus && nucleus_total > 0.0f && merged_idxs[i] >= 0)
+            {
+                out_token_ids[i] = merged_idxs[i];
+                out_probs[i] = weights[i] / nucleus_total;
+            }
+            else
+            {
+                out_token_ids[i] = -1;
+                out_probs[i] = 0.0f;
+            }
+        }
+    }
+}
+
+__device__ float cuda_distribution_probability(
+    const int *__restrict__ token_ids,
+    const float *__restrict__ probs,
+    int k,
+    int token_id)
+{
+    for (int i = 0; i < k; ++i)
+    {
+        if (token_ids[i] == token_id)
+            return probs[i];
+    }
+    return 0.0f;
+}
+
+__global__ void cuda_speculative_verify_distribution_kernel(
+    const int *__restrict__ target_token_ids,
+    const float *__restrict__ target_probs,
+    const int *__restrict__ draft_token_ids,
+    const float *__restrict__ draft_probs,
+    int k,
+    int draft_token,
+    unsigned long long accept_seed,
+    unsigned long long accept_offset,
+    unsigned long long residual_seed,
+    unsigned long long residual_offset,
+    int *__restrict__ out_token,
+    int *__restrict__ out_accepted,
+    float *__restrict__ out_accept_probability,
+    float *__restrict__ out_accept_threshold)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0)
+        return;
+
+    const float p = cuda_distribution_probability(target_token_ids, target_probs, k, draft_token);
+    const float q = cuda_distribution_probability(draft_token_ids, draft_probs, k, draft_token);
+    const float accept_probability = q > 0.0f ? fminf(1.0f, p / q) : 0.0f;
+    const float threshold = cuda_sampling_uniform01(accept_seed, accept_offset);
+
+    if (out_accept_probability)
+        *out_accept_probability = accept_probability;
+    if (out_accept_threshold)
+        *out_accept_threshold = threshold;
+
+    if (threshold < accept_probability)
+    {
+        *out_token = draft_token;
+        *out_accepted = 1;
+        return;
+    }
+
+    float residual_weights[TOPK_MAX_K];
+    float residual_total = 0.0f;
+    for (int i = 0; i < k; ++i)
+    {
+        if (target_token_ids[i] < 0)
+        {
+            residual_weights[i] = 0.0f;
+            continue;
+        }
+        const float q_i = cuda_distribution_probability(
+            draft_token_ids,
+            draft_probs,
+            k,
+            target_token_ids[i]);
+        const float w = fmaxf(0.0f, target_probs[i] - q_i);
+        residual_weights[i] = w;
+        residual_total += w;
+    }
+
+    bool use_target_fallback = !(residual_total > 0.0f);
+    if (use_target_fallback)
+    {
+        residual_total = 0.0f;
+        for (int i = 0; i < k; ++i)
+        {
+            residual_weights[i] = target_token_ids[i] >= 0 ? target_probs[i] : 0.0f;
+            residual_total += residual_weights[i];
+        }
+    }
+
+    const float r = cuda_sampling_uniform01(residual_seed, residual_offset) * residual_total;
+    float cumulative = 0.0f;
+    int selected = target_token_ids[0] >= 0 ? target_token_ids[0] : draft_token;
+    for (int i = 0; i < k; ++i)
+    {
+        cumulative += residual_weights[i];
+        if (r <= cumulative)
+        {
+            selected = target_token_ids[i] >= 0 ? target_token_ids[i] : selected;
+            break;
+        }
+    }
+
+    *out_token = selected;
+    *out_accepted = 0;
+}
+
 // ============================================================================
 // Logit Penalty Application Kernel — Subtract sparse penalties from logits
 // ============================================================================
@@ -593,6 +839,91 @@ extern "C"
         if (err != cudaSuccess)
         {
             fprintf(stderr, "CUDA Top-K/Top-P Sample FP32 kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_topk_topp_distribution_f32(
+        const float *data,
+        int n,
+        int k,
+        float top_p,
+        float temperature,
+        int *out_token_ids,
+        float *out_probs,
+        int device_idx,
+        void *stream)
+    {
+        if (n <= 0 || k <= 0 || k > TOPK_MAX_K || !data || !out_token_ids || !out_probs || !stream)
+            return false;
+
+        if (k > n)
+            k = n;
+
+        cudaSetDevice(device_idx);
+
+        const int threads = TOPK_THREADS;
+        const size_t smem_size = threads * k * (sizeof(float) + sizeof(int));
+
+        cuda_topk_topp_distribution_f32_kernel<<<1, threads, smem_size, static_cast<cudaStream_t>(stream)>>>(
+            data, n, k, top_p, temperature, out_token_ids, out_probs);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Top-K/Top-P Distribution FP32 kernel launch failed: %s\n",
+                    cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool cudaOps_speculative_verify_distribution_f32(
+        const int *target_token_ids,
+        const float *target_probs,
+        const int *draft_token_ids,
+        const float *draft_probs,
+        int k,
+        int draft_token,
+        unsigned long long accept_seed,
+        unsigned long long accept_offset,
+        unsigned long long residual_seed,
+        unsigned long long residual_offset,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx,
+        void *stream)
+    {
+        if (k <= 0 || k > TOPK_MAX_K || !target_token_ids || !target_probs ||
+            !draft_token_ids || !draft_probs || !out_token || !out_accepted || !stream)
+            return false;
+
+        cudaSetDevice(device_idx);
+
+        cuda_speculative_verify_distribution_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            target_token_ids,
+            target_probs,
+            draft_token_ids,
+            draft_probs,
+            k,
+            draft_token,
+            accept_seed,
+            accept_offset,
+            residual_seed,
+            residual_offset,
+            out_token,
+            out_accepted,
+            out_accept_probability,
+            out_accept_threshold);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "CUDA Speculative Verify Distribution FP32 kernel launch failed: %s\n",
                     cudaGetErrorString(err));
             return false;
         }

@@ -78,6 +78,28 @@ namespace llaminar2
                                             uint64_t rng_seed, uint64_t rng_offset,
                                             int device_id, void *stream,
                                             void *out_token_device) override;
+        bool enqueueBuildTopKTopPDistributionF32Device(const void *data_device, int n,
+                                                       int top_k, float top_p, float temperature,
+                                                       int device_id, void *stream,
+                                                       void *out_token_ids_device,
+                                                       void *out_probs_device) override;
+        bool enqueueSpeculativeVerifyDistributionsF32Device(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int draft_token,
+            uint64_t accept_seed,
+            uint64_t accept_offset,
+            uint64_t residual_seed,
+            uint64_t residual_offset,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr) override;
 
         // GPU-side sparse logit penalty application
         bool applyLogitPenaltiesF32(void *logits_device,

@@ -1484,6 +1484,159 @@ namespace
         return selected;
     }
 
+    struct ExpectedDistributionEntry
+    {
+        int token_id = -1;
+        float probability = 0.0f;
+    };
+
+    static std::vector<ExpectedDistributionEntry> expectedTopKTopPDistribution(
+        const std::vector<float> &logits,
+        int top_k,
+        float top_p,
+        float temperature)
+    {
+        std::vector<std::pair<float, int>> candidates;
+        candidates.reserve(logits.size());
+        for (size_t i = 0; i < logits.size(); ++i)
+            candidates.emplace_back(logits[i], static_cast<int>(i));
+
+        top_k = std::min<int>(top_k, static_cast<int>(candidates.size()));
+        std::partial_sort(candidates.begin(),
+                          candidates.begin() + top_k,
+                          candidates.end(),
+                          [](const auto &a, const auto &b)
+                          {
+                              return a.first > b.first;
+                          });
+        candidates.resize(static_cast<size_t>(top_k));
+
+        const float temp = temperature > 0.0f ? temperature : 1.0f;
+        const float max_logit = candidates.front().first;
+        std::vector<float> weights(candidates.size(), 0.0f);
+        float total = 0.0f;
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            weights[i] = std::exp((candidates[i].first - max_logit) / temp);
+            total += weights[i];
+        }
+
+        int nucleus = top_k;
+        if (total > 0.0f && top_p > 0.0f && top_p < 1.0f)
+        {
+            float cumulative = 0.0f;
+            for (int i = 0; i < top_k; ++i)
+            {
+                cumulative += weights[static_cast<size_t>(i)] / total;
+                if (cumulative >= top_p)
+                {
+                    nucleus = i + 1;
+                    break;
+                }
+            }
+        }
+
+        float nucleus_total = 0.0f;
+        for (int i = 0; i < nucleus; ++i)
+            nucleus_total += weights[static_cast<size_t>(i)];
+
+        std::vector<ExpectedDistributionEntry> distribution(
+            static_cast<size_t>(top_k));
+        for (int i = 0; i < top_k; ++i)
+        {
+            if (i < nucleus && nucleus_total > 0.0f)
+            {
+                distribution[static_cast<size_t>(i)].token_id =
+                    candidates[static_cast<size_t>(i)].second;
+                distribution[static_cast<size_t>(i)].probability =
+                    weights[static_cast<size_t>(i)] / nucleus_total;
+            }
+        }
+        return distribution;
+    }
+
+    static float distributionProbability(
+        const std::vector<ExpectedDistributionEntry> &distribution,
+        int token_id)
+    {
+        for (const auto &entry : distribution)
+        {
+            if (entry.token_id == token_id)
+                return entry.probability;
+        }
+        return 0.0f;
+    }
+
+    struct ExpectedSpeculativeVerify
+    {
+        int token_id = -1;
+        int accepted = 0;
+        float accept_probability = 0.0f;
+        float accept_threshold = 0.0f;
+    };
+
+    static ExpectedSpeculativeVerify expectedSpeculativeVerifyDistribution(
+        const std::vector<ExpectedDistributionEntry> &target,
+        const std::vector<ExpectedDistributionEntry> &draft,
+        int draft_token,
+        uint64_t accept_seed,
+        uint64_t accept_offset,
+        uint64_t residual_seed,
+        uint64_t residual_offset)
+    {
+        ExpectedSpeculativeVerify result;
+        const float p = distributionProbability(target, draft_token);
+        const float q = distributionProbability(draft, draft_token);
+        result.accept_probability = q > 0.0f ? std::min(1.0f, p / q) : 0.0f;
+        result.accept_threshold = samplingUniform01(accept_seed, accept_offset);
+
+        if (result.accept_threshold < result.accept_probability)
+        {
+            result.token_id = draft_token;
+            result.accepted = 1;
+            return result;
+        }
+
+        std::vector<float> residual_weights(target.size(), 0.0f);
+        float residual_total = 0.0f;
+        for (size_t i = 0; i < target.size(); ++i)
+        {
+            if (target[i].token_id < 0)
+                continue;
+            const float q_i = distributionProbability(draft, target[i].token_id);
+            residual_weights[i] = std::max(0.0f, target[i].probability - q_i);
+            residual_total += residual_weights[i];
+        }
+
+        if (!(residual_total > 0.0f))
+        {
+            residual_total = 0.0f;
+            for (size_t i = 0; i < target.size(); ++i)
+            {
+                residual_weights[i] =
+                    target[i].token_id >= 0 ? target[i].probability : 0.0f;
+                residual_total += residual_weights[i];
+            }
+        }
+
+        const float r = samplingUniform01(residual_seed, residual_offset) * residual_total;
+        float cumulative = 0.0f;
+        result.token_id = !target.empty() && target.front().token_id >= 0
+                              ? target.front().token_id
+                              : draft_token;
+        for (size_t i = 0; i < target.size(); ++i)
+        {
+            cumulative += residual_weights[i];
+            if (r <= cumulative)
+            {
+                if (target[i].token_id >= 0)
+                    result.token_id = target[i].token_id;
+                break;
+            }
+        }
+        return result;
+    }
+
     TEST_P(GPUSamplingTest, Penalty_SingleToken_Subtracted)
     {
         // Apply a penalty to token 2 and verify logit is reduced
@@ -2012,6 +2165,320 @@ namespace
 
         EXPECT_EQ(actual, expected)
             << "Graph-captured top-k/top-p sampler selected the wrong token";
+    }
+
+    TEST_P(GPUSamplingTest, SpeculativeVerifyDistributionsAreGraphCapturable)
+    {
+        const std::vector<float> target_logits = {0.1f, 3.2f, 2.0f, 1.2f,
+                                                  4.5f, 0.5f, 2.6f, 3.7f};
+        const std::vector<float> draft_accept_logits = {0.3f, 3.8f, 1.9f, 0.7f,
+                                                        2.6f, 0.1f, 2.1f, 3.0f};
+        const std::vector<float> draft_reject_logits = {0.2f, 5.2f, 1.8f, 0.4f,
+                                                        2.0f, 0.3f, 2.4f, 3.3f};
+        constexpr int top_k = 4;
+        constexpr float top_p = 0.95f;
+        constexpr float temperature = 0.7f;
+        constexpr uint64_t accept_seed_accept_case = 1234;
+        constexpr uint64_t accept_offset_accept_case = 7;
+        constexpr uint64_t accept_seed_reject_case = 1;
+        constexpr uint64_t accept_offset_reject_case = 0;
+        constexpr uint64_t residual_seed = 999;
+        constexpr uint64_t residual_offset = 11;
+        constexpr int accept_draft_token = 7;
+        constexpr int reject_draft_token = 1;
+
+        const auto expected_target =
+            expectedTopKTopPDistribution(target_logits, top_k, top_p, temperature);
+        const auto expected_draft_accept =
+            expectedTopKTopPDistribution(draft_accept_logits, top_k, top_p, temperature);
+        const auto expected_draft_reject =
+            expectedTopKTopPDistribution(draft_reject_logits, top_k, top_p, temperature);
+        const auto expected_accept = expectedSpeculativeVerifyDistribution(
+            expected_target,
+            expected_draft_accept,
+            accept_draft_token,
+            accept_seed_accept_case,
+            accept_offset_accept_case,
+            residual_seed,
+            residual_offset);
+        const auto expected_reject = expectedSpeculativeVerifyDistribution(
+            expected_target,
+            expected_draft_reject,
+            reject_draft_token,
+            accept_seed_reject_case,
+            accept_offset_reject_case,
+            residual_seed,
+            residual_offset);
+        ASSERT_EQ(expected_accept.accepted, 1);
+        ASSERT_EQ(expected_reject.accepted, 0);
+
+        void *d_target_logits = nullptr;
+        void *d_draft_accept_logits = nullptr;
+        void *d_draft_reject_logits = nullptr;
+        void *d_target_ids = nullptr;
+        void *d_target_probs = nullptr;
+        void *d_draft_accept_ids = nullptr;
+        void *d_draft_accept_probs = nullptr;
+        void *d_draft_reject_ids = nullptr;
+        void *d_draft_reject_probs = nullptr;
+        void *d_accept_token = nullptr;
+        void *d_accept_flag = nullptr;
+        void *d_accept_probability = nullptr;
+        void *d_accept_threshold = nullptr;
+        void *d_reject_token = nullptr;
+        void *d_reject_flag = nullptr;
+        void *d_reject_probability = nullptr;
+        void *d_reject_threshold = nullptr;
+
+        auto cleanup = [&]()
+        {
+            void *ptrs[] = {
+                d_target_logits,
+                d_draft_accept_logits,
+                d_draft_reject_logits,
+                d_target_ids,
+                d_target_probs,
+                d_draft_accept_ids,
+                d_draft_accept_probs,
+                d_draft_reject_ids,
+                d_draft_reject_probs,
+                d_accept_token,
+                d_accept_flag,
+                d_accept_probability,
+                d_accept_threshold,
+                d_reject_token,
+                d_reject_flag,
+                d_reject_probability,
+                d_reject_threshold};
+            for (void *ptr : ptrs)
+            {
+                if (ptr)
+                    backend_->free(ptr, device_id_);
+            }
+        };
+
+        d_target_logits = backend_->allocate(target_logits.size() * sizeof(float), device_id_);
+        d_draft_accept_logits = backend_->allocate(draft_accept_logits.size() * sizeof(float), device_id_);
+        d_draft_reject_logits = backend_->allocate(draft_reject_logits.size() * sizeof(float), device_id_);
+        d_target_ids = backend_->allocate(top_k * sizeof(int), device_id_);
+        d_target_probs = backend_->allocate(top_k * sizeof(float), device_id_);
+        d_draft_accept_ids = backend_->allocate(top_k * sizeof(int), device_id_);
+        d_draft_accept_probs = backend_->allocate(top_k * sizeof(float), device_id_);
+        d_draft_reject_ids = backend_->allocate(top_k * sizeof(int), device_id_);
+        d_draft_reject_probs = backend_->allocate(top_k * sizeof(float), device_id_);
+        d_accept_token = backend_->allocate(sizeof(int), device_id_);
+        d_accept_flag = backend_->allocate(sizeof(int), device_id_);
+        d_accept_probability = backend_->allocate(sizeof(float), device_id_);
+        d_accept_threshold = backend_->allocate(sizeof(float), device_id_);
+        d_reject_token = backend_->allocate(sizeof(int), device_id_);
+        d_reject_flag = backend_->allocate(sizeof(int), device_id_);
+        d_reject_probability = backend_->allocate(sizeof(float), device_id_);
+        d_reject_threshold = backend_->allocate(sizeof(float), device_id_);
+
+        ASSERT_NE(d_target_logits, nullptr);
+        ASSERT_NE(d_draft_accept_logits, nullptr);
+        ASSERT_NE(d_draft_reject_logits, nullptr);
+        ASSERT_NE(d_target_ids, nullptr);
+        ASSERT_NE(d_target_probs, nullptr);
+        ASSERT_NE(d_draft_accept_ids, nullptr);
+        ASSERT_NE(d_draft_accept_probs, nullptr);
+        ASSERT_NE(d_draft_reject_ids, nullptr);
+        ASSERT_NE(d_draft_reject_probs, nullptr);
+        ASSERT_NE(d_accept_token, nullptr);
+        ASSERT_NE(d_accept_flag, nullptr);
+        ASSERT_NE(d_accept_probability, nullptr);
+        ASSERT_NE(d_accept_threshold, nullptr);
+        ASSERT_NE(d_reject_token, nullptr);
+        ASSERT_NE(d_reject_flag, nullptr);
+        ASSERT_NE(d_reject_probability, nullptr);
+        ASSERT_NE(d_reject_threshold, nullptr);
+
+        auto run_capture = [&](IWorkerGPUContext &ctx)
+        {
+            ctx.submitAndWait([&]()
+            {
+                void *stream = ctx.defaultStream();
+                ASSERT_NE(stream, nullptr);
+
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_target_logits,
+                    target_logits.data(),
+                    target_logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_draft_accept_logits,
+                    draft_accept_logits.data(),
+                    draft_accept_logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->hostToDevice(
+                    d_draft_reject_logits,
+                    draft_reject_logits.data(),
+                    draft_reject_logits.size() * sizeof(float),
+                    device_id_,
+                    stream));
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+
+                EXPECT_FALSE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_target_logits,
+                    static_cast<int>(target_logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    nullptr,
+                    d_target_ids,
+                    d_target_probs))
+                    << "distribution builder must reject the legacy default/null stream";
+                EXPECT_FALSE(backend_->enqueueSpeculativeVerifyDistributionsF32Device(
+                    d_target_ids,
+                    d_target_probs,
+                    d_draft_accept_ids,
+                    d_draft_accept_probs,
+                    top_k,
+                    accept_draft_token,
+                    accept_seed_accept_case,
+                    accept_offset_accept_case,
+                    residual_seed,
+                    residual_offset,
+                    device_id_,
+                    nullptr,
+                    d_accept_token,
+                    d_accept_flag,
+                    d_accept_probability,
+                    d_accept_threshold))
+                    << "speculative verifier must reject the legacy default/null stream";
+
+                auto capture = ctx.createGraphCapture(stream);
+                ASSERT_NE(capture, nullptr);
+                ASSERT_TRUE(capture->beginCapture());
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_target_logits,
+                    static_cast<int>(target_logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    d_target_ids,
+                    d_target_probs));
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_draft_accept_logits,
+                    static_cast<int>(draft_accept_logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    d_draft_accept_ids,
+                    d_draft_accept_probs));
+                ASSERT_TRUE(backend_->enqueueBuildTopKTopPDistributionF32Device(
+                    d_draft_reject_logits,
+                    static_cast<int>(draft_reject_logits.size()),
+                    top_k,
+                    top_p,
+                    temperature,
+                    device_id_,
+                    stream,
+                    d_draft_reject_ids,
+                    d_draft_reject_probs));
+                ASSERT_TRUE(backend_->enqueueSpeculativeVerifyDistributionsF32Device(
+                    d_target_ids,
+                    d_target_probs,
+                    d_draft_accept_ids,
+                    d_draft_accept_probs,
+                    top_k,
+                    accept_draft_token,
+                    accept_seed_accept_case,
+                    accept_offset_accept_case,
+                    residual_seed,
+                    residual_offset,
+                    device_id_,
+                    stream,
+                    d_accept_token,
+                    d_accept_flag,
+                    d_accept_probability,
+                    d_accept_threshold));
+                ASSERT_TRUE(backend_->enqueueSpeculativeVerifyDistributionsF32Device(
+                    d_target_ids,
+                    d_target_probs,
+                    d_draft_reject_ids,
+                    d_draft_reject_probs,
+                    top_k,
+                    reject_draft_token,
+                    accept_seed_reject_case,
+                    accept_offset_reject_case,
+                    residual_seed,
+                    residual_offset,
+                    device_id_,
+                    stream,
+                    d_reject_token,
+                    d_reject_flag,
+                    d_reject_probability,
+                    d_reject_threshold));
+                ASSERT_TRUE(capture->endCapture());
+                ASSERT_TRUE(capture->instantiate());
+                ASSERT_TRUE(capture->launch());
+                ASSERT_TRUE(backend_->synchronizeStream(stream, device_id_));
+            });
+        };
+
+        if (GetParam() == "CUDA")
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(device_id_);
+            run_capture(ctx);
+        }
+        else
+        {
+            auto &ctx = GPUDeviceContextPool::instance().getAMDContext(device_id_);
+            run_capture(ctx);
+        }
+
+        std::vector<int> target_ids(top_k, -1);
+        std::vector<float> target_probs(top_k, 0.0f);
+        int accept_token = -1;
+        int accept_flag = -1;
+        float accept_probability = -1.0f;
+        float accept_threshold = -1.0f;
+        int reject_token = -1;
+        int reject_flag = -1;
+        float reject_probability = -1.0f;
+        float reject_threshold = -1.0f;
+
+        ASSERT_TRUE(backend_->deviceToHost(target_ids.data(), d_target_ids, top_k * sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(target_probs.data(), d_target_probs, top_k * sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&accept_token, d_accept_token, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&accept_flag, d_accept_flag, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&accept_probability, d_accept_probability, sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&accept_threshold, d_accept_threshold, sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&reject_token, d_reject_token, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&reject_flag, d_reject_flag, sizeof(int), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&reject_probability, d_reject_probability, sizeof(float), device_id_));
+        ASSERT_TRUE(backend_->deviceToHost(&reject_threshold, d_reject_threshold, sizeof(float), device_id_));
+
+        cleanup();
+
+        for (int i = 0; i < top_k; ++i)
+        {
+            EXPECT_EQ(target_ids[static_cast<size_t>(i)],
+                      expected_target[static_cast<size_t>(i)].token_id)
+                << "target compact distribution token mismatch at slot " << i;
+            EXPECT_NEAR(target_probs[static_cast<size_t>(i)],
+                        expected_target[static_cast<size_t>(i)].probability,
+                        1e-5f)
+                << "target compact distribution probability mismatch at slot " << i;
+        }
+
+        EXPECT_EQ(accept_flag, expected_accept.accepted);
+        EXPECT_EQ(accept_token, expected_accept.token_id);
+        EXPECT_NEAR(accept_probability, expected_accept.accept_probability, 1e-5f);
+        EXPECT_NEAR(accept_threshold, expected_accept.accept_threshold, 1e-6f);
+
+        EXPECT_EQ(reject_flag, expected_reject.accepted);
+        EXPECT_EQ(reject_token, expected_reject.token_id);
+        EXPECT_NEAR(reject_probability, expected_reject.accept_probability, 1e-5f);
+        EXPECT_NEAR(reject_threshold, expected_reject.accept_threshold, 1e-6f);
     }
 
     TEST_P(GPUSamplingTest, DRYParity_SimpleRepeat)
