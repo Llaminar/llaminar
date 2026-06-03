@@ -611,6 +611,26 @@ namespace llaminar2
         virtual bool supportsWarmupDependentGraphCapture() const { return false; }
 
         /**
+         * @brief Whether a capturable stage must start a fresh graph segment.
+         *
+         * Return true for stages that are graph-capturable on their own but
+         * cannot safely be fused after earlier captured work on a backend.
+         */
+        virtual bool requiresGraphCaptureSegmentBoundaryBefore() const { return false; }
+
+        /**
+         * @brief Whether a capturable stage must terminate its graph segment.
+         *
+         * Most capturable stages can be coalesced freely. Some stages are
+         * graph-capturable on their own but carry backend replay state, captured
+         * H2D parameter nodes, or callbacks that make fusing a following stage
+         * into the same GPU graph unsafe on a backend. Such stages should return
+         * true here so the planner starts a fresh segment for the next stage
+         * while still graph-capturing this stage.
+         */
+        virtual bool requiresGraphCaptureSegmentBoundaryAfter() const { return false; }
+
+        /**
          * @brief Whether this manual stage must complete before a following graph segment may run.
          *
          * Segmented GPU graph execution runs non-capturable stages between

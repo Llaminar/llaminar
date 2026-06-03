@@ -197,6 +197,7 @@ namespace llaminar2
 
         bool current_capturable = false;
         bool first = true;
+        bool force_new_segment = false;
 
         for (const auto &name : order)
         {
@@ -230,13 +231,20 @@ namespace llaminar2
                 stage_capturable = stage_in_collective_allowlist(name);
             }
             // Otherwise: trust each stage's isGraphCapturable() declaration.
-            // Stages that need per-step updates (embedding, KV cache, fused
-            // attention) already return false from isGraphCapturable().
+            // Stages that need per-step updates either return false or report
+            // segment boundaries around themselves when they can be captured
+            // alone but cannot safely be fused with adjacent captured work.
             // Collective stages are forced manual above. Compute-only stages
             // (GEMM, norms, SwiGLU, residual add, lm_head) can be safely
             // captured in graph segments between the manual collective segments.
+            const bool boundary_before =
+                stage_capturable &&
+                node->stage->requiresGraphCaptureSegmentBoundaryBefore() &&
+                !segment_cache.segments.empty() &&
+                !segment_cache.segments.back().stage_names.empty();
+            force_new_segment = force_new_segment || boundary_before;
 
-            if (first || stage_capturable != current_capturable)
+            if (first || force_new_segment || stage_capturable != current_capturable)
             {
                 // Create a new segment whenever capturable/manual mode changes
                 // so each segment has uniform execution semantics.
@@ -244,9 +252,13 @@ namespace llaminar2
                 segment_cache.segments.back().capturable = stage_capturable;
                 current_capturable = stage_capturable;
                 first = false;
+                force_new_segment = false;
             }
 
             segment_cache.segments.back().stage_names.push_back(name);
+            force_new_segment =
+                stage_capturable &&
+                node->stage->requiresGraphCaptureSegmentBoundaryAfter();
         }
 
         const int max_stages = debugEnv().execution.gpu_graph_max_stages;

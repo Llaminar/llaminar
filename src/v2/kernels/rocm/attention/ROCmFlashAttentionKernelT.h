@@ -405,6 +405,9 @@ namespace llaminar2
             /// Update device-side attention params for graph-capture replay
             void setDynamicAttnParams(int kv_len, int position_offset) override;
             void setDynamicAttnParams(int kv_len, int position_offset, int query_rows) override;
+            bool prepareDynamicAttnParams(
+                int kv_len, int position_offset, int query_rows, void *stream) override;
+            void resetDynamicState() override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface
@@ -487,8 +490,17 @@ namespace llaminar2
             attention::AttentionDeviceParams *h_attn_params_ = nullptr;
             int h_attn_params_capacity_ = 0;
             int small_decode_rows_ = 0;
+            int dynamic_attn_kv_len_ = 0;
+            int dynamic_attn_position_offset_ = 0;
+            int dynamic_attn_query_rows_ = 1;
+            int dynamic_attn_param_rows_ = 1;
+            bool dynamic_attn_host_valid_ = false;
+            bool dynamic_attn_device_valid_ = false;
 
             bool ensureHostAttnParamsCapacity(int capacity);
+            bool uploadDynamicAttnParams(void *stream);
+            bool dynamicAttnParamsReady(
+                int kv_len, int position_offset, int query_rows) const;
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
         };

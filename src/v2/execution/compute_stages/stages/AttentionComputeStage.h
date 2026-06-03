@@ -146,32 +146,7 @@ namespace llaminar2
         /// this step, so get_cached_tokens() returns previous step's count.
         /// We add seq_len to get the count after appending.
         bool hasDynamicParams() const override { return true; }
-        void updateDynamicParams(int pos_offset, int seq_len) override
-        {
-            params_.position_offset = pos_offset;
-            if (cached_kernel_ && params_.kv_cache && params_.layer_idx >= 0)
-            {
-                // Propagate current stage stream to kernel so setDynamicAttnParams
-                // can issue H2D copies on the correct (capture/replay) stream.
-                cached_kernel_->setGPUStream(gpuStream());
-                int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-                kv_len += seq_len; // This step will append seq_len tokens
-                const int logical_pos_offset = std::max(0, kv_len - seq_len);
-                cached_kernel_->setDynamicAttnParams(kv_len, logical_pos_offset, seq_len);
-
-                // TQ dequant: update pinned host params for captured H2D.
-                // setDynamicDequantParams computes ring_pos, out_offset, rope_position
-                // from the pre-append entry state. On graph replay, the captured
-                // H2D re-reads from pinned host, giving the kernel updated values.
-                // position_start=0 matches execute() which always passes 0 — cache
-                // rows are stored in position order, so position = entry.count.
-                const float dequant_rope_theta =
-                    params_.apply_rope_to_k ? params_.rope_theta : 0.0f;
-                params_.kv_cache->setDynamicDequantParams(
-                    params_.layer_idx, 0, dequant_rope_theta,
-                    0, gpuStream());
-            }
-        }
+        void updateDynamicParams(int pos_offset, int seq_len) override;
 
         void resetSessionState() override
         {

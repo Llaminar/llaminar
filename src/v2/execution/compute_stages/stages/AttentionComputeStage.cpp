@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <fstream>
 #include <filesystem>
+#include <stdexcept>
 
 #if defined(HAVE_CUDA)
 #include "../../../kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
@@ -155,6 +156,73 @@ namespace llaminar2
     AttentionComputeStage::AttentionComputeStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    void AttentionComputeStage::updateDynamicParams(int pos_offset, int seq_len)
+    {
+        params_.position_offset = pos_offset;
+        if (!cached_kernel_ || !params_.kv_cache || params_.layer_idx < 0)
+        {
+            return;
+        }
+
+        // Propagate current stage stream to the kernel so device-side dynamic
+        // params are uploaded on the same explicit stream used for capture/replay.
+        cached_kernel_->setGPUStream(gpuStream());
+
+        int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
+        kv_len += seq_len; // This step will append seq_len tokens.
+        const int logical_pos_offset = std::max(0, kv_len - seq_len);
+
+        int query_rows_for_params = 1;
+        if (params_.device_id.is_rocm())
+        {
+            const auto &rocm_env = debugEnv().rocm;
+            const auto kp = params_.kv_cache->k_precision();
+            const auto vp = params_.kv_cache->v_precision();
+            const bool native_kv =
+                !rocm_env.fa_disable_native_kv &&
+                params_.head_dim >= 64 &&
+                ((kp == ActivationPrecision::FP16 && vp == ActivationPrecision::FP16) ||
+                 (kp == ActivationPrecision::Q8_1 && vp == ActivationPrecision::Q8_1 &&
+                  params_.head_dim % 32 == 0));
+            const bool small_native_decode =
+                native_kv &&
+                params_.batch_size == 1 &&
+                params_.causal &&
+                !rocm_env.fa_decode_via_prefill &&
+                seq_len > 1 &&
+                seq_len <= 2 &&
+                kv_len > seq_len;
+            query_rows_for_params = small_native_decode ? seq_len : 1;
+        }
+        else
+        {
+            query_rows_for_params = seq_len;
+        }
+
+        if (!cached_kernel_->prepareDynamicAttnParams(
+                kv_len, logical_pos_offset, query_rows_for_params, gpuStream()))
+        {
+            const std::string msg =
+                "[AttentionComputeStage] Failed to prepare dynamic attention params for layer " +
+                std::to_string(params_.layer_idx) +
+                " on " + params_.device_id.toString();
+            LOG_ERROR(msg);
+            throw std::runtime_error(msg);
+        }
+
+        // TQ dequant: update pinned host params for captured H2D.
+        // setDynamicDequantParams computes ring_pos, out_offset, rope_position
+        // from the pre-append entry state. On graph replay, the captured
+        // H2D re-reads from pinned host, giving the kernel updated values.
+        // position_start=0 matches execute() which always passes 0 — cache
+        // rows are stored in position order, so position = entry.count.
+        const float dequant_rope_theta =
+            params_.apply_rope_to_k ? params_.rope_theta : 0.0f;
+        params_.kv_cache->setDynamicDequantParams(
+            params_.layer_idx, 0, dequant_rope_theta,
+            0, gpuStream());
     }
 
     uint64_t AttentionComputeStage::graphCaptureVariantSignature() const

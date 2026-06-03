@@ -3809,25 +3809,28 @@ namespace llaminar2
             return false;
 
         IWorkerGPUContext *sidecar_gpu_ctx = nullptr;
+        void *sidecar_dynamic_stream = nullptr;
         const bool try_gpu_graph_capture =
             state_.device_id.is_gpu() &&
             debugEnv().execution.gpu_graphs;
-        if (try_gpu_graph_capture && !rebuilt_graph)
+        if (state_.device_id.is_gpu())
         {
             auto &pool = GPUDeviceContextPool::instance();
             sidecar_gpu_ctx = &pool.getContext(state_.device_id);
+            sidecar_dynamic_stream = sidecar_gpu_ctx->defaultStream();
+            if (!sidecar_dynamic_stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] MTP sidecar requires an explicit non-null GPU stream for "
+                          << state_.device_id.toString());
+                return false;
+            }
+        }
+        if (try_gpu_graph_capture && !rebuilt_graph)
+        {
             if (sidecar_cache.segment_cache.ensureCaptureStream(sidecar_gpu_ctx))
             {
                 void *capture_stream = sidecar_cache.segment_cache.capture_stream;
-                std::string stream_binding_error;
-                if (!mtp_sidecar::bindStagesToCaptureStream(*sidecar_cache.graph,
-                                                             capture_stream,
-                                                             &stream_binding_error))
-                {
-                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind MTP sidecar stages to capture stream: "
-                              << stream_binding_error);
-                    return false;
-                }
+                sidecar_dynamic_stream = capture_stream;
             }
             else
             {
@@ -3890,6 +3893,18 @@ namespace llaminar2
         sidecar_cache.position_id = position_id;
         for (int i = 0; i < token_count; ++i)
             sidecar_cache.position_ids[static_cast<size_t>(i)] = position_id + i;
+        if (sidecar_dynamic_stream)
+        {
+            std::string stream_binding_error;
+            if (!mtp_sidecar::bindStagesToCaptureStream(*sidecar_cache.graph,
+                                                         sidecar_dynamic_stream,
+                                                         &stream_binding_error))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to bind MTP sidecar stages to explicit stream: "
+                          << stream_binding_error);
+                return false;
+            }
+        }
         for (auto *stage : sidecar_cache.dynamic_param_stages)
         {
             if (stage)

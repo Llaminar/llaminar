@@ -32,12 +32,16 @@ namespace
                          bool manual_boundary = false,
                          ComputeStageType stage_type = ComputeStageType::COPY,
                          bool warmup_dependent_capture = false,
+                         bool segment_boundary_before = false,
+                         bool segment_boundary_after = false,
                          const uint64_t *variant_signature = nullptr)
             : IComputeStage(DeviceId::cpu()),
               capturable_(capturable),
               manual_boundary_(manual_boundary),
               stage_type_(stage_type),
               warmup_dependent_capture_(warmup_dependent_capture),
+              segment_boundary_before_(segment_boundary_before),
+              segment_boundary_after_(segment_boundary_after),
               variant_signature_(variant_signature)
         {
         }
@@ -52,6 +56,8 @@ namespace
             return variant_signature_ ? *variant_signature_ : 0;
         }
         bool supportsWarmupDependentGraphCapture() const override { return warmup_dependent_capture_; }
+        bool requiresGraphCaptureSegmentBoundaryBefore() const override { return segment_boundary_before_; }
+        bool requiresGraphCaptureSegmentBoundaryAfter() const override { return segment_boundary_after_; }
         bool isManualGraphBoundary() const override { return manual_boundary_; }
         StageDumpInfo buildDumpInfoImpl() const override { return {}; }
 
@@ -60,6 +66,8 @@ namespace
         bool manual_boundary_ = false;
         ComputeStageType stage_type_ = ComputeStageType::COPY;
         bool warmup_dependent_capture_ = false;
+        bool segment_boundary_before_ = false;
+        bool segment_boundary_after_ = false;
         const uint64_t *variant_signature_ = nullptr;
     };
 
@@ -155,6 +163,8 @@ namespace
                              bool manual_boundary = false,
                              ComputeStageType stage_type = ComputeStageType::COPY,
                              bool warmup_dependent_capture = false,
+                             bool segment_boundary_before = false,
+                             bool segment_boundary_after = false,
                              const uint64_t *variant_signature = nullptr)
     {
         graph.addNode(
@@ -164,6 +174,8 @@ namespace
                 manual_boundary,
                 stage_type,
                 warmup_dependent_capture,
+                segment_boundary_before,
+                segment_boundary_after,
                 variant_signature),
             DeviceId::cpu());
     }
@@ -561,6 +573,44 @@ TEST(Test__GraphSegmentCache, WarmupSegmentsPlanWarmupDependentStagesWithoutRese
     ASSERT_EQ(cache.segments[0].stage_names.size(), 3u);
 }
 
+TEST(Test__GraphSegmentCache, CapturableStageBeforeAndAfterBoundariesKeepStageExclusive)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "before", true);
+    addFakeSegmentStage(
+        graph,
+        "rocm_dynamic_attention",
+        true,
+        false,
+        ComputeStageType::ATTENTION,
+        false,
+        true,
+        true);
+    addFakeSegmentStage(graph, "attention_gate", true);
+    addFakeSegmentStage(graph, "after", true);
+    graph.addDependency("rocm_dynamic_attention", "before");
+    graph.addDependency("attention_gate", "rocm_dynamic_attention");
+    graph.addDependency("after", "attention_gate");
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildWarmupSegments(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false);
+
+    ASSERT_EQ(cache.segments.size(), 3u);
+    EXPECT_TRUE(cache.segments[0].capturable);
+    EXPECT_EQ(cache.segments[0].stage_names,
+              std::vector<std::string>({"before"}));
+    EXPECT_TRUE(cache.segments[1].capturable);
+    EXPECT_EQ(cache.segments[1].stage_names,
+              std::vector<std::string>({"rocm_dynamic_attention"}));
+    EXPECT_TRUE(cache.segments[2].capturable);
+    EXPECT_EQ(cache.segments[2].stage_names,
+              std::vector<std::string>({"attention_gate", "after"}));
+}
+
 TEST(Test__GraphSegmentCache, ResetCanDestroyCaptureStream)
 {
     DeviceGraphExecutor::GraphSegmentCache cache;
@@ -859,6 +909,8 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
         true,
         false,
         ComputeStageType::ATTENTION,
+        false,
+        false,
         false,
         &variant);
 

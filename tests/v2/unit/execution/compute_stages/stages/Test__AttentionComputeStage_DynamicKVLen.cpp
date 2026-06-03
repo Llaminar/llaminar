@@ -320,6 +320,8 @@ namespace llaminar2
 
             AttentionComputeStage stage(params);
             EXPECT_TRUE(stage.isGraphCapturable());
+            EXPECT_FALSE(stage.requiresGraphCaptureSegmentBoundaryBefore());
+            EXPECT_FALSE(stage.requiresGraphCaptureSegmentBoundaryAfter());
         }
 
         TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionVariantChangesAtSplitBucket)
@@ -381,6 +383,8 @@ namespace llaminar2
             params.device_id = DeviceId::rocm(0);
             AttentionComputeStage rocm_prefill_stage(params);
             EXPECT_TRUE(rocm_prefill_stage.isGraphCapturable());
+            EXPECT_FALSE(rocm_prefill_stage.requiresGraphCaptureSegmentBoundaryBefore());
+            EXPECT_FALSE(rocm_prefill_stage.requiresGraphCaptureSegmentBoundaryAfter());
         }
 
         /// @brief Reference FP32 single-query GQA attention over a caller-selected KV prefix.

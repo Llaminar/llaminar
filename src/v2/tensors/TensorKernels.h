@@ -1503,6 +1503,22 @@ namespace llaminar2
             (void)query_rows;
             setDynamicAttnParams(kv_len, position_offset);
         }
+
+        /**
+         * @brief Prepare device-side attention params before graph capture/replay.
+         *
+         * Backends with graph-captured attention should update any device-resident
+         * scalar params on the explicit execution stream before beginCapture() or
+         * graph launch. The default preserves existing backends by updating their
+         * host-side params and reporting success.
+         */
+        virtual bool prepareDynamicAttnParams(
+            int kv_len, int position_offset, int query_rows, void *stream)
+        {
+            (void)stream;
+            setDynamicAttnParams(kv_len, position_offset, query_rows);
+            return true;
+        }
     };
 
     // =========================================================================

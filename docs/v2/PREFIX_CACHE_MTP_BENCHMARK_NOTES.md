@@ -18,11 +18,10 @@ speedup. Detailed tuning history belongs in commit messages or perf artifacts.
 
 ## Latest ROCm Dense Evidence
 
-Fresh Release captures on 2026-06-03 used code-default GPU graphs and production
-prefill buckets. The long lane shows graph-captured depth-3 MTP is speed-positive
-but still short of the 2x target. The default benchmark prompt remains
-acceptance-limited: depth 3 drops to about 62-63% acceptance, so adaptive depth is
-needed instead of hard-pinning the deepest draft.
+Fresh Release captures on 2026-06-03 used code-default GPU graphs. Depth-3 MTP
+is speed-positive but still short of the 2x target. The default prompt remains
+acceptance-limited, so adaptive depth is needed instead of hard-pinning the
+deepest draft.
 
 ## Adaptive Depth Motivation
 
@@ -53,21 +52,18 @@ before a full window elapses. The default prompt improved from the previous
 mostly because occasional perfect shallow windows can promote and then demote
 again; promotion hysteresis is the next adaptive slice.
 
-## ROCm Graph Replay Safety
+## ROCm Attention Param-Copy Safety
 
-A long dynamic-depth QBF run faulted during cached HIP graph replay of
-`layer0_attention`. ROCm decode attention now remains graph-capturable while
-reporting a launch-topology variant signature keyed to split-count buckets.
-Segmented replay warms and recaptures when the bucket changes, while ordinary
-within-bucket KV growth uses device-side dynamic params.
+The ROCm attention crash was traced to dynamic `AttentionDeviceParams` H2D
+copies being recorded inside HIP graph capture. The fix moves that upload into
+`prepareDynamicAttnParams()` on an explicit non-null stream before capture or
+replay; the captured stage body now hard-fails if params were not already
+uploaded. Cached forward graphs and MTP sidecar graphs bind all stages to the
+worker/capture stream before dynamic-param updates.
 
-Validation: `V2_Unit_AttentionComputeStage_DynamicKVLen` pins the bucket
-signature, `V2_Unit_ForwardGraphTypes` pins variant recapture, and
-`FlashDecode_FP32_GraphReplayUsesUpdatedKVLenWithinBucket` proves graph replay
-uses updated device-side KV length. The old one-stage trace shows
-`layer0_attention` as `[GRAPH]`; graph-stream stress, dynamic MTP parity, and
-prefix+dynamic restore passed. The original crash repro now completes at 46.74
-tok/s, 85.67% acceptance, and no new `gpucore.*`.
+Validation: the focused graph/attention/forward units passed. A short real
+Qwen3.6 ROCm dynamic-MTP run completed with 268 MTP graph replay traces, no
+ERROR/WARN param-copy diagnostics, 36.64 decode tok/s, and 65.85% acceptance.
 
 ## Main Tuning Actions Landed
 

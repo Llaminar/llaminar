@@ -287,7 +287,90 @@ namespace llaminar2
             }
 
             h_attn_params_capacity_ = capacity;
+            dynamic_attn_device_valid_ = false;
             return true;
+        }
+
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::uploadDynamicAttnParams(
+            void *stream)
+        {
+            if (!dynamic_attn_host_valid_ || !h_attn_params_)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Cannot upload attention params before host values are prepared");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+            if (!stream)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Cannot upload attention params on a null/default HIP stream");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+            if (!workspace_)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Cannot upload attention params without a bound workspace");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+
+            hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+            const hipError_t cap_err =
+                hipStreamIsCapturing(static_cast<hipStream_t>(stream), &cap_status);
+            if (cap_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] hipStreamIsCapturing failed before attention-param upload: "
+                          << hipGetErrorString(cap_err));
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+            if (cap_status == hipStreamCaptureStatusActive)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Refusing to record attention-param H2D inside HIP graph capture");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+
+            void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+            if (!d_buf)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Missing workspace buffer "
+                          << AttentionWorkspaceBuffers::DEVICE_PARAMS
+                          << " for attention params");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+
+            const hipError_t copy_err =
+                hipMemcpyAsync(d_buf,
+                               h_attn_params_,
+                               sizeof(attention::AttentionDeviceParams) *
+                                   static_cast<size_t>(dynamic_attn_param_rows_),
+                               hipMemcpyHostToDevice,
+                               static_cast<hipStream_t>(stream));
+            if (copy_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] hipMemcpyAsync failed for attention params: "
+                          << hipGetErrorString(copy_err));
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+
+            dynamic_attn_device_valid_ = true;
+            return true;
+        }
+
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::dynamicAttnParamsReady(
+            int kv_len, int position_offset, int query_rows) const
+        {
+            const int sanitized_query_rows =
+                (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
+            const int param_rows = std::max(1, sanitized_query_rows);
+            return dynamic_attn_host_valid_ &&
+                   dynamic_attn_device_valid_ &&
+                   dynamic_attn_kv_len_ == kv_len &&
+                   dynamic_attn_position_offset_ == position_offset &&
+                   dynamic_attn_query_rows_ == sanitized_query_rows &&
+                   dynamic_attn_param_rows_ == param_rows;
         }
 
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::allocateWorkspace(
@@ -560,11 +643,29 @@ namespace llaminar2
         void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(
             int kv_len, int position_offset, int query_rows)
         {
-            small_decode_rows_ =
-                (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 0;
-            const int param_rows = std::max(1, small_decode_rows_);
+            const int sanitized_query_rows =
+                (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
+            small_decode_rows_ = (sanitized_query_rows > 1) ? sanitized_query_rows : 0;
+            const int param_rows = std::max(1, sanitized_query_rows);
+            const bool same_params =
+                dynamic_attn_host_valid_ &&
+                dynamic_attn_kv_len_ == kv_len &&
+                dynamic_attn_position_offset_ == position_offset &&
+                dynamic_attn_query_rows_ == sanitized_query_rows &&
+                dynamic_attn_param_rows_ == param_rows;
+
             if (!ensureHostAttnParamsCapacity(param_rows))
+            {
+                dynamic_attn_host_valid_ = false;
+                dynamic_attn_device_valid_ = false;
                 return;
+            }
+
+            if (!same_params)
+            {
+                dynamic_attn_device_valid_ = false;
+            }
+
             if (small_decode_rows_ > 1)
             {
                 for (int row = 0; row < small_decode_rows_; ++row)
@@ -581,6 +682,85 @@ namespace llaminar2
                 h_attn_params_->position_offset = position_offset;
                 h_attn_params_->mask_stride = kv_len;
             }
+
+            dynamic_attn_kv_len_ = kv_len;
+            dynamic_attn_position_offset_ = position_offset;
+            dynamic_attn_query_rows_ = sanitized_query_rows;
+            dynamic_attn_param_rows_ = param_rows;
+            dynamic_attn_host_valid_ = true;
+
+            if (!stream_ || !workspace_)
+            {
+                return;
+            }
+
+            hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+            const hipError_t cap_err =
+                hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
+            if (cap_err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] hipStreamIsCapturing failed while preparing attention params: "
+                          << hipGetErrorString(cap_err));
+                dynamic_attn_device_valid_ = false;
+                return;
+            }
+            if (cap_status == hipStreamCaptureStatusActive)
+            {
+                if (!dynamic_attn_device_valid_)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Attention params changed during HIP graph capture; "
+                              "they must be uploaded before beginCapture()");
+                }
+                return;
+            }
+
+            if (!dynamic_attn_device_valid_)
+            {
+                uploadDynamicAttnParams(stream_);
+            }
+        }
+
+        bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(
+            int kv_len, int position_offset, int query_rows, void *stream)
+        {
+            if (!stream)
+            {
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] prepareDynamicAttnParams requires an explicit non-null HIP stream");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+            setGPUStream(stream);
+            setDynamicAttnParams(kv_len, position_offset, query_rows);
+            const bool ready = dynamicAttnParamsReady(kv_len, position_offset, query_rows);
+            if (!ready)
+            {
+                const int sanitized_query_rows =
+                    (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
+                LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] Dynamic attention params not ready after prepare"
+                          << " requested(kv_len=" << kv_len
+                          << ", pos=" << position_offset
+                          << ", rows=" << sanitized_query_rows << ")"
+                          << " actual(kv_len=" << dynamic_attn_kv_len_
+                          << ", pos=" << dynamic_attn_position_offset_
+                          << ", rows=" << dynamic_attn_query_rows_
+                          << ", param_rows=" << dynamic_attn_param_rows_
+                          << ") host_valid=" << dynamic_attn_host_valid_
+                          << " device_valid=" << dynamic_attn_device_valid_
+                          << " workspace=" << (workspace_ != nullptr)
+                          << " stream=" << stream_);
+            }
+            return ready;
+        }
+
+        void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::resetDynamicState()
+        {
+            small_decode_rows_ = 0;
+            dynamic_attn_kv_len_ = 0;
+            dynamic_attn_position_offset_ = 0;
+            dynamic_attn_query_rows_ = 1;
+            dynamic_attn_param_rows_ = 1;
+            dynamic_attn_host_valid_ = false;
+            dynamic_attn_device_valid_ = false;
         }
 
         bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::compute_tensor(
@@ -724,11 +904,12 @@ namespace llaminar2
                                                                                  << " head_dim=" << head_dim << " causal=" << causal
                                                                                  << " device_idx=" << dev);
 
-            // Wire device_params for graph-capture replay: H2D memcpy from pinned host
-            // memory is captured as a graph node. On replay, the memcpy re-reads
-            // the updated pinned values (kv_len, position_offset, mask_stride).
+            // Wire device_params for graph-capture replay. The tiny H2D copy is
+            // deliberately issued before beginCapture()/graph launch through
+            // setDynamicAttnParams()/prepareDynamicAttnParams(), never from the
+            // captured stage body. Capturing this memcpy made ROCm attention
+            // graph replay crash intermittently inside hipGraphLaunch.
             const attention::AttentionDeviceParams *d_attn_params = nullptr;
-            small_decode_rows_ = 0;
             if (stream_ && workspace_)
             {
                 const bool small_native_decode =
@@ -739,25 +920,25 @@ namespace llaminar2
                     seq_len > 1 &&
                     seq_len <= MAX_SMALL_DECODE_ROWS &&
                     kv_len > seq_len;
-                small_decode_rows_ = small_native_decode ? seq_len : 0;
-                const int param_rows = small_native_decode ? seq_len : 1;
-                if (ensureHostAttnParamsCapacity(param_rows))
-                {
-                    const int dynamic_position_offset =
-                        (causal && kv_len > seq_len) ? (kv_len - seq_len) : 0;
-                    setDynamicAttnParams(kv_len, dynamic_position_offset,
-                                         small_native_decode ? seq_len : 1);
+                const int query_rows_for_params = small_native_decode ? seq_len : 1;
+                const int dynamic_position_offset =
+                    (causal && kv_len > seq_len) ? (kv_len - seq_len) : 0;
 
-                    void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
-                    if (d_buf)
-                    {
-                        hipMemcpyAsync(d_buf, h_attn_params_,
-                                       sizeof(attention::AttentionDeviceParams) *
-                                           static_cast<size_t>(param_rows),
-                                       hipMemcpyHostToDevice, static_cast<hipStream_t>(stream_));
-                        d_attn_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
-                    }
+                setDynamicAttnParams(kv_len, dynamic_position_offset, query_rows_for_params);
+                if (!dynamicAttnParamsReady(kv_len, dynamic_position_offset, query_rows_for_params))
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Attention device params were not ready on the explicit stream");
+                    return false;
                 }
+
+                void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+                if (!d_buf)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Missing workspace buffer "
+                              << AttentionWorkspaceBuffers::DEVICE_PARAMS);
+                    return false;
+                }
+                d_attn_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
             }
 
             const float *mask_ptr = nullptr;
@@ -994,6 +1175,7 @@ namespace llaminar2
             DeviceWorkspaceManager *workspace)
         {
             workspace_ = workspace;
+            dynamic_attn_device_valid_ = false;
             if (workspace)
             {
                 LOG_DEBUG("[ROCmFlashAttentionKernelT<FP32>] Bound workspace manager, entering managed mode");
