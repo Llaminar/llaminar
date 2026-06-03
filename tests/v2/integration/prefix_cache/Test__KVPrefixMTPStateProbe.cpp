@@ -461,6 +461,18 @@ namespace
         EXPECT_GE(snapshot.mtp_accepted_tokens + snapshot.mtp_rejected_tokens, 1u)
             << "Speculative-sampling mode must actually verify at least one draft token on "
             << backend_name;
+        EXPECT_EQ(snapshot.mtp_request.verify_mode, "speculative-sampling");
+        EXPECT_TRUE(snapshot.mtp_request.stochastic_verify);
+        EXPECT_GE(snapshot.mtp_stochastic_accept_tests, 1u);
+        EXPECT_GE(snapshot.mtp_request.stochastic_accept_tests, 1u);
+        EXPECT_EQ(snapshot.mtp_request.stochastic_accept_tests, snapshot.mtp_stochastic_accept_tests);
+        EXPECT_EQ(snapshot.mtp_request.stochastic_accepts, snapshot.mtp_stochastic_accepts);
+        EXPECT_EQ(snapshot.mtp_request.stochastic_residual_samples,
+                  snapshot.mtp_stochastic_residual_samples);
+        EXPECT_EQ(snapshot.mtp_request.stochastic_terminal_samples,
+                  snapshot.mtp_stochastic_terminal_samples);
+        EXPECT_GE(snapshot.mtp_request.stochastic_acceptance_rate, 0.0);
+        EXPECT_LE(snapshot.mtp_request.stochastic_acceptance_rate, 1.0);
         EXPECT_GE(counter("first_token_stochastic_device_samples"), 1.0);
         EXPECT_GE(counter("mtp_token_stochastic_device_samples"), 1.0);
         EXPECT_GE(counter("verifier_stochastic_device_distributions"), 2.0);
