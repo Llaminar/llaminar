@@ -8,9 +8,11 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <array>
 #include <optional>
+#include <sstream>
 #include <typeinfo>
 
 namespace llaminar2
@@ -92,6 +94,54 @@ namespace llaminar2
             for (size_t index : indices)
                 selected.push_back(projections[index]);
             return selected;
+        }
+
+        void recordGDNProjectionRoute(
+            const char *route,
+            int m,
+            int k,
+            const std::vector<ITensorGemm::TensorProjectionDesc> &projections,
+            const std::vector<size_t> &indices,
+            const std::array<std::optional<uint8_t>, 4> &native_codebooks)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            std::ostringstream names;
+            std::ostringstream ns;
+            std::ostringstream codebooks;
+            for (size_t i = 0; i < indices.size(); ++i)
+            {
+                const size_t index = indices[i];
+                if (i > 0)
+                {
+                    names << '+';
+                    ns << '+';
+                    codebooks << '+';
+                }
+                names << (projections[index].name ? projections[index].name : "unnamed");
+                ns << projections[index].n;
+                if (index < native_codebooks.size() && native_codebooks[index].has_value())
+                    codebooks << static_cast<unsigned>(native_codebooks[index].value());
+                else
+                    codebooks << "none";
+            }
+
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "gdn_projection_route",
+                1.0,
+                {},
+                {},
+                PerfStatsCollector::Tags{
+                    {"route", route ? route : "unknown"},
+                    {"m", std::to_string(m)},
+                    {"k", std::to_string(k)},
+                    {"projections", std::to_string(indices.size())},
+                    {"names", names.str()},
+                    {"n", ns.str()},
+                    {"codebooks", codebooks.str()},
+                });
         }
     } // namespace
 
@@ -253,6 +303,13 @@ namespace llaminar2
         bool success = false;
         if (homogeneous_projection_kernels)
         {
+            recordGDNProjectionRoute(
+                "homogeneous_full",
+                M,
+                K,
+                projections,
+                {0, 1, 2, 3},
+                native_codebooks);
             success = gemm_qkv->multiply_fused_tensor(A_base, projections, M, K, nullptr, bound_workspace_);
             if (!success)
             {
@@ -264,98 +321,87 @@ namespace llaminar2
         {
             LOG_DEBUG("[GDNProjectionStage] Mixed projection GEMM kernels; trying supported fused subgroups");
 
-            bool native_small_m_full_group =
-                M >= 2 && M <= 4 &&
-                projections[0].kernel &&
-                projections[0].kernel->supports_fused_projection() &&
-                native_codebooks[0].has_value();
-            for (size_t i = 1; i < projections.size() && native_small_m_full_group; ++i)
+            std::vector<bool> completed(projections.size(), false);
+            auto runFusedSubgroups = [&](bool require_native_compatibility) -> bool
             {
-                native_small_m_full_group =
-                    projections[i].kernel &&
-                    projections[i].kernel->supports_fused_projection() &&
-                    sameKernelType(projections[0].kernel, projections[i].kernel) &&
-                    native_codebooks[i].has_value();
-            }
-
-            if (native_small_m_full_group)
-            {
-                success = projections.front().kernel->multiply_fused_tensor(
-                    A_base, projections, M, K, nullptr, bound_workspace_);
-                if (!success)
-                {
-                    LOG_ERROR("[GDNProjectionStage] Full native small-M mixed-codebook GDN projection group failed");
-                    return false;
-                }
-            }
-            else
-            {
-                std::vector<bool> completed(projections.size(), false);
-                auto runFusedSubgroups = [&](bool require_native_compatibility) -> bool
-                {
-                    for (size_t i = 0; i < projections.size(); ++i)
-                    {
-                        if (completed[i] || !projections[i].kernel ||
-                            !projections[i].kernel->supports_fused_projection())
-                        {
-                            continue;
-                        }
-
-                        std::vector<size_t> group_indices;
-                        group_indices.push_back(i);
-                        for (size_t j = i + 1; j < projections.size(); ++j)
-                        {
-                            if (!completed[j] && projections[j].kernel &&
-                                projections[j].kernel->supports_fused_projection())
-                            {
-                                const bool compatible =
-                                    require_native_compatibility
-                                        ? fusedProjectionCompatible(
-                                              projections[i].kernel,
-                                              projections[j].kernel,
-                                              native_codebooks[i],
-                                              native_codebooks[j])
-                                        : sameKernelType(projections[i].kernel, projections[j].kernel);
-                                if (compatible)
-                                    group_indices.push_back(j);
-                            }
-                        }
-
-                        if (group_indices.size() < 2)
-                            continue;
-
-                        auto group = selectProjections(projections, group_indices);
-                        if (!group.front().kernel->multiply_fused_tensor(
-                                A_base, group, M, K, nullptr, bound_workspace_))
-                        {
-                            LOG_ERROR("[GDNProjectionStage] Fused projection subgroup failed for "
-                                      << (group.front().name ? group.front().name : "unnamed")
-                                      << " group_size=" << group.size());
-                            return false;
-                        }
-
-                        for (size_t index : group_indices)
-                            completed[index] = true;
-                    }
-                    return true;
-                };
-
-                if (!runFusedSubgroups(/*require_native_compatibility=*/true))
-                    return false;
-                if (!runFusedSubgroups(/*require_native_compatibility=*/false))
-                    return false;
-
-                std::vector<ITensorGemm::TensorProjectionDesc> remaining;
-                remaining.reserve(projections.size());
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
-                    if (!completed[i])
-                        remaining.push_back(projections[i]);
-                }
+                    if (completed[i] || !projections[i].kernel ||
+                        !projections[i].kernel->supports_fused_projection())
+                    {
+                        continue;
+                    }
 
-                success = remaining.empty() ||
-                          multiplyProjectionFallback(A_base, remaining, M, K, bound_workspace_);
+                    std::vector<size_t> group_indices;
+                    group_indices.push_back(i);
+                    for (size_t j = i + 1; j < projections.size(); ++j)
+                    {
+                        if (!completed[j] && projections[j].kernel &&
+                            projections[j].kernel->supports_fused_projection())
+                        {
+                            const bool compatible =
+                                require_native_compatibility
+                                    ? fusedProjectionCompatible(
+                                          projections[i].kernel,
+                                          projections[j].kernel,
+                                          native_codebooks[i],
+                                          native_codebooks[j])
+                                    : sameKernelType(projections[i].kernel, projections[j].kernel);
+                            if (compatible)
+                                group_indices.push_back(j);
+                        }
+                    }
+
+                    if (group_indices.size() < 2)
+                        continue;
+
+                    auto group = selectProjections(projections, group_indices);
+                    recordGDNProjectionRoute(
+                        require_native_compatibility ? "native_subgroup" : "same_kernel_mixed_codebook_subgroup",
+                        M,
+                        K,
+                        projections,
+                        group_indices,
+                        native_codebooks);
+                    if (!group.front().kernel->multiply_fused_tensor(
+                            A_base, group, M, K, nullptr, bound_workspace_))
+                    {
+                        LOG_ERROR("[GDNProjectionStage] Fused projection subgroup failed for "
+                                  << (group.front().name ? group.front().name : "unnamed")
+                                  << " group_size=" << group.size());
+                        return false;
+                    }
+
+                    for (size_t index : group_indices)
+                        completed[index] = true;
+                }
+                return true;
+            };
+
+            if (!runFusedSubgroups(/*require_native_compatibility=*/true))
+                return false;
+            if (!runFusedSubgroups(/*require_native_compatibility=*/false))
+                return false;
+
+            std::vector<ITensorGemm::TensorProjectionDesc> remaining;
+            remaining.reserve(projections.size());
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                if (!completed[i])
+                {
+                    recordGDNProjectionRoute(
+                        "fallback_single",
+                        M,
+                        K,
+                        projections,
+                        {i},
+                        native_codebooks);
+                    remaining.push_back(projections[i]);
+                }
             }
+
+            success = remaining.empty() ||
+                      multiplyProjectionFallback(A_base, remaining, M, K, bound_workspace_);
         }
 
         if (!success)

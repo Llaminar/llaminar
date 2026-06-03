@@ -6188,26 +6188,21 @@ namespace llaminar2
     {
         state_.clear();
 
-        // Full forward graphs can bake in request-shaped stage wiring, so drop
-        // them at prompt boundaries. Lower-level layer graph caches are reset
-        // in-place below because their dynamic state hooks cover the reused data.
         if (forward_engine_)
-            forward_engine_->clearCache();
-        mtp_sidecar_depth0_cache_.invalidate();
-        mtp_sidecar_depth0_chained_cache_.invalidate();
-        mtp_sidecar_depth0_kv_only_cache_.invalidate();
-        mtp_terminal_hidden_row_select_cache_.invalidate();
+            forward_engine_->resetSessionReplayState();
+        mtp_sidecar_depth0_cache_.resetSessionState();
+        mtp_sidecar_depth0_chained_cache_.resetSessionState();
+        mtp_sidecar_depth0_kv_only_cache_.resetSessionState();
+        mtp_terminal_hidden_row_select_cache_.resetSessionState();
 
-        // Layer decode graphs can hold per-request stage/kernel state, so make
-        // them rebuild after the request boundary.
         for (auto &cache : layer_graph_cache_)
         {
-            cache.invalidate();
+            cache.resetSessionState();
         }
 
         resetKernelDynamicState();
 
-        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (forward graph cache dropped)");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Inference state cleared (cached graph topology preserved)");
     }
 
     // =========================================================================

@@ -1843,20 +1843,18 @@ namespace llaminar2
                 if (ctx && dev.is_gpu())
                     ctx->synchronize();
             }
-            // Layer decode graphs may own per-request stage/kernel state, so
-            // make them rebuild for the next independent prompt.
             for (auto &entry : layer_graph_cache_)
             {
-                entry.invalidate();
+                entry.resetSessionState();
             }
             if (forward_engine_)
             {
-                forward_engine_->clearCache();
+                forward_engine_->resetSessionReplayState();
             }
-            mtp_sidecar_depth0_cache_.invalidate();
-            mtp_sidecar_depth0_chained_cache_.invalidate();
-            mtp_sidecar_depth0_kv_only_cache_.invalidate();
-            mtp_terminal_hidden_row_select_cache_.invalidate();
+            mtp_sidecar_depth0_cache_.resetSessionState();
+            mtp_sidecar_depth0_chained_cache_.resetSessionState();
+            mtp_sidecar_depth0_kv_only_cache_.resetSessionState();
+            mtp_terminal_hidden_row_select_cache_.resetSessionState();
             last_pos_offset_ = -1;
             cache_stats_ = CacheStats{};
             state_.clear();
@@ -2293,6 +2291,21 @@ namespace llaminar2
                 resetReplayState();
             }
 
+            void resetSessionState()
+            {
+                resetReplayState();
+                if (graph)
+                {
+                    graph->reset();
+                    for (const auto &node_name : graph->getExecutionOrder())
+                    {
+                        ComputeNode *node = graph->getNode(node_name);
+                        if (node && node->stage)
+                            node->stage->resetSessionState();
+                    }
+                }
+            }
+
             void invalidate()
             {
                 segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
@@ -2321,6 +2334,19 @@ namespace llaminar2
             int seq_capacity = 0;
             int d_model = 0;
             bool valid = false;
+
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            }
 
             void invalidate()
             {

@@ -91,31 +91,31 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
-- Fresh GDN projection stage route-ordering hardening on 2026-06-02:
-  `GDNProjectionStage` now prefers a full native small-M mixed-codebook
-  fused group before greedily splitting same-codebook subgroups. The focused
-  regression
-  `Test__ROCmQuantisedGemmSmallM.GDNProjectionStageMixedCodebookM4UsesSingleFullBatchedRoute`
-  drives the stage itself, captures it in a HIP graph, compares every
-  projection against separate GEMM outputs, and asserts one
-  `rocm_native_vnni_small_m_batched_calls` counter with
-  `m=4,k=5120,projections=4,codebook=mixed` plus no same-codebook
-  `projections=2` split. The full
-  `V2_Integration_ROCmQuantisedGemmSmallM` target passed after the change.
-  Real Qwen3.6 dense smoke/parity also passed:
-  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`,
-  `V2_Integration_Parity_Qwen36_SingleDevice_...PrefixCacheMTPRestore`, and
-  `...MTPGreedyMatchesPyTorchDecodeTokens`. The current machine had
-  `rocm:0` occupied, so same-source long-lane benchmark evidence used
-  `rocm:1`: baseline
-  `/tmp/llaminar-mtp-bench/dense-rocm-gdnstage-fullmixed-baseline-c64-n48-rocm1-bench.json`
-  reached 20.32 decode tok/s, and the confirming MTP rerun
-  `/tmp/llaminar-mtp-bench/dense-rocm-gdnstage-fullmixed-mtp-d1-c64-n48-rocm1-rerun-bench.json`
-  reached 33.11 decode tok/s, or 1.63x, with structured stats in
-  `/tmp/llaminar-mtp-bench/dense-rocm-gdnstage-fullmixed-mtp-d1-c64-n48-rocm1-rerun-stats.json`.
-  This keeps the ROCm speedup lane healthy but does not replace the 34.28 tok/s
-  ratchet; `mtp.verifier_forward` still averaged about 52.10 ms, and the
-  next speed work remains the verifier graph itself.
+- Fresh GDN projection route probe on 2026-06-02:
+  `GDNProjectionStage` records structured `kernel.gdn_projection_route`
+  counters so real-model runs can show which fused projection groups are used.
+  The retained stage policy is codebook-preserving native subgroups first, then
+  same-kernel mixed-codebook subgroups for compatible leftovers. The rejected
+  four-projection full mixed-codebook bundle was removed because it conflicted
+  with the existing codebook-splitting contract and did not match the real
+  Qwen3.6 route. Current Qwen3.6 dense route-smoke artifacts:
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnroute-current-mtp-c64-n8-bench.json`,
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnroute-current-mtp-c64-n8-stats.json`,
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdnroute-current-mtp-c64-n8-stats.csv`.
+  Those counters show the real GDN verifier path is a large quantized `qkv+z`
+  pair (`N=10240+6144`, codebooks `5+5` or `7+5`) plus a tiny FP32
+  `alpha+beta` pair (`N=48+48`) dispatched through the ROCm FP32 batched
+  projection path. The focused validation slice passed:
+  `V2_Unit_GDNKernels`, `V2_Unit_GDNMathematicalCorrectness`,
+  `V2_Integration_ROCmQuantisedGemmSmallM`, `V2_Unit_MTPGraphConstruction`,
+  `V2_Unit_PrefillDecodeTransition`, `V2_Unit_ForwardExecutionEngine`,
+  `V2_Unit_ForwardExecutionEngineAdvanced`, and
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`.
+  `rocprofv3` remains unreliable for this MPI-bootstrapped path on the current
+  machine: direct `--no-mpi-bootstrap` crashed in OpenMPI init and the
+  self-bootstrap run did not emit the requested kernel trace. Use
+  `LLAMINAR_GPU_STAGE_TIMING=1` plus the `stage_gpu` perf domain for now.
 - Fresh both-shortcuts recheck after rebuilding `build_v2_release`, Qwen3.6
   27B Q4_K_S on `rocm:0`, GPU graphs enabled, `The quick brown fox`,
   `-c 64`, `-n 48`: baseline

@@ -1730,6 +1730,89 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheRecordsPlainAfterBuildThenP
     PerfStatsCollector::reset();
 }
 
+TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoEEpochIsStable)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    float *terminal_hidden = hidden->mutable_data();
+    ASSERT_NE(terminal_hidden, nullptr);
+    for (int i = 0; i < fixture.config.d_model; ++i)
+        terminal_hidden[i] = 0.01f * static_cast<float>((i % 19) + 1);
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    ASSERT_EQ(orchestrator.moePlacementEpoch(), 0u);
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/3));
+    orchestrator.clear_cache();
+    ASSERT_EQ(orchestrator.moePlacementEpoch(), 0u);
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/4));
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto epoch0_depth_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
+    const auto plain_after_build_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain_after_build"}};
+    const auto plain_reuse_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"path", "plain"}};
+
+    const PerfStatRecord *cache_misses = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_misses",
+        epoch0_depth_tags);
+    ASSERT_NE(cache_misses, nullptr);
+    EXPECT_DOUBLE_EQ(cache_misses->value, 1.0);
+
+    const PerfStatRecord *cache_hits = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_hits",
+        epoch0_depth_tags);
+    ASSERT_NE(cache_hits, nullptr);
+    EXPECT_DOUBLE_EQ(cache_hits->value, 1.0);
+
+    const PerfStatRecord *plain_after_build = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_capture_path",
+        plain_after_build_tags);
+    ASSERT_NE(plain_after_build, nullptr);
+    EXPECT_DOUBLE_EQ(plain_after_build->value, 1.0);
+
+    const PerfStatRecord *plain_reuse = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_capture_path",
+        plain_reuse_tags);
+    ASSERT_NE(plain_reuse, nullptr);
+    EXPECT_DOUBLE_EQ(plain_reuse->value, 1.0);
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__MTPGraphConstruction, SidecarGraphCacheMissesWhenMoEPlacementEpochChanges)
 {
     DeviceManager::instance().initialize(-1, false);
