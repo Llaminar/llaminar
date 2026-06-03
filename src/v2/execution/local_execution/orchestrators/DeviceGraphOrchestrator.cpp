@@ -3638,11 +3638,15 @@ namespace llaminar2
                    ? mtp_sidecar_depth0_chained_cache_
                    : mtp_sidecar_depth0_cache_);
         const uint64_t current_moe_placement_epoch = moePlacementEpoch();
+        const bool sidecar_moe_epoch_sensitive = mtp_moe_sidecar && !kv_cache_only;
+        const uint64_t sidecar_moe_epoch_key =
+            sidecar_moe_epoch_sensitive ? current_moe_placement_epoch : 0;
         const bool needs_graph_rebuild =
             !sidecar_cache.valid ||
             !sidecar_cache.graph ||
             sidecar_cache.terminal_hidden != terminal_hidden ||
-            sidecar_cache.moe_placement_epoch != current_moe_placement_epoch;
+            sidecar_cache.moe_epoch_sensitive != sidecar_moe_epoch_sensitive ||
+            sidecar_cache.moe_placement_epoch != sidecar_moe_epoch_key;
 
         const bool rebuilt_graph = needs_graph_rebuild;
         if (needs_graph_rebuild)
@@ -3651,7 +3655,8 @@ namespace llaminar2
             sidecar_cache.token_id = draft_condition_token;
             sidecar_cache.position_id = position_id;
             sidecar_cache.terminal_hidden = terminal_hidden;
-            sidecar_cache.moe_placement_epoch = current_moe_placement_epoch;
+            sidecar_cache.moe_placement_epoch = sidecar_moe_epoch_key;
+            sidecar_cache.moe_epoch_sensitive = sidecar_moe_epoch_sensitive;
 
             MTPForwardInput cached_input = input;
             cached_input.draft_token_ids = &sidecar_cache.token_id;
@@ -3710,7 +3715,7 @@ namespace llaminar2
                 phase,
                 device_key,
                 {{"depth", "0"},
-                 {"moe_placement_epoch", std::to_string(current_moe_placement_epoch)}});
+                 {"moe_placement_epoch", std::to_string(sidecar_moe_epoch_key)}});
         }
         else
         {
@@ -3721,7 +3726,7 @@ namespace llaminar2
                 phase,
                 device_key,
                 {{"depth", "0"},
-                 {"moe_placement_epoch", std::to_string(current_moe_placement_epoch)}});
+                 {"moe_placement_epoch", std::to_string(sidecar_moe_epoch_key)}});
         }
 
         IDeviceContext *ctx = getDeviceContext(state_.device_id);

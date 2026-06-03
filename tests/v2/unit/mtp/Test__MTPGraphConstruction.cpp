@@ -1823,7 +1823,7 @@ TEST(Test__MTPGraphConstruction, CPUSidecarGraphCacheSurvivesRequestClearWhenMoE
     PerfStatsCollector::reset();
 }
 
-TEST(Test__MTPGraphConstruction, SidecarGraphCacheMissesWhenMoEPlacementEpochChanges)
+TEST(Test__MTPGraphConstruction, DenseSidecarGraphCacheIgnoresMoEPlacementEpochChanges)
 {
     DeviceManager::instance().initialize(-1, false);
 
@@ -1858,6 +1858,97 @@ TEST(Test__MTPGraphConstruction, SidecarGraphCacheMissesWhenMoEPlacementEpochCha
     graph_builder->setPreparedWeightStore(&store);
 
     auto rebalance_config = makeTinyRebalanceConfig();
+    auto controller = std::make_unique<MoERebalanceController>(rebalance_config);
+    auto *controller_ptr = controller.get();
+    orchestrator.setMoERebalanceController(std::move(controller));
+    ASSERT_EQ(orchestrator.moePlacementEpoch(), 0u);
+
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/3));
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/4));
+
+    ASSERT_NE(controller_ptr->histogram(), nullptr);
+    fillTinyRebalanceWindow(*controller_ptr->histogram(),
+                            rebalance_config.window_size,
+                            rebalance_config.num_layers,
+                            rebalance_config.top_k);
+    ASSERT_TRUE(controller_ptr->shouldRebalance());
+    ASSERT_FALSE(controller_ptr->rebalance().empty());
+    ASSERT_EQ(orchestrator.moePlacementEpoch(), 1u);
+
+    ASSERT_TRUE(orchestrator.forwardMTP(/*draft_condition_token=*/5));
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    const auto epoch0_tags =
+        PerfStatsCollector::Tags{{"depth", "0"}, {"moe_placement_epoch", "0"}};
+    const PerfStatRecord *epoch0_miss = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_misses",
+        epoch0_tags);
+    ASSERT_NE(epoch0_miss, nullptr);
+    EXPECT_DOUBLE_EQ(epoch0_miss->value, 1.0);
+
+    const PerfStatRecord *epoch0_hit = findMTPRecord(
+        records,
+        PerfStatRecord::Kind::Counter,
+        "sidecar_graph_cache_hits",
+        epoch0_tags);
+    ASSERT_NE(epoch0_hit, nullptr);
+    EXPECT_DOUBLE_EQ(epoch0_hit->value, 2.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpochChanges)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    DenseMTPGraphFixture fixture;
+    fixture.config.activation_precision = ActivationPrecision::FP32;
+    fixture.config.kv_cache_precision = KVCachePrecision::FP32;
+    fixture.config.use_graph_buffer_management = true;
+    fixture.config.mtp.enabled = true;
+    fixture.config.mtp.draft_tokens = 1;
+    fixture.config.moe.num_experts = 4;
+    fixture.config.moe.top_k = 2;
+    fixture.config.moe.intermediate_size = 32;
+    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.has_shared_expert = false;
+
+    auto graph_builder = std::make_shared<Qwen35MoEGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto hidden = orchestrator.inferenceState().hidden;
+    ASSERT_NE(hidden, nullptr);
+    float *terminal_hidden = hidden->mutable_data();
+    ASSERT_NE(terminal_hidden, nullptr);
+    for (int i = 0; i < fixture.config.d_model; ++i)
+        terminal_hidden[i] = 0.01f * static_cast<float>((i % 19) + 1);
+
+    auto frozen = makeMoEMTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    auto rebalance_config = makeTinyRebalanceConfig();
+    rebalance_config.num_experts = fixture.config.moe.num_experts;
+    rebalance_config.initial_expert_to_socket.resize(static_cast<size_t>(rebalance_config.num_experts));
+    for (int expert = 0; expert < rebalance_config.num_experts; ++expert)
+        rebalance_config.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 2 ? 0 : 1;
     auto controller = std::make_unique<MoERebalanceController>(rebalance_config);
     auto *controller_ptr = controller.get();
     orchestrator.setMoERebalanceController(std::move(controller));

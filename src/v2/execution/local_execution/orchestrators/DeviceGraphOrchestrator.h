@@ -2278,6 +2278,7 @@ namespace llaminar2
             TensorBase *terminal_hidden = nullptr;
             uint64_t workspace_generation = 0;
             uint64_t moe_placement_epoch = 0;
+            bool moe_epoch_sensitive = false;
             int32_t token_id = 0;
             int position_id = 0;
             bool valid = false;
@@ -2316,6 +2317,7 @@ namespace llaminar2
                 terminal_hidden = nullptr;
                 workspace_generation = 0;
                 moe_placement_epoch = 0;
+                moe_epoch_sensitive = false;
                 token_id = 0;
                 position_id = 0;
                 valid = false;
