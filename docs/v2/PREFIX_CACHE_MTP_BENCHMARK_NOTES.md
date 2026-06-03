@@ -91,6 +91,30 @@ can remain enabled because it does not by itself disable segmented graph replay.
 
 Latest graph-atomic small-M hardening validation:
 
+- Fresh request-reset plus GDN verifier-capture binding recheck on 2026-06-03:
+  Qwen3.6 dense 27B Q4_K_S on `rocm:0`, GPU graphs enabled,
+  `The quick brown fox`, `-c 64`, `-n 48`, depth-1 MTP. Benchmark artifact
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-row-restore-fix-mtp-d1-c64-n48-bench.json`
+  reached 34.26 decode tok/s, essentially preserving the 34.28 tok/s
+  mixed-native-GDN ratchet. Structured stats:
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-row-restore-fix-mtp-d1-c64-n48-stats.json`
+  and
+  `/tmp/llaminar-mtp-bench/dense-rocm-gdn-row-restore-fix-mtp-d1-c64-n48-stats.csv`.
+  The request recorded 90.62% acceptance, 87 accepted tokens, 9 rejected
+  tokens, and 9 rollbacks. The measured perf window recorded six rollbacks,
+  six `rollback_verifier_state_row_shortcuts`, six GDN verifier-row restores
+  across 48 layers, no `shortconv_restore_failed`, no shortcut-unavailable
+  counter, and `restore_verifier_state_row` around 173 us per restore.
+  `sidecar_graph_cache_hits` recorded steady decode/prefill replay after
+  warmup with no measured `sidecar_build_graph` records, confirming request
+  clears no longer pay graph reconstruction when workspace generation and MoE
+  placement epoch are stable. Focused regressions passed:
+  `V2_Unit_GDNKernels`, `V2_Unit_MTPGraphConstruction`,
+  `V2_Integration_ROCmQuantisedGemmSmallM`,
+  `V2_Integration_PrefixCacheMTP_Qwen36ROCmGpuGraphsChainedDraftSmoke`,
+  `V2_Integration_Parity_Qwen36_SingleDevice_Qwen36SingleDevicePrefixMTPParity_MTPGreedyMatchesPyTorchDecodeTokens`,
+  and
+  `V2_Integration_Parity_Qwen36_SingleDevice_Qwen36SingleDevicePrefixMTPParity_PrefixCacheMTPRestore`.
 - Fresh GDN projection route probe on 2026-06-02:
   `GDNProjectionStage` records structured `kernel.gdn_projection_route`
   counters so real-model runs can show which fused projection groups are used.
