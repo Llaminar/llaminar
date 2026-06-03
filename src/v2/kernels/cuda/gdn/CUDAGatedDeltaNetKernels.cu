@@ -219,6 +219,9 @@ namespace
         float *__restrict__ output,         // [seq_len, n_heads * d_v]
         float *__restrict__ state,          // [n_heads, d_k, d_v]
         const int *__restrict__ effective_seq_len_ptr,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         bool inputs_preprocessed)
@@ -445,6 +448,18 @@ namespace
                     out_vi += reduce_out[col_in_block + s * cols_per_block];
                 o_dst[vi] = out_vi;
             }
+
+            if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows && vi < d_v)
+            {
+                float *snapshot =
+                    state_snapshots +
+                    static_cast<size_t>(t) * static_cast<size_t>(snapshot_stride_floats) +
+                    static_cast<size_t>(h) * static_cast<size_t>(d_k) * static_cast<size_t>(d_v);
+#pragma unroll
+                for (int j = 0; j < ROWS_PER_SPLIT; ++j)
+                    snapshot[(j_start + j) * d_v + vi] = sc[j];
+            }
+            __syncthreads();
         }
 
         if (vi < d_v)
@@ -606,6 +621,9 @@ namespace
         float *__restrict__ output,       // [seq_len, channels]
         float *__restrict__ conv_state,   // [channels, kernel_size-1] (updated at end)
         const int *__restrict__ effective_seq_len_ptr,
+        float *__restrict__ state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int seq_len, int channels, int kernel_size,
         bool apply_silu)
     {
@@ -645,6 +663,21 @@ namespace
                 sum = sum / (1.0f + expf(-sum));
         }
         output[t * channels + ch] = sum;
+
+        if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows)
+        {
+            float *snapshot =
+                state_snapshots +
+                static_cast<size_t>(t) * static_cast<size_t>(snapshot_stride_floats) +
+                static_cast<size_t>(ch) * static_cast<size_t>(ks_minus1);
+            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            {
+                const int src_t = t - ks_minus1 + 1 + state_idx;
+                snapshot[state_idx] =
+                    (src_t >= 0) ? input[src_t * channels + ch]
+                                 : (conv_state ? conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
+            }
+        }
     }
 
     __global__ void cuda_short_conv1d_state_update_kernel(
@@ -1023,6 +1056,9 @@ extern "C"
         float *output, float *state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
@@ -1057,6 +1093,9 @@ extern "C"
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
             nullptr,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
             seq_len, n_heads, d_k, d_v, use_qk_l2norm,
             true);
 
@@ -1077,6 +1116,9 @@ extern "C"
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
@@ -1108,6 +1150,9 @@ extern "C"
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
             device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
             seq_len, n_heads, d_k, d_v, use_qk_l2norm,
             true);
 
@@ -1125,6 +1170,9 @@ extern "C"
         float *output, float *conv_state,
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
@@ -1145,6 +1193,9 @@ extern "C"
             cuda_short_conv1d_prefill_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                 input, weight, bias, output, conv_state,
                 nullptr,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
                 seq_len, channels, kernel_size, apply_silu);
             int state_blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_state_update_kernel<<<state_blocks, threads, 0, (cudaStream_t)stream>>>(
@@ -1167,6 +1218,9 @@ extern "C"
         int seq_len, int channels, int kernel_size,
         bool apply_silu,
         const int *device_effective_seq_len,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
@@ -1187,6 +1241,9 @@ extern "C"
             cuda_short_conv1d_prefill_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
                 input, weight, bias, output, conv_state,
                 device_effective_seq_len,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
                 seq_len, channels, kernel_size, apply_silu);
             int state_blocks = (channels + threads - 1) / threads;
             cuda_short_conv1d_state_update_kernel<<<state_blocks, threads, 0, (cudaStream_t)stream>>>(

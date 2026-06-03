@@ -261,6 +261,16 @@ Latest graph-atomic small-M hardening validation:
   native codebook inventory, including the Q4_K/Q5_K aliases used by Qwen3.6.
   This closes the CUDA M=3/4 coverage gap in the Phase 13.5 GEMV-many
   contract, but not the CUDA real-model 2x speed target.
+- Fresh Phase 13.5 CUDA GDN verifier-row restore parity on 2026-06-03:
+  CUDA recurrence and short-conv kernels now bind the graph system's declared
+  verifier-state snapshot workspaces and can restore the accepted verifier row
+  before KV truncate, matching the ROCm/CPU rollback shortcut contract. Focused
+  validation passed:
+  `ctest --test-dir build_v2_integration -R "^V2_Integration_CUDAGDNPaddedRealLength$|^V2_Unit_ForwardGraphTypes$" --output-on-failure --parallel`
+  and
+  `ctest --test-dir build_v2_integration -R "^V2_Unit_PrefillDecodeTransition$|^V2_Unit_MTPGraphConstruction$" --output-on-failure --parallel`.
+  This is backend parity and rollback-cost hardening rather than a new CUDA
+  speed ratchet; the CUDA real-model 2x target still needs benchmark evidence.
 - Fresh Phase 13.5 real GDN projection perf coverage on 2026-06-03:
   `NativeVNNIGEMMPerfTest.MTP_SmallM_BatchedGDNProjectionShapes` now includes
   the measured Qwen3.6 hot-path groups `Q4_K/Q5_K qkv+z` with

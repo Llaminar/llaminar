@@ -663,4 +663,179 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvEffectivePrefillCapturesAndLaunch
     EXPECT_EQ(tail_abs, 0.0f) << "Captured CUDA short-conv padding rows must be inert";
 }
 
+TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcceptedRow)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int n_heads = 2;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 4;
+    constexpr int accepted_rows = 2;
+    constexpr int continuation_row = accepted_rows;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_stride);
+
+    const auto Q = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, 0.0021f, 0.0f, 0.0021f);
+    const auto K = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, -0.0019f, 0.0f, -0.0019f);
+    const auto V = makeSequenceRows(verifier_len, v_stride, verifier_len, verifier_len, 0.0025f, 0.0f, 0.0025f);
+    const auto alpha = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, 0.025f, 0.0f, 0.025f);
+    const auto beta = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, -0.021f, 0.0f, -0.021f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    CudaFloatBuffer d_Q(Q);
+    CudaFloatBuffer d_K(K);
+    CudaFloatBuffer d_V(V);
+    CudaFloatBuffer d_alpha(alpha);
+    CudaFloatBuffer d_beta(beta);
+    CudaFloatBuffer d_Q_cont(Q);
+    CudaFloatBuffer d_K_cont(K);
+    CudaFloatBuffer d_V_cont(V);
+    CudaFloatBuffer d_alpha_cont(alpha);
+    CudaFloatBuffer d_beta_cont(beta);
+    CudaFloatBuffer d_Q_ref(Q);
+    CudaFloatBuffer d_K_ref(K);
+    CudaFloatBuffer d_V_ref(V);
+    CudaFloatBuffer d_alpha_ref(alpha);
+    CudaFloatBuffer d_beta_ref(beta);
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_verifier_out(output_elems, 0.0f);
+    CudaFloatBuffer d_restored_next(static_cast<size_t>(v_stride), 0.0f);
+    CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(v_stride), 0.0f);
+    CudaFloatBuffer d_ref_next(static_cast<size_t>(v_stride), 0.0f);
+    CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+
+    CUDAGatedDeltaNet verifier_kernel(cuda_ordinal_);
+    verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
+        d_Q.ptr, d_K.ptr, d_V.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_verifier_out.ptr, nullptr,
+        verifier_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+        nullptr, accepted_rows - 1, nullptr));
+    ASSERT_TRUE(verifier_kernel.recurrent_step(
+        d_Q_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
+        d_K_cont.ptr + static_cast<size_t>(continuation_row) * qk_stride,
+        d_V_cont.ptr + static_cast<size_t>(continuation_row) * v_stride,
+        d_alpha_cont.ptr + static_cast<size_t>(continuation_row) * n_heads,
+        d_beta_cont.ptr + static_cast<size_t>(continuation_row) * n_heads,
+        d_A_log.ptr,
+        d_dt_bias.ptr,
+        d_restored_next.ptr,
+        nullptr,
+        n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(restored recurrence decode)");
+
+    CUDAGatedDeltaNet ref_kernel(cuda_ordinal_);
+    ref_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(ref_kernel.chunk_forward(
+        d_Q_ref.ptr, d_K_ref.ptr, d_V_ref.ptr, d_alpha_ref.ptr, d_beta_ref.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_ref_prefix.ptr, nullptr,
+        accepted_rows, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    ASSERT_TRUE(ref_kernel.recurrent_step(
+        d_Q_ref.ptr + static_cast<size_t>(continuation_row) * qk_stride,
+        d_K_ref.ptr + static_cast<size_t>(continuation_row) * qk_stride,
+        d_V_ref.ptr + static_cast<size_t>(continuation_row) * v_stride,
+        d_alpha_ref.ptr + static_cast<size_t>(continuation_row) * n_heads,
+        d_beta_ref.ptr + static_cast<size_t>(continuation_row) * n_heads,
+        d_A_log.ptr,
+        d_dt_bias.ptr,
+        d_ref_next.ptr,
+        nullptr,
+        n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(reference recurrence decode)");
+
+    const auto restored = d_restored_next.toHost();
+    const auto ref = d_ref_next.toHost();
+    const auto diff = diffStats(restored, ref, 0, restored.size());
+    EXPECT_LT(diff.first, 2e-4f);
+    EXPECT_LT(diff.second, 1e-4);
+}
+
+TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcceptedRow)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int channels = 64;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 5;
+    constexpr int accepted_rows = 3;
+    constexpr int continuation_row = accepted_rows;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(verifier_len, channels, verifier_len, verifier_len, 0.015f, 0.0f, 0.015f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+
+    CudaFloatBuffer d_input(input);
+    CudaFloatBuffer d_weight(weight);
+    CudaFloatBuffer d_bias(bias);
+    CudaFloatBuffer d_verifier_out(output_elems, 0.0f);
+    CudaFloatBuffer d_restored_next(static_cast<size_t>(channels), 0.0f);
+    CudaFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
+    CudaFloatBuffer d_ref_next(static_cast<size_t>(channels), 0.0f);
+    CudaFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
+
+    CUDAShortConvolution verifier_kernel(cuda_ordinal_);
+    verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    ASSERT_TRUE(verifier_kernel.forward(
+        d_input.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_verifier_out.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+        nullptr, accepted_rows - 1, nullptr));
+    ASSERT_TRUE(verifier_kernel.forward(
+        d_input.ptr + static_cast<size_t>(continuation_row) * channels,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_restored_next.ptr,
+        nullptr,
+        1, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(restored short-conv decode)");
+
+    CUDAShortConvolution ref_kernel(cuda_ordinal_);
+    ref_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(ref_kernel.forward(
+        d_input.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_ref_prefix.ptr,
+        nullptr,
+        accepted_rows, channels, kernel_size,
+        /*apply_silu=*/true));
+    ASSERT_TRUE(ref_kernel.forward(
+        d_input.ptr + static_cast<size_t>(continuation_row) * channels,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_ref_next.ptr,
+        nullptr,
+        1, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(reference short-conv decode)");
+
+    const auto restored = d_restored_next.toHost();
+    const auto ref = d_ref_next.toHost();
+    const auto diff = diffStats(restored, ref, 0, restored.size());
+    EXPECT_LT(diff.first, 1e-5f);
+    EXPECT_LT(diff.second, 1e-5);
+}
+
 #endif

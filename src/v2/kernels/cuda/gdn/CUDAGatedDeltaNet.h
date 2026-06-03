@@ -39,6 +39,9 @@ extern "C"
         float *output, float *state,
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int device_idx, void *stream);
 
     bool cudaGDN_chunk_forward_effective(
@@ -49,6 +52,9 @@ extern "C"
         int seq_len, int n_heads, int d_k, int d_v,
         bool use_qk_l2norm,
         const int *device_effective_seq_len,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
         int device_idx, void *stream);
 
     // GPU memory helpers (implemented in CUDAGatedDeltaNetKernels.cu)
@@ -93,6 +99,34 @@ namespace llaminar2
 
         void allocateGPUState(int state_size) override { allocateState(state_size); }
         void resetGPUState() override { resetState(); }
+        void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
+        {
+            verifier_state_capture_ = workspace;
+            verifier_state_capture_rows_ = rows;
+            verifier_state_capture_size_ = state_size;
+        }
+
+        bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
+        {
+            (void)dst_state;
+            if (!gpu_state_ || !verifier_state_capture_ ||
+                row < 0 || row >= verifier_state_capture_rows_ ||
+                verifier_state_capture_size_ != state_size_)
+            {
+                return false;
+            }
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            const float *src =
+                verifier_state_capture_ +
+                static_cast<size_t>(row) * static_cast<size_t>(verifier_state_capture_size_);
+            if (stream)
+                cudaGDN_gpu_memcpy_async(gpu_state_, src, static_cast<size_t>(state_size_), stream);
+            else
+                cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
+            return true;
+        }
+
         bool isGPUStateReady(int required_state_size) const override
         {
             return gpu_state_ != nullptr && state_size_ == required_state_size;
@@ -182,6 +216,9 @@ namespace llaminar2
                 Q, K, V, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
                 device_ordinal_, stream_);
         }
 
@@ -220,6 +257,9 @@ namespace llaminar2
                 output, effective_state,
                 seq_len, n_heads, d_k, d_v, use_qk_l2norm,
                 device_effective_seq_len,
+                verifier_state_capture_,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
                 device_ordinal_, stream_);
         }
 
@@ -414,6 +454,9 @@ namespace llaminar2
         size_t deinterleave_scratch_size_ = 0;
         float *bound_deinterleave_scratch_ = nullptr;
         size_t bound_deinterleave_scratch_size_ = 0;
+        float *verifier_state_capture_ = nullptr;
+        int verifier_state_capture_rows_ = 0;
+        int verifier_state_capture_size_ = 0;
         DeviceWorkspaceManager *workspace_ = nullptr;
     };
 
