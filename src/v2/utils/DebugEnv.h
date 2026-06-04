@@ -314,7 +314,7 @@ namespace llaminar2
         int cuda_moe_gateup_kparts = 16;          ///< K partitions for grouped MoE gate/up decode projection on CUDA (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, default 16)
         bool cuda_moe_down_kpart_decode = true;   ///< Enable K-partitioned grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         int cuda_moe_down_kparts = 16;            ///< K partitions for grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, default 16)
-        int cuda_moe_prefill_tile_m = 16;         ///< Tokens-per-block (kTileM) for grouped MoE prefill gate/up + down GEMM on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 8|16, default 16)
+        int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
         bool cuda_moe_prefill_fuse_swiglu = true; ///< Fuse SwiGLU + blockwise int8 quant into the grouped MoE prefill gate/up GEMM epilogue, eliminating the FP32 gate/up global round-trip + separate swiglu_quantize launch (LLAMINAR_CUDA_MOE_PREFILL_FUSE_SWIGLU, default ON)
 
         GemmConfig()
@@ -486,14 +486,14 @@ namespace llaminar2
             if (deterministic)
                 cuda_moe_down_kpart_decode = false;
 
-            // CUDA grouped MoE prefill tokens-per-block (kTileM). Larger tiles amortize the
-            // IQ-codebook weight decode over more tokens; valid values are 8 or 16.
-            cuda_moe_prefill_tile_m = 16;
+            // CUDA grouped MoE prefill tokens-per-block (kTileM). Default auto
+            // chooses 2/4 for MTP verifier rows and 16 for larger prompt prefill.
+            cuda_moe_prefill_tile_m = 0;
             const char *moe_prefill_tile_m_env = std::getenv("LLAMINAR_CUDA_MOE_PREFILL_TILE_M");
             if (moe_prefill_tile_m_env)
             {
                 const int requested = std::atoi(moe_prefill_tile_m_env);
-                if (requested == 8 || requested == 16)
+                if (requested == 0 || requested == 2 || requested == 4 || requested == 8 || requested == 16)
                     cuda_moe_prefill_tile_m = requested;
             }
 

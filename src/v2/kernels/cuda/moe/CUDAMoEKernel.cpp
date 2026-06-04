@@ -2085,7 +2085,10 @@ namespace llaminar2
                 PerfStatsCollector::Tags{
                     {"total_slots", std::to_string(total_slots)},
                     {"active_expert_slots", std::to_string(active_expert_slots)},
-                    {"num_experts", std::to_string(num_experts)}});
+                    {"num_experts", std::to_string(num_experts)},
+                    {"tile_m", std::to_string(debugEnv().gemm.cuda_moe_prefill_tile_m == 0
+                                                   ? (seq_len <= 2 ? 2 : (seq_len <= 4 ? 4 : 16))
+                                                   : debugEnv().gemm.cuda_moe_prefill_tile_m)}});
         }
         return true;
     }

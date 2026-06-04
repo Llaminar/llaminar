@@ -920,6 +920,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedEnv tile_env("LLAMINAR_CUDA_MOE_PREFILL_TILE_M", "0");
     llaminar2::PerfStatsCollector::reset();
 
     constexpr int seq_len = 4;
@@ -1032,6 +1033,8 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
     ASSERT_FALSE(grid_records.empty());
     EXPECT_EQ(grid_records.front().tags.at("active_expert_slots"), std::to_string(seq_len * top_k));
     EXPECT_EQ(grid_records.front().tags.at("num_experts"), std::to_string(num_experts));
+    EXPECT_EQ(grid_records.front().tags.at("tile_m"), "4")
+        << "seq_len=4 verifier-style grouped prefill should use the small-M tile by default";
 
     llaminar2::PerfStatsCollector::reset();
 #endif

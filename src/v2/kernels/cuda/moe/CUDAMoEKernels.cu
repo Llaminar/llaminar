@@ -2628,6 +2628,18 @@ extern "C"
              active_expert_slots > num_experts))
             return false;
         const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
+        auto select_tile_m = [&]() -> int
+        {
+            const int requested = llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
+            if (requested == 2 || requested == 4 || requested == 8 || requested == 16)
+                return requested;
+            if (max_tokens_per_expert <= 2)
+                return 2;
+            if (max_tokens_per_expert <= 4)
+                return 4;
+            return 16;
+        };
+        const int selected_tile_m = select_tile_m();
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -2647,10 +2659,9 @@ extern "C"
 
         {
             constexpr int kTileN = 128;
-            // kTileM is tunable (debugEnv) to amortize IQ-codebook weight decode across more
-            // tokens. Valid values 8 or 16; larger reduces redundant decode but uses more regs.
-            const int tile_m = llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const int kTileM = (tile_m == 16) ? 16 : 8;
+            // kTileM auto-specializes verifier-sized batches while keeping larger prompt
+            // prefill on wider tiles that better amortize IQ-codebook weight decode.
+            const int kTileM = selected_tile_m;
             // When fusion is enabled the gate/up kernel computes SwiGLU + blockwise int8 quant
             // in its epilogue, writing the down-projection input directly (no FP32 gate/up
             // round-trip, no separate swiglu_quantize launch).
@@ -2673,12 +2684,27 @@ extern "C"
         intermediate, d_model)
 #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                          \
     do {                                                                                           \
-        if (fuse_swiglu) {                                                                          \
-            if (kTileM == 16) LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);                      \
-            else              LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                        \
-        } else {                                                                                    \
-            if (kTileM == 16) LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                             \
-            else              LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                              \
+        if (fuse_swiglu)                                                                            \
+        {                                                                                           \
+            if (kTileM == 2)                                                                        \
+                LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 2);                                     \
+            else if (kTileM == 4)                                                                   \
+                LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 4);                                     \
+            else if (kTileM == 8)                                                                   \
+                LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                                     \
+            else                                                                                    \
+                LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);                                    \
+        }                                                                                           \
+        else                                                                                        \
+        {                                                                                           \
+            if (kTileM == 2)                                                                        \
+                LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 2);                                            \
+            else if (kTileM == 4)                                                                   \
+                LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 4);                                            \
+            else if (kTileM == 8)                                                                   \
+                LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                                            \
+            else                                                                                    \
+                LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                                           \
         }                                                                                           \
     } while (0)
 
@@ -2707,6 +2733,7 @@ extern "C"
             }
 
 #undef LAUNCH_GROUPED_GATEUP_PREFILL
+#undef LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM
 #undef LAUNCH_GROUPED_GATEUP_PREFILL_TM
 
             if (!finishLaunch("cudaMoE_grouped_gate_up_prefill"))
@@ -2729,8 +2756,7 @@ extern "C"
 
         {
             constexpr int kTileN = 128;
-            const int tile_m = llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const int kTileM = (tile_m == 16) ? 16 : 8;
+            const int kTileM = selected_tile_m;
             dim3 grid((d_model + kTileN - 1) / kTileN,
                       (max_tokens_per_expert + kTileM - 1) / kTileM,
                       expert_grid);
@@ -2743,8 +2769,14 @@ extern "C"
         d_scratch_down_out, d_model, intermediate)
 #define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
     do {                                                                                           \
-        if (kTileM == 16) LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 16);                                   \
-        else              LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 8);                                    \
+        if (kTileM == 2)                                                                            \
+            LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 2);                                                  \
+        else if (kTileM == 4)                                                                       \
+            LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 4);                                                  \
+        else if (kTileM == 8)                                                                       \
+            LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 8);                                                  \
+        else                                                                                        \
+            LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 16);                                                 \
     } while (0)
 
             switch (down_codebook_id)

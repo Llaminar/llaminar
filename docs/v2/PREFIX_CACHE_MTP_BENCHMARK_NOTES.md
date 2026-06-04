@@ -11,22 +11,19 @@ Durable Phase 14 scoreboard: headline numbers, retained actions, and live gaps.
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 42.04 tok/s | 2.13x | Fixed d1, compact active-expert prefill grid |
-| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | CUDA `cuda:0` | Qwen3.6 35B A3B | 103.84 tok/s | 64.72 tok/s | 0.62x | Correctness green; llama.cpp north star is 118.31 tok/s |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | CUDA `cuda:0` | Qwen3.6 35B A3B | 103.84 tok/s | 65.93 tok/s | 0.64x | Correctness green; llama.cpp north star is 118.31 tok/s |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
-llama.cpp CUDA: `ggml-org/llama.cpp@6ddc943`, `GGML_CUDA=ON`, SM86 RTX 3090,
-`llama-bench -p 768 -n 64 -ngl 999 -r 3`:
+llama.cpp CUDA north star: `ggml-org/llama.cpp@6ddc943`, `llama-bench -p 768 -n 64 -ngl 999 -r 3`:
 
 | Model | Prefill | Decode | File |
 |---|---:|---:|---|
 | Dense 27B | 1161.19 tok/s | 41.82 tok/s | `benchmark_results/llama_cpp_cuda/20260604T080645Z-6ddc943/dense.jsonl` |
 | MoE 35B A3B | 2415.25 tok/s | 118.31 tok/s | `benchmark_results/llama_cpp_cuda/20260604T080645Z-6ddc943/moe.jsonl` |
 
-Clean Llaminar CUDA no-MTP after prefill-reset safety:
-dense 671.87/40.42 and MoE 892.05/103.84 tok/s
-(`benchmark_results/cuda_moe_mtp/20260604T083429Z-session-reset-prefill-invalidation-production-current`).
-Request-boundary `clear_cache()` now invalidates monolithic prefill graph entries;
-recover graph-safe prefill reuse next.
+Clean Llaminar CUDA no-MTP after prefill-reset safety: dense 671.87/40.42
+and MoE 892.05/103.84 tok/s. Request-boundary `clear_cache()` invalidates
+monolithic prefill graph entries; recover graph-safe prefill reuse next.
 
 ## Adaptive Depth
 
@@ -59,9 +56,9 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
 | Case | Decode | Acceptance | Notes |
 |---|---:|---:|---|
 | baseline | 103.84 tok/s | n/a | current no-MTP ratchet after prefill reset safety |
-| fixed d1, CUDA GDN qkv+z fused | 64.72 tok/s | 42.97% | `kernel.gdn_projection_route`: qkv+z native subgroup at M=1/2 |
+| fixed d1, CUDA small-M grouped prefill tile | 65.93 tok/s | 39.84% | auto `TILE_M=2/4`; `benchmark_results/cuda_moe_mtp/20260604T090428Z-smallm-prefill-tile-auto` |
+| fixed d1, CUDA GDN qkv+z fused | 64.72 tok/s | 42.97% | qkv+z native subgroup at M=1/2 |
 | opt-in shared grouped FFN | 64.26 tok/s | 40.62% | n64 no ratchet; GPU-stage n16 improved 48.17 -> 51.65 tok/s |
-| fixed d1, after small-M attention | 41.92 tok/s | 32.03% | attention no longer uses FA2 prefill path |
 
 ## Retained Tuning Actions
 
@@ -70,6 +67,7 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
   `V2_Unit_Static_NoDefaultStreamInGPUCode`.
 - Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, batched verifier-row argmax, and GDN verifier-row rollback restore.
 - CUDA quantized GEMM now advertises fused projection support; Qwen3.6 MoE GDN qkv+z uses a native subgroup while alpha/beta remain FP32 single projections.
+- CUDA MoE grouped prefill auto-selects verifier-sized `TILE_M=2/4`.
 - CUDA shared-expert decode has an opt-in graph-capturable grouped table path; keep opt-in until n64 improves.
 - Added graph-capturable CUDA FP16KV small-M verifier attention for M=2..4.
 - Request-boundary prefill graph replay now invalidates on session reset after a CUDA padded-bucket crash; intra-request chunk capture/replay remains covered.
