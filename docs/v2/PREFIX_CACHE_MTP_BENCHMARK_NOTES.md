@@ -12,7 +12,7 @@ rediscovered.
 | Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 46.74 tok/s | 1.56x | Bucketed attention capture, depth-sensitive |
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
-| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 37.87 tok/s | 1.92x | Fixed d1 best so far; dynamic demotes close to it |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 39.10 tok/s | 1.98x | Fixed d1 with small grouping + row-wise verifier router |
 | MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Needs longer confirmation |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
@@ -42,13 +42,14 @@ Qwen3.6 35B A3B on `rocm:0`, default benchmark lane, 2026-06-04:
 | Case | Decode | Acceptance | Notes |
 |---|---:|---:|---|
 | baseline | 19.72 tok/s | n/a | no MTP |
-| fixed d1 | 37.87 tok/s | 78.12% | best retained lane after attention-param capture fix |
-| dynamic max d3 | 37.82 tok/s | 71.21% | demotes to depth 1; near fixed d1 |
+| fixed d1 | 39.10 tok/s | 73.44% | best retained lane after small grouping + row-wise verifier router |
+| dynamic max d3 | 37.82 tok/s | 71.21% | demotes to depth 1; near prior fixed d1 |
 | fixed d2 | 25.18 tok/s | 69.7% | verifier and rollback cost dominate |
 | fixed d3 | 25.90 tok/s | 69.7% | overreaches |
 
-Artifact: `benchmark_results/rocm_moe_mtp/20260604T020549Z-13eae462-attn-capture-recheck`.
-Small grouping smoke: `20260604T022255Z-small-grouping` recorded 440 fused calls.
+Latest artifact: `benchmark_results/rocm_moe_mtp/20260604T023832Z-8b3300f6-rowwise-router-n64`.
+Stats recorded 1760 calls each for `kernel.rocm_moe_small_prefill_grouping_calls`
+and `kernel.rocm_moe_small_m_rowwise_router_calls`.
 
 Router A/B results to avoid repeating:
 
@@ -74,8 +75,8 @@ Router A/B results to avoid repeating:
 - Stabilized MoE prefix fingerprints by excluding transient runtime-table caches.
 - Reinitialized grouped-decode MoE runtime tables after graph-builder reset so
   cached stages cannot see an inactive decode bank.
-- Fused verifier-sized MoE float-route grouping into one explicit-stream ROCm
-  kernel for counts, offsets, token ids, and weights.
+- Fused verifier-sized MoE float-route grouping and M=2 row-wise verifier
+  routing into explicit-stream ROCm paths.
 - Restored prefix terminal logits/hidden through streamful `TransferEngine`
   uploads before MTP sidecar consumption.
 - Kept ROCm attention param uploads out of HIP capture; captured attention now
@@ -83,5 +84,5 @@ Router A/B results to avoid repeating:
 
 ## Next Work
 
-MoE ROCm remains the priority: shrink main-verifier router/expert time to close
-the remaining gap from 1.92x to the 2x target.
+MoE ROCm remains the priority: shrink remaining main-verifier expert time and
+then repeat long-lane evidence after the 1.98x fixed-depth ratchet.

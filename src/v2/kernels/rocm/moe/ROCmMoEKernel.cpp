@@ -547,6 +547,46 @@ namespace
             return false;
         }
     }
+
+    bool launchSmallMRowwiseGateLogits(
+        const float *hidden,
+        const void *gate_weights,
+        llaminar2::TensorType gate_type,
+        float *logits,
+        int seq_len,
+        int d_model,
+        int num_experts,
+        int device_ordinal,
+        void *stream)
+    {
+        if (seq_len < 2 || seq_len > 4 || gate_type != llaminar2::TensorType::FP32)
+            return false;
+
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::routeCore] small-M rowwise router requires an explicit stream");
+            return false;
+        }
+
+        const auto *gate_weights_fp32 = static_cast<const float *>(gate_weights);
+        for (int row = 0; row < seq_len; ++row)
+        {
+            if (!launchDecodeGateLogits(
+                    hidden + static_cast<size_t>(row) * d_model,
+                    gate_weights_fp32,
+                    logits + static_cast<size_t>(row) * num_experts,
+                    d_model,
+                    num_experts,
+                    device_ordinal,
+                    stream,
+                    "ROCmMoEKernel::routeCore.small_m_rowwise"))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 }
 
 namespace llaminar2
@@ -1346,6 +1386,32 @@ namespace llaminar2
             {
                 bufs = {};
                 return false;
+            }
+        }
+        else if (seq_len >= 2 && seq_len <= 4 && gate_type == TensorType::FP32)
+        {
+            void *stream = getStream();
+            if (!launchSmallMRowwiseGateLogits(
+                    hidden, gate_weights, gate_type, bufs.d_logits,
+                    seq_len, d_model, num_experts,
+                    device_ordinal_, stream))
+            {
+                bufs = {};
+                return false;
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "rocm_moe_small_m_rowwise_router_calls",
+                    1.0,
+                    "moe",
+                    DeviceId::rocm(device_ordinal_).to_string(),
+                    PerfStatsCollector::Tags{
+                        {"seq_len", std::to_string(seq_len)},
+                        {"num_experts", std::to_string(num_experts)},
+                        {"top_k", std::to_string(top_k)}});
             }
         }
         else if (gate_type != TensorType::FP32)

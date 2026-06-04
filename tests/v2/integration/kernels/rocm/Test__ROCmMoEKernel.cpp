@@ -49,6 +49,7 @@
 #include <random>
 #include <iostream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <algorithm>
@@ -4140,6 +4141,126 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_RejectsNullStream)
         /*top_k=*/8,
         /*device_idx=*/0,
         /*stream=*/nullptr));
+}
+
+TEST(Test__ROCmMoEKernel, SmallMRowwiseRouter_VerifierShapeMatchesHostReference)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int seq_len = 4;
+    constexpr int d_model = 32;
+    constexpr int num_experts = 12;
+    constexpr int top_k = 4;
+    const DeviceId device = DeviceId::rocm(0);
+
+    auto hidden = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+        -0.25f, 0.25f, 20260604);
+    auto gate_weights = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)},
+        -0.25f, 0.25f, 20260605);
+    auto routing_indices = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+    auto routing_weights = TestTensorFactory::createFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(top_k)});
+
+    ASSERT_TRUE(hidden->ensureOnDevice(device));
+    ASSERT_TRUE(gate_weights->ensureOnDevice(device));
+    ASSERT_TRUE(routing_indices->ensureOnDevice(device));
+    ASSERT_TRUE(routing_weights->ensureOnDevice(device));
+
+    ScopedEnvOverride perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ROCmMoEKernel moe_kernel(0);
+    MoERoutingResult result;
+    ASSERT_TRUE(moe_kernel.routeWithTensors(
+        hidden.get(),
+        gate_weights.get(),
+        seq_len,
+        d_model,
+        num_experts,
+        top_k,
+        /*normalize_weights=*/true,
+        routing_indices.get(),
+        routing_weights.get(),
+        result));
+    ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+    double rowwise_router_calls = 0.0;
+    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_small_m_rowwise_router_calls"}))
+        rowwise_router_calls += record.value;
+    EXPECT_GT(rowwise_router_calls, 0.0)
+        << "verifier-sized routing should use the explicit small-M rowwise router path";
+    PerfStatsCollector::reset();
+
+    ASSERT_EQ(result.expert_indices.size(), static_cast<size_t>(seq_len * top_k));
+    ASSERT_EQ(result.expert_weights.size(), static_cast<size_t>(seq_len * top_k));
+
+    const float *h = hidden->data();
+    const float *g = gate_weights->data();
+    for (int token = 0; token < seq_len; ++token)
+    {
+        std::vector<float> probs(static_cast<size_t>(num_experts));
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            float dot = 0.0f;
+            for (int col = 0; col < d_model; ++col)
+                dot += h[token * d_model + col] * g[expert * d_model + col];
+            probs[static_cast<size_t>(expert)] = dot;
+            max_logit = std::max(max_logit, dot);
+        }
+
+        float sum = 0.0f;
+        for (float &prob : probs)
+        {
+            prob = std::exp(prob - max_logit);
+            sum += prob;
+        }
+        for (float &prob : probs)
+            prob /= sum;
+
+        std::vector<int> expected_indices;
+        std::vector<float> expected_weights;
+        expected_indices.reserve(top_k);
+        expected_weights.reserve(top_k);
+        for (int k = 0; k < top_k; ++k)
+        {
+            int best_idx = 0;
+            float best_val = -1.0f;
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                const bool already_picked =
+                    std::find(expected_indices.begin(), expected_indices.end(), expert) != expected_indices.end();
+                if (!already_picked && probs[static_cast<size_t>(expert)] > best_val)
+                {
+                    best_val = probs[static_cast<size_t>(expert)];
+                    best_idx = expert;
+                }
+            }
+            expected_indices.push_back(best_idx);
+            expected_weights.push_back(best_val);
+        }
+
+        float topk_sum = 0.0f;
+        for (float weight : expected_weights)
+            topk_sum += weight;
+        for (float &weight : expected_weights)
+            weight /= topk_sum;
+
+        for (int k = 0; k < top_k; ++k)
+        {
+            const int offset = token * top_k + k;
+            EXPECT_EQ(result.expert_indices[static_cast<size_t>(offset)],
+                      expected_indices[static_cast<size_t>(k)])
+                << "token=" << token << " k=" << k;
+            EXPECT_NEAR(result.expert_weights[static_cast<size_t>(offset)],
+                        expected_weights[static_cast<size_t>(k)],
+                        1e-5f)
+                << "token=" << token << " k=" << k;
+        }
+    }
 }
 
 TEST(Test__ROCmMoEKernel, GroupPrefillRoutesRuntimeState_DeterministicSmall)
