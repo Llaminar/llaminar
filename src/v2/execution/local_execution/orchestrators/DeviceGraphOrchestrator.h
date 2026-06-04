@@ -2282,7 +2282,9 @@ namespace llaminar2
         bool ensurePrefixCacheReady();
         bool isPrefixCacheMoEModel() const;
         void *explicitGPUStreamForOperation(const char *operation) const;
-        void handleLivePrefixReplayStateAfterMutation(const char *operation);
+        void handleLivePrefixReplayStateAfterMutation(
+            const char *operation,
+            bool preserve_gpu_replay_state = false);
         PrefixCacheFingerprintResult buildCurrentPrefixFingerprint(
             const PrefixCacheRuntimeConfig &prefix_config) const;
         PrefixCacheKey makePrefixKeyForBlock(

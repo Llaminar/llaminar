@@ -12,7 +12,7 @@ live gaps. Keep this file concise; rejected tuning history belongs in artifacts.
 | Dense long lane, `qbf`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 | 53.30 | 1.31x | Depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 | 9.50 | 1.64x | Short smoke only |
 | MoE default lane, 595p/64d | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 | 42.04 | 2.13x | Fixed d1, ratcheted |
-| MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.62 | 116.04 | 1.14x | Speed-positive, near llama.cpp |
+| MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.60 | 119.65 | 1.18x | Speed-positive, beats llama.cpp |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
 llama.cpp CUDA north star, `ggml-org/llama.cpp@6ddc943`,
@@ -39,8 +39,8 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 
 | Case | Decode | Acceptance | Artifact |
 |---|---:|---:|---|
-| latest baseline | 101.62 | n/a | `benchmark_results/cuda_moe_mtp/20260604T165605Z-kpart-verifier-gateup/baseline.json` |
-| best/latest fixed d1 | 116.04 | 90.62% | `benchmark_results/cuda_moe_mtp/20260604T165605Z-kpart-verifier-gateup/mtp_d1.json` |
+| latest baseline | 101.60 | n/a | `benchmark_results/cuda_moe_mtp/20260604T172753Z-verifier-down-kpart-prefill/baseline.json` |
+| best/latest fixed d1 | 119.65 | 82.81% | `benchmark_results/cuda_moe_mtp/20260604T172753Z-verifier-down-kpart-prefill/mtp_d1.json` |
 | latest fixed d3 | 68.57 | 66.86% | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/mtp_d3_after_suffix_commit_fix.json` |
 
 ## Retained Actions
@@ -60,6 +60,9 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 - CUDA verifier grouped MoE prefill keeps the fused SwiGLU path but now uses
   split-K gate/up for M=2/3/4 compact active grids; kernel and real Qwen3.6 MoE
   parity assert `gateup_route=kpart_swiglu`, graph replay, and repeated-row routes.
+- CUDA verifier grouped MoE prefill also split-Ks the down projection for the
+  same M=2/3/4 compact active grids; regressions assert `down_route=kpart_prefill`
+  and the default MoE lane now beats the llama.cpp CUDA decode north star.
 - CUDA MoE MTP depth-3 parity now uses the stable benchmark-prompt lane, and shared
   expert gate verification allows mathematically valid sigmoid-underflow zero rows.
 - Depth>1 MTP rollback now commits suffix shifted-cache rows after an already-committed
@@ -72,7 +75,7 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 
 ## Next Work
 
-CUDA MoE MTP is now speed-positive but still short of the 1.3x-1.8x MTP target.
-Next target is the remaining CUDA MoE verifier budget, especially down projection,
-shared expert, router/GDN costs, and prompt-prefill overhead. ROCm MoE keeps the
-current 2.13x ratchet.
+CUDA MoE MTP now beats the llama.cpp MoE decode north star but still trails the
+1.3x-1.8x MTP speedup target. Next target is the remaining verifier budget:
+shared expert, router/GDN costs, benchmark-run capture amortization, and prompt
+prefill overhead. ROCm MoE keeps the current 2.13x ratchet.

@@ -397,6 +397,7 @@ extern "C"
         float *d_scratch_down_out,
         float *d_gate_partials,
         float *d_up_partials,
+        float *d_down_partials,
         float *d_output,
         int num_experts,
         int d_model,
@@ -407,6 +408,7 @@ extern "C"
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         int gateup_k_partitions,
+        int down_k_partitions,
         int device_idx,
         void *stream);
 }
@@ -512,6 +514,7 @@ namespace llaminar2
         grouped_decode_cached_weights_.clear();
         grouped_down_kpart_partitions_cap_ = 0;
         grouped_down_kpart_d_model_cap_ = 0;
+        grouped_down_kpart_slots_cap_ = 0;
         grouped_down_desc_tables_.clear();
         grouped_gateup_desc_tables_.clear();
         runtime_gateup_pointer_cache_.clear();
@@ -869,10 +872,10 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model)
+    bool CUDAMoEKernel::ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model, int slots)
     {
         // Only the discrete partition counts the kpart launcher accepts are valid.
-        if (d_model <= 0 ||
+        if (d_model <= 0 || slots <= 0 ||
             !(k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
               k_partitions == 16))
             return false;
@@ -880,14 +883,15 @@ namespace llaminar2
         // Fast path: the existing partial buffer already covers the requested shape.
         if (d_grouped_down_partials_ &&
             grouped_down_kpart_partitions_cap_ >= k_partitions &&
-            grouped_down_kpart_d_model_cap_ >= d_model)
+            grouped_down_kpart_d_model_cap_ >= d_model &&
+            grouped_down_kpart_slots_cap_ >= slots)
             return true;
 
         // Growth requires a fresh allocation, which is illegal mid-capture.
         if (isGraphCaptureActive())
         {
             LOG_ERROR("[CUDAMoEKernel] grouped down kpart scratch growth during graph capture (need k_partitions="
-                      << k_partitions << " d_model=" << d_model << ")");
+                      << k_partitions << " d_model=" << d_model << " slots=" << slots << ")");
             return false;
         }
         if (!setMoEDevice(device_ordinal_, "ensureGroupedDownKPartScratchCapacity"))
@@ -903,10 +907,13 @@ namespace llaminar2
         };
         release(d_grouped_down_partials_);
 
-        // The down partials buffer is [k_partitions][d_model] floats (the output
-        // dimension is d_model, not intermediate).
+        // The down partials buffer is [slots][k_partitions][d_model] floats
+        // (the output dimension is d_model, not intermediate). Decode uses one
+        // slot; verifier grouped prefill uses one slot per active routed row.
         const size_t partial_count =
-            static_cast<size_t>(k_partitions) * static_cast<size_t>(d_model);
+            static_cast<size_t>(slots) *
+            static_cast<size_t>(k_partitions) *
+            static_cast<size_t>(d_model);
         cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_grouped_down_partials_),
                                      partial_count * sizeof(float));
         if (err != cudaSuccess)
@@ -916,11 +923,13 @@ namespace llaminar2
             release(d_grouped_down_partials_);
             grouped_down_kpart_partitions_cap_ = 0;
             grouped_down_kpart_d_model_cap_ = 0;
+            grouped_down_kpart_slots_cap_ = 0;
             return false;
         }
 
         grouped_down_kpart_partitions_cap_ = k_partitions;
         grouped_down_kpart_d_model_cap_ = d_model;
+        grouped_down_kpart_slots_cap_ = slots;
         return true;
     }
 
@@ -2104,9 +2113,15 @@ namespace llaminar2
                                         : debugEnv().gemm.cuda_moe_prefill_tile_m;
         const int selected_tile_n = selected_tile_m <= 2 ? 64 : 128;
         const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
+        const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
         const bool use_gateup_kpart_swiglu =
             debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
             debugEnv().gemm.cuda_moe_prefill_fuse_swiglu &&
+            active_expert_slots > 0 &&
+            selected_tile_m <= 4 &&
+            seq_len <= 4;
+        const bool use_down_kpart_prefill =
+            debugEnv().gemm.cuda_moe_down_kpart_decode &&
             active_expert_slots > 0 &&
             selected_tile_m <= 4 &&
             seq_len <= 4;
@@ -2114,6 +2129,12 @@ namespace llaminar2
             !ensureGroupedGateUpKPartScratchCapacity(total_slots, gateup_k_partitions, intermediate))
         {
             LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] verifier small-M split-K gate/up scratch unavailable");
+            return false;
+        }
+        if (use_down_kpart_prefill &&
+            !ensureGroupedDownKPartScratchCapacity(down_k_partitions, d_model, total_slots))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] verifier small-M split-K down scratch unavailable");
             return false;
         }
 
@@ -2154,6 +2175,7 @@ namespace llaminar2
             d_prefill_gate_,
             use_gateup_kpart_swiglu ? d_grouped_gateup_gate_partials_ : nullptr,
             use_gateup_kpart_swiglu ? d_grouped_gateup_up_partials_ : nullptr,
+            use_down_kpart_prefill ? d_grouped_down_partials_ : nullptr,
             d_output,
             num_experts,
             d_model,
@@ -2164,6 +2186,7 @@ namespace llaminar2
             gateup_table.codebook_id,
             down_table.codebook_id,
             gateup_k_partitions,
+            down_k_partitions,
             device_ordinal_,
             stream);
         if (!ok)
@@ -2188,7 +2211,8 @@ namespace llaminar2
                     {"num_experts", std::to_string(num_experts)},
                     {"tile_m", std::to_string(selected_tile_m)},
                     {"tile_n", std::to_string(selected_tile_n)},
-                    {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"}});
+                    {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"},
+                    {"down_route", use_down_kpart_prefill ? "kpart_prefill" : "serial"}});
         }
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
@@ -2205,7 +2229,8 @@ namespace llaminar2
                     {"tile_m", std::to_string(selected_tile_m)},
                     {"tile_n", std::to_string(selected_tile_n)},
                     {"swiglu_path", debugEnv().gemm.cuda_moe_prefill_fuse_swiglu ? "fused" : "split"},
-                    {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"}});
+                    {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"},
+                    {"down_route", use_down_kpart_prefill ? "kpart_prefill" : "serial"}});
         }
         return true;
     }

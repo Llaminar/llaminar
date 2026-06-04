@@ -5150,7 +5150,9 @@ namespace llaminar2
         }
     }
 
-    void DeviceGraphOrchestrator::handleLivePrefixReplayStateAfterMutation(const char *operation)
+    void DeviceGraphOrchestrator::handleLivePrefixReplayStateAfterMutation(
+        const char *operation,
+        bool preserve_gpu_replay_state)
     {
         PerfStatsCollector::Tags tags{{"operation", operation ? operation : "unknown"}};
         if (isPrefixCacheMoEModel())
@@ -5158,7 +5160,7 @@ namespace llaminar2
             tags["model"] = "moe";
             tags["moe_placement_epoch"] = std::to_string(moePlacementEpoch());
         }
-        if (state_.device_id.is_gpu() && forward_engine_)
+        if (state_.device_id.is_gpu() && forward_engine_ && !preserve_gpu_replay_state)
         {
             forward_engine_->resetCapturedReplayState();
             mtp_sidecar_depth0_cache_.resetReplayState();
@@ -5175,6 +5177,10 @@ namespace llaminar2
         {
             tags["replay_state"] = "preserved";
             tags["sidecar_replay_state"] = "preserved";
+            if (state_.device_id.is_gpu() && preserve_gpu_replay_state)
+            {
+                tags["gpu_replay_preserve_reason"] = "verifier_row_restore";
+            }
         }
         PerfStatsCollector::addCounter("mtp",
                                        "live_prefix_replay_state_after_mutation",
@@ -6786,7 +6792,9 @@ namespace llaminar2
 
         state_.positions[seq_idx] = target_cached_tokens;
         state_.sequence_lengths[seq_idx] = target_cached_tokens;
-        handleLivePrefixReplayStateAfterMutation("restore_mtp_verifier_state_row");
+        handleLivePrefixReplayStateAfterMutation(
+            "restore_mtp_verifier_state_row",
+            /*preserve_gpu_replay_state=*/true);
         PerfStatsCollector::addCounter("mtp",
                                        "verifier_state_row_restores",
                                        1.0,

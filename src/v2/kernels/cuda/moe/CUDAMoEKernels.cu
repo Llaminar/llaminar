@@ -1818,6 +1818,105 @@ namespace
     }
 
     /**
+     * @brief Split-K grouped prefill down projection for verifier-sized MoE batches.
+     *
+     * Each active routed slot owns one down projection row. The kernel splits
+     * that row's K blocks across k_partitions and writes partials to
+     * [slot][k_part][N]. A reduce kernel restores the original per-slot output
+     * layout consumed by grouped_prefill_scatter_weighted_deterministic_kernel.
+     */
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_down_kpart_prefill_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const int *__restrict__ expert_counts,
+        const int *__restrict__ expert_offsets,
+        const int *__restrict__ active_expert_ids,
+        int active_expert_slots,
+        float *__restrict__ partials,
+        int N,
+        int K,
+        int max_tokens_per_expert,
+        int total_slots,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int k_part = blockIdx.y;
+        const int flat = blockIdx.z;
+        if (n >= N || k_part >= k_partitions ||
+            max_tokens_per_expert <= 0 || total_slots <= 0)
+            return;
+
+        const int active_slot = flat / max_tokens_per_expert;
+        const int token_in_expert = flat - active_slot * max_tokens_per_expert;
+        if (active_slot >= active_expert_slots)
+            return;
+
+        const int expert_id = active_expert_ids[active_slot];
+        if (expert_id < 0)
+            return;
+
+        const int count = expert_counts[expert_id];
+        if (token_in_expert >= count)
+            return;
+        const int slot = expert_offsets[expert_id] + token_in_expert;
+        if (slot < 0 || slot >= total_slots)
+            return;
+
+        const int blocks_per_row = K / 32;
+        const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
+        const int b_start = k_part * blocks_per_part;
+        int b_end = b_start + blocks_per_part;
+        if (b_end > blocks_per_row)
+            b_end = blocks_per_row;
+
+        const size_t partial_index =
+            (static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) +
+             static_cast<size_t>(k_part)) *
+                static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+        if (b_start >= b_end)
+        {
+            partials[partial_index] = 0.0f;
+            return;
+        }
+
+        const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+        const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * static_cast<size_t>(K);
+        const float *slot_scales =
+            scales_A_blockwise + static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row);
+        partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
+            desc, n, slot_A, slot_scales, N, K, b_start, b_end);
+    }
+
+    __global__ void grouped_native_vnni_down_kpart_reduce_prefill_kernel(
+        const float *__restrict__ partials,
+        float *__restrict__ output,
+        int total_slots,
+        int N,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int slot = blockIdx.y;
+        if (slot >= total_slots || n >= N)
+            return;
+
+        float sum = 0.0f;
+        for (int k_part = 0; k_part < k_partitions; ++k_part)
+        {
+            sum += partials[
+                (static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) +
+                 static_cast<size_t>(k_part)) *
+                    static_cast<size_t>(N) +
+                static_cast<size_t>(n)];
+        }
+        output[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] = sum;
+    }
+
+    /**
      * @brief Split-K scatter kernel for grouped gate/up decode projection.
      *
      * Each block reduces one K-partition of one output column for one expert
@@ -2875,6 +2974,7 @@ extern "C"
         float *d_scratch_down_out,
         float *d_gate_partials,
         float *d_up_partials,
+        float *d_down_partials,
         float *d_output,
         int num_experts,
         int d_model,
@@ -2885,6 +2985,7 @@ extern "C"
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         int gateup_k_partitions,
+        int down_k_partitions,
         int device_idx,
         void *stream)
     {
@@ -2892,6 +2993,9 @@ extern "C"
             (gateup_k_partitions == 2 || gateup_k_partitions == 4 ||
              gateup_k_partitions == 8 || gateup_k_partitions == 16 ||
              gateup_k_partitions == 32);
+        const bool valid_down_k_partitions =
+            (down_k_partitions == 2 || down_k_partitions == 4 ||
+             down_k_partitions == 8 || down_k_partitions == 16);
         if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_down_desc_table ||
             !d_group_counts || !d_group_offsets || !d_group_token_indices || !d_group_weights ||
             !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate || !d_scratch_up ||
@@ -2935,6 +3039,13 @@ extern "C"
             d_gate_partials &&
             d_up_partials &&
             llaminar2::debugEnv().gemm.cuda_moe_gateup_kpart_decode;
+        const bool use_down_kpart_prefill =
+            use_active_expert_grid &&
+            selected_tile_m <= 4 &&
+            max_tokens_per_expert <= 4 &&
+            valid_down_k_partitions &&
+            d_down_partials &&
+            llaminar2::debugEnv().gemm.cuda_moe_down_kpart_decode;
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -3105,6 +3216,16 @@ extern "C"
         d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                          \
         d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
         d_scratch_down_out, d_model, intermediate)
+#define LAUNCH_GROUPED_DOWN_KPART_PREFILL(CB)                                                       \
+    do {                                                                                            \
+        dim3 partial_grid((d_model + 63) / 64, down_k_partitions,                                   \
+                          active_expert_slots * max_tokens_per_expert);                            \
+        grouped_native_vnni_down_kpart_prefill_kernel<CB><<<partial_grid, dim3(64), 0, cuda_stream>>>( \
+            d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                      \
+            d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,              \
+            d_down_partials, d_model, intermediate, max_tokens_per_expert,                          \
+            total_slots, down_k_partitions);                                                        \
+    } while (0)
 #define LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, TM)                                                     \
     do {                                                                                            \
         if (kTileN == 64)                                                                           \
@@ -3114,7 +3235,9 @@ extern "C"
     } while (0)
 #define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
     do {                                                                                           \
-        if (kTileM == 2)                                                                            \
+        if (use_down_kpart_prefill)                                                                 \
+            LAUNCH_GROUPED_DOWN_KPART_PREFILL(CB);                                                  \
+        else if (kTileM == 2)                                                                       \
             LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 2);                                                  \
         else if (kTileM == 4)                                                                       \
             LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 4);                                                  \
@@ -3150,10 +3273,23 @@ extern "C"
 
 #undef LAUNCH_GROUPED_DOWN_PREFILL
 #undef LAUNCH_GROUPED_DOWN_PREFILL_TM
+#undef LAUNCH_GROUPED_DOWN_KPART_PREFILL
 #undef LAUNCH_GROUPED_DOWN_PREFILL_TM_TN
 
-            if (!finishLaunch("cudaMoE_grouped_down_prefill"))
+            if (!finishLaunch(use_down_kpart_prefill
+                                  ? "cudaMoE_grouped_down_kpart_prefill partial"
+                                  : "cudaMoE_grouped_down_prefill"))
                 return false;
+
+            if (use_down_kpart_prefill)
+            {
+                dim3 reduce_grid((d_model + 63) / 64, total_slots);
+                grouped_native_vnni_down_kpart_reduce_prefill_kernel<<<reduce_grid, dim3(64), 0, cuda_stream>>>(
+                    d_down_partials, d_scratch_down_out,
+                    total_slots, d_model, down_k_partitions);
+                if (!finishLaunch("cudaMoE_grouped_down_kpart_prefill reduce"))
+                    return false;
+            }
         }
 
         {

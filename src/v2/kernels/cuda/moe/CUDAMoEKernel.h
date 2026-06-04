@@ -247,7 +247,7 @@ namespace llaminar2
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
         bool ensureGroupedGateUpDecodeCapacity(int top_k, int d_model);
         bool ensureGroupedGateUpKPartScratchCapacity(int top_k, int k_partitions, int intermediate);
-        bool ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model);
+        bool ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model, int slots = 1);
         bool ensureGroupedDownDecodeCapacity(int top_k, int intermediate);
         bool ensureGroupedDecodeMetadata(
             const int *expert_ids,
@@ -376,11 +376,13 @@ namespace llaminar2
         std::vector<int> grouped_decode_cached_expert_ids_;
         std::vector<float> grouped_decode_cached_weights_;
 
-        // Split-K partials scratch for the grouped SwiGLU down decode projection.
-        // Layout: [k_partitions][d_model] (the output dimension is d_model).
+        // Split-K partials scratch for the grouped SwiGLU down projection.
+        // Decode layout: [1][k_partitions][d_model].
+        // Verifier prefill layout: [total_slots][k_partitions][d_model].
         float *d_grouped_down_partials_ = nullptr;
         int grouped_down_kpart_partitions_cap_ = 0;
         int grouped_down_kpart_d_model_cap_ = 0;
+        int grouped_down_kpart_slots_cap_ = 0;
     };
 
 } // namespace llaminar2

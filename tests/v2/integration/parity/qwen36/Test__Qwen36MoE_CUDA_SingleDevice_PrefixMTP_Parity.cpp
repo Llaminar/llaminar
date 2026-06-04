@@ -175,7 +175,12 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleSkipGatherGree
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, VerifierRowShortcutTwoRowStateMatchesFullReplay)
 {
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+    });
+    PerfStatsCollector::reset();
     runMoEMTPVerifierRowShortcutEquivalence(cudaSingleDeviceBenchmarkPromptCase());
+    PerfStatsCollector::reset();
 }
 
 int main(int argc, char **argv)

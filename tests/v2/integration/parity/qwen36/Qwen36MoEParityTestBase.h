@@ -2082,16 +2082,49 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "tile_m", "2") &&
                        tag_equals(record, "tile_n", "64") &&
                        tag_equals(record, "active_expert_slots", "16") &&
-                       tag_equals(record, "gateup_route", "kpart_swiglu");
+                       tag_equals(record, "gateup_route", "kpart_swiglu") &&
+                       tag_equals(record, "down_route", "kpart_prefill");
             });
 
         ASSERT_NE(match, records.end())
             << "CUDA Qwen3.6 MoE MTP verifier path did not exercise the fused "
-            << "split-K grouped prefill SwiGLU kernel with the verifier-sized tile. "
+            << "split-K grouped prefill SwiGLU/down kernels with the verifier-sized tile. "
             << "This is a production-path regression: keep the fused path "
             << "correct instead of routing around it.\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+        EXPECT_GT(match->count, 0u);
+    }
+
+    inline void expectCudaMoEMTPVerifierRowRestorePreservedReplayState()
+    {
+        const auto records = PerfStatsCollector::snapshot({"mtp"});
+        auto tag_equals = [](const PerfStatRecord &record,
+                             const char *key,
+                             const char *value) -> bool
+        {
+            const auto it = record.tags.find(key);
+            return it != record.tags.end() && it->second == value;
+        };
+
+        const auto match = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "live_prefix_replay_state_after_mutation" &&
+                       tag_equals(record, "operation", "restore_mtp_verifier_state_row") &&
+                       tag_equals(record, "replay_state", "preserved") &&
+                       tag_equals(record, "sidecar_replay_state", "preserved") &&
+                       tag_equals(record, "gpu_replay_preserve_reason", "verifier_row_restore");
+            });
+
+        ASSERT_NE(match, records.end())
+            << "CUDA verifier-row restore must not discard already captured decode "
+            << "or MTP sidecar replay state. A reject still replays the correction "
+            << "token for mathematical correctness, but it should use the existing "
+            << "graph-captured path instead of forcing warmup/recapture.\n"
+            << PerfStatsCollector::summaryString({"mtp"});
         EXPECT_GT(match->count, 0u);
     }
 
@@ -2332,6 +2365,7 @@ namespace llaminar2::test::parity::qwen36
 
         const int target_cached_tokens = replay_checkpoint.cached_tokens + 1;
         ASSERT_TRUE(runner->restoreMTPVerifierStateRow(0, target_cached_tokens));
+        expectCudaMoEMTPVerifierRowRestorePreservedReplayState();
         const int32_t correction_token = sampled_verifier_tokens[0];
         const int32_t accepted_tokens[2] = {first_token, correction_token};
         ASSERT_TRUE(runner->forward(&correction_token, 1));
