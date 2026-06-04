@@ -26,6 +26,7 @@
 #include "tensors/TensorKernels.h"
 #include <memory>
 #include <cstdint>
+#include <vector>
 
 namespace llaminar2
 {
@@ -59,7 +60,7 @@ namespace llaminar2
          * - Single kernel instance should be used from one thread
          * - cuBLAS handle is per-kernel (not shared)
          */
-        class CUDAFloatingPointGemmKernel : public ITensorGemm
+        class CUDAFloatingPointGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
             /**
@@ -150,6 +151,15 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
 
+            bool supports_fused_projection() const override { return precision_ == Precision::FP32; }
+
+            bool multiply_fused_tensor(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
             /**
              * @brief Activation-activation GEMM (not supported for FP CUDA kernel)
              *
@@ -184,6 +194,12 @@ namespace llaminar2
 
             void setGPUStream(void *stream) override;
 
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+            void unbindWorkspace() override;
+            bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
+            DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
+
             // =========================================================================
             // IKernelSnapshotCapable interface
             // =========================================================================
@@ -215,6 +231,8 @@ namespace llaminar2
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
+
+            DeviceWorkspaceManager *bound_workspace_ = nullptr;
 
             // Cached HBM redirect buffer for mapped output memory
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.

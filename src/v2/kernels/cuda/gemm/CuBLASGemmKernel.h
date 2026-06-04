@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #ifdef HAVE_CUDA
 #include <cublas_v2.h>
@@ -185,6 +186,24 @@ namespace llaminar2
                 int M, int N, int K,
                 bool transA = false, bool transB = false,
                 float alpha = 1.0f, float beta = 0.0f);
+
+            /**
+             * @brief Batched GPU GEMM for multiple same-shaped projections sharing one A.
+             *
+             * This is used by graph-captured GDN alpha/beta projection groups:
+             * each projection has its own weight/output matrix, but all consume
+             * the same activation rows. The call keeps the math in cuBLAS while
+             * avoiding separate stage-level projection launches.
+             */
+            bool execute_batched_same_a(
+                const float *d_A,
+                const std::vector<const float *> &d_B_matrices,
+                const std::vector<float *> &d_C_matrices,
+                int M, int N, int K,
+                bool transA = false, bool transB = true,
+                float alpha = 1.0f, float beta = 0.0f);
+
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
             // Getters
             int device_id() const { return device_id_; }

@@ -2152,6 +2152,88 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GT(shared_group->count, 0u);
     }
 
+    inline void expectCudaMoEMTPVerifierGDNProjectionFusedPath()
+    {
+        const auto records = PerfStatsCollector::snapshot(
+            {"kernel.gdn_projection_route",
+             "kernel.cuda_fp32_batched_fused_projection_calls"});
+        auto tag_equals = [](const PerfStatRecord &record,
+                             const char *key,
+                             const char *value) -> bool
+        {
+            const auto it = record.tags.find(key);
+            return it != record.tags.end() && it->second == value;
+        };
+
+        const auto qkv_z = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "gdn_projection_route" &&
+                       tag_equals(record, "route", "native_subgroup") &&
+                       tag_equals(record, "m", "2") &&
+                       tag_equals(record, "k", "2048") &&
+                       tag_equals(record, "projections", "2") &&
+                       tag_equals(record, "names", "qkv+z");
+            });
+        ASSERT_NE(qkv_z, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier GDN qkv+z projections must stay "
+            << "on the native fused subgroup route.\n"
+            << PerfStatsCollector::summaryString({"kernel.gdn_projection_route"});
+
+        const auto alpha_beta = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "gdn_projection_route" &&
+                       tag_equals(record, "route", "same_kernel_mixed_codebook_subgroup") &&
+                       tag_equals(record, "m", "2") &&
+                       tag_equals(record, "k", "2048") &&
+                       tag_equals(record, "projections", "2") &&
+                       tag_equals(record, "names", "alpha+beta");
+            });
+        ASSERT_NE(alpha_beta, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier GDN alpha+beta projections must use "
+            << "the graph-capturable FP32 batched cuBLAS route instead of single "
+            << "projection fallbacks.\n"
+            << PerfStatsCollector::summaryString({"kernel.gdn_projection_route"});
+
+        const auto fp32_batch = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_fp32_batched_fused_projection_calls" &&
+                       tag_equals(record, "m", "2") &&
+                       tag_equals(record, "k", "2048") &&
+                       tag_equals(record, "n", "32") &&
+                       tag_equals(record, "projections", "2") &&
+                       tag_equals(record, "route", "cublas_batched_same_a");
+            });
+        ASSERT_NE(fp32_batch, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier GDN alpha+beta projections did not "
+            << "record the cuBLAS batched fused projection call.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_fp32_batched_fused_projection_calls"});
+
+        const auto fallback = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "gdn_projection_route" &&
+                       tag_equals(record, "route", "fallback_single") &&
+                       tag_equals(record, "m", "2") &&
+                       tag_equals(record, "k", "2048");
+            });
+        ASSERT_EQ(fallback, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier GDN projection still has a "
+            << "single-projection fallback. Keep the fused routes correct.\n"
+            << PerfStatsCollector::summaryString({"kernel.gdn_projection_route"});
+    }
+
     inline void expectCudaMoEMTPVerifierRowRestorePreservedReplayState()
     {
         const auto records = PerfStatsCollector::snapshot({"mtp"});

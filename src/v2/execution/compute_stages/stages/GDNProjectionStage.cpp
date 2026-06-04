@@ -341,11 +341,13 @@ namespace llaminar2
                         {
                             const bool compatible =
                                 require_native_compatibility
-                                    ? fusedProjectionCompatible(
+                                    ? (native_codebooks[i].has_value() &&
+                                       native_codebooks[j].has_value() &&
+                                       fusedProjectionCompatible(
                                           projections[i].kernel,
                                           projections[j].kernel,
                                           native_codebooks[i],
-                                          native_codebooks[j])
+                                          native_codebooks[j]))
                                     : sameKernelType(projections[i].kernel, projections[j].kernel);
                             if (compatible)
                                 group_indices.push_back(j);

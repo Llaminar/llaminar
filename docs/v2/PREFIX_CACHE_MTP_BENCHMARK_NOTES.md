@@ -39,8 +39,9 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 
 | Case | Decode | Acceptance | Artifact |
 |---|---:|---:|---|
-| latest baseline | 101.18 | n/a | `benchmark_results/cuda_moe_mtp/20260604T174640Z-shared-expert-prefill/baseline.json` |
-| best/latest fixed d1 | 126.60 | 89.06% | `benchmark_results/cuda_moe_mtp/20260604T174640Z-shared-expert-prefill/mtp_d1.json` |
+| best baseline | 101.18 | n/a | `benchmark_results/cuda_moe_mtp/20260604T174640Z-shared-expert-prefill/baseline.json` |
+| best fixed d1 | 126.60 | 89.06% | `benchmark_results/cuda_moe_mtp/20260604T174640Z-shared-expert-prefill/mtp_d1.json` |
+| latest fixed d1 | 121.03 | 82.81% | `benchmark_results/cuda_moe_mtp/20260604T180556Z-gdn-alpha-beta-batched/mtp_d1.json` |
 | latest fixed d3 | 68.57 | 66.86% | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/mtp_d3_after_suffix_commit_fix.json` |
 
 ## Retained Actions
@@ -49,21 +50,13 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
   depth clamping, M=2/3/4 VNNI routes, verifier-row GDN rollback restore, and compact
   active-expert MoE prefill grids.
 - CUDA dense/MoE: verifier-row GDN restore is enabled in release, small-M verifier
-  attention is graph-capturable, grouped MoE prefill auto-selects small verifier tiles,
-  and the MoE GDN qkv+z path uses fused native projections.
-- CUDA grouped MoE prefill keeps fused SwiGLU+quant but uses independent SwiGLU scratch,
-  so the fused epilogue no longer overwrites gate/up inputs before reading them.
-- CUDA verifier-sized MoE prefill separates execution support from graph-capture
-  eligibility, so snapshot/parity builds also run the production fused grouped
-  path; kernel and Qwen3.6 MoE parity regressions assert fused M=2/TileN64 use,
-  split equivalence, and capture.
-- CUDA verifier grouped MoE prefill keeps the fused SwiGLU path but now uses
-  split-K gate/up for M=2/3/4 compact active grids; kernel and real Qwen3.6 MoE
-  parity assert `gateup_route=kpart_swiglu`, graph replay, and repeated-row routes.
-- CUDA verifier grouped MoE prefill split-Ks gate/up and down for M=2/3/4
-  compact active grids; parity asserts `kpart_swiglu` and `kpart_prefill`.
-- CUDA shared-expert verifier prefill initializes an always-active grouped
-  layout on the explicit stream and uses the same split-K fused M=2/3/4 path.
+  attention is graph-capturable, and grouped MoE verifier prefill keeps fused
+  SwiGLU+quant with split-K gate/up/down for M=2/3/4 compact active grids.
+- CUDA shared-expert verifier prefill initializes an always-active grouped layout
+  on the explicit stream and uses the same split-K fused path as routed experts.
+- CUDA GDN verifier projections now keep qkv+z on fused native projection groups
+  and alpha+beta on graph-capturable cuBLAS batched FP32 projection groups backed
+  by declared workspace pointer arrays.
 - CUDA MoE MTP depth-3 parity now uses the stable benchmark-prompt lane, and shared
   expert gate verification allows mathematically valid sigmoid-underflow zero rows.
 - Depth>1 MTP rollback now commits suffix shifted-cache rows after an already-committed

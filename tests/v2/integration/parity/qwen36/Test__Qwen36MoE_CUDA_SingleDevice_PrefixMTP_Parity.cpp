@@ -157,6 +157,7 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleUsesFusedVerifie
     runMoEMTPBenchmarkStyleSkipGatherParity(
         cudaSingleDeviceBenchmarkPromptCase(),
         4);
+    expectCudaMoEMTPVerifierGDNProjectionFusedPath();
     expectCudaMoEMTPVerifierFusedPrefillPath();
     expectCudaMoEMTPVerifierSharedExpertFusedPrefillPath();
     PerfStatsCollector::reset();

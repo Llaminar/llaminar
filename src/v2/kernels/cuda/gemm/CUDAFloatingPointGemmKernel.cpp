@@ -22,9 +22,11 @@
 #include "tensors/KernelSnapshotInfo.h"
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <stdexcept>
 #include <mutex>
+#include <vector>
 
 // CUDA memory operations (implemented in CUDAQuantisedGemmKernel_CUTLASS.cu)
 extern "C"
@@ -178,11 +180,13 @@ namespace llaminar2
               K_(other.K_),
               cublas_kernel_(std::move(other.cublas_kernel_)),
               lifetime_owner_(std::move(other.lifetime_owner_)),
+              bound_workspace_(other.bound_workspace_),
               d_mapped_redirect_(other.d_mapped_redirect_),
               mapped_redirect_capacity_(other.mapped_redirect_capacity_)
         {
             other.weights_ = nullptr;
             other.d_weights_ = nullptr;
+            other.bound_workspace_ = nullptr;
             other.d_mapped_redirect_ = nullptr;
             other.mapped_redirect_capacity_ = 0;
         }
@@ -198,9 +202,11 @@ namespace llaminar2
                 N_ = other.N_;
                 K_ = other.K_;
                 cublas_kernel_ = std::move(other.cublas_kernel_);
+                bound_workspace_ = other.bound_workspace_;
 
                 other.weights_ = nullptr;
                 other.d_weights_ = nullptr;
+                other.bound_workspace_ = nullptr;
 
                 // Transfer redirect buffer ownership
                 if (d_mapped_redirect_)
@@ -380,6 +386,149 @@ namespace llaminar2
             }
         }
 
+        bool CUDAFloatingPointGemmKernel::multiply_fused_tensor(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext * /*mpi_ctx*/,
+            DeviceWorkspaceManager * /*workspace*/)
+        {
+            if (!input || projections.empty())
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Null input or empty projections");
+                return false;
+            }
+            if (precision_ != Precision::FP32)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Only FP32 projection groups are supported");
+                return false;
+            }
+            if (input->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Only FP32 activations are supported");
+                return false;
+            }
+            if (m <= 0 || k <= 0 || static_cast<size_t>(k) != K_)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Invalid dimensions: m="
+                          << m << " k=" << k << " expected_k=" << K_);
+                return false;
+            }
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] No explicit CUDA stream is bound");
+                return false;
+            }
+            if (!bound_workspace_)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Batched FP32 projection workspace is not bound");
+                return false;
+            }
+
+            const float *d_A = static_cast<const float *>(input->gpu_data_ptr());
+            if (!d_A)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Input tensor is not on CUDA device");
+                return false;
+            }
+
+            const int n = projections.front().n;
+            if (n <= 0)
+            {
+                LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Invalid projection width");
+                return false;
+            }
+
+            std::vector<const float *> d_B_matrices;
+            std::vector<float *> d_C_matrices;
+            d_B_matrices.reserve(projections.size());
+            d_C_matrices.reserve(projections.size());
+
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                const auto &proj = projections[i];
+                auto *fp_kernel = dynamic_cast<CUDAFloatingPointGemmKernel *>(proj.kernel);
+                if (!fp_kernel || !proj.output)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
+                              << i << " is not a CUDA FP32 GEMM/output pair");
+                    return false;
+                }
+                if (proj.bias)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Bias is not supported in batched FP32 projection groups");
+                    return false;
+                }
+                if (proj.n != n ||
+                    fp_kernel->N_ != static_cast<size_t>(n) ||
+                    fp_kernel->K_ != K_ ||
+                    fp_kernel->precision_ != Precision::FP32 ||
+                    fp_kernel->cuda_device_id_ != cuda_device_id_)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
+                              << i << " is not compatible with the batched FP32 group"
+                              << " n=" << proj.n << " expected_n=" << n
+                              << " k=" << fp_kernel->K_ << " expected_k=" << K_);
+                    return false;
+                }
+                if (proj.output->native_type() != TensorType::FP32)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
+                              << i << " output must be FP32");
+                    return false;
+                }
+                if (proj.output->isMapped())
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Mapped outputs are not supported in graph-captured batched FP32 projection groups");
+                    return false;
+                }
+
+                fp_kernel->setGPUStream(gpu_stream_);
+
+                auto *d_C = static_cast<float *>(proj.output->gpu_data_ptr());
+                if (!fp_kernel->d_weights_ || !d_C)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Projection "
+                              << i << " weight/output is not on CUDA device");
+                    return false;
+                }
+
+                d_B_matrices.push_back(static_cast<const float *>(fp_kernel->d_weights_));
+                d_C_matrices.push_back(d_C);
+            }
+
+            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
+            const bool success = cublas_kernel_->execute_batched_same_a(
+                d_A,
+                d_B_matrices,
+                d_C_matrices,
+                m,
+                n,
+                k,
+                false,
+                true,
+                1.0f,
+                0.0f);
+
+            if (success && PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cuda_fp32_batched_fused_projection_calls",
+                    1.0,
+                    "gemm",
+                    "cuda:" + std::to_string(cuda_device_id_),
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"k", std::to_string(k)},
+                        {"n", std::to_string(n)},
+                        {"projections", std::to_string(projections.size())},
+                        {"route", "cublas_batched_same_a"}});
+            }
+
+            return success;
+        }
+
         // =====================================================================
         // ITensorKernel interface
         // =====================================================================
@@ -412,6 +561,27 @@ namespace llaminar2
             {
                 cublas_kernel_->setStream(stream);
             }
+        }
+
+        WorkspaceRequirements CUDAFloatingPointGemmKernel::getWorkspaceRequirements(int m, int n, int k) const
+        {
+            if (!cublas_kernel_)
+                return WorkspaceRequirements{};
+            return cublas_kernel_->getWorkspaceRequirements(m, n, k);
+        }
+
+        void CUDAFloatingPointGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
+        {
+            bound_workspace_ = workspace;
+            if (cublas_kernel_)
+                cublas_kernel_->bindWorkspace(workspace);
+        }
+
+        void CUDAFloatingPointGemmKernel::unbindWorkspace()
+        {
+            if (cublas_kernel_)
+                cublas_kernel_->unbindWorkspace();
+            bound_workspace_ = nullptr;
         }
 
         // =====================================================================

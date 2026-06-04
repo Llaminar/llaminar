@@ -12,6 +12,8 @@
 
 #include <iostream>
 #include <stdexcept>
+#include <array>
+#include <vector>
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
@@ -25,6 +27,51 @@ namespace llaminar2
     {
 
 #ifdef HAVE_CUDA
+
+        namespace
+        {
+            constexpr int kMaxBatchedSameAProjections = 8;
+            constexpr const char *kBatchedSameAAArray = "cublas_batched_same_a_a_ptrs";
+            constexpr const char *kBatchedSameABArray = "cublas_batched_same_a_b_ptrs";
+            constexpr const char *kBatchedSameACArray = "cublas_batched_same_a_c_ptrs";
+
+            __global__ void prepare_batched_same_a_pointer_arrays_kernel(
+                const float *d_A,
+                const float *d_B0,
+                const float *d_B1,
+                const float *d_B2,
+                const float *d_B3,
+                const float *d_B4,
+                const float *d_B5,
+                const float *d_B6,
+                const float *d_B7,
+                float *d_C0,
+                float *d_C1,
+                float *d_C2,
+                float *d_C3,
+                float *d_C4,
+                float *d_C5,
+                float *d_C6,
+                float *d_C7,
+                int batch_count,
+                const float **d_A_array,
+                const float **d_B_array,
+                float **d_C_array)
+            {
+                const int i = static_cast<int>(threadIdx.x);
+                if (i >= batch_count)
+                    return;
+
+                const float *b_values[kMaxBatchedSameAProjections] = {
+                    d_B0, d_B1, d_B2, d_B3, d_B4, d_B5, d_B6, d_B7};
+                float *c_values[kMaxBatchedSameAProjections] = {
+                    d_C0, d_C1, d_C2, d_C3, d_C4, d_C5, d_C6, d_C7};
+
+                d_A_array[i] = d_A;
+                d_B_array[i] = b_values[i];
+                d_C_array[i] = c_values[i];
+            }
+        } // namespace
 
         // =====================================================================
         // Helper macros for error checking
@@ -499,6 +546,117 @@ namespace llaminar2
             return true;
         }
 
+        bool CuBLASGemmKernel::execute_batched_same_a(
+            const float *d_A,
+            const std::vector<const float *> &d_B_matrices,
+            const std::vector<float *> &d_C_matrices,
+            int M, int N, int K,
+            bool transA, bool transB,
+            float alpha, float beta)
+        {
+            if (!handle_)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] cuBLAS handle is null");
+                return false;
+            }
+            if (!d_A || d_B_matrices.empty() || d_B_matrices.size() != d_C_matrices.size())
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Invalid batched projection inputs");
+                return false;
+            }
+            if (d_B_matrices.size() > static_cast<size_t>(kMaxBatchedSameAProjections))
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Too many projections for fixed graph-captured pointer workspace: "
+                          << d_B_matrices.size());
+                return false;
+            }
+
+            try
+            {
+                requireStream("CuBLASGemmKernel::execute_batched_same_a");
+            }
+            catch (const std::exception &ex)
+            {
+                LOG_ERROR(ex.what());
+                return false;
+            }
+
+            for (size_t i = 0; i < d_B_matrices.size(); ++i)
+            {
+                if (!d_B_matrices[i] || !d_C_matrices[i])
+                {
+                    LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Null matrix pointer at batch "
+                              << i);
+                    return false;
+                }
+            }
+
+            CUDA_CHECK(cudaSetDevice(device_id_));
+
+            if (!workspace_)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Batched pointer workspace is not bound");
+                return false;
+            }
+            auto *d_A_array = static_cast<const float **>(workspace_->getBuffer(kBatchedSameAAArray));
+            auto *d_B_array = static_cast<const float **>(workspace_->getBuffer(kBatchedSameABArray));
+            auto *d_C_array = static_cast<float **>(workspace_->getBuffer(kBatchedSameACArray));
+            if (!d_A_array || !d_B_array || !d_C_array)
+            {
+                LOG_ERROR("[CuBLASGemmKernel::execute_batched_same_a] Missing batched pointer workspace buffers");
+                return false;
+            }
+
+            cublasOperation_t opA = transA ? CUBLAS_OP_T : CUBLAS_OP_N;
+            cublasOperation_t opB = transB ? CUBLAS_OP_T : CUBLAS_OP_N;
+
+            const int lda = K;
+            const int ldb = transB ? K : N;
+            const int ldc = N;
+            const int batch_count = static_cast<int>(d_B_matrices.size());
+
+            std::array<const float *, kMaxBatchedSameAProjections> b{};
+            std::array<float *, kMaxBatchedSameAProjections> c{};
+            for (int i = 0; i < batch_count; ++i)
+            {
+                b[static_cast<size_t>(i)] = d_B_matrices[static_cast<size_t>(i)];
+                c[static_cast<size_t>(i)] = d_C_matrices[static_cast<size_t>(i)];
+            }
+
+            prepare_batched_same_a_pointer_arrays_kernel<<<1, kMaxBatchedSameAProjections, 0, static_cast<cudaStream_t>(gpu_stream_)>>>(
+                d_A,
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
+                batch_count,
+                d_A_array,
+                d_B_array,
+                d_C_array);
+            CUDA_CHECK(cudaGetLastError());
+
+            CUBLAS_CHECK(cublasSgemmBatched(
+                handle_,
+                opB, opA,
+                N, M, K,
+                &alpha,
+                d_B_array, ldb,
+                d_A_array, lda,
+                &beta,
+                d_C_array, ldc,
+                batch_count));
+
+            return true;
+        }
+
+        WorkspaceRequirements CuBLASGemmKernel::getWorkspaceRequirements(int, int, int) const
+        {
+            WorkspaceRequirements reqs;
+            const size_t bytes = static_cast<size_t>(kMaxBatchedSameAProjections) * sizeof(void *);
+            reqs.buffers.push_back({kBatchedSameAAArray, bytes, 256, true});
+            reqs.buffers.push_back({kBatchedSameABArray, bytes, 256, true});
+            reqs.buffers.push_back({kBatchedSameACArray, bytes, 256, true});
+            return reqs;
+        }
+
         // =====================================================================
         // Factory function
         // =====================================================================
@@ -562,6 +720,21 @@ namespace llaminar2
             bool, bool, float, float)
         {
             return false;
+        }
+
+        bool CuBLASGemmKernel::execute_batched_same_a(
+            const float *,
+            const std::vector<const float *> &,
+            const std::vector<float *> &,
+            int, int, int,
+            bool, bool, float, float)
+        {
+            return false;
+        }
+
+        WorkspaceRequirements CuBLASGemmKernel::getWorkspaceRequirements(int, int, int) const
+        {
+            return WorkspaceRequirements{};
         }
 
         std::unique_ptr<CuBLASGemmKernel> createCuBLASGemm(int, CuBLASGemmKernel::Precision)

@@ -1524,6 +1524,17 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
     ASSERT_TRUE(weights_alpha->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(weights_beta->ensureOnDevice(gpu_device_));
 
+    std::vector<float> alpha_cpu(static_cast<size_t>(M) * N_ALPHA, 0.0f);
+    std::vector<float> beta_cpu(static_cast<size_t>(M) * N_BETA, 0.0f);
+    auto cpu_alpha = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_alpha.get(), KernelDeviceType::CPU);
+    auto cpu_beta = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_beta.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_alpha, nullptr);
+    ASSERT_NE(cpu_beta, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_alpha.get(), input_data.data(), alpha_cpu.data(), M, N_ALPHA, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_beta.get(), input_data.data(), beta_cpu.data(), M, N_BETA, K));
+
     auto output_qkv = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
     auto output_z = std::make_unique<FP32Tensor>(
@@ -1545,6 +1556,10 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
         << "CUDA quantized GEMM must advertise fused projection support so GDN can batch qkv+z";
     ASSERT_TRUE(kernel_z->supports_fused_projection())
         << "CUDA quantized GEMM must advertise fused projection support so GDN can batch qkv+z";
+    ASSERT_TRUE(kernel_alpha->supports_fused_projection())
+        << "CUDA FP32 GEMM must advertise fused projection support so GDN can batch alpha+beta";
+    ASSERT_TRUE(kernel_beta->supports_fused_projection())
+        << "CUDA FP32 GEMM must advertise fused projection support so GDN can batch alpha+beta";
 
     GDNProjectionStage::Params params;
     params.device_id = gpu_device_;
@@ -1589,6 +1604,42 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
         });
     ASSERT_TRUE(ok);
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    ASSERT_NE(output_qkv->gpu_data_ptr(), nullptr);
+    ASSERT_NE(output_z->gpu_data_ptr(), nullptr);
+    ASSERT_NE(output_alpha->gpu_data_ptr(), nullptr);
+    ASSERT_NE(output_beta->gpu_data_ptr(), nullptr);
+    ASSERT_EQ(cudaMemsetAsync(output_qkv->gpu_data_ptr(), 0,
+                              static_cast<size_t>(M) * N_QKV * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(output_z->gpu_data_ptr(), 0,
+                              static_cast<size_t>(M) * N_Z * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(output_alpha->gpu_data_ptr(), 0,
+                              static_cast<size_t>(M) * N_ALPHA * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(output_beta->gpu_data_ptr(), 0,
+                              static_cast<size_t>(M) * N_BETA * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ASSERT_TRUE(stage.execute(&ctx))
+        << "CUDA GDN projection stage should be graph-capturable with fused qkv+z and alpha+beta subgroups";
+    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+
+    output_qkv->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_z->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 
     stage.unbindWorkspace();
@@ -1616,6 +1667,23 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
     ASSERT_NE(qkv_z_route, route_records.end())
         << "CUDA GDN verifier projection must fuse quantized qkv+z instead of routing both as single fallbacks";
 
+    const auto alpha_beta_route = std::find_if(
+        route_records.begin(),
+        route_records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "gdn_projection_route" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("route") == "same_kernel_mixed_codebook_subgroup" &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.at("projections") == "2" &&
+                   record.tags.at("names") == "alpha+beta";
+        });
+    ASSERT_NE(alpha_beta_route, route_records.end())
+        << "CUDA GDN verifier projection must batch FP32 alpha+beta instead of routing them as single fallbacks";
+
     const auto fused_records =
         PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
     const auto fused_kernel_record = std::find_if(
@@ -1632,6 +1700,36 @@ TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
         });
     ASSERT_NE(fused_kernel_record, fused_records.end())
         << "CUDA qkv+z GDN subgroup should execute the graph-native small-M fused projection kernel";
+
+    const auto fp32_fused_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_fp32_batched_fused_projection_calls"});
+    const auto fp32_fused_record = std::find_if(
+        fp32_fused_records.begin(),
+        fp32_fused_records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "cuda_fp32_batched_fused_projection_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.at("n") == std::to_string(N_ALPHA) &&
+                   record.tags.at("projections") == "2" &&
+                   record.tags.at("route") == "cublas_batched_same_a";
+        });
+    ASSERT_NE(fp32_fused_record, fp32_fused_records.end())
+        << "CUDA alpha+beta GDN subgroup should execute the graph-capturable cuBLAS batched projection route";
+
+    const auto alpha_result =
+        checkParity(output_alpha->data(), alpha_cpu.data(), alpha_cpu.size(), 0.9999, 0.01);
+    const auto beta_result =
+        checkParity(output_beta->data(), beta_cpu.data(), beta_cpu.size(), 0.9999, 0.01);
+    EXPECT_FALSE(alpha_result.has_nan_inf);
+    EXPECT_FALSE(beta_result.has_nan_inf);
+    EXPECT_GE(alpha_result.cosine_similarity, 0.9999);
+    EXPECT_GE(beta_result.cosine_similarity, 0.9999);
+    EXPECT_LE(alpha_result.relative_l2_error, 0.01);
+    EXPECT_LE(beta_result.relative_l2_error, 0.01);
 
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
