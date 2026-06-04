@@ -7,6 +7,7 @@
 #include "execution/moe/MoEExpertParallelPlan.h"
 #include "kernels/KernelFactory.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <cnpy.h>
 
@@ -2057,6 +2058,40 @@ namespace llaminar2::test::parity::qwen36
             << "benchmark-style skip-gather decode diverged"
             << "\nreference tokens: " << joinTokensMoEDiagnostic(reference_tokens)
               << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
+    }
+
+    inline void expectCudaMoEMTPVerifierFusedPrefillPath()
+    {
+        const auto records = PerfStatsCollector::snapshot(
+            {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+        auto tag_equals = [](const PerfStatRecord &record,
+                             const char *key,
+                             const char *value) -> bool
+        {
+            const auto it = record.tags.find(key);
+            return it != record.tags.end() && it->second == value;
+        };
+
+        const auto match = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
+                       tag_equals(record, "swiglu_path", "fused") &&
+                       tag_equals(record, "tile_m", "2") &&
+                       tag_equals(record, "tile_n", "64") &&
+                       tag_equals(record, "active_expert_slots", "16");
+            });
+
+        ASSERT_NE(match, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier path did not exercise the fused "
+            << "grouped prefill SwiGLU kernel with the verifier-sized tile. "
+            << "This is a production-path regression: keep the fused path "
+            << "correct instead of routing around it.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+        EXPECT_GT(match->count, 0u);
     }
 
     inline void runMoENoMTPBenchmarkStyleSkipGatherArgmaxParity(

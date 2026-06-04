@@ -54,8 +54,10 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
   and the MoE GDN qkv+z path uses fused native projections.
 - CUDA grouped MoE prefill keeps fused SwiGLU+quant but uses independent SwiGLU scratch,
   so the fused epilogue no longer overwrites gate/up inputs before reading them.
-- CUDA verifier-sized MoE prefill now emits fused/split branch counters; M=2/3/4
-  integration coverage asserts default fused execution, split-path equivalence, and capture.
+- CUDA verifier-sized MoE prefill separates execution support from graph-capture
+  eligibility, so snapshot/parity builds also run the production fused grouped
+  path; kernel and Qwen3.6 MoE parity regressions assert fused M=2/TileN64 use,
+  split equivalence, and capture.
 - CUDA verifier M=2 grouped MoE prefill uses `TileN=64`; profiled verifier forward
   improved from ~19.49ms to ~19.10ms/step, still short of net-positive MTP.
 - CUDA MoE MTP depth-3 parity now uses the stable benchmark-prompt lane, and shared

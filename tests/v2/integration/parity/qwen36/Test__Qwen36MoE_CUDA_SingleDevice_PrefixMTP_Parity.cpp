@@ -148,6 +148,19 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleSkipGatherGreedy
         4);
 }
 
+TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleUsesFusedVerifierPrefillPath)
+{
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+    });
+    PerfStatsCollector::reset();
+    runMoEMTPBenchmarkStyleSkipGatherParity(
+        cudaSingleDeviceBenchmarkPromptCase(),
+        4);
+    expectCudaMoEMTPVerifierFusedPrefillPath();
+    PerfStatsCollector::reset();
+}
+
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesBaselineTokens)
 {
     runMoEMTPParity(cudaSingleDeviceDepth3Case(), false, 3);

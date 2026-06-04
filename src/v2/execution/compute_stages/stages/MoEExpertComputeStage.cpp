@@ -109,9 +109,9 @@ namespace llaminar2
             markGpuTensorWritten(output, device, stream);
         }
 
-        bool supportsGroupedPrefillGraphCaptureBackend(DeviceId device)
+        bool supportsGroupedPrefillExecutionBackend(DeviceId device)
         {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
             (void)device;
             return false;
 #else
@@ -126,6 +126,16 @@ namespace llaminar2
                 return true;
 #endif
             return false;
+#endif
+        }
+
+        bool supportsGroupedPrefillGraphCaptureBackend(DeviceId device)
+        {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS)
+            (void)device;
+            return false;
+#else
+            return supportsGroupedPrefillExecutionBackend(device);
 #endif
         }
 
@@ -1740,7 +1750,7 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::canUseFixedTopologyGroupedPrefill() const
     {
-        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
+        return supportsGroupedPrefillExecutionBackend(params_.device_id) &&
                params_.seq_len > 1 &&
                hasFullLocalExpertOwnership() &&
                expertMaskAllEnabled() &&
