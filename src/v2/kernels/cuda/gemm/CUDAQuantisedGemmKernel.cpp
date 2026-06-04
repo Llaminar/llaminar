@@ -844,31 +844,12 @@ namespace llaminar2
 
         void CUDAQuantisedGemmKernel::resetDynamicState()
         {
-            if (!impl_)
-                return;
-
-            if (impl_->gemv_ctx)
-            {
-                cudaGemvContext_destroy(impl_->gemv_ctx);
-                impl_->gemv_ctx = nullptr;
-            }
-            if (impl_->prefill_ctx)
-            {
-                cudaPrefillContext_destroy(impl_->prefill_ctx);
-                impl_->prefill_ctx = nullptr;
-            }
-            if (impl_->cublas_ctx)
-            {
-                cudaCuBLASContext_destroy(impl_->cublas_ctx);
-                impl_->cublas_ctx = nullptr;
-            }
-
             gpu_stream_ = nullptr;
         }
 
         bool CUDAQuantisedGemmKernel::hasDynamicStateActive() const
         {
-            return impl_ && (impl_->gemv_ctx || impl_->prefill_ctx || impl_->cublas_ctx || gpu_stream_ != nullptr);
+            return gpu_stream_ != nullptr;
         }
 
         bool CUDAQuantisedGemmKernel::exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out)

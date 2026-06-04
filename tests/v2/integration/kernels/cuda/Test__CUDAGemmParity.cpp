@@ -38,6 +38,7 @@
 #include "../../../utils/TestModelHelper.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
+#include <cuda_runtime.h>
 #endif
 
 // Now include test utils
@@ -64,6 +65,25 @@ using KernelDeviceType = llaminar::v2::kernels::DeviceType;
 
 // Alias for TensorProjectionDesc
 using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
+
+#ifdef HAVE_CUDA
+extern "C"
+{
+    void cudaNativeVNNIPrefill_setStreamKMode(int mode);
+    int cudaNativeVNNIPrefill_getStreamKMode();
+    void cudaNativeVNNIPrefill_setBK256Mode(int mode);
+    int cudaNativeVNNIPrefill_getBK256Mode();
+    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
+    bool cudaNativeVNNIPrefill_getDeterministicMode();
+    void cudaNativeVNNIPrefill_setForceTile(int tile_id, int split_k);
+    void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k);
+    void cudaNativeVNNIPrefill_getLastLaunchSelection(
+        int *tile_id,
+        int *split_k,
+        int *used_bk256,
+        int *used_streamk);
+}
+#endif
 
 namespace
 {
@@ -98,6 +118,38 @@ namespace
         std::string old_value_;
         bool had_old_ = false;
     };
+
+#ifdef HAVE_CUDA
+    class ScopedCudaPrefillModes
+    {
+    public:
+        ScopedCudaPrefillModes()
+            : streamk_(cudaNativeVNNIPrefill_getStreamKMode()),
+              bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
+              deterministic_(cudaNativeVNNIPrefill_getDeterministicMode())
+        {
+            cudaNativeVNNIPrefill_getForceTile(&force_tile_, &force_split_k_);
+        }
+
+        ~ScopedCudaPrefillModes()
+        {
+            cudaNativeVNNIPrefill_setForceTile(force_tile_, force_split_k_);
+            cudaNativeVNNIPrefill_setStreamKMode(streamk_);
+            cudaNativeVNNIPrefill_setBK256Mode(bk256_);
+            cudaNativeVNNIPrefill_setDeterministicMode(deterministic_);
+        }
+
+        ScopedCudaPrefillModes(const ScopedCudaPrefillModes &) = delete;
+        ScopedCudaPrefillModes &operator=(const ScopedCudaPrefillModes &) = delete;
+
+    private:
+        int force_tile_ = -1;
+        int force_split_k_ = 0;
+        int streamk_ = 0;
+        int bk256_ = 0;
+        bool deterministic_ = false;
+    };
+#endif
 
     struct CUDASmallMFormatSpec
     {
@@ -1028,6 +1080,107 @@ TEST_F(Test__CUDAGemmParity, Q4_0_SmallPrefillM4_UsesNativeSmallMRoute)
         << "CUDA small-prefill M=4 route must not emit NaN/Inf";
     EXPECT_GE(result.cosine_similarity, 0.99)
         << "Cosine similarity too low: " << result.cosine_similarity;
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_0_PrefillGraphReplaySurvivesKernelDynamicReset)
+{
+    const int M = 512;
+    const int N = 896;
+    const int K = 896;
+
+    ScopedCudaPrefillModes prefill_modes;
+    cudaNativeVNNIPrefill_setBK256Mode(-1);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+    cudaNativeVNNIPrefill_setForceTile(1, 1); // T64x128_w2x2, single split-K.
+    cudaNativeVNNIPrefill_setStreamKMode(2);  // Force two-pass Stream-K fixup buffer path.
+
+    auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)}, 232);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    FP32Tensor A_tensor({static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_tensor.mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    FP32Tensor C_tensor({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    ASSERT_TRUE(A_tensor.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(C_tensor.ensureOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cuda_kernel->setGPUStream(stream);
+    ASSERT_TRUE(cuda_kernel->multiply_tensor(
+        &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
+        gpu_device_.ordinal, workspace_.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    int tile_id = -1;
+    int split_k = 0;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(&tile_id, &split_k, &used_bk256, &used_streamk);
+    ASSERT_EQ(used_bk256, 0) << "Regression must exercise BK64 Stream-K, not BK256";
+    ASSERT_EQ(used_streamk, 2) << "Regression must exercise two-pass Stream-K context scratch";
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+
+    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), cudaSuccess);
+    ASSERT_TRUE(cuda_kernel->multiply_tensor(
+        &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
+        gpu_device_.ordinal, workspace_.get()));
+    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_NE(graph_exec, nullptr);
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cuda_kernel->resetDynamicState();
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "resetDynamicState should clear request-scoped stream binding";
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess)
+        << "Captured graph must survive request reset without dangling context scratch";
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  C_cuda.data(),
+                  C_tensor.gpu_data_ptr(),
+                  C_cuda.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_0 prefill graph replay after CUDA GEMM dynamic reset");
+    EXPECT_FALSE(result.has_nan_inf);
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low after graph replay: " << result.cosine_similarity;
+
+    if (graph_exec)
+        cudaGraphExecDestroy(graph_exec);
+    if (graph)
+        cudaGraphDestroy(graph);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 
     cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());

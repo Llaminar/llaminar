@@ -10,14 +10,34 @@
 
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
+
+#ifdef HAVE_CUDA
+extern "C" bool cudaMoE_group_tokens_small_float(
+    const float *routing_indices,
+    const float *routing_weights,
+    int *expert_counts,
+    int *expert_offsets,
+    int *grouped_token_indices,
+    float *grouped_weights,
+    int *active_expert_ids,
+    int total_slots,
+    int num_experts,
+    int top_k,
+    int max_active_experts,
+    int device_idx,
+    void *stream);
+#endif
 
 /**
  * @file Test__CUDAMoEKernel.cpp
@@ -107,6 +127,35 @@ namespace
 
     private:
         void *ptr_ = nullptr;
+    };
+
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            setenv(name, value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
     };
 
     /// @brief Build a minimal native-VNNI descriptor backed by CUDA device pointers.
@@ -598,6 +647,123 @@ TEST_F(Test__CUDAMoEKernel, PrepareExpertGroupsAsyncAcceptsDeviceRoutingTensors)
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int seq_len = 4;
+    constexpr int top_k = 4;
+    constexpr int num_experts = 16;
+    constexpr int total_slots = seq_len * top_k;
+    constexpr int max_active_experts = total_slots;
+
+    const std::vector<float> routing_indices = {
+        7.0f, 3.0f, 7.0f, 1.0f,
+        5.0f, 1.0f, 9.0f, 3.0f,
+        7.0f, 5.0f, 11.0f, 1.0f,
+        3.0f, 9.0f, 11.0f, 5.0f,
+    };
+    std::vector<float> routing_weights(static_cast<size_t>(total_slots));
+    for (int i = 0; i < total_slots; ++i)
+        routing_weights[static_cast<size_t>(i)] = 0.05f * static_cast<float>(i + 1);
+
+    float *d_indices = nullptr;
+    float *d_weights = nullptr;
+    int *d_counts = nullptr;
+    int *d_offsets = nullptr;
+    int *d_grouped_tokens = nullptr;
+    float *d_grouped_weights = nullptr;
+    int *d_active = nullptr;
+    ASSERT_EQ(cudaMalloc(&d_indices, routing_indices.size() * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_weights, routing_weights.size() * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_counts, num_experts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_offsets, num_experts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_grouped_tokens, total_slots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_grouped_weights, total_slots * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_active, max_active_experts * sizeof(int)), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpyAsync(d_indices, routing_indices.data(),
+                              routing_indices.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_weights, routing_weights.data(),
+                              routing_weights.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+
+    ASSERT_TRUE(cudaMoE_group_tokens_small_float(
+        d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens, d_grouped_weights,
+        d_active, total_slots, num_experts, top_k, max_active_experts, 0, stream_));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    std::vector<int> counts(num_experts);
+    std::vector<int> offsets(num_experts);
+    std::vector<int> grouped_tokens(total_slots);
+    std::vector<float> grouped_weights(total_slots);
+    std::vector<int> active(max_active_experts);
+    ASSERT_EQ(cudaMemcpy(counts.data(), d_counts, counts.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(offsets.data(), d_offsets, offsets.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(grouped_tokens.data(), d_grouped_tokens, grouped_tokens.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(grouped_weights.data(), d_grouped_weights, grouped_weights.size() * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(active.data(), d_active, active.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+
+    std::vector<int> expected_counts(num_experts, 0);
+    for (float expert : routing_indices)
+        ++expected_counts[static_cast<int>(expert)];
+
+    std::vector<int> expected_offsets(num_experts, 0);
+    int running = 0;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        expected_offsets[expert] = running;
+        running += expected_counts[expert];
+    }
+    EXPECT_EQ(counts, expected_counts);
+    EXPECT_EQ(offsets, expected_offsets);
+
+    std::vector<int> expected_active;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        if (expected_counts[expert] > 0)
+            expected_active.push_back(expert);
+    }
+    ASSERT_LE(expected_active.size(), active.size());
+    for (size_t i = 0; i < expected_active.size(); ++i)
+        EXPECT_EQ(active[i], expected_active[i]) << "active slot " << i;
+    for (size_t i = expected_active.size(); i < active.size(); ++i)
+        EXPECT_EQ(active[i], -1) << "inactive slot " << i;
+
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        int local = 0;
+        for (int slot = 0; slot < total_slots; ++slot)
+        {
+            if (static_cast<int>(routing_indices[static_cast<size_t>(slot)]) != expert)
+                continue;
+            const int dest = offsets[expert] + local++;
+            EXPECT_EQ(grouped_tokens[dest], slot / top_k);
+            EXPECT_FLOAT_EQ(grouped_weights[dest], routing_weights[static_cast<size_t>(slot)]);
+        }
+    }
+
+    EXPECT_FALSE(cudaMoE_group_tokens_small_float(
+        d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens, d_grouped_weights,
+        d_active, total_slots, num_experts, top_k, max_active_experts, 0, nullptr));
+
+    cudaFree(d_indices);
+    cudaFree(d_weights);
+    cudaFree(d_counts);
+    cudaFree(d_offsets);
+    cudaFree(d_grouped_tokens);
+    cudaFree(d_grouped_weights);
+    cudaFree(d_active);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, UploadGroupedDescriptorTablesAcceptValidCudaDescriptors)
 {
 #ifndef HAVE_CUDA
@@ -646,6 +812,243 @@ TEST_F(Test__CUDAMoEKernel, UploadGroupedDescriptorTablesAcceptValidCudaDescript
     EXPECT_GE(gateup_table, 0);
 
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveExpertGrid)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    llaminar2::PerfStatsCollector::reset();
+
+    constexpr int seq_len = 4;
+    constexpr int top_k = 4;
+    constexpr int num_experts = 16;
+    constexpr int d_model = 32;
+    constexpr int intermediate = 32;
+    constexpr size_t descriptor_bytes = 4096;
+
+    std::vector<CudaAllocation> payloads;
+    std::vector<CudaAllocation> scales;
+    payloads.reserve(static_cast<size_t>(num_experts * 3));
+    scales.reserve(static_cast<size_t>(num_experts * 3));
+
+    auto add_desc = [&](int rows, int cols)
+    {
+        payloads.emplace_back(descriptor_bytes);
+        scales.emplace_back(descriptor_bytes);
+        EXPECT_EQ(cudaMemsetAsync(payloads.back().get(), 0, descriptor_bytes, stream_), cudaSuccess);
+
+        const int scale_count = rows * (cols / 32);
+        std::vector<uint16_t> host_scales(static_cast<size_t>(scale_count), 0x3c00u);
+        EXPECT_EQ(cudaMemcpyAsync(scales.back().get(), host_scales.data(),
+                                  host_scales.size() * sizeof(uint16_t),
+                                  cudaMemcpyHostToDevice, stream_),
+                  cudaSuccess);
+        return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
+    };
+
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    down_descs.reserve(num_experts);
+    gate_descs.reserve(num_experts);
+    up_descs.reserve(num_experts);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        down_descs.push_back(add_desc(d_model, intermediate));
+        gate_descs.push_back(add_desc(intermediate, d_model));
+        up_descs.push_back(add_desc(intermediate, d_model));
+    }
+
+    const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+    const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+
+    std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
+    for (size_t i = 0; i < hidden_values.size(); ++i)
+        hidden_values[i] = 0.01f * static_cast<float>(static_cast<int>(i % 13) - 6);
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto output = makeZeros({seq_len, d_model});
+
+    auto routing_indices = makeTensor({seq_len, top_k}, {
+                                                            7.0f,
+                                                            3.0f,
+                                                            7.0f,
+                                                            1.0f,
+                                                            5.0f,
+                                                            1.0f,
+                                                            9.0f,
+                                                            3.0f,
+                                                            7.0f,
+                                                            5.0f,
+                                                            11.0f,
+                                                            1.0f,
+                                                            3.0f,
+                                                            9.0f,
+                                                            11.0f,
+                                                            5.0f,
+                                                        });
+    auto routing_weights = makeTensor({seq_len, top_k}, {
+                                                            0.40f,
+                                                            0.30f,
+                                                            0.20f,
+                                                            0.10f,
+                                                            0.45f,
+                                                            0.25f,
+                                                            0.20f,
+                                                            0.10f,
+                                                            0.35f,
+                                                            0.30f,
+                                                            0.20f,
+                                                            0.15f,
+                                                            0.50f,
+                                                            0.20f,
+                                                            0.20f,
+                                                            0.10f,
+                                                        });
+
+    ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+        routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
+    ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+        hidden.get(), output.get(), gateup_table, down_table,
+        seq_len, d_model, intermediate, num_experts, top_k));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    const float *output_data = output->data();
+    for (size_t i = 0; i < output->numel(); ++i)
+        ASSERT_TRUE(std::isfinite(output_data[i])) << "output element " << i;
+
+    const auto grouping_records =
+        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_small_prefill_grouping_calls"});
+    ASSERT_FALSE(grouping_records.empty());
+
+    const auto grid_records =
+        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_prefill_active_expert_grid_calls"});
+    ASSERT_FALSE(grid_records.empty());
+    EXPECT_EQ(grid_records.front().tags.at("active_expert_slots"), std::to_string(seq_len * top_k));
+    EXPECT_EQ(grid_records.front().tags.at("num_experts"), std::to_string(num_experts));
+
+    llaminar2::PerfStatsCollector::reset();
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPathCapturesAndReplays)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int seq_len = 33;
+    constexpr int top_k = 2;
+    constexpr int num_experts = 128;
+    constexpr int d_model = 32;
+    constexpr int intermediate = 32;
+    constexpr size_t descriptor_bytes = 4096;
+
+    std::vector<CudaAllocation> payloads;
+    std::vector<CudaAllocation> scales;
+    payloads.reserve(static_cast<size_t>(num_experts * 3));
+    scales.reserve(static_cast<size_t>(num_experts * 3));
+
+    auto add_desc = [&](int rows, int cols)
+    {
+        payloads.emplace_back(descriptor_bytes);
+        scales.emplace_back(descriptor_bytes);
+        EXPECT_EQ(cudaMemsetAsync(payloads.back().get(), 0, descriptor_bytes, stream_), cudaSuccess);
+
+        const int scale_count = rows * (cols / 32);
+        std::vector<uint16_t> host_scales(static_cast<size_t>(scale_count), 0x3c00u);
+        EXPECT_EQ(cudaMemcpyAsync(scales.back().get(), host_scales.data(),
+                                  host_scales.size() * sizeof(uint16_t),
+                                  cudaMemcpyHostToDevice, stream_),
+                  cudaSuccess);
+        return makeCudaNativeDesc(payloads.back(), scales.back(), rows, cols);
+    };
+
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    down_descs.reserve(num_experts);
+    gate_descs.reserve(num_experts);
+    up_descs.reserve(num_experts);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        down_descs.push_back(add_desc(d_model, intermediate));
+        gate_descs.push_back(add_desc(intermediate, d_model));
+        up_descs.push_back(add_desc(intermediate, d_model));
+    }
+
+    const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+    const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+
+    std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
+    for (size_t i = 0; i < hidden_values.size(); ++i)
+        hidden_values[i] = 0.01f * static_cast<float>(static_cast<int>(i % 17) - 8);
+
+    std::vector<float> routing_indices(static_cast<size_t>(seq_len) * top_k);
+    std::vector<float> routing_weights(static_cast<size_t>(seq_len) * top_k);
+    for (int slot = 0; slot < seq_len * top_k; ++slot)
+    {
+        routing_indices[static_cast<size_t>(slot)] =
+            static_cast<float>((slot * 17 + 5) % num_experts);
+        routing_weights[static_cast<size_t>(slot)] =
+            (slot % top_k == 0) ? 0.625f : 0.375f;
+    }
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto output = makeZeros({seq_len, d_model});
+    auto routing_tensor = makeTensor({seq_len, top_k}, routing_indices);
+    auto weights_tensor = makeTensor({seq_len, top_k}, routing_weights);
+
+    // Warmup allocates grouping/prefill scratch and pins tensor residency before capture.
+    ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+        routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k));
+    ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+        hidden.get(), output.get(), gateup_table, down_table,
+        seq_len, d_model, intermediate, num_experts, top_k));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(
+        routing_tensor.get(), weights_tensor.get(), seq_len, num_experts, top_k);
+    const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
+        hidden.get(), output.get(), gateup_table, down_table,
+        seq_len, d_model, intermediate, num_experts, top_k);
+    cudaGraph_t graph = nullptr;
+    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
+    EXPECT_TRUE(captured_grouping);
+    EXPECT_TRUE(captured_prefill);
+    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
+    ASSERT_NE(graph, nullptr);
+
+    cudaGraphExec_t executable = nullptr;
+    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    const float *output_data = output->data();
+    for (size_t i = 0; i < output->numel(); ++i)
+        ASSERT_TRUE(std::isfinite(output_data[i])) << "output element " << i;
+
+    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 #endif
 }
 

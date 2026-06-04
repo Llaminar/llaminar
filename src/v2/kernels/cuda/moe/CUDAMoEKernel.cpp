@@ -17,6 +17,7 @@
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 #include <cuda_runtime.h>
 
@@ -249,6 +250,15 @@ extern "C"
         int total_slots, int top_k, int num_experts,
         int device_idx, void *stream);
 
+    bool cudaMoE_group_tokens_small_float(
+        const float *routing_indices, const float *routing_weights,
+        int *expert_counts, int *expert_offsets,
+        int *grouped_token_indices, float *grouped_weights,
+        int *active_expert_ids,
+        int total_slots, int num_experts, int top_k,
+        int max_active_experts,
+        int device_idx, void *stream);
+
     bool cudaMoE_gather_expert_fixed(
         const float *hidden, float *batch_buffer,
         const int *expert_offsets, const int *expert_counts,
@@ -342,6 +352,7 @@ extern "C"
         const int *d_group_offsets,
         const int *d_group_token_indices,
         const float *d_group_weights,
+        const int *d_active_expert_ids,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
         float *d_scratch_gate,
@@ -355,6 +366,7 @@ extern "C"
         int intermediate,
         int max_tokens_per_expert,
         int total_slots,
+        int active_expert_slots,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         int device_idx,
@@ -381,6 +393,7 @@ namespace llaminar2
         host_grouped_indices_.clear();
         host_grouped_weights_.clear();
         prepared_num_experts_ = 0;
+        group_active_expert_slots_ = 0;
     }
 
     void CUDAMoEKernel::releaseDeviceBuffers() noexcept
@@ -406,6 +419,7 @@ namespace llaminar2
         release(d_group_token_indices_);
         release(d_group_write_heads_);
         release(d_group_weights_);
+        release(d_group_active_expert_ids_);
         for (auto &table : grouped_down_desc_tables_)
             release(table.device_descs);
         for (auto &table : grouped_gateup_desc_tables_)
@@ -440,6 +454,7 @@ namespace llaminar2
         route_topk_capacity_ = 0;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
+        group_active_expert_slots_ = 0;
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
@@ -563,9 +578,12 @@ namespace llaminar2
                 cudaFree(d_group_token_indices_);
             if (d_group_weights_)
                 cudaFree(d_group_weights_);
+            if (d_group_active_expert_ids_)
+                cudaFree(d_group_active_expert_ids_);
             d_group_int_indices_ = nullptr;
             d_group_token_indices_ = nullptr;
             d_group_weights_ = nullptr;
+            d_group_active_expert_ids_ = nullptr;
 
             cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_group_int_indices_), static_cast<size_t>(total_slots) * sizeof(int));
             if (err != cudaSuccess)
@@ -574,6 +592,9 @@ namespace llaminar2
             if (err != cudaSuccess)
                 return false;
             err = cudaMalloc(reinterpret_cast<void **>(&d_group_weights_), static_cast<size_t>(total_slots) * sizeof(float));
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(reinterpret_cast<void **>(&d_group_active_expert_ids_), static_cast<size_t>(total_slots) * sizeof(int));
             if (err != cudaSuccess)
                 return false;
             group_slots_cap_ = total_slots;
@@ -1523,6 +1544,7 @@ namespace llaminar2
 
         if (!cudaMoE_float_to_int(d_float_indices, d_group_int_indices_, total_slots, device_ordinal_, stream))
             return false;
+        group_active_expert_slots_ = 0;
         if (!groupTokensByExpertDevice(d_group_int_indices_, d_float_weights,
                                        seq_len, num_experts, top_k,
                                        d_group_offsets_, d_group_counts_,
@@ -1751,6 +1773,52 @@ namespace llaminar2
         if (!d_float_indices || !d_float_weights)
             return false;
 
+        const bool use_small_grouping =
+            total_slots <= 64 &&
+            num_experts <= 256 &&
+            top_k <= 16;
+        if (use_small_grouping)
+        {
+            const int active_expert_slots = std::min(total_slots, num_experts);
+            if (!cudaMoE_group_tokens_small_float(
+                    d_float_indices,
+                    d_float_weights,
+                    d_group_counts_,
+                    d_group_offsets_,
+                    d_group_token_indices_,
+                    d_group_weights_,
+                    d_group_active_expert_ids_,
+                    total_slots,
+                    num_experts,
+                    top_k,
+                    active_expert_slots,
+                    device_ordinal_,
+                    stream))
+            {
+                LOG_ERROR("[CUDAMoEKernel::prepareExpertGroupsAsync] small-M grouping failed");
+                group_active_expert_slots_ = 0;
+                return false;
+            }
+
+            group_active_expert_slots_ = active_expert_slots;
+            prepared_num_experts_ = num_experts;
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cuda_moe_small_prefill_grouping_calls",
+                    1.0,
+                    "moe",
+                    device.to_string(),
+                    PerfStatsCollector::Tags{
+                        {"total_slots", std::to_string(total_slots)},
+                        {"num_experts", std::to_string(num_experts)},
+                        {"top_k", std::to_string(top_k)}});
+            }
+            return true;
+        }
+
+        group_active_expert_slots_ = 0;
         if (!cudaMoE_float_to_int(d_float_indices, d_group_int_indices_, total_slots, device_ordinal_, stream))
             return false;
         if (!groupTokensByExpertDevice(d_group_int_indices_, d_float_weights,
@@ -1799,6 +1867,12 @@ namespace llaminar2
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
+        const int active_expert_slots = group_active_expert_slots_;
+        if (active_expert_slots > 0 && !d_group_active_expert_ids_)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] compact active expert list missing");
+            return false;
+        }
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
             !ensureTensorOnDevice(hidden, device, stream, "hidden") ||
             !ensureOutputOnDevice(output, device, stream, "output"))
@@ -1829,6 +1903,7 @@ namespace llaminar2
             d_group_offsets_,
             d_group_token_indices_,
             d_group_weights_,
+            d_group_active_expert_ids_,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
@@ -1842,6 +1917,7 @@ namespace llaminar2
             intermediate,
             max_tokens_per_expert,
             total_slots,
+            active_expert_slots,
             gateup_table.codebook_id,
             down_table.codebook_id,
             device_ordinal_,
@@ -1853,6 +1929,19 @@ namespace llaminar2
         }
 
         markDeviceWritten(output, device, stream);
+        if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_grouped_prefill_active_expert_grid_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                PerfStatsCollector::Tags{
+                    {"total_slots", std::to_string(total_slots)},
+                    {"active_expert_slots", std::to_string(active_expert_slots)},
+                    {"num_experts", std::to_string(num_experts)}});
+        }
         return true;
     }
 

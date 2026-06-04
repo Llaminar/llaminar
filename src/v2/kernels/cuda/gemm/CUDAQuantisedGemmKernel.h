@@ -111,15 +111,17 @@ namespace llaminar2
             static void clearSharedPrefillPools();
 
             /**
-             * @brief Release input-dependent CUDA execution contexts.
+             * @brief Clear request-scoped CUDA execution state.
              *
-             * Keeps packed weights resident, but drops per-session GEMV, prefill,
-             * and cuBLAS scratch/handles so a new request cannot inherit state
-             * from the previous prompt shape or capture stream.
+             * Per-device GEMV, prefill, and cuBLAS contexts are persistent
+             * scratch/handle owners. They must stay alive across request resets
+             * because CUDA graph captures may contain kernels that reference
+             * their device buffers. Kernel destruction / KernelFactory::clearCache()
+             * releases those resources.
              */
             void resetDynamicState() override;
 
-            /// @brief Returns true when any CUDA execution context is live.
+            /// @brief Returns true when request-scoped state is live.
             bool hasDynamicStateActive() const override;
 
             /**

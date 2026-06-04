@@ -1032,6 +1032,16 @@ namespace llaminar2
 
         hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
         hipStream_t hip_stream = reinterpret_cast<hipStream_t>(stream); // nullptr = default stream
+        if (hip_stream)
+        {
+            hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+            if (hipStreamIsCapturing(hip_stream, &capture_status) == hipSuccess &&
+                capture_status != hipStreamCaptureStatusNone)
+            {
+                return true;
+            }
+        }
+
         err = hipEventRecord(hip_event, hip_stream);
         if (err != hipSuccess)
         {

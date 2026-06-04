@@ -762,6 +762,76 @@ namespace
         }
     }
 
+    __global__ void group_tokens_small_float_kernel(
+        const float *__restrict__ routing_indices,
+        const float *__restrict__ routing_weights,
+        int *__restrict__ expert_counts,
+        int *__restrict__ expert_offsets,
+        int *__restrict__ grouped_token_indices,
+        float *__restrict__ grouped_weights,
+        int *__restrict__ active_expert_ids,
+        int total_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts)
+    {
+        __shared__ int counts[kDeviceMoEMaxExperts];
+        __shared__ int offsets[kDeviceMoEMaxExperts];
+        __shared__ int write_heads[kDeviceMoEMaxExperts];
+
+        const int tid = threadIdx.x;
+        if (tid < num_experts)
+        {
+            counts[tid] = 0;
+            offsets[tid] = 0;
+            write_heads[tid] = 0;
+        }
+        __syncthreads();
+
+        if (tid < total_slots)
+        {
+            const int expert_id = static_cast<int>(routing_indices[tid]);
+            if (expert_id >= 0 && expert_id < num_experts)
+                atomicAdd(&counts[expert_id], 1);
+        }
+        __syncthreads();
+
+        if (tid == 0)
+        {
+            int running = 0;
+            int active = 0;
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                offsets[expert] = running;
+                const int count = counts[expert];
+                if (count > 0 && active < max_active_experts)
+                    active_expert_ids[active++] = expert;
+                running += count;
+            }
+            for (int slot = active; slot < max_active_experts; ++slot)
+                active_expert_ids[slot] = -1;
+        }
+        __syncthreads();
+
+        if (tid < num_experts)
+        {
+            expert_counts[tid] = counts[tid];
+            expert_offsets[tid] = offsets[tid];
+        }
+
+        if (tid < total_slots)
+        {
+            const int expert_id = static_cast<int>(routing_indices[tid]);
+            if (expert_id >= 0 && expert_id < num_experts)
+            {
+                const int local = atomicAdd(&write_heads[expert_id], 1);
+                const int dest = offsets[expert_id] + local;
+                grouped_token_indices[dest] = tid / top_k;
+                grouped_weights[dest] = routing_weights[tid];
+            }
+        }
+    }
+
     __global__ void gather_expert_fixed_kernel(
         const float *__restrict__ hidden,
         float *__restrict__ batch_buffer,
@@ -1051,6 +1121,8 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ active_expert_ids,
+        int active_expert_slots,
         float *__restrict__ gate_output,
         float *__restrict__ up_output,
         int N,
@@ -1062,7 +1134,11 @@ namespace
         constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
-        const int expert_id = blockIdx.z;
+        const int expert_id = (active_expert_slots > 0)
+                                  ? active_expert_ids[blockIdx.z]
+                                  : static_cast<int>(blockIdx.z);
+        if (expert_id < 0)
+            return;
 
         const int count = expert_counts[expert_id];
         const int first_token = token_group * kTileM;
@@ -1191,6 +1267,8 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ active_expert_ids,
+        int active_expert_slots,
         int8_t *__restrict__ swiglu_int8,
         float *__restrict__ swiglu_scales,
         int N,
@@ -1199,7 +1277,11 @@ namespace
         constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
-        const int expert_id = blockIdx.z;
+        const int expert_id = (active_expert_slots > 0)
+                                  ? active_expert_ids[blockIdx.z]
+                                  : static_cast<int>(blockIdx.z);
+        if (expert_id < 0)
+            return;
 
         const int count = expert_counts[expert_id];
         const int first_token = token_group * kTileM;
@@ -1353,6 +1435,8 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ active_expert_ids,
+        int active_expert_slots,
         float *__restrict__ output,
         int N,
         int K)
@@ -1361,7 +1445,11 @@ namespace
         constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
-        const int expert_id = blockIdx.z;
+        const int expert_id = (active_expert_slots > 0)
+                                  ? active_expert_ids[blockIdx.z]
+                                  : static_cast<int>(blockIdx.z);
+        if (expert_id < 0)
+            return;
 
         const int count = expert_counts[expert_id];
         const int first_token = token_group * kTileM;
@@ -2102,6 +2190,50 @@ extern "C"
         return finishLaunch("cudaMoE_scatter_tokens_deterministic");
     }
 
+    bool cudaMoE_group_tokens_small_float(
+        const float *routing_indices,
+        const float *routing_weights,
+        int *expert_counts,
+        int *expert_offsets,
+        int *grouped_token_indices,
+        float *grouped_weights,
+        int *active_expert_ids,
+        int total_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int device_idx,
+        void *stream)
+    {
+        if (!stream ||
+            !routing_indices || !routing_weights || !expert_counts || !expert_offsets ||
+            !grouped_token_indices || !grouped_weights || !active_expert_ids ||
+            total_slots <= 0 || total_slots > 64 ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK ||
+            max_active_experts <= 0 || max_active_experts > total_slots ||
+            max_active_experts > num_experts)
+        {
+            std::fprintf(stderr, "[cudaMoE_group_tokens_small_float] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        group_tokens_small_float_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            routing_indices,
+            routing_weights,
+            expert_counts,
+            expert_offsets,
+            grouped_token_indices,
+            grouped_weights,
+            active_expert_ids,
+            total_slots,
+            num_experts,
+            top_k,
+            max_active_experts);
+        return finishLaunch("cudaMoE_group_tokens_small_float");
+    }
+
     bool cudaMoE_gather_expert_fixed(const float *hidden, float *batch_buffer,
                                      const int *expert_offsets, const int *expert_counts,
                                      const int *grouped_token_indices,
@@ -2456,6 +2588,7 @@ extern "C"
         const int *d_group_offsets,
         const int *d_group_token_indices,
         const float *d_group_weights,
+        const int *d_active_expert_ids,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
         float *d_scratch_gate,
@@ -2469,6 +2602,7 @@ extern "C"
         int intermediate,
         int max_tokens_per_expert,
         int total_slots,
+        int active_expert_slots,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         int device_idx,
@@ -2480,11 +2614,20 @@ extern "C"
             !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out || !d_output ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
             max_tokens_per_expert <= 0 || total_slots <= 0 ||
-            (d_model % 32) != 0 || (intermediate % 32) != 0)
+            active_expert_slots < 0 ||
+            (d_model % 32) != 0 || (intermediate % 32) != 0 ||
+            !stream)
         {
             std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] invalid arguments\n");
             return false;
         }
+        const bool use_active_expert_grid = active_expert_slots > 0;
+        if (use_active_expert_grid &&
+            (!d_active_expert_ids ||
+             active_expert_slots > total_slots ||
+             active_expert_slots > num_experts))
+            return false;
+        const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -2514,17 +2657,19 @@ extern "C"
             const bool fuse_swiglu = llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu;
             dim3 grid((intermediate + kTileN - 1) / kTileN,
                       (max_tokens_per_expert + kTileM - 1) / kTileM,
-                      num_experts);
+                      expert_grid);
             dim3 block(kTileN);
 
 #define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                   \
     grouped_native_vnni_gate_up_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(            \
         d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
-        d_group_counts, d_group_offsets, d_scratch_gate, d_scratch_up, intermediate, d_model)
+        d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
+        d_scratch_gate, d_scratch_up, intermediate, d_model)
 #define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                            \
     grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(     \
         d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
-        d_group_counts, d_group_offsets, d_scratch_swiglu_int8, d_scratch_swiglu_scales,            \
+        d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
+        d_scratch_swiglu_int8, d_scratch_swiglu_scales,                                            \
         intermediate, d_model)
 #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                          \
     do {                                                                                           \
@@ -2588,13 +2733,14 @@ extern "C"
             const int kTileM = (tile_m == 16) ? 16 : 8;
             dim3 grid((d_model + kTileN - 1) / kTileN,
                       (max_tokens_per_expert + kTileM - 1) / kTileM,
-                      num_experts);
+                      expert_grid);
             dim3 block(kTileN);
 
 #define LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, TM)                                                     \
     grouped_native_vnni_down_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(               \
         d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                          \
-        d_group_counts, d_group_offsets, d_scratch_down_out, d_model, intermediate)
+        d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
+        d_scratch_down_out, d_model, intermediate)
 #define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
     do {                                                                                           \
         if (kTileM == 16) LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 16);                                   \

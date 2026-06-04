@@ -280,6 +280,16 @@ namespace llaminar2
 
         cudaEvent_t cuda_event = reinterpret_cast<cudaEvent_t>(event);
         cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream); // nullptr = default stream
+        if (cuda_stream)
+        {
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(cuda_stream, &capture_status) == cudaSuccess &&
+                capture_status != cudaStreamCaptureStatusNone)
+            {
+                return true;
+            }
+        }
+
         err = cudaEventRecord(cuda_event, cuda_stream);
         if (err != cudaSuccess)
         {

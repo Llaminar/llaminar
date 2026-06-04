@@ -12,7 +12,7 @@ tuning actions, and negative A/B results that should not be rediscovered.
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 42.04 tok/s | 2.13x | Fixed d1, compact active-expert prefill grid |
-| MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Deep CUDA math parity green; needs longer confirmation |
+| MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Deep math and prefix/MTP parity green; c768/n1 replay smoke green |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
 ## Adaptive Depth
@@ -70,7 +70,8 @@ MoE A/B results to avoid repeating:
 - Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, batched
   ROCm verifier-row argmax, and GDN verifier-row rollback restore.
 - Kept CUDA verifier projection dispatch on the known-good row-wise route until
-  a batched route proves parity and speed.
+  a batched route proves parity and speed; CUDA GEMM context scratch now survives
+  request resets while captured prefill graphs are retained.
 - Stabilized MoE prefix fingerprints, grouped-decode runtime-table rewarm, and
   streamful `TransferEngine` terminal-state uploads.
 - Kept ROCm attention param uploads out of HIP capture; captured attention now

@@ -303,6 +303,8 @@ namespace llaminar2
         int *d_group_token_indices_ = nullptr;
         int *d_group_write_heads_ = nullptr;
         float *d_group_weights_ = nullptr;
+        int *d_group_active_expert_ids_ = nullptr;
+        int group_active_expert_slots_ = 0;
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
 
