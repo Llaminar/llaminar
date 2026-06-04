@@ -141,7 +141,8 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
-            const std::vector<int> *sequence_lengths);
+            const std::vector<int> *sequence_lengths,
+            const std::string &stage_prefix_override = {});
 
         ComputeGraph buildFAKVCacheAppendGraph(
             const LayerWeights &layer,
@@ -151,7 +152,8 @@ namespace llaminar2
             int batch_size,
             IKVCache *kv_cache,
             const int *position_ids,
-            DeviceId device);
+            DeviceId device,
+            const std::string &stage_prefix_override = {});
 
         // =====================================================================
         // GDN Attention Sub-Graph Building

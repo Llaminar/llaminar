@@ -646,12 +646,14 @@ namespace llaminar2
         }
 
         ComputeGraph graph;
-        std::string prefix = "layer" + std::to_string(layer_idx) + "_";
+        const bool mtp_sidecar_context = mtp_graph_context_active_;
+        const int mtp_depth_idx = mtp_graph_depth_idx_;
+        std::string prefix = mtp_sidecar_context
+                                 ? "MTP" + std::to_string(std::max(0, mtp_depth_idx)) + "_"
+                                 : "layer" + std::to_string(layer_idx) + "_";
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
-        const bool mtp_sidecar_context = mtp_graph_context_active_;
-        const int mtp_depth_idx = mtp_graph_depth_idx_;
 
         auto overlay_runtime_plan = runtimePlanForGraph(config_);
         const auto &overlay_plan = overlay_runtime_plan

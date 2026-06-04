@@ -539,6 +539,8 @@ namespace llaminar2
 
         if (kv_cache_only)
         {
+            const std::string sidecar_stage_prefix =
+                "MTP" + std::to_string(depth_idx) + "_";
             ComputeGraph kv_append = buildFAKVCacheAppendGraph(
                 weights.fa_block,
                 mtp_buffers,
@@ -547,7 +549,8 @@ namespace llaminar2
                 input.batch_size,
                 input.kv_cache,
                 input.position_ids,
-                device);
+                device,
+                sidecar_stage_prefix);
             if (kv_append.size() == 0)
                 return ComputeGraph{};
 
@@ -557,6 +560,8 @@ namespace llaminar2
             return graph;
         }
 
+        const std::string sidecar_stage_prefix =
+            "MTP" + std::to_string(depth_idx) + "_";
         ComputeGraph attention = buildFAAttentionGraph(
             weights.fa_block,
             mtp_buffers,
@@ -566,7 +571,8 @@ namespace llaminar2
             input.kv_cache,
             input.position_ids,
             device,
-            input.sequence_lengths);
+            input.sequence_lengths,
+            sidecar_stage_prefix);
         if (attention.size() == 0)
             return ComputeGraph{};
 
@@ -956,7 +962,8 @@ namespace llaminar2
         int batch_size,
         IKVCache *kv_cache,
         const int *position_ids,
-        DeviceId device)
+        DeviceId device,
+        const std::string &stage_prefix_override)
     {
         ComputeGraph graph;
         if (!kv_cache)
@@ -965,7 +972,9 @@ namespace llaminar2
             return graph;
         }
 
-        std::string prefix = "layer" + std::to_string(layer_idx) + "_";
+        std::string prefix = stage_prefix_override.empty()
+                                 ? "layer" + std::to_string(layer_idx) + "_"
+                                 : stage_prefix_override;
         const int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
         const WeightBinding *wq_binding = layer.wq_binding ? layer.wq_binding : layer_bindings.wq;
@@ -1080,10 +1089,13 @@ namespace llaminar2
         IKVCache *kv_cache,
         const int *position_ids,
         DeviceId device,
-        const std::vector<int> *sequence_lengths)
+        const std::vector<int> *sequence_lengths,
+        const std::string &stage_prefix_override)
     {
         ComputeGraph graph;
-        std::string prefix = "layer" + std::to_string(layer_idx) + "_";
+        std::string prefix = stage_prefix_override.empty()
+                                 ? "layer" + std::to_string(layer_idx) + "_"
+                                 : stage_prefix_override;
         int total_tokens = batch_size * seq_len;
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
         const WeightBinding *wq_binding = layer.wq_binding ? layer.wq_binding : layer_bindings.wq;

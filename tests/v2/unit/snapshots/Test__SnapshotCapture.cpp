@@ -117,6 +117,20 @@ TEST(Test__SnapshotCapture_KeyConversion, MoEStages)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_add"), "layer39_MOE_COMBINED_OUTPUT");
 }
 
+TEST(Test__SnapshotCapture_KeyConversion, MTPSidecarStages)
+{
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_attn_norm"), "MTP0_ATTENTION_NORM");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_q_proj"), "MTP0_Q_PROJECTION");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_attention"), "MTP0_ATTENTION_CONTEXT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_attn_output_gate"), "MTP0_ATTENTION_CONTEXT_GATED");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_wo_proj"), "MTP0_ATTENTION_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_ffn_norm"), "MTP0_FFN_NORM");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_moe_expert_ffn"), "MTP0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_shared_expert_ffn"), "MTP0_MOE_SHARED_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_shared_expert_gate"), "MTP0_MOE_SHARED_GATE_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_moe_combine"), "MTP0_MOE_COMBINED_OUTPUT");
+}
+
 TEST(Test__SnapshotCapture_KeyConversion, FallbackUpperCase)
 {
     // Unknown suffix: just uppercase the whole thing
@@ -275,6 +289,56 @@ TEST(Test__SnapshotCapture_Extract, FP16Conversion)
     EXPECT_NEAR(result[1], -0.5f, 0.001f);
     EXPECT_NEAR(result[2], 3.14f, 0.01f);
     EXPECT_FLOAT_EQ(result[3], 0.0f);
+}
+
+TEST(Test__SnapshotCapture_Capture, MTPSidecarFusedQKVUsesMTPKeys)
+{
+    std::vector<float> q = {1.0f, 2.0f};
+    std::vector<float> k = {3.0f, 4.0f};
+    std::vector<float> v = {5.0f, 6.0f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("q", q.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("k", k.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("v", v.data(), 1, 2));
+
+    SnapshotCapture capture;
+    capture.captureStage("MTP0_qkv_proj", dump);
+
+    const auto *q_snapshot = capture.get("MTP0_Q_PROJECTION");
+    const auto *k_snapshot = capture.get("MTP0_K_PROJECTION");
+    const auto *v_snapshot = capture.get("MTP0_V_PROJECTION");
+    ASSERT_NE(q_snapshot, nullptr);
+    ASSERT_NE(k_snapshot, nullptr);
+    ASSERT_NE(v_snapshot, nullptr);
+    EXPECT_EQ(q_snapshot->data, q);
+    EXPECT_EQ(k_snapshot->data, k);
+    EXPECT_EQ(v_snapshot->data, v);
+}
+
+TEST(Test__SnapshotCapture_Capture, MTPSidecarMoERoutingUsesMTPKeys)
+{
+    std::vector<float> logits = {1.0f, 2.0f, 3.0f};
+    std::vector<float> indices = {2.0f, 1.0f};
+    std::vector<float> weights = {0.75f, 0.25f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("logits", logits.data(), 1, 3));
+    dump.outputs.push_back(makeFP32Output("indices", indices.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("weights", weights.data(), 1, 2));
+
+    SnapshotCapture capture;
+    capture.captureStage("MTP0_moe_routing", dump);
+
+    const auto *router_snapshot = capture.get("MTP0_MOE_ROUTER_OUTPUT");
+    const auto *indices_snapshot = capture.get("MTP0_MOE_ROUTING_INDICES");
+    const auto *weights_snapshot = capture.get("MTP0_MOE_ROUTING_WEIGHTS");
+    ASSERT_NE(router_snapshot, nullptr);
+    ASSERT_NE(indices_snapshot, nullptr);
+    ASSERT_NE(weights_snapshot, nullptr);
+    EXPECT_EQ(router_snapshot->data, logits);
+    EXPECT_EQ(indices_snapshot->data, indices);
+    EXPECT_EQ(weights_snapshot->data, weights);
 }
 
 // =========================================================================

@@ -1092,6 +1092,20 @@ namespace llaminar2::test::parity::qwen36
         return oss.str();
     }
 
+    inline std::string joinStringsMoEDiagnostic(const std::vector<std::string> &values)
+    {
+        std::ostringstream oss;
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            if (i > 0)
+            {
+                oss << ' ';
+            }
+            oss << values[i];
+        }
+        return oss.str();
+    }
+
     inline std::string currentGitHashMoEDiagnostic()
     {
         std::string hash = "unknown";
@@ -1377,20 +1391,34 @@ namespace llaminar2::test::parity::qwen36
         row.present_in_baseline = !left.empty();
         row.present_in_mtp = right != nullptr && right_size > 0;
 
-        if (!row.present_in_baseline || !row.present_in_mtp || left.size() != right_size)
+        const float *left_data = left.data();
+        size_t left_size = left.size();
+        std::vector<float> left_tail;
+        if (row.present_in_baseline && row.present_in_mtp &&
+            left_size > right_size && right_size > 0 &&
+            left_size % right_size == 0)
         {
-            row.elements = std::max(left.size(), right_size);
+            left_tail.assign(
+                left.end() - static_cast<ptrdiff_t>(right_size),
+                left.end());
+            left_data = left_tail.data();
+            left_size = left_tail.size();
+        }
+
+        if (!row.present_in_baseline || !row.present_in_mtp || left_size != right_size)
+        {
+            row.elements = std::max(left_size, right_size);
             return row;
         }
 
-        row.elements = left.size();
+        row.elements = left_size;
         double dot = 0.0;
         double left_norm = 0.0;
         double right_norm = 0.0;
         double diff_norm = 0.0;
-        for (size_t i = 0; i < left.size(); ++i)
+        for (size_t i = 0; i < left_size; ++i)
         {
-            const double a = static_cast<double>(left[i]);
+            const double a = static_cast<double>(left_data[i]);
             const double b = static_cast<double>(right[i]);
             const double diff = a - b;
             dot += a * b;
@@ -1487,6 +1515,100 @@ namespace llaminar2::test::parity::qwen36
         return worst;
     }
 
+    inline bool isMTPSidecarSnapshotKey(const std::string &key)
+    {
+        return key.rfind("MTP", 0) == 0 || key.find("_MTP") != std::string::npos;
+    }
+
+    inline bool isComparableMoEDiagnosticRow(const MoESnapshotCompareRow &row)
+    {
+        return row.present_in_baseline && row.present_in_mtp && row.elements > 0;
+    }
+
+    inline const MoESnapshotCompareRow *firstMoEDiagnosticDivergence(
+        const std::vector<MoESnapshotCompareRow> &rows,
+        const std::string &comparison,
+        double cosine_threshold,
+        bool include_sidecar_keys)
+    {
+        for (const auto &row : rows)
+        {
+            if (row.comparison != comparison)
+            {
+                continue;
+            }
+            if (!include_sidecar_keys && isMTPSidecarSnapshotKey(row.key))
+            {
+                continue;
+            }
+            if (!isComparableMoEDiagnosticRow(row) || row.cosine < cosine_threshold)
+            {
+                return &row;
+            }
+        }
+        return nullptr;
+    }
+
+    inline const MoESnapshotCompareRow *worstComparableMoEDiagnosticRow(
+        const std::vector<MoESnapshotCompareRow> &rows,
+        const std::string &comparison,
+        bool include_sidecar_keys)
+    {
+        const MoESnapshotCompareRow *worst = nullptr;
+        for (const auto &row : rows)
+        {
+            if (row.comparison != comparison)
+            {
+                continue;
+            }
+            if (!include_sidecar_keys && isMTPSidecarSnapshotKey(row.key))
+            {
+                continue;
+            }
+            if (!isComparableMoEDiagnosticRow(row))
+            {
+                continue;
+            }
+            if (!worst || row.cosine < worst->cosine)
+            {
+                worst = &row;
+            }
+        }
+        return worst;
+    }
+
+    inline const MoESnapshotCompareRow *firstMoESidecarReferenceGap(
+        const std::vector<MoESnapshotCompareRow> &rows,
+        const std::string &comparison)
+    {
+        for (const auto &row : rows)
+        {
+            if (row.comparison == comparison &&
+                isMTPSidecarSnapshotKey(row.key) &&
+                (!row.present_in_baseline || !row.present_in_mtp))
+            {
+                return &row;
+            }
+        }
+        return nullptr;
+    }
+
+    inline std::string describeMoEDiagnosticRow(const MoESnapshotCompareRow &row)
+    {
+        std::ostringstream oss;
+        oss << "comparison=" << row.comparison
+            << " sync=" << row.sync_idx
+            << " output_tokens=" << row.output_tokens
+            << " key=" << row.key
+            << " reference_key=" << row.reference_key
+            << " cosine=" << row.cosine
+            << " rel_l2=" << row.rel_l2
+            << " max_abs_diff=" << row.max_abs_diff
+            << " present_left=" << (row.present_in_baseline ? "true" : "false")
+            << " present_right=" << (row.present_in_mtp ? "true" : "false");
+        return oss.str();
+    }
+
     inline std::string describeMoEDiagnosticRows(const std::vector<MoESnapshotCompareRow> &rows)
     {
         const auto *worst = worstMoESnapshotRow(rows);
@@ -1496,14 +1618,26 @@ namespace llaminar2::test::parity::qwen36
         }
 
         std::ostringstream oss;
-        oss << "worst snapshot sync=" << worst->sync_idx
-            << " output_tokens=" << worst->output_tokens
-            << " key=" << worst->key
-            << " cosine=" << worst->cosine
-            << " rel_l2=" << worst->rel_l2
-            << " max_abs_diff=" << worst->max_abs_diff
-            << " present_baseline=" << (worst->present_in_baseline ? "true" : "false")
-            << " present_mtp=" << (worst->present_in_mtp ? "true" : "false");
+        oss << "worst snapshot " << describeMoEDiagnosticRow(*worst);
+
+        if (const auto *first_pt_mtp =
+                firstMoEDiagnosticDivergence(rows, "pytorch_vs_mtp", 0.98, false))
+        {
+            oss << "\nfirst non-sidecar PyTorch-vs-MTP divergence "
+                << describeMoEDiagnosticRow(*first_pt_mtp);
+        }
+        if (const auto *worst_pt_mtp =
+                worstComparableMoEDiagnosticRow(rows, "pytorch_vs_mtp", false))
+        {
+            oss << "\nworst comparable non-sidecar PyTorch-vs-MTP row "
+                << describeMoEDiagnosticRow(*worst_pt_mtp);
+        }
+        if (const auto *first_sidecar =
+                firstMoESidecarReferenceGap(rows, "pytorch_vs_mtp"))
+        {
+            oss << "\nfirst sidecar PyTorch reference gap "
+                << describeMoEDiagnosticRow(*first_sidecar);
+        }
         return oss.str();
     }
 
@@ -1609,6 +1743,7 @@ namespace llaminar2::test::parity::qwen36
 
         std::vector<int32_t> mtp_tokens;
         std::vector<MoESnapshotCompareRow> all_snapshot_rows;
+        std::set<std::string> observed_mtp_sidecar_keys;
 
         auto mtp = factory->createFromOrchestrationConfig(
             makeMoEPrefixRestoreConfig(test_case, model_path, false, 2, true));
@@ -1633,6 +1768,13 @@ namespace llaminar2::test::parity::qwen36
 
             ASSERT_LE(mtp_tokens.size(), baseline_snapshots_by_output_count.size() - 1);
             auto mtp_snapshot = captureMoEDiagnosticSnapshot(*mtp, mtp_step.tokens, mtp_tokens);
+            for (const auto &entry : mtp_snapshot.snapshots)
+            {
+                if (isMTPSidecarSnapshotKey(entry.first))
+                {
+                    observed_mtp_sidecar_keys.insert(entry.first);
+                }
+            }
             write_trace(sync_idx, "mtp", mtp_snapshot);
 
             const auto &baseline_snapshot =
@@ -1735,6 +1877,175 @@ namespace llaminar2::test::parity::qwen36
             << " mtp current_position=" << mtp_state.current_position;
         EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
         EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
+
+        const std::vector<std::string> required_sidecar_keys = {
+            "MTP0_NORM_HIDDEN",
+            "MTP0_CONCAT",
+            "MTP0_FC",
+            "MTP0_ATTENTION_NORM",
+            "MTP0_Q_PROJECTION",
+            "MTP0_ATTENTION_CONTEXT",
+            "MTP0_ATTENTION_OUTPUT",
+            "MTP0_FFN_NORM",
+            "MTP0_MOE_ROUTER_OUTPUT",
+            "MTP0_MOE_ROUTING_INDICES",
+            "MTP0_MOE_ROUTING_WEIGHTS",
+            "MTP0_MOE_EXPERT_OUTPUT",
+            "MTP0_MOE_SHARED_EXPERT_OUTPUT",
+            "MTP0_MOE_SHARED_GATE_OUTPUT",
+            "MTP0_MOE_COMBINED_OUTPUT",
+            "MTP0_FINAL_NORM",
+            "MTP0_LM_HEAD",
+        };
+        std::vector<std::string> missing_sidecar_keys;
+        for (const auto &key : required_sidecar_keys)
+        {
+            if (observed_mtp_sidecar_keys.count(key) == 0)
+            {
+                missing_sidecar_keys.push_back(key);
+            }
+        }
+        EXPECT_TRUE(missing_sidecar_keys.empty())
+            << "MTP sidecar diagnostic snapshots are missing required keys: "
+            << joinStringsMoEDiagnostic(missing_sidecar_keys)
+            << "\nobserved MTP keys: "
+            << joinStringsMoEDiagnostic(std::vector<std::string>(
+                   observed_mtp_sidecar_keys.begin(),
+                   observed_mtp_sidecar_keys.end()))
+            << "\ndiagnostic CSVs:\n"
+            << token_csv_path << '\n'
+            << snapshot_csv_path;
+    }
+
+    inline void runMoEMTPBenchmarkStyleSkipGatherParity(
+        const MoEPrefixRestoreParityCase &test_case,
+        int decode_token_budget)
+    {
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        ASSERT_GT(decode_token_budget, 0);
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        auto run_mtp_decode = [&]() -> std::vector<int32_t>
+        {
+            std::vector<int32_t> tokens;
+            auto runner = factory->createFromOrchestrationConfig(
+                makeMoEPrefixRestoreConfig(test_case, model_path, false, 2, true));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                return tokens;
+            }
+
+            if (!runner->initialize())
+            {
+                ADD_FAILURE() << runner->lastError();
+                return tokens;
+            }
+            runner->setSamplingParams(greedy);
+            runner->setSkipLogitsGatherDecode(true);
+            runner->setSkipLogitsGatherPrefill(true);
+
+            auto prefill_once = [&]() -> bool
+            {
+                if (!runner->prefill(prompt_tokens))
+                {
+                    ADD_FAILURE() << runner->lastError();
+                    return false;
+                }
+                return true;
+            };
+
+            auto decode_loop = [&](std::vector<int32_t> *out_tokens) -> bool
+            {
+                int produced = 0;
+                while (produced < decode_token_budget)
+                {
+                    const int remaining = decode_token_budget - produced;
+                    runner->setDecodeStepTokenBudget(remaining);
+                    GenerationResult step = runner->decodeStep();
+                    runner->setDecodeStepTokenBudget(0);
+                    if (!step.error.empty())
+                    {
+                        ADD_FAILURE() << step.error;
+                        return false;
+                    }
+                    if (step.tokens.empty())
+                    {
+                        ADD_FAILURE()
+                            << "MTP benchmark-style decode produced no tokens";
+                        return false;
+                    }
+                    if (step.tokens.size() > static_cast<size_t>(remaining))
+                    {
+                        ADD_FAILURE()
+                            << "MTP benchmark-style decode exceeded remaining token budget: "
+                            << step.tokens.size() << " > " << remaining;
+                        return false;
+                    }
+                    if (out_tokens)
+                    {
+                        out_tokens->insert(
+                            out_tokens->end(),
+                            step.tokens.begin(),
+                            step.tokens.end());
+                    }
+                    produced += static_cast<int>(step.tokens.size());
+                    if (!runner->maybeApplyMoERebalance())
+                    {
+                        ADD_FAILURE() << runner->lastError();
+                        return false;
+                    }
+                    if (step.is_complete)
+                    {
+                        return true;
+                    }
+                }
+                return true;
+            };
+
+            runner->setSuppressTimeline(true);
+            runner->clearCache();
+            if (!prefill_once() || !decode_loop(nullptr))
+            {
+                runner->shutdown();
+                return tokens;
+            }
+
+            runner->setSuppressTimeline(false);
+            runner->clearCache();
+            if (prefill_once())
+            {
+                (void)decode_loop(&tokens);
+            }
+            runner->setSkipLogitsGatherDecode(false);
+            runner->setSkipLogitsGatherPrefill(false);
+            runner->shutdown();
+            return tokens;
+        };
+
+        ASSERT_GE(expected_tokens.size(), static_cast<size_t>(decode_token_budget));
+        std::vector<int32_t> reference_tokens(
+            expected_tokens.begin(),
+            expected_tokens.begin() + decode_token_budget);
+
+        const auto mtp_tokens = run_mtp_decode();
+        ASSERT_EQ(mtp_tokens.size(), reference_tokens.size())
+            << "reference tokens: " << joinTokensMoEDiagnostic(reference_tokens)
+            << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
+        EXPECT_EQ(mtp_tokens, reference_tokens)
+            << "benchmark-style skip-gather decode diverged"
+            << "\nreference tokens: " << joinTokensMoEDiagnostic(reference_tokens)
+            << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
     }
 
     inline void runMoEIncrementalDecodeMatchesFullContext(

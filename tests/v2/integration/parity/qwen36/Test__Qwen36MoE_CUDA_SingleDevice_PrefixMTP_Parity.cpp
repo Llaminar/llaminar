@@ -90,7 +90,7 @@ namespace
         test_case.default_metadata_path =
             "pytorch_qwen36_moe_cuda_mtp_diagnostic_snapshots/metadata.txt";
         test_case.decode_steps = 4;
-        test_case.max_seq_len = 1024;
+        test_case.max_seq_len = 608;
         return test_case;
     }
 } // namespace
@@ -128,6 +128,13 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, PrefixCacheMTPRestore)
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptSidecarStageBreakdown)
 {
     runMoEMTPSidecarStageBreakdownDiagnostic(
+        cudaSingleDeviceBenchmarkPromptCase(),
+        4);
+}
+
+TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleSkipGatherGreedyMatchesReference)
+{
+    runMoEMTPBenchmarkStyleSkipGatherParity(
         cudaSingleDeviceBenchmarkPromptCase(),
         4);
 }
