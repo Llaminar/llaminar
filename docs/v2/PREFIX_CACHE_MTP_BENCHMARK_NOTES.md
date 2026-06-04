@@ -58,6 +58,8 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
   eligibility, so snapshot/parity builds also run the production fused grouped
   path; kernel and Qwen3.6 MoE parity regressions assert fused M=2/TileN64 use,
   split equivalence, and capture.
+- CUDA fused verifier grouped prefill is now guarded for repeated experts across
+  rows with unused fixed-grid slots, while preserving unique top-k routes per row.
 - CUDA verifier M=2 grouped MoE prefill uses `TileN=64`; profiled verifier forward
   improved from ~19.49ms to ~19.10ms/step, still short of net-positive MTP.
 - CUDA MoE MTP depth-3 parity now uses the stable benchmark-prompt lane, and shared

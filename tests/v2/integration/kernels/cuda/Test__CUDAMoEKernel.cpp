@@ -1535,7 +1535,11 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         {
             for (int k = 0; k < top_k; ++k)
             {
-                const int expert = (row * top_k + k) % num_experts;
+                // Keep each token's top-k expert ids unique, as the production
+                // router does, while repeating experts across verifier rows.
+                // That creates unused active-expert grid slots without relying
+                // on impossible same-token duplicate top-k semantics.
+                const int expert = (k + ((row & 1) ? 4 : 0)) % num_experts;
                 values[static_cast<size_t>(row) * top_k + k] = static_cast<float>(expert);
             }
         }
@@ -1593,6 +1597,21 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         const auto hidden_values = make_hidden_values(seq_len);
         const auto routing_indices_values = make_routing_indices(seq_len);
         const auto routing_weights_values = make_routing_weights(seq_len);
+        auto unique_routes = routing_indices_values;
+        std::sort(unique_routes.begin(), unique_routes.end());
+        unique_routes.erase(std::unique(unique_routes.begin(), unique_routes.end()), unique_routes.end());
+        ASSERT_LT(unique_routes.size(), routing_indices_values.size())
+            << "This regression must exercise repeated experts across rows and unused verifier grid slots";
+        for (int row = 0; row < seq_len; ++row)
+        {
+            std::vector<float> row_routes(
+                routing_indices_values.begin() + static_cast<ptrdiff_t>(row) * top_k,
+                routing_indices_values.begin() + static_cast<ptrdiff_t>(row + 1) * top_k);
+            std::sort(row_routes.begin(), row_routes.end());
+            row_routes.erase(std::unique(row_routes.begin(), row_routes.end()), row_routes.end());
+            ASSERT_EQ(row_routes.size(), static_cast<size_t>(top_k))
+                << "Production top-k routes should be unique within a token row";
+        }
 
         auto hidden = makeTensor({static_cast<size_t>(seq_len), d_model}, hidden_values);
         auto routing_indices = makeTensor({static_cast<size_t>(seq_len), top_k}, routing_indices_values);
