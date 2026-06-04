@@ -279,7 +279,8 @@ namespace
         int seq_len,
         int top_k,
         int num_experts,
-        int expected_tile_m)
+        int expected_tile_m,
+        const char *expected_gateup_route = nullptr)
     {
         const auto records =
             llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
@@ -304,7 +305,9 @@ namespace
                        tag_equals("active_expert_slots", expected_total_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
                        tag_equals("tile_m", expected_tile) &&
-                       tag_equals("tile_n", expected_tile_n);
+                       tag_equals("tile_n", expected_tile_n) &&
+                       (!expected_gateup_route ||
+                        tag_equals("gateup_route", std::string(expected_gateup_route)));
             });
         ASSERT_NE(match, records.end()) << "missing grouped prefill SwiGLU path counter path="
                                         << swiglu_path << " seq_len=" << seq_len
@@ -1718,7 +1721,9 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
             ASSERT_TRUE(std::isfinite(captured_output[i])) << "captured output element " << i;
 
         expect_prefill_record(seq_len, seq_len == 2 ? 2 : 4);
-        expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, seq_len == 2 ? 2 : 4);
+        expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
+                                      seq_len == 2 ? 2 : 4,
+                                      "kpart_swiglu");
     }
 
     const auto grouping_records =

@@ -2081,12 +2081,13 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "swiglu_path", "fused") &&
                        tag_equals(record, "tile_m", "2") &&
                        tag_equals(record, "tile_n", "64") &&
-                       tag_equals(record, "active_expert_slots", "16");
+                       tag_equals(record, "active_expert_slots", "16") &&
+                       tag_equals(record, "gateup_route", "kpart_swiglu");
             });
 
         ASSERT_NE(match, records.end())
             << "CUDA Qwen3.6 MoE MTP verifier path did not exercise the fused "
-            << "grouped prefill SwiGLU kernel with the verifier-sized tile. "
+            << "split-K grouped prefill SwiGLU kernel with the verifier-sized tile. "
             << "This is a production-path regression: keep the fused path "
             << "correct instead of routing around it.\n"
             << PerfStatsCollector::summaryString(

@@ -395,6 +395,8 @@ extern "C"
         int8_t *d_scratch_swiglu_int8,
         float *d_scratch_swiglu_scales,
         float *d_scratch_down_out,
+        float *d_gate_partials,
+        float *d_up_partials,
         float *d_output,
         int num_experts,
         int d_model,
@@ -404,6 +406,7 @@ extern "C"
         int active_expert_slots,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
+        int gateup_k_partitions,
         int device_idx,
         void *stream);
 }
@@ -2096,6 +2099,23 @@ namespace llaminar2
             !ensureTensorOnDevice(hidden, device, stream, "hidden") ||
             !ensureOutputOnDevice(output, device, stream, "output"))
             return false;
+        const int selected_tile_m = debugEnv().gemm.cuda_moe_prefill_tile_m == 0
+                                        ? (seq_len <= 2 ? 2 : (seq_len <= 4 ? 4 : 16))
+                                        : debugEnv().gemm.cuda_moe_prefill_tile_m;
+        const int selected_tile_n = selected_tile_m <= 2 ? 64 : 128;
+        const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
+        const bool use_gateup_kpart_swiglu =
+            debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
+            debugEnv().gemm.cuda_moe_prefill_fuse_swiglu &&
+            active_expert_slots > 0 &&
+            selected_tile_m <= 4 &&
+            seq_len <= 4;
+        if (use_gateup_kpart_swiglu &&
+            !ensureGroupedGateUpKPartScratchCapacity(total_slots, gateup_k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] verifier small-M split-K gate/up scratch unavailable");
+            return false;
+        }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
@@ -2132,6 +2152,8 @@ namespace llaminar2
             d_prefill_swiglu_int8_,
             d_prefill_swiglu_scales_,
             d_prefill_gate_,
+            use_gateup_kpart_swiglu ? d_grouped_gateup_gate_partials_ : nullptr,
+            use_gateup_kpart_swiglu ? d_grouped_gateup_up_partials_ : nullptr,
             d_output,
             num_experts,
             d_model,
@@ -2141,6 +2163,7 @@ namespace llaminar2
             active_expert_slots,
             gateup_table.codebook_id,
             down_table.codebook_id,
+            gateup_k_partitions,
             device_ordinal_,
             stream);
         if (!ok)
@@ -2152,10 +2175,6 @@ namespace llaminar2
         markDeviceWritten(output, device, stream);
         if (PerfStatsCollector::isEnabled())
         {
-            const int selected_tile_m = debugEnv().gemm.cuda_moe_prefill_tile_m == 0
-                                            ? (seq_len <= 2 ? 2 : (seq_len <= 4 ? 4 : 16))
-                                            : debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const int selected_tile_n = selected_tile_m <= 2 ? 64 : 128;
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cuda_moe_grouped_prefill_swiglu_path_calls",
@@ -2168,14 +2187,11 @@ namespace llaminar2
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
                     {"tile_m", std::to_string(selected_tile_m)},
-                    {"tile_n", std::to_string(selected_tile_n)}});
+                    {"tile_n", std::to_string(selected_tile_n)},
+                    {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"}});
         }
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
-            const int selected_tile_m = debugEnv().gemm.cuda_moe_prefill_tile_m == 0
-                                            ? (seq_len <= 2 ? 2 : (seq_len <= 4 ? 4 : 16))
-                                            : debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const int selected_tile_n = selected_tile_m <= 2 ? 64 : 128;
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cuda_moe_grouped_prefill_active_expert_grid_calls",
@@ -2188,7 +2204,8 @@ namespace llaminar2
                     {"num_experts", std::to_string(num_experts)},
                     {"tile_m", std::to_string(selected_tile_m)},
                     {"tile_n", std::to_string(selected_tile_n)},
-                    {"swiglu_path", debugEnv().gemm.cuda_moe_prefill_fuse_swiglu ? "fused" : "split"}});
+                    {"swiglu_path", debugEnv().gemm.cuda_moe_prefill_fuse_swiglu ? "fused" : "split"},
+                    {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"}});
         }
         return true;
     }
