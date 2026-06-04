@@ -275,6 +275,7 @@ extern "C"
         const int *routing_indices, const float *routing_weights,
         int *write_heads, const int *expert_offsets,
         int *grouped_token_indices, int *original_to_grouped,
+        int *original_expert_ids,
         float *grouped_weights,
         int total_slots, int top_k, int num_experts,
         int device_idx, void *stream);
@@ -283,6 +284,7 @@ extern "C"
         const int *routing_indices, const float *routing_weights,
         const int *expert_offsets, const int *expert_counts,
         int *grouped_token_indices, int *original_to_grouped,
+        int *original_expert_ids,
         float *grouped_weights,
         int total_slots, int top_k, int num_experts,
         int device_idx, void *stream);
@@ -291,6 +293,7 @@ extern "C"
         const float *routing_indices, const float *routing_weights,
         int *expert_counts, int *expert_offsets,
         int *grouped_token_indices, int *original_to_grouped,
+        int *original_expert_ids,
         float *grouped_weights,
         int *active_expert_ids,
         int total_slots, int num_experts, int top_k,
@@ -302,6 +305,7 @@ extern "C"
         int *expert_offsets,
         int *grouped_token_indices,
         int *original_to_grouped,
+        int *original_expert_ids,
         float *grouped_weights,
         int *active_expert_ids,
         int seq_len,
@@ -401,6 +405,7 @@ extern "C"
         const int *d_group_offsets,
         const int *d_group_token_indices,
         const int *d_group_original_to_grouped,
+        const int *d_group_original_expert_ids,
         const float *d_group_weights,
         const int *d_active_expert_ids,
         int8_t *d_scratch_A_int8,
@@ -474,6 +479,7 @@ namespace llaminar2
         release(d_group_counts_);
         release(d_group_token_indices_);
         release(d_group_original_to_grouped_);
+        release(d_group_original_expert_ids_);
         release(d_group_write_heads_);
         release(d_group_weights_);
         release(d_group_active_expert_ids_);
@@ -643,6 +649,8 @@ namespace llaminar2
                 cudaFree(d_group_token_indices_);
             if (d_group_original_to_grouped_)
                 cudaFree(d_group_original_to_grouped_);
+            if (d_group_original_expert_ids_)
+                cudaFree(d_group_original_expert_ids_);
             if (d_group_weights_)
                 cudaFree(d_group_weights_);
             if (d_group_active_expert_ids_)
@@ -650,6 +658,7 @@ namespace llaminar2
             d_group_int_indices_ = nullptr;
             d_group_token_indices_ = nullptr;
             d_group_original_to_grouped_ = nullptr;
+            d_group_original_expert_ids_ = nullptr;
             d_group_weights_ = nullptr;
             d_group_active_expert_ids_ = nullptr;
 
@@ -660,6 +669,9 @@ namespace llaminar2
             if (err != cudaSuccess)
                 return false;
             err = cudaMalloc(reinterpret_cast<void **>(&d_group_original_to_grouped_), static_cast<size_t>(total_slots) * sizeof(int));
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(reinterpret_cast<void **>(&d_group_original_expert_ids_), static_cast<size_t>(total_slots) * sizeof(int));
             if (err != cudaSuccess)
                 return false;
             err = cudaMalloc(reinterpret_cast<void **>(&d_group_weights_), static_cast<size_t>(total_slots) * sizeof(float));
@@ -1784,6 +1796,7 @@ namespace llaminar2
                                                d_expert_counts,
                                                d_grouped_token_indices,
                                                d_group_original_to_grouped_,
+                                               d_group_original_expert_ids_,
                                                d_grouped_weights);
     }
 
@@ -1793,6 +1806,7 @@ namespace llaminar2
                                                         int *d_expert_offsets, int *d_expert_counts,
                                                         int *d_grouped_token_indices,
                                                         int *d_original_to_grouped,
+                                                        int *d_original_expert_ids,
                                                         float *d_grouped_weights)
     {
         const int total_slots = seq_len * top_k;
@@ -1809,6 +1823,10 @@ namespace llaminar2
                               static_cast<cudaStream_t>(stream));
         if (err != cudaSuccess)
             return false;
+        err = cudaMemsetAsync(d_original_expert_ids, 0xff, static_cast<size_t>(total_slots) * sizeof(int),
+                              static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+            return false;
         return cudaMoE_count_per_expert(d_routing_indices, d_expert_counts, total_slots,
                                         num_experts, device_ordinal_, stream) &&
                cudaMoE_exclusive_scan(d_expert_counts, d_expert_offsets,
@@ -1817,6 +1835,7 @@ namespace llaminar2
                                                     d_expert_offsets, d_expert_counts,
                                                     d_grouped_token_indices,
                                                     d_original_to_grouped,
+                                                    d_original_expert_ids,
                                                     d_grouped_weights,
                                                     total_slots, top_k, num_experts,
                                                     device_ordinal_, stream);
@@ -1848,6 +1867,7 @@ namespace llaminar2
                                              d_group_offsets_, d_group_counts_,
                                              d_group_token_indices_,
                                              d_group_original_to_grouped_,
+                                             d_group_original_expert_ids_,
                                              d_group_weights_))
             return false;
 
@@ -2087,6 +2107,7 @@ namespace llaminar2
                     d_group_offsets_,
                     d_group_token_indices_,
                     d_group_original_to_grouped_,
+                    d_group_original_expert_ids_,
                     d_group_weights_,
                     d_group_active_expert_ids_,
                     total_slots,
@@ -2127,6 +2148,7 @@ namespace llaminar2
                                              d_group_offsets_, d_group_counts_,
                                              d_group_token_indices_,
                                              d_group_original_to_grouped_,
+                                             d_group_original_expert_ids_,
                                              d_group_weights_))
             return false;
 
@@ -2151,6 +2173,7 @@ namespace llaminar2
                 d_group_offsets_,
                 d_group_token_indices_,
                 d_group_original_to_grouped_,
+                d_group_original_expert_ids_,
                 d_group_weights_,
                 d_group_active_expert_ids_,
                 seq_len,
@@ -2242,6 +2265,10 @@ namespace llaminar2
             active_expert_slots > 0 &&
             selected_tile_m <= 4 &&
             seq_len <= 4;
+        const bool use_down_token_direct_prefill =
+            use_down_kpart_prefill &&
+            seq_len <= 4 &&
+            top_k <= 16;
         if (use_gateup_kpart_swiglu &&
             !ensureGroupedGateUpKPartScratchCapacity(total_slots, gateup_k_partitions, intermediate))
         {
@@ -2260,17 +2287,6 @@ namespace llaminar2
         if (!d_hidden || !d_output)
             return false;
 
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        cudaError_t err = cudaMemsetAsync(d_output, 0,
-                                          static_cast<size_t>(seq_len) * d_model * sizeof(float),
-                                          cuda_stream);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] output memset failed: "
-                      << cudaGetErrorString(err));
-            return false;
-        }
-
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,
             gateup_table.device_gate_descs,
@@ -2280,6 +2296,7 @@ namespace llaminar2
             d_group_offsets_,
             d_group_token_indices_,
             d_group_original_to_grouped_,
+            d_group_original_expert_ids_,
             d_group_weights_,
             d_group_active_expert_ids_,
             d_prefill_A_int8_,
@@ -2333,7 +2350,8 @@ namespace llaminar2
                     {"tile_m", std::to_string(selected_tile_m)},
                     {"tile_n", std::to_string(selected_tile_n)},
                     {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"},
-                    {"down_route", use_down_kpart_prefill ? "kpart_prefill" : "serial"}});
+                    {"down_route", use_down_kpart_prefill ? "kpart_prefill" : "serial"},
+                    {"down_accumulation", use_down_token_direct_prefill ? "token_direct" : "slot_scatter"}});
         }
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {

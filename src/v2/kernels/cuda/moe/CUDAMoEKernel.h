@@ -265,6 +265,7 @@ namespace llaminar2
             int *d_expert_counts,
             int *d_grouped_token_indices,
             int *d_original_to_grouped,
+            int *d_original_expert_ids,
             float *d_grouped_weights);
         bool ensureRuntimeGateUpPointerArrays(
             int table_id,
@@ -343,6 +344,7 @@ namespace llaminar2
         int *d_group_counts_ = nullptr;
         int *d_group_token_indices_ = nullptr;
         int *d_group_original_to_grouped_ = nullptr;
+        int *d_group_original_expert_ids_ = nullptr;
         int *d_group_write_heads_ = nullptr;
         float *d_group_weights_ = nullptr;
         int *d_group_active_expert_ids_ = nullptr;

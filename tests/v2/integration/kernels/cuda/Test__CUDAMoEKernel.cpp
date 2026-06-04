@@ -34,6 +34,7 @@ extern "C" bool cudaMoE_group_tokens_small_float(
     int *expert_offsets,
     int *grouped_token_indices,
     int *original_to_grouped,
+    int *original_expert_ids,
     float *grouped_weights,
     int *active_expert_ids,
     int total_slots,
@@ -283,6 +284,7 @@ namespace
         int expected_tile_m,
         const char *expected_gateup_route = nullptr,
         const char *expected_down_route = nullptr,
+        const char *expected_down_accumulation = nullptr,
         int expected_active_expert_slots = -1)
     {
         const auto records =
@@ -315,7 +317,9 @@ namespace
                        (!expected_gateup_route ||
                         tag_equals("gateup_route", std::string(expected_gateup_route))) &&
                        (!expected_down_route ||
-                        tag_equals("down_route", std::string(expected_down_route)));
+                        tag_equals("down_route", std::string(expected_down_route))) &&
+                       (!expected_down_accumulation ||
+                        tag_equals("down_accumulation", std::string(expected_down_accumulation)));
             });
         ASSERT_NE(match, records.end()) << "missing grouped prefill SwiGLU path counter path="
                                         << swiglu_path << " seq_len=" << seq_len
@@ -1202,6 +1206,7 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
     int *d_offsets = nullptr;
     int *d_grouped_tokens = nullptr;
     int *d_original_to_grouped = nullptr;
+    int *d_original_expert_ids = nullptr;
     float *d_grouped_weights = nullptr;
     int *d_active = nullptr;
     ASSERT_EQ(cudaMalloc(&d_indices, routing_indices.size() * sizeof(float)), cudaSuccess);
@@ -1210,6 +1215,7 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
     ASSERT_EQ(cudaMalloc(&d_offsets, num_experts * sizeof(int)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_grouped_tokens, total_slots * sizeof(int)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_original_to_grouped, total_slots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_original_expert_ids, total_slots * sizeof(int)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_grouped_weights, total_slots * sizeof(float)), cudaSuccess);
     ASSERT_EQ(cudaMalloc(&d_active, max_active_experts * sizeof(int)), cudaSuccess);
 
@@ -1223,7 +1229,7 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
               cudaSuccess);
 
     ASSERT_TRUE(cudaMoE_group_tokens_small_float(
-        d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens, d_original_to_grouped, d_grouped_weights,
+        d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens, d_original_to_grouped, d_original_expert_ids, d_grouped_weights,
         d_active, total_slots, num_experts, top_k, max_active_experts, 0, stream_));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
@@ -1231,12 +1237,14 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
     std::vector<int> offsets(num_experts);
     std::vector<int> grouped_tokens(total_slots);
     std::vector<int> original_to_grouped(total_slots);
+    std::vector<int> original_expert_ids(total_slots);
     std::vector<float> grouped_weights(total_slots);
     std::vector<int> active(max_active_experts);
     ASSERT_EQ(cudaMemcpy(counts.data(), d_counts, counts.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(offsets.data(), d_offsets, offsets.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(grouped_tokens.data(), d_grouped_tokens, grouped_tokens.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(original_to_grouped.data(), d_original_to_grouped, original_to_grouped.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(original_expert_ids.data(), d_original_expert_ids, original_expert_ids.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(grouped_weights.data(), d_grouped_weights, grouped_weights.size() * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
     ASSERT_EQ(cudaMemcpy(active.data(), d_active, active.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
 
@@ -1277,13 +1285,14 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
             ASSERT_GE(dest, 0);
             ASSERT_LT(dest, total_slots);
             EXPECT_EQ(original_to_grouped[slot], dest);
+            EXPECT_EQ(original_expert_ids[slot], expert);
             EXPECT_EQ(grouped_tokens[dest], slot / top_k);
             EXPECT_FLOAT_EQ(grouped_weights[dest], routing_weights[static_cast<size_t>(slot)]);
         }
     }
 
     EXPECT_FALSE(cudaMoE_group_tokens_small_float(
-        d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens, d_original_to_grouped, d_grouped_weights,
+        d_indices, d_weights, d_counts, d_offsets, d_grouped_tokens, d_original_to_grouped, d_original_expert_ids, d_grouped_weights,
         d_active, total_slots, num_experts, top_k, max_active_experts, 0, nullptr));
 
     cudaFree(d_indices);
@@ -1292,6 +1301,7 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
     cudaFree(d_offsets);
     cudaFree(d_grouped_tokens);
     cudaFree(d_original_to_grouped);
+    cudaFree(d_original_expert_ids);
     cudaFree(d_grouped_weights);
     cudaFree(d_active);
 #endif
@@ -1921,7 +1931,8 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
                                       seq_len == 2 ? 2 : 4,
                                       "kpart_swiglu",
-                                      "kpart_prefill");
+                                      "kpart_prefill",
+                                      "token_direct");
     }
 
     const auto grouping_records =
@@ -2118,6 +2129,7 @@ TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierSmallMPrefillM234MatchesDecodeRo
                                       seq_len == 2 ? 2 : 4,
                                       "kpart_swiglu",
                                       "kpart_prefill",
+                                      "token_direct",
                                       /*expected_active_expert_slots=*/1);
     }
 

@@ -2125,7 +2125,8 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "tile_n", "64") &&
                        tag_equals(record, "active_expert_slots", "16") &&
                        tag_equals(record, "gateup_route", "kpart_swiglu") &&
-                       tag_equals(record, "down_route", "kpart_prefill");
+                       tag_equals(record, "down_route", "kpart_prefill") &&
+                       tag_equals(record, "down_accumulation", "token_direct");
             });
 
         ASSERT_NE(match, records.end())
@@ -2164,7 +2165,8 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "active_expert_slots", "1") &&
                        tag_equals(record, "num_experts", "1") &&
                        tag_equals(record, "gateup_route", "kpart_swiglu") &&
-                       tag_equals(record, "down_route", "kpart_prefill");
+                       tag_equals(record, "down_route", "kpart_prefill") &&
+                       tag_equals(record, "down_accumulation", "token_direct");
             });
 
         ASSERT_NE(shared_prefill, records.end())
@@ -2220,7 +2222,8 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "tile_m", "2") &&
                        tag_equals(record, "tile_n", "64") &&
                        tag_equals(record, "gateup_route", "kpart_swiglu") &&
-                       tag_equals(record, "down_route", "kpart_prefill");
+                       tag_equals(record, "down_route", "kpart_prefill") &&
+                       tag_equals(record, "down_accumulation", "token_direct");
             });
 
         ASSERT_NE(routed_replay, records.end())
@@ -2246,7 +2249,8 @@ namespace llaminar2::test::parity::qwen36
                        tag_equals(record, "tile_m", "2") &&
                        tag_equals(record, "tile_n", "64") &&
                        tag_equals(record, "gateup_route", "kpart_swiglu") &&
-                       tag_equals(record, "down_route", "kpart_prefill");
+                       tag_equals(record, "down_route", "kpart_prefill") &&
+                       tag_equals(record, "down_accumulation", "token_direct");
             });
 
         ASSERT_NE(shared_replay, records.end())
