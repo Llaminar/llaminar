@@ -50,7 +50,7 @@ Latest artifact: `benchmark_results/rocm_moe_mtp/20260604T030907Z-9da36b05-group
 Stats recorded 1680 calls each for `kernel.rocm_moe_small_prefill_grouping_calls`
 and `kernel.rocm_moe_small_m_fused_router_calls`.
 
-Router A/B results to avoid repeating:
+MoE A/B results to avoid repeating:
 
 | Experiment | Decode | Acceptance | Decision |
 |---|---:|---:|---|
@@ -59,6 +59,7 @@ Router A/B results to avoid repeating:
 | Q8 router | 33.05 tok/s | 75.78% | reject |
 | K-partition router | 30.13 tok/s | 71.88% | reject |
 | hipBLAS strided-batched M=2..4 router | 30.92-32.08 tok/s | 69.53-74.22% | parity green but slower; reverted |
+| token-dedup grouped-prefill quant | 38.81 tok/s | 74.22% | slower than 39.94 ratchet; reverted |
 
 ## Retained Tuning Actions
 
