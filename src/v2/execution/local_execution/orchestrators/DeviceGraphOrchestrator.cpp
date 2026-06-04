@@ -4581,12 +4581,15 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit requires position state");
             return false;
         }
+        const int catchup_token_count = token_count - already_appended_tokens;
         if (main_forward_token_count <= 0 ||
             main_forward_token_count > token_count ||
-            token_count > main_forward_token_count + 1)
+            catchup_token_count > main_forward_token_count)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit received invalid main_forward_token_count="
-                      << main_forward_token_count << " token_count=" << token_count);
+                      << main_forward_token_count << " token_count=" << token_count
+                      << " already_appended_tokens=" << already_appended_tokens
+                      << " catchup_token_count=" << catchup_token_count);
             return false;
         }
 
@@ -4661,7 +4664,6 @@ namespace llaminar2
             perfPhaseName(),
             state_.device_id.toString());
 
-        const int catchup_token_count = token_count - already_appended_tokens;
         if (catchup_token_count > 0)
         {
             if (catchup_token_count > 4)

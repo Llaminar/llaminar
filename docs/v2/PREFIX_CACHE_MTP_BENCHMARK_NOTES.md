@@ -12,7 +12,7 @@ live gaps. Keep this file concise; rejected tuning history belongs in artifacts.
 | Dense long lane, `qbf`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 | 53.30 | 1.31x | Depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 | 9.50 | 1.64x | Short smoke only |
 | MoE default lane, 595p/64d | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 | 42.04 | 2.13x | Fixed d1, ratcheted |
-| MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 102.20 | 87.62 | 0.86x | Fused paths correct, still perf-negative |
+| MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 102.09 | 87.62 | 0.86x | Correct, still perf-negative |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
 llama.cpp CUDA north star, `ggml-org/llama.cpp@6ddc943`,
@@ -39,9 +39,10 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 
 | Case | Decode | Acceptance | Artifact |
 |---|---:|---:|---|
-| baseline after fused scratch fix | 102.20 | n/a | `benchmark_results/cuda_moe_mtp/20260604T134524Z-fused-swiglu-scratch-fixed-baseline-n64` |
-| fixed d1 after fused scratch fix | 87.62 | 84.38% | `benchmark_results/cuda_moe_mtp/20260604T134433Z-fused-swiglu-scratch-fixed-n64` |
-| fixed d1 after verifier shortcut | 83.10 | 75.78% | `benchmark_results/cuda_moe_mtp/20260604T131657Z-release-shortcut-fixed-default-n64` |
+| latest baseline | 102.09 | n/a | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/baseline.json` |
+| best fixed d1 | 87.62 | 84.38% | `benchmark_results/cuda_moe_mtp/20260604T134433Z-fused-swiglu-scratch-fixed-n64` |
+| latest fixed d1 | 84.97 | 75.78% | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/mtp_d1.json` |
+| latest fixed d3 | 68.57 | 66.86% | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/mtp_d3_after_suffix_commit_fix.json` |
 
 ## Retained Actions
 
@@ -53,6 +54,8 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
   and the MoE GDN qkv+z path uses fused native projections.
 - CUDA grouped MoE prefill keeps fused SwiGLU+quant but uses independent SwiGLU scratch,
   so the fused epilogue no longer overwrites gate/up inputs before reading them.
+- Depth>1 MTP rollback now commits suffix shifted-cache rows after an already-committed
+  verifier prefix; regressions cover tiny graph construction and CUDA MoE depth-3 parity.
 - CUDA and ROCm GPU greedy argmax tie-break to the lowest token id, matching CPU greedy.
 - CUDA Qwen3.6 MoE production sampling is guarded by same-step gathered-logits argmax
   parity instead of an unstable independent-run near-tie token oracle.

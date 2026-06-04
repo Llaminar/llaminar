@@ -263,10 +263,12 @@ namespace
             {
                 last_commit_mtp_tokens_.assign(tokens, tokens + token_count);
             }
+            const int catchup_token_count = token_count - already_appended_tokens;
             return token_count <= already_appended_tokens ||
                    (tokens != nullptr &&
                     main_forward_token_count > 0 &&
-                    main_forward_token_count <= token_count);
+                    main_forward_token_count <= token_count &&
+                    catchup_token_count <= main_forward_token_count);
         }
 
         bool hasMTPLogitsLocal() const override

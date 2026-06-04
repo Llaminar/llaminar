@@ -521,7 +521,8 @@ namespace llaminar2::test::parity::qwen36
         const std::string &model_path,
         bool enable_prefix_cache,
         int block_size,
-        bool enable_mtp = false)
+        bool enable_mtp = false,
+        int mtp_draft_tokens = 1)
     {
         OrchestrationConfig config = OrchestrationConfig::defaults();
         config.model_path = model_path;
@@ -537,7 +538,7 @@ namespace llaminar2::test::parity::qwen36
         config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
-        config.mtp.draft_tokens = 1;
+        config.mtp.draft_tokens = std::max(1, mtp_draft_tokens);
         config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
 
         switch (test_case.topology)
@@ -759,7 +760,8 @@ namespace llaminar2::test::parity::qwen36
 
     inline void runMoEMTPParity(
         const MoEPrefixRestoreParityCase &test_case,
-        bool enable_prefix_cache)
+        bool enable_prefix_cache,
+        int mtp_draft_tokens = 1)
     {
         ScopedMoEParityDeterministicMode deterministic_mode(
             shouldUseMoEParityDeterministicMode(test_case));
@@ -809,7 +811,8 @@ namespace llaminar2::test::parity::qwen36
                 model_path,
                 enable_prefix_cache,
                 block_size,
-                true));
+                true,
+                mtp_draft_tokens));
         ASSERT_NE(mtp, nullptr);
         phase_start = parityPhaseStart();
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
@@ -1920,7 +1923,8 @@ namespace llaminar2::test::parity::qwen36
 
     inline void runMoEMTPBenchmarkStyleSkipGatherParity(
         const MoEPrefixRestoreParityCase &test_case,
-        int decode_token_budget)
+        int decode_token_budget,
+        int mtp_draft_tokens = 1)
     {
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
@@ -1940,7 +1944,13 @@ namespace llaminar2::test::parity::qwen36
         {
             std::vector<int32_t> tokens;
             auto runner = factory->createFromOrchestrationConfig(
-                makeMoEPrefixRestoreConfig(test_case, model_path, false, 2, true));
+                makeMoEPrefixRestoreConfig(
+                    test_case,
+                    model_path,
+                    false,
+                    2,
+                    true,
+                    mtp_draft_tokens));
             EXPECT_NE(runner, nullptr);
             if (!runner)
             {

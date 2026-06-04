@@ -1222,22 +1222,22 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     ASSERT_NE(graph.getNode("mtp0_norm_embedding"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_concat"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_kv_append"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_attention"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_kv_append"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_attention"), nullptr);
     ASSERT_NE(graph.getNode("layer64_ffn_residual"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_final_norm"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_lm_head"), nullptr);
 
     EXPECT_EQ(graph.getNode("mtp0_concat")->stage->type(), ComputeStageType::MTP_CONCAT);
     EXPECT_EQ(graph.getNode("mtp0_fc")->stage->type(), ComputeStageType::GEMM);
-    EXPECT_EQ(graph.getNode("layer0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
+    EXPECT_EQ(graph.getNode("MTP0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
     EXPECT_EQ(graph.getNode("mtp0_lm_head")->stage->type(), ComputeStageType::LM_HEAD);
 
     const auto norm_hidden_contract = graph.getNode("mtp0_norm_hidden")->stage->bufferContract();
     EXPECT_TRUE(contractReads(norm_hidden_contract, BufferId::PREFIX_TERMINAL_HIDDEN));
     EXPECT_TRUE(contractWrites(norm_hidden_contract, BufferId::MTP_NORM_HIDDEN));
 
-    const auto qkv_contract = graph.getNode("layer0_qkv_proj")->stage->bufferContract();
+    const auto qkv_contract = graph.getNode("MTP0_qkv_proj")->stage->bufferContract();
     EXPECT_TRUE(contractReads(qkv_contract, BufferId::MTP_NORM_HIDDEN));
     EXPECT_TRUE(contractWrites(qkv_contract, BufferId::MTP_FA_Q_RAW));
     EXPECT_TRUE(contractWrites(qkv_contract, BufferId::MTP_K_PROJ));
@@ -1245,14 +1245,14 @@ TEST(Test__MTPGraphConstruction, BuildsDenseQwen35SidecarGraph)
     EXPECT_FALSE(contractWrites(qkv_contract, BufferId::K_PROJ));
     EXPECT_FALSE(contractWrites(qkv_contract, BufferId::V_PROJ));
 
-    const auto q_gate_contract = graph.getNode("layer0_q_gate_split")->stage->bufferContract();
+    const auto q_gate_contract = graph.getNode("MTP0_q_gate_split")->stage->bufferContract();
     EXPECT_TRUE(contractReads(q_gate_contract, BufferId::MTP_FA_Q_RAW));
     EXPECT_TRUE(contractWrites(q_gate_contract, BufferId::MTP_Q_PROJ));
     EXPECT_TRUE(contractWrites(q_gate_contract, BufferId::MTP_FA_GATE));
     EXPECT_FALSE(contractWrites(q_gate_contract, BufferId::Q_PROJ));
     EXPECT_FALSE(contractWrites(q_gate_contract, BufferId::FA_GATE));
 
-    const auto attention_contract = graph.getNode("layer0_attention")->stage->bufferContract();
+    const auto attention_contract = graph.getNode("MTP0_attention")->stage->bufferContract();
     EXPECT_TRUE(contractReads(attention_contract, BufferId::MTP_Q_PROJ));
     EXPECT_TRUE(contractWrites(attention_contract, BufferId::MTP_ATTN_OUTPUT));
     EXPECT_FALSE(contractWrites(attention_contract, BufferId::ATTN_OUTPUT));
@@ -1291,30 +1291,30 @@ TEST(Test__MTPGraphConstruction, BuildsKVOnlyQwen35SidecarGraphForShiftedCacheCa
     ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
 
     ASSERT_GT(graph.size(), 0u);
-    EXPECT_EQ(graph.terminalNode(), "layer0_kv_append");
+    EXPECT_EQ(graph.terminalNode(), "MTP0_kv_append");
 
     ASSERT_NE(graph.getNode("mtp0_embedding"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_norm_hidden"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_norm_embedding"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_concat"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_fc"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_qkv_proj"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_q_gate_split"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_rope"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_kv_append"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_qkv_proj"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_q_gate_split"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_rope"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_kv_append"), nullptr);
 
-    EXPECT_EQ(graph.getNode("layer0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
-    EXPECT_EQ(graph.getNode("layer0_qkv_proj")->stage->type(), ComputeStageType::GEMM_FUSED_QKV);
+    EXPECT_EQ(graph.getNode("MTP0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
+    EXPECT_EQ(graph.getNode("MTP0_qkv_proj")->stage->type(), ComputeStageType::GEMM_FUSED_QKV);
 
-    EXPECT_EQ(graph.getNode("layer0_attention"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_attention"), nullptr);
     EXPECT_EQ(graph.getNode("layer64_ffn_residual"), nullptr);
     EXPECT_EQ(graph.getNode("mtp0_final_norm"), nullptr);
     EXPECT_EQ(graph.getNode("mtp0_lm_head"), nullptr);
 
     EXPECT_TRUE(hasDependency(graph, "mtp0_fc", "mtp0_concat"));
-    EXPECT_TRUE(hasDependency(graph, "layer0_attn_norm", "mtp0_fc"));
-    EXPECT_TRUE(hasDependency(graph, "layer0_qkv_proj", "layer0_attn_norm"));
-    EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_rope"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_attn_norm", "mtp0_fc"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_qkv_proj", "MTP0_attn_norm"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_kv_append", "MTP0_rope"));
 }
 
 TEST(Test__MTPGraphConstruction, BuildsMultiRowKVOnlyQwen35SidecarGraphForShiftedCacheCatchup)
@@ -1345,16 +1345,16 @@ TEST(Test__MTPGraphConstruction, BuildsMultiRowKVOnlyQwen35SidecarGraphForShifte
     ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
 
     ASSERT_GT(graph.size(), 0u);
-    EXPECT_EQ(graph.terminalNode(), "layer0_kv_append");
+    EXPECT_EQ(graph.terminalNode(), "MTP0_kv_append");
     ASSERT_NE(graph.getNode("mtp0_embedding"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_norm_hidden"), nullptr);
-    ASSERT_NE(graph.getNode("layer0_kv_append"), nullptr);
-    EXPECT_EQ(graph.getNode("layer0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
+    ASSERT_NE(graph.getNode("MTP0_kv_append"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_kv_append")->stage->type(), ComputeStageType::KV_CACHE_APPEND);
 
     const auto norm_hidden_contract = graph.getNode("mtp0_norm_hidden")->stage->bufferContract();
     EXPECT_TRUE(contractReads(norm_hidden_contract, BufferId::HIDDEN_STATE));
     EXPECT_TRUE(contractWrites(norm_hidden_contract, BufferId::MTP_NORM_HIDDEN));
-    EXPECT_EQ(graph.getNode("layer0_attention"), nullptr);
+    EXPECT_EQ(graph.getNode("MTP0_attention"), nullptr);
     EXPECT_EQ(graph.getNode("mtp0_lm_head"), nullptr);
 }
 
@@ -1405,10 +1405,10 @@ TEST(Test__MTPGraphConstruction, DenseSidecarInsertsTPAllreduceForRowParallelWei
     ComputeGraph graph = graph_builder.buildMTPGraph(0, weights, input, output);
 
     ASSERT_GT(graph.size(), 0u);
-    auto *wo_allreduce = graph.getNode("layer0_wo_allreduce");
+    auto *wo_allreduce = graph.getNode("MTP0_wo_allreduce");
     ASSERT_NE(wo_allreduce, nullptr);
     EXPECT_EQ(wo_allreduce->stage->type(), ComputeStageType::ALLREDUCE);
-    EXPECT_TRUE(hasDependency(graph, "layer0_wo_allreduce", "layer0_wo_proj"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_wo_allreduce", "MTP0_wo_proj"));
 
     auto *down_allreduce = graph.getNode("layer64_down_allreduce");
     ASSERT_NE(down_allreduce, nullptr);
@@ -1595,47 +1595,47 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
 
     ASSERT_GT(graph.size(), 0u);
     EXPECT_EQ(graph.terminalNode(), "mtp0_lm_head");
-    ASSERT_NE(graph.getNode("layer64_moe_routing"), nullptr);
-    ASSERT_NE(graph.getNode("layer64_moe_expert_ffn"), nullptr);
-    ASSERT_NE(graph.getNode("layer64_moe_combine"), nullptr);
-    ASSERT_NE(graph.getNode("layer64_ffn_residual"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_moe_routing"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_moe_expert_ffn"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_moe_combine"), nullptr);
+    ASSERT_NE(graph.getNode("MTP0_ffn_residual"), nullptr);
     ASSERT_NE(graph.getNode("mtp0_final_norm"), nullptr);
 
-    EXPECT_EQ(graph.getNode("layer64_moe_routing")->stage->type(), ComputeStageType::MOE_ROUTER);
-    EXPECT_EQ(graph.getNode("layer64_moe_expert_ffn")->stage->type(), ComputeStageType::MOE_EXPERT_FFN);
+    EXPECT_EQ(graph.getNode("MTP0_moe_routing")->stage->type(), ComputeStageType::MOE_ROUTER);
+    EXPECT_EQ(graph.getNode("MTP0_moe_expert_ffn")->stage->type(), ComputeStageType::MOE_EXPERT_FFN);
 
-    const auto ffn_norm_contract = graph.getNode("layer64_ffn_norm")->stage->bufferContract();
+    const auto ffn_norm_contract = graph.getNode("MTP0_ffn_norm")->stage->bufferContract();
     EXPECT_TRUE(contractReads(ffn_norm_contract, BufferId::MTP_ATTN_PROJ));
     EXPECT_TRUE(contractReads(ffn_norm_contract, BufferId::MTP_PROJECTED));
     EXPECT_TRUE(contractWrites(ffn_norm_contract, BufferId::MTP_NORM_HIDDEN));
     EXPECT_FALSE(contractWrites(ffn_norm_contract, BufferId::NORMALIZED));
 
-    const auto routing_contract = graph.getNode("layer64_moe_routing")->stage->bufferContract();
+    const auto routing_contract = graph.getNode("MTP0_moe_routing")->stage->bufferContract();
     EXPECT_TRUE(contractReads(routing_contract, BufferId::MTP_NORM_HIDDEN));
     EXPECT_FALSE(contractReads(routing_contract, BufferId::NORMALIZED));
     EXPECT_TRUE(contractWrites(routing_contract, BufferId::MOE_EXPERT_INDICES));
     EXPECT_TRUE(contractWrites(routing_contract, BufferId::MOE_EXPERT_WEIGHTS));
 
-    const auto expert_contract = graph.getNode("layer64_moe_expert_ffn")->stage->bufferContract();
+    const auto expert_contract = graph.getNode("MTP0_moe_expert_ffn")->stage->bufferContract();
     EXPECT_TRUE(contractReads(expert_contract, BufferId::MTP_NORM_HIDDEN));
     EXPECT_FALSE(contractReads(expert_contract, BufferId::NORMALIZED));
     EXPECT_TRUE(contractWrites(expert_contract, BufferId::MOE_COMBINED_OUTPUT));
 
-    const auto combine_contract = graph.getNode("layer64_moe_combine")->stage->bufferContract();
+    const auto combine_contract = graph.getNode("MTP0_moe_combine")->stage->bufferContract();
     EXPECT_TRUE(contractReads(combine_contract, BufferId::MOE_COMBINED_OUTPUT));
     EXPECT_TRUE(contractWrites(combine_contract, BufferId::MTP_ATTN_PROJ));
     EXPECT_FALSE(contractWrites(combine_contract, BufferId::ATTN_PROJ));
 
-    const auto residual_contract = graph.getNode("layer64_ffn_residual")->stage->bufferContract();
+    const auto residual_contract = graph.getNode("MTP0_ffn_residual")->stage->bufferContract();
     EXPECT_TRUE(contractReads(residual_contract, BufferId::MTP_ATTN_PROJ));
     EXPECT_TRUE(contractReads(residual_contract, BufferId::MTP_PROJECTED));
     EXPECT_TRUE(contractWrites(residual_contract, BufferId::MTP_PROJECTED));
     EXPECT_FALSE(contractWrites(residual_contract, BufferId::HIDDEN_STATE));
 
-    EXPECT_TRUE(hasDependency(graph, "layer64_moe_expert_ffn", "layer64_moe_routing"));
-    EXPECT_TRUE(hasDependency(graph, "layer64_moe_combine", "layer64_moe_expert_ffn"));
-    EXPECT_TRUE(hasDependency(graph, "layer64_ffn_residual", "layer64_moe_combine"));
-    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "layer64_ffn_residual"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_moe_expert_ffn", "MTP0_moe_routing"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_moe_combine", "MTP0_moe_expert_ffn"));
+    EXPECT_TRUE(hasDependency(graph, "MTP0_ffn_residual", "MTP0_moe_combine"));
+    EXPECT_TRUE(hasDependency(graph, "mtp0_final_norm", "MTP0_ffn_residual"));
 }
 
 TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespace)
@@ -2627,6 +2627,105 @@ TEST(Test__MTPGraphConstruction, ChainedSidecarCommitDiscardsSpeculativeShiftedR
     });
     ASSERT_NE(discard_counter, records.end());
     EXPECT_GT(discard_counter->value, 0.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__MTPGraphConstruction, ChainedSidecarSuffixCommitAllowsCommittedVerifierPrefix)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    ScopedDebugEnv env({
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    TinyQwen35MTPForwardFixture fixture;
+    fixture.config.mtp.draft_tokens = 3;
+    fixture.config.max_seq_len = 16;
+
+    auto graph_builder = std::make_shared<Qwen35Graph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto frozen = makeTinyQwen35MTPFrozenWeightSet(fixture);
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+
+    PreparedWeightStore store;
+    prepareFrozenGemmWeightsForCPU(*orchestrator.frozenWeightSet(), store);
+    graph_builder->setPreparedWeightStore(&store);
+
+    const std::vector<int> prefix_tokens = {1, 2, 3, 4};
+    ASSERT_NE(orchestrator.forward(prefix_tokens.data(), static_cast<int>(prefix_tokens.size()), 1), nullptr);
+
+    const int first_token = 5;
+    const int accepted_draft = 6;
+    const int rejected_draft = 7;
+    const int correction_token = 8;
+    const int prefix_position = static_cast<int>(prefix_tokens.size());
+
+    ASSERT_TRUE(orchestrator.forwardMTP(first_token));
+    PrefixStateSnapshot post_first_sidecar = orchestrator.captureLivePrefixState();
+    ASSERT_TRUE(post_first_sidecar.valid);
+
+    ASSERT_TRUE(orchestrator.forwardMTPFromLastDraft(
+        accepted_draft,
+        prefix_position + 1));
+    ASSERT_TRUE(orchestrator.forwardMTPFromLastDraft(
+        rejected_draft,
+        prefix_position + 2));
+
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(true));
+    const std::vector<int> verifier_tokens = {first_token, accepted_draft, rejected_draft, 9};
+    ASSERT_NE(orchestrator.forward(verifier_tokens.data(), static_cast<int>(verifier_tokens.size()), 1), nullptr);
+    ASSERT_TRUE(orchestrator.setComputeAllPositionLogits(false));
+
+    const std::vector<int32_t> accepted_tokens = {
+        first_token,
+        accepted_draft,
+        correction_token};
+    const int accepted_verifier_input_count = 2;
+    ASSERT_TRUE(orchestrator.commitMTPShiftedRowsFromPartialForward(
+        accepted_tokens.data(),
+        accepted_verifier_input_count,
+        /*already_appended_tokens=*/1,
+        /*main_forward_token_count=*/accepted_verifier_input_count,
+        /*allow_speculative_discard=*/true,
+        /*position_offset_override=*/prefix_position));
+
+    ASSERT_NE(orchestrator.forward(&accepted_tokens[2], 1, 1), nullptr);
+
+    ASSERT_TRUE(orchestrator.commitMTPShiftedRowsFromPartialForward(
+        accepted_tokens.data(),
+        static_cast<int>(accepted_tokens.size()),
+        /*already_appended_tokens=*/accepted_verifier_input_count,
+        /*main_forward_token_count=*/1,
+        /*allow_speculative_discard=*/true,
+        /*position_offset_override=*/prefix_position))
+        << "Depth>1 MTP suffix commit must allow accepted_tokens to include "
+           "the already-committed verifier prefix.";
+
+    const auto after_commit = orchestrator.prefixStateProbe();
+    EXPECT_GE(maxCachedTokens(after_commit.mtp_kv_caches),
+              prefix_position + static_cast<int>(accepted_tokens.size()) - 1);
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    double shifted_committed_rows = 0.0;
+    for (const PerfStatRecord &record : records)
+    {
+        if (record.kind == PerfStatRecord::Kind::Counter &&
+            record.domain == "mtp" &&
+            record.name == "shifted_rows_committed")
+        {
+            shifted_committed_rows += record.value;
+        }
+    }
+    EXPECT_GE(shifted_committed_rows, 2.0);
 
     PerfStatsCollector::reset();
 }

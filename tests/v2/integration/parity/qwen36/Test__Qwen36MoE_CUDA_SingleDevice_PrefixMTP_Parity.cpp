@@ -94,6 +94,15 @@ namespace
         return test_case;
     }
 
+    MoEPrefixRestoreParityCase cudaSingleDeviceDepth3Case()
+    {
+        auto test_case = cudaSingleDeviceCase();
+        test_case.name = "Qwen3.6 MoE CUDA SingleDevice depth-3 MTP parity";
+        test_case.decode_steps = 4;
+        test_case.max_seq_len = 128;
+        return test_case;
+    }
+
 } // namespace
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, PrefixRestoreFullHit)
@@ -138,6 +147,11 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleSkipGatherGreedy
     runMoEMTPBenchmarkStyleSkipGatherParity(
         cudaSingleDeviceBenchmarkPromptCase(),
         4);
+}
+
+TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesBaselineTokens)
+{
+    runMoEMTPParity(cudaSingleDeviceDepth3Case(), false, 3);
 }
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleSkipGatherGreedyMatchesGatheredArgmax)
