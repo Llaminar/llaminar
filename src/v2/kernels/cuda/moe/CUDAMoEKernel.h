@@ -154,6 +154,29 @@ namespace llaminar2
             int seq_len, int d_model, int intermediate,
             int num_experts, int top_k) override;
 
+        /// @brief Execute grouped gate/up decode from a persistent descriptor table and static host ids.
+        bool groupedExpertGateUpDecodeFromTable(
+            const TensorBase *input,
+            const int *expert_ids,
+            int descriptor_table_id,
+            int num_active,
+            ITensor *const *gate_outputs,
+            ITensor *const *up_outputs,
+            int d_model,
+            int intermediate) override;
+
+        /// @brief Execute grouped SwiGLU/down decode from a persistent descriptor table and static host ids/weights.
+        bool groupedExpertDownDecodeFromTable(
+            ITensor *const *gate_tensors,
+            ITensor *const *up_tensors,
+            const int *expert_ids,
+            const float *expert_weights,
+            int descriptor_table_id,
+            int num_active,
+            ITensor *output,
+            int d_model,
+            int intermediate) override;
+
         /// @brief Execute graph-capturable grouped gate/up decode from runtime-table top-k ids.
         bool groupedExpertGateUpDecodeFromRuntime(
             DeviceMoELayerRuntime *runtime_layer,
@@ -225,6 +248,11 @@ namespace llaminar2
         bool ensureGroupedGateUpKPartScratchCapacity(int top_k, int k_partitions, int intermediate);
         bool ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model);
         bool ensureGroupedDownDecodeCapacity(int top_k, int intermediate);
+        bool ensureGroupedDecodeMetadata(
+            const int *expert_ids,
+            const float *expert_weights,
+            int num_active,
+            bool include_weights);
         bool ensureRuntimeGateUpPointerArrays(
             int table_id,
             int top_k,
@@ -338,6 +366,12 @@ namespace llaminar2
         float *d_decode_swiglu_scales_ = nullptr;
         int decode_down_topk_cap_ = 0;
         int decode_down_intermediate_cap_ = 0;
+
+        int *d_grouped_decode_expert_ids_ = nullptr;
+        float *d_grouped_decode_weights_ = nullptr;
+        int grouped_decode_metadata_cap_ = 0;
+        std::vector<int> grouped_decode_cached_expert_ids_;
+        std::vector<float> grouped_decode_cached_weights_;
 
         // Split-K partials scratch for the grouped SwiGLU down decode projection.
         // Layout: [k_partitions][d_model] (the output dimension is d_model).

@@ -60,12 +60,11 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
 |---|---:|---:|---|
 | baseline | 101.37 tok/s | n/a | current no-MTP ratchet |
 | fixed d1, CUDA GDN qkv+z fused | 64.72 tok/s | 42.97% | `kernel.gdn_projection_route`: qkv+z native subgroup at M=1/2 |
-| short fixed d1, CUDA GDN restore | 55.60 tok/s | 25.00% | n=8 smoke; verifier-row restores active, no restore-failure or replay-forward counters |
+| opt-in shared grouped FFN | 64.26 tok/s | 40.62% | n64 no ratchet; profiled n16 improved 48.17 -> 54.54 tok/s |
 | fixed d1, after small-M attention | 41.92 tok/s | 32.03% | attention no longer uses FA2 prefill path |
-| fixed d1, before small-M attention | 36.75 tok/s | 33.59% | verifier/rollback cost dominated |
 
-Artifacts: `benchmark_results/cuda_moe_mtp/20260604T072857Z-bffe6cc7-gdn-qkvz-fused-n64`
-and route stats `20260604T072812Z-bffe6cc7-gdn-qkvz-kernel-route`.
+Artifacts: `benchmark_results/cuda_moe_mtp/20260604T072857Z-bffe6cc7-gdn-qkvz-fused-n64`,
+`20260604T074312Z-20a0cfed-shared-grouped-cuda-n64`, profile `20260604T074349Z-20a0cfed-shared-grouped-cuda-profile-n16`.
 Earlier attention work moved short-profile attention from 58.84 ms to 6.66 ms.
 
 ## Retained Tuning Actions
@@ -75,6 +74,7 @@ Earlier attention work moved short-profile attention from 58.84 ms to 6.66 ms.
   `V2_Unit_Static_NoDefaultStreamInGPUCode`.
 - Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, batched verifier-row argmax, and GDN verifier-row rollback restore.
 - CUDA quantized GEMM now advertises fused projection support; Qwen3.6 MoE GDN qkv+z uses a native subgroup while alpha/beta remain FP32 single projections.
+- CUDA shared-expert decode has an opt-in graph-capturable grouped table path; keep opt-in until n64 improves.
 - Added graph-capturable CUDA FP16KV small-M verifier attention for M=2..4.
 - Stabilized MoE prefix fingerprints, grouped-decode runtime-table rewarm, and streamful `TransferEngine` terminal-state uploads.
 - Kept ROCm attention params out of HIP capture and compacted MoE grouped-prefill grids to active experts only.

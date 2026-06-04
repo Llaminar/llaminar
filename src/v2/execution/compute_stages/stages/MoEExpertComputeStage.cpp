@@ -2378,7 +2378,7 @@ namespace llaminar2
     bool SharedExpertFFNStage::tryGroupedDecode(
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
-        if (!params_.device_id.is_rocm() || params_.seq_len != 1 ||
+        if (!params_.device_id.is_gpu() || params_.seq_len != 1 ||
             !debugEnv().rocm.shared_expert_grouped_decode)
         {
             return false;
