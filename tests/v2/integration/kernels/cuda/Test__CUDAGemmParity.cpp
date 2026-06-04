@@ -31,6 +31,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()
 #include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
+#include "execution/compute_stages/stages/GDNProjectionStage.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
 #include "utils/PerfStatsCollector.h"
@@ -1494,6 +1495,149 @@ TEST_F(Test__CUDAGemmParity, Q4_K_FusedVerifierSmallM_2RowsTwoProjections)
         << "Small-M fused verifier projection 1 must not leak CUDA dynamic state after workspace cleanup";
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights0.get());
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
+}
+
+TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
+{
+    const int M = 2;
+    const int K = 768;
+    const int N_QKV = 896;
+    const int N_Z = 512;
+    const int N_ALPHA = 16;
+    const int N_BETA = 16;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    auto input_data = randomFP32(static_cast<size_t>(M) * K);
+    std::memcpy(input->mutable_data(), input_data.data(), input_data.size() * sizeof(float));
+
+    auto weights_qkv = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 232);
+    auto weights_z = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 233);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_ALPHA), static_cast<size_t>(K)}, -0.1f, 0.1f, 234);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_BETA), static_cast<size_t>(K)}, -0.1f, 0.1f, 235);
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(gpu_device_));
+
+    auto output_qkv = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+    auto output_z = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+    auto output_alpha = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_ALPHA)});
+    auto output_beta = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_BETA)});
+
+    auto *kernel_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *kernel_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    auto *kernel_alpha = getPreparedKernel(weights_alpha.get(), gpu_device_);
+    auto *kernel_beta = getPreparedKernel(weights_beta.get(), gpu_device_);
+    ASSERT_NE(kernel_qkv, nullptr);
+    ASSERT_NE(kernel_z, nullptr);
+    ASSERT_NE(kernel_alpha, nullptr);
+    ASSERT_NE(kernel_beta, nullptr);
+    ASSERT_TRUE(kernel_qkv->supports_fused_projection())
+        << "CUDA quantized GEMM must advertise fused projection support so GDN can batch qkv+z";
+    ASSERT_TRUE(kernel_z->supports_fused_projection())
+        << "CUDA quantized GEMM must advertise fused projection support so GDN can batch qkv+z";
+
+    GDNProjectionStage::Params params;
+    params.device_id = gpu_device_;
+    params.input = input.get();
+    params.m = M;
+    params.k = K;
+    params.w_qkv = weights_qkv.get();
+    params.output_qkv = output_qkv.get();
+    params.n_qkv = N_QKV;
+    params.w_z = weights_z.get();
+    params.output_z = output_z.get();
+    params.n_z = N_Z;
+    params.w_a = weights_alpha.get();
+    params.output_a = output_alpha.get();
+    params.n_a = N_ALPHA;
+    params.w_b = weights_beta.get();
+    params.output_b = output_beta.get();
+    params.n_b = N_BETA;
+    params.gemm_qkv = kernel_qkv;
+    params.gemm_z = kernel_z;
+    params.gemm_a = kernel_alpha;
+    params.gemm_b = kernel_beta;
+
+    GDNProjectionStage stage(params);
+    WorkspaceRequirements reqs = stage.getWorkspaceRequirements(M, 0, K);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    stage.bindWorkspace(workspace_.get());
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    stage.setGPUStream(static_cast<void *>(stream));
+    CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+
+    const bool ok = with_gpu_coherence(
+        gpu_device_,
+        {input.get()},
+        {output_qkv.get(), output_z.get(), output_alpha.get(), output_beta.get()},
+        [&]
+        {
+            return stage.execute(&ctx);
+        });
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    stage.unbindWorkspace();
+    workspace_.reset();
+    kernel_qkv->resetDynamicState();
+    kernel_z->resetDynamicState();
+    kernel_alpha->resetDynamicState();
+    kernel_beta->resetDynamicState();
+
+    const auto route_records = PerfStatsCollector::snapshot({"kernel.gdn_projection_route"});
+    const auto qkv_z_route = std::find_if(
+        route_records.begin(),
+        route_records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "gdn_projection_route" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("route") == "native_subgroup" &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.at("projections") == "2" &&
+                   record.tags.at("names") == "qkv+z";
+        });
+    ASSERT_NE(qkv_z_route, route_records.end())
+        << "CUDA GDN verifier projection must fuse quantized qkv+z instead of routing both as single fallbacks";
+
+    const auto fused_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+    const auto fused_kernel_record = std::find_if(
+        fused_records.begin(),
+        fused_records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.at("projections") == "2";
+        });
+    ASSERT_NE(fused_kernel_record, fused_records.end())
+        << "CUDA qkv+z GDN subgroup should execute the graph-native small-M fused projection kernel";
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
+    PerfStatsCollector::reset();
 }
 
 TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)

@@ -12,7 +12,7 @@ A/Bs that should not be rediscovered.
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 42.04 tok/s | 2.13x | Fixed d1, compact active-expert prefill grid |
-| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.37 tok/s | 41.92 tok/s | 0.41x | Correctness green; verifier attention fixed, still perf-negative |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.37 tok/s | 64.72 tok/s | 0.64x | Correctness green; qkv+z GDN fused, still perf-negative |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
 ## Adaptive Depth
@@ -59,14 +59,14 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
 | Case | Decode | Acceptance | Notes |
 |---|---:|---:|---|
 | baseline | 101.37 tok/s | n/a | current no-MTP ratchet |
+| fixed d1, CUDA GDN qkv+z fused | 64.72 tok/s | 42.97% | `kernel.gdn_projection_route`: qkv+z native subgroup at M=1/2 |
 | short fixed d1, CUDA GDN restore | 55.60 tok/s | 25.00% | n=8 smoke; verifier-row restores active, no restore-failure or replay-forward counters |
 | fixed d1, after small-M attention | 41.92 tok/s | 32.03% | attention no longer uses FA2 prefill path |
 | fixed d1, before small-M attention | 36.75 tok/s | 33.59% | verifier/rollback cost dominated |
-| short fixed d1, after batched argmax | 38.98 tok/s | 50.00% | verifier sampling 36.98 us/call |
 
-Artifacts: `benchmark_results/cuda_moe_mtp/20260604T060624Z-869a4762-smallm-attn-n64`
-and restore smoke `20260604T071026Z-5e4283f2-cuda-gdn-restore-n8`.
-Attention moved from 58.84 ms to 6.66 ms on the short profile.
+Artifacts: `benchmark_results/cuda_moe_mtp/20260604T072857Z-bffe6cc7-gdn-qkvz-fused-n64`
+and route stats `20260604T072812Z-bffe6cc7-gdn-qkvz-kernel-route`.
+Earlier attention work moved short-profile attention from 58.84 ms to 6.66 ms.
 
 ## Retained Tuning Actions
 
@@ -74,7 +74,7 @@ Attention moved from 58.84 ms to 6.66 ms on the short profile.
 - Added explicit non-null GPU stream hard failures; regression:
   `V2_Unit_Static_NoDefaultStreamInGPUCode`.
 - Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, batched verifier-row argmax, and GDN verifier-row rollback restore.
-- Kept CUDA verifier projection row-wise; CUDA GEMM scratch survives request resets while captured prefill graphs are retained.
+- CUDA quantized GEMM now advertises fused projection support; Qwen3.6 MoE GDN qkv+z uses a native subgroup while alpha/beta remain FP32 single projections.
 - Added graph-capturable CUDA FP16KV small-M verifier attention for M=2..4.
 - Stabilized MoE prefix fingerprints, grouped-decode runtime-table rewarm, and streamful `TransferEngine` terminal-state uploads.
 - Kept ROCm attention params out of HIP capture and compacted MoE grouped-prefill grids to active experts only.
