@@ -568,12 +568,11 @@ namespace llaminar2
          * @param out_value Receives the maximum value
          * @param out_index Receives the index of the maximum element
          * @param stream Optional device stream to enqueue work on
-         * @param partial_vals Optional device scratch [partial_capacity] for the
+         * @param partial_vals Device scratch [partial_capacity] for the
          *        two-pass multi-block reduction (per-block partial max values).
-         *        When null (or capacity < 1), backends fall back to a single-block
-         *        reduction. Supplied by the caller's workspace/arena, not allocated
-         *        by the backend.
-         * @param partial_idxs Optional device scratch [partial_capacity] for the
+         *        Production GPU backends require caller-owned workspace/arena
+         *        scratch and fail loud when it is missing or undersized.
+         * @param partial_idxs Device scratch [partial_capacity] for the
          *        per-block partial max indices (paired with @p partial_vals).
          * @param partial_capacity Number of entries in the partial scratch buffers.
          * @return true if executed on device, false if not supported (caller should fall back)

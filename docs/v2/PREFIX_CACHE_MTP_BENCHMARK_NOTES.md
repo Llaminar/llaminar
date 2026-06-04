@@ -50,11 +50,18 @@ CUDA MoE after inverse-map top-k scatter:
 `benchmark_results/cuda_moe_mtp/20260604T213712Z-inverse-map-scatter-mtp-dynamic`
 Profiler export check:
 `benchmark_results/cuda_moe_mtp/20260604T212136Z-perf-export-device-field`
+Greedy margin diagnostic:
+`benchmark_results/cuda_moe_mtp/20260604T220430Z-greedy-margin-verifier-rows`
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
 | no MTP | 2155.28 | 107.01 | n/a |
 | dynamic MTP | 1655.00 | 127.81 | 80.47% |
+
+Verifier-row top-2 margins are large on average (~8.1 logits; one <=1e-2
+near-tie bucket), so CUDA MoE MTP acceptance swings are real draft/main
+disagreement rather than mostly argmax tie noise. The diagnostic run itself is
+not a throughput ratchet because it intentionally adds top-k probes.
 
 Focused correctness gates:
 
@@ -85,5 +92,5 @@ Focused correctness gates:
 Updated goal is to beat llama.cpp CUDA on dense and MoE, prefill and decode, with
 MTP on and off. Dense decode is close; MoE dynamic MTP decode now trails llama.cpp
 MTP d1 by about 10%. MoE prefill now beats llama-cli no-MTP but still trails
-llama-bench; next target is restoring the dynamic-MTP decode ratchet and reducing
-verifier/router overhead without giving back the prefill scatter win.
+llama-bench; next target is reducing CUDA MoE verifier/expert FFN cost without
+giving back the prefill scatter win.

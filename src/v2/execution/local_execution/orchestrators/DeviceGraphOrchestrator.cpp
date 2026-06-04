@@ -310,6 +310,84 @@ namespace llaminar2
             }
         }
 
+        bool isTruthyProfilingEnv(const char *name)
+        {
+            const char *value = std::getenv(name);
+            if (!value)
+                return false;
+            if (std::strcmp(value, "0") == 0 ||
+                std::strcmp(value, "false") == 0 ||
+                std::strcmp(value, "FALSE") == 0 ||
+                std::strcmp(value, "off") == 0 ||
+                std::strcmp(value, "OFF") == 0)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        bool greedyMarginStatsEnabled()
+        {
+            return PerfStatsCollector::isEnabled() &&
+                   isTruthyProfilingEnv("LLAMINAR_GREEDY_MARGIN_STATS");
+        }
+
+        void recordGreedyMarginStats(
+            const char *source,
+            const DeviceId &device,
+            int row,
+            float top1,
+            float top2)
+        {
+            if (!greedyMarginStatsEnabled())
+                return;
+
+            const float margin = top1 - top2;
+            const std::string phase = perfPhaseName();
+            const std::string device_name = device.toString();
+            PerfStatsCollector::Tags tags{
+                {"source", source ? source : "unknown"},
+                {"row", std::to_string(row)}};
+
+            PerfStatsCollector::addCounter(
+                "sampling", "greedy_samples", 1.0, phase, device_name, tags);
+            PerfStatsCollector::addCounter(
+                "sampling", "greedy_top2_margin", margin, phase, device_name, tags);
+
+            auto near_tie = [&](const char *name, float threshold)
+            {
+                if (margin <= threshold)
+                {
+                    PerfStatsCollector::addCounter(
+                        "sampling", name, 1.0, phase, device_name, tags);
+                }
+            };
+            near_tie("greedy_near_tie_le_1e-6", 1.0e-6f);
+            near_tie("greedy_near_tie_le_1e-5", 1.0e-5f);
+            near_tie("greedy_near_tie_le_1e-4", 1.0e-4f);
+            near_tie("greedy_near_tie_le_1e-3", 1.0e-3f);
+            near_tie("greedy_near_tie_le_1e-2", 1.0e-2f);
+        }
+
+        void recordGreedyMarginUnavailable(
+            const char *source,
+            const DeviceId &device,
+            int row)
+        {
+            if (!greedyMarginStatsEnabled())
+                return;
+
+            PerfStatsCollector::addCounter(
+                "sampling",
+                "greedy_top2_margin_unavailable",
+                1.0,
+                perfPhaseName(),
+                device.toString(),
+                PerfStatsCollector::Tags{
+                    {"source", source ? source : "unknown"},
+                    {"row", std::to_string(row)}});
+        }
+
         GreedyLogitCandidate sampleGreedyCandidateFromTensor(
             TensorBase *tensor,
             int row,
@@ -317,7 +395,8 @@ namespace llaminar2
             void *argmax_partial_vals = nullptr,
             void *argmax_partial_idxs = nullptr,
             int argmax_partial_capacity = 0,
-            void *stream = nullptr)
+            void *stream = nullptr,
+            const char *source = "unknown")
         {
             GreedyLogitCandidate candidate;
             if (!tensor || row < 0)
@@ -366,6 +445,31 @@ namespace llaminar2
                         candidate.value = max_val;
                         candidate.token = token_offset + max_idx;
                         candidate.valid = 1;
+
+                        if (greedyMarginStatsEnabled())
+                        {
+                            float top_values[2] = {};
+                            int top_indices[2] = {};
+                            if (backend->topKF32(target_row,
+                                                 static_cast<int>(cols),
+                                                 2,
+                                                 device_opt->gpu_ordinal(),
+                                                 top_values,
+                                                 top_indices,
+                                                 stream))
+                            {
+                                recordGreedyMarginStats(
+                                    source,
+                                    *device_opt,
+                                    row,
+                                    top_values[0],
+                                    top_values[1]);
+                            }
+                            else
+                            {
+                                recordGreedyMarginUnavailable(source, *device_opt, row);
+                            }
+                        }
                         return candidate;
                     }
                 }
@@ -395,18 +499,29 @@ namespace llaminar2
             const float *row_data = data + row_offset;
             max_idx = 0;
             max_val = row_data[0];
+            float second_val = -std::numeric_limits<float>::infinity();
             for (size_t i = 1; i < cols; ++i)
             {
                 if (row_data[i] > max_val)
                 {
+                    second_val = max_val;
                     max_val = row_data[i];
                     max_idx = static_cast<int>(i);
+                }
+                else if (row_data[i] > second_val)
+                {
+                    second_val = row_data[i];
                 }
             }
 
             candidate.value = max_val;
             candidate.token = token_offset + max_idx;
             candidate.valid = 1;
+            if (cols >= 2)
+            {
+                auto device_for_stats = device_opt.value_or(DeviceId::cpu());
+                recordGreedyMarginStats(source, device_for_stats, row, max_val, second_val);
+            }
             return candidate;
         }
 
@@ -4842,7 +4957,8 @@ namespace llaminar2
                                             argmax_partial_vals_dev_,
                                             argmax_partial_idxs_dev_,
                                             argmax_partial_capacity_,
-                                            pending_stream),
+                                            pending_stream,
+                                            "mtp_logits"),
             globalTPContextForMTPCoordination());
     }
 
@@ -4870,7 +4986,8 @@ namespace llaminar2
                                                 argmax_partial_vals_dev_,
                                                 argmax_partial_idxs_dev_,
                                                 argmax_partial_capacity_,
-                                                stream),
+                                                stream,
+                                                "all_position_logits"),
                 globalTPContextForMTPCoordination());
         }
 
@@ -4894,7 +5011,8 @@ namespace llaminar2
                                                 argmax_partial_vals_dev_,
                                                 argmax_partial_idxs_dev_,
                                                 argmax_partial_capacity_,
-                                                stream),
+                                                stream,
+                                                "all_position_logits_local"),
                 globalTPContextForMTPCoordination());
         }
 
@@ -4918,6 +5036,7 @@ namespace llaminar2
 
         TensorBase *tensor = nullptr;
         int token_offset = 0;
+        const char *sample_source = "all_position_logits_rows";
         if (state_.all_position_logits)
         {
             tensor = state_.all_position_logits.get();
@@ -4925,6 +5044,7 @@ namespace llaminar2
         else if (state_.all_position_logits_local)
         {
             tensor = state_.all_position_logits_local.get();
+            sample_source = "all_position_logits_local_rows";
             token_offset = graph_builder_
                                ? vocabOffsetForTPConfig(graph_builder_->config())
                                : 0;
@@ -4999,6 +5119,35 @@ namespace llaminar2
                     return false;
                 out_tokens[i] = static_cast<int32_t>(
                     token_offset + indices[static_cast<size_t>(i)]);
+            }
+            if (greedyMarginStatsEnabled())
+            {
+                for (int i = 0; i < row_count; ++i)
+                {
+                    const void *row_ptr =
+                        base + static_cast<size_t>(start_row + i) * static_cast<size_t>(cols);
+                    float top_values[2] = {};
+                    int top_indices[2] = {};
+                    if (backend->topKF32(row_ptr,
+                                         static_cast<int>(cols),
+                                         2,
+                                         device_opt->gpu_ordinal(),
+                                         top_values,
+                                         top_indices,
+                                         stream))
+                    {
+                        recordGreedyMarginStats(
+                            sample_source,
+                            *device_opt,
+                            start_row + i,
+                            top_values[0],
+                            top_values[1]);
+                    }
+                    else
+                    {
+                        recordGreedyMarginUnavailable(sample_source, *device_opt, start_row + i);
+                    }
+                }
             }
             PerfStatsCollector::addCounter(
                 "mtp",
@@ -6869,7 +7018,8 @@ namespace llaminar2
                                                 argmax_partial_vals_dev_,
                                                 argmax_partial_idxs_dev_,
                                                 argmax_partial_capacity_,
-                                                stream),
+                                                stream,
+                                                "logits_local"),
                 globalTPContextForMTPCoordination());
         }
 
@@ -6893,7 +7043,8 @@ namespace llaminar2
                                             argmax_partial_vals_dev_,
                                             argmax_partial_idxs_dev_,
                                             argmax_partial_capacity_,
-                                            stream),
+                                            stream,
+                                            "logits"),
             globalTPContextForMTPCoordination());
     }
 

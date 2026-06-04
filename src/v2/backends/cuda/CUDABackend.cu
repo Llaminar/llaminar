@@ -843,8 +843,8 @@ namespace llaminar2
         CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
         cudaStream_t s = resolveStream(device_id, stream);
         // Pass the caller-supplied partial scratch through to the kernel wrapper.
-        // When partial_vals/partial_idxs are null (or capacity < 1), the wrapper
-        // transparently falls back to a single-block reduction.
+        // The scratch is mandatory (arena-owned); the wrapper fails loud if it is
+        // missing or undersized — there is no single-block fallback.
         if (!cudaOps_argmax_f32(
                 static_cast<const float *>(data_device), n,
                 static_cast<float *>(bufs.value_ptr),
