@@ -2275,6 +2275,75 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    TEST_F(Test__PrefillDecodeTransition, CUDAMTPForcedRejectSkipsVerifierRowShortcutAndFullyReplays)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_cuda_mtp_verifier_row_shortcut_gate_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/false,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0));
+            mock->enableVerifierRowRestore();
+
+            std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
+            ASSERT_TRUE(runner->prefill(prompt));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+            EXPECT_EQ(mock->restoreVerifierRowCount(), 0)
+                << "CUDA verifier-row state equivalence is not yet proven, so the shortcut must not run";
+            EXPECT_EQ(mock->restoreCount(), 1);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 2);
+            EXPECT_FALSE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
+                << "the verifier forward should be followed by one full replay over both returned tokens";
+            EXPECT_THAT(mock->lastForwardTokens(),
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *shortcut =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "rollback_verifier_state_row_shortcuts");
+            EXPECT_EQ(shortcut, nullptr);
+
+            const PerfStatRecord *unavailable =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "rollback_verifier_state_row_shortcut_unavailable",
+                                       {{"reason", "cuda_verifier_row_state_equivalence_unverified"}});
+            ASSERT_NE(unavailable, nullptr);
+            EXPECT_DOUBLE_EQ(unavailable->value, 1.0);
+
+            const PerfStatRecord *replay_tokens =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
+            ASSERT_NE(replay_tokens, nullptr);
+            EXPECT_DOUBLE_EQ(replay_tokens->value, 2.0);
+
+            const PerfStatRecord *replay_forward =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "replay_forward");
+            ASSERT_NE(replay_forward, nullptr);
+            EXPECT_EQ(replay_forward->count, 1u);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, MTPForcedRejectRestoresHybridPayloadSnapshot)
     {
         auto [runner, mock] = createRunner(/*mtp_enabled=*/true, /*mtp_accept=*/false);

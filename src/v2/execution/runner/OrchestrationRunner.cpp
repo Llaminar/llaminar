@@ -2104,10 +2104,27 @@ namespace llaminar2
             rollback_recorded = true;
         };
 
-        if ((rejected_speculative_token || partial_verifier_commit_without_reject) &&
+        const bool verifier_row_shortcut_backend_supported =
+            !runner_->primaryDeviceId().is_cuda();
+        const bool verifier_row_shortcut_candidate =
+            (rejected_speculative_token || partial_verifier_commit_without_reject) &&
             accepted_verifier_input_count > 0 &&
             accepted_verifier_input_count < static_cast<int>(draft_tokens.size()) &&
-            accepted_verifier_input_count <= static_cast<int>(accepted_tokens.size()))
+            accepted_verifier_input_count <= static_cast<int>(accepted_tokens.size());
+        if (verifier_row_shortcut_candidate &&
+            !verifier_row_shortcut_backend_supported)
+        {
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "rollback_verifier_state_row_shortcut_unavailable",
+                1.0,
+                "decode",
+                {},
+                {{"reason", "cuda_verifier_row_state_equivalence_unverified"}});
+        }
+
+        if (verifier_row_shortcut_candidate &&
+            verifier_row_shortcut_backend_supported)
         {
             const int verifier_restore_row = accepted_verifier_input_count - 1;
             const int target_cached_tokens =
