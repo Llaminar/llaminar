@@ -60,11 +60,11 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
 |---|---:|---:|---|
 | baseline | 101.37 tok/s | n/a | current no-MTP ratchet |
 | fixed d1, CUDA GDN qkv+z fused | 64.72 tok/s | 42.97% | `kernel.gdn_projection_route`: qkv+z native subgroup at M=1/2 |
-| opt-in shared grouped FFN | 64.26 tok/s | 40.62% | n64 no ratchet; profiled n16 improved 48.17 -> 54.54 tok/s |
+| opt-in shared grouped FFN | 64.26 tok/s | 40.62% | n64 no ratchet; GPU-stage n16 improved 48.17 -> 51.65 tok/s |
 | fixed d1, after small-M attention | 41.92 tok/s | 32.03% | attention no longer uses FA2 prefill path |
 
 Artifacts: `benchmark_results/cuda_moe_mtp/20260604T072857Z-bffe6cc7-gdn-qkvz-fused-n64`,
-`20260604T074312Z-20a0cfed-shared-grouped-cuda-n64`, profile `20260604T074349Z-20a0cfed-shared-grouped-cuda-profile-n16`.
+`20260604T074312Z-20a0cfed-shared-grouped-cuda-n64`, GPU-stage `20260604T074809Z-b5cee090-shared-grouped-cuda-gpustage-n16`.
 Earlier attention work moved short-profile attention from 58.84 ms to 6.66 ms.
 
 ## Retained Tuning Actions
