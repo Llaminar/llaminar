@@ -873,6 +873,7 @@ namespace
         int *__restrict__ write_heads,
         const int *__restrict__ expert_offsets,
         int *__restrict__ grouped_token_indices,
+        int *__restrict__ original_to_grouped,
         float *__restrict__ grouped_weights,
         int total_slots, int top_k, int num_experts)
     {
@@ -885,6 +886,7 @@ namespace
         const int local = atomicAdd(write_heads + expert, 1);
         const int dest = expert_offsets[expert] + local;
         grouped_token_indices[dest] = idx / top_k;
+        original_to_grouped[idx] = dest;
         grouped_weights[dest] = routing_weights[idx];
     }
 
@@ -894,6 +896,7 @@ namespace
         const int *__restrict__ expert_offsets,
         const int *__restrict__ expert_counts,
         int *__restrict__ grouped_token_indices,
+        int *__restrict__ original_to_grouped,
         float *__restrict__ grouped_weights,
         int total_slots, int top_k, int num_experts)
     {
@@ -911,6 +914,7 @@ namespace
                 return;
 
             grouped_token_indices[write] = slot / top_k;
+            original_to_grouped[slot] = write;
             grouped_weights[write] = routing_weights[slot];
             ++write;
         }
@@ -922,6 +926,7 @@ namespace
         int *__restrict__ expert_counts,
         int *__restrict__ expert_offsets,
         int *__restrict__ grouped_token_indices,
+        int *__restrict__ original_to_grouped,
         float *__restrict__ grouped_weights,
         int *__restrict__ active_expert_ids,
         int total_slots,
@@ -981,6 +986,7 @@ namespace
                 const int local = atomicAdd(&write_heads[expert_id], 1);
                 const int dest = offsets[expert_id] + local;
                 grouped_token_indices[dest] = tid / top_k;
+                original_to_grouped[tid] = dest;
                 grouped_weights[dest] = routing_weights[tid];
             }
         }
@@ -990,6 +996,7 @@ namespace
         int *__restrict__ expert_counts,
         int *__restrict__ expert_offsets,
         int *__restrict__ grouped_token_indices,
+        int *__restrict__ original_to_grouped,
         float *__restrict__ grouped_weights,
         int *__restrict__ active_expert_ids,
         int seq_len)
@@ -1004,6 +1011,7 @@ namespace
         if (tid < seq_len)
         {
             grouped_token_indices[tid] = tid;
+            original_to_grouped[tid] = tid;
             grouped_weights[tid] = 1.0f;
         }
     }
@@ -1705,9 +1713,10 @@ namespace
         float *__restrict__ output,
         const float *__restrict__ expert_output,
         const int *__restrict__ grouped_token_indices,
+        const int *__restrict__ original_to_grouped,
         const float *__restrict__ grouped_weights,
         int seq_len,
-        int total_slots,
+        int top_k,
         int d_model)
     {
         constexpr int kTileN = 64;
@@ -1717,8 +1726,14 @@ namespace
             return;
 
         float sum = 0.0f;
-        for (int slot = 0; slot < total_slots; ++slot)
+        for (int k = 0; k < top_k; ++k)
         {
+            const int original_slot = token * top_k + k;
+            const int slot = original_to_grouped[original_slot];
+            if (slot < 0)
+                continue;
+            // The inverse map is authoritative; keep this guard for corrupt
+            // routing diagnostics without changing valid deterministic output.
             if (grouped_token_indices[slot] != token)
                 continue;
             sum += grouped_weights[slot] *
@@ -2600,27 +2615,33 @@ extern "C"
 
     bool cudaMoE_scatter_tokens(const int *routing_indices, const float *routing_weights,
                                 int *write_heads, const int *expert_offsets,
-                                int *grouped_token_indices, float *grouped_weights,
+                                int *grouped_token_indices,
+                                int *original_to_grouped,
+                                float *grouped_weights,
                                 int total_slots, int top_k, int num_experts,
                                 int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
         scatter_tokens_kernel<<<blocksFor(total_slots), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             routing_indices, routing_weights, write_heads, expert_offsets,
-            grouped_token_indices, grouped_weights, total_slots, top_k, num_experts);
+            grouped_token_indices, original_to_grouped, grouped_weights,
+            total_slots, top_k, num_experts);
         return finishLaunch("cudaMoE_scatter_tokens");
     }
 
     bool cudaMoE_scatter_tokens_deterministic(const int *routing_indices, const float *routing_weights,
                                               const int *expert_offsets, const int *expert_counts,
-                                              int *grouped_token_indices, float *grouped_weights,
+                                              int *grouped_token_indices,
+                                              int *original_to_grouped,
+                                              float *grouped_weights,
                                               int total_slots, int top_k, int num_experts,
                                               int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
         scatter_tokens_deterministic_kernel<<<num_experts, 1, 0, static_cast<cudaStream_t>(stream)>>>(
             routing_indices, routing_weights, expert_offsets, expert_counts,
-            grouped_token_indices, grouped_weights, total_slots, top_k, num_experts);
+            grouped_token_indices, original_to_grouped, grouped_weights,
+            total_slots, top_k, num_experts);
         return finishLaunch("cudaMoE_scatter_tokens_deterministic");
     }
 
@@ -2630,6 +2651,7 @@ extern "C"
         int *expert_counts,
         int *expert_offsets,
         int *grouped_token_indices,
+        int *original_to_grouped,
         float *grouped_weights,
         int *active_expert_ids,
         int total_slots,
@@ -2641,7 +2663,8 @@ extern "C"
     {
         if (!stream ||
             !routing_indices || !routing_weights || !expert_counts || !expert_offsets ||
-            !grouped_token_indices || !grouped_weights || !active_expert_ids ||
+            !grouped_token_indices || !original_to_grouped ||
+            !grouped_weights || !active_expert_ids ||
             total_slots <= 0 || total_slots > 64 ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
             top_k <= 0 || top_k > kMaxTopK ||
@@ -2659,6 +2682,7 @@ extern "C"
             expert_counts,
             expert_offsets,
             grouped_token_indices,
+            original_to_grouped,
             grouped_weights,
             active_expert_ids,
             total_slots,
@@ -2672,6 +2696,7 @@ extern "C"
         int *expert_counts,
         int *expert_offsets,
         int *grouped_token_indices,
+        int *original_to_grouped,
         float *grouped_weights,
         int *active_expert_ids,
         int seq_len,
@@ -2679,7 +2704,8 @@ extern "C"
         void *stream)
     {
         if (!stream || !expert_counts || !expert_offsets ||
-            !grouped_token_indices || !grouped_weights || !active_expert_ids ||
+            !grouped_token_indices || !original_to_grouped ||
+            !grouped_weights || !active_expert_ids ||
             seq_len <= 0 || seq_len > 64)
         {
             std::fprintf(stderr, "[cudaMoE_prepare_shared_expert_prefill_group] invalid arguments\n");
@@ -2691,6 +2717,7 @@ extern "C"
             expert_counts,
             expert_offsets,
             grouped_token_indices,
+            original_to_grouped,
             grouped_weights,
             active_expert_ids,
             seq_len);
@@ -3050,6 +3077,7 @@ extern "C"
         const int *d_group_counts,
         const int *d_group_offsets,
         const int *d_group_token_indices,
+        const int *d_group_original_to_grouped,
         const float *d_group_weights,
         const int *d_active_expert_ids,
         int8_t *d_scratch_A_int8,
@@ -3085,17 +3113,25 @@ extern "C"
             (down_k_partitions == 2 || down_k_partitions == 4 ||
              down_k_partitions == 8 || down_k_partitions == 16);
         if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_down_desc_table ||
-            !d_group_counts || !d_group_offsets || !d_group_token_indices || !d_group_weights ||
+            !d_group_counts || !d_group_offsets || !d_group_token_indices ||
+            !d_group_original_to_grouped || !d_group_weights ||
             !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate || !d_scratch_up ||
             !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out || !d_output ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
             source_tokens <= 0 || max_tokens_per_expert <= 0 || total_slots <= 0 ||
             source_tokens > total_slots ||
+            (total_slots % source_tokens) != 0 ||
             active_expert_slots < 0 ||
             (d_model % 32) != 0 || (intermediate % 32) != 0 ||
             !stream)
         {
             std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] invalid arguments\n");
+            return false;
+        }
+        const int top_k = total_slots / source_tokens;
+        if (top_k <= 0 || top_k > kMaxTopK)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] invalid inferred top_k=%d\n", top_k);
             return false;
         }
         const bool use_active_expert_grid = active_expert_slots > 0;
@@ -3387,12 +3423,12 @@ extern "C"
 
         {
             constexpr int kTileN = 64;
-            dim3 grid((d_model + kTileN - 1) / kTileN, max_tokens_per_expert);
+            dim3 grid((d_model + kTileN - 1) / kTileN, source_tokens);
             dim3 block(kTileN);
             grouped_prefill_scatter_weighted_deterministic_kernel<<<grid, block, 0, cuda_stream>>>(
                 d_output, d_scratch_down_out,
-                d_group_token_indices, d_group_weights,
-                max_tokens_per_expert, total_slots, d_model);
+                d_group_token_indices, d_group_original_to_grouped, d_group_weights,
+                source_tokens, top_k, d_model);
             if (!finishLaunch("cudaMoE_grouped_scatter_prefill_deterministic"))
                 return false;
         }

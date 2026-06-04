@@ -257,6 +257,15 @@ namespace llaminar2
             const float *expert_weights,
             int num_active,
             bool include_weights);
+        bool groupTokensByExpertDeviceMapped(
+            const int *d_routing_indices,
+            const float *d_routing_weights,
+            int seq_len, int num_experts, int top_k,
+            int *d_expert_offsets,
+            int *d_expert_counts,
+            int *d_grouped_token_indices,
+            int *d_original_to_grouped,
+            float *d_grouped_weights);
         bool ensureRuntimeGateUpPointerArrays(
             int table_id,
             int top_k,
@@ -333,6 +342,7 @@ namespace llaminar2
         int *d_group_offsets_ = nullptr;
         int *d_group_counts_ = nullptr;
         int *d_group_token_indices_ = nullptr;
+        int *d_group_original_to_grouped_ = nullptr;
         int *d_group_write_heads_ = nullptr;
         float *d_group_weights_ = nullptr;
         int *d_group_active_expert_ids_ = nullptr;

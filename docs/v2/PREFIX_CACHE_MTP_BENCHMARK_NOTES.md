@@ -10,8 +10,8 @@ active gap. Keep this concise; raw tuning history belongs in artifacts.
 | Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 671.37 | 40.82 | fits 24GB after planner fix |
 | Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 582.66 | 53.83 | near fixed d1; controller starts min |
 | Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 899.41 | 107.02 | source-token expert quant |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 799.47 | 135.46 | depth 1, 87.50% accept |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2155.28 | 107.01 | inverse-map top-k scatter |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1655.00 | 127.81 | depth 1, 80.47% accept |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
@@ -45,13 +45,16 @@ CUDA dense memory planner smoke:
 CUDA MoE after source-token expert activation quantization:
 `benchmark_results/cuda_moe_mtp/20260604T210314Z-source-token-quant`
 `benchmark_results/cuda_moe_mtp/20260604T210400Z-source-token-quant-mtp-dynamic`
+CUDA MoE after inverse-map top-k scatter:
+`benchmark_results/cuda_moe_mtp/20260604T213642Z-inverse-map-scatter`
+`benchmark_results/cuda_moe_mtp/20260604T213712Z-inverse-map-scatter-mtp-dynamic`
 Profiler export check:
 `benchmark_results/cuda_moe_mtp/20260604T212136Z-perf-export-device-field`
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
-| no MTP | 899.41 | 107.02 | n/a |
-| dynamic MTP | 799.47 | 135.46 | 87.50% |
+| no MTP | 2155.28 | 107.01 | n/a |
+| dynamic MTP | 1655.00 | 127.81 | 80.47% |
 
 Focused correctness gates:
 
@@ -68,7 +71,7 @@ Focused correctness gates:
   grouped verifier prefill, stream-explicit shared experts, fused split-K MoE,
   graph-capturable cuBLAS batched GDN projections, parallel runtime router top-k,
   source-token MoE prefill activation quantization, workspace-bound FP32 mapped
-  output redirects.
+  output redirects, inverse-map MoE top-k scatter.
 - CUDA and ROCm GPU greedy argmax tie-break to lowest token id, matching CPU.
 - Memory planning charges terminal-row logits and prepared embedding workspace only.
 - GPU activation arenas are capped to prefill-bucket capacity while KV keeps the
@@ -81,7 +84,6 @@ Focused correctness gates:
 
 Updated goal is to beat llama.cpp CUDA on dense and MoE, prefill and decode, with
 MTP on and off. Dense decode is close; MoE dynamic MTP decode now trails llama.cpp
-MTP d1 by about 5%. MoE prefill is the largest visible gap: latest CUDA no-MTP
-prefill is 899.41 tok/s versus llama-cli 1120.1 and llama-bench 2413.54. Profiling
-says MoE router/expert prefill dominates, so the next target is router prefill
-math/layout, then remaining verifier GDN/router budget.
+MTP d1 by about 10%. MoE prefill now beats llama-cli no-MTP but still trails
+llama-bench; next target is restoring the dynamic-MTP decode ratchet and reducing
+verifier/router overhead without giving back the prefill scatter win.
