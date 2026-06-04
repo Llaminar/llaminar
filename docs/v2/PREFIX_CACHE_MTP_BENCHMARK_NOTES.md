@@ -10,7 +10,7 @@ live gaps. Keep this file concise; rejected tuning history belongs in artifacts.
 | Dense long lane, `qbf`, `-c 64 -n 48` | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 30.76 | 53.81 | 1.75x | Correctness green, short of 2x |
 | Dense default benchmark, 595p/128d | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 | 46.74 | 1.56x | Depth-sensitive |
 | Dense long lane, `qbf`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 | 53.30 | 1.31x | Depth 1 best |
-| Dense default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.82 | 55.58 | 1.36x | d1 wins; dynamic d3 fell to 33.29 |
+| Dense default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.82 | 55.58 | 1.36x | d1 wins; dynamic initial-min now 53.83 |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 | 9.50 | 1.64x | Short smoke only |
 | MoE default lane, 595p/64d | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 | 42.04 | 2.13x | Fixed d1, ratcheted |
 | MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 103.31 | 131.10 | 1.27x | Clean fused path, near 1.3x |

@@ -63,6 +63,30 @@ TEST(Test__MTPDepthController, FixedModeIgnoresAdaptiveBounds)
     EXPECT_EQ(controller.stats().windows, 0u);
 }
 
+TEST(Test__MTPDepthController, DynamicDefaultInitialDepthStartsAtMinimum)
+{
+    MTPDepthPolicyConfig config;
+    config.mode = MTPDepthPolicyMode::Dynamic;
+    config.min_depth = 1;
+    config.max_depth = 3;
+    config.initial_depth = 0;
+    config.window_size = 16;
+    config.min_samples = 4;
+    config.cooldown_steps = 0;
+    config.promote_consecutive_windows = 3;
+    config.promote_full_accept_rate = 1.0;
+    config.demote_zero_accept_rate = 0.30;
+    config.demote_acceptance_rate = 0.55;
+
+    MTPDepthController controller(config, /*configured_draft_tokens=*/3);
+
+    EXPECT_EQ(controller.currentDepth(), 1)
+        << "Dynamic mode should warm from the cheapest valid depth unless the "
+           "user explicitly sets an initial depth.";
+    EXPECT_EQ(controller.minDepth(), 1);
+    EXPECT_EQ(controller.maxDepth(), 3);
+}
+
 TEST(Test__MTPDepthController, DynamicDemotesOnZeroAcceptWindows)
 {
     MTPDepthController controller(

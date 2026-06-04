@@ -475,7 +475,7 @@ namespace llaminar2
         MTPDepthPolicyMode mode = MTPDepthPolicyMode::Fixed;
         int min_depth = 1;
         int max_depth = 0;     ///< 0 derives from MTPRuntimeConfig::draft_tokens.
-        int initial_depth = 0; ///< 0 derives from max_depth.
+        int initial_depth = 0; ///< 0 derives from min_depth in Dynamic mode, otherwise max_depth.
         int window_size = 16;
         int min_samples = 4;
         int cooldown_steps = 8;

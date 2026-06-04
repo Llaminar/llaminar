@@ -58,7 +58,12 @@ namespace llaminar2
             config.max_depth = configured_draft_tokens;
         }
         if (config.initial_depth <= 0)
-            config.initial_depth = config.max_depth;
+        {
+            config.initial_depth =
+                config.mode == MTPDepthPolicyMode::Dynamic
+                    ? config.min_depth
+                    : config.max_depth;
+        }
         if (config.min_depth < 1)
             throw std::invalid_argument("MTP depth policy min_depth must be > 0");
         if (config.max_depth < config.min_depth)
