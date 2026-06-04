@@ -12,7 +12,7 @@ rediscovered.
 | Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 46.74 tok/s | 1.56x | Bucketed attention capture, depth-sensitive |
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
-| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 35.61 tok/s | 1.81x | Fixed depth 1 best so far; MoE routing capture rewarm fixed, attention param upload still noisy |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 35.61 tok/s | 1.81x | Fixed depth 1 best so far; routing rewarm and attention param capture fixed |
 | MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Needs longer confirmation |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
@@ -77,9 +77,10 @@ Router A/B results to avoid repeating:
   cached stages cannot see an inactive decode bank.
 - Restored prefix terminal logits/hidden through streamful `TransferEngine`
   uploads before MTP sidecar consumption.
+- Kept ROCm attention param uploads out of HIP capture; captured attention now
+  consumes pre-uploaded workspace params and hard-fails if they are missing.
 
 ## Next Work
 
-MoE ROCm remains the priority: investigate the attention param upload errors
-still seen in release benchmarks, then retest fixed depth 1 and dynamic against
-the 35.61 tok/s ratchet.
+MoE ROCm remains the priority: retest longer fixed depth 1 and dynamic lanes
+against the 35.61 tok/s ratchet, then attack verifier and rollback cost.

@@ -924,8 +924,50 @@ namespace llaminar2
                 const int dynamic_position_offset =
                     (causal && kv_len > seq_len) ? (kv_len - seq_len) : 0;
 
-                setDynamicAttnParams(kv_len, dynamic_position_offset, query_rows_for_params);
-                if (!dynamicAttnParamsReady(kv_len, dynamic_position_offset, query_rows_for_params))
+                hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+                const hipError_t cap_err =
+                    hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
+                if (cap_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] hipStreamIsCapturing failed before attention-param use: "
+                              << hipGetErrorString(cap_err));
+                    return false;
+                }
+
+                if (cap_status == hipStreamCaptureStatusActive)
+                {
+                    if (!dynamic_attn_host_valid_ ||
+                        !dynamic_attn_device_valid_ ||
+                        dynamic_attn_param_rows_ < 1 ||
+                        dynamic_attn_query_rows_ != query_rows_for_params)
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] "
+                                  "Attention device params were not ready before HIP graph capture"
+                                  << " captured_body(kv_len=" << kv_len
+                                  << ", pos=" << dynamic_position_offset
+                                  << ", rows=" << query_rows_for_params << ")"
+                                  << " prepared(kv_len=" << dynamic_attn_kv_len_
+                                  << ", pos=" << dynamic_attn_position_offset_
+                                  << ", rows=" << dynamic_attn_query_rows_
+                                  << ", param_rows=" << dynamic_attn_param_rows_
+                                  << ") host_valid=" << dynamic_attn_host_valid_
+                                  << " device_valid=" << dynamic_attn_device_valid_
+                                  << " workspace=" << (workspace_ != nullptr)
+                                  << " stream=" << stream_);
+                        return false;
+                    }
+                }
+                else
+                {
+                    setDynamicAttnParams(kv_len, dynamic_position_offset, query_rows_for_params);
+                    if (!dynamicAttnParamsReady(kv_len, dynamic_position_offset, query_rows_for_params))
+                    {
+                        LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Attention device params were not ready on the explicit stream");
+                        return false;
+                    }
+                }
+
+                if (!dynamic_attn_device_valid_)
                 {
                     LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>::compute_tensor] Attention device params were not ready on the explicit stream");
                     return false;

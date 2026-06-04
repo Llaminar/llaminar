@@ -11,9 +11,13 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
-#include <memory>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
@@ -25,6 +29,45 @@ namespace llaminar2
 {
     namespace
     {
+        namespace fs = std::filesystem;
+
+        fs::path findRepoRoot()
+        {
+            std::vector<fs::path> starts;
+            starts.push_back(fs::current_path());
+            starts.push_back(fs::path(__FILE__));
+
+            for (auto start : starts)
+            {
+                if (fs::is_regular_file(start))
+                    start = start.parent_path();
+
+                for (fs::path candidate = start; !candidate.empty(); candidate = candidate.parent_path())
+                {
+                    if (fs::exists(candidate / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp") &&
+                        fs::exists(candidate / "tests/v2/CMakeLists.txt"))
+                    {
+                        return candidate;
+                    }
+
+                    if (candidate == candidate.root_path())
+                        break;
+                }
+            }
+
+            return fs::current_path();
+        }
+
+        std::string readFile(const fs::path &path)
+        {
+            std::ifstream input(path);
+            if (!input)
+                return {};
+
+            std::ostringstream buffer;
+            buffer << input.rdbuf();
+            return buffer.str();
+        }
 
         /**
          * @brief Mock KV cache for testing dynamic kv_len queries
@@ -948,6 +991,43 @@ namespace llaminar2
                 sum += std::abs(out_data[i]);
             }
             EXPECT_GT(sum, 0.0f) << "Output should have contributions from all attended positions";
+        }
+
+        TEST(Test__AttentionComputeStage_ROCmCaptureContract, CapturedAttentionUsesPreuploadedDeviceParams)
+        {
+            const fs::path root = findRepoRoot();
+            const std::string source =
+                readFile(root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp");
+            ASSERT_FALSE(source.empty());
+
+            const size_t params_start =
+                source.find("// Wire device_params for graph-capture replay.");
+            ASSERT_NE(params_start, std::string::npos);
+            const size_t params_end =
+                source.find("void *d_buf = workspace_->getBuffer", params_start);
+            ASSERT_NE(params_end, std::string::npos);
+            const std::string params_section =
+                source.substr(params_start, params_end - params_start);
+
+            const size_t active_capture =
+                params_section.find("if (cap_status == hipStreamCaptureStatusActive)");
+            ASSERT_NE(active_capture, std::string::npos);
+            const size_t non_capture_else = params_section.find("else", active_capture);
+            ASSERT_NE(non_capture_else, std::string::npos);
+
+            const std::string active_capture_section =
+                params_section.substr(active_capture, non_capture_else - active_capture);
+            EXPECT_EQ(active_capture_section.find("setDynamicAttnParams("), std::string::npos)
+                << "Captured ROCm attention execution must not mutate or upload dynamic params";
+            EXPECT_NE(active_capture_section.find("Attention device params were not ready before HIP graph capture"),
+                      std::string::npos);
+            EXPECT_NE(active_capture_section.find("dynamic_attn_query_rows_ != query_rows_for_params"),
+                      std::string::npos)
+                << "Captured graphs may bucket kv_len, but verifier row count must match the prepared params";
+
+            const std::string non_capture_section = params_section.substr(non_capture_else);
+            EXPECT_NE(non_capture_section.find("setDynamicAttnParams("), std::string::npos)
+                << "Non-captured ROCm attention still prepares params lazily for eager execution";
         }
 
     } // namespace
