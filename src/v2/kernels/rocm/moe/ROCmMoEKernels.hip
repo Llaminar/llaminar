@@ -234,6 +234,58 @@ __global__ void rocm_moe_gate_logits_single_token_kernel(
     }
 }
 
+__global__ void rocm_moe_gate_logits_small_m_kernel(
+    const float *__restrict__ hidden,       // [seq_len, d_model]
+    const float *__restrict__ gate_weights, // [num_experts, d_model]
+    float *__restrict__ logits,             // [seq_len, num_experts]
+    int seq_len, int d_model, int num_experts)
+{
+    const int expert = blockIdx.x;
+    const int row = blockIdx.y;
+    if (expert >= num_experts || row >= seq_len) return;
+
+    const float *h = hidden + static_cast<size_t>(row) * d_model;
+    const float *w = gate_weights + static_cast<size_t>(expert) * d_model;
+    float sum = 0.0f;
+
+    if ((d_model & 3) == 0)
+    {
+        const int vec_count = d_model >> 2;
+        const float4 *hidden4 = reinterpret_cast<const float4 *>(h);
+        const float4 *w4 = reinterpret_cast<const float4 *>(w);
+        for (int i = threadIdx.x; i < vec_count; i += blockDim.x)
+        {
+            const float4 hh = hidden4[i];
+            const float4 ww = w4[i];
+            sum += hh.x * ww.x + hh.y * ww.y + hh.z * ww.z + hh.w * ww.w;
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+            sum += h[i] * w[i];
+    }
+
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        sum += __shfl_down(sum, offset);
+
+    __shared__ float warp_sums[8];
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (lane == 0) warp_sums[warp_id] = sum;
+    __syncthreads();
+
+    if (warp_id == 0)
+    {
+        const int nw = (blockDim.x + warpSize - 1) / warpSize;
+        sum = (lane < nw) ? warp_sums[lane] : 0.0f;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            sum += __shfl_down(sum, offset);
+        if (lane == 0)
+            logits[static_cast<size_t>(row) * num_experts + expert] = sum;
+    }
+}
+
 __global__ void rocm_moe_gate_logits_single_token_kpart_kernel(
     const float *__restrict__ hidden,       // [d_model]
     const float *__restrict__ gate_weights, // [num_experts, d_model]
@@ -1486,6 +1538,35 @@ bool hipMoE_gate_logits_single_token(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE gate_logits_single_token kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_gate_logits_small_m(
+    const float *hidden, const float *gate_weights, float *logits,
+    int seq_len, int d_model, int num_experts,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!stream || !hidden || !gate_weights || !logits ||
+        seq_len < 2 || seq_len > 4 || d_model <= 0 || num_experts <= 0)
+    {
+        fprintf(stderr, "HIP MoE gate_logits_small_m invalid arguments\n");
+        return false;
+    }
+
+    const int threads = 128;
+    hipLaunchKernelGGL(rocm_moe_gate_logits_small_m_kernel,
+        dim3(num_experts, seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        hidden, gate_weights, logits, seq_len, d_model, num_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE gate_logits_small_m kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;

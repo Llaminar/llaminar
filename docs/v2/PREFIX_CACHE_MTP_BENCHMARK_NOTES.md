@@ -1,8 +1,7 @@
 # Prefix Cache And MTP Benchmark Notes
 
-Durable Phase 14 scoreboard. Keep this file concise: headline numbers,
-current retained tuning actions, and negative A/B results that should not be
-rediscovered.
+Durable Phase 14 scoreboard. Keep this file concise: headline numbers, retained
+tuning actions, and negative A/B results that should not be rediscovered.
 
 ## Headline Matrix
 
@@ -12,8 +11,8 @@ rediscovered.
 | Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 46.74 tok/s | 1.56x | Bucketed attention capture, depth-sensitive |
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
-| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 39.10 tok/s | 1.98x | Fixed d1 with small grouping + row-wise verifier router |
-| MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Needs longer confirmation |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 39.42 tok/s | 2.00x | Fixed d1, fused small-M router/grouping |
+| MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Deep CUDA math parity green; needs longer confirmation |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
 ## Adaptive Depth
@@ -42,14 +41,14 @@ Qwen3.6 35B A3B on `rocm:0`, default benchmark lane, 2026-06-04:
 | Case | Decode | Acceptance | Notes |
 |---|---:|---:|---|
 | baseline | 19.72 tok/s | n/a | no MTP |
-| fixed d1 | 39.10 tok/s | 73.44% | best retained lane after small grouping + row-wise verifier router |
-| dynamic max d3 | 37.82 tok/s | 71.21% | demotes to depth 1; near prior fixed d1 |
+| fixed d1 | 39.42 tok/s | 77.34% | best retained lane after fused small-M router/grouping |
+| dynamic max d3 | 37.82 tok/s | 71.21% | demotes to depth 1; retest after next router/expert slice |
 | fixed d2 | 25.18 tok/s | 69.7% | verifier and rollback cost dominate |
 | fixed d3 | 25.90 tok/s | 69.7% | overreaches |
 
-Latest artifact: `benchmark_results/rocm_moe_mtp/20260604T023832Z-8b3300f6-rowwise-router-n64`.
-Stats recorded 1760 calls each for `kernel.rocm_moe_small_prefill_grouping_calls`
-and `kernel.rocm_moe_small_m_rowwise_router_calls`.
+Latest artifact: `benchmark_results/rocm_moe_mtp/20260604T025831Z-74a7043a-fused-smallm-router-n64`.
+Stats recorded 1680 calls each for `kernel.rocm_moe_small_prefill_grouping_calls`
+and `kernel.rocm_moe_small_m_fused_router_calls`.
 
 Router A/B results to avoid repeating:
 
@@ -63,26 +62,22 @@ Router A/B results to avoid repeating:
 
 ## Retained Tuning Actions
 
-- Stabilized ROCm MTP sidecar stream binding and fused sampling ordering.
-- Added hard failures for GPU stages and sampling when an explicit non-null
-  stream is unavailable; regression: `V2_Unit_Static_NoDefaultStreamInGPUCode`.
-- Added stable verifier graph lifetime handling, draft-depth clamping, and
-  batched ROCm verifier-row argmax through declared graph workspace.
-- Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks.
+- Stabilized ROCm MTP sidecar stream binding, fused sampling ordering, stable
+  verifier graph lifetime, and draft-depth clamping.
+- Added explicit non-null GPU stream hard failures; regression:
+  `V2_Unit_Static_NoDefaultStreamInGPUCode`.
+- Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, batched
+  ROCm verifier-row argmax, and GDN verifier-row rollback restore.
 - Kept CUDA verifier projection dispatch on the known-good row-wise route until
   a batched route proves parity and speed.
-- Added GDN verifier-row rollback restore for short-conv and recurrence state.
-- Stabilized MoE prefix fingerprints by excluding transient runtime-table caches.
-- Reinitialized grouped-decode MoE runtime tables after graph-builder reset so
-  cached stages cannot see an inactive decode bank.
-- Fused verifier-sized MoE float-route grouping and M=2 row-wise verifier
-  routing into explicit-stream ROCm paths.
-- Restored prefix terminal logits/hidden through streamful `TransferEngine`
-  uploads before MTP sidecar consumption.
+- Stabilized MoE prefix fingerprints, grouped-decode runtime-table rewarm, and
+  streamful `TransferEngine` terminal-state uploads.
 - Kept ROCm attention param uploads out of HIP capture; captured attention now
-  consumes pre-uploaded workspace params and hard-fails if they are missing.
+  consumes pre-uploaded workspace params and hard-fails if missing.
+- Fused verifier-sized MoE float-route grouping and small-M FP32 gate logits
+  into explicit-stream ROCm kernels.
 
 ## Next Work
 
 MoE ROCm remains the priority: shrink remaining main-verifier expert time and
-then repeat long-lane evidence after the 1.98x fixed-depth ratchet.
+then repeat longer-lane evidence after the 2.00x fixed-depth ratchet.

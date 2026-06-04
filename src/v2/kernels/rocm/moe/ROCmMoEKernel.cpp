@@ -145,6 +145,11 @@ extern "C"
         int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_gate_logits_small_m(
+        const float *hidden, const float *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool hipMoE_gate_logits_single_token_kpart(
         const float *hidden, const float *gate_weights, float *logits,
         float *partials,
@@ -548,7 +553,7 @@ namespace
         }
     }
 
-    bool launchSmallMRowwiseGateLogits(
+    bool launchSmallMGateLogits(
         const float *hidden,
         const void *gate_weights,
         llaminar2::TensorType gate_type,
@@ -569,20 +574,18 @@ namespace
         }
 
         const auto *gate_weights_fp32 = static_cast<const float *>(gate_weights);
-        for (int row = 0; row < seq_len; ++row)
+        if (!hipMoE_gate_logits_small_m(
+                hidden,
+                gate_weights_fp32,
+                logits,
+                seq_len,
+                d_model,
+                num_experts,
+                device_ordinal,
+                stream))
         {
-            if (!launchDecodeGateLogits(
-                    hidden + static_cast<size_t>(row) * d_model,
-                    gate_weights_fp32,
-                    logits + static_cast<size_t>(row) * num_experts,
-                    d_model,
-                    num_experts,
-                    device_ordinal,
-                    stream,
-                    "ROCmMoEKernel::routeCore.small_m_rowwise"))
-            {
-                return false;
-            }
+            LOG_ERROR("[ROCmMoEKernel::routeCore] small-M fused router kernel failed");
+            return false;
         }
 
         return true;
@@ -1391,7 +1394,7 @@ namespace llaminar2
         else if (seq_len >= 2 && seq_len <= 4 && gate_type == TensorType::FP32)
         {
             void *stream = getStream();
-            if (!launchSmallMRowwiseGateLogits(
+            if (!launchSmallMGateLogits(
                     hidden, gate_weights, gate_type, bufs.d_logits,
                     seq_len, d_model, num_experts,
                     device_ordinal_, stream))
@@ -1404,7 +1407,7 @@ namespace llaminar2
             {
                 PerfStatsCollector::addCounter(
                     "kernel",
-                    "rocm_moe_small_m_rowwise_router_calls",
+                    "rocm_moe_small_m_fused_router_calls",
                     1.0,
                     "moe",
                     DeviceId::rocm(device_ordinal_).to_string(),
