@@ -306,6 +306,7 @@ namespace
                 return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
                        tag_equals("swiglu_path", expected_path) &&
                        tag_equals("total_slots", expected_total_slots) &&
+                       tag_equals("activation_quant_rows", std::to_string(seq_len)) &&
                        tag_equals("active_expert_slots", expected_active_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
                        tag_equals("tile_m", expected_tile) &&

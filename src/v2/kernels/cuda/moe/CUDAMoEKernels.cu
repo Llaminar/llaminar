@@ -1142,31 +1142,26 @@ namespace
     // kWarpsPerQuantBlock warps into each CUDA block lets the scheduler run many warps
     // per SM with the same per-warp work, lifting occupancy ~8× with no extra arithmetic.
     static constexpr int kWarpsPerQuantBlock = 8; // 8 warps = 256-thread block
-    __global__ void grouped_prefill_gather_quantize_blockwise_kernel(
+    __global__ void prefill_hidden_quantize_blockwise_kernel(
         const float *__restrict__ hidden,
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
-        const int *__restrict__ grouped_token_indices,
-        int total_slots,
+        int source_tokens,
         int K)
     {
-        const int slot = blockIdx.y;
-        if (slot >= total_slots)
+        const int token = blockIdx.y;
+        if (token >= source_tokens)
             return;
 
-        // Map this thread to (warp, lane); each warp handles a distinct 32-col block.
-        const int warp = threadIdx.x >> 5;  // 0..kWarpsPerQuantBlock-1
-        const int lane = threadIdx.x & 31;  // 0..31
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
         const int block_idx = blockIdx.x * kWarpsPerQuantBlock + warp;
         const int col = block_idx * 32 + lane;
         const int blocks_per_row = (K + 31) / 32;
         if (block_idx >= blocks_per_row || col >= K)
             return;
 
-        const int source_token = grouped_token_indices[slot];
-        const float value = hidden[static_cast<size_t>(source_token) * K + col];
-
-        // Warp-local absmax reduction (each warp owns its own 32-element block).
+        const float value = hidden[static_cast<size_t>(token) * K + col];
         float abs_value = fabsf(value);
 #pragma unroll
         for (int mask = 16; mask > 0; mask >>= 1)
@@ -1174,10 +1169,10 @@ namespace
 
         const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
         if (lane == 0)
-            scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx] = scale;
+            scales_A_blockwise[static_cast<size_t>(token) * blocks_per_row + block_idx] = scale;
 
         const float q = value / scale;
-        A_int8[static_cast<size_t>(slot) * K + col] =
+        A_int8[static_cast<size_t>(token) * K + col] =
             static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
     }
 
@@ -1297,6 +1292,7 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ grouped_token_indices,
         const int *__restrict__ active_expert_ids,
         int active_expert_slots,
         float *__restrict__ gate_output,
@@ -1383,13 +1379,15 @@ namespace
                 const int m = idx >> 3;
                 const int g = idx & 7;
                 const int slot = first_slot + m;
+                const int token = grouped_token_indices[slot];
                 s_a[idx] = reinterpret_cast<const int32_t *>(
-                    A_int8 + static_cast<size_t>(slot) * K + block_idx * 32)[g];
+                    A_int8 + static_cast<size_t>(token) * K + block_idx * 32)[g];
             }
             for (int m = threadIdx.x; m < tokens_in_group; m += kTileN)
             {
                 const int slot = first_slot + m;
-                s_scale[m] = scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx];
+                const int token = grouped_token_indices[slot];
+                s_scale[m] = scales_A_blockwise[static_cast<size_t>(token) * blocks_per_row + block_idx];
             }
             __syncthreads();
 
@@ -1442,6 +1440,7 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ grouped_token_indices,
         const int *__restrict__ active_expert_ids,
         int active_expert_slots,
         int8_t *__restrict__ swiglu_int8,
@@ -1513,13 +1512,15 @@ namespace
                 const int m = idx >> 3;
                 const int g = idx & 7;
                 const int slot = first_slot + m;
+                const int token = grouped_token_indices[slot];
                 s_a[idx] = reinterpret_cast<const int32_t *>(
-                    A_int8 + static_cast<size_t>(slot) * K + block_idx * 32)[g];
+                    A_int8 + static_cast<size_t>(token) * K + block_idx * 32)[g];
             }
             for (int m = threadIdx.x; m < tokens_in_group; m += kTileN)
             {
                 const int slot = first_slot + m;
-                s_scale[m] = scales_A_blockwise[static_cast<size_t>(slot) * blocks_per_row + block_idx];
+                const int token = grouped_token_indices[slot];
+                s_scale[m] = scales_A_blockwise[static_cast<size_t>(token) * blocks_per_row + block_idx];
             }
             __syncthreads();
 
@@ -2101,6 +2102,7 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ grouped_token_indices,
         const int *__restrict__ active_expert_ids,
         int active_expert_slots,
         float *__restrict__ gate_partials,
@@ -2156,9 +2158,10 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * static_cast<size_t>(K);
+        const int token = grouped_token_indices[slot];
+        const int8_t *slot_A = A_int8 + static_cast<size_t>(token) * static_cast<size_t>(K);
         const float *slot_scales = scales_A_blockwise +
-                                   static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row);
+                                   static_cast<size_t>(token) * static_cast<size_t>(blocks_per_row);
         gate_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
             gate_desc, n, slot_A, slot_scales, N, K, b_start, b_end);
         up_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
@@ -3063,6 +3066,7 @@ extern "C"
         int num_experts,
         int d_model,
         int intermediate,
+        int source_tokens,
         int max_tokens_per_expert,
         int total_slots,
         int active_expert_slots,
@@ -3085,7 +3089,8 @@ extern "C"
             !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate || !d_scratch_up ||
             !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out || !d_output ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
-            max_tokens_per_expert <= 0 || total_slots <= 0 ||
+            source_tokens <= 0 || max_tokens_per_expert <= 0 || total_slots <= 0 ||
+            source_tokens > total_slots ||
             active_expert_slots < 0 ||
             (d_model % 32) != 0 || (intermediate % 32) != 0 ||
             !stream)
@@ -3135,15 +3140,16 @@ extern "C"
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         {
-            // One warp per 32-col quant block; pack kWarpsPerQuantBlock warps per CUDA
-            // block so each block covers kWarpsPerQuantBlock*32 columns. grid.x rounds up.
+            // Quantize each source token once. Routed expert slots reuse these rows through
+            // d_group_token_indices in the grouped gate/up kernels, avoiding top-k duplicate
+            // activation quantization during prompt prefill.
             const int blocks_per_row = d_model / 32;
-            dim3 grid((blocks_per_row + kWarpsPerQuantBlock - 1) / kWarpsPerQuantBlock, total_slots);
+            dim3 grid((blocks_per_row + kWarpsPerQuantBlock - 1) / kWarpsPerQuantBlock, source_tokens);
             dim3 block(kWarpsPerQuantBlock * 32);
-            grouped_prefill_gather_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
+            prefill_hidden_quantize_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
                 d_hidden, d_scratch_A_int8, d_scratch_scales,
-                d_group_token_indices, total_slots, d_model);
-            if (!finishLaunch("cudaMoE_grouped_prefill_gather_quantize"))
+                source_tokens, d_model);
+            if (!finishLaunch("cudaMoE_prefill_hidden_quantize"))
                 return false;
         }
 
@@ -3163,12 +3169,14 @@ extern "C"
 #define LAUNCH_GROUPED_GATEUP_PREFILL_TM_TN(CB, TM, TN)                                            \
     grouped_native_vnni_gate_up_prefill_kernel<CB, TM, TN><<<grid, block, 0, cuda_stream>>>(         \
         d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
-        d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
+        d_group_counts, d_group_offsets, d_group_token_indices,                                     \
+        d_active_expert_ids, active_expert_slots,                                                   \
         d_scratch_gate, d_scratch_up, intermediate, d_model)
 #define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM_TN(CB, TM, TN)                                     \
     grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, TN><<<grid, block, 0, cuda_stream>>>(  \
         d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
-        d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
+        d_group_counts, d_group_offsets, d_group_token_indices,                                     \
+        d_active_expert_ids, active_expert_slots,                                                   \
         d_scratch_swiglu_int8, d_scratch_swiglu_scales,                                            \
         intermediate, d_model)
 #define LAUNCH_GROUPED_GATEUP_SWIGLU_KPART_PREFILL(CB)                                             \
@@ -3177,7 +3185,8 @@ extern "C"
                           active_expert_slots * max_tokens_per_expert);                            \
         grouped_native_vnni_gate_up_swiglu_kpart_prefill_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>( \
             d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                 \
-            d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,              \
+            d_group_counts, d_group_offsets, d_group_token_indices,                                 \
+            d_active_expert_ids, active_expert_slots,                                               \
             d_gate_partials, d_up_partials, intermediate, d_model,                                  \
             max_tokens_per_expert, total_slots, gateup_k_partitions);                              \
     } while (0)

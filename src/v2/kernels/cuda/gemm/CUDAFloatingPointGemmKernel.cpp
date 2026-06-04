@@ -31,9 +31,7 @@
 // CUDA memory operations (implemented in CUDAQuantisedGemmKernel_CUTLASS.cu)
 extern "C"
 {
-    bool cudaQuantGemm_allocFloat(float **d_ptr, size_t count, int cuda_device_id);
     bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream);
-    void cudaQuantGemm_freeDevice(void *d_ptr);
 }
 
 namespace llaminar2
@@ -163,12 +161,6 @@ namespace llaminar2
 
         CUDAFloatingPointGemmKernel::~CUDAFloatingPointGemmKernel()
         {
-            if (d_mapped_redirect_)
-            {
-                cudaQuantGemm_freeDevice(d_mapped_redirect_);
-                d_mapped_redirect_ = nullptr;
-                mapped_redirect_capacity_ = 0;
-            }
         }
 
         CUDAFloatingPointGemmKernel::CUDAFloatingPointGemmKernel(CUDAFloatingPointGemmKernel &&other) noexcept
@@ -180,15 +172,11 @@ namespace llaminar2
               K_(other.K_),
               cublas_kernel_(std::move(other.cublas_kernel_)),
               lifetime_owner_(std::move(other.lifetime_owner_)),
-              bound_workspace_(other.bound_workspace_),
-              d_mapped_redirect_(other.d_mapped_redirect_),
-              mapped_redirect_capacity_(other.mapped_redirect_capacity_)
+              bound_workspace_(other.bound_workspace_)
         {
             other.weights_ = nullptr;
             other.d_weights_ = nullptr;
             other.bound_workspace_ = nullptr;
-            other.d_mapped_redirect_ = nullptr;
-            other.mapped_redirect_capacity_ = 0;
         }
 
         CUDAFloatingPointGemmKernel &CUDAFloatingPointGemmKernel::operator=(CUDAFloatingPointGemmKernel &&other) noexcept
@@ -207,14 +195,6 @@ namespace llaminar2
                 other.weights_ = nullptr;
                 other.d_weights_ = nullptr;
                 other.bound_workspace_ = nullptr;
-
-                // Transfer redirect buffer ownership
-                if (d_mapped_redirect_)
-                    cudaQuantGemm_freeDevice(d_mapped_redirect_);
-                d_mapped_redirect_ = other.d_mapped_redirect_;
-                mapped_redirect_capacity_ = other.mapped_redirect_capacity_;
-                other.d_mapped_redirect_ = nullptr;
-                other.mapped_redirect_capacity_ = 0;
             }
             return *this;
         }
@@ -300,15 +280,27 @@ namespace llaminar2
             if (C->isMapped())
             {
                 const size_t needed = static_cast<size_t>(m) * n;
-                if (needed > mapped_redirect_capacity_)
+                const size_t needed_bytes = needed * sizeof(float);
+                DeviceWorkspaceManager *effective_workspace = workspace ? workspace : bound_workspace_;
+                if (!effective_workspace ||
+                    !effective_workspace->hasBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) ||
+                    effective_workspace->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) < needed_bytes)
                 {
-                    if (d_mapped_redirect_)
-                        cudaQuantGemm_freeDevice(d_mapped_redirect_);
-                    cudaQuantGemm_allocFloat(&d_mapped_redirect_, needed, cuda_device_id_);
-                    mapped_redirect_capacity_ = needed;
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] Missing or undersized "
+                              << "declared graph workspace buffer '"
+                              << GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT
+                              << "' for mapped-output redirect. required_bytes="
+                              << needed_bytes);
+                    return false;
                 }
                 d_mapped_output = d_C;
-                d_C = d_mapped_redirect_;
+                d_C = static_cast<float *>(
+                    effective_workspace->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT));
+                if (!d_C)
+                {
+                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_tensor] Mapped-output redirect workspace resolved to null");
+                    return false;
+                }
                 static std::once_flag fp32gemm_mapped_once;
                 std::call_once(fp32gemm_mapped_once, [&]()
                                { LOG_WARN("[CUDAFloatingPointGemmKernel] MAPPED REDIRECT: M=" << m << " N=" << n
@@ -441,8 +433,15 @@ namespace llaminar2
 
             std::vector<const float *> d_B_matrices;
             std::vector<float *> d_C_matrices;
+            std::vector<float *> d_mapped_outputs;
             d_B_matrices.reserve(projections.size());
             d_C_matrices.reserve(projections.size());
+            d_mapped_outputs.reserve(projections.size());
+
+            float *d_mapped_redirect_base = nullptr;
+            const size_t mapped_redirect_stride = static_cast<size_t>(m) * static_cast<size_t>(n);
+            const size_t mapped_redirect_bytes =
+                mapped_redirect_stride * projections.size() * sizeof(float);
 
             for (size_t i = 0; i < projections.size(); ++i)
             {
@@ -477,11 +476,6 @@ namespace llaminar2
                               << i << " output must be FP32");
                     return false;
                 }
-                if (proj.output->isMapped())
-                {
-                    LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Mapped outputs are not supported in graph-captured batched FP32 projection groups");
-                    return false;
-                }
 
                 fp_kernel->setGPUStream(gpu_stream_);
 
@@ -493,12 +487,40 @@ namespace llaminar2
                     return false;
                 }
 
+                float *d_mapped_output = nullptr;
+                if (proj.output->isMapped())
+                {
+                    if (!d_mapped_redirect_base)
+                    {
+                        if (!bound_workspace_->hasBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) ||
+                            bound_workspace_->getBufferSize(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT) < mapped_redirect_bytes)
+                        {
+                            LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Missing or undersized "
+                                      << "declared graph workspace buffer '"
+                                      << GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT
+                                      << "' for batched mapped-output redirect. required_bytes="
+                                      << mapped_redirect_bytes);
+                            return false;
+                        }
+                        d_mapped_redirect_base = static_cast<float *>(
+                            bound_workspace_->getBuffer(GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT));
+                        if (!d_mapped_redirect_base)
+                        {
+                            LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Batched mapped-output redirect workspace resolved to null");
+                            return false;
+                        }
+                    }
+                    d_mapped_output = d_C;
+                    d_C = d_mapped_redirect_base + mapped_redirect_stride * i;
+                }
+
                 d_B_matrices.push_back(static_cast<const float *>(fp_kernel->d_weights_));
                 d_C_matrices.push_back(d_C);
+                d_mapped_outputs.push_back(d_mapped_output);
             }
 
             CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
-            const bool success = cublas_kernel_->execute_batched_same_a(
+            bool success = cublas_kernel_->execute_batched_same_a(
                 d_A,
                 d_B_matrices,
                 d_C_matrices,
@@ -509,6 +531,27 @@ namespace llaminar2
                 true,
                 1.0f,
                 0.0f);
+
+            if (success)
+            {
+                for (size_t i = 0; i < d_mapped_outputs.size(); ++i)
+                {
+                    if (!d_mapped_outputs[i])
+                        continue;
+                    if (!cudaQuantGemm_copyDeviceToDeviceAsync(
+                            d_mapped_outputs[i],
+                            d_C_matrices[i],
+                            mapped_redirect_stride,
+                            cuda_device_id_,
+                            gpu_stream_))
+                    {
+                        LOG_ERROR("[CUDAFloatingPointGemmKernel::multiply_fused_tensor] Failed to copy batched mapped output "
+                                  << i << " from redirect workspace");
+                        success = false;
+                        break;
+                    }
+                }
+            }
 
             if (success && PerfStatsCollector::isEnabled())
             {
@@ -523,6 +566,7 @@ namespace llaminar2
                         {"k", std::to_string(k)},
                         {"n", std::to_string(n)},
                         {"projections", std::to_string(projections.size())},
+                        {"mapped_redirect", d_mapped_redirect_base ? "1" : "0"},
                         {"route", "cublas_batched_same_a"}});
             }
 
@@ -567,7 +611,23 @@ namespace llaminar2
         {
             if (!cublas_kernel_)
                 return WorkspaceRequirements{};
-            return cublas_kernel_->getWorkspaceRequirements(m, n, k);
+            WorkspaceRequirements reqs = cublas_kernel_->getWorkspaceRequirements(m, n, k);
+            if (n == 0)
+                n = static_cast<int>(N_);
+            if (m > 0 && n > 0)
+            {
+                constexpr size_t kMaxBatchedFP32Projections = 8;
+                const size_t redirect_bytes =
+                    kMaxBatchedFP32Projections *
+                    static_cast<size_t>(m) *
+                    static_cast<size_t>(n) *
+                    sizeof(float);
+                reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_FP32_MAPPED_REDIRECT,
+                                        redirect_bytes,
+                                        256,
+                                        true});
+            }
+            return reqs;
         }
 
         void CUDAFloatingPointGemmKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
