@@ -4209,58 +4209,61 @@ TEST(Test__ROCmMoEKernel, SmallMGateLogits_ModelShapeMatchesSingleTokenLaunches)
 {
     SKIP_IF_NO_ROCM();
 
-    constexpr int seq_len = 2;
     constexpr int d_model = 2048;
     constexpr int num_experts = 256;
     const DeviceId device = DeviceId::rocm(0);
 
-    auto hidden = TestTensorFactory::createFP32Random(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
-        -0.5f, 0.5f, 20260606);
     auto gate_weights = TestTensorFactory::createFP32Random(
         {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)},
         -0.5f, 0.5f, 20260607);
-    auto fused_logits = TestTensorFactory::createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
-    auto row_logits = TestTensorFactory::createFP32(
-        {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
-
-    ASSERT_TRUE(hidden->ensureOnDevice(device));
     ASSERT_TRUE(gate_weights->ensureOnDevice(device));
-    ASSERT_TRUE(fused_logits->ensureOnDevice(device));
-    ASSERT_TRUE(row_logits->ensureOnDevice(device));
 
-    hipStream_t stream = nullptr;
-    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
-    ASSERT_TRUE(hipMoE_gate_logits_small_m(
-        static_cast<const float *>(hidden->gpu_data_ptr()),
-        static_cast<const float *>(gate_weights->gpu_data_ptr()),
-        static_cast<float *>(fused_logits->gpu_data_ptr()),
-        seq_len, d_model, num_experts,
-        /*device_idx=*/0,
-        stream));
-    for (int row = 0; row < seq_len; ++row)
+    for (int seq_len : {2, 3, 4})
     {
-        ASSERT_TRUE(hipMoE_gate_logits_single_token(
-            static_cast<const float *>(hidden->gpu_data_ptr()) + static_cast<size_t>(row) * d_model,
+        auto hidden = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(d_model)},
+            -0.5f, 0.5f, 20260606 + seq_len);
+        auto fused_logits = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
+        auto row_logits = TestTensorFactory::createFP32(
+            {static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
+
+        ASSERT_TRUE(hidden->ensureOnDevice(device));
+        ASSERT_TRUE(fused_logits->ensureOnDevice(device));
+        ASSERT_TRUE(row_logits->ensureOnDevice(device));
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+        ASSERT_TRUE(hipMoE_gate_logits_small_m(
+            static_cast<const float *>(hidden->gpu_data_ptr()),
             static_cast<const float *>(gate_weights->gpu_data_ptr()),
-            static_cast<float *>(row_logits->gpu_data_ptr()) + static_cast<size_t>(row) * num_experts,
-            d_model, num_experts,
+            static_cast<float *>(fused_logits->gpu_data_ptr()),
+            seq_len, d_model, num_experts,
             /*device_idx=*/0,
             stream));
+        for (int row = 0; row < seq_len; ++row)
+        {
+            ASSERT_TRUE(hipMoE_gate_logits_single_token(
+                static_cast<const float *>(hidden->gpu_data_ptr()) + static_cast<size_t>(row) * d_model,
+                static_cast<const float *>(gate_weights->gpu_data_ptr()),
+                static_cast<float *>(row_logits->gpu_data_ptr()) + static_cast<size_t>(row) * num_experts,
+                d_model, num_experts,
+                /*device_idx=*/0,
+                stream));
+        }
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+
+        fused_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        row_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+        const float *fused = fused_logits->data();
+        const float *rowwise = row_logits->data();
+
+        float max_abs_diff = 0.0f;
+        for (int i = 0; i < seq_len * num_experts; ++i)
+            max_abs_diff = std::max(max_abs_diff, std::fabs(fused[i] - rowwise[i]));
+        EXPECT_LE(max_abs_diff, 1e-5f) << "seq_len=" << seq_len;
     }
-    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
-
-    fused_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    row_logits->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
-    const float *fused = fused_logits->data();
-    const float *rowwise = row_logits->data();
-
-    float max_abs_diff = 0.0f;
-    for (int i = 0; i < seq_len * num_experts; ++i)
-        max_abs_diff = std::max(max_abs_diff, std::fabs(fused[i] - rowwise[i]));
-    EXPECT_LE(max_abs_diff, 1e-5f);
 }
 
 TEST(Test__ROCmMoEKernel, SmallMFusedRouter_VerifierShapeMatchesHostReference)

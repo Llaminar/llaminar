@@ -59,6 +59,7 @@ MoE A/B results to avoid repeating:
 | K-partition router | 30.13 tok/s | 71.88% | reject |
 | hipBLAS strided-batched M=2..4 router | 30.92-32.08 tok/s | 69.53-74.22% | parity green but slower; reverted |
 | token-dedup grouped-prefill quant | 38.81 tok/s | 74.22% | slower than ratchet; reverted |
+| row-batched router / expert `TILE_M=4` | 40.97 / 41.83 tok/s | 77.34-78.91% | slower than 42.04; reverted |
 
 ## Retained Tuning Actions
 
@@ -80,4 +81,4 @@ MoE A/B results to avoid repeating:
 ## Next Work
 
 MoE ROCm remains the priority: shrink remaining main-verifier router/expert
-time and then repeat longer-lane evidence after the 2.03x fixed-depth ratchet.
+time and then repeat longer-lane evidence after the 2.13x fixed-depth ratchet.
