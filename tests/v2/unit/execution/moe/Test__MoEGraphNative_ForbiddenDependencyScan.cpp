@@ -708,4 +708,62 @@ namespace llaminar2::test
         EXPECT_LT(publish, return_true);
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MoEExpertDecodeRechecksRuntimeBankAfterReset)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path stage_path = root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        ASSERT_TRUE(fs::exists(stage_path)) << stage_path;
+
+        const std::string contents = readFile(stage_path);
+        ASSERT_FALSE(contents.empty()) << stage_path;
+
+        const size_t execute_start = contents.find("bool MoEExpertComputeStage::executeSingleToken(");
+        ASSERT_NE(execute_start, std::string::npos);
+        const size_t execute_end = contents.find("// Snapshot-enabled builds keep legacy routing tensors authoritative",
+                                                 execute_start);
+        ASSERT_NE(execute_end, std::string::npos);
+        const std::string warmup_body = contents.substr(execute_start, execute_end - execute_start);
+
+        const size_t guard = warmup_body.find("!moe_runtime_table_initialized_ || !runtimeTableHasActiveGroupedDecodeBank()");
+        const size_t initialize = warmup_body.find("initializeMoERuntimeTableForGroupedDecode()");
+        ASSERT_NE(guard, std::string::npos)
+            << "Cached MoEExpertComputeStage objects must recheck the active runtime bank; "
+               "request reset clears MoERuntimeTable after stage reset.";
+        ASSERT_NE(initialize, std::string::npos);
+        EXPECT_LT(guard, initialize);
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefixTerminalRestoreUsesStreamfulTransfers)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path orchestrator_path =
+            root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        ASSERT_TRUE(fs::exists(orchestrator_path)) << orchestrator_path;
+
+        const std::string contents = readFile(orchestrator_path);
+        ASSERT_FALSE(contents.empty()) << orchestrator_path;
+
+        const size_t populate_start = contents.find("bool DeviceGraphOrchestrator::populatePrefix(");
+        ASSERT_NE(populate_start, std::string::npos);
+        const size_t populate_end = contents.find("bool DeviceGraphOrchestrator::restorePrefixTerminalState(",
+                                                  populate_start);
+        ASSERT_NE(populate_end, std::string::npos);
+        const std::string populate_body = contents.substr(populate_start, populate_end - populate_start);
+
+        const size_t restore_start = populate_end;
+        const size_t restore_end = contents.find("bool DeviceGraphOrchestrator::harvestPrefix(",
+                                                 restore_start);
+        ASSERT_NE(restore_end, std::string::npos);
+        const std::string restore_body = contents.substr(restore_start, restore_end - restore_start);
+
+        EXPECT_EQ(populate_body.find("TransferEngine::instance().upload("), std::string::npos)
+            << "Prefix populate restores terminal hidden that MTP consumes immediately; use uploadFull(..., stream).";
+        EXPECT_EQ(restore_body.find("TransferEngine::instance().upload("), std::string::npos)
+            << "Terminal logits/hidden restore must be ordered on the explicit graph stream.";
+        EXPECT_NE(populate_body.find("TransferEngine::instance().uploadFull("), std::string::npos);
+        EXPECT_NE(restore_body.find("TransferEngine::instance().uploadFull("), std::string::npos);
+        EXPECT_NE(restore_body.find("explicitGPUStreamForOperation(\"restorePrefixTerminalState\")"),
+                  std::string::npos);
+    }
+
 } // namespace llaminar2::test

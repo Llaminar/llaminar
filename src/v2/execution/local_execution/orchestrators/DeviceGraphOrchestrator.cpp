@@ -5645,9 +5645,10 @@ namespace llaminar2
             state_.prefix_terminal_hidden->mark_host_dirty();
             if (state_.device_id.is_gpu())
             {
-                auto upload = TransferEngine::instance().upload(
+                auto upload = TransferEngine::instance().uploadFull(
                     state_.prefix_terminal_hidden.get(),
-                    state_.device_id);
+                    state_.device_id,
+                    stream);
                 if (!upload.success)
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal hidden: "
@@ -5707,7 +5708,17 @@ namespace llaminar2
         terminal_logits_tensor->mark_host_dirty();
         if (state_.device_id.is_gpu())
         {
-            auto upload = TransferEngine::instance().upload(terminal_logits_tensor, state_.device_id);
+            void *stream = explicitGPUStreamForOperation("restorePrefixTerminalState");
+            if (!stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal logits: "
+                          "missing explicit GPU stream");
+                return false;
+            }
+            auto upload = TransferEngine::instance().uploadFull(
+                terminal_logits_tensor,
+                state_.device_id,
+                stream);
             if (!upload.success)
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal logits: "
@@ -5740,9 +5751,17 @@ namespace llaminar2
             state_.prefix_terminal_hidden->mark_host_dirty();
             if (state_.device_id.is_gpu())
             {
-                auto upload = TransferEngine::instance().upload(
+                void *stream = explicitGPUStreamForOperation("restorePrefixTerminalState");
+                if (!stream)
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal hidden: "
+                              "missing explicit GPU stream");
+                    return false;
+                }
+                auto upload = TransferEngine::instance().uploadFull(
                     state_.prefix_terminal_hidden.get(),
-                    state_.device_id);
+                    state_.device_id,
+                    stream);
                 if (!upload.success)
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] Failed to upload restored prefix terminal hidden: "
