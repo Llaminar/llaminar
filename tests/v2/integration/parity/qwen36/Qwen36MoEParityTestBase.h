@@ -2096,6 +2096,62 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GT(match->count, 0u);
     }
 
+    inline void expectCudaMoEMTPVerifierSharedExpertFusedPrefillPath()
+    {
+        const auto records = PerfStatsCollector::snapshot(
+            {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
+             "kernel.cuda_moe_shared_expert_prefill_group_calls"});
+        auto tag_equals = [](const PerfStatRecord &record,
+                             const char *key,
+                             const char *value) -> bool
+        {
+            const auto it = record.tags.find(key);
+            return it != record.tags.end() && it->second == value;
+        };
+
+        const auto shared_prefill = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
+                       tag_equals(record, "swiglu_path", "fused") &&
+                       tag_equals(record, "tile_m", "2") &&
+                       tag_equals(record, "tile_n", "64") &&
+                       tag_equals(record, "total_slots", "2") &&
+                       tag_equals(record, "active_expert_slots", "1") &&
+                       tag_equals(record, "num_experts", "1") &&
+                       tag_equals(record, "gateup_route", "kpart_swiglu") &&
+                       tag_equals(record, "down_route", "kpart_prefill");
+            });
+
+        ASSERT_NE(shared_prefill, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier shared expert did not exercise "
+            << "the grouped split-K prefill route. Keep the fused shared-expert "
+            << "path correct instead of silently falling back to dense GEMMs.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
+                    "kernel.cuda_moe_shared_expert_prefill_group_calls"});
+        EXPECT_GT(shared_prefill->count, 0u);
+
+        const auto shared_group = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_moe_shared_expert_prefill_group_calls" &&
+                       tag_equals(record, "seq_len", "2") &&
+                       tag_equals(record, "active_expert_slots", "1") &&
+                       tag_equals(record, "top_k", "1");
+            });
+
+        ASSERT_NE(shared_group, records.end())
+            << "CUDA shared expert grouped verifier setup did not run.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_shared_expert_prefill_group_calls"});
+        EXPECT_GT(shared_group->count, 0u);
+    }
+
     inline void expectCudaMoEMTPVerifierRowRestorePreservedReplayState()
     {
         const auto records = PerfStatsCollector::snapshot({"mtp"});

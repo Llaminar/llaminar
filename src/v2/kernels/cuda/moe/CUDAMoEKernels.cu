@@ -953,6 +953,28 @@ namespace
         }
     }
 
+    __global__ void prepare_shared_expert_prefill_group_kernel(
+        int *__restrict__ expert_counts,
+        int *__restrict__ expert_offsets,
+        int *__restrict__ grouped_token_indices,
+        float *__restrict__ grouped_weights,
+        int *__restrict__ active_expert_ids,
+        int seq_len)
+    {
+        const int tid = threadIdx.x;
+        if (tid == 0)
+        {
+            expert_counts[0] = seq_len;
+            expert_offsets[0] = 0;
+            active_expert_ids[0] = 0;
+        }
+        if (tid < seq_len)
+        {
+            grouped_token_indices[tid] = tid;
+            grouped_weights[tid] = 1.0f;
+        }
+    }
+
     __global__ void gather_expert_fixed_kernel(
         const float *__restrict__ hidden,
         float *__restrict__ batch_buffer,
@@ -2608,6 +2630,35 @@ extern "C"
             top_k,
             max_active_experts);
         return finishLaunch("cudaMoE_group_tokens_small_float");
+    }
+
+    bool cudaMoE_prepare_shared_expert_prefill_group(
+        int *expert_counts,
+        int *expert_offsets,
+        int *grouped_token_indices,
+        float *grouped_weights,
+        int *active_expert_ids,
+        int seq_len,
+        int device_idx,
+        void *stream)
+    {
+        if (!stream || !expert_counts || !expert_offsets ||
+            !grouped_token_indices || !grouped_weights || !active_expert_ids ||
+            seq_len <= 0 || seq_len > 64)
+        {
+            std::fprintf(stderr, "[cudaMoE_prepare_shared_expert_prefill_group] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        prepare_shared_expert_prefill_group_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            expert_counts,
+            expert_offsets,
+            grouped_token_indices,
+            grouped_weights,
+            active_expert_ids,
+            seq_len);
+        return finishLaunch("cudaMoE_prepare_shared_expert_prefill_group");
     }
 
     bool cudaMoE_gather_expert_fixed(const float *hidden, float *batch_buffer,

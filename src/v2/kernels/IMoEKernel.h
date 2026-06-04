@@ -767,6 +767,20 @@ namespace llaminar2
         }
 
         /**
+         * @brief Prepare a graph-capturable grouped prefill layout for a shared expert.
+         *
+         * Shared experts are always active for every token and have an implicit
+         * route weight of 1. GPU implementations can populate the same grouping
+         * scratch used by executeGroupedPrefillPipeline() without materializing
+         * synthetic routing tensors. The default returns false.
+         */
+        virtual bool prepareSharedExpertPrefillGroup(int seq_len)
+        {
+            (void)seq_len;
+            return false;
+        }
+
+        /**
          * @brief Execute the full grouped MoE prefill pipeline (graph-capturable).
          *
          * Runs all 5 kernels (gather+quant, gate+up GEMM, SwiGLU+quant,

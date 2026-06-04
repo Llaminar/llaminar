@@ -437,6 +437,7 @@ namespace llaminar2
         void ensureGemmEnginesCached() const;
         bool ensureSharedGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool ensureSharedGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
+        bool tryGroupedVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
 
         mutable int shared_grouped_gateup_desc_table_id_ = -1;

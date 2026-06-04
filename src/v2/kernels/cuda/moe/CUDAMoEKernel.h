@@ -147,6 +147,9 @@ namespace llaminar2
             ITensor *routing_indices, ITensor *routing_weights,
             int seq_len, int num_experts, int top_k) override;
 
+        /// @brief Prepare grouped prefill metadata for the always-active shared expert.
+        bool prepareSharedExpertPrefillGroup(int seq_len) override;
+
         /// @brief Execute fixed-topology grouped MoE prefill without host synchronization.
         bool executeGroupedPrefillPipeline(
             ITensor *hidden, ITensor *output,

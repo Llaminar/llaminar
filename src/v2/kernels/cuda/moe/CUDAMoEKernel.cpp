@@ -294,6 +294,16 @@ extern "C"
         int max_active_experts,
         int device_idx, void *stream);
 
+    bool cudaMoE_prepare_shared_expert_prefill_group(
+        int *expert_counts,
+        int *expert_offsets,
+        int *grouped_token_indices,
+        float *grouped_weights,
+        int *active_expert_ids,
+        int seq_len,
+        int device_idx,
+        void *stream);
+
     bool cudaMoE_gather_expert_fixed(
         const float *hidden, float *batch_buffer,
         const int *expert_offsets, const int *expert_counts,
@@ -2059,6 +2069,50 @@ namespace llaminar2
             return false;
 
         prepared_num_experts_ = num_experts;
+        return true;
+    }
+
+    bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(int seq_len)
+    {
+        if (seq_len <= 0)
+            return false;
+        void *stream = requireStream("CUDAMoEKernel::prepareSharedExpertPrefillGroup");
+        const DeviceId device = deviceId();
+        if (!ensureGroupingBufferCapacity(seq_len, 1))
+            return false;
+
+        if (!setMoEDevice(device_ordinal_, "prepareSharedExpertPrefillGroup"))
+            return false;
+
+        if (!cudaMoE_prepare_shared_expert_prefill_group(
+                d_group_counts_,
+                d_group_offsets_,
+                d_group_token_indices_,
+                d_group_weights_,
+                d_group_active_expert_ids_,
+                seq_len,
+                device_ordinal_,
+                stream))
+        {
+            group_active_expert_slots_ = 0;
+            return false;
+        }
+
+        group_active_expert_slots_ = 1;
+        prepared_num_experts_ = 1;
+        if (PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "cuda_moe_shared_expert_prefill_group_calls",
+                1.0,
+                "moe",
+                device.to_string(),
+                PerfStatsCollector::Tags{
+                    {"seq_len", std::to_string(seq_len)},
+                    {"active_expert_slots", "1"},
+                    {"top_k", "1"}});
+        }
         return true;
     }
 

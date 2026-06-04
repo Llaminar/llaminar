@@ -281,12 +281,15 @@ namespace
         int num_experts,
         int expected_tile_m,
         const char *expected_gateup_route = nullptr,
-        const char *expected_down_route = nullptr)
+        const char *expected_down_route = nullptr,
+        int expected_active_expert_slots = -1)
     {
         const auto records =
             llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
         const std::string expected_path = swiglu_path;
         const std::string expected_total_slots = std::to_string(seq_len * top_k);
+        const std::string expected_active_slots = std::to_string(
+            expected_active_expert_slots >= 0 ? expected_active_expert_slots : seq_len * top_k);
         const std::string expected_num_experts = std::to_string(num_experts);
         const std::string expected_tile = std::to_string(expected_tile_m);
         const std::string expected_tile_n = std::to_string(expected_tile_m <= 2 ? 64 : 128);
@@ -303,7 +306,7 @@ namespace
                 return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
                        tag_equals("swiglu_path", expected_path) &&
                        tag_equals("total_slots", expected_total_slots) &&
-                       tag_equals("active_expert_slots", expected_total_slots) &&
+                       tag_equals("active_expert_slots", expected_active_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
                        tag_equals("tile_m", expected_tile) &&
                        tag_equals("tile_n", expected_tile_n) &&
@@ -1734,6 +1737,199 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_small_prefill_grouping_calls"});
     ASSERT_FALSE(grouping_records.empty())
         << "MTP verifier-sized MoE prefill must keep the compact device grouping route";
+    llaminar2::PerfStatsCollector::reset();
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, SharedExpertVerifierSmallMPrefillM234MatchesDecodeRowsAndCaptures)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedCudaMoEPrefillConfig prefill_config;
+    prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
+    ScopedCudaMoEGemmConfig gemm_config;
+    gemm_config.set(
+        /*gateup_kpart=*/true,
+        /*gateup_kparts=*/16,
+        /*down_kpart=*/true,
+        /*down_kparts=*/16);
+    llaminar2::PerfStatsCollector::reset();
+
+    constexpr int num_experts = 1;
+    constexpr int top_k = 1;
+    constexpr int d_model = 256;
+    constexpr int intermediate = 256;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
+    std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
+    owned_weights.reserve(3);
+    prepared_weights.reserve(3);
+
+    auto add_prepared_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
+    {
+        std::unique_ptr<llaminar2::TensorBase> weight;
+        if (expected_codebook == 13)
+        {
+            weight = llaminar2::test::TestTensorFactory::createIQ2_SRandom(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
+        }
+        else
+        {
+            weight = llaminar2::test::TestTensorFactory::createIQ4_XSRandom(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
+        }
+
+        auto *weight_ptr = weight.get();
+        owned_weights.push_back(std::move(weight));
+        prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
+            weight_ptr,
+            device,
+            std::string("test.cuda_moe.shared_verifier.") + role,
+            llaminar2::ModelContextId{250000 + static_cast<uint64_t>(seed)}));
+
+        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+            << "failed to export native descriptor for shared " << role;
+        EXPECT_EQ(desc.n, rows);
+        EXPECT_EQ(desc.k, cols);
+        EXPECT_EQ(desc.codebook_id, expected_codebook);
+        return desc;
+    };
+
+    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> gate_descs = {
+        add_prepared_desc(intermediate, d_model, 5100, "gate", 13)};
+    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> up_descs = {
+        add_prepared_desc(intermediate, d_model, 5200, "up", 13)};
+    std::array<llaminar2::DeviceNativeVNNIMatrixDesc, num_experts> down_descs = {
+        add_prepared_desc(d_model, intermediate, 5300, "down", 4)};
+
+    const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+    const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+
+    auto make_hidden_values = [](int seq_len)
+    {
+        std::vector<float> values(static_cast<size_t>(seq_len) * d_model);
+        for (size_t i = 0; i < values.size(); ++i)
+        {
+            values[i] =
+                0.011f * static_cast<float>(static_cast<int>(i % 31) - 15) +
+                0.003f * static_cast<float>(static_cast<int>((i / 5) % 13) - 6);
+        }
+        return values;
+    };
+
+    auto expect_shared_group_record = [](int seq_len)
+    {
+        const auto records =
+            llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_shared_expert_prefill_group_calls"});
+        const std::string expected_seq_len = std::to_string(seq_len);
+        const auto it = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const llaminar2::PerfStatRecord &record)
+            {
+                auto tag_equals = [&](const char *key, const std::string &value)
+                {
+                    const auto tag = record.tags.find(key);
+                    return tag != record.tags.end() && tag->second == value;
+                };
+                return record.name == "cuda_moe_shared_expert_prefill_group_calls" &&
+                       tag_equals("seq_len", expected_seq_len) &&
+                       tag_equals("active_expert_slots", "1") &&
+                       tag_equals("top_k", "1");
+            });
+        ASSERT_NE(it, records.end()) << "missing shared expert prefill group counter seq_len="
+                                     << seq_len;
+    };
+
+    for (int seq_len : {2, 3, 4})
+    {
+        const auto hidden_values = make_hidden_values(seq_len);
+        auto hidden = makeTensor({static_cast<size_t>(seq_len), d_model}, hidden_values);
+        auto prefill_output = makeZeros({static_cast<size_t>(seq_len), d_model});
+
+        ASSERT_TRUE(cuda_kernel_->prepareSharedExpertPrefillGroup(seq_len));
+        ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+            hidden.get(), prefill_output.get(), gateup_table, down_table,
+            seq_len, d_model, intermediate, num_experts, top_k));
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+        std::vector<float> prefill_values(
+            prefill_output->data(),
+            prefill_output->data() + prefill_output->numel());
+
+        std::vector<float> rowwise_decode_values;
+        rowwise_decode_values.reserve(prefill_values.size());
+        constexpr int expert_id = 0;
+        constexpr float expert_weight = 1.0f;
+
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const auto row_begin = hidden_values.begin() + static_cast<ptrdiff_t>(row) * d_model;
+            std::vector<float> row_hidden_values(row_begin, row_begin + d_model);
+            auto row_hidden = makeTensor({1, d_model}, row_hidden_values);
+            auto gate = makeZeros({intermediate});
+            auto up = makeZeros({intermediate});
+            auto decode_output = makeZeros({d_model});
+
+            std::array<llaminar2::ITensor *, top_k> gate_outputs = {gate.get()};
+            std::array<llaminar2::ITensor *, top_k> up_outputs = {up.get()};
+
+            ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
+                row_hidden.get(), &expert_id, gateup_table, top_k,
+                gate_outputs.data(), up_outputs.data(), d_model, intermediate));
+            ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
+                gate_outputs.data(), up_outputs.data(), &expert_id, &expert_weight,
+                down_table, top_k, decode_output.get(), d_model, intermediate));
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+            rowwise_decode_values.insert(
+                rowwise_decode_values.end(),
+                decode_output->data(),
+                decode_output->data() + decode_output->numel());
+        }
+
+        expectVectorsClose(prefill_values, rowwise_decode_values, 0.990, 0.08);
+
+        ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+        const bool captured_grouping = cuda_kernel_->prepareSharedExpertPrefillGroup(seq_len);
+        const bool captured_prefill = cuda_kernel_->executeGroupedPrefillPipeline(
+            hidden.get(), prefill_output.get(), gateup_table, down_table,
+            seq_len, d_model, intermediate, num_experts, top_k);
+        cudaGraph_t graph = nullptr;
+        const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
+        EXPECT_TRUE(captured_grouping);
+        EXPECT_TRUE(captured_prefill);
+        ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
+        ASSERT_NE(graph, nullptr);
+
+        cudaGraphExec_t executable = nullptr;
+        ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+        ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+        ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+
+        expect_shared_group_record(seq_len);
+        expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts,
+                                      seq_len == 2 ? 2 : 4,
+                                      "kpart_swiglu",
+                                      "kpart_prefill",
+                                      /*expected_active_expert_slots=*/1);
+    }
+
     llaminar2::PerfStatsCollector::reset();
 #endif
 }

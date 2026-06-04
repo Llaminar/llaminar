@@ -2389,6 +2389,42 @@ namespace llaminar2
         return true;
     }
 
+    bool SharedExpertFFNStage::tryGroupedVerifierPrefill(
+        IMoEKernel *kernel, int d_model, int intermediate) const
+    {
+        if (!params_.device_id.is_cuda() ||
+            params_.seq_len <= 1 ||
+            params_.seq_len > 4 ||
+            !supportsGroupedPrefillExecutionBackend(params_.device_id))
+        {
+            return false;
+        }
+
+        if (!ensureSharedGroupedGateUpDescriptorTable(kernel, d_model, intermediate) ||
+            !ensureSharedGroupedDownDescriptorTable(kernel, d_model, intermediate))
+        {
+            LOG_ERROR("[SharedExpertFFNStage] CUDA verifier-sized shared expert requires native grouped descriptor tables");
+            return false;
+        }
+
+        if (!kernel->prepareSharedExpertPrefillGroup(params_.seq_len))
+        {
+            LOG_ERROR("[SharedExpertFFNStage] CUDA shared expert grouped prefill setup failed");
+            return false;
+        }
+
+        return kernel->executeGroupedPrefillPipeline(
+            params_.input,
+            params_.output,
+            shared_grouped_gateup_desc_table_id_,
+            shared_grouped_down_desc_table_id_,
+            params_.seq_len,
+            d_model,
+            intermediate,
+            /*num_experts=*/1,
+            /*top_k=*/1);
+    }
+
     bool SharedExpertFFNStage::tryGroupedDecode(
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
@@ -2473,6 +2509,22 @@ namespace llaminar2
         }
 
         IMoEKernel *kernel = ensureMoEKernel();
+        const bool cuda_verifier_shared_prefill =
+            params_.device_id.is_cuda() &&
+            seq_len > 1 &&
+            seq_len <= 4 &&
+            supportsGroupedPrefillExecutionBackend(params_.device_id);
+        if (cuda_verifier_shared_prefill)
+        {
+            if (!tryGroupedVerifierPrefill(kernel, d_model, intermediate))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] CUDA verifier grouped shared expert path failed");
+                return false;
+            }
+            markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
+            return true;
+        }
+
         if (tryGroupedDecode(kernel, d_model, intermediate))
         {
             markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
