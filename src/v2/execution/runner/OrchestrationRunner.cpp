@@ -2061,10 +2061,12 @@ namespace llaminar2
             }
             PerfStatsCollector::addCounter("mtp", "verifier_terminal_token_batch_hits", 1.0, "decode");
 
-            if (!runner_->commitMTPShiftedRowsFromLastForward(
+            if (!runner_->commitMTPShiftedRowsFromPartialForward(
                     accepted_tokens.data(),
                     static_cast<int>(accepted_tokens.size()),
-                    /*already_appended_tokens=*/1))
+                    /*already_appended_tokens=*/1,
+                    /*main_forward_token_count=*/static_cast<int>(accepted_tokens.size()),
+                    /*allow_speculative_discard=*/true))
             {
                 return fail_after_checkpoint("MTP shifted-cache commit failed after accepted verifier");
             }

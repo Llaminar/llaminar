@@ -300,6 +300,11 @@ namespace llaminar2
          * current hidden buffer may cover fewer rows than the logical token
          * span used to compute the shifted-cache position. Callers can pass an
          * explicit position_offset_override to keep those contracts separate.
+         *
+         * Set allow_speculative_discard only when the current MTP sidecar cache
+         * is known to contain speculative rows produced by verifier-owned draft
+         * steps. Generic callers should leave it false so unexpected extra rows
+         * remain a hard failure.
          */
         virtual bool commitMTPShiftedRowsFromPartialForward(
             const int32_t *tokens,

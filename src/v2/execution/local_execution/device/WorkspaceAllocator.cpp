@@ -141,8 +141,11 @@ namespace llaminar2
         // Per-layer GEMM workspace uses full max_seq_len (prefill processes all tokens)
         const size_t mk_overhead = static_cast<size_t>(max_seq_len) * static_cast<size_t>(d_model) * sizeof(float) * 2;
         const size_t padded_n_buffer = 8ULL * static_cast<size_t>(vocab_size) * sizeof(float);
-        const size_t embed_table_temp = static_cast<size_t>(vocab_size) * static_cast<size_t>(d_model) * sizeof(float);
-        const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer + embed_table_temp;
+        // Prepared embedding weights live in their own device allocation. The
+        // large embed_table_temp workspace is requested by the embedding kernel
+        // only for fallback/test paths without prepared weights, so it must not
+        // inflate every production graph's baseline workspace floor.
+        const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer;
         const size_t safety_margin = base_workspace / 10;
         const size_t min_budget = 768ULL * 1024 * 1024;
         return std::max(min_budget, base_workspace + safety_margin);

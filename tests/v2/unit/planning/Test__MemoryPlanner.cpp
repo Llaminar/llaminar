@@ -63,6 +63,32 @@ namespace
         return p;
     }
 
+    ModelMemoryProfile createQwen36DenseLikeProfile(size_t device_weight_bytes)
+    {
+        ModelMemoryProfile p;
+        p.architecture = "qwen3.6";
+        p.n_layers = 65;
+        p.d_model = 5120;
+        p.d_ff = 27648;
+        p.n_heads = 40;
+        p.n_kv_heads = 8;
+        p.head_dim = 128;
+        p.vocab_size = 151936;
+        p.max_seq_len = 4096;
+        p.total_native_bytes = device_weight_bytes;
+
+        TensorSizeInfo t;
+        t.name = "synthetic_dense_weights";
+        t.quant_type = "F32";
+        t.elements = device_weight_bytes / 4;
+        t.K = 1;
+        t.native_bytes = t.elements * 4;
+        t.layer_index = -1;
+        p.tensors.push_back(t);
+
+        return p;
+    }
+
 } // anonymous namespace
 
 TEST(Test__MemoryPlanner, SingleGPU_Fits)
@@ -86,6 +112,31 @@ TEST(Test__MemoryPlanner, SingleGPU_Fits)
     EXPECT_GT(plan.devices[0].workspace_bytes, 0u);
     EXPECT_TRUE(plan.devices[0].fits());
     EXPECT_TRUE(plan.fits());
+}
+
+TEST(Test__MemoryPlanner, Qwen36DenseLike_UsesTerminalLogitsAndPreparedEmbeddingWorkspace)
+{
+    constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    const size_t qwen36_dense_weight_bytes = static_cast<size_t>(16.3 * static_cast<double>(GiB));
+    auto profile = createQwen36DenseLikeProfile(qwen36_dense_weight_bytes);
+
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::cuda(0);
+    cfg.device_total_bytes = 24ULL * GiB;
+    cfg.device_free_bytes = static_cast<size_t>(23.3 * static_cast<double>(GiB));
+    cfg.batch_size = 1;
+    cfg.max_seq_len = 4096;
+    cfg.kv_precision = "fp16";
+
+    auto plan = MemoryPlanner::plan(profile, {cfg});
+
+    ASSERT_EQ(plan.devices.size(), 1u);
+    const auto &device_plan = plan.devices.front();
+    EXPECT_TRUE(device_plan.fits()) << plan.renderTable();
+    EXPECT_LT(device_plan.activation_bytes, 2ULL * GiB)
+        << "normal prefill must not reserve full-context all-position logits";
+    EXPECT_EQ(device_plan.workspace_bytes, 768ULL * 1024ULL * 1024ULL)
+        << "prepared embedding runs must not reserve vocab-by-hidden fallback workspace";
 }
 
 TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)

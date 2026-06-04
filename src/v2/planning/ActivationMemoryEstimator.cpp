@@ -29,6 +29,7 @@ size_t ActivationMemoryEstimator::estimate(
     size_t HK = static_cast<size_t>(n_kv_heads);
     size_t HD = static_cast<size_t>(head_dim);
     size_t V = static_cast<size_t>(vocab_size);
+    (void)device;
 
     // All sizes in bytes (FP32 = 4 bytes per element unless noted)
     constexpr size_t FP32 = 4;
@@ -55,8 +56,10 @@ size_t ActivationMemoryEstimator::estimate(
     // FFN down output (reuses hidden state buffer in practice, but count it)
     size_t ffn_down = B * S * D * FP32;
 
-    // Logits: B × S × V (only during prefill for full sequence, 1 token during decode)
-    size_t logits = B * S * V * FP32;
+    // Normal prefill/decode LM head computes only the selected terminal row.
+    // Full-sequence verifier logits are an opt-in MTP path with small verifier
+    // row counts; the baseline plan must not reserve B × S × vocab.
+    size_t logits = B * V * FP32;
 
     // Norm scratch: B × S × D (for RMS norm intermediates)
     size_t norm_scratch = B * S * D * FP32;
@@ -69,7 +72,7 @@ size_t ActivationMemoryEstimator::estimate(
     // Conservative estimate: count all non-aliasable concurrent buffers.
     // During attention: hidden_state + residual + Q + K + V + attn_output + norm
     // During FFN: hidden_state + residual + gate + up + ffn_down + norm
-    // During LM head: hidden_state + logits
+    // During LM head: hidden_state + one terminal logits row
     //
     // Peak is max of these phases:
     size_t attn_phase = hidden_state + residual + q_proj + k_proj + v_proj + attn_output + norm_scratch;
