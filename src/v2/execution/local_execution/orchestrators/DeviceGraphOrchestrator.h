@@ -1500,7 +1500,8 @@ namespace llaminar2
             int token_count,
             int already_appended_tokens,
             int main_forward_token_count,
-            bool allow_speculative_discard = false) override;
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;

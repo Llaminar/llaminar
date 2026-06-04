@@ -250,12 +250,14 @@ namespace
             int token_count,
             int already_appended_tokens,
             int main_forward_token_count,
-            bool allow_speculative_discard = false) override
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override
         {
             commit_mtp_shifted_count_++;
             last_commit_mtp_already_appended_ = already_appended_tokens;
             last_commit_mtp_main_forward_token_count_ = main_forward_token_count;
             last_commit_mtp_allow_speculative_discard_ = allow_speculative_discard;
+            last_commit_mtp_position_offset_override_ = position_offset_override;
             last_commit_mtp_tokens_.clear();
             if (tokens && token_count > 0)
             {
@@ -593,6 +595,7 @@ namespace
         int lastCommitMTPAlreadyAppended() const { return last_commit_mtp_already_appended_; }
         int lastCommitMTPMainForwardTokenCount() const { return last_commit_mtp_main_forward_token_count_; }
         bool lastCommitMTPAllowSpeculativeDiscard() const { return last_commit_mtp_allow_speculative_discard_; }
+        int lastCommitMTPPositionOffsetOverride() const { return last_commit_mtp_position_offset_override_; }
         const std::vector<int> &lastCommitMTPTokens() const { return last_commit_mtp_tokens_; }
         int sampleMainLogitsCount() const { return sample_main_logits_count_; }
         int sampleDeviceCount() const { return sample_device_count_; }
@@ -956,6 +959,7 @@ namespace
         int restore_verifier_row_count_{0};
         int last_commit_mtp_already_appended_{0};
         int last_commit_mtp_main_forward_token_count_{0};
+        int last_commit_mtp_position_offset_override_{-1};
         int last_verifier_restore_row_{-1};
         int last_verifier_restore_target_tokens_{-1};
         int sample_main_logits_count_{0};
@@ -1785,10 +1789,11 @@ namespace
             EXPECT_FALSE(mock->verifierRestoreAfterCheckpointRestore());
             EXPECT_EQ(mock->lastVerifierRestoreRow(), 1);
             EXPECT_EQ(mock->lastVerifierRestoreTargetTokens(), 7);
-            EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
-            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
-            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 2);
+            EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 2);
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
             EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
             EXPECT_THAT(mock->lastCommitMTPTokens(),
                         ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                     MockInferenceRunner::MTP_ARGMAX_TOKEN,
@@ -2238,6 +2243,7 @@ namespace
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
             EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
                 << "the fast path should restore verifier row 0 and replay only the correction suffix";
             EXPECT_THAT(mock->forwardHistory(),
@@ -2275,10 +2281,10 @@ namespace
         PerfStatsCollector::reset();
     }
 
-    TEST_F(Test__PrefillDecodeTransition, CUDAMTPForcedRejectSkipsVerifierRowShortcutAndFullyReplays)
+    TEST_F(Test__PrefillDecodeTransition, CUDAMTPForcedRejectUsesVerifierRowShortcutAndCommitsSuffixAfterReplay)
     {
         const std::filesystem::path export_path =
-            std::filesystem::temp_directory_path() / "llaminar_cuda_mtp_verifier_row_shortcut_gate_unit.json";
+            std::filesystem::temp_directory_path() / "llaminar_cuda_mtp_verifier_row_shortcut_unit.json";
         {
             ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
             PerfStatsCollector::reset();
@@ -2302,43 +2308,46 @@ namespace
             EXPECT_THAT(step1.tokens,
                         ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                     MockInferenceRunner::VERIFY_REJECT_TOKEN));
-            EXPECT_EQ(mock->restoreVerifierRowCount(), 0)
-                << "CUDA verifier-row state equivalence is not yet proven, so the shortcut must not run";
-            EXPECT_EQ(mock->restoreCount(), 1);
+            EXPECT_EQ(mock->restoreVerifierRowCount(), 1);
+            EXPECT_FALSE(mock->verifierRestoreAfterCheckpointRestore());
+            EXPECT_EQ(mock->lastVerifierRestoreRow(), 0);
+            EXPECT_EQ(mock->lastVerifierRestoreTargetTokens(), 6);
+            EXPECT_EQ(mock->restoreCount(), 0);
             EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
-            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 2);
-            EXPECT_FALSE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
+            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
             EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
-                << "the verifier forward should be followed by one full replay over both returned tokens";
+                << "the verifier forward should be followed by one suffix replay";
             EXPECT_THAT(mock->lastForwardTokens(),
-                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
-                                    MockInferenceRunner::VERIFY_REJECT_TOKEN));
+                        ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *shortcut =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
                                "rollback_verifier_state_row_shortcuts");
-            EXPECT_EQ(shortcut, nullptr);
-
-            const PerfStatRecord *unavailable =
-                findPerfRecordWithTags(records,
-                                       PerfStatRecord::Kind::Counter,
-                                       "rollback_verifier_state_row_shortcut_unavailable",
-                                       {{"reason", "cuda_verifier_row_state_equivalence_unverified"}});
-            ASSERT_NE(unavailable, nullptr);
-            EXPECT_DOUBLE_EQ(unavailable->value, 1.0);
+            ASSERT_NE(shortcut, nullptr);
+            EXPECT_DOUBLE_EQ(shortcut->value, 1.0);
 
             const PerfStatRecord *replay_tokens =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
-            ASSERT_NE(replay_tokens, nullptr);
-            EXPECT_DOUBLE_EQ(replay_tokens->value, 2.0);
+            EXPECT_EQ(replay_tokens, nullptr);
 
             const PerfStatRecord *replay_forward =
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "replay_forward");
-            ASSERT_NE(replay_forward, nullptr);
-            EXPECT_EQ(replay_forward->count, 1u);
+            EXPECT_EQ(replay_forward, nullptr);
+
+            const PerfStatRecord *suffix_tokens =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "verifier_state_row_replay_suffix_tokens");
+            ASSERT_NE(suffix_tokens, nullptr);
+            EXPECT_DOUBLE_EQ(suffix_tokens->value, 1.0);
+
+            const PerfStatRecord *suffix_forward =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "verifier_state_row_replay_suffix_forward");
+            ASSERT_NE(suffix_forward, nullptr);
+            EXPECT_EQ(suffix_forward->count, 1u);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

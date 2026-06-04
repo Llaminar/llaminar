@@ -2296,7 +2296,8 @@ namespace llaminar2
         int token_count,
         int already_appended_tokens,
         int main_forward_token_count,
-        bool allow_speculative_discard)
+        bool allow_speculative_discard,
+        int position_offset_override)
     {
         PerfStatsCollector::ScopedTimer total_timer(
             "mtp",
@@ -2327,7 +2328,8 @@ namespace llaminar2
                        token_count,
                        already_appended_tokens,
                        main_forward_token_count,
-                       allow_speculative_discard);
+                       allow_speculative_discard,
+                       position_offset_override);
         }
 
         if (!tp_worker_pool_)
@@ -2359,6 +2361,7 @@ namespace llaminar2
             tp_worker_pool_->dispatch(
                 [this, &committed_tokens, token_count, already_appended_tokens,
                  main_forward_token_count, allow_speculative_discard,
+                 position_offset_override,
                  kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
                 {
                     KernelProfiler::setCurrentPhase(kernel_phase);
@@ -2387,7 +2390,8 @@ namespace llaminar2
                                         token_count,
                                         already_appended_tokens,
                                         main_forward_token_count,
-                                        allow_speculative_discard);
+                                        allow_speculative_discard,
+                                        position_offset_override);
 
                     if (debugEnv().tp_collective_contract_trace)
                     {

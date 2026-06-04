@@ -4554,7 +4554,8 @@ namespace llaminar2
         int token_count,
         int already_appended_tokens,
         int main_forward_token_count,
-        bool allow_speculative_discard)
+        bool allow_speculative_discard,
+        int position_offset_override)
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
@@ -4589,12 +4590,16 @@ namespace llaminar2
             return false;
         }
 
-        const int position_offset = state_.positions[0] - main_forward_token_count;
+        const int position_offset =
+            position_offset_override >= 0
+                ? position_offset_override
+                : state_.positions[0] - main_forward_token_count;
         if (position_offset < 0)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Invalid MTP shifted-row commit position_offset="
                       << position_offset << " token_count=" << token_count
-                      << " main_forward_token_count=" << main_forward_token_count);
+                      << " main_forward_token_count=" << main_forward_token_count
+                      << " override=" << position_offset_override);
             return false;
         }
 

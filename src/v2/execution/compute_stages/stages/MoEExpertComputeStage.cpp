@@ -857,10 +857,14 @@ namespace llaminar2
         if (supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.moe_runtime_table && params_.layer_idx >= 0 && !moe_runtime_layer_)
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+        const bool runtime_decode_bank_was_active_before_expert_stage =
+            supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+            moe_runtime_layer_ &&
+            runtimeTableHasActiveGroupedDecodeBank();
         if (supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
-            (!moe_runtime_table_initialized_ || !runtimeTableHasActiveGroupedDecodeBank()))
+            (!moe_runtime_table_initialized_ || !runtime_decode_bank_was_active_before_expert_stage))
         {
-            moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank() ||
+            moe_runtime_table_initialized_ = runtime_decode_bank_was_active_before_expert_stage ||
                                              initializeMoERuntimeTableForGroupedDecode();
         }
 
@@ -875,7 +879,7 @@ namespace llaminar2
             params_.moe_runtime_table &&
             moe_runtime_layer_ &&
             moe_runtime_table_initialized_ &&
-            runtimeTableHasActiveGroupedDecodeBank() &&
+            runtime_decode_bank_was_active_before_expert_stage &&
             top_k > 0 && top_k <= 16 &&
             params_.replica_set.num_replicated == 0 &&
             hasFullLocalExpertOwnership() &&

@@ -1179,6 +1179,13 @@ namespace llaminar2
         {
             first_token = *ready_sampled_token;
             PerfStatsCollector::addCounter("mtp", "first_token_ready_cache_hits", 1.0, "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "first_token_ready_cache_token",
+                1.0,
+                "decode",
+                {},
+                {{"token", std::to_string(first_token)}});
         }
         else
         {
@@ -1877,11 +1884,21 @@ namespace llaminar2
             {
                 return fail_after_checkpoint("All-position logits unavailable after MTP verification");
             }
+            const int32_t draft_token = draft_tokens[static_cast<size_t>(draft_idx)];
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "greedy_verifier_token",
+                1.0,
+                "decode",
+                {},
+                {{"row", std::to_string(row)},
+                 {"draft_token", std::to_string(draft_token)},
+                 {"verified_token", std::to_string(verified_token)}});
             verifier_tokens.push_back(verified_token);
 
-            if (verified_token == draft_tokens[static_cast<size_t>(draft_idx)])
+            if (verified_token == draft_token)
             {
-                accepted_tokens.push_back(draft_tokens[static_cast<size_t>(draft_idx)]);
+                accepted_tokens.push_back(draft_token);
                 ++accepted_speculative_prefix;
                 continue;
             }
@@ -2104,31 +2121,18 @@ namespace llaminar2
             rollback_recorded = true;
         };
 
-        const bool verifier_row_shortcut_backend_supported =
-            !runner_->primaryDeviceId().is_cuda();
         const bool verifier_row_shortcut_candidate =
             (rejected_speculative_token || partial_verifier_commit_without_reject) &&
             accepted_verifier_input_count > 0 &&
             accepted_verifier_input_count < static_cast<int>(draft_tokens.size()) &&
             accepted_verifier_input_count <= static_cast<int>(accepted_tokens.size());
-        if (verifier_row_shortcut_candidate &&
-            !verifier_row_shortcut_backend_supported)
-        {
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "rollback_verifier_state_row_shortcut_unavailable",
-                1.0,
-                "decode",
-                {},
-                {{"reason", "cuda_verifier_row_state_equivalence_unverified"}});
-        }
 
-        if (verifier_row_shortcut_candidate &&
-            verifier_row_shortcut_backend_supported)
+        if (verifier_row_shortcut_candidate)
         {
             const int verifier_restore_row = accepted_verifier_input_count - 1;
             const int target_cached_tokens =
                 replay_checkpoint.cached_tokens + accepted_verifier_input_count;
+            const int shortcut_position_offset = replay_checkpoint.cached_tokens;
             bool restored_verifier_state = false;
             {
                 PerfStatsCollector::ScopedTimer timer(
@@ -2156,15 +2160,19 @@ namespace llaminar2
                      {"main_forward_token_count", std::to_string(accepted_verifier_input_count)},
                      {"reason", rejected_speculative_token ? "reject" : "partial_commit"}});
 
-                if (!runner_->commitMTPShiftedRowsFromPartialForward(
-                        accepted_tokens.data(),
-                        static_cast<int>(accepted_tokens.size()),
-                        already_appended_for_output,
-                        accepted_verifier_input_count,
-                        /*allow_speculative_discard=*/true))
+                if (accepted_verifier_input_count > already_appended_for_output)
                 {
-                    result.error = "MTP shifted-cache commit failed after verifier-row restore";
-                    return result;
+                    if (!runner_->commitMTPShiftedRowsFromPartialForward(
+                            accepted_tokens.data(),
+                            accepted_verifier_input_count,
+                            already_appended_for_output,
+                            accepted_verifier_input_count,
+                            /*allow_speculative_discard=*/true,
+                            shortcut_position_offset))
+                    {
+                        result.error = "MTP shifted-cache prefix commit failed after verifier-row restore";
+                        return result;
+                    }
                 }
 
                 const int suffix_start = accepted_verifier_input_count;
@@ -2175,6 +2183,7 @@ namespace llaminar2
                     result.error = "MTP verifier-row restore selected an invalid replay suffix";
                     return result;
                 }
+                std::optional<int32_t> shortcut_ready_token;
                 if (suffix_count > 0)
                 {
                     PerfStatsCollector::addCounter(
@@ -2197,10 +2206,74 @@ namespace llaminar2
                         result.error = "Forward pass failed during MTP verifier-row replay suffix";
                         return result;
                     }
+
+                    if (!stochastic_verify &&
+                        !use_sampling_penalties &&
+                        active_sampling_params_.is_greedy())
+                    {
+                        int32_t next_ready_token = -1;
+                        {
+                            PerfStatsCollector::ScopedTimer timer(
+                                "mtp",
+                                "verifier_state_row_suffix_ready_sample",
+                                "decode");
+                            next_ready_token = runner_->sampleGreedyOnDevice();
+                        }
+                        if (next_ready_token < 0)
+                        {
+                            const float *main_logits = runner_->logits();
+                            if (main_logits)
+                            {
+                                PerfStatsCollector::ScopedTimer timer(
+                                    "mtp",
+                                    "verifier_state_row_suffix_ready_sample_host",
+                                    "decode");
+                                next_ready_token = sampler_.sample(
+                                    main_logits,
+                                    static_cast<size_t>(vocab),
+                                    active_sampling_params_);
+                            }
+                        }
+                        if (next_ready_token < 0)
+                        {
+                            result.error =
+                                "MTP verifier-row shortcut could not sample suffix-ready logits";
+                            return result;
+                        }
+                        shortcut_ready_token = next_ready_token;
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "verifier_state_row_suffix_ready_samples",
+                            1.0,
+                            "decode");
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "verifier_state_row_suffix_ready_token",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"token", std::to_string(next_ready_token)}});
+                    }
+
+                    if (!runner_->commitMTPShiftedRowsFromPartialForward(
+                            accepted_tokens.data(),
+                            static_cast<int>(accepted_tokens.size()),
+                            accepted_verifier_input_count,
+                            suffix_count,
+                            /*allow_speculative_discard=*/true,
+                            shortcut_position_offset))
+                    {
+                        result.error = "MTP shifted-cache suffix commit failed after verifier-row replay";
+                        return result;
+                    }
                 }
 
                 prefill_logits_ready_ = suffix_count > 0;
-                if (!prefill_logits_ready_)
+                if (prefill_logits_ready_ && shortcut_ready_token.has_value())
+                {
+                    ready_sampled_token_ = *shortcut_ready_token;
+                }
+                else
                 {
                     ready_sampled_token_.reset();
                 }

@@ -3,6 +3,7 @@
 #include "Qwen36DenseParityTestBase.h"
 #include "backends/BackendManager.h"
 #include "backends/HardwareInventory.h"
+#include "execution/factory/InferenceRunnerFactory.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
 #include "kernels/KernelFactory.h"
 #include "utils/DebugEnv.h"
@@ -2045,7 +2046,141 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_EQ(mtp_tokens, reference_tokens)
             << "benchmark-style skip-gather decode diverged"
             << "\nreference tokens: " << joinTokensMoEDiagnostic(reference_tokens)
-            << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
+              << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
+    }
+
+    inline void runMoEMTPVerifierRowShortcutEquivalence(
+        const MoEPrefixRestoreParityCase &test_case)
+    {
+        ScopedMoEParityDeterministicMode deterministic_mode(
+            shouldUseMoEParityDeterministicMode(test_case));
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        ASSERT_GE(expected_tokens.size(), 3u);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        // This is a production decode-state contract test, not a snapshot
+        // capture test. Keep normal GPU allocations so CUDA verifier-row
+        // restore cannot be masked by mapped-memory behavior.
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+        config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
+
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            DeviceId::cuda(0),
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        const int32_t first_token = runner->sampleGreedyOnDevice();
+        ASSERT_GE(first_token, 0);
+        ASSERT_EQ(first_token, expected_tokens[0])
+            << "The verifier-row shortcut equivalence test relies on the long "
+            << "benchmark prompt's first generated token.";
+
+        int32_t draft_token = -1;
+        ASSERT_TRUE(runner->forwardMTPAndSampleGreedy(first_token, &draft_token));
+        ASSERT_GE(draft_token, 0);
+        ASSERT_TRUE(runner->flushPendingMTPWork());
+
+        const PrefixStateSnapshot replay_checkpoint = runner->captureLivePrefixCheckpoint();
+        ASSERT_TRUE(replay_checkpoint.valid);
+        ASSERT_EQ(replay_checkpoint.cached_tokens, static_cast<int>(prompt_tokens.size()));
+
+        const int32_t verifier_tokens[2] = {first_token, draft_token};
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_tokens, 2));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+
+        int32_t sampled_verifier_tokens[2] = {-1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            2,
+            sampled_verifier_tokens));
+        ASSERT_EQ(sampled_verifier_tokens[0], expected_tokens[1])
+            << "verifier row 0 should provide the correction token for the "
+            << "benchmark-prompt draft=1 reject path"
+            << "\ndraft token: " << draft_token
+            << "\nverifier rows: "
+            << sampled_verifier_tokens[0] << ','
+            << sampled_verifier_tokens[1];
+        ASSERT_NE(sampled_verifier_tokens[0], draft_token)
+            << "This regression must exercise the reject/rollback shortcut path.";
+
+        const int target_cached_tokens = replay_checkpoint.cached_tokens + 1;
+        ASSERT_TRUE(runner->restoreMTPVerifierStateRow(0, target_cached_tokens));
+        const int32_t correction_token = sampled_verifier_tokens[0];
+        const int32_t accepted_tokens[2] = {first_token, correction_token};
+        ASSERT_TRUE(runner->forward(&correction_token, 1));
+        const int32_t shortcut_next_token_before_commit = runner->sampleGreedyOnDevice();
+        ASSERT_GE(shortcut_next_token_before_commit, 0);
+        ASSERT_TRUE(runner->commitMTPShiftedRowsFromPartialForward(
+            accepted_tokens,
+            2,
+            /*already_appended_tokens=*/1,
+            /*main_forward_token_count=*/1,
+            /*allow_speculative_discard=*/true,
+            replay_checkpoint.cached_tokens));
+        const int32_t shortcut_next_token_after_commit = runner->sampleGreedyOnDevice();
+        ASSERT_GE(shortcut_next_token_after_commit, 0);
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(replay_checkpoint));
+        ASSERT_TRUE(runner->forward(accepted_tokens, 2));
+        const int32_t full_replay_next_token = runner->sampleGreedyOnDevice();
+        ASSERT_GE(full_replay_next_token, 0);
+
+        EXPECT_EQ(full_replay_next_token, expected_tokens[2])
+            << "full replay should match the PyTorch benchmark-prompt reference";
+        EXPECT_EQ(shortcut_next_token_before_commit, full_replay_next_token)
+            << "restoring CUDA verifier row 0 from a two-row verifier forward "
+            << "must be equivalent to replaying the accepted token prefix"
+            << "\nfirst token: " << first_token
+            << "\ndraft token: " << draft_token
+            << "\ncorrection token: " << correction_token
+            << "\nshortcut next before commit: " << shortcut_next_token_before_commit
+            << "\nfull replay next: " << full_replay_next_token
+            << "\nreference prefix: "
+            << joinTokensMoEDiagnostic(std::vector<int32_t>(
+                   expected_tokens.begin(),
+                   expected_tokens.begin() + 3));
+        EXPECT_EQ(shortcut_next_token_after_commit, full_replay_next_token)
+            << "MTP shifted-cache commit after verifier-row restore must not "
+            << "invalidate the current main-logits sample"
+            << "\nfirst token: " << first_token
+            << "\ndraft token: " << draft_token
+            << "\ncorrection token: " << correction_token
+            << "\nshortcut next before commit: " << shortcut_next_token_before_commit
+            << "\nshortcut next after commit: " << shortcut_next_token_after_commit
+            << "\nfull replay next: " << full_replay_next_token;
+
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
     }
 
     inline void runMoEIncrementalDecodeMatchesFullContext(

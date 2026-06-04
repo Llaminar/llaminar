@@ -295,21 +295,23 @@ namespace llaminar2
          * @brief Commit shifted MTP rows when the usable verifier hidden rows
          *        cover only a prefix of the emitted token sequence.
          *
-         * Verifier-row restore can reuse hidden rows for the accepted prefix and
-         * then replay a rejected correction suffix. Implementations should use
-         * main_forward_token_count, not token_count, to recover the logical
-         * position offset and terminal hidden row count represented by the
-         * current hidden buffer.
+         * Verifier-row restore can reuse mutable state for an accepted prefix
+         * and then replay only a rejected correction suffix. In that case the
+         * current hidden buffer may cover fewer rows than the logical token
+         * span used to compute the shifted-cache position. Callers can pass an
+         * explicit position_offset_override to keep those contracts separate.
          */
         virtual bool commitMTPShiftedRowsFromPartialForward(
             const int32_t *tokens,
             int token_count,
             int already_appended_tokens,
             int main_forward_token_count,
-            bool allow_speculative_discard = false)
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1)
         {
             (void)main_forward_token_count;
             (void)allow_speculative_discard;
+            (void)position_offset_override;
             return commitMTPShiftedRowsFromLastForward(
                 tokens,
                 token_count,

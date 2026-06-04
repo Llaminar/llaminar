@@ -724,13 +724,27 @@ namespace llaminar2::test
         ASSERT_NE(execute_end, std::string::npos);
         const std::string warmup_body = contents.substr(execute_start, execute_end - execute_start);
 
-        const size_t guard = warmup_body.find("!moe_runtime_table_initialized_ || !runtimeTableHasActiveGroupedDecodeBank()");
+        const size_t guard = warmup_body.find("!moe_runtime_table_initialized_ || !runtime_decode_bank_was_active_before_expert_stage");
+        const size_t pre_stage_bank =
+            warmup_body.find("runtime_decode_bank_was_active_before_expert_stage");
         const size_t initialize = warmup_body.find("initializeMoERuntimeTableForGroupedDecode()");
+        const size_t can_try = contents.find("const bool can_try_device_routed_decode", execute_start);
+        ASSERT_NE(pre_stage_bank, std::string::npos)
+            << "Device-routed decode may consume runtime top-k only when the "
+               "runtime bank was already active before this expert stage. If the "
+               "expert stage initializes the bank itself, MoERoutingStage could "
+               "not have populated runtime top-k for the current pass.";
         ASSERT_NE(guard, std::string::npos)
             << "Cached MoEExpertComputeStage objects must recheck the active runtime bank; "
                "request reset clears MoERuntimeTable after stage reset.";
         ASSERT_NE(initialize, std::string::npos);
+        ASSERT_NE(can_try, std::string::npos);
+        EXPECT_LT(pre_stage_bank, initialize);
         EXPECT_LT(guard, initialize);
+        EXPECT_NE(contents.find("runtime_decode_bank_was_active_before_expert_stage", can_try),
+                  std::string::npos)
+            << "The runtime-table decode path must be gated by pre-stage bank "
+               "availability, not by a bank initialized after routing.";
     }
 
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefixTerminalRestoreUsesStreamfulTransfers)
