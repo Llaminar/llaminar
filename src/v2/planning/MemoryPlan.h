@@ -14,6 +14,8 @@ namespace llaminar2
 struct DeviceMemoryPlan
 {
     DeviceId device;
+    int max_seq_len = 0;
+    int activation_seq_len = 0;
     size_t weight_bytes = 0;
     size_t kv_cache_bytes = 0;
     size_t activation_bytes = 0;

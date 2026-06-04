@@ -40,6 +40,7 @@
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../execution/moe/MoEExpertParallelPlanner.h"
 #include "../../execution/mtp/MTPWeightManifest.h"
+#include "../../planning/ActivationBufferSizing.h"
 #include "../../loaders/WeightLoadProgress.h"
 #include "../../loaders/WeightLoadProgressAggregator.h"
 #include <algorithm>
@@ -2034,6 +2035,10 @@ namespace llaminar2
         // Initialize inference state via schema-driven BufferArena path
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
+        init_config.activation_seq_len =
+            config.activation_seq_len > 0
+                ? config.activation_seq_len
+                : resolveActivationBufferSeqLen(config.max_seq_len, device);
 
         {
             ScopedWeightLoadDetailTimer timer("graph.build.initialize_inference_state");
@@ -2971,6 +2976,10 @@ namespace llaminar2
         // =====================================================================
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
+        init_config.activation_seq_len =
+            config.activation_seq_len > 0
+                ? config.activation_seq_len
+                : resolveActivationBufferSeqLen(config.max_seq_len, primary_device);
 
         if (!orchestrator->initializeInferenceStateFromArena(
                 config.batch_size, config.max_seq_len, primary_device, init_config))
@@ -3147,6 +3156,10 @@ namespace llaminar2
         // =====================================================================
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
+        init_config.activation_seq_len =
+            config.activation_seq_len > 0
+                ? config.activation_seq_len
+                : resolveActivationBufferSeqLen(config.max_seq_len, device);
 
         if (!orchestrator->initializeInferenceStateFromArena(
                 config.batch_size, config.max_seq_len, device, init_config))
@@ -3382,6 +3395,10 @@ namespace llaminar2
         // Initialize inference state via schema-driven BufferArena path
         InferenceStateInitConfig init_config;
         init_config.use_mapped_memory = config.use_mapped_memory;
+        init_config.activation_seq_len =
+            config.activation_seq_len > 0
+                ? config.activation_seq_len
+                : resolveActivationBufferSeqLen(config.max_seq_len, device);
 
         if (!orchestrator->initializeInferenceStateFromArena(
                 config.batch_size, config.max_seq_len, device, init_config))

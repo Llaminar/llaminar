@@ -178,6 +178,18 @@ namespace llaminar2
          * Default: false (use device memory for best GPU performance)
          */
         bool use_mapped_memory = false;
+
+        /**
+         * @brief Sequence length used for transient graph/activation buffers.
+         *
+         * This may be smaller than max_seq_len. KV caches, positions, and request
+         * context validation still use max_seq_len; graph execution shapes must
+         * fit within this activation capacity or go through explicit chunked
+         * prefill scheduling.
+         *
+         * Default: 0 (use max_seq_len, preserving historical behavior).
+         */
+        int activation_seq_len = 0;
     };
 
     /**
@@ -285,6 +297,7 @@ namespace llaminar2
         // === Configuration ===
         int batch_size = 0;
         int max_seq_len = 0;
+        int activation_seq_len = 0;
         int d_model = 0;
         int vocab_size = 0;
         DeviceId device_id = DeviceId::cpu();

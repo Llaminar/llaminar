@@ -35,6 +35,13 @@ Artifacts: `benchmark_results/llama_cpp_cuda/20260604T191903Z-6ddc943-mtp-recali
 
 ## Latest Evidence
 
+CUDA dense memory planner smoke:
+`benchmark_results/memory_planner/20260604T203612Z-cuda-dense-activation-cap`
+
+| Case | Context | Act.Seq | KV | Arena | Result |
+|---|---:|---:|---:|---:|---|
+| Qwen3.6 27B CUDA tiny prompt | 16384 | 4096 | 4.0 GB | 1785 MB | pass |
+
 CUDA MoE after parallel runtime router top-k:
 `benchmark_results/cuda_moe_mtp/20260604T201753Z-parallel-runtime-router-topk`
 
@@ -59,6 +66,8 @@ Focused correctness gates:
   graph-capturable cuBLAS batched GDN projections, parallel runtime router top-k.
 - CUDA and ROCm GPU greedy argmax tie-break to lowest token id, matching CPU.
 - Memory planning charges terminal-row logits and prepared embedding workspace only.
+- GPU activation arenas are capped to prefill-bucket capacity while KV keeps the
+  requested context capacity; oversized monolithic graph shapes hard fail.
 - Explicit non-null GPU stream hard failures remain required.
 
 ## Next Work

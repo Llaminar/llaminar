@@ -2,6 +2,7 @@
 #include "planning/MemoryPlanner.h"
 #include "planning/MemoryPlan.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/ActivationBufferSizing.h"
 #include "backends/DeviceId.h"
 
 using namespace llaminar2;
@@ -137,6 +138,53 @@ TEST(Test__MemoryPlanner, Qwen36DenseLike_UsesTerminalLogitsAndPreparedEmbedding
         << "normal prefill must not reserve full-context all-position logits";
     EXPECT_EQ(device_plan.workspace_bytes, 768ULL * 1024ULL * 1024ULL)
         << "prepared embedding runs must not reserve vocab-by-hidden fallback workspace";
+}
+
+TEST(Test__MemoryPlanner, GPUActivationBufferSizing_UsesLargestPrefillBucket)
+{
+    EXPECT_EQ(resolveActivationBufferSeqLen(131072, DeviceId::cuda(0)), 4096);
+    EXPECT_EQ(resolveActivationBufferSeqLen(2048, DeviceId::cuda(0)), 2048);
+    EXPECT_EQ(resolveActivationBufferSeqLen(131072, DeviceId::rocm(0)), 4096);
+    EXPECT_EQ(resolveActivationBufferSeqLen(131072, DeviceId::cpu()), 131072);
+}
+
+TEST(Test__MemoryPlanner, LongContext_KeepsKVFullContextButCapsActivationWorkspace)
+{
+    constexpr size_t GiB = 1024ULL * 1024ULL * 1024ULL;
+    const size_t qwen36_dense_weight_bytes = static_cast<size_t>(16.3 * static_cast<double>(GiB));
+    auto profile = createQwen36DenseLikeProfile(qwen36_dense_weight_bytes);
+
+    DevicePlanConfig short_context;
+    short_context.device = DeviceId::cuda(0);
+    short_context.device_total_bytes = 48ULL * GiB;
+    short_context.device_free_bytes = 48ULL * GiB;
+    short_context.batch_size = 1;
+    short_context.max_seq_len = 4096;
+    short_context.activation_seq_len = 4096;
+    short_context.kv_precision = "fp16";
+
+    DevicePlanConfig long_context = short_context;
+    long_context.max_seq_len = 16384;
+    long_context.activation_seq_len = 4096;
+
+    auto short_plan = MemoryPlanner::plan(profile, {short_context});
+    auto long_plan = MemoryPlanner::plan(profile, {long_context});
+
+    ASSERT_EQ(short_plan.devices.size(), 1u);
+    ASSERT_EQ(long_plan.devices.size(), 1u);
+
+    const auto &short_device = short_plan.devices.front();
+    const auto &long_device = long_plan.devices.front();
+
+    EXPECT_GT(long_device.kv_cache_bytes, short_device.kv_cache_bytes)
+        << "KV cache must still reserve the requested long context";
+    EXPECT_EQ(long_device.activation_bytes, short_device.activation_bytes)
+        << "Activation arena must be sized to graph chunk capacity, not context capacity";
+    EXPECT_EQ(long_device.workspace_bytes, short_device.workspace_bytes)
+        << "GPU workspace must follow activation graph capacity, not context capacity";
+    EXPECT_EQ(long_device.max_seq_len, 16384);
+    EXPECT_EQ(long_device.activation_seq_len, 4096);
+    EXPECT_TRUE(long_plan.fits()) << long_plan.renderTable();
 }
 
 TEST(Test__MemoryPlanner, SingleGPU_DoesNotFit)

@@ -52,7 +52,14 @@ MemoryPlan MemoryPlanner::plan(
         int last_layer = cfg.last_layer >= 0 ? cfg.last_layer : profile.n_layers - 1;
         int n_layers_local = last_layer - cfg.first_layer + 1;
         int max_seq = cfg.max_seq_len > 0 ? cfg.max_seq_len : profile.max_seq_len;
+        int activation_seq = cfg.activation_seq_len > 0 ? cfg.activation_seq_len : max_seq;
+        if (max_seq > 0)
+            activation_seq = std::min(activation_seq, max_seq);
+        activation_seq = std::max(1, activation_seq);
         int local_kv_heads = cfg.local_kv_heads > 0 ? cfg.local_kv_heads : profile.n_kv_heads;
+
+        dev_plan.max_seq_len = max_seq;
+        dev_plan.activation_seq_len = activation_seq;
 
         // If TP sharded, divide KV heads
         if (cfg.total_shards > 1 && cfg.local_kv_heads <= 0)
@@ -86,7 +93,7 @@ MemoryPlan MemoryPlanner::plan(
         }
 
         dev_plan.activation_bytes = ActivationMemoryEstimator::estimate(
-            cfg.batch_size, max_seq,
+            cfg.batch_size, activation_seq,
             profile.d_model, local_d_ff,
             local_n_heads, local_kv_heads,
             profile.head_dim, profile.vocab_size,
@@ -94,7 +101,7 @@ MemoryPlan MemoryPlanner::plan(
 
         // Workspace estimation
         dev_plan.workspace_bytes = WorkspaceMemoryEstimator::estimate(
-            cfg.batch_size, max_seq,
+            cfg.batch_size, activation_seq,
             profile.d_model, local_d_ff,
             profile.vocab_size, cfg.device);
 
@@ -129,22 +136,24 @@ std::string MemoryPlan::renderTable() const
 
     // Header
     table << fort::header
-          << "Device" << "Weights" << "KV Cache" << "Activ."
+          << "Device" << "Context" << "Act.Seq" << "Weights" << "KV Cache" << "Activ."
           << "Wkspace" << "Total" << "Avail." << "OK"
           << fort::endr;
 
     // Column alignments
     table.column(0).set_cell_text_align(fort::text_align::left);
-    for (int c = 1; c <= 6; ++c)
+    for (int c = 1; c <= 8; ++c)
     {
         table.column(c).set_cell_text_align(fort::text_align::right);
     }
-    table.column(7).set_cell_text_align(fort::text_align::center);
+    table.column(9).set_cell_text_align(fort::text_align::center);
 
     // Data rows
     for (const auto& d : devices)
     {
         table << d.device.to_string()
+              << d.max_seq_len
+              << d.activation_seq_len
               << formatMB(d.weight_bytes)
               << formatMB(d.kv_cache_bytes)
               << formatMB(d.activation_bytes)

@@ -2620,6 +2620,17 @@ namespace llaminar2
         }
 
         const auto &config = graph_builder_->config();
+        const int activation_seq_len =
+            init_config.activation_seq_len > 0
+                ? std::min(max_seq_len, init_config.activation_seq_len)
+                : max_seq_len;
+        if (batch_size <= 0 || max_seq_len <= 0 || activation_seq_len <= 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid inference state shape: batch_size="
+                      << batch_size << " max_seq_len=" << max_seq_len
+                      << " activation_seq_len=" << activation_seq_len);
+            return false;
+        }
 
         // =====================================================================
         // Ensure TensorFactory exists (needed for arena allocation + snapshots)
@@ -2658,7 +2669,7 @@ namespace llaminar2
                 snapshot_enabled_ = true;
             }
 
-            if (!initializeBuffers(max_seq_len))
+            if (!initializeBuffers(activation_seq_len))
             {
                 snapshot_enabled_ = prev_snapshot;
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize buffers via arena");
@@ -2747,7 +2758,7 @@ namespace llaminar2
         if (act_prec == ActivationPrecision::HybridQ16)
         {
             int buffer_n_kv_heads = config.qkv_column_parallel ? config.local_n_kv_heads : config.n_kv_heads;
-            const size_t k_head_scales_size = static_cast<size_t>(batch_size * max_seq_len * buffer_n_kv_heads);
+            const size_t k_head_scales_size = static_cast<size_t>(batch_size * activation_seq_len * buffer_n_kv_heads);
             state_.K_head_scales.resize(k_head_scales_size, 1.0f);
             LOG_DEBUG("[DeviceGraphOrchestrator] HybridQ16 K precision fix: allocated K_head_scales ("
                       << k_head_scales_size << " floats)");
@@ -2764,13 +2775,13 @@ namespace llaminar2
             int d_model = config.d_model;
 
             state_.context_snapshot = tensor_factory_->createFP32(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
+                {static_cast<size_t>(batch_size * activation_seq_len), static_cast<size_t>(buffer_n_heads * head_dim)},
                 device);
             state_.attention_output_snapshot = tensor_factory_->createFP32(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                {static_cast<size_t>(batch_size * activation_seq_len), static_cast<size_t>(d_model)},
                 device);
             state_.attention_residual_snapshot = tensor_factory_->createFP32(
-                {static_cast<size_t>(batch_size * max_seq_len), static_cast<size_t>(d_model)},
+                {static_cast<size_t>(batch_size * activation_seq_len), static_cast<size_t>(d_model)},
                 device);
             LOG_DEBUG("[DeviceGraphOrchestrator] Allocated snapshot buffers from arena path");
         }
@@ -2801,6 +2812,7 @@ namespace llaminar2
         state_.sequence_lengths.assign(batch_size, 0);
         state_.batch_size = batch_size;
         state_.max_seq_len = max_seq_len;
+        state_.activation_seq_len = activation_seq_len;
         state_.d_model = config.d_model;
         state_.vocab_size = config.vocab_size;
         state_.device_id = device;
@@ -2808,6 +2820,7 @@ namespace llaminar2
         LOG_DEBUG("[DeviceGraphOrchestrator] Inference state initialized from arena: "
                   << "batch_size=" << batch_size
                   << " max_seq_len=" << max_seq_len
+                  << " activation_seq_len=" << activation_seq_len
                   << " device=" << device.toString());
         return true;
     }
@@ -3111,6 +3124,19 @@ namespace llaminar2
                                                                 << state_.batch_size * state_.max_seq_len);
             return nullptr;
         }
+        const int activation_seq_len =
+            state_.activation_seq_len > 0 ? state_.activation_seq_len : state_.max_seq_len;
+        if (total_tokens > state_.batch_size * activation_seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Total tokens " << total_tokens
+                                                                << " exceeds activation graph buffer capacity "
+                                                                << state_.batch_size * activation_seq_len
+                                                                << " (context capacity is "
+                                                                << state_.batch_size * state_.max_seq_len
+                                                                << "); run long prompts through prefill chunk scheduling "
+                                                                   "or increase the activation arena length");
+            return nullptr;
+        }
 
         // =====================================================================
         // Gap 4: Automatic phase transition based on live request position.
@@ -3398,6 +3424,16 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk schedule length " << seq_len
                                                                                  << " exceeds buffer capacity "
                                                                                  << state_.max_seq_len);
+            return false;
+        }
+        const int activation_seq_len =
+            state_.activation_seq_len > 0 ? state_.activation_seq_len : state_.max_seq_len;
+        const auto normalized_buckets = normalizePrefillGraphBuckets(policy.bucket_sizes);
+        if (!normalized_buckets.empty() && normalized_buckets.back() > activation_seq_len)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Prefill chunk bucket " << normalized_buckets.back()
+                                                                        << " exceeds activation graph buffer capacity "
+                                                                        << activation_seq_len);
             return false;
         }
 
@@ -8011,6 +8047,18 @@ namespace llaminar2
             LOG_ERROR("[DGO] Materialization token count " << total_tokens
                                                            << " exceeds buffer capacity "
                                                            << (state_.batch_size * state_.max_seq_len));
+            return false;
+        }
+        const int activation_seq_len =
+            state_.activation_seq_len > 0 ? state_.activation_seq_len : state_.max_seq_len;
+        if (total_tokens > state_.batch_size * activation_seq_len)
+        {
+            LOG_ERROR("[DGO] Materialization token count " << total_tokens
+                                                           << " exceeds activation graph buffer capacity "
+                                                           << (state_.batch_size * activation_seq_len)
+                                                           << " (context capacity is "
+                                                           << (state_.batch_size * state_.max_seq_len)
+                                                           << ")");
             return false;
         }
 

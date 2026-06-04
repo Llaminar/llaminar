@@ -215,19 +215,19 @@ static GraphSchema buildMinimalSchema(
 
     // Core layer buffers (the minimum set required by initializeInferenceStateFromArena)
     schema.layer_buffers = {
-        BufferSpec("normalized", {"64", "32"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("residual", {"64", "32"}, "fp32", BufferSemantic::InOut),
-        BufferSpec("Q", {"64", "32"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("K", {"64", "16"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("V", {"64", "16"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("attn_output", {"64", "32"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("attn_proj", {"64", "32"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("gate", {"64", "64"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("up", {"64", "64"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("ffn_output", {"64", "32"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("workspace_scores", {"64", "64"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("workspace_context", {"64", "8"}, "fp32", BufferSemantic::Scratch),
-        BufferSpec("workspace_mask", {"64", "64"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("normalized", {"seq_len", "32"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("residual", {"seq_len", "32"}, "fp32", BufferSemantic::InOut),
+        BufferSpec("Q", {"seq_len", "32"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("K", {"seq_len", "16"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("V", {"seq_len", "16"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("attn_output", {"seq_len", "32"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("attn_proj", {"seq_len", "32"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("gate", {"seq_len", "64"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("up", {"seq_len", "64"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("ffn_output", {"seq_len", "32"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("workspace_scores", {"seq_len", "64"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("workspace_context", {"seq_len", "8"}, "fp32", BufferSemantic::Scratch),
+        BufferSpec("workspace_mask", {"seq_len", "64"}, "fp32", BufferSemantic::Scratch),
     };
 
     // Extension layer buffers
@@ -242,8 +242,8 @@ static GraphSchema buildMinimalSchema(
 
     // Core model buffers
     schema.model_buffers = {
-        BufferSpec("hidden", {"64", "32"}, "fp32", BufferSemantic::InOut),
-        BufferSpec("logits", {"64", "128"}, "fp32", BufferSemantic::Output),
+        BufferSpec("hidden", {"seq_len", "32"}, "fp32", BufferSemantic::InOut),
+        BufferSpec("logits", {"seq_len", "128"}, "fp32", BufferSemantic::Output),
     };
 
     return schema;
@@ -338,6 +338,31 @@ TEST_F(Test__DynamicBufferExtensions_Orchestrator, ToModelBuffers_EmptyExtension
     // Extension map should be empty
     EXPECT_TRUE(mb.layer_buffers.extensions.empty())
         << "No extension buffers in schema; extensions should be empty";
+}
+
+TEST_F(Test__DynamicBufferExtensions_Orchestrator, InitializeInferenceState_UsesActivationSeqLenForArena)
+{
+    auto mock = createMockGraphBuilder();
+    DeviceGraphOrchestrator orchestrator(mock, mpi_ctx_);
+    orchestrator.setTensorFactory(tensor_factory_.get());
+
+    InferenceStateInitConfig init_config;
+    init_config.activation_seq_len = 8;
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        1, 64, DeviceId::cpu(), init_config));
+
+    const auto &state = orchestrator.inferenceState();
+    EXPECT_EQ(state.max_seq_len, 64);
+    EXPECT_EQ(state.activation_seq_len, 8);
+    ASSERT_NE(state.hidden, nullptr);
+    ASSERT_NE(state.logits, nullptr);
+    ASSERT_GE(state.hidden->shape().size(), 2u);
+    ASSERT_GE(state.logits->shape().size(), 2u);
+    EXPECT_EQ(state.hidden->shape()[0], 8u);
+    EXPECT_EQ(state.hidden->shape()[1], 32u);
+    EXPECT_EQ(state.logits->shape()[0], 8u);
+    EXPECT_EQ(state.logits->shape()[1], 128u);
 }
 
 TEST_F(Test__DynamicBufferExtensions_Orchestrator, ToModelBuffers_ExtensionsPropagate)

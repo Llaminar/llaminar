@@ -30,6 +30,7 @@
 #include "../../backends/ComputeBackend.h"
 #include "../../planning/ClusterInventoryGatherer.h"
 #include "../../planning/ModelMemoryProfile.h"
+#include "../../planning/ActivationBufferSizing.h"
 #include "../../backends/DeviceAddressAdapter.h"
 #include "../../kernels/KernelFactory.h"
 #include "../../tensors/TensorFactory.h"
@@ -3381,6 +3382,7 @@ namespace llaminar2
             cfg.last_layer = plan_.last_layer;
             cfg.batch_size = plan_.runtime.batch_size;
             cfg.max_seq_len = plan_.runtime.max_seq_len;
+            cfg.activation_seq_len = resolveActivationBufferSeqLen(cfg.max_seq_len, device);
 
             switch (plan_.runtime.kv_cache_precision)
             {

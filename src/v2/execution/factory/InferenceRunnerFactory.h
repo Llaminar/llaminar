@@ -100,6 +100,7 @@ namespace llaminar2
     struct InferenceRunnerConfig
     {
         int max_seq_len = 4096;
+        int activation_seq_len = 0;
         int batch_size = 1;
 
         // Explicit graph path selection (only graph path is supported)
