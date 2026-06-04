@@ -41,6 +41,7 @@ namespace llaminar2
         using Clock = std::chrono::steady_clock;
 
         static bool isEnabled();
+        static bool gpuStageEventTimingEnabled();
         static void reset();
 
         static void addCounter(

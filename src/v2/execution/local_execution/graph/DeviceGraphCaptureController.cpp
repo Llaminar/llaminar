@@ -1700,10 +1700,6 @@ namespace llaminar2
             return result;
         }
 
-        const bool trace_replay = exec_cfg.gpu_graph_trace_replay;
-        const auto &device_id = ctx->deviceId();
-        const std::string device_name = device_id.toString();
-        const int total_segments = static_cast<int>(segment_cache.segments.size());
         const bool can_defer_final_sync =
             defer_final_sync &&
             !has_collective_nodes &&
@@ -1713,12 +1709,20 @@ namespace llaminar2
                         {
                             return segment.capturable;
                         });
+        const bool trace_replay = exec_cfg.gpu_graph_trace_replay;
+        const auto &device_id = ctx->deviceId();
+        const std::string device_name = device_id.toString();
+        const int total_segments = static_cast<int>(segment_cache.segments.size());
+        auto replay_total_tags = replayCacheTags(segment_cache);
+        replay_total_tags.emplace(
+            "sync_scope",
+            can_defer_final_sync ? "launch_only_deferred" : "stream_synchronized");
         PerfStatsCollector::ScopedTimer replay_timer(
             "forward_graph",
             "segmented_replay_total",
             "decode",
             device_name,
-            replayCacheTags(segment_cache));
+            std::move(replay_total_tags));
 
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)

@@ -4324,7 +4324,7 @@ namespace llaminar2
                  {"path", used_segmented_capture ? "segmented" : (rebuilt_graph ? "plain_after_build" : "plain")}});
         }
         if (ok && state_.device_id.is_gpu() &&
-            (debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled()))
+            PerfStatsCollector::gpuStageEventTimingEnabled())
         {
             auto &timeline = executor_.stageTimeline();
             if (timeline.isInitialized())

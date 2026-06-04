@@ -1,4 +1,5 @@
 #include "utils/PerfStatsCollector.h"
+#include "utils/DebugEnv.h"
 #include "utils/KernelProfiler.h"
 #include "utils/KVCacheProfiler.h"
 #include "utils/WeightLoadingProfiler.h"
@@ -30,7 +31,11 @@ namespace
                 had_old_ = true;
                 old_value_ = old;
             }
-            setenv(name, value, 1);
+            if (value)
+                setenv(name, value, 1);
+            else
+                unsetenv(name);
+            mutableDebugEnv().reload();
         }
 
         ~ScopedEnv()
@@ -39,6 +44,7 @@ namespace
                 setenv(name_.c_str(), old_value_.c_str(), 1);
             else
                 unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
         }
 
     private:
@@ -137,6 +143,33 @@ TEST(Test__PerfStatsCollector, SummaryTableCanBeRequestedByEnv)
     EXPECT_NE(summary.find("mtp.sidecar_forward"), std::string::npos);
 }
 
+TEST(Test__PerfStatsCollector, PerfStatsExportAloneDoesNotEnableGpuStageEventTiming)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv stage_detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", nullptr);
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
+}
+
+TEST(Test__PerfStatsCollector, ExplicitProfilingOrGpuStageTimingEnablesGpuStageEventTiming)
+{
+    {
+        ScopedEnv profiling("LLAMINAR_PROFILING", "1");
+        ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
+        EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
+    }
+
+    {
+        ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+        ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+        EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
+    }
+}
+
 TEST(Test__PerfStatsCollector, ExistingProfilersPublishStructuredRecords)
 {
     ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
@@ -167,6 +200,47 @@ TEST(Test__PerfStatsCollector, ExistingProfilersPublishStructuredRecords)
     EXPECT_TRUE(has_record("kv_cache", "tokens"));
     EXPECT_TRUE(has_record("kv_cache", "bytes"));
     EXPECT_TRUE(has_record("weight_loading", "weights.gemm_pack.test"));
+}
+
+TEST(Test__PerfStatsCollector, GraphReplayTimersCarrySyncScopeTags)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    PerfStatsCollector::recordTimingNs(
+        "forward_graph",
+        "segmented_replay_total",
+        1000,
+        "decode",
+        "cuda:0",
+        {{"context", "main_decode"}, {"sync_scope", "stream_synchronized"}});
+    PerfStatsCollector::recordTimingNs(
+        "forward_graph",
+        "segmented_replay_total",
+        2000,
+        "decode",
+        "cuda:0",
+        {{"context", "mtp_decode_sidecar"}, {"sync_scope", "launch_only_deferred"}});
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    ASSERT_EQ(records.size(), 2u);
+
+    auto has_sync_scope = [&](const std::string &scope) {
+        return std::any_of(records.begin(), records.end(), [&](const PerfStatRecord &record) {
+            const auto it = record.tags.find("sync_scope");
+            return record.domain == "forward_graph" &&
+                   record.name == "segmented_replay_total" &&
+                   it != record.tags.end() &&
+                   it->second == scope;
+        });
+    };
+
+    EXPECT_TRUE(has_sync_scope("stream_synchronized"));
+    EXPECT_TRUE(has_sync_scope("launch_only_deferred"));
+
+    const std::string csv = PerfStatsCollector::csvString({"forward_graph"});
+    EXPECT_NE(csv.find("sync_scope=stream_synchronized"), std::string::npos);
+    EXPECT_NE(csv.find("sync_scope=launch_only_deferred"), std::string::npos);
 }
 
 TEST(Test__PerfStatsCollector, FlushFromEnvWritesMachineReadableFiles)

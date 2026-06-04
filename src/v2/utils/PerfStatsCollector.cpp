@@ -286,6 +286,11 @@ namespace llaminar2
                exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv").size() > 0;
     }
 
+    bool PerfStatsCollector::gpuStageEventTimingEnabled()
+    {
+        return debugEnv().gpu_stage_timing || debugEnv().profile.enabled;
+    }
+
     void PerfStatsCollector::reset()
     {
         auto &s = state();

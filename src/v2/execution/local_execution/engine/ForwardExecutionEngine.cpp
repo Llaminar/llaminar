@@ -2054,7 +2054,7 @@ namespace llaminar2
         std::chrono::high_resolution_clock::time_point start,
         std::string stage_context)
     {
-        if (!(debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled()) ||
+        if (!PerfStatsCollector::gpuStageEventTimingEnabled() ||
             !ctx || !ctx->deviceId().is_gpu())
         {
             return;

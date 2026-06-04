@@ -611,7 +611,7 @@ namespace llaminar2
         // GPU Stage Timing: event-based per-stage profiling
         // Gated by policy AND env var. ~1μs CPU overhead per event record.
         // =====================================================================
-        const bool timeline_requested = debugEnv().gpu_stage_timing || PerfStatsCollector::isEnabled();
+        const bool timeline_requested = PerfStatsCollector::gpuStageEventTimingEnabled();
         const bool timeline_active = policy.timeline && timeline_requested && ctx->isGPU() && !isGraphCaptureActive();
         IWorkerGPUContext *timeline_gpu_ctx = nullptr;
         if (timeline_active)

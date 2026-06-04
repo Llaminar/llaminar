@@ -46,7 +46,7 @@ CUDA MoE after token-direct verifier down accumulation:
 `benchmark_results/cuda_moe_mtp/20260604T222925Z-token-direct-down-no-mtp`
 `benchmark_results/cuda_moe_mtp/20260604T222925Z-token-direct-down-mtp-dynamic`
 Profiler export check:
-`benchmark_results/cuda_moe_mtp/20260604T212136Z-perf-export-device-field`
+`benchmark_results/cuda_moe_mtp/20260604T230244Z-perf-export-no-stage-events`
 Greedy margin diagnostic:
 `benchmark_results/cuda_moe_mtp/20260604T220430Z-greedy-margin-verifier-rows`
 
@@ -59,6 +59,8 @@ Verifier-row top-2 margins are large on average (~8.1 logits; one <=1e-2
 near-tie bucket), so CUDA MoE MTP acceptance swings are real draft/main
 disagreement rather than mostly argmax tie noise. The diagnostic run itself is
 not a throughput ratchet because it intentionally adds top-k probes.
+Perf-export smoke verified 0 `stage_gpu` rows and graph counters tagged with
+sync scope; export-only dynamic MTP ran 1607.23/130.34 tok/s at 79.30%.
 
 Focused correctness gates:
 
@@ -81,8 +83,9 @@ Focused correctness gates:
 - Memory planning charges terminal-row logits and prepared embedding workspace only.
 - GPU activation arenas are capped to prefill-bucket capacity while KV keeps the
   requested context capacity; oversized monolithic graph shapes hard fail.
-- Stage profiling split: `stage_gpu` is GPU-event eager timing, `stage_executor_cpu`
-  is host attribution, and graph replay timing is under `forward_graph`.
+- Stage profiling split: `stage_gpu` is explicit GPU-event eager timing,
+  `stage_executor_cpu` is host attribution, and graph replay timing is under
+  `forward_graph`; JSON/CSV export alone no longer enables intrusive stage events.
 - Explicit non-null GPU stream hard failures remain required.
 
 ## Next Work
