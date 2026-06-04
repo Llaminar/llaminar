@@ -2049,6 +2049,157 @@ namespace llaminar2::test::parity::qwen36
               << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
     }
 
+    inline void runMoENoMTPBenchmarkStyleSkipGatherArgmaxParity(
+        const MoEPrefixRestoreParityCase &test_case,
+        int decode_token_budget,
+        int repetitions = 3)
+    {
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        ASSERT_GT(decode_token_budget, 0);
+        ASSERT_GT(repetitions, 0);
+        (void)expected_tokens;
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        auto run_no_mtp_decode = [&](int repetition, bool check_gathered_argmax) -> std::vector<int32_t>
+        {
+            std::vector<int32_t> tokens;
+            auto runner = factory->createFromOrchestrationConfig(
+                makeMoEPrefixRestoreConfig(test_case, model_path, false, 2, false));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                return tokens;
+            }
+
+            if (!runner->initialize())
+            {
+                ADD_FAILURE() << runner->lastError();
+                return tokens;
+            }
+            runner->setSamplingParams(greedy);
+            runner->setSkipLogitsGatherDecode(true);
+            runner->setSkipLogitsGatherPrefill(true);
+            const int vocab_size = runner->vocabSize();
+            if (vocab_size <= 0)
+            {
+                ADD_FAILURE() << "runner reported invalid vocab size " << vocab_size;
+                runner->shutdown();
+                return tokens;
+            }
+
+            auto prefill_once = [&]() -> bool
+            {
+                if (!runner->prefill(prompt_tokens))
+                {
+                    ADD_FAILURE() << runner->lastError();
+                    return false;
+                }
+                return true;
+            };
+
+            auto decode_loop = [&](std::vector<int32_t> *out_tokens) -> bool
+            {
+                for (int produced = 0; produced < decode_token_budget; ++produced)
+                {
+                    GenerationResult step = runner->decodeStep();
+                    if (!step.error.empty())
+                    {
+                        ADD_FAILURE() << step.error;
+                        return false;
+                    }
+                    if (step.tokens.size() != 1u)
+                    {
+                        ADD_FAILURE()
+                            << "No-MTP benchmark-style decode repetition "
+                            << repetition
+                            << " check_gathered_argmax=" << check_gathered_argmax
+                            << " produced " << step.tokens.size()
+                            << " tokens for a single decode step";
+                        return false;
+                    }
+                    const int32_t token = step.tokens.front();
+                    if (check_gathered_argmax)
+                    {
+                        const float *logits = runner->lastLogits();
+                        if (!logits)
+                        {
+                            ADD_FAILURE()
+                                << "No-MTP benchmark-style decode repetition "
+                                << repetition
+                                << " produced no gathered logits for step "
+                                << produced;
+                            return false;
+                        }
+                        const int top = argmaxToken(logits, vocab_size);
+                        if (token != top)
+                        {
+                            ADD_FAILURE()
+                                << "No-MTP benchmark-style GPU greedy sample "
+                                << "does not match gathered logits argmax at repetition "
+                                << repetition
+                                << " step " << produced
+                                << "\ntoken=" << token
+                                << " gathered_argmax=" << top
+                                << "\ntop-5: " << topKSummary(logits, vocab_size);
+                            return false;
+                        }
+                    }
+                    if (out_tokens)
+                    {
+                        out_tokens->push_back(token);
+                    }
+                    if (!runner->maybeApplyMoERebalance())
+                    {
+                        ADD_FAILURE() << runner->lastError();
+                        return false;
+                    }
+                    if (step.is_complete)
+                    {
+                        break;
+                    }
+                }
+                return true;
+            };
+
+            runner->setSuppressTimeline(true);
+            runner->clearCache();
+            if (!prefill_once() || !decode_loop(nullptr))
+            {
+                runner->shutdown();
+                return tokens;
+            }
+
+            runner->setSuppressTimeline(false);
+            runner->clearCache();
+            if (prefill_once())
+            {
+                (void)decode_loop(&tokens);
+            }
+            runner->setSkipLogitsGatherDecode(false);
+            runner->setSkipLogitsGatherPrefill(false);
+            runner->shutdown();
+            return tokens;
+        };
+
+        for (int repetition = 0; repetition < repetitions; ++repetition)
+        {
+            const auto tokens = run_no_mtp_decode(repetition, true);
+            ASSERT_EQ(tokens.size(), static_cast<size_t>(decode_token_budget))
+                << "repetition=" << repetition
+                << "\nactual tokens: " << joinTokensMoEDiagnostic(tokens);
+        }
+    }
+
     inline void runMoEMTPVerifierRowShortcutEquivalence(
         const MoEPrefixRestoreParityCase &test_case)
     {

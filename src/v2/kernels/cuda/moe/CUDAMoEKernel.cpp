@@ -464,6 +464,8 @@ namespace llaminar2
         }
         release(d_prefill_A_int8_);
         release(d_prefill_A_scales_);
+        release(d_prefill_swiglu_int8_);
+        release(d_prefill_swiglu_scales_);
         release(d_prefill_gate_);
         release(d_prefill_up_);
         release(d_decode_hidden_int8_);
@@ -702,6 +704,8 @@ namespace llaminar2
         };
         release(d_prefill_A_int8_);
         release(d_prefill_A_scales_);
+        release(d_prefill_swiglu_int8_);
+        release(d_prefill_swiglu_scales_);
         release(d_prefill_gate_);
         release(d_prefill_up_);
 
@@ -713,6 +717,12 @@ namespace llaminar2
             err = cudaMalloc(reinterpret_cast<void **>(&d_prefill_A_scales_),
                              static_cast<size_t>(total_slots) * max_blocks * sizeof(float));
         if (err == cudaSuccess)
+            err = cudaMalloc(reinterpret_cast<void **>(&d_prefill_swiglu_int8_),
+                             static_cast<size_t>(total_slots) * intermediate * sizeof(int8_t));
+        if (err == cudaSuccess)
+            err = cudaMalloc(reinterpret_cast<void **>(&d_prefill_swiglu_scales_),
+                             static_cast<size_t>(total_slots) * ((intermediate + 31) / 32) * sizeof(float));
+        if (err == cudaSuccess)
             err = cudaMalloc(reinterpret_cast<void **>(&d_prefill_gate_),
                              static_cast<size_t>(total_slots) * max_dim * sizeof(float));
         if (err == cudaSuccess)
@@ -723,6 +733,8 @@ namespace llaminar2
             LOG_ERROR("[CUDAMoEKernel] grouped prefill scratch cudaMalloc failed: " << cudaGetErrorString(err));
             release(d_prefill_A_int8_);
             release(d_prefill_A_scales_);
+            release(d_prefill_swiglu_int8_);
+            release(d_prefill_swiglu_scales_);
             release(d_prefill_gate_);
             release(d_prefill_up_);
             prefill_slots_cap_ = 0;
@@ -2115,8 +2127,10 @@ namespace llaminar2
             d_prefill_A_scales_,
             d_prefill_gate_,
             d_prefill_up_,
-            d_prefill_A_int8_,
-            d_prefill_A_scales_,
+            // The fused gate/up epilogue reads A while writing SwiGLU quant output,
+            // so SwiGLU scratch must not alias d_prefill_A_*.
+            d_prefill_swiglu_int8_,
+            d_prefill_swiglu_scales_,
             d_prefill_gate_,
             d_output,
             num_experts,

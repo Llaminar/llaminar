@@ -10,7 +10,11 @@
 
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+
+#include "../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
 #include <array>
@@ -167,6 +171,42 @@ namespace
         std::string old_value_;
     };
 
+    class ScopedCudaMoEGemmConfig
+    {
+    public:
+        ScopedCudaMoEGemmConfig()
+            : old_gateup_kpart_decode_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kpart_decode),
+              old_gateup_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_gateup_kparts),
+              old_down_kpart_decode_(llaminar2::mutableDebugEnv().gemm.cuda_moe_down_kpart_decode),
+              old_down_kparts_(llaminar2::mutableDebugEnv().gemm.cuda_moe_down_kparts)
+        {
+        }
+
+        ~ScopedCudaMoEGemmConfig()
+        {
+            auto &gemm = llaminar2::mutableDebugEnv().gemm;
+            gemm.cuda_moe_gateup_kpart_decode = old_gateup_kpart_decode_;
+            gemm.cuda_moe_gateup_kparts = old_gateup_kparts_;
+            gemm.cuda_moe_down_kpart_decode = old_down_kpart_decode_;
+            gemm.cuda_moe_down_kparts = old_down_kparts_;
+        }
+
+        void set(bool gateup_kpart, int gateup_kparts, bool down_kpart, int down_kparts)
+        {
+            auto &gemm = llaminar2::mutableDebugEnv().gemm;
+            gemm.cuda_moe_gateup_kpart_decode = gateup_kpart;
+            gemm.cuda_moe_gateup_kparts = gateup_kparts;
+            gemm.cuda_moe_down_kpart_decode = down_kpart;
+            gemm.cuda_moe_down_kparts = down_kparts;
+        }
+
+    private:
+        bool old_gateup_kpart_decode_ = true;
+        int old_gateup_kparts_ = 16;
+        bool old_down_kpart_decode_ = true;
+        int old_down_kparts_ = 16;
+    };
+
     void expectGroupedDecodeCounter(
         const char *counter_name,
         const char *source,
@@ -204,6 +244,45 @@ namespace
                                         << " source=" << source;
         EXPECT_GE(match->count, 1u);
         EXPECT_GE(match->value, 1.0);
+    }
+
+    void expectVectorsClose(const std::vector<float> &actual,
+                            const std::vector<float> &expected,
+                            double min_cosine,
+                            double max_relative_l2)
+    {
+        ASSERT_EQ(actual.size(), expected.size());
+        double dot = 0.0;
+        double norm_actual = 0.0;
+        double norm_expected = 0.0;
+        double diff2 = 0.0;
+        double max_abs = 0.0;
+        size_t max_abs_index = 0;
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            ASSERT_TRUE(std::isfinite(actual[i])) << "actual element " << i;
+            ASSERT_TRUE(std::isfinite(expected[i])) << "expected element " << i;
+            const double a = actual[i];
+            const double e = expected[i];
+            const double diff = a - e;
+            dot += a * e;
+            norm_actual += a * a;
+            norm_expected += e * e;
+            diff2 += diff * diff;
+            if (std::abs(diff) > max_abs)
+            {
+                max_abs = std::abs(diff);
+                max_abs_index = i;
+            }
+        }
+
+        const double cosine = dot / (std::sqrt(norm_actual) * std::sqrt(norm_expected) + 1.0e-30);
+        const double relative_l2 = std::sqrt(diff2) / (std::sqrt(norm_expected) + 1.0e-30);
+        EXPECT_GE(cosine, min_cosine)
+            << "max_abs=" << max_abs << " at index " << max_abs_index;
+        EXPECT_LE(relative_l2, max_relative_l2)
+            << "max_abs=" << max_abs << " at index " << max_abs_index
+            << " cosine=" << cosine;
     }
 
     /// @brief Build a minimal native-VNNI descriptor backed by CUDA device pointers.
@@ -1096,6 +1175,159 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
         << "seq_len=4 verifier-style grouped prefill should use the small-M tile by default";
 
     llaminar2::PerfStatsCollector::reset();
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNativeWeights)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedCudaMoEGemmConfig gemm_config;
+    gemm_config.set(
+        /*gateup_kpart=*/true,
+        /*gateup_kparts=*/16,
+        /*down_kpart=*/true,
+        /*down_kparts=*/16);
+    ASSERT_TRUE(llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
+        << "CUDA grouped prefill fused SwiGLU should stay enabled by default once "
+           "production-shaped decode/prefill parity is covered";
+
+    constexpr int seq_len = 1;
+    constexpr int top_k = 8;
+    constexpr int num_experts = 8;
+    constexpr int d_model = 2048;
+    constexpr int intermediate = 512;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
+    std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
+    owned_weights.reserve(static_cast<size_t>(num_experts * 3));
+    prepared_weights.reserve(static_cast<size_t>(num_experts * 3));
+
+    auto add_prepared_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
+    {
+        std::unique_ptr<llaminar2::TensorBase> weight;
+        if (expected_codebook == 13)
+        {
+            weight = llaminar2::test::TestTensorFactory::createIQ2_SRandom(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
+        }
+        else
+        {
+            weight = llaminar2::test::TestTensorFactory::createIQ4_NLRandom(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
+        }
+        auto *weight_ptr = weight.get();
+        owned_weights.push_back(std::move(weight));
+        prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
+            weight_ptr,
+            device,
+            std::string("test.cuda_moe.") + role + "." + std::to_string(seed),
+            llaminar2::ModelContextId{123000 + static_cast<uint64_t>(seed)}));
+
+        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+            << "failed to export native descriptor for " << role;
+        EXPECT_EQ(desc.n, rows);
+        EXPECT_EQ(desc.k, cols);
+        EXPECT_EQ(desc.codebook_id, expected_codebook);
+        return desc;
+    };
+
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    gate_descs.reserve(num_experts);
+    up_descs.reserve(num_experts);
+    down_descs.reserve(num_experts);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        gate_descs.push_back(add_prepared_desc(intermediate, d_model, 3100 + expert, "gate", 13));
+        up_descs.push_back(add_prepared_desc(intermediate, d_model, 3200 + expert, "up", 13));
+        down_descs.push_back(add_prepared_desc(d_model, intermediate, 3300 + expert, "down", 4));
+    }
+
+    const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+    const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+
+    std::vector<float> hidden_values(static_cast<size_t>(d_model));
+    for (int i = 0; i < d_model; ++i)
+        hidden_values[static_cast<size_t>(i)] =
+            0.017f * static_cast<float>((i % 19) - 9) +
+            0.003f * static_cast<float>((i % 7) - 3);
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+
+    const std::array<int, top_k> expert_ids = {0, 1, 2, 3, 4, 5, 6, 7};
+    const std::array<float, top_k> expert_weights = {
+        0.19f, 0.17f, 0.15f, 0.14f, 0.13f, 0.10f, 0.07f, 0.05f};
+    auto routing_indices = makeTensor(
+        {seq_len, top_k},
+        {static_cast<float>(expert_ids[0]), static_cast<float>(expert_ids[1]),
+         static_cast<float>(expert_ids[2]), static_cast<float>(expert_ids[3]),
+         static_cast<float>(expert_ids[4]), static_cast<float>(expert_ids[5]),
+         static_cast<float>(expert_ids[6]), static_cast<float>(expert_ids[7])});
+    auto routing_weights = makeTensor(
+        {seq_len, top_k},
+        {expert_weights[0], expert_weights[1], expert_weights[2], expert_weights[3],
+         expert_weights[4], expert_weights[5], expert_weights[6], expert_weights[7]});
+
+    auto decode_gate0 = makeZeros({intermediate});
+    auto decode_gate1 = makeZeros({intermediate});
+    auto decode_gate2 = makeZeros({intermediate});
+    auto decode_gate3 = makeZeros({intermediate});
+    auto decode_gate4 = makeZeros({intermediate});
+    auto decode_gate5 = makeZeros({intermediate});
+    auto decode_gate6 = makeZeros({intermediate});
+    auto decode_gate7 = makeZeros({intermediate});
+    auto decode_up0 = makeZeros({intermediate});
+    auto decode_up1 = makeZeros({intermediate});
+    auto decode_up2 = makeZeros({intermediate});
+    auto decode_up3 = makeZeros({intermediate});
+    auto decode_up4 = makeZeros({intermediate});
+    auto decode_up5 = makeZeros({intermediate});
+    auto decode_up6 = makeZeros({intermediate});
+    auto decode_up7 = makeZeros({intermediate});
+    std::array<llaminar2::ITensor *, top_k> gate_outputs = {
+        decode_gate0.get(), decode_gate1.get(), decode_gate2.get(), decode_gate3.get(),
+        decode_gate4.get(), decode_gate5.get(), decode_gate6.get(), decode_gate7.get()};
+    std::array<llaminar2::ITensor *, top_k> up_outputs = {
+        decode_up0.get(), decode_up1.get(), decode_up2.get(), decode_up3.get(),
+        decode_up4.get(), decode_up5.get(), decode_up6.get(), decode_up7.get()};
+    auto decode_output = makeZeros({d_model});
+
+    ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
+        hidden.get(), expert_ids.data(), gateup_table, top_k,
+        gate_outputs.data(), up_outputs.data(), d_model, intermediate));
+    ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromTable(
+        gate_outputs.data(), up_outputs.data(), expert_ids.data(), expert_weights.data(),
+        down_table, top_k, decode_output.get(), d_model, intermediate));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    std::vector<float> decode_values(
+        decode_output->data(),
+        decode_output->data() + decode_output->numel());
+
+    auto prefill_output = makeZeros({seq_len, d_model});
+    ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+        routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
+    ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+        hidden.get(), prefill_output.get(), gateup_table, down_table,
+        seq_len, d_model, intermediate, num_experts, top_k));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    std::vector<float> prefill_values(
+        prefill_output->data(),
+        prefill_output->data() + prefill_output->numel());
+
+    expectVectorsClose(decode_values, prefill_values, 0.999, 0.025);
 #endif
 }
 

@@ -344,6 +344,8 @@ namespace llaminar2
 
         int8_t *d_prefill_A_int8_ = nullptr;
         float *d_prefill_A_scales_ = nullptr;
+        int8_t *d_prefill_swiglu_int8_ = nullptr;
+        float *d_prefill_swiglu_scales_ = nullptr;
         float *d_prefill_gate_ = nullptr;
         float *d_prefill_up_ = nullptr;
         int prefill_slots_cap_ = 0;

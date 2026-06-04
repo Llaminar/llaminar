@@ -491,6 +491,31 @@ namespace
         freeDevice(d_ptr);
     }
 
+    TEST_P(GPUSamplingTest, Argmax_LargeVocabTieBreaksToLowestTokenId)
+    {
+        // Regression for CUDA skip-gather greedy decode: equal winning logits
+        // must match std::max_element semantics and select the first/lower id,
+        // even when the tied candidates land in different reduction lanes.
+        const int n = 248320;
+        std::vector<float> logits(n, -8.0f);
+        logits[248046] = 17.0f;
+        logits[248068] = 17.0f;
+        logits[1024] = 16.0f;
+
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        float out_value = 0.0f;
+        int out_index = -1;
+        bool ok = argmaxF32(d_ptr, n, device_id_, &out_value, &out_index);
+        ASSERT_TRUE(ok);
+
+        EXPECT_EQ(out_index, 248046);
+        EXPECT_FLOAT_EQ(out_value, 17.0f);
+
+        freeDevice(d_ptr);
+    }
+
     TEST_P(GPUSamplingTest, Argmax_PeakAtLastElement)
     {
         // Edge case: max at end of large array
@@ -565,6 +590,32 @@ namespace
                        static_cast<size_t>(expected[row])])
                 << "row=" << row;
         }
+
+        freeDevice(d_ptr);
+    }
+
+    TEST_P(GPUSamplingTest, Argmax_BatchedRowsTieBreaksToLowestTokenId)
+    {
+        constexpr int rows = 2;
+        constexpr int cols = 8192;
+        std::vector<float> logits(static_cast<size_t>(rows) * static_cast<size_t>(cols), -3.0f);
+        logits[2047] = 9.0f;
+        logits[4096] = 9.0f;
+        logits[static_cast<size_t>(cols) + 7000] = 11.0f;
+        logits[static_cast<size_t>(cols) + 123] = 11.0f;
+
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        float out_values[rows] = {};
+        int out_indices[rows] = {-1, -1};
+        ASSERT_TRUE(argmaxF32BatchedRows(d_ptr, rows, cols, device_id_, out_values, out_indices))
+            << "argmaxF32BatchedRows not supported on " << GetParam();
+
+        EXPECT_EQ(out_indices[0], 2047);
+        EXPECT_FLOAT_EQ(out_values[0], 9.0f);
+        EXPECT_EQ(out_indices[1], 123);
+        EXPECT_FLOAT_EQ(out_values[1], 11.0f);
 
         freeDevice(d_ptr);
     }

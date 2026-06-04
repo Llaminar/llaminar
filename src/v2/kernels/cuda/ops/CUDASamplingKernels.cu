@@ -16,6 +16,7 @@
 
 #include <cuda_runtime.h>
 #include <cfloat>
+#include <climits>
 #include <cstdio>
 #include "../../common/SamplingMath.h"
 
@@ -35,6 +36,15 @@ constexpr int ARGMAX_FINALIZE_THREADS = 256;
 // across enough blocks to occupy most SMs. 8 → ~74 blocks for a 152K vocab,
 // which keeps all 82 SMs of an RTX 3090 busy without oversubscription.
 constexpr int ARGMAX_ELEMS_PER_THREAD = 8;
+
+__device__ __forceinline__ bool argmax_better(float candidate_value,
+                                              int candidate_index,
+                                              float current_value,
+                                              int current_index)
+{
+    return candidate_value > current_value ||
+           (candidate_value == current_value && candidate_index < current_index);
+}
 
 // ============================================================================
 // Argmax Pass 1 — Multi-block partial reduction
@@ -60,11 +70,11 @@ __global__ void cuda_argmax_partial_f32_kernel(
 
     // Phase 1: Grid-strided scan — each thread reduces its share to a local max.
     float local_max = -FLT_MAX;
-    int local_idx = 0;
+    int local_idx = INT_MAX;
     for (int i = gid; i < n; i += grid_stride)
     {
         float val = data[i];
-        if (val > local_max)
+        if (argmax_better(val, i, local_max, local_idx))
         {
             local_max = val;
             local_idx = i;
@@ -80,7 +90,8 @@ __global__ void cuda_argmax_partial_f32_kernel(
     {
         if (tid < stride)
         {
-            if (smax[tid + stride] > smax[tid])
+            if (argmax_better(smax[tid + stride], sidx[tid + stride],
+                              smax[tid], sidx[tid]))
             {
                 smax[tid] = smax[tid + stride];
                 sidx[tid] = sidx[tid + stride];
@@ -119,14 +130,15 @@ __global__ void cuda_argmax_finalize_f32_kernel(
 
     // Phase 1: Strided scan of the partials into a per-thread local max.
     float local_max = -FLT_MAX;
-    int local_idx = 0;
+    int local_idx = INT_MAX;
     for (int i = tid; i < num_partials; i += blockDim.x)
     {
         float val = partial_vals[i];
-        if (val > local_max)
+        const int idx = partial_idxs[i];
+        if (argmax_better(val, idx, local_max, local_idx))
         {
             local_max = val;
-            local_idx = partial_idxs[i];
+            local_idx = idx;
         }
     }
 
@@ -139,7 +151,8 @@ __global__ void cuda_argmax_finalize_f32_kernel(
     {
         if (tid < stride)
         {
-            if (smax[tid + stride] > smax[tid])
+            if (argmax_better(smax[tid + stride], sidx[tid + stride],
+                              smax[tid], sidx[tid]))
             {
                 smax[tid] = smax[tid + stride];
                 sidx[tid] = sidx[tid + stride];
@@ -179,11 +192,11 @@ __global__ void cuda_argmax_partial_f32_batched_rows_kernel(
     const float *row_data = data + static_cast<size_t>(row) * static_cast<size_t>(row_stride);
 
     float local_max = -FLT_MAX;
-    int local_idx = 0;
+    int local_idx = INT_MAX;
     for (int i = gid; i < cols; i += grid_stride)
     {
         const float val = row_data[i];
-        if (val > local_max)
+        if (argmax_better(val, i, local_max, local_idx))
         {
             local_max = val;
             local_idx = i;
@@ -196,7 +209,9 @@ __global__ void cuda_argmax_partial_f32_batched_rows_kernel(
 
     for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
     {
-        if (tid < stride && smax[tid + stride] > smax[tid])
+        if (tid < stride &&
+            argmax_better(smax[tid + stride], sidx[tid + stride],
+                          smax[tid], sidx[tid]))
         {
             smax[tid] = smax[tid + stride];
             sidx[tid] = sidx[tid + stride];
@@ -229,14 +244,15 @@ __global__ void cuda_argmax_finalize_f32_batched_rows_kernel(
     const int base = row * row_partial_capacity;
 
     float local_max = -FLT_MAX;
-    int local_idx = 0;
+    int local_idx = INT_MAX;
     for (int i = tid; i < num_partials; i += blockDim.x)
     {
         const float val = partial_vals[base + i];
-        if (val > local_max)
+        const int idx = partial_idxs[base + i];
+        if (argmax_better(val, idx, local_max, local_idx))
         {
             local_max = val;
-            local_idx = partial_idxs[base + i];
+            local_idx = idx;
         }
     }
 
@@ -246,7 +262,9 @@ __global__ void cuda_argmax_finalize_f32_batched_rows_kernel(
 
     for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1)
     {
-        if (tid < stride && smax[tid + stride] > smax[tid])
+        if (tid < stride &&
+            argmax_better(smax[tid + stride], sidx[tid + stride],
+                          smax[tid], sidx[tid]))
         {
             smax[tid] = smax[tid + stride];
             sidx[tid] = sidx[tid + stride];

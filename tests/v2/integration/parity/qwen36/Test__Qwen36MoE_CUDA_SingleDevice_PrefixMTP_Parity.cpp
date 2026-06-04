@@ -93,6 +93,7 @@ namespace
         test_case.max_seq_len = 768;
         return test_case;
     }
+
 } // namespace
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, PrefixRestoreFullHit)
@@ -137,6 +138,13 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleSkipGatherGreedy
     runMoEMTPBenchmarkStyleSkipGatherParity(
         cudaSingleDeviceBenchmarkPromptCase(),
         4);
+}
+
+TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleSkipGatherGreedyMatchesGatheredArgmax)
+{
+    runMoENoMTPBenchmarkStyleSkipGatherArgmaxParity(
+        cudaSingleDeviceBenchmarkPromptCase(),
+        16);
 }
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, VerifierRowShortcutTwoRowStateMatchesFullReplay)
