@@ -47,6 +47,7 @@ CUDA MoE after token-direct verifier down accumulation:
 `benchmark_results/cuda_moe_mtp/20260604T222925Z-token-direct-down-mtp-dynamic`
 Profiler export check:
 `benchmark_results/cuda_moe_mtp/20260604T230244Z-perf-export-no-stage-events`
+Stage-event fix: `benchmark_results/cuda_moe_mtp/20260604T231108Z-stage-timing-accumulator-fix`
 Greedy margin diagnostic:
 `benchmark_results/cuda_moe_mtp/20260604T220430Z-greedy-margin-verifier-rows`
 
@@ -59,8 +60,9 @@ Verifier-row top-2 margins are large on average (~8.1 logits; one <=1e-2
 near-tie bucket), so CUDA MoE MTP acceptance swings are real draft/main
 disagreement rather than mostly argmax tie noise. The diagnostic run itself is
 not a throughput ratchet because it intentionally adds top-k probes.
-Perf-export smoke verified 0 `stage_gpu` rows and graph counters tagged with
-sync scope; export-only dynamic MTP ran 1607.23/130.34 tok/s at 79.30%.
+Perf-export smoke verified 0 `stage_gpu` rows and graph sync-scope tags.
+Stage-event smoke no longer folds captured replay wall into eager tables;
+verifier correction suffix setup still shows eager events.
 
 Focused correctness gates:
 
@@ -83,15 +85,14 @@ Focused correctness gates:
 - Memory planning charges terminal-row logits and prepared embedding workspace only.
 - GPU activation arenas are capped to prefill-bucket capacity while KV keeps the
   requested context capacity; oversized monolithic graph shapes hard fail.
-- Stage profiling split: `stage_gpu` is explicit GPU-event eager timing,
-  `stage_executor_cpu` is host attribution, and graph replay timing is under
-  `forward_graph`; JSON/CSV export alone no longer enables intrusive stage events.
+- Stage profiling split: `stage_gpu` is explicit eager/capture setup event
+  timing, `stage_executor_cpu` is host attribution, and captured replay timing
+  is under `forward_graph`; JSON/CSV export alone stays non-intrusive.
 - Explicit non-null GPU stream hard failures remain required.
 
 ## Next Work
 
 Updated goal is to beat llama.cpp CUDA on dense and MoE, prefill and decode, with
-MTP on and off. Dense decode is close; MoE dynamic MTP decode now trails llama.cpp
-MTP d1 by about 8% and is near llama.cpp d3. MoE prefill now beats llama-cli no-MTP but still trails
-llama-bench; next target is reducing CUDA MoE verifier/expert FFN cost without
-giving back the prefill scatter win.
+MTP on and off. Dense decode is close; MoE dynamic MTP decode trails llama.cpp
+MTP d1 by about 8% and is near d3. Next target is CUDA MoE verifier and suffix
+replay cost without giving back the prefill scatter win.

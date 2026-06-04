@@ -26,7 +26,7 @@ namespace llaminar2
         // Title row
         {
             std::ostringstream title;
-            title << "GPU STAGE TIMELINE: " << phase_name;
+            title << "GPU STAGE EVENTS: " << phase_name;
             if (device_name)
                 title << " [" << device_name << "]";
             if (token_count > 0)
@@ -40,19 +40,19 @@ namespace llaminar2
         {
             std::ostringstream info;
             info << std::fixed << std::setprecision(2);
-            info << "GPU Total: " << total_gpu_ms << " ms";
+            info << "Event Total: " << total_gpu_ms << " ms";
             if (wall_ms > 0.0)
             {
                 info << "  |  Wall: " << wall_ms << " ms";
                 double gap = wall_ms - total_gpu_ms;
-                info << "  |  Gap: " << gap << " ms";
+                info << "  |  Non-event wall: " << gap << " ms";
                 if (wall_ms > 0.0)
-                    info << " (" << std::setprecision(1) << (gap / wall_ms * 100.0) << "% overhead)";
+                    info << " (" << std::setprecision(1) << (gap / wall_ms * 100.0) << "%)";
             }
             if (token_count > 0 && total_gpu_ms > 0.0f)
             {
                 double tok_per_sec = token_count / (total_gpu_ms / 1000.0);
-                info << "  |  GPU-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
+                info << "  |  Event-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
             }
             table << info.str() << "" << "" << "" << "" << fort::endr;
             table[1][0].set_cell_span(5);
@@ -135,7 +135,7 @@ namespace llaminar2
         // Title row
         {
             std::ostringstream title;
-            title << "GPU STAGE TIMELINE: " << phase_name;
+            title << "GPU STAGE EVENTS: " << phase_name;
             if (device_name)
                 title << " [" << device_name << "]";
             title << " (avg of " << accumulated_iterations_ << " iterations)";
@@ -148,14 +148,14 @@ namespace llaminar2
         {
             std::ostringstream info;
             info << std::fixed << std::setprecision(2);
-            info << "GPU Avg: " << avg_gpu_ms << " ms";
+            info << "Event Avg: " << avg_gpu_ms << " ms";
             info << "  |  Wall Avg: " << avg_wall_ms << " ms";
             double gap = avg_wall_ms - avg_gpu_ms;
-            info << "  |  Gap: " << gap << " ms";
+            info << "  |  Non-event wall: " << gap << " ms";
             if (avg_wall_ms > 0.0)
-                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "% overhead)";
+                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "%)";
             double tok_per_sec = 1000.0 / avg_gpu_ms;
-            info << "  |  GPU-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
+            info << "  |  Event-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
             table << info.str() << "" << "" << "" << "" << fort::endr;
             table[1][0].set_cell_span(5);
         }
@@ -243,7 +243,7 @@ namespace llaminar2
         // Title row
         {
             std::ostringstream title;
-            title << "GPU STAGE TIMELINE: PREFILL";
+            title << "GPU STAGE EVENTS: PREFILL";
             if (device_name)
                 title << " [" << device_name << "]";
             title << " (avg of " << prefill_accumulated_iterations_ << " iterations, "
@@ -257,16 +257,16 @@ namespace llaminar2
         {
             std::ostringstream info;
             info << std::fixed << std::setprecision(2);
-            info << "GPU Avg: " << avg_gpu_ms << " ms";
+            info << "Event Avg: " << avg_gpu_ms << " ms";
             info << "  |  Wall Avg: " << avg_wall_ms << " ms";
             double gap = avg_wall_ms - avg_gpu_ms;
-            info << "  |  Gap: " << gap << " ms";
+            info << "  |  Non-event wall: " << gap << " ms";
             if (avg_wall_ms > 0.0)
-                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "% overhead)";
+                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "%)";
             if (avg_tokens > 0 && avg_gpu_ms > 0.0f)
             {
                 double tok_per_sec = avg_tokens / (avg_gpu_ms / 1000.0);
-                info << "  |  GPU-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
+                info << "  |  Event-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
             }
             table << info.str() << "" << "" << "" << "" << fort::endr;
             table[1][0].set_cell_span(5);
@@ -335,7 +335,7 @@ namespace llaminar2
 
         {
             std::ostringstream title;
-            title << "GPU DETAILED TIMELINE: " << phase_name;
+            title << "GPU DETAILED STAGE EVENTS: " << phase_name;
             if (device_name)
                 title << " [" << device_name << "]";
             table << title.str() << "" << "" << "" << fort::endr;

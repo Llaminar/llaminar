@@ -330,6 +330,9 @@ namespace llaminar2
         void accumulateIteration(double wall_ms)
         {
             auto agg = aggregateByType();
+            if (agg.empty())
+                return;
+
             for (const auto &entry : agg)
             {
                 auto &acc = accumulated_[entry.type_name];
@@ -350,6 +353,9 @@ namespace llaminar2
         void accumulatePrefillIteration(double wall_ms, size_t token_count)
         {
             auto agg = aggregateByType();
+            if (agg.empty())
+                return;
+
             for (const auto &entry : agg)
             {
                 auto &acc = prefill_accumulated_[entry.type_name];

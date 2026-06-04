@@ -399,6 +399,31 @@ TEST_F(Test__StageTimeline, Collect_NoValidEvents_ReturnsEarly)
     EXPECT_EQ(gpu_ctx_->elapsed_time_queries_, 0);
 }
 
+TEST_F(Test__StageTimeline, AccumulateSkipsGraphCapturedIterationsWithoutFreshEvents)
+{
+    StageTimeline timeline;
+    timeline.initialize(gpu_ctx_.get(), 2);
+    timeline.setStageInfo(0, "captured_gemm", ComputeStageType::GEMM);
+    timeline.setStageInfo(1, "captured_lm_head", ComputeStageType::LM_HEAD);
+
+    // Graph replay does not execute stages eagerly, so no stage events are valid.
+    // Wall time for that replay is exported through forward_graph counters; it must
+    // not dilute the eager stage-event accumulator or produce a fake overhead gap.
+    timeline.accumulateIteration(12.5);
+    timeline.accumulatePrefillIteration(25.0, 128);
+    EXPECT_FALSE(timeline.hasAccumulatedData());
+    EXPECT_FALSE(timeline.hasAccumulatedPrefillData());
+
+    void *stream = gpu_ctx_->defaultStream();
+    timeline.recordStart(0, gpu_ctx_.get(), stream);
+    timeline.recordStop(0, gpu_ctx_.get(), stream);
+    timeline.collect(gpu_ctx_.get());
+
+    timeline.accumulateIteration(1.5);
+    EXPECT_TRUE(timeline.hasAccumulatedData());
+    EXPECT_FALSE(timeline.hasAccumulatedPrefillData());
+}
+
 // =============================================================================
 // Regression: resetTimings() clears valid flags
 // =============================================================================
