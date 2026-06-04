@@ -95,6 +95,11 @@ Examples:
         action="store_true",
         help="Write metadata.txt with prompt/decode tokens without saving .npy snapshots",
     )
+    parser.add_argument(
+        "--decode-snapshots-only",
+        action="store_true",
+        help="Save decode-step snapshots but skip prefill snapshots",
+    )
 
     args = parser.parse_args()
 
@@ -107,6 +112,7 @@ Examples:
     print(f"  Output: {args.output}")
     print(f"  Decode steps: {args.decode_steps}")
     print(f"  Metadata only: {args.metadata_only}")
+    print(f"  Decode snapshots only: {args.decode_snapshots_only}")
 
     # Create and load model via registry
     print("\nLoading model...")
@@ -121,6 +127,8 @@ Examples:
         args.output,
         verbose=args.verbose,
         save_snapshots=not args.metadata_only,
+        save_prefill_snapshots=not args.decode_snapshots_only,
+        save_decode_snapshots=True,
     )
 
     # Write metadata

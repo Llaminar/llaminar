@@ -5222,11 +5222,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36moe_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36MoE_SingleDevice_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36moe_single_device_prefix_mtp
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36moe_single_device_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36moe_single_device_prefix_mtp
@@ -5238,11 +5240,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36MoE_CUDA_SingleDevice_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36moe_cuda_single_device_prefix_mtp
@@ -5254,11 +5258,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
         integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp

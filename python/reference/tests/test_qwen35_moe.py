@@ -59,8 +59,8 @@ def _forward_reorder(tensor, dim, num_k, num_v_per_k, head_dim):
     return GGUFLoader._reorder_v_heads(tensor, dim, num_k, num_v_per_k, head_dim)
 
 
-def test_moe_snapshot_generator_help_exposes_metadata_only():
-    """MoE parity can refresh token metadata without writing full snapshot payloads."""
+def test_moe_snapshot_generator_help_exposes_diagnostic_snapshot_modes():
+    """MoE parity can refresh metadata or decode-only diagnostic snapshots."""
     script = Path(__file__).resolve().parents[1] / "generate_qwen35_moe_pipeline_snapshots.py"
     result = subprocess.run(
         [sys.executable, str(script), "--help"],
@@ -70,6 +70,7 @@ def test_moe_snapshot_generator_help_exposes_metadata_only():
     )
 
     assert "--metadata-only" in result.stdout
+    assert "--decode-snapshots-only" in result.stdout
 
 
 def test_bf16_gguf_tensor_type_dequantizes_to_fp32():

@@ -145,6 +145,8 @@ def run_prefill_and_decode(
     output_dir: Path,
     verbose: bool = False,
     save_snapshots: bool = True,
+    save_prefill_snapshots: bool = True,
+    save_decode_snapshots: bool = True,
 ):
     """
     Run prefill + optional decode steps with snapshot capture.
@@ -166,21 +168,21 @@ def run_prefill_and_decode(
     # state). Without this, each decode step re-runs the full prompt + all
     # prior decoded tokens — O(S²) attention work that produces snapshots
     # we then throw away (the C++ parity test only compares the LAST row).
-    capture_stages = None if save_snapshots else []
+    capture_prefill_stages = None if save_snapshots and save_prefill_snapshots else []
     result = model.forward(
         token_ids,
         clear_snapshots=True,
         use_cache=True,
-        capture_stages=capture_stages,
+        capture_stages=capture_prefill_stages,
     )
     total = 0
-    if save_snapshots:
+    if save_snapshots and save_prefill_snapshots:
         prefill_snaps = model.get_snapshots()
         total = save_snapshots_as_npy(prefill_snaps, output_dir, prefix="", verbose=verbose)
         print(f"  Captured {total} prefill snapshots")
     else:
         model.clear_snapshots()
-        print("  Snapshot capture disabled; metadata only")
+        print("  Prefill snapshot capture disabled")
 
     # Get next token (greedy)
     logits = result["logits"]
@@ -208,10 +210,10 @@ def run_prefill_and_decode(
             clear_snapshots=True,
             past_key_values=cache,
             use_cache=True,
-            capture_stages=capture_stages,
+            capture_stages=None if save_snapshots and save_decode_snapshots else [],
         )
         cache = result.get("past_key_values")
-        if save_snapshots:
+        if save_snapshots and save_decode_snapshots:
             step_snaps = model.get_snapshots()
             n = save_snapshots_as_npy(step_snaps, output_dir, prefix=prefix, verbose=verbose)
             total += n
@@ -280,6 +282,11 @@ Examples:
         action="store_true",
         help="Write metadata.txt with prompt/decode tokens without saving .npy snapshots",
     )
+    parser.add_argument(
+        "--decode-snapshots-only",
+        action="store_true",
+        help="Save decode-step snapshots but skip prefill snapshots",
+    )
 
     args = parser.parse_args()
 
@@ -292,6 +299,7 @@ Examples:
     print(f"  Output: {args.output}")
     print(f"  Decode steps: {args.decode_steps}")
     print(f"  Metadata only: {args.metadata_only}")
+    print(f"  Decode snapshots only: {args.decode_snapshots_only}")
 
     # Create and load model via registry
     print("\nLoading model...")
@@ -306,6 +314,8 @@ Examples:
         args.output,
         verbose=args.verbose,
         save_snapshots=not args.metadata_only,
+        save_prefill_snapshots=not args.decode_snapshots_only,
+        save_decode_snapshots=True,
     )
 
     # Write metadata

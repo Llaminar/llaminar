@@ -7,6 +7,9 @@
 #include "kernels/KernelFactory.h"
 #include "utils/DebugEnv.h"
 
+#include <cnpy.h>
+
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
@@ -284,6 +287,99 @@ namespace llaminar2::test::parity::qwen36
             *output = std::move(captured);
         }
         return exit_code == 0;
+    }
+
+    inline bool regenerateQwen36MoEDecodeSnapshots(
+        const std::string &model_path,
+        const std::filesystem::path &metadata_path,
+        const std::string &prompt,
+        int decode_steps,
+        std::string *output)
+    {
+        std::filesystem::create_directories(metadata_path.parent_path());
+
+        std::string script =
+            "unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS "
+            "OMP_PROC_BIND OMP_PLACES KMP_AFFINITY; "
+            "[ -f /workspaces/llaminar/.venv/bin/activate ] && "
+            "source /workspaces/llaminar/.venv/bin/activate; "
+            "python3 python/reference/generate_qwen35_moe_pipeline_snapshots.py";
+        script += " --model " + shellQuote(model_path);
+        script += " --prompt " + shellQuote(prompt);
+        script += " --decode-steps " + std::to_string(decode_steps);
+        script += " --output " + shellQuote(metadata_path.parent_path().string());
+        script += " --decode-snapshots-only";
+
+        const std::string command = "bash -c " + shellQuote(script) + " 2>&1";
+        FILE *pipe = popen(command.c_str(), "r");
+        if (!pipe)
+        {
+            if (output)
+            {
+                *output = "failed to spawn python MoE decode snapshot generator";
+            }
+            return false;
+        }
+
+        char buffer[512];
+        std::string captured;
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+        {
+            captured += buffer;
+        }
+
+        const int exit_code = pclose(pipe);
+        if (output)
+        {
+            *output = std::move(captured);
+        }
+        return exit_code == 0;
+    }
+
+    inline bool qwen36MoEDecodeSnapshotsLookUsable(
+        const std::filesystem::path &metadata_path,
+        int decode_steps)
+    {
+        if (!metadataLooksUsable(metadata_path, decode_steps))
+        {
+            return false;
+        }
+
+        const auto dir = metadata_path.parent_path();
+        if (decode_steps <= 0)
+        {
+            return true;
+        }
+
+        return std::filesystem::exists(dir / "decode_step0_LM_HEAD.npy") &&
+               std::filesystem::exists(dir / "decode_step0_layer0_ATTENTION_NORM.npy");
+    }
+
+    inline void ensurePyTorchMoEDecodeSnapshots(
+        const MoEPrefixRestoreParityCase &test_case,
+        const std::string &model_path,
+        const std::filesystem::path &metadata_path)
+    {
+        if (qwen36MoEDecodeSnapshotsLookUsable(metadata_path, test_case.decode_steps))
+        {
+            return;
+        }
+
+        std::string output;
+        ASSERT_TRUE(regenerateQwen36MoEDecodeSnapshots(
+            model_path,
+            metadata_path,
+            test_case.prompt,
+            test_case.decode_steps,
+            &output))
+            << test_case.name << " failed to regenerate PyTorch MoE decode snapshots at "
+            << metadata_path.parent_path() << "\n"
+            << output;
+
+        ASSERT_TRUE(qwen36MoEDecodeSnapshotsLookUsable(metadata_path, test_case.decode_steps))
+            << test_case.name << " regenerated MoE decode snapshots are incomplete at "
+            << metadata_path.parent_path() << "\n"
+            << output;
     }
 
     inline void ensurePyTorchMoEMetadata(
@@ -1062,13 +1158,17 @@ namespace llaminar2::test::parity::qwen36
 
     struct MoESnapshotCompareRow
     {
+        std::string comparison = "baseline_vs_mtp";
         int sync_idx = 0;
         int output_tokens = 0;
         std::string key;
+        std::string reference_key;
         size_t elements = 0;
         double cosine = 0.0;
         double rel_l2 = 0.0;
         double max_abs_diff = 0.0;
+        std::string left_label = "baseline";
+        std::string right_label = "mtp";
         bool present_in_baseline = false;
         bool present_in_mtp = false;
     };
@@ -1092,9 +1192,13 @@ namespace llaminar2::test::parity::qwen36
         const std::string &key)
     {
         MoESnapshotCompareRow row;
+        row.comparison = "baseline_vs_mtp";
         row.sync_idx = sync_idx;
         row.output_tokens = output_tokens;
         row.key = key;
+        row.reference_key = key;
+        row.left_label = "baseline";
+        row.right_label = "mtp";
 
         size_t baseline_size = 0;
         size_t mtp_size = 0;
@@ -1140,9 +1244,13 @@ namespace llaminar2::test::parity::qwen36
         const std::string &key)
     {
         MoESnapshotCompareRow row;
+        row.comparison = "baseline_vs_mtp";
         row.sync_idx = sync_idx;
         row.output_tokens = output_tokens;
         row.key = key;
+        row.reference_key = key;
+        row.left_label = "baseline";
+        row.right_label = "mtp";
 
         const auto baseline_it = baseline.snapshots.find(key);
         size_t mtp_size = 0;
@@ -1184,6 +1292,121 @@ namespace llaminar2::test::parity::qwen36
         return row;
     }
 
+    inline std::vector<float> loadMoEPyTorchSnapshot(
+        const std::filesystem::path &snapshot_dir,
+        const std::string &key)
+    {
+        const auto npy_path = snapshot_dir / (key + ".npy");
+        try
+        {
+            cnpy::NpyArray arr = cnpy::npy_load(npy_path.string());
+            std::vector<float> data;
+            if (arr.word_size == sizeof(float))
+            {
+                const float *ptr = arr.data<float>();
+                data.assign(ptr, ptr + arr.num_vals);
+                return data;
+            }
+            if (arr.word_size == sizeof(double))
+            {
+                const double *ptr = arr.data<double>();
+                data.resize(arr.num_vals);
+                for (size_t i = 0; i < arr.num_vals; ++i)
+                {
+                    data[i] = static_cast<float>(ptr[i]);
+                }
+                return data;
+            }
+        }
+        catch (const std::exception &)
+        {
+            return {};
+        }
+        return {};
+    }
+
+    inline std::vector<std::string> listMoEPyTorchSnapshotKeysForDecodeStep(
+        const std::filesystem::path &snapshot_dir,
+        int decode_step)
+    {
+        std::vector<std::string> keys;
+        const std::string prefix = "decode_step" + std::to_string(decode_step) + "_";
+        std::error_code ec;
+        for (const auto &entry : std::filesystem::directory_iterator(snapshot_dir, ec))
+        {
+            if (ec || !entry.is_regular_file())
+            {
+                continue;
+            }
+            const auto path = entry.path();
+            if (path.extension() != ".npy")
+            {
+                continue;
+            }
+            const std::string stem = path.stem().string();
+            if (stem.rfind(prefix, 0) != 0)
+            {
+                continue;
+            }
+            keys.push_back(stem.substr(prefix.size()));
+        }
+        std::sort(keys.begin(), keys.end());
+        return keys;
+    }
+
+    inline MoESnapshotCompareRow compareMoESnapshotVectors(
+        const std::vector<float> &left,
+        const float *right,
+        size_t right_size,
+        int sync_idx,
+        int output_tokens,
+        const std::string &key,
+        const std::string &reference_key,
+        const std::string &comparison,
+        const std::string &left_label,
+        const std::string &right_label)
+    {
+        MoESnapshotCompareRow row;
+        row.comparison = comparison;
+        row.sync_idx = sync_idx;
+        row.output_tokens = output_tokens;
+        row.key = key;
+        row.reference_key = reference_key;
+        row.left_label = left_label;
+        row.right_label = right_label;
+        row.present_in_baseline = !left.empty();
+        row.present_in_mtp = right != nullptr && right_size > 0;
+
+        if (!row.present_in_baseline || !row.present_in_mtp || left.size() != right_size)
+        {
+            row.elements = std::max(left.size(), right_size);
+            return row;
+        }
+
+        row.elements = left.size();
+        double dot = 0.0;
+        double left_norm = 0.0;
+        double right_norm = 0.0;
+        double diff_norm = 0.0;
+        for (size_t i = 0; i < left.size(); ++i)
+        {
+            const double a = static_cast<double>(left[i]);
+            const double b = static_cast<double>(right[i]);
+            const double diff = a - b;
+            dot += a * b;
+            left_norm += a * a;
+            right_norm += b * b;
+            diff_norm += diff * diff;
+            row.max_abs_diff = std::max(row.max_abs_diff, std::abs(diff));
+        }
+
+        const double denom = std::sqrt(left_norm) * std::sqrt(right_norm);
+        row.cosine = denom > 0.0 ? dot / denom : 1.0;
+        row.rel_l2 = left_norm > 0.0 ? std::sqrt(diff_norm / left_norm)
+                                     : std::sqrt(diff_norm);
+        return row;
+    }
+
     inline MoEDiagnosticSnapshot captureMoEDiagnosticSnapshot(
         IOrchestrationRunner &runner,
         const std::vector<int32_t> &emitted_tokens,
@@ -1214,19 +1437,24 @@ namespace llaminar2::test::parity::qwen36
 
     inline void writeMoESnapshotCsvHeader(std::ofstream &csv)
     {
-        csv << "sync_idx,output_tokens,key,elements,cosine,rel_l2,max_abs_diff,"
-               "present_in_baseline,present_in_mtp\n";
+        csv << "comparison,sync_idx,output_tokens,key,reference_key,elements,"
+               "cosine,rel_l2,max_abs_diff,left_label,right_label,"
+               "present_left,present_right\n";
     }
 
     inline void writeMoESnapshotCsvRow(std::ofstream &csv, const MoESnapshotCompareRow &row)
     {
-        csv << row.sync_idx << ','
+        csv << csvEscapeMoEDiagnostic(row.comparison) << ','
+            << row.sync_idx << ','
             << row.output_tokens << ','
             << csvEscapeMoEDiagnostic(row.key) << ','
+            << csvEscapeMoEDiagnostic(row.reference_key) << ','
             << row.elements << ','
             << row.cosine << ','
             << row.rel_l2 << ','
             << row.max_abs_diff << ','
+            << csvEscapeMoEDiagnostic(row.left_label) << ','
+            << csvEscapeMoEDiagnostic(row.right_label) << ','
             << (row.present_in_baseline ? "true" : "false") << ','
             << (row.present_in_mtp ? "true" : "false") << '\n';
         csv.flush();
@@ -1294,6 +1522,16 @@ namespace llaminar2::test::parity::qwen36
             return;
         }
         ASSERT_GT(decode_token_budget, 0);
+
+        const std::filesystem::path metadata_path = firstEnvOrDefault(
+            test_case.metadata_envs,
+            test_case.default_metadata_path);
+        ensurePyTorchMoEDecodeSnapshots(test_case, model_path, metadata_path);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        const auto pytorch_snapshot_dir = metadata_path.parent_path();
 
         auto factory = createOrchestrationRunnerFactory();
         SamplingParams greedy;
@@ -1405,7 +1643,14 @@ namespace llaminar2::test::parity::qwen36
             {
                 baseline_keys.push_back(entry.first);
             }
-            const auto keys = unionSnapshotKeys(baseline_keys, mtp->getSnapshotKeys());
+            const int pytorch_decode_step =
+                std::max(0, static_cast<int>(mtp_tokens.size()) - 2);
+            auto keys = unionSnapshotKeys(baseline_keys, mtp->getSnapshotKeys());
+            keys = unionSnapshotKeys(
+                keys,
+                listMoEPyTorchSnapshotKeysForDecodeStep(
+                    pytorch_snapshot_dir,
+                    pytorch_decode_step));
             for (const auto &key : keys)
             {
                 auto row = compareMoESnapshotKey(
@@ -1416,6 +1661,55 @@ namespace llaminar2::test::parity::qwen36
                     key);
                 all_snapshot_rows.push_back(row);
                 writeMoESnapshotCsvRow(snapshot_csv, row);
+
+                if (pytorch_decode_step < test_case.decode_steps)
+                {
+                    const std::string pytorch_key =
+                        "decode_step" + std::to_string(pytorch_decode_step) + "_" + key;
+                    const auto pytorch_data = loadMoEPyTorchSnapshot(
+                        pytorch_snapshot_dir,
+                        pytorch_key);
+
+                    const auto baseline_it = baseline_snapshot.snapshots.find(key);
+                    const float *baseline_data = nullptr;
+                    size_t baseline_size = 0;
+                    if (baseline_it != baseline_snapshot.snapshots.end() &&
+                        !baseline_it->second.empty())
+                    {
+                        baseline_data = baseline_it->second.data();
+                        baseline_size = baseline_it->second.size();
+                    }
+
+                    auto baseline_pt_row = compareMoESnapshotVectors(
+                        pytorch_data,
+                        baseline_data,
+                        baseline_size,
+                        sync_idx,
+                        static_cast<int>(mtp_tokens.size()),
+                        key,
+                        pytorch_key,
+                        "pytorch_vs_baseline",
+                        "pytorch",
+                        "baseline");
+                    all_snapshot_rows.push_back(baseline_pt_row);
+                    writeMoESnapshotCsvRow(snapshot_csv, baseline_pt_row);
+
+                    size_t mtp_size = 0;
+                    const float *mtp_data = mtp->getSnapshot(key, mtp_size);
+                    auto mtp_pt_row = compareMoESnapshotVectors(
+                        pytorch_data,
+                        mtp_data,
+                        mtp_size,
+                        sync_idx,
+                        static_cast<int>(mtp_tokens.size()),
+                        key,
+                        pytorch_key,
+                        "pytorch_vs_mtp",
+                        "pytorch",
+                        "mtp");
+                    all_snapshot_rows.push_back(mtp_pt_row);
+                    writeMoESnapshotCsvRow(snapshot_csv, mtp_pt_row);
+                }
             }
 
             ++sync_idx;

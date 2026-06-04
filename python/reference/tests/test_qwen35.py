@@ -348,6 +348,58 @@ class TestQwen35SnapshotGeneration:
         assert model.clear_count == 3
         assert not list(tmp_path.glob("*.npy"))
 
+    def test_decode_only_snapshots_skip_prefill_payloads(self, tmp_path):
+        from python.reference.generate_qwen35_pipeline_snapshots import run_prefill_and_decode
+
+        class FakeTokenizer:
+            def __call__(self, prompt, return_tensors):
+                assert prompt == "hello"
+                assert return_tensors == "pt"
+                return {"input_ids": torch.tensor([[10, 11]])}
+
+        class FakeModel:
+            def __init__(self):
+                self.tokenizer = FakeTokenizer()
+                self.capture_args = []
+                self.clear_count = 0
+
+            def forward(self, token_ids, **kwargs):
+                self.capture_args.append(kwargs.get("capture_stages"))
+                vocab = 32
+                logits = np.zeros((1, len(token_ids), vocab), dtype=np.float32)
+                logits[0, -1, 20 + len(self.capture_args)] = 1.0
+                return {"logits": logits, "past_key_values": object()}
+
+            def get_snapshots(self):
+                return {
+                    (PipelineStage.LM_HEAD, -1):
+                        np.array([[float(len(self.capture_args))]], dtype=np.float32)
+                }
+
+            def clear_snapshots(self):
+                self.clear_count += 1
+
+        model = FakeModel()
+        total, token_ids, decode_tokens = run_prefill_and_decode(
+            model,
+            "hello",
+            decode_steps=2,
+            output_dir=tmp_path,
+            save_snapshots=True,
+            save_prefill_snapshots=False,
+            save_decode_snapshots=True,
+        )
+
+        assert total == 2
+        assert token_ids == [10, 11]
+        assert decode_tokens == [21, 22, 23]
+        assert model.capture_args == [[], None, None]
+        assert model.clear_count == 1
+        assert sorted(p.name for p in tmp_path.glob("*.npy")) == [
+            "decode_step0_LM_HEAD.npy",
+            "decode_step1_LM_HEAD.npy",
+        ]
+
     def test_write_metadata_creates_output_directory(self, tmp_path):
         from python.reference.generate_qwen35_pipeline_snapshots import write_metadata
 
