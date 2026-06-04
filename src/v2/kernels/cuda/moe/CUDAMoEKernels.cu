@@ -1439,26 +1439,6 @@ namespace
         }
     }
 
-    __global__ void grouped_prefill_scatter_weighted_kernel(
-        float *__restrict__ output,
-        const float *__restrict__ expert_output,
-        const int *__restrict__ grouped_token_indices,
-        const float *__restrict__ grouped_weights,
-        int total_slots,
-        int d_model)
-    {
-        constexpr int kTileN = 64;
-        const int col = blockIdx.x * kTileN + threadIdx.x;
-        const int slot = blockIdx.y;
-        if (slot >= total_slots || col >= d_model)
-            return;
-
-        const int token = grouped_token_indices[slot];
-        const float weight = grouped_weights[slot];
-        const float value = expert_output[static_cast<size_t>(slot) * d_model + col];
-        atomicAdd(output + static_cast<size_t>(token) * d_model + col, weight * value);
-    }
-
     __global__ void grouped_prefill_scatter_weighted_deterministic_kernel(
         float *__restrict__ output,
         const float *__restrict__ expert_output,

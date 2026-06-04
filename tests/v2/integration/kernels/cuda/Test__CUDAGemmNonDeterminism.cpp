@@ -1033,17 +1033,12 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
               << " split_k=" << selected_split_k
               << " bk256=" << used_bk256
               << " streamk=" << used_streamk << "\n";
-    EXPECT_EQ(selected_split_k, 1)
-        << "auto tiny-M prefill must avoid split-K accumulation-order drift";
-    EXPECT_EQ(used_streamk, 0)
-        << "auto tiny-M prefill must avoid stream-K atomic accumulation";
-
     ws->unbindWorkspace();
     workspace_.reset();
 #endif
 }
 
-TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMAutoSelectionIsStable)
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIsStable)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA build required";
@@ -1052,7 +1047,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMAutoSelectionIsStab
     cudaNativeVNNIPrefill_setForceTile(-1, 0);
     cudaNativeVNNIPrefill_setStreamKMode(0);
     cudaNativeVNNIPrefill_setBK256Mode(0);
-    cudaNativeVNNIPrefill_setDeterministicMode(false);
+    cudaNativeVNNIPrefill_setDeterministicMode(true);
 
     const int M = 72;
     const int N = 4864;
@@ -1097,14 +1092,14 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMAutoSelectionIsStab
     int used_streamk = 0;
     cudaNativeVNNIPrefill_getLastLaunchSelection(
         &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
-    std::cout << "NativeVNNI grouped-small-M auto selection: tile=" << selected_tile
+    std::cout << "NativeVNNI grouped-small-M deterministic selection: tile=" << selected_tile
               << " split_k=" << selected_split_k
               << " bk256=" << used_bk256
               << " streamk=" << used_streamk << "\n";
     EXPECT_EQ(selected_split_k, 1)
-        << "auto grouped-small-M prefill must avoid split-K accumulation-order drift";
+        << "deterministic grouped-small-M prefill must avoid split-K accumulation-order drift";
     EXPECT_EQ(used_streamk, 0)
-        << "auto grouped-small-M prefill must avoid stream-K atomic accumulation";
+        << "deterministic grouped-small-M prefill must avoid stream-K atomic accumulation";
 
     ws->unbindWorkspace();
     workspace_.reset();

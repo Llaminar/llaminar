@@ -1395,8 +1395,8 @@ TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)
                 std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N1)});
 
             std::vector<TensorProjectionDesc> projections = {
-                {cuda_kernel0, C0_tensor.get(), N0, nullptr, "small_m_proj0"},
-                {cuda_kernel1, C1_tensor.get(), N1, nullptr, "small_m_proj1"}};
+                {cuda_kernel0, C0_tensor.get(), N0, nullptr, "qkv"},
+                {cuda_kernel1, C1_tensor.get(), N1, nullptr, "z"}};
 
             ASSERT_TRUE(with_gpu_coherence(
                 gpu_device_,
@@ -1454,10 +1454,130 @@ TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)
             total_count += record.count;
             EXPECT_EQ(record.tags.at("k"), std::to_string(K));
             EXPECT_EQ(record.tags.at("projections"), "2");
+            const std::string &m_tag = record.tags.at("m");
+            const std::string &route_tag = record.tags.at("route");
+            if (m_tag == "3")
+            {
+                EXPECT_EQ(route_tag, "rowwise")
+                    << "M=3 CUDA verifier projections should stay on the known-good rowwise route until M=3 batching proves faster";
+            }
+            else if (m_tag == "4")
+            {
+                EXPECT_EQ(route_tag, "rowwise")
+                    << "M=4 CUDA verifier projections should stay on the known-good rowwise route until M=4 batching proves faster";
+            }
+            else if (m_tag == "2")
+            {
+                EXPECT_EQ(route_tag, "m2_or_rowwise")
+                    << "M=2 CUDA verifier projections should use the native two-row route when supported";
+            }
         }
     }
     EXPECT_EQ(total_count, cudaSmallMNativeFormats().size() * verifier_rows.size())
         << "Every CUDA native format and M=2/3/4 verifier shape should use the fused small-M route";
+
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__CUDAGemmParity, MTP_SmallM_MoEProjectionNamesStayRowwiseUntilBatchedRouteIsProven)
+{
+    const int K = 256;
+    const int N0 = 192;
+    const int N1 = 128;
+    const std::array<int, 2> verifier_rows = {3, 4};
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto weights0 = TestTensorFactory::createQ4_KRandom({static_cast<size_t>(N0), static_cast<size_t>(K)}, 230);
+    auto weights1 = TestTensorFactory::createQ4_KRandom({static_cast<size_t>(N1), static_cast<size_t>(K)}, 231);
+    ASSERT_NE(weights0, nullptr);
+    ASSERT_NE(weights1, nullptr);
+
+    auto cpu_kernel0 = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights0.get(), KernelDeviceType::CPU);
+    auto cpu_kernel1 = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights1.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel0, nullptr);
+    ASSERT_NE(cpu_kernel1, nullptr);
+
+    auto *cuda_kernel0 = getPreparedKernel(weights0.get(), gpu_device_);
+    auto *cuda_kernel1 = getPreparedKernel(weights1.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel0, nullptr);
+    ASSERT_NE(cuda_kernel1, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace({cuda_kernel0, cuda_kernel1}, 4, {N0, N1}, K));
+
+    for (int M : verifier_rows)
+    {
+        auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+        std::vector<float> C0_cpu(static_cast<size_t>(M) * N0, 0.0f);
+        std::vector<float> C1_cpu(static_cast<size_t>(M) * N1, 0.0f);
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel0.get(), A_data.data(), C0_cpu.data(), M, N0, K));
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel1.get(), A_data.data(), C1_cpu.data(), M, N1, K));
+
+        auto A_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+        std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+        auto C0_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N0)});
+        auto C1_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N1)});
+
+        std::vector<TensorProjectionDesc> projections = {
+            {cuda_kernel0, C0_tensor.get(), N0, nullptr, "shared_gate"},
+            {cuda_kernel1, C1_tensor.get(), N1, nullptr, "shared_up"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_tensor.get()},
+            {C0_tensor.get(), C1_tensor.get()},
+            [&]
+            {
+                return cuda_kernel0->multiply_fused_tensor(
+                    A_tensor.get(), projections, M, K);
+            }))
+            << "MoE-style CUDA fused projection failed at M=" << M;
+
+        const float *C0_cuda = C0_tensor->data();
+        const float *C1_cuda = C1_tensor->data();
+        const auto result0 =
+            checkParity(C0_cuda, C0_cpu.data(), C0_cpu.size(), 0.990, 0.20);
+        const auto result1 =
+            checkParity(C1_cuda, C1_cpu.data(), C1_cpu.size(), 0.990, 0.20);
+        EXPECT_FALSE(result0.has_nan_inf);
+        EXPECT_FALSE(result1.has_nan_inf);
+        EXPECT_GE(result0.cosine_similarity, 0.990)
+            << "projection 0 cosine too low at M=" << M;
+        EXPECT_GE(result1.cosine_similarity, 0.990)
+            << "projection 1 cosine too low at M=" << M;
+        EXPECT_LE(result0.relative_l2_error, 0.20);
+        EXPECT_LE(result1.relative_l2_error, 0.20);
+    }
+
+    cleanupSharedWorkspace({cuda_kernel0, cuda_kernel1});
+    EXPECT_FALSE(cuda_kernel0->hasDynamicStateActive());
+    EXPECT_FALSE(cuda_kernel1->hasDynamicStateActive());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights0.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
+
+    const auto records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+    uint64_t total_count = 0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter)
+        {
+            total_count += record.count;
+            EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"), "2");
+            EXPECT_EQ(record.tags.at("route"), "rowwise")
+                << "MoE projection groups must not use the GDN chunked route until that path has direct parity coverage";
+        }
+    }
+    EXPECT_EQ(total_count, verifier_rows.size());
 
     PerfStatsCollector::reset();
 }

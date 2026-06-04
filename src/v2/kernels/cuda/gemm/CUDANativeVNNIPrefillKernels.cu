@@ -3021,8 +3021,6 @@ namespace
         CUDAPrefillContext_ *prefill_ctx)
     {
         const int nsm = querySmCount(prefill_ctx);
-        const int ntx = (N + BN - 1) / BN;
-        const int nty = (M + BM - 1) / BM;
 
         // Query how many blocks the hardware can run concurrently per SM,
         // given the kernel's compiled register and shared memory usage.
@@ -3412,11 +3410,6 @@ namespace
         cudaStream_t cuda_stream,
         CUDAPrefillContext_ *prefill_ctx)
     {
-        constexpr int kSmallMStableThreshold = 128;
-        const bool force_tile_or_split_requested = (g_force_tile_id >= 0) || (g_force_split_k > 0);
-        const bool require_stable_small_m =
-            (M <= kSmallMStableThreshold) && !force_tile_or_split_requested;
-
         // ─── BK256 path (CB=0 only) ──────────────────────────────────
         // BK256 processes 256 K-elements per outer tile (4× fewer K-iterations
         // than BK64), benefiting K-heavy shapes like FFN_Down (K=18944).
@@ -3433,7 +3426,7 @@ namespace
                 const bool use_narrow_bn64 = (M <= 32) && (N <= 1024);
                 const int bk256_bn = use_narrow_bn64 ? 64 : 128;
                 int sk = chooseSplitK_BK256(M, N, K, 128, bk256_bn, prefill_ctx);
-                if (require_stable_small_m)
+                if (g_deterministic_mode)
                     sk = 1;
                 bool ok = false;
                 if (use_narrow_bn64)
@@ -3501,12 +3494,12 @@ namespace
             }
         }
 
-        // Deterministic mode and auto-selected short/sparse-M prefill both use
-        // the stable single-partition path. Split-K is race-free here, but it
-        // changes FP32 accumulation order; for short prompts and grouped MoE
-        // rows those ULPs can compound into near-tie greedy token flips. Force
-        // knobs still bypass this for tuning.
-        if ((g_deterministic_mode || require_stable_small_m) && tc.split_k > 1)
+        // Deterministic parity mode uses the stable single-partition path.
+        // Split-K is race-free here, but it changes FP32 accumulation order;
+        // for short prompts and grouped MoE rows those ULPs can compound into
+        // near-tie greedy token flips. Production auto mode keeps the faster
+        // split-K/StreamK choices for Phase 14 throughput.
+        if (g_deterministic_mode && tc.split_k > 1)
             tc.split_k = 1;
 
         // ─── Tile launch with StreamK evaluation (CB=0) ──────────────
@@ -3517,7 +3510,7 @@ namespace
     {                                                                                   \
         if constexpr (CB == 0)                                                          \
         {                                                                               \
-            if (!require_stable_small_m && tc.split_k == 1 && g_stream_k_force_mode == 2) \
+            if (!g_deterministic_mode && tc.split_k == 1 && g_stream_k_force_mode == 2)   \
             {                                                                           \
                 recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 2);      \
                 return launchNativeVNNITC_BK64_StreamK_TwoPass<CB, BM_, BN_, WM_, WN_>( \
@@ -3526,7 +3519,7 @@ namespace
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
                     prefill_ctx);                                                       \
             }                                                                           \
-            if (!require_stable_small_m && tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_, prefill_ctx)) \
+            if (!g_deterministic_mode && tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_, prefill_ctx)) \
             {                                                                           \
                 recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 1);      \
                 return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>(         \

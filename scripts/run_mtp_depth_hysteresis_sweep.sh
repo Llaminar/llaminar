@@ -17,6 +17,8 @@ Options:
   --output-dir DIR   Output directory (default: benchmark_results/mtp_depth_hysteresis/<timestamp>-<git>).
   --cases SET        smoke, short, long, code, all, or comma list (default: smoke).
   --variants SET     acceptance, grid, all, or comma list (default: acceptance).
+  --deterministic    Pass --deterministic to llaminar2 benchmark. Default is production mode.
+  --no-deterministic Do not pass --deterministic.
   --dry-run          Print commands without executing.
   -h, --help         Show this help.
 
@@ -38,6 +40,7 @@ Environment:
   LLAMINAR_MTP_HYSTERESIS_CASES
   LLAMINAR_MTP_HYSTERESIS_VARIANTS
   LLAMINAR_MTP_HYSTERESIS_RESULTS_DIR
+  LLAMINAR_MTP_HYSTERESIS_DETERMINISTIC
   LLAMINAR_LL2_BIN
   LLAMINAR_LOG_LEVEL
 
@@ -54,6 +57,7 @@ device_spec="${LLAMINAR_MTP_HYSTERESIS_DEVICE:-rocm:0}"
 case_selection="${LLAMINAR_MTP_HYSTERESIS_CASES:-smoke}"
 variant_selection="${LLAMINAR_MTP_HYSTERESIS_VARIANTS:-acceptance}"
 output_dir="${LLAMINAR_MTP_HYSTERESIS_RESULTS_DIR:-}"
+deterministic="${LLAMINAR_MTP_HYSTERESIS_DETERMINISTIC:-0}"
 dry_run=0
 extra_args=()
 
@@ -86,6 +90,14 @@ while [[ $# -gt 0 ]]; do
     --variants)
       variant_selection="${2:-}"
       shift 2
+      ;;
+    --deterministic)
+      deterministic=1
+      shift
+      ;;
+    --no-deterministic)
+      deterministic=0
+      shift
       ;;
     --dry-run)
       dry_run=1
@@ -281,6 +293,7 @@ metadata_path="${output_dir}/metadata.txt"
   echo "device=${device_spec}"
   echo "cases=${case_selection}"
   echo "variants=${variant_selection}"
+  echo "deterministic=${deterministic}"
   echo "extra_args=${extra_args[*]:-}"
   echo
   git -C "${repo_root}" status --short || true
@@ -336,9 +349,11 @@ for case_name in "${cases[@]}"; do
       "${binary_path}" benchmark
       -m "${model_path}"
       -d "${device_spec}"
-      --deterministic
       --benchmark-json-output "${json_path}"
     )
+    if [[ "${deterministic}" == "1" || "${deterministic}" == "true" || "${deterministic}" == "TRUE" ]]; then
+      cmd+=(--deterministic)
+    fi
     cmd+=("${case_args[@]}")
     cmd+=("${variant_args[@]}")
     cmd+=("${extra_args[@]}")

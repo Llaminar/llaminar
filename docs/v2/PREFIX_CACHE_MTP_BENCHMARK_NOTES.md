@@ -10,16 +10,11 @@ speedup. Detailed tuning history belongs in commit messages or perf artifacts.
 |---|---|---|---:|---:|---:|---|
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 30.76 tok/s | 53.81 tok/s | 1.75x | Correctness green, mostly graph captured, short of 2x target |
 | Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 46.74 tok/s | 1.56x | Bucketed attention graph capture, depth-sensitive |
-| Dense long lane | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.44 tok/s | 54.02 tok/s | 1.34x | Correctness green, needs verifier work |
+| Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 15.76 tok/s | 26.66 tok/s | 1.69x | Dynamic best; d3 overreaches |
 | MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Needs longer confirmation |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | Phase 14 after single-device lanes |
-
-## Latest ROCm Dense Evidence
-
-Fresh Release captures on 2026-06-03 used code-default GPU graphs. Depth-3 is
-speed-positive but still short of 2x; default prompts need adaptive depth.
 
 ## Adaptive Depth Motivation
 
@@ -49,18 +44,26 @@ The useful tuning change was lifecycle, not another threshold tweak:
 so dynamic mode keeps the running tally it needs. No further hysteresis change
 is required for this slice.
 
-## ROCm Attention Param-Copy Safety
+The reusable sweep script defaults to production benchmark mode. Use
+`--deterministic` only when the benchmark is meant to mirror deterministic
+parity settings.
 
-The ROCm attention crash was traced to dynamic `AttentionDeviceParams` H2D
-copies being recorded inside HIP graph capture. The fix moves that upload into
-`prepareDynamicAttnParams()` on an explicit non-null stream before capture or
-replay; the captured stage body now hard-fails if params were not already
-uploaded. Cached forward graphs and MTP sidecar graphs bind all stages to the
-worker/capture stream before dynamic-param updates.
+## Latest CUDA Dense Evidence
 
-Validation: the focused graph/attention/forward units passed. A short real
-Qwen3.6 ROCm dynamic-MTP run completed with 268 MTP graph replay traces, no
-ERROR/WARN param-copy diagnostics, 36.64 decode tok/s, and 65.85% acceptance.
+Production-mode Qwen3.6 27B Q4_K_S on `cuda:0`, 2026-06-04:
+
+| Case | Decode | Acceptance | Notes |
+|---|---:|---:|---|
+| baseline | 40.75 tok/s | n/a | no MTP |
+| fixed d1 | 53.30 tok/s | 95.83% | best CUDA lane |
+| fixed d2 | 33.20 tok/s | 93.55% | verifier cost dominates |
+| fixed d3 | 31.29 tok/s | 91.43% | slower than d1 |
+| dynamic max d3 | 31.32 tok/s | 91.43% | no update before short run ends |
+
+Artifacts:
+`benchmark_results/cuda_dense_mtp/20260604T003037Z-27115c81-qbf-fast-prodauto-final`.
+An attempted CUDA M=3/4 chunked small-M route passed focused parity but
+regressed deeper-draft throughput, so it is not retained.
 
 ## Main Tuning Actions Landed
 
@@ -71,6 +74,8 @@ ERROR/WARN param-copy diagnostics, 36.64 decode tok/s, and 65.85% acceptance.
 - Added stable verifier graph lifetime handling and draft-depth clamping.
 - Added batched ROCm verifier-row argmax through declared graph workspace.
 - Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks.
+- Kept CUDA M=3/4 verifier projection dispatch on the known-good row-wise route
+  until a batched route proves both parity and speed.
 - Added GDN verifier-row rollback restore for short-conv and recurrence state.
 - Stabilized MoE prefix fingerprints by excluding transient runtime-table caches.
 - Moved touched graph scratch paths onto declared workspace buffers.

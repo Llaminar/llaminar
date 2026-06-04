@@ -677,6 +677,7 @@ namespace llaminar2
                 }
                 return ok;
             }
+
         }
 
         // Static method stubs kept for ABI compatibility but are no-ops.
@@ -1451,6 +1452,7 @@ namespace llaminar2
                 }
 
                 const int blocks_per_row = k / 32;
+
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
                     const auto &proj = projections[i];
@@ -1535,7 +1537,7 @@ namespace llaminar2
                     cuda_kernel->ensureWeightsConverted();
                     if (!canUseNativeVNNIBlockwise(cuda_kernel->impl_.get(), 1, k))
                     {
-                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M native GEMV unsupported for projection "
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M native path unsupported for projection "
                                   << i << " (" << (proj.name ? proj.name : "unnamed") << ")");
                         return false;
                     }
