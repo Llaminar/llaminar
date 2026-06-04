@@ -36,9 +36,11 @@
 #include <random>
 #include <cmath>
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <iomanip>
 #include <cstring>
+#include <string>
 
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
@@ -51,6 +53,45 @@
 
 namespace llaminar2::test::cuda
 {
+
+    /**
+     * @brief Temporarily set an environment variable for scoped startup control.
+     *
+     * CUDA-only test fixtures use this to keep ROCm startup out of the process
+     * while DeviceManager performs CUDA discovery. That avoids initializing the
+     * HIP runtime in tests that never exercise it.
+     */
+    class ScopedEnvVar
+    {
+    public:
+        ScopedEnvVar(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *existing = std::getenv(name_.c_str());
+            if (existing)
+            {
+                had_value_ = true;
+                old_value_ = existing;
+            }
+            setenv(name_.c_str(), value, 1);
+        }
+
+        ~ScopedEnvVar()
+        {
+            if (had_value_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+        ScopedEnvVar(const ScopedEnvVar &) = delete;
+        ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+
+    private:
+        std::string name_;
+        std::string old_value_;
+        bool had_value_ = false;
+    };
 
     // =========================================================================
     // Tolerance Constants
@@ -176,7 +217,8 @@ namespace llaminar2::test::cuda
             // Initialize DeviceManager to enumerate GPU devices
             // Must be called before has_gpu() or find_device()
             auto &dm = DeviceManager::instance();
-            dm.initialize(-1); // -1 = no NUMA filtering, enumerate all devices
+            ScopedEnvVar skip_rocm_startup("LLAMINAR_SKIP_ROCM_STARTUP", "1");
+            dm.initialize(-1); // -1 = no NUMA filtering, enumerate all non-skipped devices
 
             if (!dm.has_gpu())
             {

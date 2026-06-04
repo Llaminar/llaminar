@@ -740,7 +740,7 @@ namespace llaminar2
         const bool verifier_state_capture_supported =
             config_.compute_all_position_logits &&
             config_.mtp.enabled &&
-            (device.is_cpu() || device.is_rocm());
+            (device.is_cpu() || device.is_cuda() || device.is_rocm());
         const int verifier_state_capture_rows =
             verifier_state_capture_supported ? std::max(0, config_.mtp.draft_tokens) : 0;
 

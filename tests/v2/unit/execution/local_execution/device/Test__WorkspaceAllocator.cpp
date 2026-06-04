@@ -360,6 +360,65 @@ TEST(Test__WorkspaceAllocator, GraphConsumerAllocatesCPUWorkspaceForDeclaredStag
     EXPECT_EQ(raw_stage->lastN(), 0);
 }
 
+TEST(Test__WorkspaceAllocator, CPUReallocatesExistingWorkspaceWhenNamedBufferGrows)
+{
+    if (!hasCPUBackend())
+    {
+        initCPUBackend(-1);
+    }
+
+    WorkspaceAllocator allocator;
+    ComputeGraph graph;
+    const auto hints = tinyHints();
+
+    WorkspaceBudgetConfig config;
+    config.cpu_fraction = 0.1f;
+    config.min_budget = 1 * 1024 * 1024;
+    config.max_budget = 8 * 1024 * 1024;
+    config.headroom = 0;
+
+    MockWorkspaceConsumer initial_consumer({
+        {"shared_scratch", 1024, 256, true},
+        {"old_only_scratch", 2048, 256, true},
+    });
+
+    ASSERT_TRUE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {requestFor(initial_consumer, DeviceId::cpu())},
+        config));
+
+    auto *initial_workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
+    ASSERT_NE(initial_workspace, nullptr);
+    const uint64_t initial_generation = allocator.deviceGeneration(DeviceId::cpu());
+    EXPECT_GT(initial_generation, 0u);
+    ASSERT_TRUE(initial_workspace->hasBuffer("shared_scratch"));
+    ASSERT_TRUE(initial_workspace->hasBuffer("old_only_scratch"));
+
+    MockWorkspaceConsumer larger_consumer({
+        {"shared_scratch", 4096, 256, true},
+        {"new_only_scratch", 512, 256, true},
+    });
+
+    ASSERT_TRUE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {requestFor(larger_consumer, DeviceId::cpu())},
+        config));
+
+    auto *reallocated_workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
+    ASSERT_NE(reallocated_workspace, nullptr)
+        << "Workspace reallocation must leave a live manager owned by the allocator";
+    EXPECT_EQ(larger_consumer.boundWorkspace(), reallocated_workspace);
+    EXPECT_GT(allocator.deviceGeneration(DeviceId::cpu()), initial_generation);
+    EXPECT_TRUE(reallocated_workspace->hasBuffer("shared_scratch"));
+    EXPECT_TRUE(reallocated_workspace->hasBuffer("old_only_scratch"));
+    EXPECT_TRUE(reallocated_workspace->hasBuffer("new_only_scratch"));
+    EXPECT_EQ(reallocated_workspace->getBufferSize("shared_scratch"), 4096u);
+    EXPECT_EQ(reallocated_workspace->getBufferSize("old_only_scratch"), 2048u);
+    EXPECT_EQ(reallocated_workspace->getBufferSize("new_only_scratch"), 512u);
+}
+
 TEST(Test__WorkspaceAllocator, ReusesExistingWorkspaceWhenAllRequestedBuffersFit)
 {
     auto device = selectAvailableGpuWithMemory();

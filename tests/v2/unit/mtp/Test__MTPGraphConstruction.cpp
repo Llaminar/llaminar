@@ -8,11 +8,14 @@
 #include "execution/compute_stages/stages/MTPConcatStage.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
+#include "execution/compute_stages/stages/GDNRecurrenceStage.h"
+#include "execution/compute_stages/stages/ShortConv1dStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/moe/MoEExpertParallelPlan.h"
 #include "execution/moe/MoERebalanceController.h"
+#include "kernels/cpu/CPUHybridRingKVCache.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #include "loaders/PreparedWeightStore.h"
 #include "mocks/MockMPIContext.h"
@@ -634,6 +637,113 @@ namespace
     bool contractWrites(const StageBufferContract &contract, BufferId id)
     {
         return hasBufferBinding(contract.allWrites(), id);
+    }
+
+    HybridKVCacheConfig tinyGDNHybridConfig()
+    {
+        HybridKVCacheConfig hybrid;
+        hybrid.layer_types = {"gdn"};
+        hybrid.gdn_conv_kernel_size = 4;
+        hybrid.gdn_state_size = 8;
+        hybrid.gdn_inner_size = 16;
+        hybrid.gdn_group_count = 2;
+        hybrid.gdn_time_step_rank = 2;
+        return hybrid;
+    }
+
+    GraphConfig tinyQwen35GDNConfig(DeviceId device)
+    {
+        GraphConfig config;
+        config.n_layers = 1;
+        config.total_n_layers = 1;
+        config.d_model = 32;
+        config.n_heads = 2;
+        config.n_kv_heads = 2;
+        config.head_dim = 8;
+        config.d_ff = 64;
+        config.vocab_size = 128;
+        config.rms_norm_eps = 1e-6f;
+        config.default_device = device;
+        config.max_seq_len = 8;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = KVCachePrecision::FP32;
+        config.layer_types = {"gdn"};
+        config.gdn.conv_kernel_size = 4;
+        config.gdn.state_size = 8;
+        config.gdn.inner_size = 16;
+        config.gdn.group_count = 2;
+        config.gdn.time_step_rank = 2;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 2;
+        config.compute_all_position_logits = true;
+        return config;
+    }
+
+    LayerWeights tinyQwen35GDNLayerWeights(const GraphConfig &config)
+    {
+        const size_t d = static_cast<size_t>(config.d_model);
+        const size_t qkv_dim = 48;
+        const size_t value_dim = static_cast<size_t>(config.gdn.inner_size);
+        const size_t value_heads = static_cast<size_t>(config.gdn.time_step_rank);
+        const size_t kernel = static_cast<size_t>(config.gdn.conv_kernel_size);
+
+        static std::vector<std::unique_ptr<FP32Tensor>> owned;
+        owned.clear();
+        auto tensor = [](std::vector<size_t> shape, int seed) -> FP32Tensor *
+        {
+            owned.push_back(TestTensorFactory::createFP32Random(
+                shape,
+                -0.02f,
+                0.02f,
+                seed));
+            return owned.back().get();
+        };
+        auto ones = [](std::vector<size_t> shape) -> FP32Tensor *
+        {
+            owned.push_back(TestTensorFactory::createFP32Ones(shape));
+            return owned.back().get();
+        };
+
+        LayerWeights layer;
+        layer.attn_norm = ones({d});
+        layer.attn_qkv = tensor({qkv_dim, d}, 301);
+        layer.attn_gate = tensor({value_dim, d}, 302);
+        layer.ssm_alpha = tensor({value_heads, d}, 303);
+        layer.ssm_beta = tensor({value_heads, d}, 304);
+        layer.ssm_conv1d = tensor({kernel, qkv_dim}, 305);
+        layer.ssm_dt_bias = tensor({value_heads}, 306);
+        layer.ssm_a = tensor({value_heads}, 307);
+        layer.ssm_norm = ones({static_cast<size_t>(config.gdn.state_size)});
+        layer.ssm_out = tensor({d, value_dim}, 308);
+        return layer;
+    }
+
+    ActivationBuffers tinyQwen35GDNActivationBuffers(const GraphConfig &config, int total_tokens)
+    {
+        const size_t rows = static_cast<size_t>(total_tokens);
+        const size_t d = static_cast<size_t>(config.d_model);
+        const size_t qkv_dim = 48;
+        const size_t value_dim = static_cast<size_t>(config.gdn.inner_size);
+        const size_t value_heads = static_cast<size_t>(config.gdn.time_step_rank);
+
+        static std::vector<std::unique_ptr<FP32Tensor>> owned;
+        owned.clear();
+        auto buffer = [](std::vector<size_t> shape) -> FP32Tensor *
+        {
+            owned.push_back(TestTensorFactory::createFP32(shape));
+            return owned.back().get();
+        };
+
+        ActivationBuffers buffers;
+        buffers.current_hidden = buffer({rows, d});
+        buffers.normalized = buffer({rows, d});
+        buffers.attn_output = buffer({rows, value_dim});
+        buffers.attn_proj = buffer({rows, d});
+        buffers.extensions[BufferId::GDN_QKV] = buffer({rows, qkv_dim});
+        buffers.extensions[BufferId::GDN_Z] = buffer({rows, value_dim});
+        buffers.extensions[BufferId::GDN_ALPHA] = buffer({rows, value_heads});
+        buffers.extensions[BufferId::GDN_BETA] = buffer({rows, value_heads});
+        return buffers;
     }
 
     template <typename StageType>
@@ -1393,6 +1503,55 @@ TEST(Test__MTPGraphConstruction, ColumnParallelAllPositionLMHeadUsesVerifierShar
     const auto gather_contract = allgather->stage->bufferContract();
     EXPECT_TRUE(contractReads(gather_contract, BufferId::ALL_POSITION_LOGITS_LOCAL));
     EXPECT_TRUE(contractWrites(gather_contract, BufferId::ALL_POSITION_LOGITS));
+}
+
+TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspace)
+{
+    auto mpi = std::make_shared<MockMPIContext>(0, 1);
+    GraphConfig config = tinyQwen35GDNConfig(DeviceId::cuda(0));
+
+    CPUHybridRingKVCacheFP32 cache(
+        tinyGDNHybridConfig(),
+        *mpi,
+        config.n_layers,
+        /*batch_size=*/1,
+        config.max_seq_len,
+        config.n_kv_heads,
+        config.head_dim,
+        DeviceId::cpu());
+
+    Qwen35Graph graph_builder(config, mpi);
+    LayerWeights layer = tinyQwen35GDNLayerWeights(config);
+    ActivationBuffers buffers = tinyQwen35GDNActivationBuffers(config, /*total_tokens=*/2);
+
+    ComputeGraph graph = graph_builder.buildAttentionGraph(
+        layer,
+        buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        &cache,
+        /*position_ids=*/nullptr,
+        DeviceId::cuda(0),
+        /*sequence_lengths=*/nullptr);
+
+    const auto *short_conv_node = graph.getNode("layer0_short_conv");
+    ASSERT_NE(short_conv_node, nullptr);
+    const auto *short_conv = dynamic_cast<const ShortConv1dStage *>(short_conv_node->stage.get());
+    ASSERT_NE(short_conv, nullptr);
+    const WorkspaceRequirements short_conv_reqs =
+        short_conv->getWorkspaceRequirements(/*m=*/2);
+    EXPECT_NE(short_conv_reqs.find("gdn_shortconv_verifier_state_capture_layer0"), nullptr)
+        << "CUDA verifier GDN graphs must snapshot short-conv state rows for cheap MTP rollback";
+
+    const auto *recurrence_node = graph.getNode("layer0_gdn_recurrence");
+    ASSERT_NE(recurrence_node, nullptr);
+    const auto *recurrence = dynamic_cast<const GDNRecurrenceStage *>(recurrence_node->stage.get());
+    ASSERT_NE(recurrence, nullptr);
+    const WorkspaceRequirements recurrence_reqs =
+        recurrence->getWorkspaceRequirements(/*m=*/2);
+    EXPECT_NE(recurrence_reqs.find("gdn_verifier_state_capture_layer0"), nullptr)
+        << "CUDA verifier GDN graphs must snapshot recurrence state rows for cheap MTP rollback";
 }
 
 TEST(Test__MTPGraphConstruction, RejectsIncompleteMoESidecarWeights)
@@ -2526,20 +2685,32 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
     EXPECT_EQ(maxCachedTokens(after_second_restore.mtp_kv_caches), static_cast<int>(prefix_tokens.size()) - 1);
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
-    const auto restore_tags = PerfStatsCollector::Tags{{"operation", "restore_payload_checkpoint"}};
-    const auto truncate_tags = PerfStatsCollector::Tags{{"operation", "truncate_live_prefix"}};
+    const auto restore_tags = PerfStatsCollector::Tags{
+        {"operation", "restore_payload_checkpoint"},
+        {"replay_state", "preserved"},
+        {"sidecar_replay_state", "preserved"}};
+    const auto truncate_tags = PerfStatsCollector::Tags{
+        {"operation", "truncate_live_prefix"},
+        {"replay_state", "preserved"},
+        {"sidecar_replay_state", "preserved"}};
     const PerfStatRecord *restore_preserved =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", restore_tags);
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", restore_tags);
     ASSERT_NE(restore_preserved, nullptr);
     EXPECT_DOUBLE_EQ(restore_preserved->value, 2.0);
     const PerfStatRecord *truncate_preserved =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", truncate_tags);
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", truncate_tags);
     ASSERT_NE(truncate_preserved, nullptr);
     EXPECT_DOUBLE_EQ(truncate_preserved->value, 1.0);
-    const auto reset_tags = PerfStatsCollector::Tags{
+    const auto legacy_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_payload_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};
-    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", reset_tags),
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", legacy_reset_tags),
+              nullptr);
+    const auto structured_reset_tags = PerfStatsCollector::Tags{
+        {"operation", "restore_payload_checkpoint"},
+        {"replay_state", "reset"},
+        {"sidecar_replay_state", "reset"}};
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }
@@ -2591,15 +2762,24 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     EXPECT_EQ(after_restore.positions[0], static_cast<int>(prefix_tokens.size()));
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
-    const auto restore_tags = PerfStatsCollector::Tags{{"operation", "restore_logical_checkpoint"}};
+    const auto restore_tags = PerfStatsCollector::Tags{
+        {"operation", "restore_logical_checkpoint"},
+        {"replay_state", "preserved"},
+        {"sidecar_replay_state", "preserved"}};
     const PerfStatRecord *restore_preserved =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", restore_tags);
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", restore_tags);
     ASSERT_NE(restore_preserved, nullptr);
     EXPECT_DOUBLE_EQ(restore_preserved->value, 1.0);
-    const auto reset_tags = PerfStatsCollector::Tags{
+    const auto legacy_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};
-    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", reset_tags),
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", legacy_reset_tags),
+              nullptr);
+    const auto structured_reset_tags = PerfStatsCollector::Tags{
+        {"operation", "restore_logical_checkpoint"},
+        {"replay_state", "reset"},
+        {"sidecar_replay_state", "reset"}};
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }
@@ -2630,17 +2810,27 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto preserve_tags = PerfStatsCollector::Tags{
-        {"operation", "restore_logical_checkpoint"},
         {"model", "moe"},
-        {"moe_placement_epoch", "0"}};
+        {"moe_placement_epoch", "0"},
+        {"operation", "restore_logical_checkpoint"},
+        {"replay_state", "preserved"},
+        {"sidecar_replay_state", "preserved"}};
     const PerfStatRecord *preserved =
-        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_preserved", preserve_tags);
+        findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", preserve_tags);
     ASSERT_NE(preserved, nullptr);
     EXPECT_DOUBLE_EQ(preserved->value, 1.0);
-    const auto reset_tags = PerfStatsCollector::Tags{
+    const auto legacy_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
         {"reason", "moe_live_state_mutation_guard"}};
-    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", reset_tags),
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_reset", legacy_reset_tags),
+              nullptr);
+    const auto structured_reset_tags = PerfStatsCollector::Tags{
+        {"model", "moe"},
+        {"moe_placement_epoch", "0"},
+        {"operation", "restore_logical_checkpoint"},
+        {"replay_state", "reset"},
+        {"sidecar_replay_state", "reset"}};
+    EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
               nullptr);
     PerfStatsCollector::reset();
 }

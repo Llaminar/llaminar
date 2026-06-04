@@ -59,16 +59,14 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
 | Case | Decode | Acceptance | Notes |
 |---|---:|---:|---|
 | baseline | 101.37 tok/s | n/a | current no-MTP ratchet |
+| short fixed d1, CUDA GDN restore | 55.60 tok/s | 25.00% | n=8 smoke; verifier-row restores active, no restore-failure or replay-forward counters |
 | fixed d1, after small-M attention | 41.92 tok/s | 32.03% | attention no longer uses FA2 prefill path |
-| short fixed d1, rejected small-M router | 43.88 tok/s | 31.25% | slower than attention-only short run; reverted |
 | fixed d1, before small-M attention | 36.75 tok/s | 33.59% | verifier/rollback cost dominated |
 | short fixed d1, after batched argmax | 38.98 tok/s | 50.00% | verifier sampling 36.98 us/call |
 
 Artifacts: `benchmark_results/cuda_moe_mtp/20260604T060624Z-869a4762-smallm-attn-n64`
-and rejected router `20260604T062639Z-982c7aad-smallm-router-n8`.
-Attention moved from 58.84 ms to 6.66 ms on the short profile. The rejected
-router fired 480 times but worsened `MOE_ROUTER` 5.18 -> 5.54 ms/token and
-acceptance 43.75% -> 31.25%.
+and restore smoke `20260604T071026Z-5e4283f2-cuda-gdn-restore-n8`.
+Attention moved from 58.84 ms to 6.66 ms on the short profile.
 
 ## Retained Tuning Actions
 
