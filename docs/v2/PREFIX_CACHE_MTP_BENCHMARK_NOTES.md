@@ -12,7 +12,7 @@ tuning actions, and negative A/B results that should not be rediscovered.
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 42.04 tok/s | 2.13x | Fixed d1, compact active-expert prefill grid |
-| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.37 tok/s | 36.75 tok/s | 0.36x | Correctness green; MTP disabled for perf until verifier economics improve |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.37 tok/s | 41.92 tok/s | 0.41x | Correctness green; verifier attention fixed, still perf-negative |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
 ## Adaptive Depth
@@ -60,13 +60,14 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
 | Case | Decode | Acceptance | Notes |
 |---|---:|---:|---|
 | baseline | 101.37 tok/s | n/a | current no-MTP ratchet |
-| fixed d1 | 36.75 tok/s | 33.59% | verifier/rollback cost dominates |
-| short fixed d1, before CUDA batched argmax | 36.46 tok/s | 50.00% | verifier sampling 67.63 us/call |
-| short fixed d1, after CUDA batched argmax | 38.98 tok/s | 50.00% | verifier sampling 36.98 us/call |
+| fixed d1, after small-M attention | 41.92 tok/s | 32.03% | attention no longer uses FA2 prefill path |
+| fixed d1, before small-M attention | 36.75 tok/s | 33.59% | verifier/rollback cost dominated |
+| short fixed d1, after batched argmax | 38.98 tok/s | 50.00% | verifier sampling 36.98 us/call |
 
-Artifact: `benchmark_results/cuda_moe_mtp/20260604T052521Z-b9cba058-cuda-moe-current-n64`.
-`mtp.verifier_forward` remains about 33 ms/call; sampler cleanup is not the
-Phase 14 speedup lever.
+Artifacts: previous `benchmark_results/cuda_moe_mtp/20260604T052521Z-b9cba058-cuda-moe-current-n64`,
+current `benchmark_results/cuda_moe_mtp/20260604T060624Z-869a4762-smallm-attn-n64`.
+The short profile moved attention from 58.84 ms total before the fix to 6.66 ms
+after; remaining CUDA MoE work is verifier economics outside attention.
 
 ## Retained Tuning Actions
 
@@ -75,10 +76,11 @@ Phase 14 speedup lever.
   `V2_Unit_Static_NoDefaultStreamInGPUCode`.
 - Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, ROCm/CUDA batched verifier-row argmax, and GDN verifier-row rollback restore.
 - Kept CUDA verifier projection on the known-good row-wise route; CUDA GEMM scratch now survives request resets while captured prefill graphs are retained.
+- Added graph-capturable CUDA FP16KV small-M verifier attention for M=2..4.
 - Stabilized MoE prefix fingerprints, grouped-decode runtime-table rewarm, and streamful `TransferEngine` terminal-state uploads.
 - Kept ROCm attention params out of HIP capture and compacted MoE grouped-prefill grids to active experts only.
 
 ## Next Work
 
-CUDA MoE MTP is correctness-green but performance-negative; next work is
-verifier economics, not sampler overhead. ROCm MoE keeps the 2.13x ratchet.
+CUDA MoE MTP is correctness-green but performance-negative; next work is MoE
+verifier economics after attention. ROCm MoE keeps the 2.13x ratchet.

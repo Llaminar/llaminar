@@ -147,7 +147,7 @@ namespace llaminar2
         // Maximum number of splits for Flash Decoding
         constexpr int MAX_NUM_SPLITS = 32;
 
-        constexpr int MAX_SMALL_DECODE_ROWS = 2;
+        constexpr int MAX_SMALL_DECODE_ROWS = 4;
 
         // Minimum KV positions per split to avoid excessive overhead
         constexpr int MIN_KV_PER_SPLIT = 16;
@@ -198,6 +198,11 @@ namespace llaminar2
                 num_splits = 1;
 
             return num_splits;
+        }
+
+        static int sanitizeSmallDecodeQueryRows(int query_rows)
+        {
+            return (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
         }
 
         // =====================================================================
@@ -604,6 +609,17 @@ namespace llaminar2
             const float *V_ptr = static_cast<const float *>(V->gpu_data_ptr());
             float *output_ptr = static_cast<float *>(output->gpu_data_ptr());
 
+            const bool use_small_fp16kv_decode =
+                K->native_type() == TensorType::FP16 &&
+                V->native_type() == TensorType::FP16 &&
+                batch_size == 1 &&
+                causal &&
+                seq_len > 1 &&
+                seq_len <= MAX_SMALL_DECODE_ROWS &&
+                kv_len > seq_len;
+            const int expected_query_rows =
+                use_small_fp16kv_decode ? seq_len : 1;
+
             // Wire device_params for graph-capture replay. The tiny H2D copy is
             // issued before beginCapture()/graph launch via
             // setDynamicAttnParams()/prepareDynamicAttnParams(), never from the
@@ -630,14 +646,14 @@ namespace llaminar2
                 {
                     if (!dynamic_attn_host_valid_ ||
                         !dynamic_attn_device_valid_ ||
-                        dynamic_attn_param_rows_ < 1 ||
-                        dynamic_attn_query_rows_ != 1)
+                        dynamic_attn_param_rows_ < expected_query_rows ||
+                        dynamic_attn_query_rows_ != expected_query_rows)
                     {
                         LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] "
                                   "Attention device params were not ready before CUDA graph capture"
                                   << " captured_body(kv_len=" << kv_len
                                   << ", pos=" << dynamic_position_offset
-                                  << ", rows=1)"
+                                  << ", rows=" << expected_query_rows << ")"
                                   << " prepared(kv_len=" << dynamic_attn_kv_len_
                                   << ", pos=" << dynamic_attn_position_offset_
                                   << ", rows=" << dynamic_attn_query_rows_
@@ -651,8 +667,8 @@ namespace llaminar2
                 }
                 else
                 {
-                    setDynamicAttnParams(kv_len, dynamic_position_offset, 1);
-                    if (!dynamicAttnParamsReady(kv_len, dynamic_position_offset, 1))
+                    setDynamicAttnParams(kv_len, dynamic_position_offset, expected_query_rows);
+                    if (!dynamicAttnParamsReady(kv_len, dynamic_position_offset, expected_query_rows))
                     {
                         LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Attention device params were not ready on the explicit stream");
                         return false;
@@ -878,6 +894,64 @@ namespace llaminar2
                     return true;
                 }
 
+                if (use_small_fp16kv_decode)
+                {
+                    if (!stream_)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode requires an explicit non-null CUDA stream");
+                        return false;
+                    }
+
+                    if (!workspace_)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode requires a bound workspace");
+                        return false;
+                    }
+
+                    float *O_partial = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_OUTPUT));
+                    float *m_partial = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_M));
+                    float *l_partial = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_L));
+
+                    if (!O_partial || !m_partial || !l_partial)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace buffers missing for small-M FP16KV decode");
+                        return false;
+                    }
+
+                    const size_t row_stride =
+                        static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
+                    for (int row = 0; row < seq_len; ++row)
+                    {
+                        const int row_kv_len = std::max(1, kv_len - (seq_len - 1 - row));
+                        const int num_splits = computeNumSplitsForDevice(row_kv_len, n_heads, dev);
+                        const attention::AttentionDeviceParams *row_params =
+                            d_attn_params ? (d_attn_params + row) : nullptr;
+
+                        int result;
+                        {
+                            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                            result = cudaFlashAttn_decode_fp16kv(
+                                Q_ptr + static_cast<size_t>(row) * row_stride,
+                                K_fp16_ptr, V_fp16_ptr,
+                                output_ptr + static_cast<size_t>(row) * row_stride,
+                                O_partial, m_partial, l_partial,
+                                1, row_kv_len,
+                                n_heads, n_kv_heads, head_dim,
+                                num_splits, row_params, stream_, dev,
+                                head_start, gqa_n_rep);
+                        }
+                        if (result != 0)
+                        {
+                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode failed"
+                                      << " row=" << row
+                                      << " row_kv_len=" << row_kv_len
+                                      << " num_splits=" << num_splits);
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+
                 // PREFILL: FA2 with FP16 KV
 
                 // Check for cuBLAS attention override (env: LLAMINAR_CUBLAS_ATTN=1)
@@ -1028,7 +1102,8 @@ namespace llaminar2
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::DEVICE_PARAMS,
-                                    sizeof(attention::AttentionDeviceParams),
+                                    sizeof(attention::AttentionDeviceParams) *
+                                        static_cast<size_t>(MAX_SMALL_DECODE_ROWS),
                                     256,
                                     true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::K_TMP_FP32, kv_convert_bytes, 256, true});
@@ -1183,9 +1258,8 @@ namespace llaminar2
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::dynamicAttnParamsReady(
             int kv_len, int position_offset, int query_rows) const
         {
-            (void)query_rows;
-            constexpr int sanitized_query_rows = 1;
-            constexpr int param_rows = 1;
+            const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
+            const int param_rows = sanitized_query_rows;
             return dynamic_attn_host_valid_ &&
                    dynamic_attn_device_valid_ &&
                    dynamic_attn_kv_len_ == kv_len &&
@@ -1203,9 +1277,8 @@ namespace llaminar2
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(
             int kv_len, int position_offset, int query_rows)
         {
-            (void)query_rows;
-            constexpr int sanitized_query_rows = 1;
-            constexpr int param_rows = 1;
+            const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
+            const int param_rows = sanitized_query_rows;
             const bool same_params =
                 dynamic_attn_host_valid_ &&
                 dynamic_attn_kv_len_ == kv_len &&
@@ -1223,9 +1296,13 @@ namespace llaminar2
             if (!same_params)
                 dynamic_attn_device_valid_ = false;
 
-            h_attn_params_->kv_len = kv_len;
-            h_attn_params_->position_offset = position_offset;
-            h_attn_params_->mask_stride = kv_len;
+            for (int row = 0; row < param_rows; ++row)
+            {
+                const int row_kv_len = std::max(1, kv_len - (param_rows - 1 - row));
+                h_attn_params_[row].kv_len = row_kv_len;
+                h_attn_params_[row].position_offset = position_offset + row;
+                h_attn_params_[row].mask_stride = kv_len;
+            }
 
             dynamic_attn_kv_len_ = kv_len;
             dynamic_attn_position_offset_ = position_offset;
@@ -1277,7 +1354,7 @@ namespace llaminar2
                 LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Dynamic attention params not ready after prepare"
                           << " requested(kv_len=" << kv_len
                           << ", pos=" << position_offset
-                          << ", rows=1)"
+                          << ", rows=" << sanitizeSmallDecodeQueryRows(query_rows) << ")"
                           << " prepared(kv_len=" << dynamic_attn_kv_len_
                           << ", pos=" << dynamic_attn_position_offset_
                           << ", rows=" << dynamic_attn_query_rows_

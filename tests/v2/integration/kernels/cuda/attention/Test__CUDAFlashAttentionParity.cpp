@@ -25,8 +25,11 @@
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "utils/MPIContext.h"
 #include "kernels/cpu/CPURingKVCache.h"
+#include "tensors/FP16Utils.h"
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -206,6 +209,36 @@ namespace
         }
     }
 
+    void cpuSmallCausalAttentionReference(
+        const float *Q, // [seq_len, n_heads, head_dim]
+        const float *K, // [kv_len, n_kv_heads, head_dim]
+        const float *V, // [kv_len, n_kv_heads, head_dim]
+        float *O,       // [seq_len, n_heads, head_dim]
+        int seq_len,
+        int kv_len,
+        int n_heads,
+        int n_kv_heads,
+        int head_dim)
+    {
+        const size_t q_stride =
+            static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
+        for (int row = 0; row < seq_len; ++row)
+        {
+            const int row_kv_len = std::max(1, kv_len - (seq_len - 1 - row));
+            cpuDecodeAttentionReference(
+                Q + static_cast<size_t>(row) * q_stride,
+                K,
+                V,
+                O + static_cast<size_t>(row) * q_stride,
+                row_kv_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                false,
+                0);
+        }
+    }
+
 } // namespace
 
 // ============================================================================
@@ -244,6 +277,157 @@ protected:
 };
 
 #ifdef HAVE_CUDA
+
+TEST_F(Test__CUDAFlashAttentionParity, WorkspaceDeviceParamsSupportsSmallMVerifierRows)
+{
+    SKIP_IF_NO_CUDA();
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    const auto reqs = cuda_kernel.getWorkspaceRequirements(1, 14, 64);
+    const auto *device_params =
+        reqs.find(llaminar2::cuda::AttentionWorkspaceBuffers::DEVICE_PARAMS);
+    ASSERT_NE(device_params, nullptr);
+    EXPECT_GE(device_params->size_bytes,
+              sizeof(llaminar2::attention::AttentionDeviceParams) * 4u)
+        << "CUDA verifier attention needs one graph-replay param row per MTP verifier row";
+}
+
+TEST_F(Test__CUDAFlashAttentionParity, ComputeTensor_FP16KV_SmallM2_CausalGraphCapture)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int seq_len = 2;
+    constexpr int kv_len = 17;
+    constexpr int n_heads = 14;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 64;
+    const size_t q_size =
+        static_cast<size_t>(seq_len) * n_heads * head_dim;
+    const size_t kv_size =
+        static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
+    const size_t out_size = q_size;
+
+    auto Q_data = randomFP32(q_size);
+    auto K_data = randomFP32(kv_size);
+    auto V_data = randomFP32(kv_size);
+
+    std::vector<uint16_t> K_fp16(kv_size);
+    std::vector<uint16_t> V_fp16(kv_size);
+    std::vector<float> K_ref(kv_size);
+    std::vector<float> V_ref(kv_size);
+    for (size_t i = 0; i < kv_size; ++i)
+    {
+        K_fp16[i] = fp32_to_fp16(K_data[i]);
+        V_fp16[i] = fp32_to_fp16(V_data[i]);
+        K_ref[i] = fp16_to_fp32(K_fp16[i]);
+        V_ref[i] = fp16_to_fp32(V_fp16[i]);
+    }
+
+    std::vector<float> cpu_output(out_size, 0.0f);
+    cpuSmallCausalAttentionReference(
+        Q_data.data(), K_ref.data(), V_ref.data(), cpu_output.data(),
+        seq_len, kv_len, n_heads, n_kv_heads, head_dim);
+
+    auto q_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len),
+                            static_cast<size_t>(n_heads * head_dim)},
+        DeviceId::cpu());
+    auto k_tensor = std::make_unique<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len),
+                            static_cast<size_t>(n_kv_heads * head_dim)},
+        K_fp16);
+    auto v_tensor = std::make_unique<FP16Tensor>(
+        std::vector<size_t>{static_cast<size_t>(kv_len),
+                            static_cast<size_t>(n_kv_heads * head_dim)},
+        V_fp16);
+    auto out_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(seq_len),
+                            static_cast<size_t>(n_heads * head_dim)},
+        DeviceId::cpu());
+
+    std::copy(Q_data.begin(), Q_data.end(), q_tensor->mutable_data());
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+
+    ASSERT_TRUE(q_tensor->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(k_tensor->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(v_tensor->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(out_tensor->ensureOnDevice(gpu_device_, stream));
+
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    cuda_kernel.setGPUStream(stream);
+    DeviceWorkspaceManager workspace(gpu_device_, 64 * 1024 * 1024);
+    ASSERT_TRUE(workspace.allocate(cuda_kernel.getWorkspaceRequirements(1, n_heads, head_dim)));
+    cuda_kernel.bindWorkspace(&workspace);
+
+    const int position_offset = kv_len - seq_len;
+    ASSERT_TRUE(cuda_kernel.prepareDynamicAttnParams(kv_len, position_offset, seq_len, stream));
+    ASSERT_TRUE(cuda_kernel.compute_tensor(
+        q_tensor.get(), k_tensor.get(), v_tensor.get(), out_tensor.get(),
+        1, seq_len, kv_len,
+        n_heads, n_kv_heads, head_dim,
+        true, -1,
+        nullptr, nullptr,
+        &mpi_ctx_, cuda_ordinal_,
+        0, n_heads, n_kv_heads, n_heads / n_kv_heads));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> cuda_output(out_size, 0.0f);
+    ASSERT_EQ(cudaMemcpyAsync(cuda_output.data(), out_tensor->gpu_data_ptr(),
+                              out_size * sizeof(float), cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    double cosine = cosineSimilarity(cuda_output.data(), cpu_output.data(), out_size);
+    double l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
+    double max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
+    printComparisonStats("ComputeTensor FP16KV Small-M2", cosine, l2_error, max_error, out_size);
+    ASSERT_GE(cosine, 0.99);
+    ASSERT_LE(l2_error, 0.05);
+
+    ASSERT_EQ(cudaMemsetAsync(out_tensor->gpu_data_ptr(), 0, out_size * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_TRUE(cuda_kernel.prepareDynamicAttnParams(kv_len, position_offset, seq_len, stream));
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    {
+        GraphCaptureGuard guard;
+        ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+        ASSERT_TRUE(cuda_kernel.compute_tensor(
+            q_tensor.get(), k_tensor.get(), v_tensor.get(), out_tensor.get(),
+            1, seq_len, kv_len,
+            n_heads, n_kv_heads, head_dim,
+            true, -1,
+            nullptr, nullptr,
+            &mpi_ctx_, cuda_ordinal_,
+            0, n_heads, n_kv_heads, n_heads / n_kv_heads));
+        ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    }
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::fill(cuda_output.begin(), cuda_output.end(), 0.0f);
+    ASSERT_EQ(cudaMemcpyAsync(cuda_output.data(), out_tensor->gpu_data_ptr(),
+                              out_size * sizeof(float), cudaMemcpyDeviceToHost, stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cosine = cosineSimilarity(cuda_output.data(), cpu_output.data(), out_size);
+    l2_error = relativeL2Error(cuda_output.data(), cpu_output.data(), out_size);
+    max_error = maxAbsError(cuda_output.data(), cpu_output.data(), out_size);
+    printComparisonStats("ComputeTensor FP16KV Small-M2 Captured", cosine, l2_error, max_error, out_size);
+    EXPECT_GE(cosine, 0.99);
+    EXPECT_LE(l2_error, 0.05);
+
+    cudaGraphExecDestroy(graph_exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+}
 
 // ============================================================================
 // Flash Attention 2 (Prefill) Parity Tests

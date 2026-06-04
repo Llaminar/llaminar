@@ -174,6 +174,7 @@ namespace llaminar2
         kv_len += seq_len; // This step will append seq_len tokens.
         const int logical_pos_offset = std::max(0, kv_len - seq_len);
 
+        constexpr int kCudaSmallDecodeMaxRows = 4;
         int query_rows_for_params = 1;
         if (params_.device_id.is_rocm())
         {
@@ -198,7 +199,18 @@ namespace llaminar2
         }
         else
         {
-            query_rows_for_params = seq_len;
+            const auto kp = params_.kv_cache->k_precision();
+            const auto vp = params_.kv_cache->v_precision();
+            const bool cuda_small_fp16_decode =
+                params_.device_id.is_cuda() &&
+                kp == ActivationPrecision::FP16 &&
+                vp == ActivationPrecision::FP16 &&
+                params_.batch_size == 1 &&
+                params_.causal &&
+                seq_len > 1 &&
+                seq_len <= kCudaSmallDecodeMaxRows &&
+                kv_len > seq_len;
+            query_rows_for_params = cuda_small_fp16_decode ? seq_len : 1;
         }
 
         if (!cached_kernel_->prepareDynamicAttnParams(
