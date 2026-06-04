@@ -12,7 +12,7 @@ live gaps. Keep this file concise; rejected tuning history belongs in artifacts.
 | Dense long lane, `qbf`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 | 53.30 | 1.31x | Depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 | 9.50 | 1.64x | Short smoke only |
 | MoE default lane, 595p/64d | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 | 42.04 | 2.13x | Fixed d1, ratcheted |
-| MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 102.09 | 87.62 | 0.86x | Correct, still perf-negative |
+| MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.70 | 91.82 | 0.90x | Correct, still perf-negative |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
 llama.cpp CUDA north star, `ggml-org/llama.cpp@6ddc943`,
@@ -39,10 +39,10 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 
 | Case | Decode | Acceptance | Artifact |
 |---|---:|---:|---|
-| latest baseline | 102.09 | n/a | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/baseline.json` |
-| best fixed d1 | 87.62 | 84.38% | `benchmark_results/cuda_moe_mtp/20260604T134433Z-fused-swiglu-scratch-fixed-n64` |
-| latest fixed d1 | 84.97 | 75.78% | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/mtp_d1.json` |
+| latest baseline | 101.70 | n/a | `benchmark_results/cuda_moe_mtp/20260604T155211Z-fused-branch-counter/baseline_clean.json` |
+| best/latest fixed d1 | 91.82 | 86.72% | `benchmark_results/cuda_moe_mtp/20260604T155211Z-fused-branch-counter/mtp_d1_tilen64_clean.json` |
 | latest fixed d3 | 68.57 | 66.86% | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/mtp_d3_after_suffix_commit_fix.json` |
+| profiled fixed d1 | 83.72 | 87.50% | `benchmark_results/cuda_moe_mtp/20260604T155211Z-fused-branch-counter/mtp_d1_tilen64_profiled.json` |
 
 ## Retained Actions
 
@@ -56,6 +56,8 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
   so the fused epilogue no longer overwrites gate/up inputs before reading them.
 - CUDA verifier-sized MoE prefill now emits fused/split branch counters; M=2/3/4
   integration coverage asserts default fused execution, split-path equivalence, and capture.
+- CUDA verifier M=2 grouped MoE prefill uses `TileN=64`; profiled verifier forward
+  improved from ~19.49ms to ~19.10ms/step, still short of net-positive MTP.
 - CUDA MoE MTP depth-3 parity now uses the stable benchmark-prompt lane, and shared
   expert gate verification allows mathematically valid sigmoid-underflow zero rows.
 - Depth>1 MTP rollback now commits suffix shifted-cache rows after an already-committed

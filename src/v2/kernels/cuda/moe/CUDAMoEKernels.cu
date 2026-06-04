@@ -1234,7 +1234,7 @@ namespace
         }
     }
 
-    template <uint8_t CodebookId, int kTileM>
+    template <uint8_t CodebookId, int kTileM, int kTileN>
     __global__ void grouped_native_vnni_gate_up_prefill_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -1252,7 +1252,6 @@ namespace
         // kTileN columns per block (one per thread); kTileM tokens processed per block.
         // Larger kTileM amortizes the expensive IQ-codebook weight decode (done once per
         // (block_idx, n)) over more tokens and reduces redundant cross-group re-decode.
-        constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
         const int expert_id = (active_expert_slots > 0)
@@ -1380,7 +1379,7 @@ namespace
     // Quantization layout: each warp (32 lanes) spans exactly one aligned 32-wide block of the
     // intermediate (N) dimension (kTileN=128 is a multiple of 32, and N % 32 == 0), so the
     // per-block absmax is a warp-shuffle reduction with no cross-warp synchronization.
-    template <uint8_t CodebookId, int kTileM>
+    template <uint8_t CodebookId, int kTileM, int kTileN>
     __global__ void grouped_native_vnni_gate_up_swiglu_prefill_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -1395,7 +1394,6 @@ namespace
         int N,
         int K)
     {
-        constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
         const int expert_id = (active_expert_slots > 0)
@@ -1549,7 +1547,7 @@ namespace
         A_int8[idx] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
     }
 
-    template <uint8_t CodebookId, int kTileM>
+    template <uint8_t CodebookId, int kTileM, int kTileN>
     __global__ void grouped_native_vnni_down_prefill_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -1563,7 +1561,6 @@ namespace
         int K)
     {
         // kTileM tokens processed per block; larger values amortize weight decode (see gate_up).
-        constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
         const int expert_id = (active_expert_slots > 0)
@@ -2786,6 +2783,7 @@ extern "C"
             return 16;
         };
         const int selected_tile_m = select_tile_m();
+        const int selected_tile_n = selected_tile_m <= 2 ? 64 : 128;
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -2804,7 +2802,7 @@ extern "C"
         }
 
         {
-            constexpr int kTileN = 128;
+            const int kTileN = selected_tile_n;
             // kTileM auto-specializes verifier-sized batches while keeping larger prompt
             // prefill on wider tiles that better amortize IQ-codebook weight decode.
             const int kTileM = selected_tile_m;
@@ -2817,17 +2815,31 @@ extern "C"
                       expert_grid);
             dim3 block(kTileN);
 
-#define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                   \
-    grouped_native_vnni_gate_up_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(            \
+#define LAUNCH_GROUPED_GATEUP_PREFILL_TM_TN(CB, TM, TN)                                            \
+    grouped_native_vnni_gate_up_prefill_kernel<CB, TM, TN><<<grid, block, 0, cuda_stream>>>(         \
         d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
         d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
         d_scratch_gate, d_scratch_up, intermediate, d_model)
-#define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                            \
-    grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(     \
+#define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM_TN(CB, TM, TN)                                     \
+    grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM, TN><<<grid, block, 0, cuda_stream>>>(  \
         d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
         d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
         d_scratch_swiglu_int8, d_scratch_swiglu_scales,                                            \
         intermediate, d_model)
+#define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                   \
+    do {                                                                                            \
+        if (kTileN == 64)                                                                           \
+            LAUNCH_GROUPED_GATEUP_PREFILL_TM_TN(CB, TM, 64);                                        \
+        else                                                                                        \
+            LAUNCH_GROUPED_GATEUP_PREFILL_TM_TN(CB, TM, 128);                                       \
+    } while (0)
+#define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                            \
+    do {                                                                                            \
+        if (kTileN == 64)                                                                           \
+            LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM_TN(CB, TM, 64);                                 \
+        else                                                                                        \
+            LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM_TN(CB, TM, 128);                                \
+    } while (0)
 #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                          \
     do {                                                                                           \
         if (fuse_swiglu)                                                                            \
@@ -2880,7 +2892,9 @@ extern "C"
 
 #undef LAUNCH_GROUPED_GATEUP_PREFILL
 #undef LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM
+#undef LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM_TN
 #undef LAUNCH_GROUPED_GATEUP_PREFILL_TM
+#undef LAUNCH_GROUPED_GATEUP_PREFILL_TM_TN
 
             if (!finishLaunch("cudaMoE_grouped_gate_up_prefill"))
                 return false;
@@ -2901,18 +2915,25 @@ extern "C"
         }
 
         {
-            constexpr int kTileN = 128;
+            const int kTileN = selected_tile_n;
             const int kTileM = selected_tile_m;
             dim3 grid((d_model + kTileN - 1) / kTileN,
                       (max_tokens_per_expert + kTileM - 1) / kTileM,
                       expert_grid);
             dim3 block(kTileN);
 
-#define LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, TM)                                                     \
-    grouped_native_vnni_down_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(               \
+#define LAUNCH_GROUPED_DOWN_PREFILL_TM_TN(CB, TM, TN)                                              \
+    grouped_native_vnni_down_prefill_kernel<CB, TM, TN><<<grid, block, 0, cuda_stream>>>(            \
         d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                          \
         d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
         d_scratch_down_out, d_model, intermediate)
+#define LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, TM)                                                     \
+    do {                                                                                            \
+        if (kTileN == 64)                                                                           \
+            LAUNCH_GROUPED_DOWN_PREFILL_TM_TN(CB, TM, 64);                                          \
+        else                                                                                        \
+            LAUNCH_GROUPED_DOWN_PREFILL_TM_TN(CB, TM, 128);                                         \
+    } while (0)
 #define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
     do {                                                                                           \
         if (kTileM == 2)                                                                            \
@@ -2951,6 +2972,7 @@ extern "C"
 
 #undef LAUNCH_GROUPED_DOWN_PREFILL
 #undef LAUNCH_GROUPED_DOWN_PREFILL_TM
+#undef LAUNCH_GROUPED_DOWN_PREFILL_TM_TN
 
             if (!finishLaunch("cudaMoE_grouped_down_prefill"))
                 return false;

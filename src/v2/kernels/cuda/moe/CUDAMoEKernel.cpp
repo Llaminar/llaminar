@@ -2155,6 +2155,7 @@ namespace llaminar2
             const int selected_tile_m = debugEnv().gemm.cuda_moe_prefill_tile_m == 0
                                             ? (seq_len <= 2 ? 2 : (seq_len <= 4 ? 4 : 16))
                                             : debugEnv().gemm.cuda_moe_prefill_tile_m;
+            const int selected_tile_n = selected_tile_m <= 2 ? 64 : 128;
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cuda_moe_grouped_prefill_swiglu_path_calls",
@@ -2166,13 +2167,15 @@ namespace llaminar2
                     {"total_slots", std::to_string(total_slots)},
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
-                    {"tile_m", std::to_string(selected_tile_m)}});
+                    {"tile_m", std::to_string(selected_tile_m)},
+                    {"tile_n", std::to_string(selected_tile_n)}});
         }
         if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
         {
             const int selected_tile_m = debugEnv().gemm.cuda_moe_prefill_tile_m == 0
                                             ? (seq_len <= 2 ? 2 : (seq_len <= 4 ? 4 : 16))
                                             : debugEnv().gemm.cuda_moe_prefill_tile_m;
+            const int selected_tile_n = selected_tile_m <= 2 ? 64 : 128;
             PerfStatsCollector::addCounter(
                 "kernel",
                 "cuda_moe_grouped_prefill_active_expert_grid_calls",
@@ -2184,6 +2187,7 @@ namespace llaminar2
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
                     {"tile_m", std::to_string(selected_tile_m)},
+                    {"tile_n", std::to_string(selected_tile_n)},
                     {"swiglu_path", debugEnv().gemm.cuda_moe_prefill_fuse_swiglu ? "fused" : "split"}});
         }
         return true;

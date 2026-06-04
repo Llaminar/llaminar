@@ -287,6 +287,7 @@ namespace
         const std::string expected_total_slots = std::to_string(seq_len * top_k);
         const std::string expected_num_experts = std::to_string(num_experts);
         const std::string expected_tile = std::to_string(expected_tile_m);
+        const std::string expected_tile_n = std::to_string(expected_tile_m <= 2 ? 64 : 128);
         const auto match = std::find_if(
             records.begin(),
             records.end(),
@@ -302,7 +303,8 @@ namespace
                        tag_equals("total_slots", expected_total_slots) &&
                        tag_equals("active_expert_slots", expected_total_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
-                       tag_equals("tile_m", expected_tile);
+                       tag_equals("tile_m", expected_tile) &&
+                       tag_equals("tile_n", expected_tile_n);
             });
         ASSERT_NE(match, records.end()) << "missing grouped prefill SwiGLU path counter path="
                                         << swiglu_path << " seq_len=" << seq_len
@@ -1271,6 +1273,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
     EXPECT_EQ(grid_records.front().tags.at("num_experts"), std::to_string(num_experts));
     EXPECT_EQ(grid_records.front().tags.at("tile_m"), "4")
         << "seq_len=4 verifier-style grouped prefill should use the small-M tile by default";
+    EXPECT_EQ(grid_records.front().tags.at("tile_n"), "128");
     expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 4);
 
     llaminar2::PerfStatsCollector::reset();
@@ -1564,6 +1567,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         const std::string expected_total_slots = std::to_string(seq_len * top_k);
         const std::string expected_num_experts = std::to_string(num_experts);
         const std::string expected_tile = std::to_string(expected_tile_m);
+        const std::string expected_tile_n = std::to_string(expected_tile_m <= 2 ? 64 : 128);
         const auto it = std::find_if(
             records.begin(),
             records.end(),
@@ -1577,7 +1581,8 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
                 return tag_equals("total_slots", expected_total_slots) &&
                        tag_equals("active_expert_slots", expected_total_slots) &&
                        tag_equals("num_experts", expected_num_experts) &&
-                       tag_equals("tile_m", expected_tile);
+                       tag_equals("tile_m", expected_tile) &&
+                       tag_equals("tile_n", expected_tile_n);
             });
         ASSERT_NE(it, records.end()) << "missing verifier small-M prefill counter for seq_len="
                                      << seq_len << " tile_m=" << expected_tile_m;
