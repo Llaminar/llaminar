@@ -227,6 +227,7 @@ namespace llaminar2
             void *capture_stream,
             bool needs_segment_sync,
             const std::string &perf_context,
+            const std::string &device_name,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**

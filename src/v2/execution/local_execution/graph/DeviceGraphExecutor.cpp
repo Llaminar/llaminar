@@ -312,8 +312,8 @@ namespace llaminar2
     void GraphExecutorStats::printProfilingSummary(size_t prefill_tokens, size_t decode_tokens) const
     {
         // Print per-phase tables first (the useful ones)
-        printPhaseTable("EXECUTOR STAGE PROFILING — PREFILL", prefill, prefill_tokens);
-        printPhaseTable("EXECUTOR STAGE PROFILING — DECODE", decode, decode_tokens);
+        printPhaseTable("HOST EXECUTOR STAGE PROFILING — PREFILL", prefill, prefill_tokens);
+        printPhaseTable("HOST EXECUTOR STAGE PROFILING — DECODE", decode, decode_tokens);
 
         // Calculate totals for overhead summary
         double total_overhead = overhead.total();
@@ -426,6 +426,78 @@ namespace llaminar2
         }
 
         std::print("\n{}", table.to_string());
+    }
+
+    void GraphExecutorStats::recordPerfStats(const std::string &device_name) const
+    {
+        if (!PerfStatsCollector::isEnabled())
+            return;
+
+        auto record_phase = [&](const char *phase_name, const PhaseStats &phase)
+        {
+            if (!phase_name || phase.total_stages_executed == 0)
+                return;
+
+            const PerfStatsCollector::Tags base_tags{
+                {"attribution", "host"},
+                {"source", "device_graph_executor"},
+                {"graph_capture_scope", "eager_or_capture_setup"},
+                {"note", "host_executor_timing_not_gpu_stage_time"}};
+
+            PerfStatsCollector::recordTimingNs(
+                "stage_executor_cpu",
+                "execute_total",
+                static_cast<uint64_t>(phase.total_execute_ms * 1.0e6),
+                phase_name,
+                device_name,
+                base_tags);
+
+            if (phase.total_collective_ms > 0.0)
+            {
+                auto collective_tags = base_tags;
+                collective_tags.emplace("calls", std::to_string(phase.total_collective_calls));
+                PerfStatsCollector::recordTimingNs(
+                    "stage_executor_cpu",
+                    "collective_total",
+                    static_cast<uint64_t>(phase.total_collective_ms * 1.0e6),
+                    phase_name,
+                    device_name,
+                    std::move(collective_tags));
+            }
+
+            const double overhead_ms = phase.overhead.total();
+            if (overhead_ms > 0.0)
+            {
+                PerfStatsCollector::recordTimingNs(
+                    "stage_executor_cpu",
+                    "overhead_total",
+                    static_cast<uint64_t>(overhead_ms * 1.0e6),
+                    phase_name,
+                    device_name,
+                    base_tags);
+            }
+
+            for (const auto &[stage_type, ms] : phase.stage_type_execute_ms)
+            {
+                auto tags = base_tags;
+                const auto count_it = phase.stage_type_counts.find(stage_type);
+                tags.emplace("stage_type", stage_type);
+                tags.emplace("stage_count",
+                             count_it == phase.stage_type_counts.end()
+                                 ? "0"
+                                 : std::to_string(count_it->second));
+                PerfStatsCollector::recordTimingNs(
+                    "stage_executor_cpu",
+                    std::string("type.") + stage_type,
+                    static_cast<uint64_t>(ms * 1.0e6),
+                    phase_name,
+                    device_name,
+                    std::move(tags));
+            }
+        };
+
+        record_phase("prefill", prefill);
+        record_phase("decode", decode);
     }
 
     // =============================================================================

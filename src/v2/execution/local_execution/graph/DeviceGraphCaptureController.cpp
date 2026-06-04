@@ -676,6 +676,7 @@ namespace llaminar2
         void *capture_stream,
         bool needs_segment_sync,
         const std::string &perf_context,
+        const std::string &device_name,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         if (!gpu_ctx)
@@ -712,7 +713,7 @@ namespace llaminar2
                 "segmented_replay_graph_launch",
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count()),
                 "decode",
-                {},
+                device_name,
                 replaySegmentTags(segment, perf_context));
         }
 
@@ -733,7 +734,7 @@ namespace llaminar2
                 "segmented_replay_post_launch",
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(post_t1 - post_t0).count()),
                 "decode",
-                {},
+                device_name,
                 replaySegmentTags(segment, perf_context));
         }
 
@@ -1295,6 +1296,7 @@ namespace llaminar2
         // Coherence IS needed for verify/recapture modes since they may re-execute
         // stages in a different order or on different streams.
         const bool skip_coherence = !recapture_mode && !verify_mode;
+        const std::string device_name = ctx->deviceId().toString();
 
         if (!skip_coherence && !cohere_inputs_cb(segment))
         {
@@ -1337,6 +1339,7 @@ namespace llaminar2
             capture_stream,
             needs_segment_sync,
             perf_context,
+            device_name,
             post_launch_cb);
         result.success = launch_ok;
         result.launch_failure_fallback = !launch_ok;

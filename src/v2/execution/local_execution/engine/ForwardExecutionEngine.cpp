@@ -1300,6 +1300,10 @@ namespace llaminar2
         bool used_segmented_capture = false;
 
         auto exec_t0 = std::chrono::high_resolution_clock::now();
+        if (profiling_setup)
+        {
+            ForwardPassProfiler::resetReplayTimings();
+        }
 
         if (!is_decode)
         {
@@ -1474,15 +1478,13 @@ namespace llaminar2
             timings.setup_graph_reset_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(setup_graph_reset_t1 - setup_graph_reset_t0).count());
 
-            // Graph replay sub-phase timings are populated by the capture controller
-            // via the thread-local ReplayPhaseTimings if Phase 3 was active.
-            if (forward_cache.phase3_active)
-            {
-                const auto &replay_timings = ForwardPassProfiler::consumeReplayTimings();
-                timings.graph_launch_ns = replay_timings.graph_launch_ns;
-                timings.post_launch_ns = replay_timings.post_launch_ns;
-                timings.stream_sync_ns = replay_timings.stream_sync_ns;
-            }
+            // Graph replay sub-phase timings are populated by decode segmented
+            // replay and prefill graph-cache launch paths via thread-local
+            // ReplayPhaseTimings. Eager paths simply consume zeros.
+            const auto &replay_timings = ForwardPassProfiler::consumeReplayTimings();
+            timings.graph_launch_ns = replay_timings.graph_launch_ns;
+            timings.post_launch_ns = replay_timings.post_launch_ns;
+            timings.stream_sync_ns = replay_timings.stream_sync_ns;
 
             if (is_decode)
                 forward_pass_profiler_.recordDecodeIteration(timings);
@@ -1524,6 +1526,45 @@ namespace llaminar2
         const bool moe_rebalancing_active = host.isMoeRebalancingActive();
         bool padded_preflight_checked = false;
         PrefillGraphRejectReason padded_preflight_reason = PrefillGraphRejectReason::None;
+
+        auto launchPrefillGraph = [&](const char *capture_phase,
+                                      PrefillGraphPhase cache_phase,
+                                      const char *launch_kind,
+                                      const std::string &recapture_reason) -> bool
+        {
+            const auto launch_t0 = std::chrono::high_resolution_clock::now();
+            const bool ok = cache.launch(key);
+            const auto launch_t1 = std::chrono::high_resolution_clock::now();
+            const auto ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count());
+
+            if (KernelProfiler::isEnabled())
+            {
+                ForwardPassProfiler::addReplayLaunchNs(ns);
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                auto observation = makePrefillGraphObservation(
+                    input,
+                    key,
+                    capture_phase,
+                    recapture_reason);
+                auto tags = prefillGraphObservationTags(
+                    observation,
+                    prefillGraphPhaseName(cache_phase));
+                tags.emplace("launch_kind", launch_kind ? launch_kind : "unknown");
+                PerfStatsCollector::recordTimingNs(
+                    "forward_graph",
+                    "prefill_graph_launch",
+                    ns,
+                    "prefill",
+                    input.device.toString(),
+                    std::move(tags));
+            }
+
+            return ok;
+        };
 
         if (padded_bucket)
         {
@@ -1588,7 +1629,7 @@ namespace llaminar2
             }
             bindPrefillStreamToStages(stream);
 
-            if (!cache.launch(key))
+            if (!launchPrefillGraph("replay", PrefillGraphPhase::Ready, "replay", "none"))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph replay FAILED for seq_len=" << input.seq_len);
                 return false;
@@ -1659,7 +1700,8 @@ namespace llaminar2
             // Kernels recorded during HIP/CUDA stream capture are not executed
             // until the executable graph is launched. Launch once immediately so
             // the capture request produces logits and advances device state.
-            if (!cache.launch(key))
+            if (!launchPrefillGraph("capture", PrefillGraphPhase::Ready, "launch_after_capture",
+                                    phase == PrefillGraphPhase::Warmup ? "armed_warmup" : "recapture"))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph launch-after-capture failed for seq_len=" << input.seq_len);
                 return false;

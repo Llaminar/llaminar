@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/graph/StageTimeline.h"
+#include "execution/local_execution/graph/IGraphExecutor.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/compute_stages/IComputeStage.h"
 #include "backends/IWorkerGPUContext.h"
@@ -292,9 +293,93 @@ TEST_F(Test__StageTimeline, RecordPerfStatsCarriesContextTags)
         });
     };
 
-    EXPECT_TRUE(has_record("total", {{"context", "main_verifier"}}));
-    EXPECT_TRUE(has_record("type.GEMM", {{"context", "main_verifier"}, {"stage_count", "1"}}));
-    EXPECT_TRUE(has_record("gemm_stage", {{"context", "main_verifier"}, {"index", "0"}, {"type", "GEMM"}}));
+    const PerfStatsCollector::Tags base_tags{
+        {"attribution", "gpu_event"},
+        {"context", "main_verifier"},
+        {"graph_capture_scope", "eager_stage_events"},
+        {"source", "stage_timeline"}};
+    EXPECT_TRUE(has_record("total", base_tags));
+    EXPECT_TRUE(has_record("type.GEMM", {{"attribution", "gpu_event"},
+                                         {"context", "main_verifier"},
+                                         {"graph_capture_scope", "eager_stage_events"},
+                                         {"source", "stage_timeline"},
+                                         {"stage_count", "1"}}));
+    EXPECT_TRUE(has_record("gemm_stage", {{"attribution", "gpu_event"},
+                                          {"context", "main_verifier"},
+                                          {"graph_capture_scope", "eager_stage_events"},
+                                          {"index", "0"},
+                                          {"source", "stage_timeline"},
+                                          {"type", "GEMM"}}));
+
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__StageTimeline, RecordPerfStatsWithoutValidEventsDoesNotInventStageGpuRecords)
+{
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "/tmp/stage_timeline_no_valid_events.json");
+    PerfStatsCollector::reset();
+
+    StageTimeline timeline;
+    timeline.initialize(gpu_ctx_.get(), 1);
+    timeline.setStageInfo(0, "captured_stage", ComputeStageType::MOE_ROUTER);
+
+    timeline.recordPerfStats(
+        "decode",
+        "CUDA:0",
+        "stage_gpu",
+        {{"context", "main_decode"}});
+
+    EXPECT_TRUE(PerfStatsCollector::snapshot({"stage_gpu"}).empty());
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__StageTimeline, GraphExecutorStatsExportIsHostAttributed)
+{
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "/tmp/graph_executor_host_stats.json");
+    PerfStatsCollector::reset();
+
+    GraphExecutorStats stats;
+    stats.prefill.total_stages_executed = 3;
+    stats.prefill.total_execute_ms = 12.5;
+    stats.prefill.stage_type_execute_ms["MOE_ROUTER"] = 9.0;
+    stats.prefill.stage_type_counts["MOE_ROUTER"] = 2;
+    stats.prefill.stage_type_execute_ms["GEMM"] = 3.5;
+    stats.prefill.stage_type_counts["GEMM"] = 1;
+    stats.prefill.overhead.mark_dirty_ms = 0.25;
+    stats.total_stages_executed = stats.prefill.total_stages_executed;
+
+    stats.recordPerfStats("CUDA:0");
+
+    const auto records = PerfStatsCollector::snapshot({"stage_executor_cpu"});
+    ASSERT_FALSE(records.empty());
+
+    auto has_record = [&](const std::string &name,
+                          const std::string &phase,
+                          const PerfStatsCollector::Tags &tags) {
+        return std::any_of(records.begin(), records.end(), [&](const PerfStatRecord &record) {
+            return record.domain == "stage_executor_cpu" &&
+                   record.name == name &&
+                   record.phase == phase &&
+                   record.device == "CUDA:0" &&
+                   record.tags == tags;
+        });
+    };
+
+    const PerfStatsCollector::Tags base_tags{
+        {"attribution", "host"},
+        {"graph_capture_scope", "eager_or_capture_setup"},
+        {"note", "host_executor_timing_not_gpu_stage_time"},
+        {"source", "device_graph_executor"}};
+
+    EXPECT_TRUE(has_record("execute_total", "prefill", base_tags));
+    EXPECT_TRUE(has_record("overhead_total", "prefill", base_tags));
+    EXPECT_TRUE(has_record("type.MOE_ROUTER", "prefill",
+                           {{"attribution", "host"},
+                            {"graph_capture_scope", "eager_or_capture_setup"},
+                            {"note", "host_executor_timing_not_gpu_stage_time"},
+                            {"source", "device_graph_executor"},
+                            {"stage_count", "2"},
+                            {"stage_type", "MOE_ROUTER"}}));
 
     PerfStatsCollector::reset();
 }

@@ -391,6 +391,9 @@ namespace llaminar2
         const std::string device = device_name ? device_name : "";
         const std::string perf_domain = domain ? domain : "stage_gpu";
         auto merge_tags = [&](PerfStatsCollector::Tags record_tags = {}) {
+            record_tags.emplace("attribution", "gpu_event");
+            record_tags.emplace("source", "stage_timeline");
+            record_tags.emplace("graph_capture_scope", "eager_stage_events");
             record_tags.insert(tags.begin(), tags.end());
             return record_tags;
         };

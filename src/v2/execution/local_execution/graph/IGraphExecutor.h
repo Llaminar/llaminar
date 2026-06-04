@@ -230,6 +230,9 @@ namespace llaminar2
         /// Print a formatted profiling summary to stdout
         void printProfilingSummary(size_t prefill_tokens, size_t decode_tokens) const;
 
+        /// Export host-side executor stage/profile attribution into PerfStatsCollector.
+        void recordPerfStats(const std::string &device_name = {}) const;
+
     private:
         static thread_local ExecutionPhase current_phase_;
 

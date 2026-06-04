@@ -45,6 +45,8 @@ CUDA dense memory planner smoke:
 CUDA MoE after source-token expert activation quantization:
 `benchmark_results/cuda_moe_mtp/20260604T210314Z-source-token-quant`
 `benchmark_results/cuda_moe_mtp/20260604T210400Z-source-token-quant-mtp-dynamic`
+Profiler export check:
+`benchmark_results/cuda_moe_mtp/20260604T212136Z-perf-export-device-field`
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
@@ -71,6 +73,8 @@ Focused correctness gates:
 - Memory planning charges terminal-row logits and prepared embedding workspace only.
 - GPU activation arenas are capped to prefill-bucket capacity while KV keeps the
   requested context capacity; oversized monolithic graph shapes hard fail.
+- Stage profiling split: `stage_gpu` is GPU-event eager timing, `stage_executor_cpu`
+  is host attribution, and graph replay timing is under `forward_graph`.
 - Explicit non-null GPU stream hard failures remain required.
 
 ## Next Work

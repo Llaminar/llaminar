@@ -1396,7 +1396,20 @@ namespace llaminar2
             }
         }
 
-        // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1)
+        // Export host-side executor timing into the unified perf collector even
+        // when the legacy human table is suppressed.
+        if (runner_)
+        {
+            const auto *stats = runner_->executorStats();
+            if (stats && stats->total_stages_executed > 0)
+            {
+                stats->recordPerfStats();
+            }
+        }
+
+        // Print executor overhead profiling if enabled (LLAMINAR_PROFILING=1).
+        // These are host executor timings, not GPU stage timings; graph-captured
+        // execution is represented in forward_graph/stage_gpu perf records.
         if (print_legacy_profile_tables && runner_)
         {
             const auto *stats = runner_->executorStats();
