@@ -599,6 +599,105 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeOnlyDoesNotRequireLegacyOutp
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoELayerRuntime;
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int num_layers = 1;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+    constexpr int d_model = 64;
+    constexpr int seq_len = 1;
+
+    DeviceMoERuntimeTable::Config cuda_config;
+    cuda_config.device_id = llaminar2::DeviceId::cuda(0);
+    cuda_config.num_layers = num_layers;
+    cuda_config.num_experts = num_experts;
+    cuda_config.top_k = top_k;
+    cuda_config.mirror_to_device = true;
+    DeviceMoERuntimeTable cuda_table(cuda_config);
+
+    llaminar2::MoEPlacementUpdate update;
+    update.epoch = 1;
+    update.expert_count = num_experts;
+    update.experts.resize(num_experts);
+    update.local_compute_mask.assign(num_experts, 0);
+    update.replica_role.resize(num_experts, 0);
+    for (int expert = 0; expert < num_experts; ++expert)
+        update.experts[expert].logical_expert_id = expert;
+
+    ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
+
+    std::vector<float> hidden_values(static_cast<size_t>(d_model));
+    for (int i = 0; i < d_model; ++i)
+        hidden_values[static_cast<size_t>(i)] = (i == 0)
+                                                    ? 1.0f
+                                                    : 0.01f * std::sin(static_cast<float>(i) * 0.37f);
+
+    std::vector<float> gate_values(static_cast<size_t>(num_experts) * d_model);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        gate_values[static_cast<size_t>(expert) * d_model] =
+            -1.5f + 0.015f * static_cast<float>(expert);
+        for (int i = 1; i < d_model; ++i)
+        {
+            gate_values[static_cast<size_t>(expert) * d_model + i] =
+                0.05f * std::cos(static_cast<float>((expert + 3) * (i + 5)) * 0.011f);
+        }
+    }
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto gate = makeTensor({num_experts, d_model}, gate_values);
+    auto cuda_indices = makeZeros({seq_len, top_k});
+    auto cuda_weights = makeZeros({seq_len, top_k});
+    auto cpu_indices = makeZeros({seq_len, top_k});
+    auto cpu_weights = makeZeros({seq_len, top_k});
+
+    auto *cuda_layer = cuda_table.deviceLayerState(0);
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        cuda_layer, hidden.get(), gate.get(), d_model, num_experts, top_k,
+        true, cuda_indices.get(), cuda_weights.get(), true, true));
+
+    llaminar2::MoERoutingResult cpu_host_result;
+    ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
+                                              num_experts, top_k, true,
+                                              cpu_indices.get(), cpu_weights.get(), cpu_host_result));
+
+    int32_t runtime_ids[top_k] = {};
+    float runtime_weights[top_k] = {};
+    const char *runtime_base = reinterpret_cast<const char *>(cuda_layer);
+    const auto *ids_device = reinterpret_cast<const int32_t *>(
+        runtime_base + offsetof(DeviceMoELayerRuntime, topk_expert_ids));
+    const auto *weights_device = reinterpret_cast<const float *>(
+        runtime_base + offsetof(DeviceMoELayerRuntime, topk_weights));
+    ASSERT_EQ(cudaMemcpyAsync(runtime_ids, ids_device, sizeof(runtime_ids),
+                              cudaMemcpyDeviceToHost, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(runtime_weights, weights_device, sizeof(runtime_weights),
+                              cudaMemcpyDeviceToHost, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    expectNearArray(cuda_indices->data(), cpu_indices->data(), seq_len * top_k, 0.0f);
+    expectNearArray(cuda_weights->data(), cpu_weights->data(), seq_len * top_k, 1.0e-5f);
+
+    const float *cpu_index_data = cpu_indices->data();
+    const float *cpu_weight_data = cpu_weights->data();
+    for (int k = 0; k < top_k; ++k)
+    {
+        EXPECT_EQ(runtime_ids[k], static_cast<int32_t>(cpu_index_data[k]));
+        EXPECT_NEAR(runtime_weights[k], cpu_weight_data[k], 1.0e-5f);
+    }
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, RouteWithTensorsMatchesCPU)
 {
     constexpr int seq_len = 3;

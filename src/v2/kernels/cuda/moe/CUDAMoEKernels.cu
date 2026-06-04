@@ -483,8 +483,10 @@ namespace
     {
         __shared__ float values[kMaxExperts];
         __shared__ float reductions[kThreads];
+        __shared__ int red_idx[kThreads];
         __shared__ int selected[kMaxTopK];
         __shared__ float selected_weights[kMaxTopK];
+        __shared__ float selected_sum;
 
         float local_max = -INFINITY;
         for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
@@ -524,30 +526,61 @@ namespace
         __syncthreads();
 
         if (threadIdx.x == 0)
+            selected_sum = 0.0f;
+        __syncthreads();
+
+        for (int k = 0; k < top_k; ++k)
         {
-            float topk_sum = 0.0f;
-            for (int k = 0; k < top_k; ++k)
+            float best_value = -1.0f;
+            int best = 0;
+            for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
             {
-                int best = 0;
-                float best_value = -1.0f;
-                for (int expert = 0; expert < num_experts; ++expert)
+                const float value = values[expert];
+                if (value > best_value)
                 {
-                    if (values[expert] > best_value)
+                    best_value = value;
+                    best = expert;
+                }
+            }
+            reductions[threadIdx.x] = best_value;
+            red_idx[threadIdx.x] = best;
+            __syncthreads();
+
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+            {
+                if (threadIdx.x < stride)
+                {
+                    const float other = reductions[threadIdx.x + stride];
+                    const int other_idx = red_idx[threadIdx.x + stride];
+                    const float cur = reductions[threadIdx.x];
+                    const int cur_idx = red_idx[threadIdx.x];
+                    if (other > cur || (other == cur && other_idx < cur_idx))
                     {
-                        best_value = values[expert];
-                        best = expert;
+                        reductions[threadIdx.x] = other;
+                        red_idx[threadIdx.x] = other_idx;
                     }
                 }
-                selected[k] = best;
-                selected_weights[k] = best_value;
-                topk_sum += best_value;
-                values[best] = -1.0f;
+                __syncthreads();
             }
 
+            const int winner = red_idx[0];
+            const float winner_value = reductions[0];
+            if (threadIdx.x == 0)
+            {
+                selected[k] = winner;
+                selected_weights[k] = winner_value;
+                selected_sum += winner_value;
+                values[winner] = -1.0f;
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0)
+        {
             for (int k = 0; k < top_k; ++k)
             {
-                const float weight = normalize_weights && topk_sum > 0.0f
-                                         ? selected_weights[k] / topk_sum
+                const float weight = normalize_weights && selected_sum > 0.0f
+                                         ? selected_weights[k] / selected_sum
                                          : selected_weights[k];
                 runtime_expert_ids[k] = selected[k];
                 runtime_weights[k] = weight;
