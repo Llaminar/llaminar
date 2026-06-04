@@ -491,6 +491,7 @@ void moe_grouped_gate_up_prefill_gemm_kernel(
     const DeviceNativeVNNIMatrixDesc* __restrict__ up_descs,   // [num_experts]
     const int*     __restrict__ d_group_counts,      // [num_experts]
     const int*     __restrict__ d_group_offsets,     // [num_experts]
+    const int*     __restrict__ d_active_expert_ids, // [active_expert_slots] or null
     float*         __restrict__ gate_output,         // [total_slots, N]
     float*         __restrict__ up_output,           // [total_slots, N]
     int N, int K)
@@ -499,7 +500,8 @@ void moe_grouped_gate_up_prefill_gemm_kernel(
     constexpr int TILE_M = 8;  // Process 8 tokens per block, amortizing weight decode
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     const int token_group = blockIdx.y;  // group of TILE_M tokens
-    const int expert_id = blockIdx.z;
+    const int expert_id = d_active_expert_ids ? d_active_expert_ids[blockIdx.z] : static_cast<int>(blockIdx.z);
+    if (expert_id < 0) return;
 
     const int count = d_group_counts[expert_id];
     const int first_token = token_group * TILE_M;
@@ -764,6 +766,7 @@ void moe_grouped_down_prefill_gemm_kernel(
     const DeviceNativeVNNIMatrixDesc* __restrict__ down_descs, // [num_experts]
     const int*     __restrict__ d_group_counts,      // [num_experts]
     const int*     __restrict__ d_group_offsets,     // [num_experts]
+    const int*     __restrict__ d_active_expert_ids, // [active_expert_slots] or null
     float*         __restrict__ output,              // [total_slots, d_model]
     int N,   // d_model (output columns)
     int K)   // intermediate (input columns / reduction dim)
@@ -772,7 +775,8 @@ void moe_grouped_down_prefill_gemm_kernel(
     constexpr int TILE_M = 8;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     const int token_group = blockIdx.y;
-    const int expert_id = blockIdx.z;
+    const int expert_id = d_active_expert_ids ? d_active_expert_ids[blockIdx.z] : static_cast<int>(blockIdx.z);
+    if (expert_id < 0) return;
 
     const int count = d_group_counts[expert_id];
     const int first_token = token_group * TILE_M;
@@ -966,6 +970,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     const int*    d_group_offsets,       // [num_experts] prefix-sum offsets
     const int*    d_group_token_indices, // [total_slots] original token indices
     const float*  d_group_weights,       // [total_slots] routing weights
+    const int*    d_active_expert_ids,   // [active_expert_slots] compact active experts, optional
     // Scratch buffers (caller provides, sized for total_slots)
     int8_t*       d_scratch_A_int8,      // [total_slots, max(d_model, intermediate)]
     float*        d_scratch_scales,      // [total_slots, max_blocks_per_row]
@@ -982,6 +987,7 @@ bool rocmMoE_grouped_prefill_pipeline(
     int intermediate,
     int max_tokens_per_expert,           // upper bound on tokens any expert gets
     int total_slots,                     // seq_len * top_k
+    int active_expert_slots,             // fixed graph-capturable expert grid, 0 => all experts
     // Formats and device. Gate/up and down can differ on Qwen35 MoE
     // (for example Q4_K gate/up with Q5_K down), so keep them separate.
     uint8_t gateup_codebook_id,
@@ -990,8 +996,13 @@ bool rocmMoE_grouped_prefill_pipeline(
     void* stream)
 {
     if (num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
-        max_tokens_per_expert <= 0 || total_slots <= 0)
+        max_tokens_per_expert <= 0 || total_slots <= 0 || !stream)
         return false;
+    const bool use_active_expert_grid = d_active_expert_ids && active_expert_slots > 0;
+    if (use_active_expert_grid &&
+        (active_expert_slots > total_slots || active_expert_slots > num_experts))
+        return false;
+    const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
 
     llaminar2::HipDeviceGuard::setDevice(device_id);
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
@@ -1020,7 +1031,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         constexpr int TILE_M = 8;
         dim3 grid((intermediate + TILE_N - 1) / TILE_N,
                   (max_tokens_per_expert + TILE_M - 1) / TILE_M,
-                  num_experts);
+                  expert_grid);
         dim3 block(TILE_N);
 
         const auto* gate_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_gate_desc_table);
@@ -1031,7 +1042,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 HIP_KERNEL_NAME(moe_grouped_gate_up_prefill_gemm_kernel<FMT>), \
                 grid, block, 0, hip_stream, \
                 d_scratch_A_int8, d_scratch_scales, gate_descs, up_descs, \
-                d_group_counts, d_group_offsets, \
+                d_group_counts, d_group_offsets, d_active_expert_ids, \
                 d_scratch_gate, d_scratch_up, intermediate, d_model)
 
         switch (static_cast<NativeVNNIFormatPrefill>(gateup_codebook_id)) {
@@ -1079,7 +1090,7 @@ bool rocmMoE_grouped_prefill_pipeline(
         constexpr int TILE_M = 8;
         dim3 grid((d_model + TILE_N - 1) / TILE_N,
                   (max_tokens_per_expert + TILE_M - 1) / TILE_M,
-                  num_experts);
+                  expert_grid);
         dim3 block(TILE_N);
 
         const auto* down_descs = static_cast<const DeviceNativeVNNIMatrixDesc*>(d_down_desc_table);
@@ -1089,7 +1100,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 HIP_KERNEL_NAME(moe_grouped_down_prefill_gemm_kernel<FMT>), \
                 grid, block, 0, hip_stream, \
                 d_scratch_swiglu_int8, d_scratch_swiglu_scales, down_descs, \
-                d_group_counts, d_group_offsets, \
+                d_group_counts, d_group_offsets, d_active_expert_ids, \
                 d_scratch_down_out, d_model, intermediate)
 
         switch (static_cast<NativeVNNIFormatPrefill>(down_codebook_id)) {

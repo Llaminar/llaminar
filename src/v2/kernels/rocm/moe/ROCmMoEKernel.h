@@ -538,6 +538,8 @@ namespace llaminar2
         int *d_group_max_tokens_ = nullptr;    ///< [1] device-side max(d_group_counts_) (async reduction)
         int *d_group_token_indices_ = nullptr; ///< [total_slots] grouped token indices
         float *d_group_weights_ = nullptr;     ///< [total_slots] grouped routing weights
+        int *d_group_active_expert_ids_ = nullptr; ///< [min(total_slots,num_experts)] compact active expert ids
+        int group_active_expert_slots_ = 0;    ///< Fixed active-expert launch slots from the last small grouping pass
         int group_slots_cap_ = 0;              ///< capacity for total_slots buffers
         int group_experts_cap_ = 0;            ///< capacity for num_experts buffers
 

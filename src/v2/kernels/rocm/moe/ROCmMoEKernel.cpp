@@ -20,6 +20,7 @@
 #include "../../../utils/ROCmKernelProfiler.h"
 
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <limits>
@@ -318,7 +319,9 @@ extern "C"
         const float *routing_indices, const float *routing_weights,
         int *expert_counts, int *expert_offsets,
         int *grouped_token_indices, float *grouped_weights,
+        int *active_expert_ids,
         int total_slots, int num_experts, int top_k,
+        int max_active_experts,
         int device_idx, void *stream);
 
     // Phase 4: Tensor-aware utility bridges
@@ -441,6 +444,7 @@ extern "C"
         const int *d_group_offsets,
         const int *d_group_token_indices,
         const float *d_group_weights,
+        const int *d_active_expert_ids,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
         float *d_scratch_gate,
@@ -454,6 +458,7 @@ extern "C"
         int intermediate,
         int max_tokens_per_expert,
         int total_slots,
+        int active_expert_slots,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         int device_id,
@@ -745,6 +750,41 @@ namespace llaminar2
             hipFree(d_route_weights_);
             d_route_weights_ = nullptr;
         }
+        if (d_group_int_indices_)
+        {
+            hipFree(d_group_int_indices_);
+            d_group_int_indices_ = nullptr;
+        }
+        if (d_group_offsets_)
+        {
+            hipFree(d_group_offsets_);
+            d_group_offsets_ = nullptr;
+        }
+        if (d_group_counts_)
+        {
+            hipFree(d_group_counts_);
+            d_group_counts_ = nullptr;
+        }
+        if (d_group_max_tokens_)
+        {
+            hipFree(d_group_max_tokens_);
+            d_group_max_tokens_ = nullptr;
+        }
+        if (d_group_token_indices_)
+        {
+            hipFree(d_group_token_indices_);
+            d_group_token_indices_ = nullptr;
+        }
+        if (d_group_weights_)
+        {
+            hipFree(d_group_weights_);
+            d_group_weights_ = nullptr;
+        }
+        if (d_group_active_expert_ids_)
+        {
+            hipFree(d_group_active_expert_ids_);
+            d_group_active_expert_ids_ = nullptr;
+        }
         for (auto &entry : router_fp16_gate_cache_)
         {
             if (entry.d_gate_weights_fp16)
@@ -868,6 +908,7 @@ namespace llaminar2
         host_grouped_indices_.clear();
         host_grouped_weights_.clear();
         prepared_num_experts_ = 0;
+        group_active_expert_slots_ = 0;
     }
 
     void ROCmMoEKernel::syncBlasStream()
@@ -4060,11 +4101,15 @@ namespace llaminar2
                 (void)hipFree(d_group_token_indices_);
             if (d_group_weights_)
                 (void)hipFree(d_group_weights_);
+            if (d_group_active_expert_ids_)
+                (void)hipFree(d_group_active_expert_ids_);
             hipError_t alloc_err = hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
             if (alloc_err == hipSuccess)
                 alloc_err = hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
             if (alloc_err == hipSuccess)
                 alloc_err = hipMalloc(&d_group_weights_, total_slots * sizeof(float));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_active_expert_ids_, total_slots * sizeof(int));
             if (alloc_err != hipSuccess)
             {
                 LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] hipMalloc grouping buffers failed: "
@@ -4072,6 +4117,8 @@ namespace llaminar2
                 d_group_int_indices_ = nullptr;
                 d_group_token_indices_ = nullptr;
                 d_group_weights_ = nullptr;
+                d_group_active_expert_ids_ = nullptr;
+                group_active_expert_slots_ = 0;
                 group_slots_cap_ = 0;
                 return false;
             }
@@ -4231,11 +4278,15 @@ namespace llaminar2
                 (void)hipFree(d_group_token_indices_);
             if (d_group_weights_)
                 (void)hipFree(d_group_weights_);
+            if (d_group_active_expert_ids_)
+                (void)hipFree(d_group_active_expert_ids_);
             hipError_t alloc_err = hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
             if (alloc_err == hipSuccess)
                 alloc_err = hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
             if (alloc_err == hipSuccess)
                 alloc_err = hipMalloc(&d_group_weights_, total_slots * sizeof(float));
+            if (alloc_err == hipSuccess)
+                alloc_err = hipMalloc(&d_group_active_expert_ids_, total_slots * sizeof(int));
             if (alloc_err != hipSuccess)
             {
                 LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] hipMalloc grouping buffers failed: "
@@ -4243,6 +4294,8 @@ namespace llaminar2
                 d_group_int_indices_ = nullptr;
                 d_group_token_indices_ = nullptr;
                 d_group_weights_ = nullptr;
+                d_group_active_expert_ids_ = nullptr;
+                group_active_expert_slots_ = 0;
                 group_slots_cap_ = 0;
                 return false;
             }
@@ -4287,6 +4340,7 @@ namespace llaminar2
             top_k <= 16;
         if (use_small_grouping)
         {
+            const int active_expert_slots = std::min(total_slots, num_experts);
             if (!hipMoE_group_tokens_small_float(
                     d_float_indices,
                     d_float_weights,
@@ -4294,15 +4348,19 @@ namespace llaminar2
                     d_group_offsets_,
                     d_group_token_indices_,
                     d_group_weights_,
+                    d_group_active_expert_ids_,
                     total_slots,
                     num_experts,
                     top_k,
+                    active_expert_slots,
                     device_ordinal_,
                     getStream()))
             {
                 LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] small-M grouping failed");
+                group_active_expert_slots_ = 0;
                 return false;
             }
+            group_active_expert_slots_ = active_expert_slots;
 
             if (PerfStatsCollector::isEnabled())
             {
@@ -4323,6 +4381,7 @@ namespace llaminar2
         }
 
         // 3. Convert float indices → int on device
+        group_active_expert_slots_ = 0;
         if (!hipMoE_float_to_int(d_float_indices, d_group_int_indices_,
                                  total_slots, device_ordinal_, getStream()))
         {
@@ -4506,6 +4565,14 @@ namespace llaminar2
         // potential future use (e.g., separate-stream approach or graph capture).
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
+        const int active_expert_slots = group_active_expert_slots_;
+        const int *d_active_expert_ids =
+            (active_expert_slots > 0) ? d_group_active_expert_ids_ : nullptr;
+        if (active_expert_slots > 0 && !d_active_expert_ids)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipeline] compact active expert list missing");
+            return false;
+        }
 
         // Ensure scratch buffers
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
@@ -4544,6 +4611,7 @@ namespace llaminar2
             d_group_offsets_,
             d_group_token_indices_,
             d_group_weights_,
+            d_active_expert_ids,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
@@ -4557,6 +4625,7 @@ namespace llaminar2
             intermediate,
             max_tokens_per_expert,
             total_slots,
+            active_expert_slots,
             gateup_table.codebook_id,
             down_table.codebook_id,
             device_ordinal_,
@@ -4570,6 +4639,19 @@ namespace llaminar2
 
         output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
                              DeviceId::rocm(device_ordinal_));
+        if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel",
+                "rocm_moe_grouped_prefill_active_expert_grid_calls",
+                1.0,
+                "moe",
+                DeviceId::rocm(device_ordinal_).to_string(),
+                PerfStatsCollector::Tags{
+                    {"total_slots", std::to_string(total_slots)},
+                    {"active_expert_slots", std::to_string(active_expert_slots)},
+                    {"num_experts", std::to_string(num_experts)}});
+        }
         return true;
     }
 

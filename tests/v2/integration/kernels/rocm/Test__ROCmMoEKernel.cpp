@@ -63,7 +63,9 @@ extern "C" bool hipMoE_group_tokens_small_float(
     const float *routing_indices, const float *routing_weights,
     int *expert_counts, int *expert_offsets,
     int *grouped_token_indices, float *grouped_weights,
+    int *active_expert_ids,
     int total_slots, int num_experts, int top_k,
+    int max_active_experts,
     int device_idx, void *stream);
 
 extern "C" bool hipMoE_gate_logits_small_m(
@@ -4049,6 +4051,8 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_VerifierSizedRoutesMatchHostGroupin
     int *d_expert_counts = nullptr;
     int *d_grouped_indices = nullptr;
     float *d_grouped_weights = nullptr;
+    int *d_active_experts = nullptr;
+    const int max_active_experts = std::min(total_slots, num_experts);
 
     ASSERT_EQ(hipMalloc(&d_routing_indices, total_slots * sizeof(float)), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_routing_weights, total_slots * sizeof(float)), hipSuccess);
@@ -4056,6 +4060,7 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_VerifierSizedRoutesMatchHostGroupin
     ASSERT_EQ(hipMalloc(&d_expert_counts, num_experts * sizeof(int)), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_grouped_indices, total_slots * sizeof(int)), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_grouped_weights, total_slots * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_active_experts, max_active_experts * sizeof(int)), hipSuccess);
 
     ASSERT_EQ(hipMemcpy(d_routing_indices, routing_indices.data(),
                         total_slots * sizeof(float), hipMemcpyHostToDevice),
@@ -4073,9 +4078,11 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_VerifierSizedRoutesMatchHostGroupin
         d_expert_offsets,
         d_grouped_indices,
         d_grouped_weights,
+        d_active_experts,
         total_slots,
         num_experts,
         top_k,
+        max_active_experts,
         /*device_idx=*/0,
         stream));
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -4085,6 +4092,7 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_VerifierSizedRoutesMatchHostGroupin
     std::vector<int> host_counts(static_cast<size_t>(num_experts));
     std::vector<int> host_grouped_indices(static_cast<size_t>(total_slots));
     std::vector<float> host_grouped_weights(static_cast<size_t>(total_slots));
+    std::vector<int> host_active_experts(static_cast<size_t>(max_active_experts));
     ASSERT_EQ(hipMemcpy(host_offsets.data(), d_expert_offsets,
                         num_experts * sizeof(int), hipMemcpyDeviceToHost),
               hipSuccess);
@@ -4097,6 +4105,9 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_VerifierSizedRoutesMatchHostGroupin
     ASSERT_EQ(hipMemcpy(host_grouped_weights.data(), d_grouped_weights,
                         total_slots * sizeof(float), hipMemcpyDeviceToHost),
               hipSuccess);
+    ASSERT_EQ(hipMemcpy(host_active_experts.data(), d_active_experts,
+                        max_active_experts * sizeof(int), hipMemcpyDeviceToHost),
+              hipSuccess);
 
     ASSERT_EQ(hipFree(d_routing_indices), hipSuccess);
     ASSERT_EQ(hipFree(d_routing_weights), hipSuccess);
@@ -4104,6 +4115,7 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_VerifierSizedRoutesMatchHostGroupin
     ASSERT_EQ(hipFree(d_expert_counts), hipSuccess);
     ASSERT_EQ(hipFree(d_grouped_indices), hipSuccess);
     ASSERT_EQ(hipFree(d_grouped_weights), hipSuccess);
+    ASSERT_EQ(hipFree(d_active_experts), hipSuccess);
 
     int running_offset = 0;
     for (int expert = 0; expert < num_experts; ++expert)
@@ -4133,6 +4145,18 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_VerifierSizedRoutesMatchHostGroupin
         running_offset += host_counts[static_cast<size_t>(expert)];
     }
     EXPECT_EQ(running_offset, total_slots);
+
+    std::vector<int> expected_active_experts;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        if (!expected_per_expert[static_cast<size_t>(expert)].empty())
+            expected_active_experts.push_back(expert);
+    }
+    ASSERT_LE(expected_active_experts.size(), host_active_experts.size());
+    for (size_t i = 0; i < expected_active_experts.size(); ++i)
+        EXPECT_EQ(host_active_experts[i], expected_active_experts[i]) << "active slot " << i;
+    for (size_t i = expected_active_experts.size(); i < host_active_experts.size(); ++i)
+        EXPECT_EQ(host_active_experts[i], -1) << "inactive slot " << i;
 }
 
 TEST(Test__ROCmMoEKernel, SmallFloatGrouping_RejectsNullStream)
@@ -4146,9 +4170,11 @@ TEST(Test__ROCmMoEKernel, SmallFloatGrouping_RejectsNullStream)
         /*expert_offsets=*/nullptr,
         /*grouped_token_indices=*/nullptr,
         /*grouped_weights=*/nullptr,
+        /*active_expert_ids=*/nullptr,
         /*total_slots=*/8,
         /*num_experts=*/16,
         /*top_k=*/8,
+        /*max_active_experts=*/8,
         /*device_idx=*/0,
         /*stream=*/nullptr));
 }
@@ -4749,6 +4775,14 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
             small_grouping_calls += record.value;
         EXPECT_GT(small_grouping_calls, 0.0)
             << "verifier-sized fixed-topology prefill should use fused small-M grouping";
+    }
+    {
+        const auto records = PerfStatsCollector::snapshot({"kernel.rocm_moe_grouped_prefill_active_expert_grid_calls"});
+        double active_grid_calls = 0.0;
+        for (const auto &record : records)
+            active_grid_calls += record.value;
+        EXPECT_GT(active_grid_calls, 0.0)
+            << "verifier-sized fixed-topology prefill should launch over compact active experts";
     }
     PerfStatsCollector::reset();
 

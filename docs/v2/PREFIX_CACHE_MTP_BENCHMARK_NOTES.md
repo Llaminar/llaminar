@@ -11,7 +11,7 @@ tuning actions, and negative A/B results that should not be rediscovered.
 | Dense default benchmark, 595 prompt tokens, 128 decode tokens | ROCm `rocm:0` | Qwen3.6 27B Q4_K_S | 29.91 tok/s | 46.74 tok/s | 1.56x | Bucketed attention capture, depth-sensitive |
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
-| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 39.94 tok/s | 2.03x | Fixed d1, grouped small-M router/grouping |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 42.04 tok/s | 2.13x | Fixed d1, compact active-expert prefill grid |
 | MoE single-device | CUDA `cuda:0` | Qwen3.6 35B A3B | 31.20 tok/s | 50.89 tok/s | 1.63x | Deep CUDA math parity green; needs longer confirmation |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
@@ -41,14 +41,13 @@ Qwen3.6 35B A3B on `rocm:0`, default benchmark lane, 2026-06-04:
 | Case | Decode | Acceptance | Notes |
 |---|---:|---:|---|
 | baseline | 19.72 tok/s | n/a | no MTP |
-| fixed d1 | 39.94 tok/s | 78.12% | best retained lane after grouped small-M router/grouping |
+| fixed d1 | 42.04 tok/s | 78.12% | best stable repeat after compact active-expert prefill grid |
 | dynamic max d3 | 37.82 tok/s | 71.21% | demotes to depth 1; retest after next router/expert slice |
 | fixed d2 | 25.18 tok/s | 69.7% | verifier and rollback cost dominate |
 | fixed d3 | 25.90 tok/s | 69.7% | overreaches |
 
-Latest artifact: `benchmark_results/rocm_moe_mtp/20260604T030907Z-9da36b05-grouped-smallm-router-n64-repeat`.
-Stats recorded 1680 calls each for `kernel.rocm_moe_small_prefill_grouping_calls`
-and `kernel.rocm_moe_small_m_fused_router_calls`.
+Latest artifact: `benchmark_results/rocm_moe_mtp/20260604T034243Z-64e01724-active-expert-prefill-grid-n64-repeat`.
+Stats recorded active grouped-prefill grids with 16 active experts out of 256.
 
 MoE A/B results to avoid repeating:
 
@@ -59,7 +58,7 @@ MoE A/B results to avoid repeating:
 | Q8 router | 33.05 tok/s | 75.78% | reject |
 | K-partition router | 30.13 tok/s | 71.88% | reject |
 | hipBLAS strided-batched M=2..4 router | 30.92-32.08 tok/s | 69.53-74.22% | parity green but slower; reverted |
-| token-dedup grouped-prefill quant | 38.81 tok/s | 74.22% | slower than 39.94 ratchet; reverted |
+| token-dedup grouped-prefill quant | 38.81 tok/s | 74.22% | slower than ratchet; reverted |
 
 ## Retained Tuning Actions
 
@@ -75,8 +74,8 @@ MoE A/B results to avoid repeating:
   streamful `TransferEngine` terminal-state uploads.
 - Kept ROCm attention param uploads out of HIP capture; captured attention now
   consumes pre-uploaded workspace params and hard-fails if missing.
-- Fused verifier-sized MoE float-route grouping and grouped/LDS small-M FP32
-  gate logits into explicit-stream ROCm kernels.
+- Fused verifier-sized MoE grouping/router work into explicit-stream ROCm kernels
+  and compacted grouped-prefill launch grids to active experts only.
 
 ## Next Work
 

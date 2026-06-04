@@ -2524,9 +2524,11 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
     int *__restrict__ expert_offsets,
     int *__restrict__ grouped_token_indices,
     float *__restrict__ grouped_weights,
+    int *__restrict__ active_expert_ids,
     int total_slots,
     int num_experts,
-    int top_k)
+    int top_k,
+    int max_active_experts)
 {
     __shared__ int counts[kDeviceMoEMaxExperts];
     __shared__ int offsets[kDeviceMoEMaxExperts];
@@ -2552,11 +2554,17 @@ __global__ void rocm_moe_group_tokens_small_float_kernel(
     if (tid == 0)
     {
         int running = 0;
+        int active = 0;
         for (int expert = 0; expert < num_experts; ++expert)
         {
             offsets[expert] = running;
-            running += counts[expert];
+            const int count = counts[expert];
+            if (count > 0 && active < max_active_experts)
+                active_expert_ids[active++] = expert;
+            running += count;
         }
+        for (int slot = active; slot < max_active_experts; ++slot)
+            active_expert_ids[slot] = -1;
     }
     __syncthreads();
 
@@ -2834,7 +2842,9 @@ bool hipMoE_group_tokens_small_float(
     const float *routing_indices, const float *routing_weights,
     int *expert_counts, int *expert_offsets,
     int *grouped_token_indices, float *grouped_weights,
+    int *active_expert_ids,
     int total_slots, int num_experts, int top_k,
+    int max_active_experts,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -2842,10 +2852,12 @@ bool hipMoE_group_tokens_small_float(
 
     if (!stream ||
         !routing_indices || !routing_weights || !expert_counts || !expert_offsets ||
-        !grouped_token_indices || !grouped_weights ||
+        !grouped_token_indices || !grouped_weights || !active_expert_ids ||
         total_slots <= 0 || total_slots > 64 ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
-        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK ||
+        max_active_experts <= 0 || max_active_experts > total_slots ||
+        max_active_experts > num_experts)
     {
         fprintf(stderr, "HIP MoE small float grouping invalid arguments\n");
         return false;
@@ -2856,7 +2868,9 @@ bool hipMoE_group_tokens_small_float(
         routing_indices, routing_weights,
         expert_counts, expert_offsets,
         grouped_token_indices, grouped_weights,
-        total_slots, num_experts, top_k);
+        active_expert_ids,
+        total_slots, num_experts, top_k,
+        max_active_experts);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
