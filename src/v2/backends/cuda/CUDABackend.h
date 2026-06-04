@@ -81,6 +81,10 @@ namespace llaminar2
                        float *out_value, int *out_index, void *stream = nullptr,
                        void *partial_vals = nullptr, void *partial_idxs = nullptr,
                        int partial_capacity = 0) override;
+        bool argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
+                                  float *out_values, int *out_indices, void *stream = nullptr,
+                                  void *partial_vals = nullptr, void *partial_idxs = nullptr,
+                                  int partial_capacity = 0) override;
 
         // GPU-side top-k selection for sampling
         bool topKF32(const void *data_device, int n, int k, int device_id,

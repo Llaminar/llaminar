@@ -770,6 +770,11 @@ namespace llaminar2
         const float *data, int n, float *out_value, int *out_index,
         float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream);
+    extern "C" bool cudaOps_argmax_f32_batched_rows(
+        const float *data, int rows, int cols, int row_stride,
+        float *out_values, int *out_indices,
+        float *partial_vals, int *partial_idxs, int partial_capacity,
+        int device_idx, void *stream);
 
     extern "C" bool cudaOps_topk_f32(
         const float *data, int n, int k, float *out_values, int *out_indices,
@@ -861,6 +866,83 @@ namespace llaminar2
         CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), cudaMemcpyDeviceToHost, s));
         CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
 
+        return true;
+    }
+
+    bool CUDABackend::argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
+                                           float *out_values, int *out_indices, void *stream,
+                                           void *partial_vals, void *partial_idxs, int partial_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            rows <= 0 || cols <= 0 || !out_values || !out_indices)
+        {
+            return false;
+        }
+
+        if (!partial_vals || !partial_idxs || partial_capacity < rows)
+        {
+            LOG_ERROR("[CUDABackend::argmaxF32BatchedRows] missing arena-owned partial scratch "
+                      << "(rows=" << rows << " capacity=" << partial_capacity << ")");
+            return false;
+        }
+
+        if (argmax_buffers_.empty())
+            argmax_buffers_.resize(device_count_);
+
+        auto &bufs = argmax_buffers_[device_id];
+        if (!bufs.value_ptr || bufs.allocated_count < rows)
+        {
+            CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+            if (bufs.value_ptr)
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.value_ptr));
+            if (bufs.index_ptr)
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.index_ptr));
+            bufs.value_ptr = nullptr;
+            bufs.index_ptr = nullptr;
+            bufs.allocated_count = 0;
+
+            cudaError_t err = cudaMalloc(&bufs.value_ptr, static_cast<size_t>(rows) * sizeof(float));
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(&bufs.index_ptr, static_cast<size_t>(rows) * sizeof(int));
+            if (err != cudaSuccess)
+            {
+                CUDA_WARN_IF_FAIL(cudaFree(bufs.value_ptr));
+                bufs.value_ptr = nullptr;
+                return false;
+            }
+            bufs.allocated_count = rows;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaSetDevice(device_id));
+        cudaStream_t s = resolveStream(device_id, stream);
+        if (!cudaOps_argmax_f32_batched_rows(
+                static_cast<const float *>(data_device),
+                rows,
+                cols,
+                cols,
+                static_cast<float *>(bufs.value_ptr),
+                static_cast<int *>(bufs.index_ptr),
+                static_cast<float *>(partial_vals),
+                static_cast<int *>(partial_idxs),
+                partial_capacity,
+                device_id,
+                s))
+        {
+            return false;
+        }
+
+        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_values,
+                                            bufs.value_ptr,
+                                            static_cast<size_t>(rows) * sizeof(float),
+                                            cudaMemcpyDeviceToHost,
+                                            s));
+        CUDA_CHECK_OR_THROW(cudaMemcpyAsync(out_indices,
+                                            bufs.index_ptr,
+                                            static_cast<size_t>(rows) * sizeof(int),
+                                            cudaMemcpyDeviceToHost,
+                                            s));
+        CUDA_CHECK_OR_THROW(cudaStreamSynchronize(s));
         return true;
     }
 
