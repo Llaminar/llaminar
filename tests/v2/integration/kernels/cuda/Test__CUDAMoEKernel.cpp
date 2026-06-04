@@ -207,6 +207,34 @@ namespace
         int old_down_kparts_ = 16;
     };
 
+    class ScopedCudaMoEPrefillConfig
+    {
+    public:
+        ScopedCudaMoEPrefillConfig()
+            : old_tile_m_(llaminar2::mutableDebugEnv().gemm.cuda_moe_prefill_tile_m),
+              old_fuse_swiglu_(llaminar2::mutableDebugEnv().gemm.cuda_moe_prefill_fuse_swiglu)
+        {
+        }
+
+        ~ScopedCudaMoEPrefillConfig()
+        {
+            auto &gemm = llaminar2::mutableDebugEnv().gemm;
+            gemm.cuda_moe_prefill_tile_m = old_tile_m_;
+            gemm.cuda_moe_prefill_fuse_swiglu = old_fuse_swiglu_;
+        }
+
+        void set(int tile_m, bool fuse_swiglu)
+        {
+            auto &gemm = llaminar2::mutableDebugEnv().gemm;
+            gemm.cuda_moe_prefill_tile_m = tile_m;
+            gemm.cuda_moe_prefill_fuse_swiglu = fuse_swiglu;
+        }
+
+    private:
+        int old_tile_m_ = 0;
+        bool old_fuse_swiglu_ = true;
+    };
+
     void expectGroupedDecodeCounter(
         const char *counter_name,
         const char *source,
@@ -242,6 +270,43 @@ namespace
             });
         ASSERT_NE(match, records.end()) << "missing matching perf counter " << counter_name
                                         << " source=" << source;
+        EXPECT_GE(match->count, 1u);
+        EXPECT_GE(match->value, 1.0);
+    }
+
+    void expectPrefillSwiGLUPathRecord(
+        const char *swiglu_path,
+        int seq_len,
+        int top_k,
+        int num_experts,
+        int expected_tile_m)
+    {
+        const auto records =
+            llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+        const std::string expected_path = swiglu_path;
+        const std::string expected_total_slots = std::to_string(seq_len * top_k);
+        const std::string expected_num_experts = std::to_string(num_experts);
+        const std::string expected_tile = std::to_string(expected_tile_m);
+        const auto match = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const llaminar2::PerfStatRecord &record)
+            {
+                auto tag_equals = [&](const char *key, const std::string &value)
+                {
+                    const auto it = record.tags.find(key);
+                    return it != record.tags.end() && it->second == value;
+                };
+                return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
+                       tag_equals("swiglu_path", expected_path) &&
+                       tag_equals("total_slots", expected_total_slots) &&
+                       tag_equals("active_expert_slots", expected_total_slots) &&
+                       tag_equals("num_experts", expected_num_experts) &&
+                       tag_equals("tile_m", expected_tile);
+            });
+        ASSERT_NE(match, records.end()) << "missing grouped prefill SwiGLU path counter path="
+                                        << swiglu_path << " seq_len=" << seq_len
+                                        << " tile_m=" << expected_tile_m;
         EXPECT_GE(match->count, 1u);
         EXPECT_GE(match->value, 1.0);
     }
@@ -1090,7 +1155,8 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
-    ScopedEnv tile_env("LLAMINAR_CUDA_MOE_PREFILL_TILE_M", "0");
+    ScopedCudaMoEPrefillConfig prefill_config;
+    prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     llaminar2::PerfStatsCollector::reset();
 
     constexpr int seq_len = 4;
@@ -1205,6 +1271,7 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillUsesCompactActiveE
     EXPECT_EQ(grid_records.front().tags.at("num_experts"), std::to_string(num_experts));
     EXPECT_EQ(grid_records.front().tags.at("tile_m"), "4")
         << "seq_len=4 verifier-style grouped prefill should use the small-M tile by default";
+    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 4);
 
     llaminar2::PerfStatsCollector::reset();
 #endif
@@ -1372,7 +1439,8 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         GTEST_SKIP() << "No CUDA device available";
 
     ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
-    ScopedEnv tile_env("LLAMINAR_CUDA_MOE_PREFILL_TILE_M", "0");
+    ScopedCudaMoEPrefillConfig prefill_config;
+    prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
     ScopedCudaMoEGemmConfig gemm_config;
     gemm_config.set(
         /*gateup_kpart=*/true,
@@ -1525,7 +1593,9 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         auto routing_indices = makeTensor({static_cast<size_t>(seq_len), top_k}, routing_indices_values);
         auto routing_weights = makeTensor({static_cast<size_t>(seq_len), top_k}, routing_weights_values);
         auto prefill_output = makeZeros({static_cast<size_t>(seq_len), d_model});
+        auto split_prefill_output = makeZeros({static_cast<size_t>(seq_len), d_model});
 
+        prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
         ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
             routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
         ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
@@ -1536,6 +1606,22 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
         std::vector<float> prefill_values(
             prefill_output->data(),
             prefill_output->data() + prefill_output->numel());
+
+        prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/false);
+        ASSERT_TRUE(cuda_kernel_->prepareExpertGroupsAsync(
+            routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
+        ASSERT_TRUE(cuda_kernel_->executeGroupedPrefillPipeline(
+            hidden.get(), split_prefill_output.get(), gateup_table, down_table,
+            seq_len, d_model, intermediate, num_experts, top_k));
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        std::vector<float> split_prefill_values(
+            split_prefill_output->data(),
+            split_prefill_output->data() + split_prefill_output->numel());
+
+        expectVectorsClose(prefill_values, split_prefill_values, 0.999, 0.03);
+        expectPrefillSwiGLUPathRecord("split", seq_len, top_k, num_experts, seq_len == 2 ? 2 : 4);
+        prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
+
         std::vector<float> rowwise_decode_values;
         rowwise_decode_values.reserve(prefill_values.size());
 
@@ -1608,6 +1694,7 @@ TEST_F(Test__CUDAMoEKernel, VerifierSmallMPrefillM234MatchesDecodeRowsAndCapture
             ASSERT_TRUE(std::isfinite(captured_output[i])) << "captured output element " << i;
 
         expect_prefill_record(seq_len, seq_len == 2 ? 2 : 4);
+        expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, seq_len == 2 ? 2 : 4);
     }
 
     const auto grouping_records =
