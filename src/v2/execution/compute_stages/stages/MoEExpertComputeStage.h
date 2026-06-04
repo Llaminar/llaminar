@@ -487,6 +487,13 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_SHARED_EXPERT_GATE; }
         std::string name() const override { return "shared_expert_gate"; }
+        bool allowsZeroOutput() const override
+        {
+            // The sigmoid gate can saturate to exactly zero for very negative
+            // gate dot-products. That is a valid model result, not an
+            // uninitialized shared-expert buffer.
+            return true;
+        }
         size_t estimatedFlops() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;

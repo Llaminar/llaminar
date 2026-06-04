@@ -96,10 +96,9 @@ namespace
 
     MoEPrefixRestoreParityCase cudaSingleDeviceDepth3Case()
     {
-        auto test_case = cudaSingleDeviceCase();
+        auto test_case = cudaSingleDeviceBenchmarkPromptCase();
         test_case.name = "Qwen3.6 MoE CUDA SingleDevice depth-3 MTP parity";
         test_case.decode_steps = 4;
-        test_case.max_seq_len = 128;
         return test_case;
     }
 

@@ -404,6 +404,45 @@ TEST_F(MoEExpertComputeStageTest, SharedGate_LargePositiveDotSaturates)
     }
 }
 
+TEST_F(MoEExpertComputeStageTest, SharedGate_LargeNegativeDotCanSaturateToZero)
+{
+    const int seq = 1;
+    const int d = 4;
+
+    auto input = TestTensorFactory::createFP32({seq, d});
+    auto gate_inp = TestTensorFactory::createFP32({1, d});
+    auto shared_output = TestTensorFactory::createFP32({seq, d});
+
+    // dot = 10 * -10 * 4 = -400. The sigmoid underflows to 0.0f when
+    // stored as float, so the in-place shared expert output becomes zero.
+    for (int i = 0; i < d; ++i)
+    {
+        input->mutable_data()[i] = 10.0f;
+        gate_inp->mutable_data()[i] = -10.0f;
+    }
+    shared_output->mutable_data()[0] = 3.0f;
+    shared_output->mutable_data()[1] = -2.0f;
+    shared_output->mutable_data()[2] = 5.0f;
+    shared_output->mutable_data()[3] = -7.0f;
+
+    SharedExpertGateStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.gate_inp = gate_inp.get();
+    params.shared_output = shared_output.get();
+    params.seq_len = seq;
+    params.d_model = d;
+
+    SharedExpertGateStage stage(params);
+    EXPECT_TRUE(stage.allowsZeroOutput())
+        << "Stage verifier must not treat a saturated shared-expert gate as uninitialized";
+    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+
+    const float *out = shared_output->data();
+    for (int i = 0; i < d; ++i)
+        EXPECT_EQ(out[i], 0.0f) << "Gate should saturate to zero at dim " << i;
+}
+
 TEST_F(MoEExpertComputeStageTest, SharedGate_NullInputReturnsError)
 {
     auto shared_output = TestTensorFactory::createFP32({SEQ_LEN, D_MODEL});

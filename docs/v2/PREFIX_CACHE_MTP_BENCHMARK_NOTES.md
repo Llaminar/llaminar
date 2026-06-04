@@ -54,6 +54,8 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
   and the MoE GDN qkv+z path uses fused native projections.
 - CUDA grouped MoE prefill keeps fused SwiGLU+quant but uses independent SwiGLU scratch,
   so the fused epilogue no longer overwrites gate/up inputs before reading them.
+- CUDA MoE MTP depth-3 parity now uses the stable benchmark-prompt lane, and shared
+  expert gate verification allows mathematically valid sigmoid-underflow zero rows.
 - Depth>1 MTP rollback now commits suffix shifted-cache rows after an already-committed
   verifier prefix; regressions cover tiny graph construction and CUDA MoE depth-3 parity.
 - CUDA and ROCm GPU greedy argmax tie-break to the lowest token id, matching CPU greedy.
