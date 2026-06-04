@@ -1,7 +1,7 @@
 # Prefix Cache And MTP Benchmark Notes
 
-Durable Phase 14 scoreboard. Keep this file concise: headline numbers, retained
-tuning actions, and negative A/B results that should not be rediscovered.
+Durable Phase 14 scoreboard: headline numbers, retained actions, and negative
+A/Bs that should not be rediscovered.
 
 ## Headline Matrix
 
@@ -20,11 +20,10 @@ tuning actions, and negative A/B results that should not be rediscovered.
 `MTPDepthController` supports fixed, observe, and dynamic modes. The reusable
 sweep script is `scripts/run_mtp_depth_hysteresis_sweep.sh`.
 
-Latest ROCm dense sweeps showed dynamic preserves depth 3 on high-acceptance
-`qbf_short` (48.36 tok/s, 86.33%) and learns depth 1 on default/code prompts,
-near fixed depth-1 speed. Controller lifetime, not hysteresis thresholds, was
-the useful tuning change: `clearCache()` and repeated benchmark prefills no
-longer reset the controller.
+Latest ROCm dense sweeps showed dynamic preserves depth 3 on `qbf_short`
+(48.36 tok/s, 86.33%) and learns depth 1 on default/code prompts. The useful
+tuning change was controller lifetime across `clearCache()` and repeated
+benchmark prefills.
 
 ## MoE ROCm Evidence
 
@@ -39,7 +38,7 @@ Qwen3.6 35B A3B on `rocm:0`, default benchmark lane, 2026-06-04:
 | fixed d3 | 25.90 tok/s | 69.7% | overreaches |
 
 Artifact: `benchmark_results/rocm_moe_mtp/20260604T034243Z-64e01724-active-expert-prefill-grid-n64-repeat`.
-Stats recorded active grouped-prefill grids with 16 active experts out of 256.
+Stats showed 16 active experts out of 256.
 
 MoE ROCm A/B results to avoid repeating:
 
@@ -61,21 +60,23 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
 |---|---:|---:|---|
 | baseline | 101.37 tok/s | n/a | current no-MTP ratchet |
 | fixed d1, after small-M attention | 41.92 tok/s | 32.03% | attention no longer uses FA2 prefill path |
+| short fixed d1, rejected small-M router | 43.88 tok/s | 31.25% | slower than attention-only short run; reverted |
 | fixed d1, before small-M attention | 36.75 tok/s | 33.59% | verifier/rollback cost dominated |
 | short fixed d1, after batched argmax | 38.98 tok/s | 50.00% | verifier sampling 36.98 us/call |
 
-Artifacts: previous `benchmark_results/cuda_moe_mtp/20260604T052521Z-b9cba058-cuda-moe-current-n64`,
-current `benchmark_results/cuda_moe_mtp/20260604T060624Z-869a4762-smallm-attn-n64`.
-The short profile moved attention from 58.84 ms total before the fix to 6.66 ms
-after; remaining CUDA MoE work is verifier economics outside attention.
+Artifacts: `benchmark_results/cuda_moe_mtp/20260604T060624Z-869a4762-smallm-attn-n64`
+and rejected router `20260604T062639Z-982c7aad-smallm-router-n8`.
+Attention moved from 58.84 ms to 6.66 ms on the short profile. The rejected
+router fired 480 times but worsened `MOE_ROUTER` 5.18 -> 5.54 ms/token and
+acceptance 43.75% -> 31.25%.
 
 ## Retained Tuning Actions
 
-- Stabilized ROCm sidecar stream binding, fused sampling ordering, verifier graph lifetime, and depth clamping.
+- Stabilized ROCm sidecar streams, fused sampling ordering, verifier graph lifetime, and depth clamping.
 - Added explicit non-null GPU stream hard failures; regression:
   `V2_Unit_Static_NoDefaultStreamInGPUCode`.
-- Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, ROCm/CUDA batched verifier-row argmax, and GDN verifier-row rollback restore.
-- Kept CUDA verifier projection on the known-good row-wise route; CUDA GEMM scratch now survives request resets while captured prefill graphs are retained.
+- Added graph-native M=2/3/4 small-M VNNI routes for Q/K/IQ codebooks, batched verifier-row argmax, and GDN verifier-row rollback restore.
+- Kept CUDA verifier projection row-wise; CUDA GEMM scratch survives request resets while captured prefill graphs are retained.
 - Added graph-capturable CUDA FP16KV small-M verifier attention for M=2..4.
 - Stabilized MoE prefix fingerprints, grouped-decode runtime-table rewarm, and streamful `TransferEngine` terminal-state uploads.
 - Kept ROCm attention params out of HIP capture and compacted MoE grouped-prefill grids to active experts only.
