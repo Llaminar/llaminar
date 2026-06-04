@@ -2408,6 +2408,68 @@ __global__ void rocm_moe_scatter_tokens_kernel(
     }
 }
 
+__global__ void rocm_moe_group_tokens_small_float_kernel(
+    const float *__restrict__ routing_indices,
+    const float *__restrict__ routing_weights,
+    int *__restrict__ expert_counts,
+    int *__restrict__ expert_offsets,
+    int *__restrict__ grouped_token_indices,
+    float *__restrict__ grouped_weights,
+    int total_slots,
+    int num_experts,
+    int top_k)
+{
+    __shared__ int counts[kDeviceMoEMaxExperts];
+    __shared__ int offsets[kDeviceMoEMaxExperts];
+    __shared__ int write_heads[kDeviceMoEMaxExperts];
+
+    const int tid = threadIdx.x;
+    if (tid < num_experts)
+    {
+        counts[tid] = 0;
+        offsets[tid] = 0;
+        write_heads[tid] = 0;
+    }
+    __syncthreads();
+
+    if (tid < total_slots)
+    {
+        const int expert_id = static_cast<int>(routing_indices[tid]);
+        if (expert_id >= 0 && expert_id < num_experts)
+            atomicAdd(&counts[expert_id], 1);
+    }
+    __syncthreads();
+
+    if (tid == 0)
+    {
+        int running = 0;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            offsets[expert] = running;
+            running += counts[expert];
+        }
+    }
+    __syncthreads();
+
+    if (tid < num_experts)
+    {
+        expert_counts[tid] = counts[tid];
+        expert_offsets[tid] = offsets[tid];
+    }
+
+    if (tid < total_slots)
+    {
+        const int expert_id = static_cast<int>(routing_indices[tid]);
+        if (expert_id >= 0 && expert_id < num_experts)
+        {
+            const int local = atomicAdd(&write_heads[expert_id], 1);
+            const int dest = offsets[expert_id] + local;
+            grouped_token_indices[dest] = tid / top_k;
+            grouped_weights[dest] = routing_weights[tid];
+        }
+    }
+}
+
 __global__ void rocm_moe_prefill_group_clear_kernel(
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     int max_slots, int num_experts)
@@ -2654,6 +2716,43 @@ bool hipMoE_scatter_tokens(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE scatter_tokens kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_group_tokens_small_float(
+    const float *routing_indices, const float *routing_weights,
+    int *expert_counts, int *expert_offsets,
+    int *grouped_token_indices, float *grouped_weights,
+    int total_slots, int num_experts, int top_k,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    if (!stream ||
+        !routing_indices || !routing_weights || !expert_counts || !expert_offsets ||
+        !grouped_token_indices || !grouped_weights ||
+        total_slots <= 0 || total_slots > 64 ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    {
+        fprintf(stderr, "HIP MoE small float grouping invalid arguments\n");
+        return false;
+    }
+
+    hipLaunchKernelGGL(rocm_moe_group_tokens_small_float_kernel,
+        dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream),
+        routing_indices, routing_weights,
+        expert_counts, expert_offsets,
+        grouped_token_indices, grouped_weights,
+        total_slots, num_experts, top_k);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE small float grouping kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;

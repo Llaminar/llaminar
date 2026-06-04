@@ -16,6 +16,7 @@
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../utils/ROCmKernelProfiler.h"
 
 #include <hip/hip_runtime.h>
@@ -23,6 +24,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace
@@ -303,6 +305,13 @@ extern "C"
     bool hipMoE_scatter_tokens(
         const int *routing_indices, const float *routing_weights,
         const int *expert_offsets, int *write_heads,
+        int *grouped_token_indices, float *grouped_weights,
+        int total_slots, int num_experts, int top_k,
+        int device_idx, void *stream);
+
+    bool hipMoE_group_tokens_small_float(
+        const float *routing_indices, const float *routing_weights,
+        int *expert_counts, int *expert_offsets,
         int *grouped_token_indices, float *grouped_weights,
         int total_slots, int num_experts, int top_k,
         int device_idx, void *stream);
@@ -4201,6 +4210,47 @@ namespace llaminar2
                 return false;
             }
             group_experts_cap_ = num_experts;
+        }
+
+        const bool use_small_grouping =
+            total_slots <= 64 &&
+            num_experts <= 256 &&
+            top_k <= 16;
+        if (use_small_grouping)
+        {
+            if (!hipMoE_group_tokens_small_float(
+                    d_float_indices,
+                    d_float_weights,
+                    d_group_counts_,
+                    d_group_offsets_,
+                    d_group_token_indices_,
+                    d_group_weights_,
+                    total_slots,
+                    num_experts,
+                    top_k,
+                    device_ordinal_,
+                    getStream()))
+            {
+                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] small-M grouping failed");
+                return false;
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "rocm_moe_small_prefill_grouping_calls",
+                    1.0,
+                    "moe",
+                    DeviceId::rocm(device_ordinal_).to_string(),
+                    PerfStatsCollector::Tags{
+                        {"total_slots", std::to_string(total_slots)},
+                        {"num_experts", std::to_string(num_experts)},
+                        {"top_k", std::to_string(top_k)}});
+            }
+
+            prepared_num_experts_ = num_experts;
+            return true;
         }
 
         // 3. Convert float indices → int on device

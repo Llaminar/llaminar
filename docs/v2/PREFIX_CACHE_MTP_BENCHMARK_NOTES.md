@@ -44,12 +44,11 @@ Qwen3.6 35B A3B on `rocm:0`, default benchmark lane, 2026-06-04:
 | baseline | 19.72 tok/s | n/a | no MTP |
 | fixed d1 | 37.87 tok/s | 78.12% | best retained lane after attention-param capture fix |
 | dynamic max d3 | 37.82 tok/s | 71.21% | demotes to depth 1; near fixed d1 |
-| fixed d1 previous | 35.61 tok/s | 64.84% | streamful prefix terminal restore |
-| fixed d1 previous | 33.98 tok/s | 79.69% | prior ratchet |
 | fixed d2 | 25.18 tok/s | 69.7% | verifier and rollback cost dominate |
 | fixed d3 | 25.90 tok/s | 69.7% | overreaches |
 
 Artifact: `benchmark_results/rocm_moe_mtp/20260604T020549Z-13eae462-attn-capture-recheck`.
+Small grouping smoke: `20260604T022255Z-small-grouping` recorded 440 fused calls.
 
 Router A/B results to avoid repeating:
 
@@ -75,6 +74,8 @@ Router A/B results to avoid repeating:
 - Stabilized MoE prefix fingerprints by excluding transient runtime-table caches.
 - Reinitialized grouped-decode MoE runtime tables after graph-builder reset so
   cached stages cannot see an inactive decode bank.
+- Fused verifier-sized MoE float-route grouping into one explicit-stream ROCm
+  kernel for counts, offsets, token ids, and weights.
 - Restored prefix terminal logits/hidden through streamful `TransferEngine`
   uploads before MTP sidecar consumption.
 - Kept ROCm attention param uploads out of HIP capture; captured attention now
@@ -82,5 +83,5 @@ Router A/B results to avoid repeating:
 
 ## Next Work
 
-MoE ROCm remains the priority: attack verifier and rollback cost to close the
-remaining gap from 1.92x to the 2x target.
+MoE ROCm remains the priority: shrink main-verifier router/expert time to close
+the remaining gap from 1.92x to the 2x target.

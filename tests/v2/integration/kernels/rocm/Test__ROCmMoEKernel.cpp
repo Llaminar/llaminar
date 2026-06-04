@@ -38,6 +38,7 @@
 #include "execution/moe/MoERuntimeTable.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 #endif
 
 #include "../../../utils/TestTensorFactory.h"
@@ -55,6 +56,15 @@
 #include <cstring>
 #include <string>
 #include <utility>
+
+#ifdef HAVE_ROCM
+extern "C" bool hipMoE_group_tokens_small_float(
+    const float *routing_indices, const float *routing_weights,
+    int *expert_counts, int *expert_offsets,
+    int *grouped_token_indices, float *grouped_weights,
+    int total_slots, int num_experts, int top_k,
+    int device_idx, void *stream);
+#endif
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -128,6 +138,38 @@ namespace
         }
         return max_diff;
     }
+
+    class ScopedEnvOverride
+    {
+    public:
+        ScopedEnvOverride(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old_value = std::getenv(name);
+            if (old_value)
+            {
+                had_old_value_ = true;
+                old_value_ = old_value;
+            }
+            ::setenv(name_.c_str(), value, 1);
+        }
+
+        ~ScopedEnvOverride()
+        {
+            if (had_old_value_)
+                ::setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+        }
+
+        ScopedEnvOverride(const ScopedEnvOverride &) = delete;
+        ScopedEnvOverride &operator=(const ScopedEnvOverride &) = delete;
+
+    private:
+        std::string name_;
+        bool had_old_value_ = false;
+        std::string old_value_;
+    };
 
     /// @brief Give synthetic K-quant blocks nonzero min terms so tests cover asymmetric correction.
     void injectNonZeroKQuantMins(TensorBase *tensor)
@@ -3968,6 +4010,138 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_Basic)
               << " all_matched=" << (all_matched ? "true" : "false") << std::endl;
 }
 
+TEST(Test__ROCmMoEKernel, SmallFloatGrouping_VerifierSizedRoutesMatchHostGrouping)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int seq_len = 4;
+    constexpr int num_experts = 16;
+    constexpr int top_k = 8;
+    constexpr int total_slots = seq_len * top_k;
+
+    std::vector<float> routing_indices(static_cast<size_t>(total_slots));
+    std::vector<float> routing_weights(static_cast<size_t>(total_slots));
+    std::vector<std::vector<std::pair<int, float>>> expected_per_expert(static_cast<size_t>(num_experts));
+    for (int slot = 0; slot < total_slots; ++slot)
+    {
+        const int token = slot / top_k;
+        const int expert = (slot * 5 + token * 3) % num_experts;
+        const float weight = 0.03125f * static_cast<float>(slot + 1);
+        routing_indices[static_cast<size_t>(slot)] = static_cast<float>(expert);
+        routing_weights[static_cast<size_t>(slot)] = weight;
+        expected_per_expert[static_cast<size_t>(expert)].push_back({token, weight});
+    }
+
+    float *d_routing_indices = nullptr;
+    float *d_routing_weights = nullptr;
+    int *d_expert_offsets = nullptr;
+    int *d_expert_counts = nullptr;
+    int *d_grouped_indices = nullptr;
+    float *d_grouped_weights = nullptr;
+
+    ASSERT_EQ(hipMalloc(&d_routing_indices, total_slots * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_routing_weights, total_slots * sizeof(float)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_expert_offsets, num_experts * sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_expert_counts, num_experts * sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_grouped_indices, total_slots * sizeof(int)), hipSuccess);
+    ASSERT_EQ(hipMalloc(&d_grouped_weights, total_slots * sizeof(float)), hipSuccess);
+
+    ASSERT_EQ(hipMemcpy(d_routing_indices, routing_indices.data(),
+                        total_slots * sizeof(float), hipMemcpyHostToDevice),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_routing_weights, routing_weights.data(),
+                        total_slots * sizeof(float), hipMemcpyHostToDevice),
+              hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+    ASSERT_TRUE(hipMoE_group_tokens_small_float(
+        d_routing_indices,
+        d_routing_weights,
+        d_expert_counts,
+        d_expert_offsets,
+        d_grouped_indices,
+        d_grouped_weights,
+        total_slots,
+        num_experts,
+        top_k,
+        /*device_idx=*/0,
+        stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+
+    std::vector<int> host_offsets(static_cast<size_t>(num_experts));
+    std::vector<int> host_counts(static_cast<size_t>(num_experts));
+    std::vector<int> host_grouped_indices(static_cast<size_t>(total_slots));
+    std::vector<float> host_grouped_weights(static_cast<size_t>(total_slots));
+    ASSERT_EQ(hipMemcpy(host_offsets.data(), d_expert_offsets,
+                        num_experts * sizeof(int), hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(host_counts.data(), d_expert_counts,
+                        num_experts * sizeof(int), hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(host_grouped_indices.data(), d_grouped_indices,
+                        total_slots * sizeof(int), hipMemcpyDeviceToHost),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpy(host_grouped_weights.data(), d_grouped_weights,
+                        total_slots * sizeof(float), hipMemcpyDeviceToHost),
+              hipSuccess);
+
+    ASSERT_EQ(hipFree(d_routing_indices), hipSuccess);
+    ASSERT_EQ(hipFree(d_routing_weights), hipSuccess);
+    ASSERT_EQ(hipFree(d_expert_offsets), hipSuccess);
+    ASSERT_EQ(hipFree(d_expert_counts), hipSuccess);
+    ASSERT_EQ(hipFree(d_grouped_indices), hipSuccess);
+    ASSERT_EQ(hipFree(d_grouped_weights), hipSuccess);
+
+    int running_offset = 0;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const auto &expected = expected_per_expert[static_cast<size_t>(expert)];
+        ASSERT_EQ(host_counts[static_cast<size_t>(expert)], static_cast<int>(expected.size()))
+            << "expert=" << expert;
+        ASSERT_EQ(host_offsets[static_cast<size_t>(expert)], running_offset)
+            << "expert=" << expert;
+
+        std::vector<std::pair<int, float>> actual;
+        actual.reserve(expected.size());
+        for (int i = 0; i < host_counts[static_cast<size_t>(expert)]; ++i)
+        {
+            const int grouped = running_offset + i;
+            actual.push_back({host_grouped_indices[static_cast<size_t>(grouped)],
+                              host_grouped_weights[static_cast<size_t>(grouped)]});
+        }
+
+        for (const auto &entry : expected)
+        {
+            EXPECT_NE(std::find(actual.begin(), actual.end(), entry), actual.end())
+                << "expert=" << expert << " token=" << entry.first
+                << " weight=" << entry.second;
+        }
+
+        running_offset += host_counts[static_cast<size_t>(expert)];
+    }
+    EXPECT_EQ(running_offset, total_slots);
+}
+
+TEST(Test__ROCmMoEKernel, SmallFloatGrouping_RejectsNullStream)
+{
+    SKIP_IF_NO_ROCM();
+
+    EXPECT_FALSE(hipMoE_group_tokens_small_float(
+        /*routing_indices=*/nullptr,
+        /*routing_weights=*/nullptr,
+        /*expert_counts=*/nullptr,
+        /*expert_offsets=*/nullptr,
+        /*grouped_token_indices=*/nullptr,
+        /*grouped_weights=*/nullptr,
+        /*total_slots=*/8,
+        /*num_experts=*/16,
+        /*top_k=*/8,
+        /*device_idx=*/0,
+        /*stream=*/nullptr));
+}
+
 TEST(Test__ROCmMoEKernel, GroupPrefillRoutesRuntimeState_DeterministicSmall)
 {
     SKIP_IF_NO_ROCM();
@@ -4198,6 +4372,8 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
             mutableDebugEnv().rocm.moe_grouped_prefill = old_value;
         }
     } grouped_prefill_flag(true);
+    ScopedEnvOverride perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
 
     std::vector<std::unique_ptr<TensorBase>> gate_weight_tensors;
     std::vector<std::unique_ptr<TensorBase>> up_weight_tensors;
@@ -4351,6 +4527,15 @@ TEST(Test__ROCmMoEKernel, FixedTopologyRuntimeGroupedPrefillMatchesExistingPrefi
     fixed_stage.bindWorkspace(workspace.get());
     ASSERT_TRUE(fixed_stage.execute(&ctx));
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    {
+        const auto records = PerfStatsCollector::snapshot({"kernel.rocm_moe_small_prefill_grouping_calls"});
+        double small_grouping_calls = 0.0;
+        for (const auto &record : records)
+            small_grouping_calls += record.value;
+        EXPECT_GT(small_grouping_calls, 0.0)
+            << "verifier-sized fixed-topology prefill should use fused small-M grouping";
+    }
+    PerfStatsCollector::reset();
 
     reference_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     fixed_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
