@@ -343,9 +343,9 @@ namespace llaminar2
          * decode graphs are more stateful: they encode a specific replay lifecycle
          * over the previous request. Dropping segment captures forces the next
          * decode to warm up/capture again against the freshly cleared model state.
-         * Prefill graph entries are preserved because their explicit stream and
-         * arena pointers remain owned by this cache, and replay callbacks restore
-         * host-side metadata after each launch.
+         * Monolithic prefill graph entries also encode raw dynamic-param and
+         * prepared-kernel state. Session reset clears stage/kernel dynamic state,
+         * so those captures must be dropped and rebuilt for the next request.
          *
          * The capture stream itself is retained because cached stages store that
          * stream pointer internally. Destroying it here would leave dynamic-param
@@ -393,6 +393,8 @@ namespace llaminar2
         void resetSessionState()
         {
             resetReplayState();
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll(PrefillGraphRejectReason::SessionReset);
 
             if (graph)
             {

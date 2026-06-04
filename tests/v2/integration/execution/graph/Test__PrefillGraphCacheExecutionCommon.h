@@ -20,8 +20,10 @@
 #include "execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "execution/compute_stages/stages/KVCacheAppendStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/engine/ForwardExecutionEngine.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
@@ -464,10 +466,38 @@ namespace
             return {{device_, ctx_}};
         }
 
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph, int workspace_seq_len) override
         {
             ++ensure_workspace_calls;
             last_workspace_seq_len = workspace_seq_len;
+
+            WorkspaceRequirements combined;
+            std::vector<IWorkspaceConsumer *> consumers;
+            for (const auto &node_name : graph.getExecutionOrder())
+            {
+                const ComputeNode *node = graph.getNode(node_name);
+                if (!node || !node->stage)
+                    continue;
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(node->stage.get());
+                if (!consumer)
+                    continue;
+                consumers.push_back(consumer);
+                combined.merge(consumer->getWorkspaceRequirements(workspace_seq_len, 0, 0));
+            }
+
+            if (consumers.empty())
+                return true;
+
+            if (!workspace_ || workspace_seq_len != workspace_seq_len_)
+            {
+                workspace_ = std::make_unique<DeviceWorkspaceManager>(device_, 1 << 20);
+                workspace_seq_len_ = workspace_seq_len;
+                if (!workspace_->allocate(combined))
+                    return false;
+            }
+
+            for (auto *consumer : consumers)
+                consumer->bindWorkspace(workspace_.get());
             return true;
         }
 
@@ -590,13 +620,18 @@ namespace
         ForwardExecutionEngine *engine_to_clear_on_maintenance_ = nullptr;
         std::vector<std::unique_ptr<FP32Tensor>> tensors_;
         std::unique_ptr<IKVCache> kv_cache_;
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
+        int workspace_seq_len_ = 0;
         FP32Tensor *output_tensor_ = nullptr;
         GPUResidualAddProbeStage *stage_ = nullptr;
         HiddenStateRowSelectStage *row_select_stage_ = nullptr;
         KVCacheAppendStage *kv_append_stage_ = nullptr;
     };
 
-    ForwardGraphSignature bucketedPrefillSignature(DeviceId device, int seq_len)
+    ForwardGraphSignature bucketedPrefillSignature(
+        DeviceId device,
+        int seq_len,
+        uint64_t moe_placement_epoch = 0)
     {
         ForwardGraphSignature signature;
         signature.seq_len = seq_len;
@@ -611,6 +646,7 @@ namespace
         signature.pp_has_lm_head = false;
         signature.is_bucketed_prefill = true;
         signature.bucket_seq_len = seq_len;
+        signature.moe_placement_epoch = moe_placement_epoch;
         return signature;
     }
 
@@ -755,7 +791,7 @@ namespace
         ASSERT_EQ(plan.chunk.bucket_seq_len, kExactBucketSeqLen);
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
         const auto key = prefillGraphKey(device_, kExactBucketSeqLen);
 
         ASSERT_TRUE(engine_->runPrefillChunk(base_input, plan, output, *host_));
@@ -865,7 +901,7 @@ namespace
         EXPECT_EQ(host_->maintenance_calls, 0);
         expectProbeOutputMatches(*host_, kExactBucketSeqLen);
 
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
         const auto key = prefillGraphKey(
             device_,
             kExactBucketSeqLen,
@@ -955,7 +991,7 @@ namespace
         EXPECT_EQ(host_->topology_signature, 0x5510u);
         expectProbeOutputMatches(*host_, kExactBucketSeqLen);
 
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
         const auto new_key = prefillGraphKey(
             device_,
             kExactBucketSeqLen,
@@ -1039,7 +1075,7 @@ namespace
         ASSERT_EQ(plan63.chunk.bucket_seq_len, kExactBucketSeqLen);
 
         ForwardOutput output;
-        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen);
+        const auto signature = bucketedPrefillSignature(device_, kExactBucketSeqLen, host_->placement_epoch);
         const auto key = prefillGraphKey(
             device_,
             kExactBucketSeqLen,

@@ -149,6 +149,28 @@ TEST(Test__PrefillGraphCacheIntegration, InvalidateAllClearsPrefillCache)
     EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold);
 }
 
+TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillCache)
+{
+    ForwardGraphCache cache;
+
+    PrefillGraphConfig config;
+    config.enabled = true;
+    config.min_seq_len = 1;
+    cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
+
+    PrefillGraphCacheKey key;
+    key.seq_len = 512;
+    key.device_id = testGPUDevice();
+
+    cache.prefill_graph_cache->markWarmedUp(key);
+    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Warmup);
+
+    cache.resetSessionState();
+
+    EXPECT_NE(cache.prefill_graph_cache, nullptr);
+    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold);
+}
+
 // =============================================================================
 // Test: Phase transitions Cold → Warmup → Ready in ForwardGraphCache context
 // =============================================================================
@@ -567,4 +589,5 @@ TEST(Test__PrefillGraphCacheIntegration, RejectReasonToString)
     EXPECT_NE(toString(PrefillGraphRejectReason::GDNWithPaddedBucket), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::NoGPUContext), nullptr);
     EXPECT_NE(toString(PrefillGraphRejectReason::InvalidatedByPlacement), nullptr);
+    EXPECT_NE(toString(PrefillGraphRejectReason::SessionReset), nullptr);
 }

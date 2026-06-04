@@ -72,7 +72,8 @@ namespace llaminar2
         StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
         GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
         NoGPUContext,           ///< GPU context unavailable
-        InvalidatedByPlacement  ///< Expert placement mutation since last capture
+        InvalidatedByPlacement, ///< Expert placement mutation since last capture
+        SessionReset            ///< Request/session reset invalidated captured dynamic state
     };
 
     /// Convert PrefillGraphRejectReason to string for logging.

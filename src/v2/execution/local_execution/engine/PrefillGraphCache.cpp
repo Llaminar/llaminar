@@ -103,6 +103,8 @@ namespace llaminar2
             return "NoGPUContext";
         case PrefillGraphRejectReason::InvalidatedByPlacement:
             return "InvalidatedByPlacement";
+        case PrefillGraphRejectReason::SessionReset:
+            return "SessionReset";
         }
         return "Unknown";
     }
