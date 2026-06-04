@@ -292,14 +292,14 @@ namespace llaminar2
         }
 
         /**
-         * @brief Commit shifted MTP rows when the most recent main forward only
-         *        replayed a prefix of the emitted token sequence.
+         * @brief Commit shifted MTP rows when the usable verifier hidden rows
+         *        cover only a prefix of the emitted token sequence.
          *
-         * This lets MTP reject recovery leave the main model in the normal
-         * decode-lag state while still catching the shifted MTP cache up to the
-         * emitted correction token. Implementations should use
+         * Verifier-row restore can reuse hidden rows for the accepted prefix and
+         * then replay a rejected correction suffix. Implementations should use
          * main_forward_token_count, not token_count, to recover the logical
-         * position offset and terminal hidden row count from the last forward.
+         * position offset and terminal hidden row count represented by the
+         * current hidden buffer.
          */
         virtual bool commitMTPShiftedRowsFromPartialForward(
             const int32_t *tokens,

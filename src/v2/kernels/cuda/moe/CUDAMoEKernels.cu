@@ -8,6 +8,7 @@
  * split used by the rest of the CUDA backend.
  */
 
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
@@ -99,6 +100,44 @@ namespace
 
         // Combine per-warp partials. blockDim is a multiple of 32 and <= 1024, so at
         // most 32 warps; warp 0 reduces the per-warp sums in a single shuffle pass.
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int num_warps = blockDim.x >> 5;
+        __shared__ float warp_sums[32];
+        if (lane == 0)
+            warp_sums[warp] = sum;
+        __syncthreads();
+        if (warp == 0)
+        {
+            float v = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1)
+                v += __shfl_down_sync(0xffffffffu, v, offset);
+            if (lane == 0)
+                logits[static_cast<size_t>(token) * num_experts + expert] = v;
+        }
+    }
+
+    __global__ void route_logits_bf16_gate_kernel(
+        const float *__restrict__ hidden,
+        const __nv_bfloat16 *__restrict__ gate_weights,
+        float *__restrict__ logits,
+        int seq_len, int d_model, int num_experts)
+    {
+        const int expert = blockIdx.x;
+        const int token = blockIdx.y;
+        if (expert >= num_experts || token >= seq_len)
+            return;
+
+        const float *h = hidden + static_cast<size_t>(token) * d_model;
+        const __nv_bfloat16 *g = gate_weights + static_cast<size_t>(expert) * d_model;
+
+        float sum = 0.0f;
+        for (int j = threadIdx.x; j < d_model; j += blockDim.x)
+            sum += h[j] * __bfloat162float(g[j]);
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+
         const int lane = threadIdx.x & 31;
         const int warp = threadIdx.x >> 5;
         const int num_warps = blockDim.x >> 5;
@@ -209,6 +248,88 @@ namespace
 
         // Write the micro-tile back to global memory, guarding the ragged token edge
         // (num_experts is a multiple of BN for all supported models, but guard anyway).
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+        {
+            const int m = blockM + threadRow * TM + i;
+            if (m >= seq_len)
+                continue;
+#pragma unroll
+            for (int j = 0; j < TN; ++j)
+            {
+                const int n = blockN + threadCol * TN + j;
+                if (n < num_experts)
+                    logits[static_cast<size_t>(m) * num_experts + n] = acc[i][j];
+            }
+        }
+    }
+
+    template <int BM, int BN, int BK, int TM, int TN>
+    __global__ void route_logits_tiled_bf16_gate_kernel(
+        const float *__restrict__ hidden,
+        const __nv_bfloat16 *__restrict__ gate_weights,
+        float *__restrict__ logits,
+        int seq_len, int d_model, int num_experts)
+    {
+        __shared__ float As[BK * BM];
+        __shared__ float Bs[BK * BN];
+
+        const int blockM = blockIdx.y * BM;
+        const int blockN = blockIdx.x * BN;
+        const int threadRow = threadIdx.x / (BN / TN);
+        const int threadCol = threadIdx.x % (BN / TN);
+
+        float acc[TM][TN];
+#pragma unroll
+        for (int i = 0; i < TM; ++i)
+#pragma unroll
+            for (int j = 0; j < TN; ++j)
+                acc[i][j] = 0.0f;
+
+        for (int kk = 0; kk < d_model; kk += BK)
+        {
+            for (int idx = threadIdx.x; idx < BM * BK; idx += blockDim.x)
+            {
+                const int m = idx / BK;
+                const int k = idx % BK;
+                const int gm = blockM + m;
+                const int gk = kk + k;
+                As[k * BM + m] = (gm < seq_len && gk < d_model)
+                                     ? hidden[static_cast<size_t>(gm) * d_model + gk]
+                                     : 0.0f;
+            }
+            for (int idx = threadIdx.x; idx < BN * BK; idx += blockDim.x)
+            {
+                const int n = idx / BK;
+                const int k = idx % BK;
+                const int gn = blockN + n;
+                const int gk = kk + k;
+                Bs[k * BN + n] = (gn < num_experts && gk < d_model)
+                                     ? __bfloat162float(gate_weights[static_cast<size_t>(gn) * d_model + gk])
+                                     : 0.0f;
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int k = 0; k < BK; ++k)
+            {
+                float regM[TM];
+                float regN[TN];
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+                    regM[i] = As[k * BM + threadRow * TM + i];
+#pragma unroll
+                for (int j = 0; j < TN; ++j)
+                    regN[j] = Bs[k * BN + threadCol * TN + j];
+#pragma unroll
+                for (int i = 0; i < TM; ++i)
+#pragma unroll
+                    for (int j = 0; j < TN; ++j)
+                        acc[i][j] += regM[i] * regN[j];
+            }
+            __syncthreads();
+        }
+
 #pragma unroll
         for (int i = 0; i < TM; ++i)
         {
@@ -2012,6 +2133,31 @@ extern "C"
         route_logits_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             hidden, gate_weights, logits, seq_len, d_model, num_experts);
         return finishLaunch("cudaMoE_route_logits");
+    }
+
+    bool cudaMoE_route_logits_bf16_gate(const float *hidden, const void *gate_weights, float *logits,
+                                        int seq_len, int d_model, int num_experts,
+                                        int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        const auto *bf16_gate = static_cast<const __nv_bfloat16 *>(gate_weights);
+
+        constexpr int kRouteTiledMinTokens = 16;
+        if (seq_len >= kRouteTiledMinTokens)
+        {
+            constexpr int BM = 64, BN = 64, BK = 16, TM = 4, TN = 4;
+            constexpr int kTiledThreads = (BM / TM) * (BN / TN);
+            dim3 grid((num_experts + BN - 1) / BN, (seq_len + BM - 1) / BM);
+            route_logits_tiled_bf16_gate_kernel<BM, BN, BK, TM, TN>
+                <<<grid, kTiledThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                    hidden, bf16_gate, logits, seq_len, d_model, num_experts);
+            return finishLaunch("cudaMoE_route_logits_tiled_bf16_gate");
+        }
+
+        dim3 grid(num_experts, seq_len);
+        route_logits_bf16_gate_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            hidden, bf16_gate, logits, seq_len, d_model, num_experts);
+        return finishLaunch("cudaMoE_route_logits_bf16_gate");
     }
 
     bool cudaMoE_softmax_topk(float *logits, int *expert_indices, float *expert_weights,

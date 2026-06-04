@@ -71,6 +71,7 @@ namespace llaminar2
 
         // Generated text (for verification)
         std::string generated_text;
+        std::vector<int32_t> generated_token_ids;
 
         // Prefix-cache / MTP observability captured after the benchmark loop.
         PrefixRuntimeStateSnapshot prefix_state;
@@ -185,9 +186,18 @@ namespace llaminar2
          * @param n_tokens Number of tokens to generate
          * @param eos_token_id EOS token ID for early stopping
          * @param ignore_stop_tokens If true, never stop on EOS/stop tokens (for throughput benchmarks)
-         * @return Tuple of (success, time_ms, tokens_generated, generated_text)
+         * @return Decode run result with timing, text, and generated token ids.
          */
-        std::tuple<bool, double, int, std::string> runDecode(int n_tokens, int eos_token_id, bool ignore_stop_tokens = false);
+        struct DecodeRunResult
+        {
+            bool success = false;
+            double time_ms = 0.0;
+            int tokens_generated = 0;
+            std::string generated_text;
+            std::vector<int32_t> generated_token_ids;
+        };
+
+        DecodeRunResult runDecode(int n_tokens, int eos_token_id, bool ignore_stop_tokens = false);
     };
 
 } // namespace llaminar2

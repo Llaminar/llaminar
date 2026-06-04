@@ -424,6 +424,8 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
     ASSERT_TRUE(result.success);
     EXPECT_TRUE(result.decode_success);
     EXPECT_EQ(result.decode_tokens, 3);
+    EXPECT_THAT(result.generated_token_ids, ::testing::ElementsAre(14, 10, 11))
+        << "Benchmark JSON should report the final measured iteration, not warmup output";
     EXPECT_TRUE(runner->samplingParamsSet());
     EXPECT_EQ(runner->lastTemperature(), 0.0f);
     EXPECT_GT(runner->decodeStepCalls(), 0);
@@ -589,6 +591,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     result.total_time_ms = 6.0;
     result.success = true;
     result.generated_text = "xy";
+    result.generated_token_ids = {77, 88};
 
     auto &snapshot = result.prefix_state;
     snapshot.initialized = true;
@@ -683,6 +686,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_DOUBLE_EQ(doc.at("timing_ms").at("total").get<double>(), 6.0);
     EXPECT_DOUBLE_EQ(doc.at("throughput_tokens_per_sec").at("overall").get<double>(), 2000.0);
     EXPECT_EQ(doc.at("generated_text_bytes"), 2);
+    EXPECT_EQ(doc.at("generated_token_ids"), nlohmann::json::array({77, 88}));
 
     const auto &prefix = doc.at("prefix_cache");
     EXPECT_TRUE(prefix.at("config_enabled").get<bool>());

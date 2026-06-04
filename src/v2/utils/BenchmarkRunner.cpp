@@ -203,6 +203,7 @@ namespace llaminar2
                                                                   result.total_time_ms
                                                             : 0.0}}},
             {"generated_text_bytes", result.generated_text.size()},
+            {"generated_token_ids", result.generated_token_ids},
             {"runtime_state", {{"initialized", state.initialized},
                                 {"architecture", state.architecture},
                                 {"execution_path", state.execution_path},
@@ -414,11 +415,16 @@ namespace llaminar2
         return {success, time_ms};
     }
 
-    std::tuple<bool, double, int, std::string> BenchmarkRunner::runDecode(int n_tokens, int eos_token_id, bool ignore_stop_tokens)
+    BenchmarkRunner::DecodeRunResult BenchmarkRunner::runDecode(
+        int n_tokens,
+        int eos_token_id,
+        bool ignore_stop_tokens)
     {
+        (void)eos_token_id;
         Sampler sampler(42); // Fixed seed for reproducibility
-        std::string generated_text;
-        generated_text.reserve(n_tokens * 4); // Pre-allocate ~4 bytes/token to avoid reallocs
+        DecodeRunResult result;
+        result.generated_text.reserve(n_tokens * 4); // Pre-allocate ~4 bytes/token to avoid reallocs
+        result.generated_token_ids.reserve(static_cast<size_t>(std::max(0, n_tokens)));
         int tokens_generated = 0;
 
         // Sampler profiling (enabled when LLAMINAR_PROFILING=1)
@@ -452,8 +458,10 @@ namespace llaminar2
                 {
                     last_failure_reason_ = step.error.empty() ? "decode step failed" : step.error;
                     auto end = std::chrono::high_resolution_clock::now();
-                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                    return {false, time_ms, tokens_generated, generated_text};
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
                 }
 
                 int step_token_count = mpi_ctx_->rank() == 0
@@ -467,12 +475,17 @@ namespace llaminar2
                 if (step_token_count <= 0)
                 {
                     auto end = std::chrono::high_resolution_clock::now();
-                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
                     if (step.is_complete)
-                        return {true, time_ms, tokens_generated, generated_text};
+                    {
+                        result.success = true;
+                        return result;
+                    }
                     LOG_ERROR("Benchmark decode step produced no tokens");
                     last_failure_reason_ = "decode step produced no tokens";
-                    return {false, time_ms, tokens_generated, generated_text};
+                    result.success = false;
+                    return result;
                 }
 
                 int stop_reached = 0;
@@ -481,9 +494,10 @@ namespace llaminar2
                     for (int j = 0; j < step_token_count; ++j)
                     {
                         const int32_t token = step.tokens[static_cast<size_t>(j)];
+                        result.generated_token_ids.push_back(token);
                         if (!tokenizer_->is_stop_token(token))
                         {
-                            generated_text += tokenizer_->decode_token(token);
+                            result.generated_text += tokenizer_->decode_token(token);
                         }
                         else if (!ignore_stop_tokens)
                         {
@@ -505,15 +519,19 @@ namespace llaminar2
                 {
                     last_failure_reason_ = "decode maintenance failed";
                     auto end = std::chrono::high_resolution_clock::now();
-                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                    return {false, time_ms, tokens_generated, generated_text};
+                    result.success = false;
+                    result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    result.tokens_generated = tokens_generated;
+                    return result;
                 }
             }
 
             const bool decode_success = synchronizeSuccess(true, "decode complete");
             auto end = std::chrono::high_resolution_clock::now();
-            double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-            return {decode_success, time_ms, tokens_generated, generated_text};
+            result.success = decode_success;
+            result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+            result.tokens_generated = tokens_generated;
+            return result;
         }
 
         for (int i = 0; i < n_tokens; ++i)
@@ -539,8 +557,10 @@ namespace llaminar2
                                                                                  << ": logits() returned nullptr.");
                         last_failure_reason_ = "CPU sampling fallback failed: logits unavailable";
                         auto end = std::chrono::high_resolution_clock::now();
-                        double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                        return {false, time_ms, tokens_generated, generated_text};
+                        result.success = false;
+                        result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                        result.tokens_generated = tokens_generated;
+                        return result;
                     }
                     const int vs = runner_->vocab_size();
                     next_token = static_cast<int>(
@@ -556,7 +576,7 @@ namespace llaminar2
                 // Collect generated text for verification (but don't print during benchmark)
                 if (!tokenizer_->is_stop_token(next_token))
                 {
-                    generated_text += tokenizer_->decode_token(next_token);
+                    result.generated_text += tokenizer_->decode_token(next_token);
                 }
             }
 
@@ -570,6 +590,10 @@ namespace llaminar2
                 break;
             }
 
+            if (mpi_ctx_->rank() == 0)
+            {
+                result.generated_token_ids.push_back(next_token);
+            }
             tokens_generated++;
 
             // Measure inter-step gap: time from last forward() return to this forward() call
@@ -589,8 +613,10 @@ namespace llaminar2
             {
                 last_failure_reason_ = "decode forward failed";
                 auto end = std::chrono::high_resolution_clock::now();
-                double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-                return {false, time_ms, tokens_generated, generated_text};
+                result.success = false;
+                result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                result.tokens_generated = tokens_generated;
+                return result;
             }
 
             // Optional per-step callback (e.g., incremental MoE expert rebalancing)
@@ -607,7 +633,10 @@ namespace llaminar2
         if (!decode_success)
         {
             last_failure_reason_ = "decode synchronization failed";
-            return {false, time_ms, tokens_generated, generated_text};
+            result.success = false;
+            result.time_ms = time_ms;
+            result.tokens_generated = tokens_generated;
+            return result;
         }
 
         // Accumulate inter-step profiling data across benchmark iterations
@@ -625,7 +654,10 @@ namespace llaminar2
                                            << pct << "% of decode time)");
         }
 
-        return {true, time_ms, tokens_generated, generated_text};
+        result.success = true;
+        result.time_ms = time_ms;
+        result.tokens_generated = tokens_generated;
+        return result;
     }
 
     bool BenchmarkRunner::synchronizeSuccess(bool local_success, const char *phase) const
@@ -842,9 +874,8 @@ namespace llaminar2
         if (n_decode > 0)
         {
             int eos_token = tokenizer_->eos_token();
-            auto [warmup_decode_success, warmup_decode_time, warmup_tokens, warmup_text] =
-                runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
-            if (!warmup_decode_success)
+            auto warmup_decode = runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
+            if (!warmup_decode.success)
             {
                 if (mpi_ctx_->rank() == 0)
                 {
@@ -882,7 +913,7 @@ namespace llaminar2
             if (rw_ok && n_decode > 0)
             {
                 int eos_token = tokenizer_->eos_token();
-                runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
+                (void)runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
             }
             if (rw_ok && !warmPrefillGraphCapture())
             {
@@ -966,9 +997,9 @@ namespace llaminar2
                 KVCacheProfiler::setCurrentPhase(KVCacheProfiler::Phase::DECODE);
                 GraphExecutorStats::setCurrentPhase(ExecutionPhase::DECODE);
                 int eos_token = tokenizer_->eos_token();
-                auto [decode_success, decode_time, tokens_generated, generated_text] =
+                auto decode_result =
                     runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
-                if (!decode_success)
+                if (!decode_result.success)
                 {
                     if (mpi_ctx_->rank() == 0)
                     {
@@ -978,9 +1009,10 @@ namespace llaminar2
                         last_failure_reason_ = "decode failed on benchmark iteration";
                     return capture_and_return();
                 }
-                decode_times.push_back(decode_time);
-                decode_token_counts.push_back(tokens_generated);
-                last_generated_text = generated_text;
+                decode_times.push_back(decode_result.time_ms);
+                decode_token_counts.push_back(decode_result.tokens_generated);
+                last_generated_text = decode_result.generated_text;
+                result.generated_token_ids = std::move(decode_result.generated_token_ids);
                 logGPUMemorySnapshot(("after-decode iter=" + std::to_string(iter + 1)).c_str());
             }
 

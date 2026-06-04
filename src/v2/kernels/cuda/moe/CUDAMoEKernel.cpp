@@ -219,6 +219,11 @@ extern "C"
         int seq_len, int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool cudaMoE_route_logits_bf16_gate(
+        const float *hidden, const void *gate_weights, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool cudaMoE_softmax_topk(
         float *logits, int *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k, bool normalize_weights,
@@ -1235,7 +1240,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::routeCore(const float *hidden, const float *gate_weights,
+    bool CUDAMoEKernel::routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                                   int seq_len, int d_model, int num_experts, int top_k,
                                   bool normalize_weights, DeviceRouteBuffers &buffers)
     {
@@ -1253,10 +1258,26 @@ namespace llaminar2
         if (!ensureRouteBufferCapacity(logits_count, topk_count))
             return false;
 
-        if (!cudaMoE_route_logits(hidden, gate_weights, d_route_logits_,
-                                  seq_len, d_model, num_experts,
-                                  device_ordinal_, getStream()))
+        switch (gate_type)
+        {
+        case TensorType::FP32:
+            if (!cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
+                                      seq_len, d_model, num_experts,
+                                      device_ordinal_, getStream()))
+                return false;
+            break;
+        case TensorType::BF16:
+            if (!cudaMoE_route_logits_bf16_gate(hidden, gate_weights, d_route_logits_,
+                                                seq_len, d_model, num_experts,
+                                                device_ordinal_, getStream()))
+                return false;
+            break;
+        default:
+            LOG_ERROR("[CUDAMoEKernel] Unsupported MoE router gate tensor type "
+                      << tensorTypeName(gate_type) << " for CUDA routing");
             return false;
+        }
+
         if (!cudaMoE_softmax_topk(d_route_logits_, d_route_indices_, d_route_weights_,
                                   seq_len, num_experts, top_k, normalize_weights,
                                   device_ordinal_, getStream()))
@@ -1379,15 +1400,29 @@ namespace llaminar2
             !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
             return false;
 
+        if (hidden->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] hidden must be FP32, got "
+                      << tensorTypeName(hidden->native_type()));
+            return false;
+        }
+        if (output_indices->native_type() != TensorType::FP32 ||
+            output_weights->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] routing outputs must be FP32 tensors");
+            return false;
+        }
+
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        const float *d_gate = static_cast<const float *>(gate_weights->gpu_data_ptr());
+        const void *d_gate = gate_weights->gpu_data_ptr();
         float *d_idx = static_cast<float *>(output_indices->gpu_data_ptr());
         float *d_wt = static_cast<float *>(output_weights->gpu_data_ptr());
         if (!d_hidden || !d_gate || !d_idx || !d_wt)
             return false;
 
         DeviceRouteBuffers buffers;
-        if (!routeCore(d_hidden, d_gate, seq_len, d_model, num_experts, top_k, normalize_weights, buffers))
+        if (!routeCore(d_hidden, d_gate, gate_weights->native_type(),
+                       seq_len, d_model, num_experts, top_k, normalize_weights, buffers))
             return false;
 
         if (!cudaMoE_int_to_float(buffers.d_indices, d_idx, static_cast<int>(buffers.topk_count), device_ordinal_, stream))
@@ -1484,6 +1519,12 @@ namespace llaminar2
         if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
             !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights"))
             return false;
+        if (hidden->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] hidden must be FP32, got "
+                      << tensorTypeName(hidden->native_type()));
+            return false;
+        }
 
         float *legacy_indices = nullptr;
         float *legacy_weights = nullptr;
@@ -1493,21 +1534,42 @@ namespace llaminar2
                 !ensureOutputOnDevice(output_indices, device, stream, "output_indices") ||
                 !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
                 return false;
+            if (output_indices->native_type() != TensorType::FP32 ||
+                output_weights->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] legacy routing outputs must be FP32 tensors");
+                return false;
+            }
             legacy_indices = static_cast<float *>(output_indices->gpu_data_ptr());
             legacy_weights = static_cast<float *>(output_weights->gpu_data_ptr());
         }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        const float *d_gate = static_cast<const float *>(gate_weights->gpu_data_ptr());
+        const void *d_gate = gate_weights->gpu_data_ptr();
         if (!d_hidden || !d_gate)
             return false;
 
         if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), static_cast<size_t>(top_k)))
             return false;
-        if (!cudaMoE_route_logits(d_hidden, d_gate, d_route_logits_,
-                                  /*seq_len=*/1, d_model, num_experts,
-                                  device_ordinal_, stream))
+        switch (gate_weights->native_type())
+        {
+        case TensorType::FP32:
+            if (!cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
+                                      /*seq_len=*/1, d_model, num_experts,
+                                      device_ordinal_, stream))
+                return false;
+            break;
+        case TensorType::BF16:
+            if (!cudaMoE_route_logits_bf16_gate(d_hidden, d_gate, d_route_logits_,
+                                                /*seq_len=*/1, d_model, num_experts,
+                                                device_ordinal_, stream))
+                return false;
+            break;
+        default:
+            LOG_ERROR("[CUDAMoEKernel] Unsupported MoE router gate tensor type "
+                      << tensorTypeName(gate_weights->native_type()) << " for CUDA decode routing");
             return false;
+        }
         if (!cudaMoE_softmax_topk_decode_runtime(d_route_logits_,
                              runtimeTopKExpertIdsDevice(runtime_layer),
                              runtimeTopKWeightsDevice(runtime_layer),

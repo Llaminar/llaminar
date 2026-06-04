@@ -18,6 +18,7 @@
 #include "../../IMoEKernel.h"
 #include "../CUDAKernelBase.h"
 #include "../gemm/CUDADeviceWorkspace.h"
+#include "../../../tensors/TensorType.h"
 
 #include <array>
 #include <cstddef>
@@ -236,7 +237,7 @@ namespace llaminar2
 
         DeviceId deviceId() const { return DeviceId::cuda(device_ordinal_); }
 
-        bool routeCore(const float *hidden, const float *gate_weights,
+        bool routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                        int seq_len, int d_model, int num_experts, int top_k,
                        bool normalize_weights, DeviceRouteBuffers &buffers);
 

@@ -64,6 +64,14 @@ namespace
         return tensor;
     }
 
+    std::shared_ptr<llaminar2::BF16Tensor> makeBF16Tensor(const std::vector<size_t> &shape,
+                                                          const std::vector<float> &values)
+    {
+        auto tensor = std::make_shared<llaminar2::BF16Tensor>(shape);
+        tensor->from_fp32(values.data(), values.size());
+        return tensor;
+    }
+
     std::shared_ptr<llaminar2::FP32Tensor> makeZeros(const std::vector<size_t> &shape)
     {
         auto tensor = std::make_shared<llaminar2::FP32Tensor>(shape);
@@ -563,6 +571,57 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenQwenScalePopulatesSnapsho
         [](float v)
         { return v != 0.0f; });
     EXPECT_GT(nonzero_logits, 0);
+    expectNearArray(cuda_host_result.router_logits.data(), cpu_host_result.router_logits.data(),
+                    cuda_host_result.router_logits.size(), 1.0e-4f);
+#endif
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, RouteWithTensorsBF16GateMatchesCPU)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int seq_len = 1;
+    constexpr int d_model = 2048;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+
+    std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
+    std::vector<float> gate_values(static_cast<size_t>(num_experts) * d_model);
+    for (size_t i = 0; i < hidden_values.size(); ++i)
+        hidden_values[i] = 0.09f * std::sin(0.011f * static_cast<float>(i + 1)) -
+                           0.04f * std::cos(0.023f * static_cast<float>(i + 2));
+    for (size_t i = 0; i < gate_values.size(); ++i)
+        gate_values[i] = 0.06f * std::sin(0.019f * static_cast<float>(i + 3)) +
+                         0.03f * std::cos(0.037f * static_cast<float>(i + 4));
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto gate_bf16 = makeBF16Tensor({num_experts, d_model}, gate_values);
+    auto cuda_indices = makeZeros({seq_len, top_k});
+    auto cuda_weights = makeZeros({seq_len, top_k});
+    auto cpu_indices = makeZeros({seq_len, top_k});
+    auto cpu_weights = makeZeros({seq_len, top_k});
+
+    llaminar2::MoERoutingResult cuda_host_result;
+    llaminar2::MoERoutingResult cpu_host_result;
+    ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate_bf16.get(), seq_len, d_model,
+                                               num_experts, top_k, true,
+                                               cuda_indices.get(), cuda_weights.get(), cuda_host_result));
+    ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate_bf16.get(), seq_len, d_model,
+                                              num_experts, top_k, true,
+                                              cpu_indices.get(), cpu_weights.get(), cpu_host_result));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    expectNearArray(cuda_indices->data(), cpu_indices->data(), cuda_indices->numel(), 0.0f);
+    expectNearArray(cuda_weights->data(), cpu_weights->data(), cuda_weights->numel(), 1.0e-4f);
+
+#ifdef ENABLE_PIPELINE_SNAPSHOTS
+    ASSERT_EQ(cuda_host_result.router_logits.size(), static_cast<size_t>(num_experts));
+    ASSERT_EQ(cuda_host_result.router_logits.size(), cpu_host_result.router_logits.size());
     expectNearArray(cuda_host_result.router_logits.data(), cpu_host_result.router_logits.data(),
                     cuda_host_result.router_logits.size(), 1.0e-4f);
 #endif
