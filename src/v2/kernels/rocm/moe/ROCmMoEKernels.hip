@@ -238,22 +238,51 @@ __global__ void rocm_moe_gate_logits_small_m_kernel(
     const float *__restrict__ hidden,       // [seq_len, d_model]
     const float *__restrict__ gate_weights, // [num_experts, d_model]
     float *__restrict__ logits,             // [seq_len, num_experts]
-    int seq_len, int d_model, int num_experts)
+    int seq_len, int d_model, int num_experts,
+    bool use_vec4)
 {
-    const int expert = blockIdx.x;
+    extern __shared__ float4 hidden_shared_vec4[];
+    float *hidden_shared = reinterpret_cast<float *>(hidden_shared_vec4);
+
     const int row = blockIdx.y;
-    if (expert >= num_experts || row >= seq_len) return;
+    if (row >= seq_len) return;
 
     const float *h = hidden + static_cast<size_t>(row) * d_model;
-    const float *w = gate_weights + static_cast<size_t>(expert) * d_model;
-    float sum = 0.0f;
 
-    if ((d_model & 3) == 0)
+    if (use_vec4)
     {
         const int vec_count = d_model >> 2;
         const float4 *hidden4 = reinterpret_cast<const float4 *>(h);
-        const float4 *w4 = reinterpret_cast<const float4 *>(w);
         for (int i = threadIdx.x; i < vec_count; i += blockDim.x)
+        {
+            hidden_shared_vec4[i] = hidden4[i];
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+            hidden_shared[i] = h[i];
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x % warpSize;
+    const int warp_id = threadIdx.x / warpSize;
+    if (warp_id >= kGateLogitsExpertsPerBlock)
+        return;
+
+    const int expert = blockIdx.x * kGateLogitsExpertsPerBlock + warp_id;
+    if (expert >= num_experts)
+        return;
+
+    const float *w = gate_weights + static_cast<size_t>(expert) * d_model;
+    float sum = 0.0f;
+
+    if (use_vec4)
+    {
+        const int vec_count = d_model >> 2;
+        const float4 *hidden4 = reinterpret_cast<const float4 *>(hidden_shared);
+        const float4 *w4 = reinterpret_cast<const float4 *>(w);
+        for (int i = lane; i < vec_count; i += warpSize)
         {
             const float4 hh = hidden4[i];
             const float4 ww = w4[i];
@@ -262,28 +291,15 @@ __global__ void rocm_moe_gate_logits_small_m_kernel(
     }
     else
     {
-        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
-            sum += h[i] * w[i];
+        for (int i = lane; i < d_model; i += warpSize)
+            sum += hidden_shared[i] * w[i];
     }
 
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
         sum += __shfl_down(sum, offset);
 
-    __shared__ float warp_sums[8];
-    const int lane = threadIdx.x % warpSize;
-    const int warp_id = threadIdx.x / warpSize;
-    if (lane == 0) warp_sums[warp_id] = sum;
-    __syncthreads();
-
-    if (warp_id == 0)
-    {
-        const int nw = (blockDim.x + warpSize - 1) / warpSize;
-        sum = (lane < nw) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
-        if (lane == 0)
-            logits[static_cast<size_t>(row) * num_experts + expert] = sum;
-    }
+    if (lane == 0)
+        logits[static_cast<size_t>(row) * num_experts + expert] = sum;
 }
 
 __global__ void rocm_moe_gate_logits_single_token_kpart_kernel(
@@ -1558,10 +1574,22 @@ bool hipMoE_gate_logits_small_m(
         return false;
     }
 
-    const int threads = 128;
+    constexpr size_t kSmallMGroupedSharedCapBytes = 48 * 1024;
+    const size_t shared_mem_bytes = static_cast<size_t>(d_model) * sizeof(float);
+    if (shared_mem_bytes > kSmallMGroupedSharedCapBytes)
+    {
+        fprintf(stderr, "HIP MoE gate_logits_small_m shared memory too large: requested=%zu cap=%zu\n",
+                shared_mem_bytes, kSmallMGroupedSharedCapBytes);
+        return false;
+    }
+
+    const bool use_vec4 = ((d_model & 3) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(hidden) & 0xfu) == 0) &&
+                          ((reinterpret_cast<uintptr_t>(gate_weights) & 0xfu) == 0);
+    const int blocks = (num_experts + kGateLogitsExpertsPerBlock - 1) / kGateLogitsExpertsPerBlock;
     hipLaunchKernelGGL(rocm_moe_gate_logits_small_m_kernel,
-        dim3(num_experts, seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        hidden, gate_weights, logits, seq_len, d_model, num_experts);
+        dim3(blocks, seq_len), dim3(kGateLogitsGroupedThreads), shared_mem_bytes, static_cast<hipStream_t>(stream),
+        hidden, gate_weights, logits, seq_len, d_model, num_experts, use_vec4);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
