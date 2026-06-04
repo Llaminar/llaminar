@@ -43,9 +43,9 @@ namespace llaminar2
             return true;
         }
 
-        bool supportsGroupedPrefillGraphCaptureBackend(DeviceId device)
+        bool supportsGroupedPrefillExecutionBackend(DeviceId device)
         {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
             (void)device;
             return false;
 #else
@@ -60,6 +60,16 @@ namespace llaminar2
                 return true;
 #endif
             return false;
+#endif
+        }
+
+        bool supportsGroupedPrefillGraphCaptureBackend(DeviceId device)
+        {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS)
+            (void)device;
+            return false;
+#else
+            return supportsGroupedPrefillExecutionBackend(device);
 #endif
         }
 
@@ -186,6 +196,24 @@ namespace llaminar2
             return true;
         }
 
+        if (params_.seq_len == 1 && params_.force_grouped_verifier_prefill_for_decode &&
+            !isDeviceRoutedPrefillExecutionSupported())
+        {
+            LOG_ERROR("[MoERoutingStage] MTP verifier correction replay requested grouped prefill "
+                      "routing for seq_len=1, but the device-routed prefill path is unavailable"
+                      << " (device=" << params_.device_id.toString()
+                      << ", grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
+                      << ", d_model=" << params_.d_model
+                      << ", num_experts=" << params_.num_experts
+                      << ", top_k=" << params_.top_k
+                      << ", input=" << (params_.input != nullptr)
+                      << ", gate_weights=" << (params_.gate_weights != nullptr)
+                      << ", output_indices=" << (params_.output_indices != nullptr)
+                      << ", output_weights=" << (params_.output_weights != nullptr)
+                      << ")");
+            return false;
+        }
+
         if (!kernel->routeWithTensors(
                 params_.input, params_.gate_weights,
                 seq_len, d_model, num_experts, top_k,
@@ -242,6 +270,9 @@ namespace llaminar2
 
     bool MoERoutingStage::isGraphCapturable() const
     {
+        if (params_.force_grouped_verifier_prefill_for_decode)
+            return isDeviceRoutedPrefillGraphCapturable();
+
         return isDeviceRoutedDecodeGraphCapturable() ||
                isDeviceRoutedPrefillGraphCapturable();
     }
@@ -252,6 +283,7 @@ namespace llaminar2
         return false;
 #else
         const bool decode_supported =
+            !params_.force_grouped_verifier_prefill_for_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.seq_len == 1 &&
             params_.d_model > 0 &&
@@ -296,6 +328,7 @@ namespace llaminar2
         // require host top-k/logit materialization, but decode histograms are
         // merged lazily from DeviceMoELayerRuntime::decode_histogram.
         return supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+               !params_.force_grouped_verifier_prefill_for_decode &&
                params_.seq_len == 1 &&
                params_.d_model > 0 &&
                params_.num_experts > 0 &&
@@ -311,13 +344,12 @@ namespace llaminar2
 #endif
     }
 
-    bool MoERoutingStage::isDeviceRoutedPrefillGraphCaptureSupported() const
+    bool MoERoutingStage::isDeviceRoutedPrefillExecutionSupported() const
     {
-        // Cold padded-bucket preflight can run before ensureMoEKernel() has
-        // been called. Validate the backend, shape, and tensor contract here;
-        // isDeviceRoutedPrefillGraphCapturable() adds warmed-kernel readiness.
-        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
-               params_.seq_len > 1 &&
+        const bool forced_decode_replay =
+            params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
+        return supportsGroupedPrefillExecutionBackend(params_.device_id) &&
+               (params_.seq_len > 1 || forced_decode_replay) &&
                params_.d_model > 0 &&
                params_.num_experts > 0 &&
                params_.top_k > 0 &&
@@ -326,6 +358,15 @@ namespace llaminar2
                params_.gate_weights &&
                params_.output_indices &&
                params_.output_weights;
+    }
+
+    bool MoERoutingStage::isDeviceRoutedPrefillGraphCaptureSupported() const
+    {
+        // Cold padded-bucket preflight can run before ensureMoEKernel() has
+        // been called. Validate the backend, shape, and tensor contract here;
+        // isDeviceRoutedPrefillGraphCapturable() adds warmed-kernel readiness.
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
+               isDeviceRoutedPrefillExecutionSupported();
     }
 
     bool MoERoutingStage::isDeviceRoutedPrefillGraphCapturable() const

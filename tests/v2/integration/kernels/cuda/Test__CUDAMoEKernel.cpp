@@ -732,6 +732,88 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenQwenScalePopulatesSnapsho
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, RouteWithTensorsSingleTokenIsCudaGraphCapturableDeviceOnly)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int seq_len = 1;
+    constexpr int d_model = 64;
+    constexpr int num_experts = 8;
+    constexpr int top_k = 2;
+
+    std::vector<float> hidden_values(static_cast<size_t>(seq_len) * d_model);
+    std::vector<float> gate_values(static_cast<size_t>(num_experts) * d_model);
+    for (size_t i = 0; i < hidden_values.size(); ++i)
+        hidden_values[i] = 0.11f * std::sin(0.021f * static_cast<float>(i + 1)) -
+                           0.04f * std::cos(0.037f * static_cast<float>(i + 2));
+    for (size_t i = 0; i < gate_values.size(); ++i)
+        gate_values[i] = 0.07f * std::sin(0.013f * static_cast<float>(i + 3)) +
+                         0.05f * std::cos(0.029f * static_cast<float>(i + 4));
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto gate = makeTensor({num_experts, d_model}, gate_values);
+    auto cuda_indices = makeZeros({seq_len, top_k});
+    auto cuda_weights = makeZeros({seq_len, top_k});
+    auto cpu_indices = makeZeros({seq_len, top_k});
+    auto cpu_weights = makeZeros({seq_len, top_k});
+
+    llaminar2::MoERoutingResult warmup_host_result;
+    ASSERT_TRUE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
+                                               num_experts, top_k, true,
+                                               cuda_indices.get(), cuda_weights.get(), warmup_host_result));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_EQ(warmup_host_result.expert_indices.size(), static_cast<size_t>(seq_len * top_k));
+    ASSERT_EQ(warmup_host_result.expert_weights.size(), static_cast<size_t>(seq_len * top_k));
+
+    llaminar2::MoERoutingResult captured_host_result;
+    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    const bool captured_route = cuda_kernel_->routeWithTensors(
+        hidden.get(), gate.get(), seq_len, d_model,
+        num_experts, top_k, true,
+        cuda_indices.get(), cuda_weights.get(), captured_host_result);
+    cudaGraph_t graph = nullptr;
+    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
+    EXPECT_TRUE(captured_route);
+    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
+    ASSERT_NE(graph, nullptr);
+    EXPECT_TRUE(captured_host_result.expert_indices.empty());
+    EXPECT_TRUE(captured_host_result.expert_weights.empty());
+    EXPECT_TRUE(captured_host_result.router_logits.empty());
+
+    cudaGraphExec_t executable = nullptr;
+    ASSERT_EQ(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    llaminar2::MoERoutingResult cpu_host_result;
+    ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
+                                              num_experts, top_k, true,
+                                              cpu_indices.get(), cpu_weights.get(), cpu_host_result));
+
+    std::vector<float> captured_indices(cuda_indices->numel());
+    std::vector<float> captured_weights(cuda_weights->numel());
+    ASSERT_EQ(cudaMemcpyAsync(captured_indices.data(), cuda_indices->gpu_data_ptr(),
+                              captured_indices.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(captured_weights.data(), cuda_weights->gpu_data_ptr(),
+                              captured_weights.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    expectNearArray(captured_indices.data(), cpu_indices->data(), captured_indices.size(), 0.0f);
+    expectNearArray(captured_weights.data(), cpu_weights->data(), captured_weights.size(), 1.0e-5f);
+
+    ASSERT_EQ(cudaGraphExecDestroy(executable), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, RouteWithTensorsBF16GateMatchesCPU)
 {
 #ifndef HAVE_CUDA

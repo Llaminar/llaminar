@@ -12,7 +12,7 @@ live gaps. Keep this file concise; rejected tuning history belongs in artifacts.
 | Dense long lane, `qbf`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 | 53.30 | 1.31x | Depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 | 9.50 | 1.64x | Short smoke only |
 | MoE default lane, 595p/64d | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 | 42.04 | 2.13x | Fixed d1, ratcheted |
-| MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.18 | 126.60 | 1.25x | Beats llama.cpp, short of 1.3x |
+| MoE default lane, 595p/64d | CUDA `cuda:0` | Qwen3.6 35B A3B | 103.31 | 131.10 | 1.27x | Clean fused path, near 1.3x |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
 
 llama.cpp CUDA north star, `ggml-org/llama.cpp@6ddc943`,
@@ -39,9 +39,9 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 
 | Case | Decode | Acceptance | Artifact |
 |---|---:|---:|---|
-| best baseline | 101.18 | n/a | `benchmark_results/cuda_moe_mtp/20260604T174640Z-shared-expert-prefill/baseline.json` |
-| best fixed d1 | 126.60 | 89.06% | `benchmark_results/cuda_moe_mtp/20260604T174640Z-shared-expert-prefill/mtp_d1.json` |
-| latest fixed d1 | 121.03 | 82.81% | `benchmark_results/cuda_moe_mtp/20260604T180556Z-gdn-alpha-beta-batched/mtp_d1.json` |
+| latest clean baseline | 103.31 | n/a | `benchmark_results/cuda_moe_mtp/20260604T190711Z-m1-correction-fused-routing-capture/baseline.json` |
+| latest clean fixed d1 | 131.10 | 85.94% | `benchmark_results/cuda_moe_mtp/20260604T190711Z-m1-correction-fused-routing-capture/mtp_d1.json` |
+| prior fixed d1 ratchet | 126.60 | 89.06% | `benchmark_results/cuda_moe_mtp/20260604T174640Z-shared-expert-prefill/mtp_d1.json` |
 | latest fixed d3 | 68.57 | 66.86% | `benchmark_results/cuda_moe_mtp/20260604T144911Z-post-fused-path-regression-refresh/mtp_d3_after_suffix_commit_fix.json` |
 
 ## Retained Actions
@@ -57,6 +57,9 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 - CUDA GDN verifier projections now keep qkv+z on fused native projection groups
   and alpha+beta on graph-capturable cuBLAS batched FP32 projection groups backed
   by declared workspace pointer arrays.
+- CUDA MoE verifier correction replay now forces all-position grouped-prefill
+  routing/expert/shared paths for `seq_len=1`; CUDA routing stays device-only
+  during graph capture and no longer synchronizes to materialize host top-k.
 - CUDA MoE MTP depth-3 parity now uses the stable benchmark-prompt lane, and shared
   expert gate verification allows mathematically valid sigmoid-underflow zero rows.
 - Depth>1 MTP rollback now commits suffix shifted-cache rows after an already-committed
@@ -69,7 +72,7 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane:
 
 ## Next Work
 
-CUDA MoE MTP now beats the llama.cpp MoE decode north star but still trails the
-1.3x-1.8x MTP speedup target. Next target is the remaining verifier budget:
-router/GDN costs, benchmark-run capture amortization, and prompt prefill
-overhead. ROCm MoE keeps the current 2.13x ratchet.
+CUDA MoE MTP now beats the llama.cpp MoE decode north star and is close to the
+1.3x-1.8x MTP speedup target on the clean fused path. Next target is the
+remaining verifier budget: router/GDN costs, benchmark-run capture amortization,
+and prompt prefill overhead. ROCm MoE keeps the current 2.13x ratchet.

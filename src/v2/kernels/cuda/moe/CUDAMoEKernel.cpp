@@ -1475,11 +1475,22 @@ namespace llaminar2
         host_result.expert_weights.clear();
         host_result.router_logits.clear();
 
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        err = cudaStreamIsCapturing(cuda_stream, &capture_status);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] cudaStreamIsCapturing failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        const bool stream_capturing = (capture_status != cudaStreamCaptureStatusNone);
+
         float *h_idx = nullptr;
         float *h_wt = nullptr;
-        const bool needs_decode_host_topk = (seq_len == 1);
+        const bool needs_decode_host_topk = (seq_len == 1) && !stream_capturing;
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-        const bool needs_snapshot_host_topk = true;
+        const bool needs_snapshot_host_topk = !stream_capturing;
 #else
         const bool needs_snapshot_host_topk = false;
 #endif
@@ -1502,17 +1513,20 @@ namespace llaminar2
         }
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-        host_result.router_logits.resize(buffers.logits_count);
-        err = cudaMemcpyAsync(host_result.router_logits.data(), buffers.d_logits,
-                              buffers.logits_count * sizeof(float),
-                              cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-            return false;
+        if (!stream_capturing)
+        {
+            host_result.router_logits.resize(buffers.logits_count);
+            err = cudaMemcpyAsync(host_result.router_logits.data(), buffers.d_logits,
+                                  buffers.logits_count * sizeof(float),
+                                  cudaMemcpyDeviceToHost, cuda_stream);
+            if (err != cudaSuccess)
+                return false;
+        }
 #endif
 
         if (needs_host_topk || !host_result.router_logits.empty())
         {
-            err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+            err = cudaStreamSynchronize(cuda_stream);
             if (err != cudaSuccess)
             {
                 LOG_ERROR("[CUDAMoEKernel::routeWithTensors] stream sync failed: " << cudaGetErrorString(err));
@@ -2261,6 +2275,7 @@ namespace llaminar2
                 PerfStatsCollector::Tags{
                     {"swiglu_path", debugEnv().gemm.cuda_moe_prefill_fuse_swiglu ? "fused" : "split"},
                     {"total_slots", std::to_string(total_slots)},
+                    {"seq_len", std::to_string(seq_len)},
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
                     {"tile_m", std::to_string(selected_tile_m)},
@@ -2278,6 +2293,7 @@ namespace llaminar2
                 device.to_string(),
                 PerfStatsCollector::Tags{
                     {"total_slots", std::to_string(total_slots)},
+                    {"seq_len", std::to_string(seq_len)},
                     {"active_expert_slots", std::to_string(active_expert_slots)},
                     {"num_experts", std::to_string(num_experts)},
                     {"tile_m", std::to_string(selected_tile_m)},

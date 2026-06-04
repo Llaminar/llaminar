@@ -758,6 +758,10 @@ namespace llaminar2
             route_params.layer_idx = layer_idx;
             route_params.decode_histogram = mtp_sidecar_context ? nullptr : config_.moe.decode_histogram;
             route_params.moe_runtime_table = moe_runtime_table;
+            route_params.force_grouped_verifier_prefill_for_decode =
+                config_.compute_all_position_logits &&
+                total_tokens == 1 &&
+                device.is_cuda();
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
@@ -812,6 +816,10 @@ namespace llaminar2
                 expert_params.prepared_store = prepared_weight_store_;
                 expert_params.expert_mask = std::move(expert_mask);
                 expert_params.moe_runtime_table = moe_runtime_table;
+                expert_params.force_grouped_verifier_prefill_for_decode =
+                    config_.compute_all_position_logits &&
+                    total_tokens == 1 &&
+                    stage_device.is_cuda();
 
                 if (config_.moe.expert_mode == MoEExpertMode::ExpertParallel &&
                     expert_params.expert_mask.empty())
@@ -1424,6 +1432,10 @@ namespace llaminar2
             shared_params.intermediate = shared_intermediate;
             shared_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
             shared_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+            shared_params.force_grouped_verifier_prefill_for_decode =
+                config_.compute_all_position_logits &&
+                total_tokens == 1 &&
+                shared_device.is_cuda();
             shared_params.prepared_ref_gate = preparedRefForGraphWeight(
                 layer_bindings.shared_expert_gate, shared_device);
             shared_params.prepared_ref_up = preparedRefForGraphWeight(

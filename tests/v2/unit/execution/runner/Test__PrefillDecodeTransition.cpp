@@ -1804,6 +1804,11 @@ namespace
                 << "the correction token should be replayed before returning it";
             EXPECT_THAT(mock->lastForwardTokens(),
                         ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+            EXPECT_EQ(mock->setAllPositionCount(), 4)
+                << "verifier forward and greedy correction replay both use all-position logits";
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 2);
+            EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
+            EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 1);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *reject_trace =
@@ -1847,6 +1852,13 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "verifier_state_row_replay_suffix_forward");
             ASSERT_NE(suffix_forward, nullptr);
             EXPECT_EQ(suffix_forward->count, 1u);
+
+            const PerfStatRecord *suffix_all_position =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "verifier_state_row_replay_suffix_all_position_forwards");
+            ASSERT_NE(suffix_all_position, nullptr);
+            EXPECT_DOUBLE_EQ(suffix_all_position->value, 1.0);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -2252,6 +2264,11 @@ namespace
                         Not(Contains(ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN))));
             EXPECT_THAT(mock->lastForwardTokens(),
                         ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+            EXPECT_EQ(mock->setAllPositionCount(), 4)
+                << "verifier forward and greedy correction replay both use all-position logits";
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 2);
+            EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
+            EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 1);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *shortcut =
@@ -2278,6 +2295,13 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "verifier_state_row_replay_suffix_forward");
             ASSERT_NE(suffix_forward, nullptr);
             EXPECT_EQ(suffix_forward->count, 1u);
+
+            const PerfStatRecord *suffix_all_position =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "verifier_state_row_replay_suffix_all_position_forwards");
+            ASSERT_NE(suffix_all_position, nullptr);
+            EXPECT_DOUBLE_EQ(suffix_all_position->value, 1.0);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -2324,6 +2348,11 @@ namespace
                 << "the verifier forward should be followed by one suffix replay";
             EXPECT_THAT(mock->lastForwardTokens(),
                         ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
+            EXPECT_EQ(mock->setAllPositionCount(), 4)
+                << "verifier forward and greedy correction replay both use all-position logits";
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 2);
+            EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
+            EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 1);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *shortcut =
@@ -2350,6 +2379,13 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "verifier_state_row_replay_suffix_forward");
             ASSERT_NE(suffix_forward, nullptr);
             EXPECT_EQ(suffix_forward->count, 1u);
+
+            const PerfStatRecord *suffix_all_position =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "verifier_state_row_replay_suffix_all_position_forwards");
+            ASSERT_NE(suffix_all_position, nullptr);
+            EXPECT_DOUBLE_EQ(suffix_all_position->value, 1.0);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

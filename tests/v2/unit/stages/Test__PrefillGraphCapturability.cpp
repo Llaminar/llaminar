@@ -25,6 +25,7 @@
 #include "utils/DebugEnv.h"
 
 #include <cmath>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -64,6 +65,47 @@ namespace
         bool old_device_routed_;
         bool old_prefill_;
     };
+
+    DeviceNativeVNNIMatrixDesc runtimeDesc(uintptr_t base, int n, int k)
+    {
+        DeviceNativeVNNIMatrixDesc desc;
+        desc.payload = reinterpret_cast<const uint8_t *>(base);
+        desc.scales = reinterpret_cast<const void *>(base + 0x1000u);
+        desc.mins = reinterpret_cast<const void *>(base + 0x2000u);
+        desc.n = n;
+        desc.k = k;
+        desc.blocks_per_row = static_cast<uint32_t>(k / 32);
+        desc.codebook_id = 4;
+        return desc;
+    }
+
+    MoEPlacementUpdate routingRuntimeUpdate(uint32_t epoch, int num_experts, int d_model)
+    {
+        MoEPlacementUpdate update;
+        update.epoch = epoch;
+        update.expert_count = static_cast<uint32_t>(num_experts);
+        update.experts.resize(static_cast<size_t>(num_experts));
+        update.local_compute_mask.assign(static_cast<size_t>(num_experts), 1u);
+        update.replica_role.assign(static_cast<size_t>(num_experts),
+                                   static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const uintptr_t base = 0x70000000u + static_cast<uintptr_t>(expert) * 0x10000u;
+            auto &desc = update.experts[static_cast<size_t>(expert)];
+            desc.gate = runtimeDesc(base + 0x0100u, d_model, d_model);
+            desc.up = runtimeDesc(base + 0x0200u, d_model, d_model);
+            desc.down = runtimeDesc(base + 0x0300u, d_model, d_model);
+            desc.logical_expert_id = expert;
+            desc.owner_participant = 0;
+            desc.local_slot = expert;
+            desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                          DeviceMoEExpertFlags::Resident |
+                                          DeviceMoEExpertFlags::LocalCompute);
+        }
+
+        return update;
+    }
 
     // =========================================================================
     // Minimal stub IMoEKernel (no actual compute, just satisfies the interface)
@@ -239,6 +281,83 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
 #else
     EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
 #endif
+}
+
+TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplaySeqLenOneUsesPrefillCaptureContract)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.input = input.get();
+    params.gate_weights = gate_weights_.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+    params.force_grouped_verifier_prefill_for_decode = true;
+
+    MoERoutingStage cold_stage(params);
+#if defined(HAVE_CUDA) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(cold_stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_TRUE(cold_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(cold_stage.isGraphCapturable())
+        << "Forced seq_len=1 verifier replay must wait for the prefill router kernel warmup";
+
+    cold_stage.setMoEKernelForTesting(&stub_kernel_);
+    EXPECT_TRUE(cold_stage.isGraphCapturable())
+        << "Forced seq_len=1 verifier replay should use the prefill routing capture contract";
+#else
+    EXPECT_FALSE(cold_stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_FALSE(cold_stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(cold_stage.isGraphCapturable());
+#endif
+}
+
+TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplayDoesNotFallBackToDecodeCapture)
+{
+    ScopedRocmMoEFlags flags(true, true, false);
+
+    auto input = TestTensorFactory::createFP32({1, D_MODEL});
+    auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
+    auto output_weights = TestTensorFactory::createFP32({TOP_K, 1});
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+    MoERoutingStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.input = input.get();
+    params.gate_weights = gate_weights_.get();
+    params.output_indices = output_indices.get();
+    params.output_weights = output_weights.get();
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+    params.force_grouped_verifier_prefill_for_decode = true;
+
+    MoERoutingStage stage(params);
+    stage.setMoEKernelForTesting(&stub_kernel_);
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
+    EXPECT_FALSE(stage.isGraphCapturable())
+        << "Forced verifier replay must hard-require grouped prefill instead of using decode capture";
 }
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsOnCPU)
@@ -944,7 +1063,7 @@ TEST_F(GDNPrefillGraphCapture, PrefillCapturableWhenGPUStateReady)
     auto params = makeValidPrefillParams(&ready_kernel);
     GDNRecurrenceStage stage(params);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.isGraphCapturable())
         << "GDN prefill should be capturable when GPU state is ready";
 #else
@@ -1066,12 +1185,8 @@ TEST_F(GDNPrefillGraphCapture, CUDAPrefillCapturableWhenGPUStateReady)
     params.device_id = DeviceId::cuda(0);
     GDNRecurrenceStage stage(params);
 
-#ifndef ENABLE_PIPELINE_SNAPSHOTS
     EXPECT_TRUE(stage.isGraphCapturable())
         << "CUDA GDN prefill graph capture should be enabled once recurrence state is ready.";
-#else
-    EXPECT_FALSE(stage.isGraphCapturable());
-#endif
 #else
     GTEST_SKIP() << "CUDA backend not compiled";
 #endif

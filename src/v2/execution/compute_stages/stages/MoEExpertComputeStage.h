@@ -133,6 +133,7 @@ namespace llaminar2
             TensorBase *routing_weights = nullptr; ///< FP32 [seq_len * top_k] normalized weights
             BufferId routing_indices_buffer_id = BufferId::MOE_EXPERT_INDICES;
             BufferId routing_weights_buffer_id = BufferId::MOE_EXPERT_WEIGHTS;
+            bool force_grouped_verifier_prefill_for_decode = false;
 
             // Output
             TensorBase *output = nullptr; ///< Combined output [seq_len, d_model]
@@ -376,6 +377,7 @@ namespace llaminar2
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
+            bool force_grouped_verifier_prefill_for_decode = false;
 
             // =================================================================
             // Phase 7: PreparedWeightRef for direct kernel resolution

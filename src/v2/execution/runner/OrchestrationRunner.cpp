@@ -2186,11 +2186,40 @@ namespace llaminar2
                 std::optional<int32_t> shortcut_ready_token;
                 if (suffix_count > 0)
                 {
+                    const bool use_all_position_suffix_replay =
+                        !stochastic_verify &&
+                        !use_sampling_penalties &&
+                        active_sampling_params_.is_greedy();
                     PerfStatsCollector::addCounter(
                         "mtp",
                         "verifier_state_row_replay_suffix_tokens",
                         static_cast<double>(suffix_count),
                         "decode");
+                    if (use_all_position_suffix_replay)
+                    {
+                        bool suffix_all_position_enabled = false;
+                        {
+                            PerfStatsCollector::ScopedTimer timer(
+                                "mtp",
+                                "enable_all_position_logits_for_verifier_state_row_suffix",
+                                "decode");
+                            suffix_all_position_enabled = runner_->setComputeAllPositionLogits(true);
+                        }
+                        if (!suffix_all_position_enabled)
+                        {
+                            result.error =
+                                "Runner does not support all-position logits for MTP verifier-row replay suffix";
+                            return result;
+                        }
+                        PerfStatsCollector::addCounter(
+                            "mtp",
+                            "verifier_state_row_replay_suffix_all_position_forwards",
+                            1.0,
+                            "decode",
+                            {},
+                            {{"tokens", std::to_string(suffix_count)}});
+                    }
+
                     bool suffix_ok = false;
                     {
                         PerfStatsCollector::ScopedTimer timer(
@@ -2200,6 +2229,23 @@ namespace llaminar2
                         suffix_ok = runner_->forward(
                             accepted_tokens.data() + suffix_start,
                             suffix_count);
+                    }
+                    if (use_all_position_suffix_replay)
+                    {
+                        bool suffix_all_position_disabled = false;
+                        {
+                            PerfStatsCollector::ScopedTimer timer(
+                                "mtp",
+                                "disable_all_position_logits_for_verifier_state_row_suffix",
+                                "decode");
+                            suffix_all_position_disabled = runner_->setComputeAllPositionLogits(false);
+                        }
+                        if (!suffix_all_position_disabled)
+                        {
+                            result.error =
+                                "Failed to disable all-position logits after MTP verifier-row replay suffix";
+                            return result;
+                        }
                     }
                     if (!suffix_ok)
                     {
@@ -2217,9 +2263,23 @@ namespace llaminar2
                                 "mtp",
                                 "verifier_state_row_suffix_ready_sample",
                                 "decode");
-                            next_ready_token = runner_->sampleGreedyOnDevice();
+                            if (use_all_position_suffix_replay)
+                            {
+                                const int terminal_suffix_row = suffix_count - 1;
+                                if (!runner_->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                                        terminal_suffix_row,
+                                        1,
+                                        &next_ready_token))
+                                {
+                                    next_ready_token = -1;
+                                }
+                            }
+                            else
+                            {
+                                next_ready_token = runner_->sampleGreedyOnDevice();
+                            }
                         }
-                        if (next_ready_token < 0)
+                        if (next_ready_token < 0 && !use_all_position_suffix_replay)
                         {
                             const float *main_logits = runner_->logits();
                             if (main_logits)

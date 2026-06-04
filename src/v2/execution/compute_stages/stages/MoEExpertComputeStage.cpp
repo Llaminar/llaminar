@@ -394,9 +394,11 @@ namespace llaminar2
             return false;
         }
 
-        // Fast path for decode (seq_len=1): eliminates gather/scatter overhead,
-        // vector allocations, and expert_token_lists construction.
-        if (params_.seq_len == 1)
+        // Fast path for ordinary decode (seq_len=1): eliminates gather/scatter
+        // overhead. MTP verifier correction replay explicitly opts into the
+        // grouped prefill route so rejected-token replay stays on the same
+        // fused graph-captured path as the verifier rows.
+        if (params_.seq_len == 1 && !params_.force_grouped_verifier_prefill_for_decode)
         {
             return executeSingleToken(ctx);
         }
@@ -484,6 +486,19 @@ namespace llaminar2
             if (params_.device_id.is_gpu())
                 markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
             return true;
+        }
+
+        if (params_.seq_len == 1 && params_.force_grouped_verifier_prefill_for_decode)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] MTP verifier correction replay requested grouped "
+                      "prefill for seq_len=1, but the fixed-topology grouped path is unavailable: "
+                      "device=" << params_.device_id.to_string()
+                                << ", moe_grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
+                                << ", fullOwnership=" << hasFullLocalExpertOwnership()
+                                << ", allEnabled=" << expertMaskAllEnabled()
+                                << ", replicas=" << params_.replica_set.num_replicated
+                                << ", layer=" << params_.layer_idx);
+            return false;
         }
 
         // ROCm graph capture requires the fixed-topology grouped path. Ordinary
@@ -1750,8 +1765,10 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::canUseFixedTopologyGroupedPrefill() const
     {
+        const bool forced_decode_replay =
+            params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
         return supportsGroupedPrefillExecutionBackend(params_.device_id) &&
-               params_.seq_len > 1 &&
+               (params_.seq_len > 1 || forced_decode_replay) &&
                hasFullLocalExpertOwnership() &&
                expertMaskAllEnabled() &&
                params_.replica_set.num_replicated == 0;
@@ -1826,7 +1843,10 @@ namespace llaminar2
         // without requiring lazy warmup resources such as the MoE kernel or its
         // grouping scratch. Those are checked by isGraphCapturable() before the
         // actual capture pass begins.
-        if (!supportsGroupedPrefillGraphCaptureBackend(params_.device_id) || params_.seq_len <= 1)
+        const bool forced_decode_replay =
+            params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
+        if (!supportsGroupedPrefillGraphCaptureBackend(params_.device_id) ||
+            (params_.seq_len <= 1 && !forced_decode_replay))
             return false;
 
         // Require full local expert ownership, no masks, no replicas
@@ -2052,6 +2072,9 @@ namespace llaminar2
 #if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
         return false;
 #else
+        if (params_.force_grouped_verifier_prefill_for_decode)
+            return isFixedTopologyPrefillGraphCapturable();
+
         // Device-routed grouped decode path: after warmup, all descriptor tables
         // are built and execution is pure kernel launches reading routing info
         // from the device-resident MoE runtime table.
@@ -2069,6 +2092,7 @@ namespace llaminar2
         return false;
 #else
         const bool decode_supported =
+            !params_.force_grouped_verifier_prefill_for_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.seq_len == 1 &&
             params_.d_model > 0 &&
@@ -2392,8 +2416,10 @@ namespace llaminar2
     bool SharedExpertFFNStage::tryGroupedVerifierPrefill(
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
+        const bool forced_decode_replay =
+            params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
         if (!params_.device_id.is_cuda() ||
-            params_.seq_len <= 1 ||
+            (params_.seq_len <= 1 && !forced_decode_replay) ||
             params_.seq_len > 4 ||
             !supportsGroupedPrefillExecutionBackend(params_.device_id))
         {
@@ -2511,7 +2537,7 @@ namespace llaminar2
         IMoEKernel *kernel = ensureMoEKernel();
         const bool cuda_verifier_shared_prefill =
             params_.device_id.is_cuda() &&
-            seq_len > 1 &&
+            (seq_len > 1 || params_.force_grouped_verifier_prefill_for_decode) &&
             seq_len <= 4 &&
             supportsGroupedPrefillExecutionBackend(params_.device_id);
         if (cuda_verifier_shared_prefill)
@@ -2615,8 +2641,10 @@ namespace llaminar2
 
     bool SharedExpertFFNStage::supportsPaddedPrefillGraphCapturePreflight() const
     {
+        const bool forced_decode_replay =
+            params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
-               params_.seq_len > 1 &&
+               (params_.seq_len > 1 || forced_decode_replay) &&
                params_.d_model > 0 &&
                params_.intermediate > 0 &&
                params_.input &&

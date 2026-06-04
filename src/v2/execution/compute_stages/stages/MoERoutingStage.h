@@ -53,6 +53,7 @@ namespace llaminar2
             int layer_idx = -1;
             DecodeExpertHistogram *decode_histogram = nullptr;
             IMoERuntimeTable *moe_runtime_table = nullptr;
+            bool force_grouped_verifier_prefill_for_decode = false;
 
             // Outputs (written by this stage)
             TensorBase *output_indices = nullptr; ///< FP32 [seq_len * top_k] expert IDs as float
@@ -115,6 +116,7 @@ namespace llaminar2
 
         IMoEKernel *ensureMoEKernel() const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
+        bool isDeviceRoutedPrefillExecutionSupported() const;
         bool isDeviceRoutedPrefillGraphCaptureSupported() const;
         bool isDeviceRoutedPrefillGraphCapturable() const;
         bool hasInitializedRuntimeTableIfProvided() const;

@@ -155,6 +155,47 @@ namespace llaminar2::test::parity::qwen36
 #endif
     };
 
+    class ScopedCudaMoEFusedVerifierPrefillRoutes
+    {
+    public:
+        ScopedCudaMoEFusedVerifierPrefillRoutes()
+            : old_gateup_kpart_decode_(mutableDebugEnv().gemm.cuda_moe_gateup_kpart_decode),
+              old_down_kpart_decode_(mutableDebugEnv().gemm.cuda_moe_down_kpart_decode),
+              old_prefill_fuse_swiglu_(mutableDebugEnv().gemm.cuda_moe_prefill_fuse_swiglu),
+              old_prefill_tile_m_(mutableDebugEnv().gemm.cuda_moe_prefill_tile_m),
+              old_grouped_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
+        {
+            auto &gemm = mutableDebugEnv().gemm;
+            gemm.cuda_moe_gateup_kpart_decode = true;
+            gemm.cuda_moe_down_kpart_decode = true;
+            gemm.cuda_moe_prefill_fuse_swiglu = true;
+            gemm.cuda_moe_prefill_tile_m = 0;
+            mutableDebugEnv().rocm.moe_grouped_prefill = true;
+            llaminar::v2::kernels::KernelFactory::clearCache();
+        }
+
+        ~ScopedCudaMoEFusedVerifierPrefillRoutes()
+        {
+            auto &gemm = mutableDebugEnv().gemm;
+            gemm.cuda_moe_gateup_kpart_decode = old_gateup_kpart_decode_;
+            gemm.cuda_moe_down_kpart_decode = old_down_kpart_decode_;
+            gemm.cuda_moe_prefill_fuse_swiglu = old_prefill_fuse_swiglu_;
+            gemm.cuda_moe_prefill_tile_m = old_prefill_tile_m_;
+            mutableDebugEnv().rocm.moe_grouped_prefill = old_grouped_prefill_;
+            llaminar::v2::kernels::KernelFactory::clearCache();
+        }
+
+        ScopedCudaMoEFusedVerifierPrefillRoutes(const ScopedCudaMoEFusedVerifierPrefillRoutes &) = delete;
+        ScopedCudaMoEFusedVerifierPrefillRoutes &operator=(const ScopedCudaMoEFusedVerifierPrefillRoutes &) = delete;
+
+    private:
+        bool old_gateup_kpart_decode_ = false;
+        bool old_down_kpart_decode_ = false;
+        bool old_prefill_fuse_swiglu_ = false;
+        int old_prefill_tile_m_ = 0;
+        bool old_grouped_prefill_ = false;
+    };
+
     inline bool shouldUseMoEParityDeterministicMode(
         const MoEPrefixRestoreParityCase &test_case)
     {
@@ -1937,6 +1978,7 @@ namespace llaminar2::test::parity::qwen36
         }
         ASSERT_GT(decode_token_budget, 0);
 
+        ScopedCudaMoEFusedVerifierPrefillRoutes fused_verifier_prefill_routes;
         auto factory = createOrchestrationRunnerFactory();
         SamplingParams greedy;
         greedy.temperature = 0.0f;
@@ -2147,6 +2189,86 @@ namespace llaminar2::test::parity::qwen36
 
         ASSERT_NE(shared_group, records.end())
             << "CUDA shared expert grouped verifier setup did not run.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_shared_expert_prefill_group_calls"});
+        EXPECT_GT(shared_group->count, 0u);
+    }
+
+    inline void expectCudaMoEMTPCorrectionReplayFusedPrefillPath()
+    {
+        const auto records = PerfStatsCollector::snapshot(
+            {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls",
+             "kernel.cuda_moe_shared_expert_prefill_group_calls"});
+        auto tag_equals = [](const PerfStatRecord &record,
+                             const char *key,
+                             const char *value) -> bool
+        {
+            const auto it = record.tags.find(key);
+            return it != record.tags.end() && it->second == value;
+        };
+
+        const auto routed_replay = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
+                       tag_equals(record, "swiglu_path", "fused") &&
+                       tag_equals(record, "seq_len", "1") &&
+                       tag_equals(record, "total_slots", "8") &&
+                       tag_equals(record, "active_expert_slots", "8") &&
+                       tag_equals(record, "tile_m", "2") &&
+                       tag_equals(record, "tile_n", "64") &&
+                       tag_equals(record, "gateup_route", "kpart_swiglu") &&
+                       tag_equals(record, "down_route", "kpart_prefill");
+            });
+
+        ASSERT_NE(routed_replay, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier-row correction replay did not "
+            << "exercise the fused routed-expert grouped prefill path for seq_len=1. "
+            << "Rejected-token replay must keep the fused path correct instead "
+            << "of falling back to the slower single-token decode route.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+        EXPECT_GT(routed_replay->count, 0u);
+
+        const auto shared_replay = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_moe_grouped_prefill_swiglu_path_calls" &&
+                       tag_equals(record, "swiglu_path", "fused") &&
+                       tag_equals(record, "seq_len", "1") &&
+                       tag_equals(record, "total_slots", "1") &&
+                       tag_equals(record, "active_expert_slots", "1") &&
+                       tag_equals(record, "num_experts", "1") &&
+                       tag_equals(record, "tile_m", "2") &&
+                       tag_equals(record, "tile_n", "64") &&
+                       tag_equals(record, "gateup_route", "kpart_swiglu") &&
+                       tag_equals(record, "down_route", "kpart_prefill");
+            });
+
+        ASSERT_NE(shared_replay, records.end())
+            << "CUDA Qwen3.6 MoE MTP verifier-row correction replay did not "
+            << "exercise the fused shared-expert grouped prefill path for seq_len=1.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
+        EXPECT_GT(shared_replay->count, 0u);
+
+        const auto shared_group = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const PerfStatRecord &record)
+            {
+                return record.name == "cuda_moe_shared_expert_prefill_group_calls" &&
+                       tag_equals(record, "seq_len", "1") &&
+                       tag_equals(record, "active_expert_slots", "1") &&
+                       tag_equals(record, "top_k", "1");
+            });
+
+        ASSERT_NE(shared_group, records.end())
+            << "CUDA shared expert grouped correction-replay setup did not run.\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_moe_shared_expert_prefill_group_calls"});
         EXPECT_GT(shared_group->count, 0u);
@@ -2422,6 +2544,7 @@ namespace llaminar2::test::parity::qwen36
     {
         ScopedMoEParityDeterministicMode deterministic_mode(
             shouldUseMoEParityDeterministicMode(test_case));
+        ScopedCudaMoEFusedVerifierPrefillRoutes fused_verifier_prefill_routes;
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -2506,8 +2629,14 @@ namespace llaminar2::test::parity::qwen36
         expectCudaMoEMTPVerifierRowRestorePreservedReplayState();
         const int32_t correction_token = sampled_verifier_tokens[0];
         const int32_t accepted_tokens[2] = {first_token, correction_token};
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
         ASSERT_TRUE(runner->forward(&correction_token, 1));
-        const int32_t shortcut_next_token_before_commit = runner->sampleGreedyOnDevice();
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t shortcut_next_token_before_commit = -1;
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            1,
+            &shortcut_next_token_before_commit));
         ASSERT_GE(shortcut_next_token_before_commit, 0);
         ASSERT_TRUE(runner->commitMTPShiftedRowsFromPartialForward(
             accepted_tokens,
@@ -2516,8 +2645,13 @@ namespace llaminar2::test::parity::qwen36
             /*main_forward_token_count=*/1,
             /*allow_speculative_discard=*/true,
             replay_checkpoint.cached_tokens));
-        const int32_t shortcut_next_token_after_commit = runner->sampleGreedyOnDevice();
+        int32_t shortcut_next_token_after_commit = -1;
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            1,
+            &shortcut_next_token_after_commit));
         ASSERT_GE(shortcut_next_token_after_commit, 0);
+        expectCudaMoEMTPCorrectionReplayFusedPrefillPath();
 
         ASSERT_TRUE(runner->restoreLivePrefixState(replay_checkpoint));
         ASSERT_TRUE(runner->forward(accepted_tokens, 2));
