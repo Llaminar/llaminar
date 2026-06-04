@@ -159,6 +159,45 @@ namespace
         std::string old_value_;
     };
 
+    void expectGroupedDecodeCounter(
+        const char *counter_name,
+        const char *source,
+        int active_slots,
+        int d_model,
+        int intermediate)
+    {
+        const auto records =
+            llaminar2::PerfStatsCollector::snapshot({std::string("kernel.") + counter_name});
+        ASSERT_FALSE(records.empty()) << "missing perf counter " << counter_name;
+
+        const auto expected_active_slots = std::to_string(active_slots);
+        const auto expected_d_model = std::to_string(d_model);
+        const auto expected_intermediate = std::to_string(intermediate);
+        const auto match = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const llaminar2::PerfStatRecord &record)
+            {
+                auto tag_equals = [&](const char *key, const std::string &value)
+                {
+                    const auto it = record.tags.find(key);
+                    return it != record.tags.end() && it->second == value;
+                };
+                const auto route = record.tags.find("route");
+                return record.name == counter_name &&
+                       tag_equals("source", source) &&
+                       tag_equals("active_slots", expected_active_slots) &&
+                       tag_equals("d_model", expected_d_model) &&
+                       tag_equals("intermediate", expected_intermediate) &&
+                       route != record.tags.end() &&
+                       (route->second == "kpart" || route->second == "serial");
+            });
+        ASSERT_NE(match, records.end()) << "missing matching perf counter " << counter_name
+                                        << " source=" << source;
+        EXPECT_GE(match->count, 1u);
+        EXPECT_GE(match->value, 1.0);
+    }
+
     /// @brief Build a minimal native-VNNI descriptor backed by CUDA device pointers.
     llaminar2::DeviceNativeVNNIMatrixDesc makeCudaNativeDesc(
         const CudaAllocation &payload,
@@ -1117,6 +1156,9 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeDescriptorPathCapturesAfterWarmu
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    llaminar2::PerfStatsCollector::reset();
+
     using llaminar2::DeviceMoERuntimeTable;
     constexpr int num_layers = 1;
     constexpr int num_experts = 2;
@@ -1241,6 +1283,12 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeDescriptorPathCapturesAfterWarmu
     ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
     if (graph)
         ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+
+    expectGroupedDecodeCounter(
+        "cuda_moe_grouped_decode_gateup_calls", "runtime", top_k, d_model, intermediate);
+    expectGroupedDecodeCounter(
+        "cuda_moe_grouped_decode_down_calls", "runtime", top_k, d_model, intermediate);
+    llaminar2::PerfStatsCollector::reset();
 #endif
 }
 
@@ -1251,6 +1299,9 @@ TEST_F(Test__CUDAMoEKernel, StaticGroupedDecodeDescriptorPathCapturesAfterWarmup
 #else
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
+
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    llaminar2::PerfStatsCollector::reset();
 
     constexpr int num_experts = 1;
     constexpr int num_active = 1;
@@ -1336,5 +1387,11 @@ TEST_F(Test__CUDAMoEKernel, StaticGroupedDecodeDescriptorPathCapturesAfterWarmup
     ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
     if (graph)
         ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+
+    expectGroupedDecodeCounter(
+        "cuda_moe_grouped_decode_gateup_calls", "table", num_active, d_model, intermediate);
+    expectGroupedDecodeCounter(
+        "cuda_moe_grouped_decode_down_calls", "table", num_active, d_model, intermediate);
+    llaminar2::PerfStatsCollector::reset();
 #endif
 }

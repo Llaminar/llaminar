@@ -12,8 +12,16 @@ A/Bs that should not be rediscovered.
 | Dense long lane, `The quick brown fox`, `-c 64 -n 48` | CUDA `cuda:0` | Qwen3.6 27B Q4_K_S | 40.75 tok/s | 53.30 tok/s | 1.31x | Correctness green, depth 1 best |
 | Dense short lane | CPU `cpu:0` | Qwen3.6 27B Q4_K_S | 5.80 tok/s | 9.50 tok/s | 1.64x | Short smoke only |
 | MoE default lane, 595 prompt tokens, `-c 768 -n 64` | ROCm `rocm:0` | Qwen3.6 35B A3B | 19.72 tok/s | 42.04 tok/s | 2.13x | Fixed d1, compact active-expert prefill grid |
-| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.37 tok/s | 64.72 tok/s | 0.64x | Correctness green; qkv+z GDN fused, still perf-negative |
+| MoE default lane, 595 prompt tokens, `-c 768 -n 64` | CUDA `cuda:0` | Qwen3.6 35B A3B | 101.37 tok/s | 64.72 tok/s | 0.64x | Correctness green; llama.cpp north star is 118.31 tok/s |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | Pending | Pending | Pending | After single-device lanes |
+
+llama.cpp CUDA: `ggml-org/llama.cpp@6ddc943`, `GGML_CUDA=ON`, SM86 RTX 3090,
+`llama-bench -p 768 -n 64 -ngl 999 -r 3`:
+
+| Model | Prefill | Decode | File |
+|---|---:|---:|---|
+| Dense 27B | 1161.19 tok/s | 41.82 tok/s | `benchmark_results/llama_cpp_cuda/20260604T080645Z-6ddc943/dense.jsonl` |
+| MoE 35B A3B | 2415.25 tok/s | 118.31 tok/s | `benchmark_results/llama_cpp_cuda/20260604T080645Z-6ddc943/moe.jsonl` |
 
 ## Adaptive Depth
 
@@ -40,17 +48,9 @@ Qwen3.6 35B A3B on `rocm:0`, default benchmark lane, 2026-06-04:
 Artifact: `benchmark_results/rocm_moe_mtp/20260604T034243Z-64e01724-active-expert-prefill-grid-n64-repeat`.
 Stats showed 16 active experts out of 256.
 
-MoE ROCm A/B results to avoid repeating:
-
-| Experiment | Decode | Acceptance | Decision |
-|---|---:|---:|---|
-| exact FP32 router | 33.98 tok/s | 79.69% | retained |
-| FP16 router | 27.42 tok/s | 64.84% | reject |
-| Q8 router | 33.05 tok/s | 75.78% | reject |
-| K-partition router | 30.13 tok/s | 71.88% | reject |
-| hipBLAS M=2..4 router | 30.92-32.08 tok/s | 69.53-74.22% | reverted |
-| token-dedup grouped quant | 38.81 tok/s | 74.22% | reverted |
-| row-batched router / expert `TILE_M=4` | 40.97 / 41.83 tok/s | 77.34-78.91% | reverted |
+MoE ROCm A/Bs not to repeat: FP16/Q8/K-partition routers, hipBLAS M=2..4
+router, token-dedup grouped quant, and row-batched router/expert `TILE_M=4`
+all passed correctness but missed the retained 42.04 tok/s ratchet.
 
 ## MoE CUDA Evidence
 
@@ -64,8 +64,8 @@ Qwen3.6 35B A3B on `cuda:0`, default benchmark lane, 2026-06-04:
 | fixed d1, after small-M attention | 41.92 tok/s | 32.03% | attention no longer uses FA2 prefill path |
 
 Artifacts: `benchmark_results/cuda_moe_mtp/20260604T072857Z-bffe6cc7-gdn-qkvz-fused-n64`,
-`20260604T074312Z-20a0cfed-shared-grouped-cuda-n64`, GPU-stage `20260604T074809Z-b5cee090-shared-grouped-cuda-gpustage-n16`.
-Earlier attention work moved short-profile attention from 58.84 ms to 6.66 ms.
+`20260604T074312Z-20a0cfed-shared-grouped-cuda-n64`,
+`20260604T074809Z-b5cee090-shared-grouped-cuda-gpustage-n16`.
 
 ## Retained Tuning Actions
 

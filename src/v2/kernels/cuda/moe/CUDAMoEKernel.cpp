@@ -96,6 +96,36 @@ namespace
         tensor->transitionTo(llaminar2::TensorCoherenceState::SYNCED);
     }
 
+    void recordGroupedDecodeCounter(
+        const std::string &name,
+        const char *source,
+        const char *route,
+        llaminar2::DeviceId device,
+        int active_slots,
+        int d_model,
+        int intermediate,
+        int codebook_id,
+        int k_partitions)
+    {
+        if (!llaminar2::PerfStatsCollector::isEnabled())
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            name,
+            1.0,
+            "moe",
+            device.to_string(),
+            llaminar2::PerfStatsCollector::Tags{
+                {"source", source},
+                {"route", route},
+                {"active_slots", std::to_string(active_slots)},
+                {"d_model", std::to_string(d_model)},
+                {"intermediate", std::to_string(intermediate)},
+                {"codebook", std::to_string(codebook_id)},
+                {"k_partitions", std::to_string(k_partitions)}});
+    }
+
     int *runtimeTopKExpertIdsDevice(llaminar2::DeviceMoELayerRuntime *runtime_layer)
     {
         auto *base = reinterpret_cast<char *>(runtime_layer);
@@ -2202,6 +2232,16 @@ namespace llaminar2
                 markDeviceWritten(gate_outputs[slot], device, stream);
                 markDeviceWritten(up_outputs[slot], device, stream);
             }
+            recordGroupedDecodeCounter(
+                "cuda_moe_grouped_decode_gateup_calls",
+                "table",
+                use_kpart ? "kpart" : "serial",
+                device,
+                num_active,
+                d_model,
+                intermediate,
+                table.codebook_id,
+                use_kpart ? k_partitions : 1);
         }
         return ok;
     }
@@ -2332,7 +2372,19 @@ namespace llaminar2
                   stream);
 
         if (ok)
+        {
             markDeviceWritten(output, device, stream);
+            recordGroupedDecodeCounter(
+                "cuda_moe_grouped_decode_down_calls",
+                "table",
+                use_kpart ? "kpart" : "serial",
+                device,
+                num_active,
+                d_model,
+                intermediate,
+                table.codebook_id,
+                use_kpart ? k_partitions : 1);
+        }
         return ok;
     }
 
@@ -2478,6 +2530,16 @@ namespace llaminar2
                 markDeviceWritten(gate_outputs[slot], device, stream);
                 markDeviceWritten(up_outputs[slot], device, stream);
             }
+            recordGroupedDecodeCounter(
+                "cuda_moe_grouped_decode_gateup_calls",
+                "runtime",
+                use_kpart ? "kpart" : "serial",
+                device,
+                top_k,
+                d_model,
+                intermediate,
+                table.codebook_id,
+                use_kpart ? k_partitions : 1);
         }
         return ok;
     }
@@ -2602,7 +2664,19 @@ namespace llaminar2
                   stream);
 
         if (ok)
+        {
             markDeviceWritten(output, device, stream);
+            recordGroupedDecodeCounter(
+                "cuda_moe_grouped_decode_down_calls",
+                "runtime",
+                use_kpart ? "kpart" : "serial",
+                device,
+                top_k,
+                d_model,
+                intermediate,
+                table.codebook_id,
+                use_kpart ? k_partitions : 1);
+        }
         return ok;
     }
 
