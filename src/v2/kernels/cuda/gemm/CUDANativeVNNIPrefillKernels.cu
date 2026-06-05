@@ -2520,6 +2520,44 @@ namespace
     // are baked into the generated tables.
 #include "kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc"
 
+    // Narrow Qwen3.6 dense prompt-prefill overrides from the production-shape
+    // Q4_K M=595 sweep in
+    // benchmark_results/cuda_dense_mtp/20260605T072031Z-dense-refresh/
+    // qwen36_dense_q4k_m595_tile_sweep.csv. Keep this ahead of the generated
+    // table so the production model gets the measured winner without
+    // regenerating all historical sweep inputs.
+    template <uint8_t CB>
+    bool selectManualPrefillTileOverride(
+        int M,
+        int N,
+        int K,
+        uint8_t &out_tile_id,
+        uint8_t &out_split_k)
+    {
+        if constexpr (CB == 5)
+        {
+            if (binPrefillM(M) != 512)
+                return false;
+
+            if ((N == 17408 && K == 5120) ||
+                (N == 10240 && K == 5120))
+            {
+                out_tile_id = static_cast<uint8_t>(TileId::T128x128_w4x2);
+                out_split_k = 1;
+                return true;
+            }
+
+            if (N == 5120 && K == 17408)
+            {
+                out_tile_id = static_cast<uint8_t>(TileId::T64x128_w4x2);
+                out_split_k = 1;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     // ─── Asymmetric-format heuristic ──────────────────────────────────
     // Sweep data (Q4_1, Q5_1, IQ1_S across 7B shapes, M=64..512) shows:
     //   - T64x128_w2x2 sk=1 wins all well-filling shapes for Q4_1
@@ -3480,9 +3518,10 @@ namespace
         }
         else
         {
-            // Try generated dispatch tables first
+            // Try manual production-shape overrides, then generated dispatch tables.
             uint8_t gen_tile_id = 0, gen_split_k = 1;
-            if (selectPrefillTileGenerated<CB>(M, N, K, gen_tile_id, gen_split_k))
+            if (selectManualPrefillTileOverride<CB>(M, N, K, gen_tile_id, gen_split_k) ||
+                selectPrefillTileGenerated<CB>(M, N, K, gen_tile_id, gen_split_k))
             {
                 tc = {static_cast<TileId>(gen_tile_id), static_cast<int>(gen_split_k)};
             }

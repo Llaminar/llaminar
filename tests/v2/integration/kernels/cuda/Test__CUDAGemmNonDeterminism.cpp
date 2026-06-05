@@ -1106,6 +1106,102 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIs
 #endif
 }
 
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesSweepTiles)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    struct Shape
+    {
+        const char *name;
+        int m;
+        int n;
+        int k;
+        int expected_tile;
+    };
+
+    const Shape shapes[] = {
+        {"Qwen36_FFN_GateUp", 595, 17408, 5120, 4},
+        {"Qwen36_FFN_DownProjection", 595, 5120, 17408, 2},
+        {"Qwen36_GDN_InnerProjection", 595, 10240, 5120, 4},
+    };
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    for (const auto &shape : shapes)
+    {
+        SCOPED_TRACE(shape.name);
+
+        auto weight = TestTensorFactory::createQ4_KRandom(
+            {static_cast<size_t>(shape.n), static_cast<size_t>(shape.k)},
+            static_cast<uint32_t>(9000 + shape.n + shape.k));
+        auto *w_q4k = dynamic_cast<Q4_KTensor *>(weight.get());
+        ASSERT_NE(w_q4k, nullptr);
+        ASSERT_TRUE(w_q4k->ensureOnDevice(gpu_device_));
+
+        auto *kernel = getPreparedKernel(w_q4k, gpu_device_);
+        ASSERT_NE(kernel, nullptr);
+
+        auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
+        ASSERT_NE(ws, nullptr);
+        auto reqs = ws->getWorkspaceRequirements(shape.m, shape.n, shape.k);
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 512 * 1024 * 1024);
+        ASSERT_TRUE(workspace_->allocate(reqs));
+        ws->bindWorkspace(workspace_.get());
+
+        FP32Tensor input({static_cast<size_t>(shape.m), static_cast<size_t>(shape.k)});
+        FP32Tensor output({static_cast<size_t>(shape.m), static_cast<size_t>(shape.n)});
+        for (int i = 0; i < shape.m * shape.k; ++i)
+            input.mutable_data()[i] = dist_(rng_);
+
+        ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+        ASSERT_TRUE(output.ensureOnDevice(gpu_device_, stream));
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        kernel->setGPUStream(stream);
+        ASSERT_TRUE(kernel->multiply_tensor(
+            &input,
+            &output,
+            shape.m,
+            shape.n,
+            shape.k,
+            true,
+            1.0f,
+            0.0f,
+            nullptr,
+            nullptr,
+            gpu_device_.ordinal,
+            workspace_.get()));
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        int selected_tile = -1;
+        int selected_split_k = 0;
+        int used_bk256 = 0;
+        int used_streamk = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+
+        EXPECT_EQ(selected_tile, shape.expected_tile);
+        EXPECT_EQ(selected_split_k, 1);
+        EXPECT_EQ(used_bk256, 0);
+        EXPECT_EQ(used_streamk, 0);
+
+        ws->unbindWorkspace();
+        workspace_.reset();
+    }
+
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
 // ============================================================================
 // Custom main with MPI initialization
 // ============================================================================
