@@ -75,15 +75,14 @@ inline bool selectROCmNativeVNNIPrefillGenerated(
     const uint64_t key = packROCmNativeVNNIPrefillDispatchKey(m_key, n, k);
     if constexpr (CB == 0) { // Q4_0
         static constexpr ROCmNativeVNNIPrefillTuningEntry kTable[] = {
-            {0x0002580140000400ULL, {128, 32, 1, 4}}, // CB=0 (Q4_0) M=600 1024x5120 N128/MT32/MB1 Qwen36_GDN_TimeProjection 483.519us
-            {0x0002580440001400ULL, {128, 32, 1, 4}}, // CB=0 (Q4_0) M=600 5120x17408 N128/MT32/MB1 Qwen36_FFN_DownProjection 5986.871us
+            {0x0002580140000400ULL, {128, 32, 1, 4}}, // CB=0 (Q4_0) M=600 1024x5120 N128/MT32/MB1 Qwen36_GDN_TimeProjection 481.761us
         };
         return findROCmNativeVNNIPrefillDispatchEntry(kTable, key, out);
     }
     if constexpr (CB == 5) { // Q4_1
         static constexpr ROCmNativeVNNIPrefillTuningEntry kTable[] = {
-            {0x0002580140000400ULL, {128, 32, 1, 1}}, // CB=5 (Q4_1) M=600 1024x5120 N128/MT32/MB1/U1 Qwen36_GDN_TimeProjection 632.959us
-            {0x0002580440001400ULL, {128, 32, 2, 4}}, // CB=5 (Q4_1) M=600 5120x17408 N128/MT32/MB2 Qwen36_FFN_DownProjection 8180.628us
+            {0x0002580140000400ULL, {128, 32, 1, 1}}, // CB=5 (Q4_1) M=600 1024x5120 N128/MT32/MB1/U1 Qwen36_GDN_TimeProjection 631.520us
+            {0x0002580440001400ULL, {128, 32, 2, 4}}, // CB=5 (Q4_1) M=600 5120x17408 N128/MT32/MB2 Qwen36_FFN_DownProjection 8182.090us
         };
         return findROCmNativeVNNIPrefillDispatchEntry(kTable, key, out);
     }

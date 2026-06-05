@@ -30,13 +30,16 @@
 #include <functional>
 #include <memory>
 #include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/ROCmWeightPacker.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "tensors/Tensors.h"
+#include "tensors/FP16Utils.h"
 #include "utils/Logger.h"
 #include "../../../utils/TestTensorFactory.h"
 
@@ -126,6 +129,94 @@ namespace
                        static_cast<double>(W_dequant[j * K + k]);
             }
             output[j] = static_cast<float>(acc);
+        }
+    }
+
+    std::unique_ptr<Q4_KTensor> createQ4KWithNonzeroMins(size_t N, size_t K)
+    {
+        constexpr size_t BLOCK_SIZE = Q4_KBlock::BLOCK_SIZE;
+        const size_t blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        std::vector<uint8_t> raw_data(N * blocks_per_row * sizeof(Q4_KBlock));
+        auto *blocks = reinterpret_cast<Q4_KBlock *>(raw_data.data());
+
+        std::mt19937 rng(0x4B36);
+        std::uniform_int_distribution<int> nibble_dist(0, 15);
+
+        for (size_t row = 0; row < N; ++row)
+        {
+            for (size_t sb = 0; sb < blocks_per_row; ++sb)
+            {
+                Q4_KBlock &block = blocks[row * blocks_per_row + sb];
+                const float scale = 0.0025f + 0.00005f * static_cast<float>((row + sb) % 17);
+                const float min_scale = 0.00045f + 0.00003f * static_cast<float>((row * 3 + sb) % 11);
+                block.d = fp32_to_fp16(scale);
+                block.dmin = fp32_to_fp16(min_scale);
+
+                // 0x44 decodes to nonzero scale and min selectors in both halves of
+                // the Q4_K superblock, giving this regression real asymmetric
+                // min-correction work rather than the friendlier zero-min fixture.
+                std::memset(block.scales, 0x44, sizeof(block.scales));
+
+                for (uint8_t &q : block.qs)
+                {
+                    const int lo = nibble_dist(rng);
+                    const int hi = nibble_dist(rng);
+                    q = static_cast<uint8_t>((hi << 4) | lo);
+                }
+            }
+        }
+
+        return std::make_unique<Q4_KTensor>(std::vector<size_t>{N, K}, raw_data);
+    }
+
+    void cpuQ4LikeNativeVNNIGemvFromPacked(const int8_t *a_int8,
+                                          const float *a_scales_blockwise,
+                                          const std::vector<uint8_t> &payload,
+                                          const std::vector<uint16_t> &scales,
+                                          const std::vector<uint16_t> &mins,
+                                          float *output,
+                                          int N,
+                                          int K)
+    {
+        constexpr int BLOCK_SIZE = 32;
+        constexpr int PAYLOAD_BYTES = 16;
+        const int blocks_per_row = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        for (int n = 0; n < N; ++n)
+        {
+            float acc = 0.0f;
+            for (int b = 0; b < blocks_per_row; ++b)
+            {
+                const size_t linear = static_cast<size_t>(b) * static_cast<size_t>(N) +
+                                      static_cast<size_t>(n);
+                const uint8_t *block_payload = payload.data() + linear * PAYLOAD_BYTES;
+                const float block_scale = fp16_to_fp32(scales[linear]);
+                const float block_min = fp16_to_fp32(mins[linear]);
+                const float activation_scale = a_scales_blockwise[b];
+                const int8_t *a_block = a_int8 + static_cast<size_t>(b) * BLOCK_SIZE;
+
+                int32_t dot = 0;
+                int32_t sum_a = 0;
+                for (int i = 0; i < 16; ++i)
+                {
+                    const int32_t a = static_cast<int32_t>(a_block[i]);
+                    const int32_t q = static_cast<int32_t>(block_payload[i] & 0x0F);
+                    dot += a * q;
+                    sum_a += a;
+                }
+                for (int i = 0; i < 16; ++i)
+                {
+                    const int32_t a = static_cast<int32_t>(a_block[i + 16]);
+                    const int32_t q = static_cast<int32_t>(block_payload[i] >> 4);
+                    dot += a * q;
+                    sum_a += a;
+                }
+
+                acc += (static_cast<float>(dot) * block_scale +
+                        static_cast<float>(sum_a) * block_min) *
+                       activation_scale;
+            }
+            output[n] = acc;
         }
     }
 
@@ -638,6 +729,112 @@ namespace
         EXPECT_GT(cos, 0.99f);
 
         cleanupWorkspace(kernel);
+    }
+
+    TEST_F(NativeVNNIGEMVTest, Q4_K_Qwen36GDNTimeProjection_MatchesPackedNativeContract)
+    {
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        const int M = 1;
+        const int N = 1024;
+        const int K = 5120;
+        const int blocks_per_row = K / 32;
+
+        auto weights = createQ4KWithNonzeroMins(
+            static_cast<size_t>(N), static_cast<size_t>(K));
+        ASSERT_NE(weights, nullptr);
+
+        std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+        weights->to_fp32(W_fp32.data());
+
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        ASSERT_FALSE(packed.native_vnni_payload.empty());
+        ASSERT_FALSE(packed.native_vnni_scales.empty());
+        ASSERT_FALSE(packed.native_vnni_mins.empty());
+        ASSERT_EQ(packed.native_vnni_codebook_id, 5)
+            << "Q4_K must reuse the Q4_1 native-VNNI codebook.";
+        const std::vector<uint8_t> host_payload = packed.native_vnni_payload;
+        const std::vector<uint16_t> host_scales = packed.native_vnni_scales;
+        const std::vector<uint16_t> host_mins = packed.native_vnni_mins;
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        ASSERT_NE(stream, nullptr);
+        kernel.setGPUStream(stream);
+        ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 3605);
+        auto output_gpu = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        const void *d_quant_a = workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A);
+        const void *d_scales_a = workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE);
+        ASSERT_NE(d_quant_a, nullptr);
+        ASSERT_NE(d_scales_a, nullptr);
+
+        std::vector<int8_t> quant_a(static_cast<size_t>(K));
+        std::vector<float> scales_a(static_cast<size_t>(blocks_per_row));
+        ASSERT_EQ(hipMemcpyAsync(quant_a.data(), d_quant_a,
+                                 quant_a.size() * sizeof(int8_t),
+                                 hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipMemcpyAsync(scales_a.data(), d_scales_a,
+                                 scales_a.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+
+        auto *output_fp32 = dynamic_cast<FP32Tensor *>(output_gpu.get());
+        ASSERT_NE(output_fp32, nullptr);
+        const void *d_output = output_fp32->gpu_data_ptr();
+        ASSERT_NE(d_output, nullptr);
+        std::vector<float> gpu_output(static_cast<size_t>(N));
+        ASSERT_EQ(hipMemcpyAsync(gpu_output.data(), d_output,
+                                 gpu_output.size() * sizeof(float),
+                                 hipMemcpyDeviceToHost, stream),
+                  hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        std::vector<float> native_contract_ref(static_cast<size_t>(N));
+        cpuQ4LikeNativeVNNIGemvFromPacked(
+            quant_a.data(), scales_a.data(), host_payload, host_scales, host_mins,
+            native_contract_ref.data(), N, K);
+
+        const float native_cos = cosineSimilarity(
+            gpu_output.data(), native_contract_ref.data(), static_cast<size_t>(N));
+        const float native_rel_l2 = relativeL2Error(
+            gpu_output.data(), native_contract_ref.data(), static_cast<size_t>(N));
+        const float native_max_abs = maxAbsError(
+            gpu_output.data(), native_contract_ref.data(), static_cast<size_t>(N));
+
+        std::vector<float> fp32_ref(static_cast<size_t>(N));
+        cpuFP32Gemv(input->data(), W_fp32.data(), fp32_ref.data(), N, K);
+        const float fp32_cos = cosineSimilarity(
+            gpu_output.data(), fp32_ref.data(), static_cast<size_t>(N));
+
+        LOG_INFO("[NativeVNNI_GEMV] Q4_K Qwen3.6 GDN time exact-contract"
+                 << " native_cos=" << native_cos
+                 << " native_rel_l2=" << native_rel_l2
+                 << " native_max_abs=" << native_max_abs
+                 << " fp32_cos=" << fp32_cos);
+
+        EXPECT_GT(native_cos, 0.999999f);
+        EXPECT_LT(native_rel_l2, 2e-5f);
+        EXPECT_LT(native_max_abs, 2e-3f);
+        EXPECT_GT(fp32_cos, 0.9998f)
+            << "The full-FP32 reference may be lower than the packed native "
+               "contract because this path intentionally quantizes activations.";
+
+        cleanupWorkspace(kernel);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
     }
 
     /**

@@ -32,7 +32,7 @@ COMMON_REQUIRED = {
 }
 
 PHASE_REQUIRED = {
-    "decode": {"weight_bytes", "eff_bw_gbs", "speedup_vs_int8"},
+    "decode": {"weight_bytes", "eff_bw_gbs", "speedup_vs_int8", "variant", "kb", "target_waves", "is_best"},
     "prefill": {"category", "m", "variant", "gflops", "is_best"},
 }
 
@@ -161,6 +161,16 @@ def validate_file(
                     )
                 seen_prefill_m.add(m)
                 is_best = _parse_int(path, row_index, "is_best", row.get("is_best", ""))
+                if is_best not in (0, 1):
+                    raise SystemExit(f"{path}:{row_index}: is_best must be 0 or 1")
+            elif phase == "decode":
+                kb = _parse_int(path, row_index, "kb", row.get("kb", ""))
+                target_waves = _parse_int(path, row_index, "target_waves", row.get("target_waves", ""))
+                is_best = _parse_int(path, row_index, "is_best", row.get("is_best", ""))
+                if kb < 0:
+                    raise SystemExit(f"{path}:{row_index}: decode kb must be >= 0")
+                if target_waves < 0:
+                    raise SystemExit(f"{path}:{row_index}: decode target_waves must be >= 0")
                 if is_best not in (0, 1):
                     raise SystemExit(f"{path}:{row_index}: is_best must be 0 or 1")
 

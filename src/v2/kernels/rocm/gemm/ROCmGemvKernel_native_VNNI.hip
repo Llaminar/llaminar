@@ -43,6 +43,7 @@
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc"
 
 #include <atomic>
 
@@ -52,6 +53,41 @@
 // ============================================================================
 static std::atomic<int> g_native_vnni_kb_override{-1};
 static std::atomic<int> g_native_vnni_target_waves_override{-1};
+
+struct NativeVNNIDecodeGeneratedRuntimeConfig
+{
+    bool has_generated = false;
+    int kb = -1;
+    int target_waves_per_cu = -1;
+};
+
+static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRuntimeConfig(
+    uint8_t codebook_id,
+    int n,
+    int k)
+{
+    NativeVNNIDecodeGeneratedRuntimeConfig resolved{};
+    const auto& rocm_env = llaminar2::debugEnv().rocm;
+    const bool has_explicit_override =
+        g_native_vnni_kb_override.load(std::memory_order_relaxed) > 0 ||
+        g_native_vnni_target_waves_override.load(std::memory_order_relaxed) > 0 ||
+        rocm_env.nvnni_gemv_kb > 0 ||
+        rocm_env.nvnni_gemv_target_waves > 0;
+    if (has_explicit_override)
+        return resolved;
+
+    llaminar2::rocm::generated::ROCmNativeVNNIDecodeDispatchConfig generated_cfg{};
+    if (!llaminar2::rocm::generated::selectROCmNativeVNNIDecodeGenerated(
+            codebook_id, n, k, generated_cfg))
+    {
+        return resolved;
+    }
+
+    resolved.has_generated = true;
+    resolved.kb = static_cast<int>(generated_cfg.kb);
+    resolved.target_waves_per_cu = static_cast<int>(generated_cfg.target_waves_per_cu);
+    return resolved;
+}
 
 static void recordNativeVNNISmallMLaunch(
     int m,
@@ -4631,6 +4667,8 @@ bool rocmGemv_native_vnni_fp32(
 
     const auto& rocm_env = llaminar2::debugEnv().rocm;
     const bool use_atomic_reduce = rocm_env.nvnni_atomic_reduce;
+    const NativeVNNIDecodeGeneratedRuntimeConfig generated_cfg =
+        resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_id, N, K);
 
     // =========================================================================
     // IQ grid formats: LDS-cached grid kernel with 256-thread workgroups
@@ -4719,6 +4757,8 @@ bool rocmGemv_native_vnni_fp32(
             max_waves_per_cu = 16;
         else                         // IQ3_S, IQ3_XXS (≤2KB LDS, 94 VALU/block)
             max_waves_per_cu = 40;
+        if (generated_cfg.target_waves_per_cu > 0)
+            max_waves_per_cu = generated_cfg.target_waves_per_cu;
 
         // Each 256-thread block contains 4 wavefronts (wavefront64).
         // Convert wave target to block target before computing KB.
@@ -4743,6 +4783,11 @@ bool rocmGemv_native_vnni_fp32(
                 if (kb_raw + d <= kb_max && blocks_per_row % (kb_raw + d) == 0) { kb = kb_raw + d; break; }
             }
         }
+        if (generated_cfg.kb > 0)
+        {
+            kb = min(generated_cfg.kb, KB_CAP);
+            if (kb > blocks_per_row) kb = blocks_per_row;
+        }
         if (kb < 1) kb = 1;
 
         if (kb > 1 && !d_partial_fp32 && !use_atomic_reduce)
@@ -4761,7 +4806,13 @@ bool rocmGemv_native_vnni_fp32(
                     d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,               \
                     d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, 1);       \
             } else if (use_atomic_reduce) {                                                   \
-                hipMemsetAsync(d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream)); \
+                hipError_t memset_err = hipMemsetAsync(                                       \
+                    d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream));        \
+                if (memset_err != hipSuccess) {                                               \
+                    fprintf(stderr, "[rocmGemv_native_vnni_fp32] IQ atomic memset failed: %s (N=%d K=%d codebook=%u)\n", \
+                            hipGetErrorString(memset_err), N, K, static_cast<unsigned>(codebook_id)); \
+                    return false;                                                            \
+                }                                                                             \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_iq_lds_kernel_t<IQ_TN, FMT_TAG>),                   \
                     dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),             \
@@ -4811,8 +4862,10 @@ bool rocmGemv_native_vnni_fp32(
         // microbench sweeps can override process-level defaults deterministically.
         const int api_kb_override = g_native_vnni_kb_override.load(std::memory_order_relaxed);
         const int api_waves_override = g_native_vnni_target_waves_override.load(std::memory_order_relaxed);
-        const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
-        const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+        const int explicit_kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
+        const int explicit_waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
+        const int kb_override = (explicit_kb_override > 0) ? explicit_kb_override : generated_cfg.kb;
+        const int waves_override = (explicit_waves_override > 0) ? explicit_waves_override : generated_cfg.target_waves_per_cu;
 
         constexpr int DEFAULT_TARGET_WAVES_PER_CU = 24;
 
@@ -4871,7 +4924,13 @@ bool rocmGemv_native_vnni_fp32(
                     d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32,              \
                     d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, 1);      \
             } else if (use_atomic_reduce) {                                                   \
-                hipMemsetAsync(d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream)); \
+                hipError_t memset_err = hipMemsetAsync(                                       \
+                    d_C_fp32, 0, N * sizeof(float), static_cast<hipStream_t>(stream));        \
+                if (memset_err != hipSuccess) {                                               \
+                    fprintf(stderr, "[rocmGemv_native_vnni_fp32] atomic memset failed: %s (N=%d K=%d codebook=%u)\n", \
+                            hipGetErrorString(memset_err), N, K, static_cast<unsigned>(codebook_id)); \
+                    return false;                                                            \
+                }                                                                             \
                 hipLaunchKernelGGL(                                                           \
                     HIP_KERNEL_NAME(gemv_native_vnni_kernel_t<TN, CPT, FMT_TAG>),            \
                     dim3(grid_n, kb), block, 0, static_cast<hipStream_t>(stream),            \
