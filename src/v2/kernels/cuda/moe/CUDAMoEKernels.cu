@@ -2539,9 +2539,9 @@ namespace
      * then reduce inside the warp in a fixed order and write the final
      * route-weighted output directly.
      *
-     * Grid: (ceil(N / 8))   Block: (256 = 8 warps)
+     * Grid: (ceil(N / WarpsPerBlock))   Block: (32 * WarpsPerBlock)
      */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, int WarpsPerBlock>
     __global__ void grouped_native_vnni_down_warp_reduce_decode_kernel(
         const int8_t *__restrict__ A_int8,
         const float *__restrict__ scales_A_blockwise,
@@ -2553,11 +2553,11 @@ namespace
         int N,
         int K)
     {
-        constexpr int kWarpsPerBlock = 8;
+        static_assert(WarpsPerBlock > 0, "WarpsPerBlock must be positive");
         const int lane = threadIdx.x & 31;
         const int warp = threadIdx.x >> 5;
-        const int n = blockIdx.x * kWarpsPerBlock + warp;
-        if (warp >= kWarpsPerBlock || n >= N)
+        const int n = blockIdx.x * WarpsPerBlock + warp;
+        if (warp >= WarpsPerBlock || n >= N)
             return;
 
         const int blocks_per_row = K / 32;
@@ -3401,7 +3401,8 @@ extern "C"
         dim3 down_block(kDownWarpsPerBlock * 32);
 
 #define LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(CB)                                                  \
-    grouped_native_vnni_down_warp_reduce_decode_kernel<CB><<<down_grid, down_block, 0, cuda_stream>>>( \
+    grouped_native_vnni_down_warp_reduce_decode_kernel<CB, kDownWarpsPerBlock>                       \
+        <<<down_grid, down_block, 0, cuda_stream>>>(                                                 \
         d_swiglu_int8, d_swiglu_scales, d_down_desc_table, d_expert_ids, d_weights,                 \
         d_output, top_k, d_model, intermediate)
 
