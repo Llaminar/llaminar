@@ -182,6 +182,22 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream,
                 CUDAPrefillContext *prefill_ctx);
+            void cudaPrefillContext_bindWorkspace(
+                CUDAPrefillContext *ctx,
+                float *splitk_partials,
+                size_t splitk_partials_bytes,
+                float *streamk_fixup,
+                size_t streamk_fixup_bytes);
+            bool cudaNativeVNNIPrefill_getWorkspacePlan(
+                uint8_t codebook_id,
+                int M,
+                int N,
+                int K,
+                int cuda_device_id,
+                size_t *splitk_partials_bytes,
+                size_t *streamk_fixup_bytes,
+                int *planned_split_k,
+                int *planned_streamk);
 
             // cuBLAS FP16 GEMM for Q4_0 native VNNI weights (CUDAcuBLASQuantGemm.cu)
             bool cudaCuBLAS_fp16_gemm_q40(
@@ -197,6 +213,69 @@ namespace llaminar2
                 CUDACuBLASContext *cublas_ctx);
         }
 
+        namespace
+        {
+            constexpr int kCudaConcurrentPrefillWorkspaceSlots = 8;
+
+            std::string indexedWorkspaceBufferName(const char *base, uint32_t id)
+            {
+                return std::string(base) + "_" + std::to_string(id);
+            }
+
+            std::string concurrentPrefillAccBufferName(int slot)
+            {
+                return std::string(GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32) +
+                       "_" + std::to_string(slot);
+            }
+
+            std::string nativePrefillSplitKBufferName(uint32_t id)
+            {
+                return indexedWorkspaceBufferName(
+                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS,
+                    id);
+            }
+
+            std::string nativePrefillStreamKFixupBufferName(uint32_t id)
+            {
+                return indexedWorkspaceBufferName(
+                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP,
+                    id);
+            }
+
+            void bindNativePrefillWorkspace(
+                CUDAPrefillContext *ctx,
+                DeviceWorkspaceManager *workspace,
+                uint32_t slice_id)
+            {
+                if (!ctx)
+                    return;
+
+                float *splitk = nullptr;
+                size_t splitk_bytes = 0;
+                float *fixup = nullptr;
+                size_t fixup_bytes = 0;
+
+                if (workspace)
+                {
+                    const std::string splitk_name = nativePrefillSplitKBufferName(slice_id);
+                    if (workspace->hasBuffer(splitk_name))
+                    {
+                        splitk = static_cast<float *>(workspace->getBuffer(splitk_name));
+                        splitk_bytes = workspace->getBufferSize(splitk_name);
+                    }
+
+                    const std::string fixup_name = nativePrefillStreamKFixupBufferName(slice_id);
+                    if (workspace->hasBuffer(fixup_name))
+                    {
+                        fixup = static_cast<float *>(workspace->getBuffer(fixup_name));
+                        fixup_bytes = workspace->getBufferSize(fixup_name);
+                    }
+                }
+
+                cudaPrefillContext_bindWorkspace(ctx, splitk, splitk_bytes, fixup, fixup_bytes);
+            }
+        }
+
         // =====================================================================
         // Concurrent prefill stream pool (per-kernel instance, not static)
         // =====================================================================
@@ -210,6 +289,7 @@ namespace llaminar2
             void *quant_ready = nullptr;
             int32_t *scratch[MAX_STREAMS] = {};        // Per-stream INT32 accumulator
             size_t scratch_capacity[MAX_STREAMS] = {}; // In elements (M*N)
+            bool scratch_owned[MAX_STREAMS] = {};
             int count = 0;
             int device_id = -1;
             bool initialized = false;
@@ -236,32 +316,24 @@ namespace llaminar2
             {
                 if (idx < 0 || idx >= count)
                     return false;
-                if (scratch_capacity[idx] >= elements)
+                if (scratch[idx] && scratch_capacity[idx] >= elements)
                     return true;
+                LOG_ERROR("[CUDAConcurrentPrefillPool] Missing or undersized workspace scratch["
+                          << idx << "]: need " << (elements * sizeof(int32_t))
+                          << " bytes, have " << (scratch_capacity[idx] * sizeof(int32_t))
+                          << " bytes");
+                return false;
+            }
 
-                // Free old
-                if (scratch[idx])
-                {
+            void bindScratch(int idx, int32_t *ptr, size_t elements)
+            {
+                if (idx < 0 || idx >= MAX_STREAMS)
+                    return;
+                if (scratch[idx] && scratch_owned[idx])
                     cudaQuantGemm_freeDevice(scratch[idx]);
-                    scratch[idx] = nullptr;
-                    scratch_capacity[idx] = 0;
-                }
-
-                cudaQuantGemm_setDevice(device_id);
-                float *tmp = nullptr;
-                // Allocate int32 buffer via allocFloat (same underlying cudaMalloc)
-                size_t float_count = (elements * sizeof(int32_t) + sizeof(float) - 1) / sizeof(float);
-                if (!cudaQuantGemm_allocFloat(&tmp, float_count, device_id))
-                {
-                    LOG_ERROR("[CUDAConcurrentPrefillPool] Failed to allocate scratch["
-                              << idx << "] (" << (elements * 4 / 1024) << " KB)");
-                    return false;
-                }
-                scratch[idx] = reinterpret_cast<int32_t *>(tmp);
+                scratch[idx] = ptr;
                 scratch_capacity[idx] = elements;
-                LOG_DEBUG("[CUDAConcurrentPrefillPool] Allocated scratch[" << idx
-                                                                           << "] = " << (elements * 4 / 1024) << " KB");
-                return true;
+                scratch_owned[idx] = false;
             }
 
             void destroy()
@@ -274,12 +346,13 @@ namespace llaminar2
                     streams[i] = nullptr;
                     cudaQuantGemm_destroyEvent(completion[i]);
                     completion[i] = nullptr;
-                    if (scratch[i])
+                    if (scratch[i] && scratch_owned[i])
                     {
                         cudaQuantGemm_freeDevice(scratch[i]);
-                        scratch[i] = nullptr;
-                        scratch_capacity[i] = 0;
                     }
+                    scratch[i] = nullptr;
+                    scratch_capacity[i] = 0;
+                    scratch_owned[i] = false;
                 }
                 cudaQuantGemm_destroyEvent(quant_ready);
                 quant_ready = nullptr;
@@ -487,6 +560,8 @@ namespace llaminar2
                 const float *d_bias,
                 int cuda_device_id,
                 void *stream,
+                DeviceWorkspaceManager *workspace = nullptr,
+                uint32_t workspace_slice_id = 0,
                 CUDARowMajorWeights **rm_slot = nullptr)
             {
                 if (!impl || m <= 0 || k <= 0 || (k % 32) != 0)
@@ -561,6 +636,10 @@ namespace llaminar2
                     // Lazy-create per-device prefill context (stream-K fixup buffer + SM count)
                     if (!impl->prefill_ctx)
                         impl->prefill_ctx = cudaPrefillContext_create(cuda_device_id);
+                    bindNativePrefillWorkspace(
+                        impl->prefill_ctx,
+                        workspace,
+                        workspace_slice_id);
 
                     if (cudaNativeVNNIPrefill_fp32(
                             d_A_int8,
@@ -1564,6 +1643,8 @@ namespace llaminar2
                                 d_bias,
                                 cuda_device_id_,
                                 gpu_stream_,
+                                cuda_kernel->workspace_,
+                                cuda_kernel->slice_id_,
                                 cuda_kernel->packed_ ? &cuda_kernel->packed_->rowmajor_ : nullptr))
                         {
                             LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV failed for projection "
@@ -1688,6 +1769,23 @@ namespace llaminar2
                 const int num_proj = static_cast<int>(projections.size());
                 auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
                 pool.init(cuda_device_id_, num_proj);
+                if (!concurrent_decode)
+                {
+                    for (int si = 0; si < pool.count; ++si)
+                    {
+                        const std::string slot_name = concurrentPrefillAccBufferName(si);
+                        if (!workspace_ || !workspace_->hasBuffer(slot_name))
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Missing required workspace scratch slot '" +
+                                slot_name + "' — concurrent prefill cannot allocate private CUDA scratch");
+                        }
+                        pool.bindScratch(
+                            si,
+                            static_cast<int32_t *>(workspace_->getBuffer(slot_name)),
+                            workspace_->getBufferSize(slot_name) / sizeof(int32_t));
+                    }
+                }
 
                 // Record event after quantization completes on main stream
                 cudaQuantGemm_recordEvent(pool.quant_ready, gpu_stream_);
@@ -1709,14 +1807,6 @@ namespace llaminar2
                     // Use per-stream scratch buffer instead of shared workspace ACC_INT32
                     // to avoid write-after-write races between concurrent projections.
                     int stream_idx = pi % pool.count;
-                    size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
-                    if (!pool.ensureScratch(stream_idx, acc_elements))
-                    {
-                        throw std::runtime_error(
-                            "[ConcurrentPrefill] Failed to allocate scratch for projection " +
-                            std::to_string(pi) + " (" + std::to_string(acc_elements * sizeof(int32_t)) +
-                            " bytes) — GPU OOM");
-                    }
                     // The decode (m == 1) GEMV path ignores the INT32 accumulator entirely
                     // (it reduces directly into FP32 via the per-kernel GEMV context), so we
                     // skip the scratch allocation there — this also keeps the captured-decode
@@ -1724,6 +1814,15 @@ namespace llaminar2
                     int32_t *proj_d_C_int32 = nullptr;
                     if (!concurrent_decode)
                     {
+                        size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
+                        if (!pool.ensureScratch(stream_idx, acc_elements))
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Workspace scratch slot " +
+                                std::to_string(stream_idx) + " is too small for projection " +
+                                std::to_string(pi) + " (" + std::to_string(acc_elements * sizeof(int32_t)) +
+                                " bytes)");
+                        }
                         proj_d_C_int32 = pool.scratch[stream_idx];
                     }
 
@@ -1781,7 +1880,9 @@ namespace llaminar2
                         cuda_kernel->impl_.get(),
                         d_A_int8, proj_d_C_int32, d_output, d_scales_A_blockwise,
                         m, n, k, 1.0f, 0.0f, nullptr, d_bias,
-                        cuda_device_id_, pool.streams[stream_idx]);
+                        cuda_device_id_, pool.streams[stream_idx],
+                        cuda_kernel->workspace_,
+                        cuda_kernel->slice_id_);
 
                     if (!proj_ok)
                     {
@@ -1984,7 +2085,9 @@ namespace llaminar2
                         1.0f, 0.0f,
                         nullptr,
                         d_bias,
-                        cuda_device_id_, gpu_stream_);
+                        cuda_device_id_, gpu_stream_,
+                        cuda_kernel->workspace_,
+                        cuda_kernel->slice_id_);
 
                     if (trace_fused)
                     {
@@ -2141,6 +2244,8 @@ namespace llaminar2
                                 nullptr,
                                 cuda_device_id_,
                                 gpu_stream_,
+                                workspace_,
+                                slice_id_,
                                 packed_ ? &packed_->rowmajor_ : nullptr))
                         {
                             LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Row "
@@ -2159,6 +2264,8 @@ namespace llaminar2
                         d_A_int8, nullptr, d_C, d_scales_A_blockwise,
                         m, n, k, alpha, beta, d_C_existing, nullptr,
                         cuda_device_id_, gpu_stream_,
+                        workspace_,
+                        slice_id_,
                         packed_ ? &packed_->rowmajor_ : nullptr))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
@@ -2332,6 +2439,8 @@ namespace llaminar2
                         d_bias,
                         cuda_device_id_,
                         gpu_stream_,
+                        workspace_,
+                        slice_id_,
                         packed_ ? &packed_->rowmajor_ : nullptr))
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Row "
@@ -2439,6 +2548,8 @@ namespace llaminar2
                         d_C_existing,
                         nullptr,
                         cuda_device_id_, gpu_stream_,
+                        workspace_,
+                        slice_id_,
                         packed_ ? &packed_->rowmajor_ : nullptr))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (native payload GEMV)");
@@ -2510,6 +2621,8 @@ namespace llaminar2
                         d_C_existing,
                         d_bias,
                         cuda_device_id_, gpu_stream_,
+                        workspace_,
+                        slice_id_,
                         packed_ ? &packed_->rowmajor_ : nullptr))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (native payload GEMV)");
@@ -2646,6 +2759,99 @@ namespace llaminar2
             size_t temp_c_fp32_bytes = static_cast<size_t>(workspace_m) * n * sizeof(float);
             reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
 
+            uint8_t prefill_codebook = impl_ ? impl_->native_codebook_id : 0;
+            bool has_prefill_codebook = impl_ != nullptr;
+            if (packed_)
+            {
+                prefill_codebook = packed_->native_codebook_id;
+                has_prefill_codebook = true;
+            }
+
+            if (m > 1 &&
+                has_prefill_codebook &&
+                nativeVNNIPrefillSupportsCodebook(prefill_codebook))
+            {
+                size_t splitk_bytes = 0;
+                size_t fixup_bytes = 0;
+                int planned_split_k = 1;
+                int planned_streamk = 0;
+                if (cudaNativeVNNIPrefill_getWorkspacePlan(
+                        prefill_codebook,
+                        m,
+                        n,
+                        k,
+                        cuda_device_id_,
+                        &splitk_bytes,
+                        &fixup_bytes,
+                        &planned_split_k,
+                        &planned_streamk))
+                {
+                    if (workspace_m != m)
+                    {
+                        size_t padded_splitk_bytes = 0;
+                        size_t padded_fixup_bytes = 0;
+                        int padded_split_k = 1;
+                        int padded_streamk = 0;
+                        if (cudaNativeVNNIPrefill_getWorkspacePlan(
+                                prefill_codebook,
+                                workspace_m,
+                                n,
+                                k,
+                                cuda_device_id_,
+                                &padded_splitk_bytes,
+                                &padded_fixup_bytes,
+                                &padded_split_k,
+                                &padded_streamk))
+                        {
+                            if (padded_splitk_bytes > splitk_bytes)
+                            {
+                                splitk_bytes = padded_splitk_bytes;
+                                planned_split_k = padded_split_k;
+                            }
+                            if (padded_fixup_bytes > fixup_bytes)
+                            {
+                                fixup_bytes = padded_fixup_bytes;
+                                planned_streamk = padded_streamk;
+                            }
+                        }
+                    }
+                    if (splitk_bytes > 0)
+                    {
+                        reqs.buffers.push_back({
+                            nativePrefillSplitKBufferName(slice_id_),
+                            splitk_bytes,
+                            256,
+                            true});
+                    }
+                    if (fixup_bytes > 0)
+                    {
+                        reqs.buffers.push_back({
+                            nativePrefillStreamKFixupBufferName(slice_id_),
+                            fixup_bytes,
+                            256,
+                            true});
+                    }
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: split_k="
+                              << planned_split_k << " streamk=" << planned_streamk
+                              << " splitk_scratch=" << (splitk_bytes / 1024) << "KB"
+                              << " streamk_fixup=" << (fixup_bytes / 1024) << "KB");
+                }
+            }
+
+            if (m > 16 && debugEnv().gemm.cuda_concurrent_prefill)
+            {
+                const size_t concurrent_acc_bytes =
+                    static_cast<size_t>(workspace_m) * static_cast<size_t>(n) * sizeof(int32_t);
+                for (int slot = 0; slot < kCudaConcurrentPrefillWorkspaceSlots; ++slot)
+                {
+                    reqs.buffers.push_back({
+                        concurrentPrefillAccBufferName(slot),
+                        concurrent_acc_bytes,
+                        256,
+                        true});
+                }
+            }
+
             // GEMV kpar partials for decode (M=1): two-phase K-parallel reduction
             // Size: kpar_factor × N floats. kpar_factor ≈ ceil(K/tile_k) capped by SM count.
             // Use conservative estimate: min(ceil(K/128), 84) × N × sizeof(float)
@@ -2674,6 +2880,10 @@ namespace llaminar2
                 resetDynamicState();
             }
             workspace_ = workspace;
+            if (impl_ && impl_->prefill_ctx)
+            {
+                bindNativePrefillWorkspace(impl_->prefill_ctx, workspace_, slice_id_);
+            }
             if (workspace)
             {
                 LOG_DEBUG("[CUDAQuantisedGemmKernel] Bound workspace manager at " << (void *)workspace

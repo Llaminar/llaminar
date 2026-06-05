@@ -182,6 +182,13 @@ namespace llaminar2
 
         // GEMV kpar partials buffer for CUDA NativeVNNI two-phase reduction
         constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × N] FP32 reduction partials
+
+        // CUDA NativeVNNI prefill scratch. These buffers are intentionally
+        // workspace-owned so split-K and stream-K cannot grow hidden VRAM
+        // allocations behind graph capture / workspace planning.
+        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS = "cuda_native_vnni_prefill_splitk_partials"; ///< [split_k × M × N] FP32 partials
+        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP = "cuda_native_vnni_prefill_streamk_fixup";       ///< [tiles × BM × BN] FP32 stream-K fixup
+        constexpr const char *CUDA_CONCURRENT_PREFILL_ACC_INT32 = "cuda_concurrent_prefill_acc_int32";               ///< per-slot [M × max_N] INT32 accumulator
     }
 
     // =============================================================================

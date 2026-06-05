@@ -41,6 +41,11 @@ struct CUDAPrefillContext_
     int sm_count = 0;
     int device_id = -1;
     std::vector<CUDAPrefillStreamScratch_> stream_scratch;
+    float *workspace_splitk_partials = nullptr;
+    size_t workspace_splitk_partials_size = 0;
+    float *workspace_fixup_buf = nullptr;
+    size_t workspace_fixup_buf_size = 0;
+    bool require_workspace_scratch = true;
 };
 
 struct LastLaunchSelection_
@@ -93,6 +98,14 @@ static CUDAPrefillStreamScratch_ *getOrCreateStreamScratch(CUDAPrefillContext_ *
 
 static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
 {
+    if (ctx->workspace_fixup_buf && ctx->workspace_fixup_buf_size >= required_bytes)
+    {
+        cudaMemsetAsync(ctx->workspace_fixup_buf, 0, required_bytes, stream);
+        return ctx->workspace_fixup_buf;
+    }
+    if (ctx->require_workspace_scratch)
+        return nullptr;
+
     auto *scratch = getOrCreateStreamScratch(ctx, stream);
     if (scratch->fixup_buf_size < required_bytes)
     {
@@ -111,6 +124,12 @@ static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_by
 
 static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
 {
+    (void)stream;
+    if (ctx->workspace_splitk_partials && ctx->workspace_splitk_partials_size >= required_bytes)
+        return ctx->workspace_splitk_partials;
+    if (ctx->require_workspace_scratch)
+        return nullptr;
+
     auto *scratch = getOrCreateStreamScratch(ctx, stream);
     if (scratch->splitk_partials_size < required_bytes)
     {
@@ -3441,6 +3460,127 @@ namespace
         return 2;
     }
 
+    struct PrefillWorkspacePlan
+    {
+        int tile_id = -1;
+        int split_k = 1;
+        int streamk = 0;
+        bool bk256 = false;
+        size_t splitk_partials_bytes = 0;
+        size_t streamk_fixup_bytes = 0;
+    };
+
+    void tileShape(TileId tile, int &bm, int &bn)
+    {
+        switch (tile)
+        {
+        case TileId::T64x64_w2x2:
+            bm = 64;
+            bn = 64;
+            return;
+        case TileId::T64x128_w2x2:
+        case TileId::T64x128_w4x2:
+        case TileId::T64x128_w2x4:
+            bm = 64;
+            bn = 128;
+            return;
+        case TileId::T128x128_w4x2:
+        case TileId::T128x128_w4x4:
+            bm = 128;
+            bn = 128;
+            return;
+        }
+        bm = 64;
+        bn = 128;
+    }
+
+    template <uint8_t CB>
+    PrefillWorkspacePlan planGenericPrefillWorkspace(
+        int M,
+        int N,
+        int K,
+        CUDAPrefillContext_ *prefill_ctx)
+    {
+        PrefillWorkspacePlan plan;
+
+        if constexpr (CB == 0)
+        {
+            const bool bk256_forced = (g_bk256_force_mode > 0);
+            const bool bk256_disabled = (g_bk256_force_mode < 0);
+            const int SM = querySmCount(prefill_ctx);
+            const int t64x128_check = ((M + 63) / 64) * ((N + 127) / 128);
+            const bool bk256_auto = !bk256_disabled && (K > 2 * N) && (t64x128_check < SM);
+            if (bk256_forced || bk256_auto)
+            {
+                const bool use_narrow_bn64 = (M <= 32) && (N <= 1024);
+                const int bk256_bn = use_narrow_bn64 ? 64 : 128;
+                int sk = chooseSplitK_BK256(M, N, K, 128, bk256_bn, prefill_ctx);
+                if (g_deterministic_mode)
+                    sk = 1;
+                plan.tile_id = use_narrow_bn64 ? -3 : -2;
+                plan.split_k = sk;
+                plan.bk256 = true;
+                if (sk > 1)
+                    plan.splitk_partials_bytes = static_cast<size_t>(sk) * M * N * sizeof(float);
+                return plan;
+            }
+        }
+
+        TileChoice tc;
+        if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+        {
+            tc = {static_cast<TileId>(g_force_tile_id),
+                  (g_force_split_k > 0) ? g_force_split_k : 1};
+        }
+        else
+        {
+            uint8_t gen_tile_id = 0;
+            uint8_t gen_split_k = 1;
+            if (selectManualPrefillTileOverride<CB>(M, N, K, gen_tile_id, gen_split_k) ||
+                selectPrefillTileGenerated<CB>(M, N, K, gen_tile_id, gen_split_k))
+            {
+                tc = {static_cast<TileId>(gen_tile_id), static_cast<int>(gen_split_k)};
+            }
+            else
+            {
+                constexpr FormatComplexity complexity = getFormatComplexity(CB);
+                tc = choosePrefillTile(M, N, K, prefill_ctx, complexity);
+            }
+        }
+
+        if (g_deterministic_mode && tc.split_k > 1)
+            tc.split_k = 1;
+
+        plan.tile_id = static_cast<int>(tc.tile);
+        plan.split_k = tc.split_k;
+
+        int bm = 64;
+        int bn = 128;
+        tileShape(tc.tile, bm, bn);
+
+        if constexpr (CB == 0)
+        {
+            if (!g_deterministic_mode && tc.split_k == 1 && g_stream_k_force_mode == 2)
+            {
+                const int ntx = (N + bn - 1) / bn;
+                const int nty = (M + bm - 1) / bm;
+                const int total_tiles = ntx * nty;
+                plan.streamk = 2;
+                plan.streamk_fixup_bytes = static_cast<size_t>(total_tiles) * bm * bn * sizeof(float);
+                return plan;
+            }
+            if (!g_deterministic_mode && tc.split_k == 1 && shouldUseStreamK(M, N, K, bm, bn, prefill_ctx))
+            {
+                plan.streamk = 1;
+                return plan;
+            }
+        }
+
+        if (tc.split_k > 1)
+            plan.splitk_partials_bytes = static_cast<size_t>(tc.split_k) * M * N * sizeof(float);
+        return plan;
+    }
+
     // =========================================================================
     // Unified prefill dispatch: single format-agnostic path for ALL codebooks.
     //
@@ -3761,6 +3901,113 @@ extern "C"
                 cudaFree(scratch.splitk_partials);
         }
         delete ctx;
+    }
+
+    void cudaPrefillContext_bindWorkspace(
+        CUDAPrefillContext *ctx,
+        float *splitk_partials,
+        size_t splitk_partials_bytes,
+        float *streamk_fixup,
+        size_t streamk_fixup_bytes)
+    {
+        if (!ctx)
+            return;
+        ctx->workspace_splitk_partials = splitk_partials;
+        ctx->workspace_splitk_partials_size = splitk_partials_bytes;
+        ctx->workspace_fixup_buf = streamk_fixup;
+        ctx->workspace_fixup_buf_size = streamk_fixup_bytes;
+    }
+
+    bool cudaNativeVNNIPrefill_getWorkspacePlan(
+        uint8_t codebook_id,
+        int M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *splitk_partials_bytes,
+        size_t *streamk_fixup_bytes,
+        int *planned_split_k,
+        int *planned_streamk)
+    {
+        if (splitk_partials_bytes)
+            *splitk_partials_bytes = 0;
+        if (streamk_fixup_bytes)
+            *streamk_fixup_bytes = 0;
+        if (planned_split_k)
+            *planned_split_k = 1;
+        if (planned_streamk)
+            *planned_streamk = 0;
+        if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+            return false;
+
+        CUDAPrefillContext_ temp_ctx;
+        temp_ctx.device_id = cuda_device_id;
+        temp_ctx.require_workspace_scratch = true;
+
+        PrefillWorkspacePlan plan;
+        switch (codebook_id)
+        {
+        case 0:
+            plan = planGenericPrefillWorkspace<0>(M, N, K, &temp_ctx);
+            break;
+        case 4:
+            plan = planGenericPrefillWorkspace<4>(M, N, K, &temp_ctx);
+            break;
+        case 5:
+            plan = planGenericPrefillWorkspace<5>(M, N, K, &temp_ctx);
+            break;
+        case 6:
+            plan = planGenericPrefillWorkspace<6>(M, N, K, &temp_ctx);
+            break;
+        case 7:
+            plan = planGenericPrefillWorkspace<7>(M, N, K, &temp_ctx);
+            break;
+        case 8:
+            plan = planGenericPrefillWorkspace<8>(M, N, K, &temp_ctx);
+            break;
+        case 9:
+            plan = planGenericPrefillWorkspace<9>(M, N, K, &temp_ctx);
+            break;
+        case 10:
+            plan = planGenericPrefillWorkspace<10>(M, N, K, &temp_ctx);
+            break;
+        case 11:
+            plan = planGenericPrefillWorkspace<11>(M, N, K, &temp_ctx);
+            break;
+        case 12:
+            plan = planGenericPrefillWorkspace<12>(M, N, K, &temp_ctx);
+            break;
+        case 13:
+            plan = planGenericPrefillWorkspace<13>(M, N, K, &temp_ctx);
+            break;
+        case 14:
+            plan = planGenericPrefillWorkspace<14>(M, N, K, &temp_ctx);
+            break;
+        case 15:
+            plan = planGenericPrefillWorkspace<15>(M, N, K, &temp_ctx);
+            break;
+        case 16:
+            plan = planGenericPrefillWorkspace<16>(M, N, K, &temp_ctx);
+            break;
+        case 17:
+            plan = planGenericPrefillWorkspace<17>(M, N, K, &temp_ctx);
+            break;
+        case 19:
+            plan = planGenericPrefillWorkspace<19>(M, N, K, &temp_ctx);
+            break;
+        default:
+            return false;
+        }
+
+        if (splitk_partials_bytes)
+            *splitk_partials_bytes = plan.splitk_partials_bytes;
+        if (streamk_fixup_bytes)
+            *streamk_fixup_bytes = plan.streamk_fixup_bytes;
+        if (planned_split_k)
+            *planned_split_k = plan.split_k;
+        if (planned_streamk)
+            *planned_streamk = plan.streamk;
+        return true;
     }
 } // extern "C"
 
@@ -4104,6 +4351,7 @@ extern "C"
         // Benchmark helper: use a thread-local context for the sweep
         static thread_local CUDAPrefillContext_ tl_sweep_ctx{};
         tl_sweep_ctx.device_id = device_id;
+        tl_sweep_ctx.require_workspace_scratch = false;
         CUDAPrefillContext_ *pctx = &tl_sweep_ctx;
 
         cudaStream_t cs = static_cast<cudaStream_t>(stream);

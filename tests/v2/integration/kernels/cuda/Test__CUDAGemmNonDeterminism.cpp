@@ -1259,6 +1259,94 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
 #endif
 }
 
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIPrefillForcedSplitKDeclaresWorkspaceScratch)
+{
+#ifdef HAVE_CUDA
+    ScopedCudaPrefillModes modes;
+    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w2x2=*/1, /*split_k=*/2);
+    cudaNativeVNNIPrefill_setStreamKMode(-1);
+    cudaNativeVNNIPrefill_setBK256Mode(-1);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    constexpr int M = 32;
+    constexpr int N = 512;
+    constexpr int K = 512;
+    constexpr size_t padded_m = 128;
+    constexpr size_t expected_splitk_bytes = 2ULL * padded_m * N * sizeof(float);
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    auto weight = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 424242u);
+    ASSERT_TRUE(weight->ensureOnDevice(gpu_device_, stream));
+
+    auto *kernel = getPreparedKernel(weight.get(), gpu_device_);
+    ASSERT_NE(kernel, nullptr);
+
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
+    ASSERT_NE(ws, nullptr);
+    auto reqs = ws->getWorkspaceRequirements(M, N, K);
+
+    bool found_splitk = false;
+    for (const auto &buf : reqs.buffers)
+    {
+        if (buf.name.find("cuda_native_vnni_prefill_splitk_partials_") == 0)
+        {
+            found_splitk = true;
+            EXPECT_GE(buf.size_bytes, expected_splitk_bytes);
+            EXPECT_TRUE(buf.required);
+        }
+    }
+    ASSERT_TRUE(found_splitk) << "Forced split-K prefill must declare workspace-owned partials";
+
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    ws->bindWorkspace(workspace_.get());
+
+    FP32Tensor input({static_cast<size_t>(M), static_cast<size_t>(K)});
+    FP32Tensor output({static_cast<size_t>(M), static_cast<size_t>(N)});
+    for (int i = 0; i < M * K; ++i)
+        input.mutable_data()[i] = dist_(rng_);
+
+    ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    kernel->setGPUStream(stream);
+    ASSERT_TRUE(kernel->multiply_tensor(
+        &input,
+        &output,
+        M,
+        N,
+        K,
+        true,
+        1.0f,
+        0.0f,
+        nullptr,
+        nullptr,
+        gpu_device_.ordinal,
+        workspace_.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    int selected_tile = -1;
+    int selected_split_k = 0;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(
+        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+    EXPECT_EQ(selected_tile, 1);
+    EXPECT_EQ(selected_split_k, 2);
+    EXPECT_EQ(used_bk256, 0);
+    EXPECT_EQ(used_streamk, 0);
+
+    ws->unbindWorkspace();
+    workspace_.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
 // ============================================================================
 // Custom main with MPI initialization
 // ============================================================================

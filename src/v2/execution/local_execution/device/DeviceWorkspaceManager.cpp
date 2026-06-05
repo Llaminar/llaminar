@@ -12,6 +12,7 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../backends/IBackend.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 
 namespace llaminar2
 {
@@ -48,6 +49,15 @@ namespace llaminar2
         if (requirements.buffers.empty())
         {
             LOG_DEBUG("[DeviceWorkspaceManager] Empty requirements, marking as allocated with no buffers");
+            PerfStatsCollector::addCounter(
+                "memory",
+                "workspace_allocate_requests",
+                1.0,
+                "allocate",
+                device_.to_string(),
+                {{"result", "empty"},
+                 {"budget_bytes", std::to_string(budget_bytes_)},
+                 {"buffer_count", "0"}});
             allocated_ = true;
             return true;
         }
@@ -159,6 +169,15 @@ namespace llaminar2
                                                  << " bytes=" << total_size
                                                  << " device=" << device_.to_string()
                                                  << " ordinal=" << device_ordinal);
+        PerfStatsCollector::addCounter(
+            "memory",
+            "workspace_block_bytes",
+            static_cast<double>(total_size),
+            "allocate",
+            device_.to_string(),
+            {{"budget_bytes", std::to_string(budget_bytes_)},
+             {"buffer_count", std::to_string(buffers.size())},
+             {"bytes", std::to_string(total_size)}});
 
         // Suballocate buffers at aligned offsets
         size_t current_offset = 0;
@@ -177,6 +196,17 @@ namespace llaminar2
                                                << " offset=" << current_offset
                                                << " size=" << buf->size_bytes
                                                << " device=" << device_.to_string());
+            PerfStatsCollector::addCounter(
+                "memory",
+                "workspace_suballoc_bytes",
+                static_cast<double>(buf->size_bytes),
+                "allocate",
+                device_.to_string(),
+                {{"name", buf->name},
+                 {"required", buf->required ? "true" : "false"},
+                 {"alignment", std::to_string(buf->alignment)},
+                 {"offset_bytes", std::to_string(current_offset)},
+                 {"bytes", std::to_string(buf->size_bytes)}});
 
             current_offset += buf->size_bytes;
         }
@@ -198,6 +228,8 @@ namespace llaminar2
 
         if (block_)
         {
+            const size_t release_bytes = block_size_;
+            const size_t release_buffer_count = buffers_.size();
             IBackend *backend = getBackendFor(device_);
             if (backend)
             {
@@ -205,6 +237,14 @@ namespace llaminar2
                 backend->free(block_, device_ordinal);
                 LOG_DEBUG("[DeviceWorkspaceManager] Released " << block_size_
                                                                << " bytes on device " << device_.to_string());
+                PerfStatsCollector::addCounter(
+                    "memory",
+                    "workspace_release_bytes",
+                    static_cast<double>(release_bytes),
+                    "release",
+                    device_.to_string(),
+                    {{"buffer_count", std::to_string(release_buffer_count)},
+                     {"bytes", std::to_string(release_bytes)}});
             }
             block_ = nullptr;
             block_size_ = 0;

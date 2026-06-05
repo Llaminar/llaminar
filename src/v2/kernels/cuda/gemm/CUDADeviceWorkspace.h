@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 #ifdef __cplusplus
@@ -60,6 +61,22 @@ extern "C"
     // -----------------------------------------------------------------
     CUDAPrefillContext *cudaPrefillContext_create(int cuda_device_id);
     void cudaPrefillContext_destroy(CUDAPrefillContext *ctx);
+    void cudaPrefillContext_bindWorkspace(
+        CUDAPrefillContext *ctx,
+        float *splitk_partials,
+        size_t splitk_partials_bytes,
+        float *streamk_fixup,
+        size_t streamk_fixup_bytes);
+    bool cudaNativeVNNIPrefill_getWorkspacePlan(
+        uint8_t codebook_id,
+        int M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *splitk_partials_bytes,
+        size_t *streamk_fixup_bytes,
+        int *planned_split_k,
+        int *planned_streamk);
 
     // -----------------------------------------------------------------
     // cuBLAS context lifetime
