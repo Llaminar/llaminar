@@ -254,6 +254,8 @@ namespace llaminar2
         bool routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
                        int seq_len, int d_model, int num_experts, int top_k,
                        bool normalize_weights, DeviceRouteBuffers &buffers);
+        bool routeLogitsCuBLAS(const float *hidden, const float *gate_weights, float *logits,
+                               int seq_len, int d_model, int num_experts);
 
         bool ensureStagingCapacity(int count);
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
@@ -339,6 +341,7 @@ namespace llaminar2
         };
 
         int device_ordinal_ = 0;
+        void *router_cublas_handle_ = nullptr;
 
         int *d_staging_indices_ = nullptr;
         float *d_staging_weights_ = nullptr;
