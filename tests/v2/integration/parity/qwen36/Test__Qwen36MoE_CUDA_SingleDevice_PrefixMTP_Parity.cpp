@@ -204,6 +204,13 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleUsesFusedVerifie
     PerfStatsCollector::reset();
 }
 
+TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleDynamicDepthRequestStateResets)
+{
+    runMoEMTPDynamicDepthRequestStateResetBenchmarkStyle(
+        cudaSingleDeviceBenchmarkPromptCase(),
+        16);
+}
+
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesBaselineTokens)
 {
     runMoEMTPParity(cudaSingleDeviceDepth3Case(), false, 3);

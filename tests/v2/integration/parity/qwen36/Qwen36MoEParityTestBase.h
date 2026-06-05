@@ -620,7 +620,8 @@ namespace llaminar2::test::parity::qwen36
         bool enable_prefix_cache,
         int block_size,
         bool enable_mtp = false,
-        int mtp_draft_tokens = 1)
+        int mtp_draft_tokens = 1,
+        MTPDepthPolicyConfig mtp_depth_policy = {})
     {
         OrchestrationConfig config = OrchestrationConfig::defaults();
         config.model_path = model_path;
@@ -637,6 +638,7 @@ namespace llaminar2::test::parity::qwen36
         config.prefix_cache.ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
         config.mtp.enabled = enable_mtp;
         config.mtp.draft_tokens = std::max(1, mtp_draft_tokens);
+        config.mtp.depth_policy = mtp_depth_policy;
         config.moe_expert_parallel_plan = test_case.moe_expert_parallel_plan;
 
         switch (test_case.topology)
@@ -2119,7 +2121,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runMoEMTPBenchmarkStyleSkipGatherParity(
         const MoEPrefixRestoreParityCase &test_case,
         int decode_token_budget,
-        int mtp_draft_tokens = 1)
+        int mtp_draft_tokens = 1,
+        MTPDepthPolicyConfig mtp_depth_policy = {})
     {
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
@@ -2146,7 +2149,8 @@ namespace llaminar2::test::parity::qwen36
                     false,
                     2,
                     true,
-                    mtp_draft_tokens));
+                    mtp_draft_tokens,
+                    mtp_depth_policy));
             EXPECT_NE(runner, nullptr);
             if (!runner)
             {
@@ -2290,6 +2294,143 @@ namespace llaminar2::test::parity::qwen36
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_moe_grouped_prefill_swiglu_path_calls"});
         EXPECT_GT(match->count, 0u);
+    }
+
+    inline void runMoEMTPDynamicDepthRequestStateResetBenchmarkStyle(
+        const MoEPrefixRestoreParityCase &test_case,
+        int decode_token_budget)
+    {
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadMoEReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+        if (moeReferenceInputsStoppedCurrentTest())
+        {
+            return;
+        }
+        ASSERT_GT(decode_token_budget, 0);
+        (void)expected_tokens;
+
+        ScopedCudaMoEFusedVerifierPrefillRoutes fused_verifier_prefill_routes;
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+
+        MTPDepthPolicyConfig dynamic_policy;
+        dynamic_policy.mode = MTPDepthPolicyMode::Dynamic;
+        dynamic_policy.min_depth = 1;
+        dynamic_policy.max_depth = 1;
+        dynamic_policy.initial_depth = 1;
+
+        auto runner = factory->createFromOrchestrationConfig(
+            makeMoEPrefixRestoreConfig(
+                test_case,
+                model_path,
+                false,
+                2,
+                true,
+                1,
+                dynamic_policy));
+        ASSERT_NE(runner, nullptr);
+        if (!runner)
+        {
+            return;
+        }
+
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+        runner->setSamplingParams(greedy);
+        runner->setSkipLogitsGatherDecode(true);
+        runner->setSkipLogitsGatherPrefill(true);
+
+        auto prefill_once = [&]() -> bool
+        {
+            if (!runner->prefill(prompt_tokens))
+            {
+                ADD_FAILURE() << runner->lastError();
+                return false;
+            }
+            return true;
+        };
+
+        auto decode_loop = [&](std::vector<int32_t> *out_tokens) -> bool
+        {
+            int produced = 0;
+            while (produced < decode_token_budget)
+            {
+                const int remaining = decode_token_budget - produced;
+                runner->setDecodeStepTokenBudget(remaining);
+                GenerationResult step = runner->decodeStep();
+                runner->setDecodeStepTokenBudget(0);
+                if (!step.error.empty())
+                {
+                    ADD_FAILURE() << step.error;
+                    return false;
+                }
+                if (step.tokens.empty())
+                {
+                    ADD_FAILURE() << "decode produced no tokens";
+                    return false;
+                }
+                if (step.tokens.size() > static_cast<size_t>(remaining))
+                {
+                    ADD_FAILURE() << "decode exceeded remaining token budget: "
+                                  << step.tokens.size() << " > " << remaining;
+                    return false;
+                }
+                if (out_tokens)
+                {
+                    out_tokens->insert(
+                        out_tokens->end(),
+                        step.tokens.begin(),
+                        step.tokens.end());
+                }
+                produced += static_cast<int>(step.tokens.size());
+                if (!runner->maybeApplyMoERebalance())
+                {
+                    ADD_FAILURE() << runner->lastError();
+                    return false;
+                }
+                if (step.is_complete)
+                {
+                    return true;
+                }
+            }
+            return true;
+        };
+
+        runner->setSuppressTimeline(true);
+        runner->clearCache();
+        ASSERT_TRUE(prefill_once());
+        ASSERT_TRUE(decode_loop(nullptr));
+        const auto warmup_state = runner->prefixStateProbe();
+        ASSERT_GT(warmup_state.mtp_draft_steps, 0u);
+
+        runner->clearCache();
+        const auto cleared_state = runner->prefixStateProbe();
+        EXPECT_EQ(cleared_state.mtp_draft_steps, 0u);
+        EXPECT_EQ(cleared_state.mtp_accepted_tokens, 0u);
+        EXPECT_EQ(cleared_state.mtp_rejected_tokens, 0u);
+        EXPECT_EQ(cleared_state.mtp_rollbacks, 0u);
+        EXPECT_EQ(cleared_state.mtp_depth_policy_windows, 0u);
+        EXPECT_EQ(cleared_state.mtp_depth_policy_updates, 0u);
+        EXPECT_EQ(cleared_state.mtp_current_depth, 1);
+        EXPECT_EQ(cleared_state.mtp_min_depth, 1);
+        EXPECT_EQ(cleared_state.mtp_max_depth, 1);
+
+        std::vector<int32_t> measured_tokens;
+        runner->setSuppressTimeline(false);
+        ASSERT_TRUE(prefill_once());
+        ASSERT_TRUE(decode_loop(&measured_tokens));
+        EXPECT_EQ(measured_tokens.size(), static_cast<size_t>(decode_token_budget))
+            << "measured tokens: " << joinTokensMoEDiagnostic(measured_tokens);
+        const auto measured_state = runner->prefixStateProbe();
+        EXPECT_GT(measured_state.mtp_draft_steps, 0u);
+        EXPECT_LE(measured_state.mtp_draft_steps,
+                  static_cast<uint64_t>(decode_token_budget));
+
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+        runner->shutdown();
     }
 
     inline void expectCudaMoEMTPVerifierSharedExpertFusedPrefillPath()

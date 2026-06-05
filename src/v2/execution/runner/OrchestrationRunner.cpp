@@ -606,6 +606,11 @@ namespace llaminar2
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();
+        mtp_stats_ = {};
+        if (mtp_depth_controller_)
+        {
+            mtp_depth_controller_->reset();
+        }
         ready_sampled_token_.reset();
         last_token_ = prompt_tokens.back();
 
@@ -2801,6 +2806,11 @@ namespace llaminar2
         mtp_bypassed_ = false;
         mtp_bypass_recorded_for_request_ = false;
         mtp_bypass_reason_.clear();
+        mtp_stats_ = {};
+        if (mtp_depth_controller_)
+        {
+            mtp_depth_controller_->reset();
+        }
     }
 
     PrefixRuntimeStateSnapshot OrchestrationRunner::prefixStateProbe() const
