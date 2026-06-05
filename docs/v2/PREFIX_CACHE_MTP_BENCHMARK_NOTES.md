@@ -59,11 +59,11 @@ Fresh checks:
 - Trusted `stage_gpu` graph-replay timing is now exportable without legacy
   profiling, and CUDA NativeVNNI prompt-prefill emits structured
   `kernel.cuda_native_vnni_prefill_calls` route counters.
-- CUDA NativeVNNI prefill split-K/fixup and GEMV KPAR scratch now bind
-  through `DeviceWorkspaceManager`; workspace suballocs emit structured memory
-  counters. CUDA/ROCm MoE request scratch and GDN deinterleave scratch now also
-  require bound graph workspace instead of raw hot-path allocation. CUDA
-  attention decode split-K partials now use the same workspace contract.
+- CUDA NativeVNNI scratch, CUDA/ROCm MoE request scratch, CUDA KV gather, GDN
+  deinterleave scratch, and CUDA attention decode partials now bind through
+  `DeviceWorkspaceManager`; workspace suballocs emit structured memory counters.
+  The old CUDA cuBLAS attention fallback/env knob was removed rather than
+  preserving hidden O(seq^2) `cudaMalloc` state.
 - Dense diagnostic at graph bucket `M=600` recorded top prompt-prefill routes:
   `17408x5120` Q4_K tile 4, `5120x17408` Q4_K tile 2, and GDN projection
   shapes including `6144x5120`, `5120x6144`, `10240x5120`, and `1024x5120`.

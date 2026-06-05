@@ -51,15 +51,6 @@ extern "C"
         int head_start,
         int gqa_n_rep);
 
-    // cuBLAS-based unfused attention for prefill with FP16 KV
-    int cudaFlashAttn_prefill_cublas_fp16kv(
-        const float *Q, const void *K_fp16, const void *V_fp16, float *O,
-        int batch_size, int seq_len, int kv_len,
-        int n_heads, int n_kv_heads, int head_dim,
-        bool causal, int position_offset,
-        void *stream,
-        int device_idx);
-
     // Flash Decoding for single-token decode with split-K parallelism
     int cudaFlashAttn_decode_fp32(
         const float *Q, const float *K_cache, const float *V_cache, float *O,
@@ -968,32 +959,6 @@ namespace llaminar2
                 }
 
                 // PREFILL: FA2 with FP16 KV
-
-                // Check for cuBLAS attention override (env: LLAMINAR_CUBLAS_ATTN=1)
-                static const int use_cublas_attn = []()
-                {
-                    return debugEnv().attention.cuda_cublas_attn ? 1 : 0;
-                }();
-
-                if (use_cublas_attn && n_heads % n_kv_heads == 0)
-                {
-                    int result;
-                    {
-                        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
-                        result = cudaFlashAttn_prefill_cublas_fp16kv(
-                            Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
-                            batch_size, seq_len, kv_len,
-                            n_heads, n_kv_heads, head_dim,
-                            causal, 0, // position_offset
-                            stream_, dev);
-                    }
-                    if (result != 0)
-                    {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] cuBLAS attention failed");
-                        return false;
-                    }
-                    return true;
-                }
 
                 int result;
                 {

@@ -647,7 +647,6 @@ namespace llaminar2
         bool debug_kv_append_source_snapshot = false;         ///< Capture source K/V tensors before append when LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT is non-zero.
         std::optional<int> debug_kv_append_source_layer;      ///< Selected layer for source K/V snapshots; nullopt means all layers.
         int cuda_fa2_tile_kv = 0;                             ///< CUDA FA2 KV tile override (LLAMINAR_FA2_TILE_KV, default 0=auto).
-        bool cuda_cublas_attn = false;                        ///< Use CUDA cuBLAS attention path only when LLAMINAR_CUBLAS_ATTN=1.
 
         // Wo projection mode (JIT backend only)
         // When enabled, Wo weights are expected to be passed as packed QuantisedPackedWeights
@@ -775,9 +774,6 @@ namespace llaminar2
 
             const char *cuda_fa2_tile_kv_env = std::getenv("LLAMINAR_FA2_TILE_KV");
             cuda_fa2_tile_kv = cuda_fa2_tile_kv_env ? std::atoi(cuda_fa2_tile_kv_env) : 0;
-
-            const char *cuda_cublas_attn_env = std::getenv("LLAMINAR_CUBLAS_ATTN");
-            cuda_cublas_attn = cuda_cublas_attn_env && std::atoi(cuda_cublas_attn_env) == 1;
         }
 
     private:
