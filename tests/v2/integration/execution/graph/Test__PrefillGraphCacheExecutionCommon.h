@@ -549,7 +549,7 @@ namespace
             if (topology_delta_on_maintenance_ != 0)
                 topology_signature += topology_delta_on_maintenance_;
             if (engine_to_clear_on_maintenance_)
-                engine_to_clear_on_maintenance_->clearCache();
+                engine_to_clear_on_maintenance_->discardAllCachedGraphs();
             return true;
         }
 

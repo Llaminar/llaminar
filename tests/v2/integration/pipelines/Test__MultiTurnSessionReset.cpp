@@ -12,7 +12,7 @@
  *
  * Regression coverage for:
  *   - Embedding stale dynamic_params_active_ after clearCache() (eeca83dd)
- *   - Graph cache invalidation on clear_cache() (eeca83dd)
+ *   - Graph cache reuse after clear_cache() without stale request state
  *   - KernelFactory::resetAllDynamicState() lifecycle (8666332f)
  *   - Session epoch reset (8666332f)
  *   - Stale activation buffer K/V in decode after graph cache reuse

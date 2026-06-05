@@ -149,7 +149,7 @@ TEST(Test__PrefillGraphCacheIntegration, InvalidateAllClearsPrefillCache)
     EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold);
 }
 
-TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillCache)
+TEST(Test__PrefillGraphCacheIntegration, SessionResetPreservesPrefillCache)
 {
     ForwardGraphCache cache;
 
@@ -168,7 +168,32 @@ TEST(Test__PrefillGraphCacheIntegration, SessionResetInvalidatesPrefillCache)
     cache.resetSessionState();
 
     EXPECT_NE(cache.prefill_graph_cache, nullptr);
-    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold);
+    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Warmup)
+        << "Request/session reset must preserve the prefill graph lifecycle so "
+           "benchmark warmup can advance Warmup -> Ready and steady-state runs can replay";
+}
+
+TEST(Test__PrefillGraphCacheIntegration, WorkspaceRebindInvalidatesPrefillCache)
+{
+    ForwardGraphCache cache;
+
+    PrefillGraphConfig config;
+    config.enabled = true;
+    config.min_seq_len = 1;
+    cache.prefill_graph_cache = std::make_unique<PrefillGraphCache>(config);
+
+    PrefillGraphCacheKey key;
+    key.seq_len = 512;
+    key.device_id = testGPUDevice();
+
+    cache.prefill_graph_cache->markWarmedUp(key);
+    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Warmup);
+
+    cache.resetReplayStateAfterWorkspaceRebind();
+
+    EXPECT_NE(cache.prefill_graph_cache, nullptr);
+    EXPECT_EQ(cache.prefill_graph_cache->phase(key), PrefillGraphPhase::Cold)
+        << "Captured graph entries encode workspace addresses and must be rebuilt after rebind";
 }
 
 // =============================================================================

@@ -1246,7 +1246,7 @@ namespace llaminar2
             applyExpertMasks(masks, received);
 
             if (forward_engine_)
-                forward_engine_->clearCache();
+                forward_engine_->discardAllCachedGraphs();
             mtp_sidecar_depth0_cache_.invalidate();
             mtp_sidecar_depth0_chained_cache_.invalidate();
             mtp_sidecar_depth0_kv_only_cache_.invalidate();
@@ -2643,7 +2643,7 @@ namespace llaminar2
     // Cache Management
     // =========================================================================
 
-    void DeviceGraphOrchestrator::clearCache()
+    void DeviceGraphOrchestrator::invalidateExecutionCaches()
     {
         // Clear graph caches
         for (auto &cache : layer_graph_cache_)
@@ -2653,7 +2653,7 @@ namespace llaminar2
 
         // Clear forward graph caches
         if (forward_engine_)
-            forward_engine_->clearCache();
+            forward_engine_->discardAllCachedGraphs();
         mtp_sidecar_depth0_cache_.invalidate();
         mtp_sidecar_depth0_chained_cache_.invalidate();
         mtp_sidecar_depth0_kv_only_cache_.invalidate();
@@ -2674,7 +2674,7 @@ namespace llaminar2
         resetKernelDynamicState();
         ++session_epoch_;
 
-        LOG_DEBUG("[DeviceGraphOrchestrator] All caches cleared");
+        LOG_DEBUG("[DeviceGraphOrchestrator] Execution caches invalidated");
     }
 
     void DeviceGraphOrchestrator::invalidateGraphCache(int layer_idx)

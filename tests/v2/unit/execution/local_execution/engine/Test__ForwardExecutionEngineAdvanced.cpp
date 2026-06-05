@@ -692,7 +692,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, InvalidateAll_ForcesRebuild)
     EXPECT_EQ(host.build_calls, 2) << "invalidateAll should force rebuild";
 }
 
-TEST_F(Test__ForwardExecutionEngineAdvanced, ClearCache_ForcesRebuild)
+TEST_F(Test__ForwardExecutionEngineAdvanced, DiscardAllCachedGraphs_ForcesRebuild)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
     TrackingHost host(&mock_ctx_);
@@ -704,7 +704,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, ClearCache_ForcesRebuild)
     engine.execute(t1.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
 
-    engine.clearCache();
+    engine.discardAllCachedGraphs();
     EXPECT_TRUE(engine.cacheEmpty());
 
     TestInput t2(1);

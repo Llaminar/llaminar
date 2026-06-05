@@ -343,9 +343,9 @@ namespace llaminar2
          * decode graphs are more stateful: they encode a specific replay lifecycle
          * over the previous request. Dropping segment captures forces the next
          * decode to warm up/capture again against the freshly cleared model state.
-         * Monolithic prefill graph entries also encode raw dynamic-param and
-         * prepared-kernel state. Session reset clears stage/kernel dynamic state,
-         * so those captures must be dropped and rebuilt for the next request.
+         * Monolithic prefill graph entries are keyed by stable request shape and
+         * refresh token ids, positions, stage dynamic params, and prefill replay
+         * params before launch, so they can survive ordinary request clears.
          *
          * The capture stream itself is retained because cached stages store that
          * stream pointer internally. Destroying it here would leave dynamic-param
@@ -387,14 +387,12 @@ namespace llaminar2
          * This is the request-boundary counterpart to invalidate(): it keeps the
          * cached ComputeGraph, stable token buffers, workspace bindings, and
          * prefill graph entries, but clears stage/kernels' dynamic metadata and
-         * replay lifecycle state so the next prompt starts from cleared KV/GDN
-         * model state.
+         * decode replay lifecycle state so the next prompt starts from cleared
+         * KV/GDN model state.
          */
         void resetSessionState()
         {
             resetReplayState();
-            if (prefill_graph_cache)
-                prefill_graph_cache->invalidateAll(PrefillGraphRejectReason::SessionReset);
 
             if (graph)
             {

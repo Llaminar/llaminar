@@ -238,9 +238,12 @@ namespace llaminar2
         virtual int currentPosition() const = 0;
 
         /**
-         * @brief Clear KV cache and reset position
+         * @brief Reset request/session state before starting a new sequence.
          *
-         * Call before starting a new sequence.
+         * This is a request-boundary reset. It must not destructively discard
+         * reusable graph caches, prepared weights, workspace bindings, or device
+         * contexts unless a lower-level implementation has detected a topology or
+         * workspace lifetime change.
          */
         virtual void clearCache() = 0;
 

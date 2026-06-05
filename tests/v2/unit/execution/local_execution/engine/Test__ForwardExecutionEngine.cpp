@@ -282,7 +282,7 @@ namespace
             if (bump_epoch_on_maintenance)
                 ++placement_epoch;
             if (engine_to_clear_on_maintenance)
-                engine_to_clear_on_maintenance->clearCache();
+                engine_to_clear_on_maintenance->discardAllCachedGraphs();
             return true;
         }
 
@@ -1185,10 +1185,10 @@ TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketOnCpu_FallsThrough)
 // Cache Management
 // =========================================================================
 
-TEST_F(Test__ForwardExecutionEngine, ClearCacheOnEmpty)
+TEST_F(Test__ForwardExecutionEngine, DiscardAllCachedGraphsOnEmpty)
 {
     auto engine = makeEngine();
-    engine.clearCache(); // Should not crash on empty cache
+    engine.discardAllCachedGraphs(); // Should not crash on empty cache
     EXPECT_TRUE(engine.cacheEmpty());
 }
 
@@ -1483,10 +1483,10 @@ TEST_F(Test__ForwardExecutionEngine, Prefill_LargeSeqLen_NotDecode)
 }
 
 // =========================================================================
-// clearCache after population attempt
+// Destructive graph discard after population attempt
 // =========================================================================
 
-TEST_F(Test__ForwardExecutionEngine, ClearCache_AfterExecute)
+TEST_F(Test__ForwardExecutionEngine, DiscardAllCachedGraphs_AfterExecute)
 {
     auto engine = makeEngine();
     MockForwardExecutionHost host(&mock_ctx_);
@@ -1498,8 +1498,8 @@ TEST_F(Test__ForwardExecutionEngine, ClearCache_AfterExecute)
 
     engine.execute(input, output, host);
 
-    // Cache may or may not be empty after failed build, but clearCache
-    // should always succeed
-    engine.clearCache();
+    // Cache may or may not be empty after failed build, but destructive graph
+    // discard should always succeed.
+    engine.discardAllCachedGraphs();
     EXPECT_TRUE(engine.cacheEmpty());
 }

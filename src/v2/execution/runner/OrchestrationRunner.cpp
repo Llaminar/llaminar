@@ -2790,7 +2790,8 @@ namespace llaminar2
 
     void OrchestrationRunner::clearCache()
     {
-        // Broadcast to worker ranks so they clear their KV caches in lockstep
+        // Request-boundary reset: broadcast to worker ranks so they clear
+        // KV/recurrent state in lockstep while preserving reusable graph caches.
         if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
             broadcastCommand(MPICommand::CLEAR_CACHE);
 

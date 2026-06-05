@@ -489,7 +489,12 @@ namespace llaminar2
         virtual int vocab_size() const = 0;
 
         /**
-         * @brief Clear KV cache (reset for new sequence)
+         * @brief Reset request/session state for a new sequence.
+         *
+         * Implementations must clear KV/recurrent/request-local state and reset
+         * stage dynamic metadata, but preserve reusable graph topology, prepared
+         * weights, workspace bindings, and device contexts. Destructive cache
+         * invalidation should use an explicitly named implementation method.
          */
         virtual void clear_cache() = 0;
 

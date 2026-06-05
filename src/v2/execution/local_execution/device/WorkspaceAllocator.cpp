@@ -237,7 +237,7 @@ namespace llaminar2
             }
 
             DeviceId device = node->device;
-            if ((!device.is_valid() || (!device.is_gpu() && !device.is_cpu())) &&
+            if ((!device.is_valid() || !device.is_gpu()) &&
                 node->stage->device().is_valid())
             {
                 device = node->stage->device();
@@ -246,7 +246,7 @@ namespace llaminar2
             {
                 device = node->stage->device();
             }
-            if (!device.is_gpu() && !device.is_cpu())
+            if (!device.is_gpu())
             {
                 continue;
             }
@@ -296,7 +296,7 @@ namespace llaminar2
         for (const auto &request : extra_consumers)
         {
             if (!request.consumer ||
-                (!request.device.is_gpu() && !request.device.is_cpu()))
+                !request.device.is_gpu())
             {
                 continue;
             }
@@ -311,7 +311,7 @@ namespace llaminar2
 
         if (consumers_by_device.empty())
         {
-            LOG_DEBUG("[WorkspaceAllocator] No CPU/GPU workspace consumers found in graph");
+            LOG_DEBUG("[WorkspaceAllocator] No GPU workspace consumers found in graph");
             return true;
         }
 

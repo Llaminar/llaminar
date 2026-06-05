@@ -538,13 +538,13 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, InitializeGraphCache_WithM
     EXPECT_EQ(stats.attention_cache_misses, 0u);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, ClearCache_WithMockBuilder)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, InvalidateExecutionCaches_WithMockBuilder)
 {
     auto deps = minimalDeps();
     DeviceGraphOrchestrator dgo(std::move(deps));
 
     dgo.initializeGraphCache(24);
-    dgo.clearCache();
+    dgo.invalidateExecutionCaches();
 
     auto stats = dgo.getCacheStats();
     EXPECT_EQ(stats.attention_cache_hits, 0u);

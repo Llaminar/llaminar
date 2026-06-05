@@ -585,7 +585,7 @@ namespace llaminar2
         }
     }
 
-    void ForwardExecutionEngine::clearCache()
+    void ForwardExecutionEngine::discardAllCachedGraphs()
     {
         invalidateAll();
         cache_.clear();

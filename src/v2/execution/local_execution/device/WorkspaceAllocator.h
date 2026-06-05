@@ -4,7 +4,9 @@
  *
  * Extracted from DeviceGraphBufferManager to decouple workspace management
  * from buffer lifecycle management. Provides model-aware GPU/CPU workspace
- * allocation with per-device budget enforcement.
+ * allocation with per-device budget enforcement. Graph-stage workspace binding
+ * is GPU-only; CPU scratch is owned by CPU kernels or higher-level CPU memory
+ * managers rather than DeviceWorkspaceManager.
  *
  * @author David Sanftenberg
  * @date March 2026

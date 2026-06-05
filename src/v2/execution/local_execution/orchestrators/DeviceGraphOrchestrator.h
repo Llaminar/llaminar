@@ -638,9 +638,13 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Clear all caches (graphs, device contexts, state)
+         * @brief Destructively invalidate execution caches and device contexts.
+         *
+         * This is a topology/workspace lifetime reset, not a request boundary.
+         * Normal prompt/session resets must use IInferenceRunner::clear_cache(),
+         * which preserves reusable graph topology and prepared runtime resources.
          */
-        void clearCache();
+        void invalidateExecutionCaches();
 
         /**
          * @brief Invalidate graph cache for a specific layer
@@ -1883,7 +1887,7 @@ namespace llaminar2
         int vocab_size() const override { return graph_builder_ ? graph_builder_->config().vocab_size : 0; }
 
         /**
-         * @brief Clear KV cache (IInferenceRunner override)
+         * @brief Reset request/session state for a new sequence.
          *
          * Resets inference state (KV cache, positions, model recurrence) while
          * preserving cached ComputeGraphs. Cached stages and GPU replay segments

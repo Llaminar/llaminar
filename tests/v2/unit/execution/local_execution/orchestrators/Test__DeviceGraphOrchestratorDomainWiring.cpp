@@ -261,7 +261,7 @@ TEST_F(Test__DeviceGraphOrchestratorDomainWiring, DomainConfigPersistsAcrossOper
     orchestrator->setDomainConfig(domain_config);
 
     // Perform some operations
-    orchestrator->clearCache();
+    orchestrator->invalidateExecutionCaches();
     orchestrator->initializeGraphCache(config_.n_layers);
 
     // Domain config should still be set

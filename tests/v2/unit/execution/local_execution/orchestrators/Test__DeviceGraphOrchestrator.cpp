@@ -423,13 +423,13 @@ TEST_F(Test__DeviceGraphOrchestrator, SetGraphCachingEnabled)
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, ClearCacheResetsCacheStats)
+TEST_F(Test__DeviceGraphOrchestrator, InvalidateExecutionCachesResetsCacheStats)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator->initializeGraphCache(24);
 
-    // Clear cache
-    orchestrator->clearCache();
+    // Destructively invalidate execution caches
+    orchestrator->invalidateExecutionCaches();
 
     // Verify stats are reset
     auto stats = orchestrator->getCacheStats();
@@ -497,7 +497,7 @@ TEST_F(Test__DeviceGraphOrchestrator, GetDeviceContextMultipleDevices)
     }
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, ClearCacheClearsDeviceContexts)
+TEST_F(Test__DeviceGraphOrchestrator, InvalidateExecutionCachesClearsDeviceContexts)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
@@ -508,8 +508,8 @@ TEST_F(Test__DeviceGraphOrchestrator, ClearCacheClearsDeviceContexts)
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
     }
 
-    // Clear all caches
-    orchestrator->clearCache();
+    // Destructively invalidate all execution caches
+    orchestrator->invalidateExecutionCaches();
 
     // New context should be created (different pointer)
     IDeviceContext *ctx_after = orchestrator->getDeviceContext(DeviceId::cpu());

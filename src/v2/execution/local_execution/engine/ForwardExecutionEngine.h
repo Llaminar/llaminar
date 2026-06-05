@@ -344,8 +344,8 @@ namespace llaminar2
         /** Invalidate all cached graphs and release resources. */
         void invalidateAll();
 
-        /** Clear all cache entries (invalidate + remove). */
-        void clearCache();
+        /** Discard all cached forward graphs after a topology/workspace lifetime change. */
+        void discardAllCachedGraphs();
 
         /**
          * @brief Drop captured GPU replay state while keeping cached ComputeGraphs.
