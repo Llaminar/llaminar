@@ -36,6 +36,7 @@
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/MoEExpertWeightService.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
@@ -88,6 +89,28 @@ namespace
     // ============================================================================
     // ROCm Availability Check
     // ============================================================================
+
+    std::unique_ptr<DeviceWorkspaceManager> bindDefaultMoEWorkspace(
+        ROCmMoEKernel &kernel,
+        int max_seq_len = 64,
+        int d_model = 2048,
+        int intermediate = 512,
+        int num_experts = 256,
+        int top_k = 16)
+    {
+        auto reqs = MoEWorkspaceBuffers::rocmMoE(
+            max_seq_len,
+            d_model,
+            intermediate,
+            num_experts,
+            top_k);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0),
+            reqs.total_bytes_with_alignment() + 4 * 1024 * 1024);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        kernel.bindWorkspace(workspace.get());
+        return workspace;
+    }
 
     bool hasROCm()
     {
@@ -395,6 +418,7 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesRejectInvalidDescriptors)
     };
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
 
     std::vector<DeviceNativeVNNIMatrixDesc> down_descs;
     down_descs.reserve(num_experts);
@@ -459,6 +483,7 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeVNNICodebo
     };
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
 
     for (size_t case_idx = 0; case_idx < codebooks.size(); ++case_idx)
     {
@@ -533,6 +558,7 @@ TEST(Test__ROCmMoEKernel, Route_DecodeSmall)
 
     // GPU execution
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
 
     // Upload data to device
     float *d_hidden = nullptr, *d_gate_weights = nullptr;
@@ -625,6 +651,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeStateUpdatesTopKAndHistogram)
     ASSERT_EQ(hipMemcpy(device_runtime, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     EXPECT_FALSE(gpu_kernel.decodeRouteSelect(
         nullptr,
         hidden.get(), gate_weights.get(),
@@ -750,6 +777,7 @@ TEST(Test__ROCmMoEKernel, DecodeRuntimeHistogramSyncMatchesHostRecordAcrossToken
     DecodeExpertHistogram runtime_merged(hist_config);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     std::vector<float> hidden_host(static_cast<size_t>(d_model));
     for (int token = 0; token < tokens; ++token)
     {
@@ -843,6 +871,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWaveTopKMatchesDefaultRuntimeTopK)
     ASSERT_EQ(hipMemcpy(runtime_wave, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
@@ -963,6 +992,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectWaveTopKMatchesDefaultRuntimeTopKQwen
     ASSERT_EQ(hipMemcpy(runtime_wave, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
@@ -1097,6 +1127,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectFP16RouterMatchesFP32TopK)
     ASSERT_EQ(hipMemcpy(runtime_fp16, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         {
@@ -1218,6 +1249,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectBF16RouterMatchesFP32TopK)
     ASSERT_EQ(hipMemcpy(runtime_bf16, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     {
         ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
         ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
@@ -1329,6 +1361,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectKPartRouterMatchesFP32TopK)
     ASSERT_EQ(hipMemcpy(runtime_fp32, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     auto expectHistogramMatchesTopK = [&](const DeviceMoELayerRuntime &runtime)
     {
         std::vector<uint64_t> expected(static_cast<size_t>(num_experts), 0);
@@ -1505,6 +1538,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectQ8RouterMatchesFP32TopKAcrossSeeds)
         ASSERT_EQ(hipMemcpy(runtime_q8, &host_runtime, sizeof(DeviceMoELayerRuntime), hipMemcpyHostToDevice), hipSuccess);
 
         ROCmMoEKernel gpu_kernel(0);
+        auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
         {
             ScopedROCmEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "0");
             ScopedROCmEnvOverride grouped_env("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER", "0");
@@ -1607,6 +1641,7 @@ TEST(Test__ROCmMoEKernel, Route_PrefillLarge)
 
     // GPU
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_hidden = nullptr, *d_gate = nullptr;
     hipMalloc(&d_hidden, hidden.size() * sizeof(float));
     hipMalloc(&d_gate, gate_weights.size() * sizeof(float));
@@ -1670,6 +1705,7 @@ TEST(Test__ROCmMoEKernel, GatherTokenBatch)
 
     // GPU
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_hidden = nullptr, *d_batch = nullptr;
     int *d_indices = nullptr;
     hipMalloc(&d_hidden, hidden.size() * sizeof(float));
@@ -1734,6 +1770,7 @@ TEST(Test__ROCmMoEKernel, ScatterAddWeighted)
 
     // GPU
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_output = nullptr, *d_expert = nullptr, *d_weights = nullptr;
     int *d_indices = nullptr;
     hipMalloc(&d_output, seq_len * d_model * sizeof(float));
@@ -1797,6 +1834,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGate_Decode)
 
     // GPU
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_input = nullptr, *d_gate_inp = nullptr, *d_shared_output = nullptr;
     hipMalloc(&d_input, input.size() * sizeof(float));
     hipMalloc(&d_gate_inp, gate_inp.size() * sizeof(float));
@@ -1863,6 +1901,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGate_DecodeFusedFromTensorsMarksOutputDirt
     ASSERT_TRUE(shared_output_tensor->ensureOnDevice(device));
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     gpu_kernel.sharedExpertGateFromTensors(input_tensor.get(), gate_tensor.get(), shared_output_tensor.get(),
                                            seq_len, d_model);
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
@@ -1902,6 +1941,7 @@ TEST(Test__ROCmMoEKernel, SharedExpertGate_Prefill)
                                 cpu_shared_output.data(), seq_len, d_model);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_input = nullptr, *d_gate_inp = nullptr, *d_shared_output = nullptr;
     hipMalloc(&d_input, input.size() * sizeof(float));
     hipMalloc(&d_gate_inp, gate_inp.size() * sizeof(float));
@@ -1953,6 +1993,7 @@ TEST(Test__ROCmMoEKernel, SwiGLU)
 
     // GPU
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_gate = nullptr, *d_up = nullptr;
     hipMalloc(&d_gate, count * sizeof(float));
     hipMalloc(&d_up, count * sizeof(float));
@@ -1996,6 +2037,7 @@ TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q4_0MatchesSequential)
     const DeviceId device = DeviceId::rocm(0);
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
 
     std::vector<std::unique_ptr<TensorBase>> weight_tensors;
     std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> packed_weights;
@@ -2115,6 +2157,7 @@ void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory crea
     const DeviceId device = DeviceId::rocm(0);
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
 
     std::vector<std::unique_ptr<TensorBase>> weight_tensors;
     std::vector<std::unique_ptr<rocm::ROCmPackedWeights>> packed_weights;
@@ -2359,6 +2402,7 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
     const DeviceId device = DeviceId::rocm(0);
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
 
     std::vector<std::unique_ptr<TensorBase>> gate_weight_tensors;
     std::vector<std::unique_ptr<TensorBase>> up_weight_tensors;
@@ -2771,6 +2815,7 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Q4KGateUp_Q5KDownMatchesSequentialGemm)
     constexpr int total_slots = seq_len * top_k;
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
 
     std::vector<std::unique_ptr<TensorBase>> gate_weight_tensors;
     std::vector<std::unique_ptr<TensorBase>> up_weight_tensors;
@@ -3244,6 +3289,7 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen35RouteTable_Q4KQ5KMatchesCpuDequan
     ASSERT_TRUE(routing_weights_tensor->ensureOnDevice(device));
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
     ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
         routing_indices_tensor.get(), routing_weights_tensor.get(), seq_len, num_experts, top_k));
 
@@ -3515,6 +3561,7 @@ TEST(Test__ROCmMoEKernel, GroupedPrefill_Qwen36RouteTable_IQ2SGateUp_IQ4XSDownMa
     ASSERT_TRUE(routing_weights_tensor->ensureOnDevice(device));
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
     ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
         routing_indices_tensor.get(), routing_weights_tensor.get(), seq_len, num_experts, top_k));
 
@@ -3624,6 +3671,7 @@ TEST(Test__ROCmMoEKernel, Histogram_RecordAndSync)
               routing_indices.size() * sizeof(int), hipMemcpyHostToDevice);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     gpu_kernel.recordHistogramDevice(d_indices, seq_len, top_k, layer_idx);
 
     // Sync histogram to host
@@ -3671,6 +3719,7 @@ TEST(Test__ROCmMoEKernel, Histogram_Reset)
               routing_indices.size() * sizeof(int), hipMemcpyHostToDevice);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     gpu_kernel.recordHistogramDevice(d_indices, seq_len, top_k, layer_idx);
 
     // Verify something was recorded
@@ -3742,6 +3791,7 @@ TEST(Test__ROCmMoEKernel, ExpertMask_ApplyZerosWeights)
     hipMemcpy(d_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     // Need to convert std::vector<bool> to a contiguous bool array
     std::vector<char> mask_bytes(num_experts);
     for (int i = 0; i < num_experts; ++i)
@@ -3824,6 +3874,7 @@ TEST(Test__ROCmMoEKernel, ExpertMask_AllActiveNoChange)
     hipMemcpy(d_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     gpu_kernel.updateExpertMaskDevice(reinterpret_cast<const bool *>(mask_bytes.data()), num_experts);
     gpu_kernel.applyExpertMaskDevice(d_weights, d_indices, seq_len, top_k);
     hipDeviceSynchronize();
@@ -3935,6 +3986,7 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_Basic)
     hipMalloc(&d_grouped_weights, total_slots * sizeof(float));
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     bool ok = gpu_kernel.groupTokensByExpertDevice(
         d_routing_indices, d_routing_weights,
         seq_len, num_experts, top_k,
@@ -4296,6 +4348,7 @@ TEST(Test__ROCmMoEKernel, SmallMFusedRouter_VerifierShapeMatchesHostReference)
     PerfStatsCollector::reset();
 
     ROCmMoEKernel moe_kernel(0);
+    auto moe_kernel_workspace = bindDefaultMoEWorkspace(moe_kernel);
     MoERoutingResult result;
     ASSERT_TRUE(moe_kernel.routeWithTensors(
         hidden.get(),
@@ -4430,6 +4483,7 @@ TEST(Test__ROCmMoEKernel, GroupPrefillRoutesRuntimeState_DeterministicSmall)
     MoERuntimeTable runtime_table(config);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
         runtime_table.deviceLayerState(0),
         routing_index_tensor.get(),
@@ -4546,6 +4600,7 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillGatherScatter_ZeroCountExpertNoOps)
     MoERuntimeTable runtime_table(config);
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     ASSERT_TRUE(gpu_kernel.groupPrefillRoutes(
         runtime_table.deviceLayerState(0),
         routing_index_tensor.get(),
@@ -4843,6 +4898,7 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_PrefillScale)
     hipMalloc(&d_grouped_weights, total_slots * sizeof(float));
 
     ROCmMoEKernel gpu_kernel(0);
+    auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     bool ok = gpu_kernel.groupTokensByExpertDevice(
         d_routing_indices, d_routing_weights,
         seq_len, num_experts, top_k,

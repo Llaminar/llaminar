@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../local_execution/device/WorkspaceDescriptor.h"
+#include "../../tensors/TensorKernels.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -42,6 +43,17 @@ namespace llaminar2
         constexpr const char *DECODE_SWIGLU_SCALES = "moe_decode_swiglu_scales";
         constexpr const char *DECODE_EXPERT_IDS = "moe_grouped_decode_expert_ids";
         constexpr const char *DECODE_WEIGHTS = "moe_grouped_decode_weights";
+
+        constexpr const char *ROCM_SHARED_GATE = "rocm_moe_shared_gate";
+        constexpr const char *ROCM_ROUTE_LOGITS_PARTIALS = "rocm_moe_route_logits_partials";
+        constexpr const char *ROCM_ROUTER_Q8_HIDDEN = "rocm_moe_router_q8_hidden";
+        constexpr const char *ROCM_ROUTER_Q8_SCALES = "rocm_moe_router_q8_scales";
+        constexpr const char *ROCM_GROUP_MAX_TOKENS = "rocm_moe_group_max_tokens";
+        constexpr const char *ROCM_DECODE_GATE_PTRS = "rocm_moe_decode_gate_ptrs";
+        constexpr const char *ROCM_DECODE_UP_PTRS = "rocm_moe_decode_up_ptrs";
+        constexpr const char *ROCM_DECODE_GATE_OUTPUT_PTRS = "rocm_moe_decode_gate_output_ptrs";
+        constexpr const char *ROCM_DECODE_UP_OUTPUT_PTRS = "rocm_moe_decode_up_output_ptrs";
+        constexpr const char *ROCM_DECODE_DOWN_DESCS = "rocm_moe_decode_down_descs";
 
         inline int ceilDiv(int value, int divisor)
         {
@@ -142,6 +154,53 @@ namespace llaminar2
         {
             WorkspaceRequirements reqs = routing(max_seq_len, num_experts, top_k);
             reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
+            return reqs;
+        }
+
+        inline WorkspaceRequirements rocmRouting(
+            int max_seq_len,
+            int d_model,
+            int num_experts,
+            int top_k)
+        {
+            WorkspaceRequirements reqs = routing(max_seq_len, num_experts, top_k);
+            max_seq_len = std::max(1, max_seq_len);
+            d_model = std::max(1, d_model);
+            num_experts = std::max(1, num_experts);
+            top_k = std::max(1, top_k);
+
+            const int d_model_blocks = ceilDiv(d_model, 32);
+            constexpr int kMaxRouterPartitions = 16;
+
+            add(reqs, ROCM_ROUTE_LOGITS_PARTIALS,
+                static_cast<std::size_t>(num_experts) * kMaxRouterPartitions * sizeof(float));
+            add(reqs, ROCM_ROUTER_Q8_HIDDEN, static_cast<std::size_t>(d_model) * sizeof(int8_t));
+            add(reqs, ROCM_ROUTER_Q8_SCALES, static_cast<std::size_t>(d_model_blocks) * sizeof(float));
+            return reqs;
+        }
+
+        inline WorkspaceRequirements rocmMoE(
+            int max_seq_len,
+            int d_model,
+            int intermediate,
+            int num_experts,
+            int top_k)
+        {
+            WorkspaceRequirements reqs = rocmRouting(max_seq_len, d_model, num_experts, top_k);
+            reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
+            max_seq_len = std::max(1, max_seq_len);
+            top_k = std::max(1, top_k);
+
+            const std::size_t decode_slots = static_cast<std::size_t>(top_k);
+
+            add(reqs, ROCM_SHARED_GATE, static_cast<std::size_t>(max_seq_len) * sizeof(float));
+            add(reqs, ROCM_GROUP_MAX_TOKENS, sizeof(int));
+            add(reqs, ROCM_DECODE_GATE_PTRS, decode_slots * sizeof(const float *));
+            add(reqs, ROCM_DECODE_UP_PTRS, decode_slots * sizeof(const float *));
+            add(reqs, ROCM_DECODE_GATE_OUTPUT_PTRS, decode_slots * sizeof(float *));
+            add(reqs, ROCM_DECODE_UP_OUTPUT_PTRS, decode_slots * sizeof(float *));
+            add(reqs, ROCM_DECODE_DOWN_DESCS,
+                decode_slots * sizeof(DeviceNativeVNNIMatrixDesc));
             return reqs;
         }
     } // namespace MoEWorkspaceBuffers

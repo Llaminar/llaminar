@@ -2237,6 +2237,15 @@ namespace llaminar2
                 params_.num_experts,
                 params_.top_k));
         }
+        else if (params_.device_id.is_rocm())
+        {
+            combined.merge(MoEWorkspaceBuffers::rocmMoE(
+                params_.seq_len,
+                params_.d_model,
+                params_.expert_intermediate,
+                params_.num_experts,
+                params_.top_k));
+        }
 
         // All expert GEMM engines use shared buffer names (not per-instance),
         // so requirements from any one engine represent all of them.

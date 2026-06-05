@@ -9,6 +9,7 @@
 #include "ROCmMoEKernel.h"
 #include "../gemm/HipBLASGemmKernel.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
+#include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/DeviceId.h"
@@ -617,9 +618,109 @@ namespace llaminar2
                                                              << " stream=" << ROCmKernelBase::getStream());
     }
 
+    void ROCmMoEKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        if (workspace_ == workspace)
+            return;
+        ROCmKernelBase::bindWorkspace(workspace);
+        clearWorkspaceScratchBindings();
+    }
+
+    bool ROCmMoEKernel::bindWorkspaceBuffer(
+        void **ptr,
+        const char *name,
+        size_t bytes,
+        const char *context)
+    {
+        if (!ptr || !name || bytes == 0)
+            return false;
+        if (!validateROCmWorkspaceBinding(workspace_, device_ordinal_, "ROCmMoEKernel"))
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context
+                                         << " requires graph-owned MoE workspace");
+            return false;
+        }
+        void *buffer = workspace_->getBuffer(name);
+        const size_t available = workspace_->getBufferSize(name);
+        if (!buffer || available < bytes)
+        {
+            LOG_ERROR("[ROCmMoEKernel] " << context << " missing required workspace buffer '"
+                                         << name << "' (need " << bytes << " bytes, have "
+                                         << available << ")");
+            return false;
+        }
+        *ptr = buffer;
+        scratch_workspace_bound_ = true;
+        return true;
+    }
+
+    void ROCmMoEKernel::clearWorkspaceScratchBindings() noexcept
+    {
+        d_write_heads_ = nullptr;
+        d_staging_indices_ = nullptr;
+        d_staging_weights_ = nullptr;
+        d_grouped_gate_ptrs_ = nullptr;
+        d_grouped_up_ptrs_ = nullptr;
+        d_grouped_expert_ids_ = nullptr;
+        d_grouped_decode_weights_ = nullptr;
+        d_grouped_down_descs_ = nullptr;
+        d_grouped_swiglu_int8_ = nullptr;
+        d_grouped_swiglu_scales_ = nullptr;
+        d_grouped_gate_output_ptrs_ = nullptr;
+        d_grouped_up_output_ptrs_ = nullptr;
+        d_grouped_gateup_expert_ids_ = nullptr;
+        d_grouped_hidden_int8_ = nullptr;
+        d_grouped_hidden_scales_ = nullptr;
+        d_grouped_gateup_gate_partials_ = nullptr;
+        d_grouped_gateup_up_partials_ = nullptr;
+        d_shared_gate_scratch_ = nullptr;
+        d_route_logits_ = nullptr;
+        d_route_logits_partials_ = nullptr;
+        d_router_q8_hidden_ = nullptr;
+        d_router_q8_hidden_scales_ = nullptr;
+        d_route_indices_ = nullptr;
+        d_route_weights_ = nullptr;
+        d_group_int_indices_ = nullptr;
+        d_group_offsets_ = nullptr;
+        d_group_counts_ = nullptr;
+        d_group_max_tokens_ = nullptr;
+        d_group_token_indices_ = nullptr;
+        d_group_weights_ = nullptr;
+        d_group_active_expert_ids_ = nullptr;
+        d_prefill_A_int8_ = nullptr;
+        d_prefill_A_scales_ = nullptr;
+        d_prefill_gate_ = nullptr;
+        d_prefill_up_ = nullptr;
+
+        max_write_heads_experts_ = 0;
+        staging_capacity_ = 0;
+        grouped_decode_active_cap_ = 0;
+        grouped_decode_intermediate_cap_ = 0;
+        grouped_gateup_active_cap_ = 0;
+        grouped_gateup_d_model_cap_ = 0;
+        grouped_gateup_kpart_active_cap_ = 0;
+        grouped_gateup_kpart_partitions_cap_ = 0;
+        grouped_gateup_kpart_intermediate_cap_ = 0;
+        shared_gate_scratch_capacity_ = 0;
+        route_logits_capacity_ = 0;
+        route_topk_capacity_ = 0;
+        route_logits_partials_capacity_ = 0;
+        router_q8_hidden_d_model_cap_ = 0;
+        router_q8_hidden_blocks_cap_ = 0;
+        group_active_expert_slots_ = 0;
+        group_slots_cap_ = 0;
+        group_experts_cap_ = 0;
+        prefill_slots_cap_ = 0;
+        prefill_d_model_cap_ = 0;
+        prefill_intermediate_cap_ = 0;
+        scratch_workspace_bound_ = false;
+    }
+
     ROCmMoEKernel::~ROCmMoEKernel()
     {
         (void)setMoEDevice(device_ordinal_, "destructor");
+        if (scratch_workspace_bound_)
+            clearWorkspaceScratchBindings();
         if (d_histogram_)
         {
             hipFree(d_histogram_);
@@ -922,59 +1023,27 @@ namespace llaminar2
         if (seq_len <= shared_gate_scratch_capacity_)
             return true;
 
-        if (!setMoEDevice(device_ordinal_, "ensureSharedGateScratchCapacity"))
-            return false;
-
-        if (d_shared_gate_scratch_)
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_shared_gate_scratch_),
+                                 MoEWorkspaceBuffers::ROCM_SHARED_GATE,
+                                 static_cast<size_t>(seq_len) * sizeof(float),
+                                 "ensureSharedGateScratchCapacity"))
         {
-            hipError_t free_err = hipFree(d_shared_gate_scratch_);
-            if (free_err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::ensureSharedGateScratchCapacity] hipFree failed: "
-                          << hipGetErrorString(free_err));
-                return false;
-            }
-            d_shared_gate_scratch_ = nullptr;
             shared_gate_scratch_capacity_ = 0;
-        }
-
-        hipError_t err = hipMalloc(&d_shared_gate_scratch_, static_cast<size_t>(seq_len) * sizeof(float));
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::ensureSharedGateScratchCapacity] hipMalloc scratch failed: "
-                      << hipGetErrorString(err));
-            d_shared_gate_scratch_ = nullptr;
             return false;
         }
-
         shared_gate_scratch_capacity_ = seq_len;
         return true;
     }
 
     bool ROCmMoEKernel::ensureRouteBufferCapacity(size_t logits_count, size_t topk_count)
     {
-        if (!setMoEDevice(device_ordinal_, "ensureRouteBufferCapacity"))
-            return false;
-
         if (logits_count > route_logits_capacity_)
         {
-            if (d_route_logits_)
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_logits_),
+                                     MoEWorkspaceBuffers::ROUTE_LOGITS,
+                                     logits_count * sizeof(float),
+                                     "ensureRouteBufferCapacity(logits)"))
             {
-                hipError_t free_err = hipFree(d_route_logits_);
-                if (free_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipFree logits failed: "
-                              << hipGetErrorString(free_err));
-                    return false;
-                }
-            }
-
-            hipError_t err = hipMalloc(&d_route_logits_, logits_count * sizeof(float));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipMalloc logits failed: "
-                          << hipGetErrorString(err));
-                d_route_logits_ = nullptr;
                 route_logits_capacity_ = 0;
                 return false;
             }
@@ -983,42 +1052,15 @@ namespace llaminar2
 
         if (topk_count > route_topk_capacity_)
         {
-            if (d_route_indices_)
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_indices_),
+                                     MoEWorkspaceBuffers::ROUTE_INDICES,
+                                     topk_count * sizeof(int),
+                                     "ensureRouteBufferCapacity(indices)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_weights_),
+                                     MoEWorkspaceBuffers::ROUTE_WEIGHTS,
+                                     topk_count * sizeof(float),
+                                     "ensureRouteBufferCapacity(weights)"))
             {
-                hipError_t free_err = hipFree(d_route_indices_);
-                if (free_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipFree indices failed: "
-                              << hipGetErrorString(free_err));
-                    return false;
-                }
-            }
-            if (d_route_weights_)
-            {
-                hipError_t free_err = hipFree(d_route_weights_);
-                if (free_err != hipSuccess)
-                {
-                    LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipFree weights failed: "
-                              << hipGetErrorString(free_err));
-                    return false;
-                }
-            }
-
-            hipError_t err = hipMalloc(&d_route_indices_, topk_count * sizeof(int));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipMalloc indices failed: "
-                          << hipGetErrorString(err));
-                d_route_indices_ = nullptr;
-                route_topk_capacity_ = 0;
-                return false;
-            }
-            err = hipMalloc(&d_route_weights_, topk_count * sizeof(float));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::ensureRouteBufferCapacity] hipMalloc weights failed: "
-                          << hipGetErrorString(err));
-                hipFree(d_route_indices_);
                 d_route_indices_ = nullptr;
                 d_route_weights_ = nullptr;
                 route_topk_capacity_ = 0;
@@ -1041,43 +1083,11 @@ namespace llaminar2
         if (partial_count <= route_logits_partials_capacity_)
             return d_route_logits_partials_ != nullptr;
 
-        const bool capture_active = isGraphCaptureActive() ||
-                                    (deviceContext() && deviceContext()->isDeviceGraphCaptureActive());
-        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-        void *stream = getStream();
-        if (stream)
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_logits_partials_),
+                                 MoEWorkspaceBuffers::ROCM_ROUTE_LOGITS_PARTIALS,
+                                 partial_count * sizeof(float),
+                                 "ensureRouteLogitsPartialsCapacity"))
         {
-            const hipError_t capture_err = hipStreamIsCapturing(static_cast<hipStream_t>(stream), &capture_status);
-            if (capture_err != hipSuccess)
-                capture_status = hipStreamCaptureStatusNone;
-        }
-        if (capture_active || capture_status == hipStreamCaptureStatusActive)
-        {
-            LOG_DEBUG("[ROCmMoEKernel::ensureRouteLogitsPartialsCapacity] scratch miss during graph capture; falling back to non-K-part router");
-            return false;
-        }
-
-        if (!setMoEDevice(device_ordinal_, "ensureRouteLogitsPartialsCapacity"))
-            return false;
-
-        if (d_route_logits_partials_)
-        {
-            hipError_t free_err = hipFree(d_route_logits_partials_);
-            if (free_err != hipSuccess)
-            {
-                LOG_WARN("[ROCmMoEKernel::ensureRouteLogitsPartialsCapacity] hipFree partials failed: "
-                         << hipGetErrorString(free_err));
-                return false;
-            }
-            d_route_logits_partials_ = nullptr;
-            route_logits_partials_capacity_ = 0;
-        }
-
-        hipError_t err = hipMalloc(&d_route_logits_partials_, partial_count * sizeof(float));
-        if (err != hipSuccess)
-        {
-            LOG_WARN("[ROCmMoEKernel::ensureRouteLogitsPartialsCapacity] hipMalloc partials failed: "
-                     << hipGetErrorString(err));
             d_route_logits_partials_ = nullptr;
             route_logits_partials_capacity_ = 0;
             return false;
@@ -1100,66 +1110,19 @@ namespace llaminar2
             return true;
         }
 
-        const bool capture_active = isGraphCaptureActive() ||
-                                    (deviceContext() && deviceContext()->isDeviceGraphCaptureActive());
-        hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
-        void *stream = getStream();
-        if (stream)
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_router_q8_hidden_),
+                                 MoEWorkspaceBuffers::ROCM_ROUTER_Q8_HIDDEN,
+                                 static_cast<size_t>(d_model) * sizeof(int8_t),
+                                 "ensureRouterQ8HiddenScratchCapacity(hidden)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_router_q8_hidden_scales_),
+                                 MoEWorkspaceBuffers::ROCM_ROUTER_Q8_SCALES,
+                                 static_cast<size_t>(blocks_per_row) * sizeof(float),
+                                 "ensureRouterQ8HiddenScratchCapacity(scales)"))
         {
-            const hipError_t capture_err = hipStreamIsCapturing(static_cast<hipStream_t>(stream), &capture_status);
-            if (capture_err != hipSuccess)
-                capture_status = hipStreamCaptureStatusNone;
-        }
-        if (capture_active || capture_status == hipStreamCaptureStatusActive)
-        {
-            LOG_DEBUG("[ROCmMoEKernel::ensureRouterQ8HiddenScratchCapacity] scratch miss during graph capture; falling back to non-Q8 router");
-            return false;
-        }
-
-        if (!setMoEDevice(device_ordinal_, "ensureRouterQ8HiddenScratchCapacity"))
-            return false;
-
-        if (d_router_q8_hidden_)
-        {
-            hipError_t free_err = hipFree(d_router_q8_hidden_);
-            if (free_err != hipSuccess)
-            {
-                LOG_WARN("[ROCmMoEKernel::ensureRouterQ8HiddenScratchCapacity] hipFree hidden failed: "
-                         << hipGetErrorString(free_err));
-                return false;
-            }
-        }
-        if (d_router_q8_hidden_scales_)
-        {
-            hipError_t free_err = hipFree(d_router_q8_hidden_scales_);
-            if (free_err != hipSuccess)
-            {
-                LOG_WARN("[ROCmMoEKernel::ensureRouterQ8HiddenScratchCapacity] hipFree scales failed: "
-                         << hipGetErrorString(free_err));
-                d_router_q8_hidden_ = nullptr;
-                router_q8_hidden_d_model_cap_ = 0;
-                router_q8_hidden_blocks_cap_ = 0;
-                return false;
-            }
-        }
-        d_router_q8_hidden_ = nullptr;
-        d_router_q8_hidden_scales_ = nullptr;
-        router_q8_hidden_d_model_cap_ = 0;
-        router_q8_hidden_blocks_cap_ = 0;
-
-        hipError_t err = hipMalloc(&d_router_q8_hidden_, static_cast<size_t>(d_model) * sizeof(int8_t));
-        if (err == hipSuccess)
-        {
-            err = hipMalloc(&d_router_q8_hidden_scales_, static_cast<size_t>(blocks_per_row) * sizeof(float));
-        }
-        if (err != hipSuccess)
-        {
-            LOG_WARN("[ROCmMoEKernel::ensureRouterQ8HiddenScratchCapacity] hipMalloc failed: "
-                     << hipGetErrorString(err));
-            if (d_router_q8_hidden_)
-                (void)hipFree(d_router_q8_hidden_);
             d_router_q8_hidden_ = nullptr;
             d_router_q8_hidden_scales_ = nullptr;
+            router_q8_hidden_d_model_cap_ = 0;
+            router_q8_hidden_blocks_cap_ = 0;
             return false;
         }
 
@@ -1938,21 +1901,11 @@ namespace llaminar2
         // Step 4: Lazy-allocate write_heads scratch buffer
         if (!d_write_heads_ || max_write_heads_experts_ < num_experts)
         {
-            if (isGraphCaptureActive())
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_write_heads_),
+                                     MoEWorkspaceBuffers::GROUP_WRITE_HEADS,
+                                     static_cast<size_t>(num_experts) * sizeof(int),
+                                     "groupTokensByExpertDevice(write_heads)"))
             {
-                LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] write_heads realloc during graph capture "
-                          "(need "
-                          << num_experts << ", have " << max_write_heads_experts_ << ")");
-                return false;
-            }
-            if (d_write_heads_)
-                hipFree(d_write_heads_);
-
-            err = hipMalloc(&d_write_heads_, num_experts * sizeof(int));
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] hipMalloc write_heads failed: "
-                          << hipGetErrorString(err));
                 d_write_heads_ = nullptr;
                 max_write_heads_experts_ = 0;
                 return false;
@@ -1991,42 +1944,27 @@ namespace llaminar2
     // routing weights) are uploaded via cached staging buffers.
     // =========================================================================
 
-    void ROCmMoEKernel::ensureStagingCapacity(int count)
+    bool ROCmMoEKernel::ensureStagingCapacity(int count)
     {
         if (count <= staging_capacity_)
-            return;
+            return d_staging_indices_ && d_staging_weights_;
 
-        if (!setMoEDevice(device_ordinal_, "ensureStagingCapacity"))
-            return;
-
-        if (d_staging_indices_)
-            (void)hipFree(d_staging_indices_);
-        if (d_staging_weights_)
-            (void)hipFree(d_staging_weights_);
-
-        hipError_t err = hipMalloc(&d_staging_indices_, count * sizeof(int));
-        if (err != hipSuccess)
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_staging_indices_),
+                                 MoEWorkspaceBuffers::STAGING_INDICES,
+                                 static_cast<size_t>(count) * sizeof(int),
+                                 "ensureStagingCapacity(indices)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_staging_weights_),
+                                 MoEWorkspaceBuffers::STAGING_WEIGHTS,
+                                 static_cast<size_t>(count) * sizeof(float),
+                                 "ensureStagingCapacity(weights)"))
         {
-            LOG_ERROR("[ROCmMoEKernel::ensureStagingCapacity] hipMalloc indices failed: "
-                      << hipGetErrorString(err));
             d_staging_indices_ = nullptr;
             d_staging_weights_ = nullptr;
             staging_capacity_ = 0;
-            return;
-        }
-
-        err = hipMalloc(&d_staging_weights_, count * sizeof(float));
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::ensureStagingCapacity] hipMalloc weights failed: "
-                      << hipGetErrorString(err));
-            (void)hipFree(d_staging_indices_);
-            d_staging_indices_ = nullptr;
-            d_staging_weights_ = nullptr;
-            staging_capacity_ = 0;
-            return;
+            return false;
         }
         staging_capacity_ = count;
+        return true;
     }
 
     bool ROCmMoEKernel::ensureGroupedDecodeCapacity(int num_active, int intermediate)
@@ -2048,22 +1986,35 @@ namespace llaminar2
             return true;
         }
 
-        auto free_grouped = [&]()
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gate_ptrs_),
+                                 MoEWorkspaceBuffers::ROCM_DECODE_GATE_PTRS,
+                                 static_cast<size_t>(num_active) * sizeof(float *),
+                                 "ensureGroupedDecodeCapacity(gate_ptrs)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_up_ptrs_),
+                                 MoEWorkspaceBuffers::ROCM_DECODE_UP_PTRS,
+                                 static_cast<size_t>(num_active) * sizeof(float *),
+                                 "ensureGroupedDecodeCapacity(up_ptrs)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_expert_ids_),
+                                 MoEWorkspaceBuffers::DECODE_EXPERT_IDS,
+                                 static_cast<size_t>(num_active) * sizeof(int),
+                                 "ensureGroupedDecodeCapacity(expert_ids)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_decode_weights_),
+                                 MoEWorkspaceBuffers::DECODE_WEIGHTS,
+                                 static_cast<size_t>(num_active) * sizeof(float),
+                                 "ensureGroupedDecodeCapacity(weights)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_down_descs_),
+                                 MoEWorkspaceBuffers::ROCM_DECODE_DOWN_DESCS,
+                                 static_cast<size_t>(num_active) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                 "ensureGroupedDecodeCapacity(down_descs)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_swiglu_int8_),
+                                 MoEWorkspaceBuffers::DECODE_SWIGLU_INT8,
+                                 static_cast<size_t>(num_active) * intermediate * sizeof(int8_t),
+                                 "ensureGroupedDecodeCapacity(swiglu_int8)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_swiglu_scales_),
+                                 MoEWorkspaceBuffers::DECODE_SWIGLU_SCALES,
+                                 static_cast<size_t>(num_active) * blocks_per_row * sizeof(float),
+                                 "ensureGroupedDecodeCapacity(swiglu_scales)"))
         {
-            if (d_grouped_gate_ptrs_)
-                (void)hipFree(d_grouped_gate_ptrs_);
-            if (d_grouped_up_ptrs_)
-                (void)hipFree(d_grouped_up_ptrs_);
-            if (d_grouped_expert_ids_)
-                (void)hipFree(d_grouped_expert_ids_);
-            if (d_grouped_decode_weights_)
-                (void)hipFree(d_grouped_decode_weights_);
-            if (d_grouped_down_descs_)
-                (void)hipFree(d_grouped_down_descs_);
-            if (d_grouped_swiglu_int8_)
-                (void)hipFree(d_grouped_swiglu_int8_);
-            if (d_grouped_swiglu_scales_)
-                (void)hipFree(d_grouped_swiglu_scales_);
             d_grouped_gate_ptrs_ = nullptr;
             d_grouped_up_ptrs_ = nullptr;
             d_grouped_expert_ids_ = nullptr;
@@ -2073,29 +2024,6 @@ namespace llaminar2
             d_grouped_swiglu_scales_ = nullptr;
             grouped_decode_active_cap_ = 0;
             grouped_decode_intermediate_cap_ = 0;
-        };
-
-        free_grouped();
-
-        hipError_t err = hipMalloc(&d_grouped_gate_ptrs_, static_cast<size_t>(num_active) * sizeof(float *));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_up_ptrs_, static_cast<size_t>(num_active) * sizeof(float *));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_expert_ids_, static_cast<size_t>(num_active) * sizeof(int));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_decode_weights_, static_cast<size_t>(num_active) * sizeof(float));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_down_descs_, static_cast<size_t>(num_active) * sizeof(DeviceNativeVNNIMatrixDesc));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_swiglu_int8_, static_cast<size_t>(num_active) * intermediate * sizeof(int8_t));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_swiglu_scales_, static_cast<size_t>(num_active) * blocks_per_row * sizeof(float));
-
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::ensureGroupedDecodeCapacity] hipMalloc failed: "
-                      << hipGetErrorString(err));
-            free_grouped();
             return false;
         }
 
@@ -2122,18 +2050,27 @@ namespace llaminar2
             return true;
         }
 
-        auto free_gateup = [&]()
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gate_output_ptrs_),
+                                 MoEWorkspaceBuffers::ROCM_DECODE_GATE_OUTPUT_PTRS,
+                                 static_cast<size_t>(num_active) * sizeof(float *),
+                                 "ensureGroupedGateUpCapacity(gate_output_ptrs)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_up_output_ptrs_),
+                                 MoEWorkspaceBuffers::ROCM_DECODE_UP_OUTPUT_PTRS,
+                                 static_cast<size_t>(num_active) * sizeof(float *),
+                                 "ensureGroupedGateUpCapacity(up_output_ptrs)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gateup_expert_ids_),
+                                 MoEWorkspaceBuffers::DECODE_EXPERT_IDS,
+                                 static_cast<size_t>(num_active) * sizeof(int),
+                                 "ensureGroupedGateUpCapacity(expert_ids)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_hidden_int8_),
+                                 MoEWorkspaceBuffers::DECODE_HIDDEN_INT8,
+                                 static_cast<size_t>(d_model) * sizeof(int8_t),
+                                 "ensureGroupedGateUpCapacity(hidden_int8)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_hidden_scales_),
+                                 MoEWorkspaceBuffers::DECODE_HIDDEN_SCALES,
+                                 static_cast<size_t>(blocks_per_row) * sizeof(float),
+                                 "ensureGroupedGateUpCapacity(hidden_scales)"))
         {
-            if (d_grouped_gate_output_ptrs_)
-                (void)hipFree(d_grouped_gate_output_ptrs_);
-            if (d_grouped_up_output_ptrs_)
-                (void)hipFree(d_grouped_up_output_ptrs_);
-            if (d_grouped_gateup_expert_ids_)
-                (void)hipFree(d_grouped_gateup_expert_ids_);
-            if (d_grouped_hidden_int8_)
-                (void)hipFree(d_grouped_hidden_int8_);
-            if (d_grouped_hidden_scales_)
-                (void)hipFree(d_grouped_hidden_scales_);
             d_grouped_gate_output_ptrs_ = nullptr;
             d_grouped_up_output_ptrs_ = nullptr;
             d_grouped_gateup_expert_ids_ = nullptr;
@@ -2141,25 +2078,6 @@ namespace llaminar2
             d_grouped_hidden_scales_ = nullptr;
             grouped_gateup_active_cap_ = 0;
             grouped_gateup_d_model_cap_ = 0;
-        };
-
-        free_gateup();
-
-        hipError_t err = hipMalloc(&d_grouped_gate_output_ptrs_, static_cast<size_t>(num_active) * sizeof(float *));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_up_output_ptrs_, static_cast<size_t>(num_active) * sizeof(float *));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_gateup_expert_ids_, static_cast<size_t>(num_active) * sizeof(int));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_hidden_int8_, static_cast<size_t>(d_model) * sizeof(int8_t));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_hidden_scales_, static_cast<size_t>(blocks_per_row) * sizeof(float));
-
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::ensureGroupedGateUpCapacity] hipMalloc failed: "
-                      << hipGetErrorString(err));
-            free_gateup();
             return false;
         }
 
@@ -2187,32 +2105,23 @@ namespace llaminar2
             return true;
         }
 
-        auto free_kpart = [&]()
+        const size_t partial_count = static_cast<size_t>(num_active) *
+                                     static_cast<size_t>(k_partitions) *
+                                     static_cast<size_t>(intermediate);
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gateup_gate_partials_),
+                                 MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,
+                                 partial_count * sizeof(float),
+                                 "ensureGroupedGateUpKPartScratchCapacity(gate)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gateup_up_partials_),
+                                 MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
+                                 partial_count * sizeof(float),
+                                 "ensureGroupedGateUpKPartScratchCapacity(up)"))
         {
-            if (d_grouped_gateup_gate_partials_)
-                (void)hipFree(d_grouped_gateup_gate_partials_);
-            if (d_grouped_gateup_up_partials_)
-                (void)hipFree(d_grouped_gateup_up_partials_);
             d_grouped_gateup_gate_partials_ = nullptr;
             d_grouped_gateup_up_partials_ = nullptr;
             grouped_gateup_kpart_active_cap_ = 0;
             grouped_gateup_kpart_partitions_cap_ = 0;
             grouped_gateup_kpart_intermediate_cap_ = 0;
-        };
-
-        free_kpart();
-
-        const size_t partial_count = static_cast<size_t>(num_active) *
-                                     static_cast<size_t>(k_partitions) *
-                                     static_cast<size_t>(intermediate);
-        hipError_t err = hipMalloc(&d_grouped_gateup_gate_partials_, partial_count * sizeof(float));
-        if (err == hipSuccess)
-            err = hipMalloc(&d_grouped_gateup_up_partials_, partial_count * sizeof(float));
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::ensureGroupedGateUpKPartScratchCapacity] hipMalloc failed: "
-                      << hipGetErrorString(err));
-            free_kpart();
             return false;
         }
 
@@ -2796,8 +2705,7 @@ namespace llaminar2
             return;
         }
         // Upload host token indices to device staging buffer
-        ensureStagingCapacity(num_tokens);
-        if (!d_staging_indices_)
+        if (!ensureStagingCapacity(num_tokens))
             return;
 
         hipError_t err = hipMemcpyAsync(
@@ -2838,8 +2746,7 @@ namespace llaminar2
             return;
         }
         // Upload host indices + weights to device staging
-        ensureStagingCapacity(num_tokens);
-        if (!d_staging_indices_ || !d_staging_weights_)
+        if (!ensureStagingCapacity(num_tokens))
             return;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
@@ -4095,25 +4002,23 @@ namespace llaminar2
         // 2. Lazy-allocate grouping buffers
         if (total_slots > group_slots_cap_)
         {
-            if (d_group_int_indices_)
-                (void)hipFree(d_group_int_indices_);
-            if (d_group_token_indices_)
-                (void)hipFree(d_group_token_indices_);
-            if (d_group_weights_)
-                (void)hipFree(d_group_weights_);
-            if (d_group_active_expert_ids_)
-                (void)hipFree(d_group_active_expert_ids_);
-            hipError_t alloc_err = hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_weights_, total_slots * sizeof(float));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_active_expert_ids_, total_slots * sizeof(int));
-            if (alloc_err != hipSuccess)
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_int_indices_),
+                                     MoEWorkspaceBuffers::GROUP_INT_INDICES,
+                                     static_cast<size_t>(total_slots) * sizeof(int),
+                                     "prepareExpertGroups(group_int_indices)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_token_indices_),
+                                     MoEWorkspaceBuffers::GROUP_TOKEN_INDICES,
+                                     static_cast<size_t>(total_slots) * sizeof(int),
+                                     "prepareExpertGroups(group_token_indices)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_weights_),
+                                     MoEWorkspaceBuffers::GROUP_WEIGHTS,
+                                     static_cast<size_t>(total_slots) * sizeof(float),
+                                     "prepareExpertGroups(group_weights)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
+                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
+                                     static_cast<size_t>(total_slots) * sizeof(int),
+                                     "prepareExpertGroups(group_active_expert_ids)"))
             {
-                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] hipMalloc grouping buffers failed: "
-                          << hipGetErrorString(alloc_err));
                 d_group_int_indices_ = nullptr;
                 d_group_token_indices_ = nullptr;
                 d_group_weights_ = nullptr;
@@ -4126,21 +4031,19 @@ namespace llaminar2
         }
         if (num_experts > group_experts_cap_)
         {
-            if (d_group_offsets_)
-                (void)hipFree(d_group_offsets_);
-            if (d_group_counts_)
-                (void)hipFree(d_group_counts_);
-            if (d_group_max_tokens_)
-                (void)hipFree(d_group_max_tokens_);
-            hipError_t alloc_err = hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_counts_, num_experts * sizeof(int));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_max_tokens_, sizeof(int));
-            if (alloc_err != hipSuccess)
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_offsets_),
+                                     MoEWorkspaceBuffers::GROUP_OFFSETS,
+                                     static_cast<size_t>(num_experts) * sizeof(int),
+                                     "prepareExpertGroups(group_offsets)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_counts_),
+                                     MoEWorkspaceBuffers::GROUP_COUNTS,
+                                     static_cast<size_t>(num_experts) * sizeof(int),
+                                     "prepareExpertGroups(group_counts)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_max_tokens_),
+                                     MoEWorkspaceBuffers::ROCM_GROUP_MAX_TOKENS,
+                                     sizeof(int),
+                                     "prepareExpertGroups(group_max_tokens)"))
             {
-                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroups] hipMalloc expert buffers failed: "
-                          << hipGetErrorString(alloc_err));
                 d_group_offsets_ = nullptr;
                 d_group_counts_ = nullptr;
                 d_group_max_tokens_ = nullptr;
@@ -4265,32 +4168,23 @@ namespace llaminar2
         // 2. Lazy-allocate grouping buffers
         if (total_slots > group_slots_cap_)
         {
-            if (isGraphCaptureActive())
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_int_indices_),
+                                     MoEWorkspaceBuffers::GROUP_INT_INDICES,
+                                     static_cast<size_t>(total_slots) * sizeof(int),
+                                     "prepareExpertGroupsAsync(group_int_indices)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_token_indices_),
+                                     MoEWorkspaceBuffers::GROUP_TOKEN_INDICES,
+                                     static_cast<size_t>(total_slots) * sizeof(int),
+                                     "prepareExpertGroupsAsync(group_token_indices)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_weights_),
+                                     MoEWorkspaceBuffers::GROUP_WEIGHTS,
+                                     static_cast<size_t>(total_slots) * sizeof(float),
+                                     "prepareExpertGroupsAsync(group_weights)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
+                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
+                                     static_cast<size_t>(total_slots) * sizeof(int),
+                                     "prepareExpertGroupsAsync(group_active_expert_ids)"))
             {
-                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] grouping buffer realloc during graph capture "
-                          "(need "
-                          << total_slots << " slots, have " << group_slots_cap_ << ")");
-                return false;
-            }
-            if (d_group_int_indices_)
-                (void)hipFree(d_group_int_indices_);
-            if (d_group_token_indices_)
-                (void)hipFree(d_group_token_indices_);
-            if (d_group_weights_)
-                (void)hipFree(d_group_weights_);
-            if (d_group_active_expert_ids_)
-                (void)hipFree(d_group_active_expert_ids_);
-            hipError_t alloc_err = hipMalloc(&d_group_int_indices_, total_slots * sizeof(int));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_token_indices_, total_slots * sizeof(int));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_weights_, total_slots * sizeof(float));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_active_expert_ids_, total_slots * sizeof(int));
-            if (alloc_err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] hipMalloc grouping buffers failed: "
-                          << hipGetErrorString(alloc_err));
                 d_group_int_indices_ = nullptr;
                 d_group_token_indices_ = nullptr;
                 d_group_weights_ = nullptr;
@@ -4303,28 +4197,19 @@ namespace llaminar2
         }
         if (num_experts > group_experts_cap_)
         {
-            if (isGraphCaptureActive())
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_offsets_),
+                                     MoEWorkspaceBuffers::GROUP_OFFSETS,
+                                     static_cast<size_t>(num_experts) * sizeof(int),
+                                     "prepareExpertGroupsAsync(group_offsets)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_counts_),
+                                     MoEWorkspaceBuffers::GROUP_COUNTS,
+                                     static_cast<size_t>(num_experts) * sizeof(int),
+                                     "prepareExpertGroupsAsync(group_counts)") ||
+                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_max_tokens_),
+                                     MoEWorkspaceBuffers::ROCM_GROUP_MAX_TOKENS,
+                                     sizeof(int),
+                                     "prepareExpertGroupsAsync(group_max_tokens)"))
             {
-                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] expert buffer realloc during graph capture "
-                          "(need "
-                          << num_experts << " experts, have " << group_experts_cap_ << ")");
-                return false;
-            }
-            if (d_group_offsets_)
-                (void)hipFree(d_group_offsets_);
-            if (d_group_counts_)
-                (void)hipFree(d_group_counts_);
-            if (d_group_max_tokens_)
-                (void)hipFree(d_group_max_tokens_);
-            hipError_t alloc_err = hipMalloc(&d_group_offsets_, num_experts * sizeof(int));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_counts_, num_experts * sizeof(int));
-            if (alloc_err == hipSuccess)
-                alloc_err = hipMalloc(&d_group_max_tokens_, sizeof(int));
-            if (alloc_err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] hipMalloc expert buffers failed: "
-                          << hipGetErrorString(alloc_err));
                 d_group_offsets_ = nullptr;
                 d_group_counts_ = nullptr;
                 d_group_max_tokens_ = nullptr;
@@ -4427,93 +4312,45 @@ namespace llaminar2
         if (!need_realloc)
             return true;
 
-        if (isGraphCaptureActive())
-        {
-            LOG_ERROR("[ROCmMoEKernel::ensureGroupedPrefillScratchCapacity] prefill scratch realloc during graph capture "
-                      "(need slots="
-                      << total_slots << " d_model=" << d_model << " inter=" << intermediate
-                      << ", have slots=" << prefill_slots_cap_ << " d_model=" << prefill_d_model_cap_
-                      << " inter=" << prefill_intermediate_cap_ << ")");
-            return false;
-        }
-
-        // Free existing allocations
-        if (d_prefill_A_int8_)
-        {
-            hipFree(d_prefill_A_int8_);
-            d_prefill_A_int8_ = nullptr;
-        }
-        if (d_prefill_A_scales_)
-        {
-            hipFree(d_prefill_A_scales_);
-            d_prefill_A_scales_ = nullptr;
-        }
-        if (d_prefill_gate_)
-        {
-            hipFree(d_prefill_gate_);
-            d_prefill_gate_ = nullptr;
-        }
-        if (d_prefill_up_)
-        {
-            hipFree(d_prefill_up_);
-            d_prefill_up_ = nullptr;
-        }
         const int max_dim = (d_model > intermediate) ? d_model : intermediate;
         const int max_blocks = max_dim / 32;
 
-        hipError_t err = hipSuccess;
         // K1 produces A_int8/scales and K2 consumes them before K3 starts.
         // Reuse the same buffers for K3's SwiGLU quantized output to avoid
         // holding a second full route-slot INT8 activation at prefill length.
-        err = hipMalloc(&d_prefill_A_int8_, static_cast<size_t>(total_slots) * max_dim * sizeof(int8_t));
-        if (err != hipSuccess)
-            goto fail;
-        err = hipMalloc(&d_prefill_A_scales_, static_cast<size_t>(total_slots) * max_blocks * sizeof(float));
-        if (err != hipSuccess)
-            goto fail;
-
         // K2 writes gate/up; K3 consumes both, then K4 can reuse gate as the
         // down-projection output buffer because it is sized for max(d_model,intermediate).
-        err = hipMalloc(&d_prefill_gate_, static_cast<size_t>(total_slots) * max_dim * sizeof(float));
-        if (err != hipSuccess)
-            goto fail;
-        err = hipMalloc(&d_prefill_up_, static_cast<size_t>(total_slots) * intermediate * sizeof(float));
-        if (err != hipSuccess)
-            goto fail;
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_A_int8_),
+                                 MoEWorkspaceBuffers::PREFILL_A_INT8,
+                                 static_cast<size_t>(total_slots) * max_dim * sizeof(int8_t),
+                                 "ensureGroupedPrefillScratchCapacity(a_int8)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_A_scales_),
+                                 MoEWorkspaceBuffers::PREFILL_A_SCALES,
+                                 static_cast<size_t>(total_slots) * max_blocks * sizeof(float),
+                                 "ensureGroupedPrefillScratchCapacity(a_scales)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_gate_),
+                                 MoEWorkspaceBuffers::PREFILL_GATE,
+                                 static_cast<size_t>(total_slots) * max_dim * sizeof(float),
+                                 "ensureGroupedPrefillScratchCapacity(gate)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_up_),
+                                 MoEWorkspaceBuffers::PREFILL_UP,
+                                 static_cast<size_t>(total_slots) * intermediate * sizeof(float),
+                                 "ensureGroupedPrefillScratchCapacity(up)"))
+        {
+            d_prefill_A_int8_ = nullptr;
+            d_prefill_A_scales_ = nullptr;
+            d_prefill_gate_ = nullptr;
+            d_prefill_up_ = nullptr;
+            prefill_slots_cap_ = 0;
+            prefill_d_model_cap_ = 0;
+            prefill_intermediate_cap_ = 0;
+            return false;
+        }
 
         prefill_slots_cap_ = total_slots;
         prefill_d_model_cap_ = d_model;
         prefill_intermediate_cap_ = intermediate;
         return true;
-
-    fail:
-        LOG_ERROR("[ROCmMoEKernel::ensureGroupedPrefillScratchCapacity] hipMalloc failed: "
-                  << hipGetErrorString(err));
-        // Cleanup partial allocations
-        if (d_prefill_A_int8_)
-        {
-            hipFree(d_prefill_A_int8_);
-            d_prefill_A_int8_ = nullptr;
-        }
-        if (d_prefill_A_scales_)
-        {
-            hipFree(d_prefill_A_scales_);
-            d_prefill_A_scales_ = nullptr;
-        }
-        if (d_prefill_gate_)
-        {
-            hipFree(d_prefill_gate_);
-            d_prefill_gate_ = nullptr;
-        }
-        if (d_prefill_up_)
-        {
-            hipFree(d_prefill_up_);
-            d_prefill_up_ = nullptr;
-        }
-        prefill_slots_cap_ = 0;
-        prefill_d_model_cap_ = 0;
-        prefill_intermediate_cap_ = 0;
-        return false;
     }
 
     bool ROCmMoEKernel::executeGroupedPrefillPipeline(

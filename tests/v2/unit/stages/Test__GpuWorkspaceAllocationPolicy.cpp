@@ -126,3 +126,41 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoEExecutionScratchUsesWorkspace)
     EXPECT_NE(grouped_scratch.find("bindWorkspaceBuffer"), std::string::npos);
     EXPECT_NE(source.find("requires graph-owned MoE workspace"), std::string::npos);
 }
+
+TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEExecutionScratchUsesWorkspace)
+{
+    const auto source = readFile(repoRoot() / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp");
+    const auto route_scratch = sliceBetween(
+        source,
+        "bool ROCmMoEKernel::ensureSharedGateScratchCapacity(",
+        "const ROCmMoEKernel::RouterQ8GateCacheEntry *ROCmMoEKernel::getOrCreateQ8RouterGateCache(");
+    const auto device_grouping_scratch = sliceBetween(
+        source,
+        "bool ROCmMoEKernel::groupTokensByExpertDevice(",
+        "    // =========================================================================\n    // Tensor-aware API overrides");
+    const auto decode_scratch = sliceBetween(
+        source,
+        "bool ROCmMoEKernel::ensureStagingCapacity(",
+        "bool ROCmMoEKernel::ensureRuntimeGateUpPointerArrays(");
+    const auto sync_grouping_scratch = sliceBetween(
+        source,
+        "bool ROCmMoEKernel::prepareExpertGroups(",
+        "int ROCmMoEKernel::getExpertTokenCount(");
+    const auto async_grouping_scratch = sliceBetween(
+        source,
+        "bool ROCmMoEKernel::prepareExpertGroupsAsync(",
+        "bool ROCmMoEKernel::executeGroupedPrefillPipeline(");
+
+    expectNoRawGpuAllocationCalls(route_scratch, "ROCmMoEKernel route scratch");
+    expectNoRawGpuAllocationCalls(device_grouping_scratch, "ROCmMoEKernel device grouping scratch");
+    expectNoRawGpuAllocationCalls(decode_scratch, "ROCmMoEKernel decode scratch");
+    expectNoRawGpuAllocationCalls(sync_grouping_scratch, "ROCmMoEKernel synchronous grouping scratch");
+    expectNoRawGpuAllocationCalls(async_grouping_scratch, "ROCmMoEKernel asynchronous grouping/prefill scratch");
+
+    EXPECT_NE(route_scratch.find("bindWorkspaceBuffer"), std::string::npos);
+    EXPECT_NE(device_grouping_scratch.find("bindWorkspaceBuffer"), std::string::npos);
+    EXPECT_NE(decode_scratch.find("bindWorkspaceBuffer"), std::string::npos);
+    EXPECT_NE(sync_grouping_scratch.find("bindWorkspaceBuffer"), std::string::npos);
+    EXPECT_NE(async_grouping_scratch.find("bindWorkspaceBuffer"), std::string::npos);
+    EXPECT_NE(source.find("requires graph-owned MoE workspace"), std::string::npos);
+}

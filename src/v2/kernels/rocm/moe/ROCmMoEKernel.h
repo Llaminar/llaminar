@@ -53,6 +53,9 @@ namespace llaminar2
         explicit ROCmMoEKernel(int device_ordinal);
         ~ROCmMoEKernel() override;
 
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override { bindWorkspace(nullptr); }
+
         /**
          * @brief Reset request-shaped host metadata while preserving device buffers.
          *
@@ -347,7 +350,7 @@ namespace llaminar2
 
         void syncBlasStream();
         void allocateHistogramBuffers(int num_layers, int num_experts);
-        void ensureStagingCapacity(int count);
+        bool ensureStagingCapacity(int count);
         bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
         bool ensureGroupedGateUpCapacity(int num_active, int d_model);
         bool ensureGroupedGateUpKPartScratchCapacity(int num_active, int k_partitions, int intermediate);
@@ -369,6 +372,8 @@ namespace llaminar2
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
         bool ensureRouteLogitsPartialsCapacity(size_t partial_count);
         bool ensureRouterQ8HiddenScratchCapacity(int d_model);
+        bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
+        void clearWorkspaceScratchBindings() noexcept;
         struct RouterQ8GateCacheEntry;
         const RouterQ8GateCacheEntry *getOrCreateQ8RouterGateCache(
             ITensor *gate_weights,
@@ -553,6 +558,8 @@ namespace llaminar2
         int prefill_slots_cap_ = 0;           ///< Current capacity (total_slots)
         int prefill_d_model_cap_ = 0;         ///< Current d_model capacity
         int prefill_intermediate_cap_ = 0;    ///< Current intermediate capacity
+
+        bool scratch_workspace_bound_ = false;
 
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
     };

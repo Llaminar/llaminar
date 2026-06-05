@@ -489,12 +489,15 @@ namespace llaminar2
 
     WorkspaceRequirements MoERoutingStage::getWorkspaceRequirements(int, int, int) const
     {
-        if (!params_.device_id.is_cuda())
+        if (!params_.device_id.is_cuda() && !params_.device_id.is_rocm())
             return WorkspaceRequirements{};
-        return MoEWorkspaceBuffers::routing(
-            params_.seq_len,
-            params_.num_experts,
-            params_.top_k);
+        if (params_.device_id.is_rocm())
+            return MoEWorkspaceBuffers::rocmRouting(
+                params_.seq_len,
+                params_.d_model,
+                params_.num_experts,
+                params_.top_k);
+        return MoEWorkspaceBuffers::routing(params_.seq_len, params_.num_experts, params_.top_k);
     }
 
     void MoERoutingStage::bindWorkspace(DeviceWorkspaceManager *workspace)
