@@ -306,8 +306,6 @@ namespace
         {"N128/MT16/MB2", 128, 16, 2, -1},
         {"N128/MT32/MB1", 128, 32, 1, -1},
         {"N128/MT32/MB2", 128, 32, 2, -1},
-        {"N128/MT64/MB1", 128, 64, 1, -1},
-        {"N128/MT64/MB2", 128, 64, 2, -1},
         // UNROLL_G sweep on best known config (N64/MT64/MB1 — most likely winner)
         {"N64/MT64/MB1/U0", 64, 64, 1, 0},
         {"N64/MT64/MB1/U1", 64, 64, 1, 1},
@@ -318,9 +316,6 @@ namespace
         {"N128/MT32/MB1/U1", 128, 32, 1, 1},
         {"N128/MT32/MB1/U2", 128, 32, 1, 2},
         {"N128/MT32/MB1/U4", 128, 32, 1, 4},
-        // 3-wave variants for comparison
-        {"N64/MT16/MB3", 64, 16, 3, -1},
-        {"N128/MT16/MB3", 128, 16, 3, -1},
         // Auto dispatch (current heuristic)
         {"Auto", -1, -1, -1, -1},
     };
@@ -360,8 +355,10 @@ namespace
             {
                 (void)hipSetDevice(0);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, 0);
-                device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
+                if (hipGetDeviceProperties(&props, 0) == hipSuccess)
+                    device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
+                else
+                    device_name_ = "rocm:0";
             }
 #else
             has_device_ = false;

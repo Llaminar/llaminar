@@ -62,9 +62,10 @@ Fresh checks:
   buckets; temporary source-level selector overrides are gone and `M=595`
   prompts route through bucket 600 under regression coverage.
 - NativeVNNI trainers share one codebook map and bucket policy across CUDA and
-  ROCm. CUDA policy smoke: `20260605T195141Z-prefill-policy-smoke`. ROCm policy
-  smoke: `benchmark_results/rocm_native_vnni/20260605T200819Z-prefill-policy-smoke`,
-  `Q4_0/Qwen36_GDN_TimeProjection/M=600`, `501.279 us`, cosine `0.999993`.
+  ROCm. ROCm now consumes generated prefill dispatch tables from real sweep CSVs:
+  `benchmark_results/rocm_native_vnni/20260605T202837Z-prefill-generated-pipeline`
+  trained Q4_0/Q4_K `M=600` GDN time and FFN-down rows and passed focused GEMM
+  integration.
 - Focused coverage green: codebook/generated-dispatch validators, ROCm trainer
   generator/CSV validators, CUDA GEMM route/workspace regressions, CUDA graph
   stochastic smoke, and Qwen3.6 CUDA dense prefix/MTP parity.

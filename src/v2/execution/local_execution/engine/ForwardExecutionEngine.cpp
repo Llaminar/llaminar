@@ -1527,16 +1527,49 @@ namespace llaminar2
         bool padded_preflight_checked = false;
         PrefillGraphRejectReason padded_preflight_reason = PrefillGraphRejectReason::None;
 
-        auto launchPrefillGraph = [&](const char *capture_phase,
+        auto launchPrefillGraph = [&](IWorkerGPUContext *gpu_ctx,
+                                      void *stream,
+                                      const char *capture_phase,
                                       PrefillGraphPhase cache_phase,
                                       const char *launch_kind,
                                       const std::string &recapture_reason) -> bool
         {
+            void *gpu_start_event = nullptr;
+            void *gpu_stop_event = nullptr;
+            const bool should_time_gpu =
+                PerfStatsCollector::gpuStageEventTimingEnabled() &&
+                gpu_ctx != nullptr &&
+                stream != nullptr;
+            bool gpu_event_timing_active = false;
+            if (should_time_gpu)
+            {
+                gpu_start_event = gpu_ctx->createEvent();
+                gpu_stop_event = gpu_ctx->createEvent();
+                if (gpu_start_event && gpu_stop_event)
+                {
+                    gpu_ctx->recordEvent(gpu_start_event, stream);
+                    gpu_event_timing_active = true;
+                }
+            }
+
             const auto launch_t0 = std::chrono::high_resolution_clock::now();
             const bool ok = cache.launch(key);
             const auto launch_t1 = std::chrono::high_resolution_clock::now();
             const auto ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count());
+
+            auto destroy_gpu_events = [&]()
+            {
+                if (gpu_ctx)
+                {
+                    if (gpu_start_event)
+                        gpu_ctx->destroyEvent(gpu_start_event);
+                    if (gpu_stop_event)
+                        gpu_ctx->destroyEvent(gpu_stop_event);
+                }
+                gpu_start_event = nullptr;
+                gpu_stop_event = nullptr;
+            };
 
             if (KernelProfiler::isEnabled())
             {
@@ -1562,6 +1595,38 @@ namespace llaminar2
                     input.device.toString(),
                     std::move(tags));
             }
+
+            if (gpu_event_timing_active && ok)
+            {
+                gpu_ctx->recordEvent(gpu_stop_event, stream);
+                gpu_ctx->synchronizeEvent(gpu_stop_event);
+                const float elapsed_ms = gpu_ctx->eventElapsedTime(gpu_start_event, gpu_stop_event);
+                if (elapsed_ms >= 0.0f)
+                {
+                    auto observation = makePrefillGraphObservation(
+                        input,
+                        key,
+                        capture_phase,
+                        recapture_reason);
+                    auto tags = prefillGraphObservationTags(
+                        observation,
+                        prefillGraphPhaseName(cache_phase));
+                    tags.emplace("attribution", "gpu_event");
+                    tags.emplace("source", "prefill_graph_cache");
+                    tags.emplace("graph_capture_scope", "prefill_graph_replay");
+                    tags.emplace("timing_scope", "total_replay_gpu_event");
+                    tags.emplace("sync_scope", "profiling_event_synchronized");
+                    tags.emplace("launch_kind", launch_kind ? launch_kind : "unknown");
+                    PerfStatsCollector::recordTimingNs(
+                        "stage_gpu",
+                        "prefill_graph.replay",
+                        static_cast<uint64_t>(static_cast<double>(elapsed_ms) * 1.0e6),
+                        "prefill",
+                        input.device.toString(),
+                        std::move(tags));
+                }
+            }
+            destroy_gpu_events();
 
             return ok;
         };
@@ -1629,7 +1694,7 @@ namespace llaminar2
             }
             bindPrefillStreamToStages(stream);
 
-            if (!launchPrefillGraph("replay", PrefillGraphPhase::Ready, "replay", "none"))
+            if (!launchPrefillGraph(gpu_ctx, stream, "replay", PrefillGraphPhase::Ready, "replay", "none"))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph replay FAILED for seq_len=" << input.seq_len);
                 return false;
@@ -1700,7 +1765,7 @@ namespace llaminar2
             // Kernels recorded during HIP/CUDA stream capture are not executed
             // until the executable graph is launched. Launch once immediately so
             // the capture request produces logits and advances device state.
-            if (!launchPrefillGraph("capture", PrefillGraphPhase::Ready, "launch_after_capture",
+            if (!launchPrefillGraph(gpu_ctx, stream, "capture", PrefillGraphPhase::Ready, "launch_after_capture",
                                     phase == PrefillGraphPhase::Warmup ? "armed_warmup" : "recapture"))
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph launch-after-capture failed for seq_len=" << input.seq_len);

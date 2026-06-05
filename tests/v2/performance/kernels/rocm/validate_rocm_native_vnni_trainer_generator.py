@@ -42,10 +42,12 @@ def main() -> int:
         text = output.read_text()
         summary_text = summary.read_text()
         required_fragments = [
-            "kROCmNativeVNNIPrefillTuning",
+            "selectROCmNativeVNNIPrefillGenerated",
+            "ROCmNativeVNNIPrefillDispatchConfig",
             "CB=5 (Q4_1)",
             "CB=7 (Q5_1)",
             "CB=19 (Q8_0)",
+            "{128, 32, 1, 2}",
             "M=600",
             "qwen36_ffn_down_bucket",
         ]

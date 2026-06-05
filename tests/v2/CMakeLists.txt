@@ -1625,6 +1625,7 @@ add_test(NAME V2_Unit_NativeVNNIGeneratedDispatchCodebooks
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
             ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc
             ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc
+            ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc
 )
 set_tests_properties(V2_Unit_NativeVNNIGeneratedDispatchCodebooks PROPERTIES
     LABELS "V2;Unit;NativeVNNI;Quantization;Codebook;Dispatch;Regression"

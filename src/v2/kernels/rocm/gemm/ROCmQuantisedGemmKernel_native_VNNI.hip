@@ -44,6 +44,7 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
+#include "kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc"
 
 // ============================================================================
 // Format tags — full set matching ROCmGemvKernel_native_VNNI.hip
@@ -2200,6 +2201,65 @@ static bool launch_native_vnni_gemm(
         return hipGetLastError() == hipSuccess;
     };
 
+    auto launch_config = [&](int n_tile, int m_tile_cfg, int min_blocks, int unroll) -> bool
+    {
+        if (min_blocks != 1 && min_blocks != 2)
+            return false;
+
+#define NVNNI_CONFIG_LAUNCH(NT, MT, MB, UG) \
+        { \
+            dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1); \
+            dim3 block(BLOCK_SIZE, 1, 1); \
+            native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, UG> \
+                <<<grid, block, 0, hip_stream>>>( \
+                    d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins, \
+                    d_output, d_scales_A, M, N, K, d_scales_A_blockwise); \
+            return hipGetLastError() == hipSuccess; \
+        }
+
+#define NVNNI_CONFIG_LAUNCH_UG(NT, MT, MB) \
+        switch (unroll) { \
+            case 0:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 0) \
+            case 1:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 1) \
+            case 2:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 2) \
+            default: NVNNI_CONFIG_LAUNCH(NT, MT, MB, 4) \
+        }
+
+#define NVNNI_CONFIG_LAUNCH_MB(NT, MT) \
+        switch (min_blocks) { \
+            case 1:  NVNNI_CONFIG_LAUNCH_UG(NT, MT, 1) \
+            default: NVNNI_CONFIG_LAUNCH_UG(NT, MT, 2) \
+        }
+
+#define NVNNI_CONFIG_LAUNCH_MT(NT) \
+        switch (m_tile_cfg) { \
+            case 16: NVNNI_CONFIG_LAUNCH_MB(NT, 16) \
+            case 64: NVNNI_CONFIG_LAUNCH_MB(NT, 64) \
+            default: NVNNI_CONFIG_LAUNCH_MB(NT, 32) \
+        }
+
+        switch (n_tile)
+        {
+        case 64:
+            NVNNI_CONFIG_LAUNCH_MT(64)
+        case 128:
+            // N128/MT64 is intentionally not a supported trained mode; the
+            // generator rejects stale CSVs that claim it as a winner.
+            switch (m_tile_cfg)
+            {
+            case 16: NVNNI_CONFIG_LAUNCH_MB(128, 16)
+            default: NVNNI_CONFIG_LAUNCH_MB(128, 32)
+            }
+        default:
+            return false;
+        }
+
+#undef NVNNI_CONFIG_LAUNCH_MT
+#undef NVNNI_CONFIG_LAUNCH_MB
+#undef NVNNI_CONFIG_LAUNCH_UG
+#undef NVNNI_CONFIG_LAUNCH
+    };
+
     // M_TILE selection: minimize row waste (same as INT8 V7)
     auto select_m_tile = [](int rows) -> int {
         int best_mt = 64;
@@ -2240,67 +2300,30 @@ static bool launch_native_vnni_gemm(
     // extra template instantiations only for Pattern S formats (Q4_0, IQ4_NL)
     // to keep compile time reasonable.
     // =========================================================================
-    if constexpr (FMT == NVNNI_GEMM_Q4_0 || FMT == NVNNI_GEMM_IQ4_NL) {
-        const auto& env = llaminar2::debugEnv().rocm;
-        const bool has_overrides = (env.nvnni_mt > 0 || env.nvnni_unroll >= 0 ||
-                                    env.nvnni_min_blocks > 0 ||
-                                    env.nvnni_force_n64 || env.nvnni_force_n128);
-        if (has_overrides) {
-            const int eff_mt = (env.nvnni_mt > 0) ? env.nvnni_mt : m_tile;
-            const int eff_unroll = (env.nvnni_unroll >= 0) ? env.nvnni_unroll : 4;
-            const int eff_min_blocks = (env.nvnni_min_blocks > 0) ? env.nvnni_min_blocks : 2;
-            const bool eff_n128 = env.nvnni_force_n128 ? true :
-                                  env.nvnni_force_n64 ? false : use_n128;
+    const auto& env = llaminar2::debugEnv().rocm;
+    const bool has_overrides = (env.nvnni_mt > 0 || env.nvnni_unroll >= 0 ||
+                                env.nvnni_min_blocks > 0 ||
+                                env.nvnni_force_n64 || env.nvnni_force_n128);
+    if (has_overrides) {
+        int eff_mt = (env.nvnni_mt > 0) ? env.nvnni_mt : m_tile;
+        const int eff_unroll = (env.nvnni_unroll >= 0) ? env.nvnni_unroll : 4;
+        const int eff_min_blocks = (env.nvnni_min_blocks > 0) ? env.nvnni_min_blocks : 2;
+        const bool eff_n128 = env.nvnni_force_n128 ? true :
+                              env.nvnni_force_n64 ? false : use_n128;
+        if (eff_n128 && eff_mt > 32)
+            eff_mt = 32;
+        return launch_config(eff_n128 ? 128 : 64, eff_mt, eff_min_blocks, eff_unroll);
+    }
 
-#define NVNNI_LAUNCH(NT, MT, MB, UG) \
-            { \
-                dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1); \
-                dim3 block(BLOCK_SIZE, 1, 1); \
-                native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, UG> \
-                    <<<grid, block, 0, hip_stream>>>( \
-                        d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins, \
-                        d_output, d_scales_A, M, N, K, d_scales_A_blockwise); \
-                return hipGetLastError() == hipSuccess; \
-            }
-
-#define NVNNI_LAUNCH_UG(NT, MT, MB) \
-            switch (eff_unroll) { \
-                case 0:  NVNNI_LAUNCH(NT, MT, MB, 0) \
-                case 1:  NVNNI_LAUNCH(NT, MT, MB, 1) \
-                case 2:  NVNNI_LAUNCH(NT, MT, MB, 2) \
-                default: NVNNI_LAUNCH(NT, MT, MB, 4) \
-            }
-
-#define NVNNI_LAUNCH_MB(NT, MT) \
-            switch (eff_min_blocks) { \
-                case 1:  NVNNI_LAUNCH_UG(NT, MT, 1) \
-                case 3:  NVNNI_LAUNCH_UG(NT, MT, 3) \
-                default: NVNNI_LAUNCH_UG(NT, MT, 2) \
-            }
-
-#define NVNNI_LAUNCH_MT(NT) \
-            switch (eff_mt) { \
-                case 16: NVNNI_LAUNCH_MB(NT, 16) \
-                case 64: NVNNI_LAUNCH_MB(NT, 64) \
-                default: NVNNI_LAUNCH_MB(NT, 32) \
-            }
-
-            if (eff_n128) {
-                // M_TILE > 32 is NOT viable with N128 (A-LDS 2-way bank conflicts
-                // at THREADS_M=16, empirically 2.5× slower).  Cap to M32.
-                switch (eff_mt <= 32 ? eff_mt : 32) {
-                    case 16: NVNNI_LAUNCH_MB(128, 16)
-                    default: NVNNI_LAUNCH_MB(128, 32)
-                }
-            } else {
-                NVNNI_LAUNCH_MT(64)
-            }
-
-#undef NVNNI_LAUNCH_MT
-#undef NVNNI_LAUNCH_MB
-#undef NVNNI_LAUNCH_UG
-#undef NVNNI_LAUNCH
-        }
+    llaminar2::rocm::generated::ROCmNativeVNNIPrefillDispatchConfig generated_cfg{};
+    if (llaminar2::rocm::generated::selectROCmNativeVNNIPrefillGenerated<static_cast<uint8_t>(FMT)>(
+            M, N, K, generated_cfg))
+    {
+        return launch_config(
+            static_cast<int>(generated_cfg.n_tile),
+            static_cast<int>(generated_cfg.m_tile),
+            static_cast<int>(generated_cfg.min_blocks),
+            static_cast<int>(generated_cfg.unroll));
     }
 
     // =========================================================================
