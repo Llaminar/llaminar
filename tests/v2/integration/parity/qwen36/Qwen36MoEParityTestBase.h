@@ -957,8 +957,16 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
         EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
         EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
-        EXPECT_GT(after_second.mtp_draft_steps, after_first.mtp_draft_steps);
-        EXPECT_GT(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs);
+        // MTP counters are request-local: prove the restored-prefix request
+        // still ran the verifier instead of expecting cumulative growth.
+        const uint64_t expected_second_step_drafts = static_cast<uint64_t>(
+            std::min(mtp_draft_tokens, std::max(0, test_case.decode_steps - 1)));
+        EXPECT_GE(after_second.mtp_draft_steps, expected_second_step_drafts);
+        if (expected_second_step_drafts > 0)
+        {
+            EXPECT_GE(after_second.mtp_verifier_runs, 1u);
+            EXPECT_GE(after_second.mtp_verifier_token_count, expected_second_step_drafts + 1);
+        }
     }
 
     inline void runMoEGreedyFreshRunnerDeterminism(

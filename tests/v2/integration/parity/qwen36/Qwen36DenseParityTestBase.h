@@ -748,8 +748,14 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
         EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
         EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
-        EXPECT_GT(after_second.mtp_draft_steps, after_first.mtp_draft_steps);
-        EXPECT_GT(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs);
+        // MTP counters are request-local: prove the restored-prefix request
+        // still ran the verifier instead of expecting cumulative growth.
+        EXPECT_GE(after_second.mtp_draft_steps, expected_first_step_drafts);
+        if (expected_first_step_drafts > 0)
+        {
+            EXPECT_GE(after_second.mtp_verifier_runs, 1u);
+            EXPECT_GE(after_second.mtp_verifier_token_count, expected_first_step_drafts + 1);
+        }
     }
 
     inline void runDenseDynamicMTPParity(
@@ -833,7 +839,7 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_TRUE(after_second.prefix_request.hit);
         EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
         EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
-        EXPECT_GT(after_second.mtp_depth_policy_windows, after_first.mtp_depth_policy_windows);
+        EXPECT_GE(after_second.mtp_depth_policy_windows, 1u);
     }
 
     inline void runDenseStochasticMTPVerifierParity(

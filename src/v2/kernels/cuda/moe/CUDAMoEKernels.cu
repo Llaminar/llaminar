@@ -904,23 +904,54 @@ namespace
         int total_slots, int top_k, int num_experts)
     {
         const int expert = blockIdx.x;
-        if (expert >= num_experts || threadIdx.x != 0)
+        if (expert >= num_experts)
             return;
 
-        int write = expert_offsets[expert];
-        const int end = write + expert_counts[expert];
-        for (int slot = 0; slot < total_slots; ++slot)
-        {
-            if (routing_indices[slot] != expert)
-                continue;
-            if (write >= end)
-                return;
+        __shared__ int chunk_matches[kThreads];
+        __shared__ int write_base;
 
-            grouped_token_indices[write] = slot / top_k;
-            original_to_grouped[slot] = write;
-            original_expert_ids[slot] = expert;
-            grouped_weights[write] = routing_weights[slot];
-            ++write;
+        if (threadIdx.x == 0)
+            write_base = expert_offsets[expert];
+        __syncthreads();
+
+        const int end = expert_offsets[expert] + expert_counts[expert];
+        for (int base = 0; base < total_slots; base += blockDim.x)
+        {
+            const int slot = base + threadIdx.x;
+            const int match = (slot < total_slots && routing_indices[slot] == expert) ? 1 : 0;
+            chunk_matches[threadIdx.x] = match;
+            const int chunk_count = __syncthreads_count(match);
+            if (chunk_count == 0)
+                continue;
+
+            // Inclusive scan over this chunk. The chunks are processed in ascending
+            // slot order and the scan is stable within the chunk, so grouped slots
+            // exactly match the serial deterministic order.
+#pragma unroll
+            for (int offset = 1; offset < kThreads; offset <<= 1)
+            {
+                const int add = (threadIdx.x >= offset) ? chunk_matches[threadIdx.x - offset] : 0;
+                __syncthreads();
+                chunk_matches[threadIdx.x] += add;
+                __syncthreads();
+            }
+
+            if (match)
+            {
+                const int write = write_base + chunk_matches[threadIdx.x] - 1;
+                if (write < end)
+                {
+                    grouped_token_indices[write] = slot / top_k;
+                    original_to_grouped[slot] = write;
+                    original_expert_ids[slot] = expert;
+                    grouped_weights[write] = routing_weights[slot];
+                }
+            }
+
+            __syncthreads();
+            if (threadIdx.x == 0)
+                write_base += chunk_count;
+            __syncthreads();
         }
     }
 
@@ -2765,7 +2796,7 @@ extern "C"
                                               int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
-        scatter_tokens_deterministic_kernel<<<num_experts, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+        scatter_tokens_deterministic_kernel<<<num_experts, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             routing_indices, routing_weights, expert_offsets, expert_counts,
             grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
             total_slots, top_k, num_experts);

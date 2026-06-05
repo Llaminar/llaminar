@@ -2208,8 +2208,9 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmPrefixCacheMTPRealModelSmoke)
     EXPECT_TRUE(after_second.prefix_request.terminal_logits_restored);
     EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
     EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
-    EXPECT_GE(after_second.mtp_draft_steps, after_first.mtp_draft_steps + 2u);
-    EXPECT_GE(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs + 2u);
+    // MTP counters are request-local after each prefill/generate request.
+    EXPECT_GE(after_second.mtp_draft_steps, 2u);
+    EXPECT_GE(after_second.mtp_verifier_runs, 1u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPMTPRealModelSmoke)
@@ -2528,8 +2529,9 @@ TEST(Test__KVPrefixMTPStateProbe, Qwen36ROCmLocalTPPrefixCacheMTPRealModelSmoke)
     EXPECT_TRUE(after_second.prefix_request.terminal_hidden_restored);
     EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
     EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
-    EXPECT_GE(after_second.mtp_draft_steps, after_first.mtp_draft_steps + 2u);
-    EXPECT_GE(after_second.mtp_verifier_runs, after_first.mtp_verifier_runs + 2u);
+    // MTP counters are request-local after each prefill/generate request.
+    EXPECT_GE(after_second.mtp_draft_steps, 1u);
+    EXPECT_GE(after_second.mtp_verifier_runs, 1u);
 }
 
 TEST(Test__KVPrefixMTPStateProbe, MTP_ShiftedCacheCountProbeOnGPU)

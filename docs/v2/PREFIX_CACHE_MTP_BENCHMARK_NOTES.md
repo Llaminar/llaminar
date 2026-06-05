@@ -10,20 +10,18 @@ history belongs in artifacts.
 | Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 671.37 | 40.82 | fits 24GB |
 | Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 582.66 | 53.83 | near fixed d1 |
 | Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2156.95 | 109.91 | shared-expert grouped decode default |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1628.13 | 141.05 | post-reset, best 142.74 |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1653.16 | 139.46 | request reset, 85.94% accept |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2286.11 | 109.66 | deterministic scatter parallelized |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1723.72 | 138.67 | latest accept 84.38%, best decode 142.74 |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1725.62 | 141.08 | latest accept 90.62% |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
 
 ## llama.cpp CUDA Anchors
 
-`ggml-org/llama.cpp@6ddc943`.
-MTP-off uses `llama-bench`; MTP uses generated `mtp-*` sidecars with
-`llama-cli --single-turn`. Artifact:
+`ggml-org/llama.cpp@6ddc943`. MTP-off uses `llama-bench`; MTP uses generated
+`mtp-*` sidecars with `llama-cli --single-turn`. Artifact:
 `benchmark_results/llama_cpp_cuda/20260604T191903Z-6ddc943-mtp-recalibration`.
-Prompt/template differences mean acceptance is directional, not exact parity.
 
 | Lane | Model | Prefill | Decode | Acceptance |
 |---|---|---:|---:|---:|
@@ -38,54 +36,43 @@ Prompt/template differences mean acceptance is directional, not exact parity.
 ## Latest Evidence
 
 CUDA MoE latest:
-`20260605T031355Z-reset-check-no-mtp`,
-`20260605T031848Z-post-reset-rerun-mtp-fixed`,
-`20260605T031906Z-post-reset-rerun-mtp-dynamic`.
+`20260605T041151Z-parallel-scatter-skipzero-clean-no-mtp`,
+`20260605T041209Z-parallel-scatter-skipzero-clean-mtp-fixed-d1`,
+`20260605T041227Z-parallel-scatter-skipzero-clean-mtp-dynamic`.
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
-| no MTP | 2156.95 | 109.91 | n/a |
-| fixed d1 MTP | 1628.13 | 141.05 | 84.38% |
-| dynamic MTP | 1653.16 | 139.46 | 85.94% |
+| no MTP | 2286.11 | 109.66 | n/a |
+| fixed d1 MTP | 1723.72 | 138.67 | 84.38% |
+| dynamic MTP | 1725.62 | 141.08 | 90.62% |
 
 Fresh checks:
-- Perf export/stage fixes:
-  `20260604T230244Z-perf-export-no-stage-events`,
-  `20260604T231108Z-stage-timing-accumulator-fix`,
-  `20260605T024434Z-graph-replay-stage-stats`.
-- Captured replay exports `stage_gpu.graph_replay.*` GPU-event timings when
-  stage timing is enabled, plus `stage_gpu.graph_replay_plan_*` metadata to
-  JSON/CSV; host replay bookkeeping remains in `forward_graph`.
-- CUDA runtime-routed MoE decode has graph-replay regression coverage via
-  `RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphReplays`; counter-only runs
-  show `cuda_moe_grouped_decode_fused_calls`, `route=fused_kpart`.
-- CUDA shared-expert decode now uses the grouped table path by default and has
-  benchmark-style parity coverage with perf-counter evidence.
-- Dynamic MTP request state resets across benchmark-style `clearCache()`; JSON
-  counters now describe the measured request rather than warmup plus all runs.
-- CUDA MoE prefill tile sweep `20260605T032239Z-cuda-moe-prefill-tile-sweep`:
-  tile 16 remains best; disabling fused SwiGLU regresses slightly.
+- Graph replay stage stats export trusted GPU-event rows in `stage_gpu`; host
+  bookkeeping stays in `forward_graph` (`20260605T024434Z`).
+- CUDA runtime-routed MoE decode and shared-expert grouped decode have graph
+  replay / benchmark-style parity coverage with perf-counter evidence.
+- Dynamic MTP request state resets across benchmark-style `clearCache()`.
+- CUDA MoE prefill checks: tile 16 remains best; down prefill decode-hoist
+  was neutral/slightly negative (`2146p/109.79d`) and reverted.
+- CUDA deterministic scatter now uses block-per-expert chunk scans. nsys
+  `20260605T041258Z-nsys-parallel-scatter-skipzero` shows scatter down from
+  `67.2ms` to `4.6ms`; no-MTP prefill improved `2156.95 -> 2286.11 tok/s`.
 
 Focused gates: `V2_Integration_CUDAMoEKernel`, Qwen3.6 MoE CUDA math parity,
-and Qwen3.6 MoE CUDA benchmark-style parity.
+Qwen3.6 dense/MoE CUDA prefix+MTP restore parity, and Qwen3.6 MoE CUDA
+benchmark-style parity. ROCm LocalTP prefix smoke currently has an unrelated
+segfault breadcrumb from this run.
 
 ## Retained Actions
 
-- ROCm dense/MoE: graph-safe sidecar streams, depth clamping, M=2/3/4 VNNI,
+- ROCm: graph-safe sidecar streams, depth clamping, M=2/3/4 VNNI,
   verifier-row GDN restore, compact active-expert MoE prefill grids.
-- CUDA dense/MoE: verifier-row GDN restore, graph-capturable small-M attention,
-  grouped verifier prefill, stream-explicit shared experts, fused split-K MoE,
-  cuBLAS batched GDN projections, parallel router top-k, source-token MoE
-  activation quantization, mapped output redirects, inverse-map top-k scatter,
-  token-direct verifier down accumulation, post-sidecar checkpoint elision, and
-  fused runtime-routed MoE decode.
-- CUDA and ROCm GPU greedy argmax tie-break to lowest token id.
-- Memory planning caps activation arenas to prefill-bucket capacity while KV
-  keeps requested context capacity; oversized monolithic graph shapes hard fail.
-- Stage profiling split: `stage_gpu` has eager per-stage event timing plus
-  captured graph replay GPU-event/plan stats, `stage_executor_cpu` is host
-  attribution, and `forward_graph` remains graph-control attribution.
-- Non-null stream hard failures remain required.
+- CUDA: verifier-row GDN restore, graph-capturable small-M attention, grouped
+  verifier prefill, stream-explicit shared experts, fused split-K/runtime MoE,
+  parallel router/top-k/scatter, source-token activation quantization, mapped
+  outputs, checkpoint elision, and batched GDN projections.
+- Shared: lowest-id greedy argmax tie-break, capped activation arenas, trusted
+  stage profiling split, and non-null GPU stream hard failures.
 
 ## Next Work
 

@@ -27,6 +27,36 @@
 #include <vector>
 
 #ifdef HAVE_CUDA
+extern "C" bool cudaMoE_count_per_expert(
+    const int *routing_indices,
+    int *expert_counts,
+    int total_slots,
+    int num_experts,
+    int device_idx,
+    void *stream);
+
+extern "C" bool cudaMoE_exclusive_scan(
+    const int *expert_counts,
+    int *expert_offsets,
+    int num_experts,
+    int device_idx,
+    void *stream);
+
+extern "C" bool cudaMoE_scatter_tokens_deterministic(
+    const int *routing_indices,
+    const float *routing_weights,
+    const int *expert_offsets,
+    const int *expert_counts,
+    int *grouped_token_indices,
+    int *original_to_grouped,
+    int *original_expert_ids,
+    float *grouped_weights,
+    int total_slots,
+    int top_k,
+    int num_experts,
+    int device_idx,
+    void *stream);
+
 extern "C" bool cudaMoE_group_tokens_small_float(
     const float *routing_indices,
     const float *routing_weights,
@@ -1305,6 +1335,133 @@ TEST_F(Test__CUDAMoEKernel, SmallFloatGroupingEmitsCompactActiveExperts)
     cudaFree(d_original_expert_ids);
     cudaFree(d_grouped_weights);
     cudaFree(d_active);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, DeterministicScatterPreservesStableOrderAcrossChunks)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int seq_len = 80;
+    constexpr int top_k = 8;
+    constexpr int total_slots = seq_len * top_k;
+    constexpr int num_experts = 40;
+
+    std::vector<int> routing_indices(total_slots);
+    std::vector<float> routing_weights(total_slots);
+    for (int slot = 0; slot < total_slots; ++slot)
+    {
+        // Crosses multiple 256-thread chunks and leaves experts 32..39 empty,
+        // exercising both stable within-chunk ordering and the zero-match skip.
+        int expert = (slot * 17 + slot / 5) % 32;
+        if (slot % 19 == 0)
+            expert = 7;
+        if (slot % 23 == 0)
+            expert = 31;
+        routing_indices[static_cast<size_t>(slot)] = expert;
+        routing_weights[static_cast<size_t>(slot)] = 0.001f * static_cast<float>(slot + 3);
+    }
+
+    int *d_indices = nullptr;
+    float *d_weights = nullptr;
+    int *d_counts = nullptr;
+    int *d_offsets = nullptr;
+    int *d_grouped_tokens = nullptr;
+    int *d_original_to_grouped = nullptr;
+    int *d_original_expert_ids = nullptr;
+    float *d_grouped_weights = nullptr;
+    ASSERT_EQ(cudaMalloc(&d_indices, routing_indices.size() * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_weights, routing_weights.size() * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_counts, num_experts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_offsets, num_experts * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_grouped_tokens, total_slots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_original_to_grouped, total_slots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_original_expert_ids, total_slots * sizeof(int)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_grouped_weights, total_slots * sizeof(float)), cudaSuccess);
+
+    ASSERT_EQ(cudaMemcpyAsync(d_indices, routing_indices.data(),
+                              routing_indices.size() * sizeof(int),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_weights, routing_weights.data(),
+                              routing_weights.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_counts, 0, num_experts * sizeof(int), stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_grouped_tokens, 0xff, total_slots * sizeof(int), stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_original_to_grouped, 0xff, total_slots * sizeof(int), stream_), cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(d_original_expert_ids, 0xff, total_slots * sizeof(int), stream_), cudaSuccess);
+
+    ASSERT_TRUE(cudaMoE_count_per_expert(
+        d_indices, d_counts, total_slots, num_experts, 0, stream_));
+    ASSERT_TRUE(cudaMoE_exclusive_scan(
+        d_counts, d_offsets, num_experts, 0, stream_));
+    ASSERT_TRUE(cudaMoE_scatter_tokens_deterministic(
+        d_indices, d_weights, d_offsets, d_counts,
+        d_grouped_tokens, d_original_to_grouped, d_original_expert_ids, d_grouped_weights,
+        total_slots, top_k, num_experts, 0, stream_));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    std::vector<int> counts(num_experts);
+    std::vector<int> offsets(num_experts);
+    std::vector<int> grouped_tokens(total_slots);
+    std::vector<int> original_to_grouped(total_slots);
+    std::vector<int> original_expert_ids(total_slots);
+    std::vector<float> grouped_weights(total_slots);
+    ASSERT_EQ(cudaMemcpy(counts.data(), d_counts, counts.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(offsets.data(), d_offsets, offsets.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(grouped_tokens.data(), d_grouped_tokens, grouped_tokens.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(original_to_grouped.data(), d_original_to_grouped, original_to_grouped.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(original_expert_ids.data(), d_original_expert_ids, original_expert_ids.size() * sizeof(int), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(grouped_weights.data(), d_grouped_weights, grouped_weights.size() * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+
+    std::vector<int> expected_counts(num_experts, 0);
+    for (int expert : routing_indices)
+        ++expected_counts[static_cast<size_t>(expert)];
+
+    std::vector<int> expected_offsets(num_experts, 0);
+    int running = 0;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        expected_offsets[static_cast<size_t>(expert)] = running;
+        running += expected_counts[static_cast<size_t>(expert)];
+    }
+    EXPECT_EQ(counts, expected_counts);
+    EXPECT_EQ(offsets, expected_offsets);
+
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        int local = 0;
+        for (int slot = 0; slot < total_slots; ++slot)
+        {
+            if (routing_indices[static_cast<size_t>(slot)] != expert)
+                continue;
+            const int dest = offsets[static_cast<size_t>(expert)] + local++;
+            ASSERT_GE(dest, 0);
+            ASSERT_LT(dest, total_slots);
+            EXPECT_EQ(original_to_grouped[static_cast<size_t>(slot)], dest);
+            EXPECT_EQ(original_expert_ids[static_cast<size_t>(slot)], expert);
+            EXPECT_EQ(grouped_tokens[static_cast<size_t>(dest)], slot / top_k);
+            EXPECT_FLOAT_EQ(grouped_weights[static_cast<size_t>(dest)],
+                            routing_weights[static_cast<size_t>(slot)]);
+        }
+    }
+
+    for (int expert = 32; expert < num_experts; ++expert)
+        EXPECT_EQ(counts[static_cast<size_t>(expert)], 0);
+
+    cudaFree(d_indices);
+    cudaFree(d_weights);
+    cudaFree(d_counts);
+    cudaFree(d_offsets);
+    cudaFree(d_grouped_tokens);
+    cudaFree(d_original_to_grouped);
+    cudaFree(d_original_expert_ids);
+    cudaFree(d_grouped_weights);
 #endif
 }
 
