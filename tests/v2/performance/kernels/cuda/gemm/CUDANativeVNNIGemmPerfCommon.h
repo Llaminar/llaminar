@@ -13,6 +13,7 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "kernels/cuda/gemm/CuBLASGemmKernel.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../../utils/PreparedWeightTestHarness.h"
 #include "../../../../utils/TestTensorFactory.h"
@@ -178,7 +179,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
         {"14B_TP4_LM_Head", 38016, 5120},
     };
 
-    inline const std::vector<int> kPrefillMValues = {32, 64, 128};
+    inline const std::vector<int> kPrefillMValues = defaultNativeVNNIDispatchTrainingRows();
 
     struct RunConfig
     {

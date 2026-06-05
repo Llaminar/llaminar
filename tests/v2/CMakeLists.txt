@@ -1635,11 +1635,25 @@ add_test(NAME V2_Unit_ROCmNativeVNNITrainerCsvValidator
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_vnni_trainer_csv.py
             --require-alias-group
+            --require-policy-prefill-m
+            --require-prefill-m 600
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_decode_alias_smoke.csv
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_prefill_alias_smoke.csv
 )
 set_tests_properties(V2_Unit_ROCmNativeVNNITrainerCsvValidator PROPERTIES
     LABELS "V2;Unit;ROCm;GEMM;GEMV;NativeVNNI;Codebook;Trainer;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ROCmNativeVNNITrainerGenerator
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_vnni_trainer_generator.py
+            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/analyze_rocm_native_vnni_trainer.py
+            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_prefill_alias_smoke.csv
+)
+set_tests_properties(V2_Unit_ROCmNativeVNNITrainerGenerator PROPERTIES
+    LABELS "V2;Unit;ROCm;GEMM;NativeVNNI;Codebook;Trainer;Dispatch;Regression"
     TIMEOUT 30
 )
 

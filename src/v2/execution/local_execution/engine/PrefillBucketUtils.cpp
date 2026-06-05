@@ -10,6 +10,8 @@
 
 #include "PrefillBucketUtils.h"
 
+#include "utils/PrefillGraphBucketDefaults.h"
+
 #include <algorithm>
 
 namespace llaminar2
@@ -17,7 +19,7 @@ namespace llaminar2
 
     std::vector<int> defaultPrefillGraphBuckets()
     {
-        return {64, 128, 256, 384, 512, 544, 576, 608, 640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560, 3072, 4096};
+        return defaultPrefillGraphBucketSizes();
     }
 
     std::vector<int> normalizePrefillGraphBuckets(const std::vector<int> &buckets)

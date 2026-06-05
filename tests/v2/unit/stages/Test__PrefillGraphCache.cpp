@@ -17,6 +17,8 @@
 #include "utils/DebugEnv.h"
 #include "utils/TestTensorFactory.h"
 
+#include <algorithm>
+
 using namespace llaminar2;
 using namespace llaminar2::test;
 using namespace llaminar2::testing;
@@ -300,6 +302,19 @@ TEST(Test__PrefillGraphCache, BucketSelection_JustOverBucket)
     ASSERT_TRUE(selection);
     EXPECT_EQ(selection.real_seq_len, 513);
     EXPECT_EQ(selection.bucket_seq_len, 544);
+    EXPECT_FALSE(selection.exact);
+}
+
+TEST(Test__PrefillGraphCache, BucketSelection_DefaultsIncludeDenseBenchmarkLane)
+{
+    auto buckets = defaultPrefillGraphBuckets();
+    EXPECT_NE(std::find(buckets.begin(), buckets.end(), 600), buckets.end());
+
+    auto selection = selectPrefillGraphBucket(595, buckets);
+
+    ASSERT_TRUE(selection);
+    EXPECT_EQ(selection.real_seq_len, 595);
+    EXPECT_EQ(selection.bucket_seq_len, 600);
     EXPECT_FALSE(selection.exact);
 }
 

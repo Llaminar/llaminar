@@ -1,6 +1,6 @@
 /**
  * @file Perf__NativeVNNI_Sweep.cpp
- * @brief Per-shape tuning sweep for native-VNNI GEMM (Q4_0 prefill).
+ * @brief Per-shape tuning sweep for native-VNNI GEMM prefill.
  *
  * Benchmarks all combinations of:
  *   - N_TILE: 64 vs 128
@@ -9,8 +9,8 @@
  *   - UNROLL_G: {0 (no hint), 2, 4 (default)}
  *   - Auto dispatch (current heuristic baseline)
  *
- * Shapes tested: Qwen2.5-0.5B, 3B, 7B (Attention, FFN_Up, FFN_Down, LM_Head)
- * M values: 128, 256, 512 (typical prefill sizes)
+ * Shapes tested: Qwen2.5/Qwen3.6 dense and MoE-style production shapes.
+ * M values: MTP small rows plus the canonical graph-prefill bucket policy.
  *
  * Output: per-shape best variant table with correctness gate (cosine > 0.9990).
  *
@@ -39,6 +39,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "fort.hpp"
 
@@ -151,7 +152,7 @@ namespace
         {"Qwen36_LM_Head", "LM_Head", 248320, 5120},
     };
 
-    static const std::vector<int> M_VALUES = {2, 3, 4, 128, 256, 512};
+    static const std::vector<int> M_VALUES = defaultNativeVNNIDispatchTrainingRows();
 
     struct FormatSpec
     {
@@ -704,7 +705,9 @@ namespace
             format_filters.insert("q4_0");
         const std::set<std::string> shape_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_SHAPES");
         const std::set<std::string> variant_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_VARIANTS");
-        const std::vector<int> m_values = getEnvCsvInts("LLAMINAR_ROCM_NVNNI_SWEEP_M", {2, 3, 4, 128});
+        const std::vector<int> m_values = getEnvCsvInts(
+            "LLAMINAR_ROCM_NVNNI_SWEEP_M",
+            defaultNativeVNNIDispatchTrainingRows());
         const int max_cases = std::max(1, getEnvInt("LLAMINAR_ROCM_NVNNI_SWEEP_MAX_CASES").value_or(1));
         const std::string csv_path = getEnvString("LLAMINAR_ROCM_NVNNI_SWEEP_CSV");
 

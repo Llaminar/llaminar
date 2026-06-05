@@ -1137,17 +1137,17 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
 
     const Shape shapes[] = {
         {"Qwen36_FFN_GateUp_Q4_K", 5, 595, 17408, 5120, 4, 1},
-        {"Qwen36_FFN_DownProjection_Q4_K_exact", 5, 595, 5120, 17408, 2, 1},
+        {"Qwen36_FFN_DownProjection_Q4_K_policy_bucket", 5, 595, 5120, 17408, 4, 4},
         {"Qwen36_FFN_DownProjection_Q4_K_bucketed", 5, 600, 5120, 17408, 4, 4},
-        {"Qwen36_Attention_KVProjection_Q4_K_bucketed", 5, 600, 1024, 5120, 4, 1},
+        {"Qwen36_Attention_KVProjection_Q4_K_bucketed", 5, 600, 1024, 5120, 4, 4},
         {"Qwen36_GDN_InnerProjection_Q4_K", 5, 595, 10240, 5120, 4, 1},
-        {"Qwen36_GDN_ZProjection_Q4_K", 5, 595, 6144, 5120, 2, 1},
-        {"Qwen36_GDN_OutputProjection_Q4_K", 5, 595, 5120, 6144, 2, 1},
+        {"Qwen36_GDN_ZProjection_Q4_K", 5, 595, 6144, 5120, 4, 2},
+        {"Qwen36_GDN_OutputProjection_Q4_K", 5, 595, 5120, 6144, 4, 2},
         {"Qwen36_GDN_InnerProjection_Q5_1", 7, 595, 10240, 5120, 4, 1},
-        {"Qwen36_GDN_ZProjection_Q5_1", 7, 595, 6144, 5120, 2, 1},
-        {"Qwen36_GDN_OutputProjection_Q5_1", 7, 595, 5120, 6144, 2, 1},
+        {"Qwen36_GDN_ZProjection_Q5_1", 7, 595, 6144, 5120, 4, 2},
+        {"Qwen36_GDN_OutputProjection_Q5_1", 7, 595, 5120, 6144, 4, 2},
         {"Qwen36_FFN_GateUp_Q5_1_bucketed", 7, 600, 17408, 5120, 4, 1},
-        {"Qwen36_FFN_DownProjection_Q5_1_bucketed", 7, 600, 5120, 17408, 4, 4},
+        {"Qwen36_FFN_DownProjection_Q5_1_bucketed", 7, 600, 5120, 17408, 4, 8},
     };
 
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);

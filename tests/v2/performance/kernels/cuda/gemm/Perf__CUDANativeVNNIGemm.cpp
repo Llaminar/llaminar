@@ -385,7 +385,8 @@ namespace
     //
     // Environment variables:
     //   LLAMINAR_TILE_SWEEP_SHAPES       - Comma-separated shape names (default: all kQwenShapes)
-    //   LLAMINAR_TILE_SWEEP_PREFILL_M    - Comma-separated M values (default: 2,3,4,64,128,256,600)
+    //   LLAMINAR_TILE_SWEEP_PREFILL_M    - Comma-separated M values
+    //                                     (default: MTP rows + canonical prefill buckets)
     //   LLAMINAR_TILE_SWEEP_TILES        - Comma-separated tile IDs 0..5 for BK64 (default: all)
     //   LLAMINAR_TILE_SWEEP_STRATEGIES   - Comma-separated: auto,std,sk1,sk2,bk256,bk256_sk (default: all)
     //   LLAMINAR_TILE_SWEEP_WARMUP       - Warmup runs (default: 3)
@@ -428,7 +429,7 @@ namespace
     {
         int warmup_runs = 3;
         int bench_runs = 10;
-        std::vector<int> prefill_m = {2, 3, 4, 64, 128, 256, 600};
+        std::vector<int> prefill_m = llaminar2::defaultNativeVNNIDispatchTrainingRows();
         std::set<std::string> shape_filters;
         std::vector<int> tile_ids = {0, 1, 2, 3, 4, 5};
         std::vector<Strategy> strategies = {Strategy::Auto, Strategy::Standard, Strategy::SK1, Strategy::SK2, Strategy::BK256, Strategy::BK256_SK};

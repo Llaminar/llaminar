@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 import sys
 from pathlib import Path
 
@@ -13,6 +14,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from native_vnni_codebooks import FORMAT_TO_CODEBOOK  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[5]
+DEFAULT_POLICY_HEADER = REPO_ROOT / "src/v2/utils/PrefillGraphBucketDefaults.h"
 
 
 COMMON_REQUIRED = {
@@ -40,8 +44,44 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Require at least one pair of format aliases sharing a codebook",
     )
+    parser.add_argument(
+        "--require-policy-prefill-m",
+        action="store_true",
+        help="Require every prefill M row to be part of the canonical NativeVNNI training policy",
+    )
+    parser.add_argument(
+        "--require-prefill-m",
+        type=int,
+        action="append",
+        default=[],
+        help="Require at least one prefill row with this M value; may be repeated",
+    )
+    parser.add_argument(
+        "--m-policy-header",
+        type=Path,
+        default=DEFAULT_POLICY_HEADER,
+        help="C++ header containing canonical NativeVNNI MTP/prefill bucket policy",
+    )
     parser.add_argument("csv", type=Path, nargs="+")
     return parser.parse_args()
+
+
+def _parse_int_array_from_header(text: str, symbol: str, path: Path) -> list[int]:
+    pattern = rf"{re.escape(symbol)}[^=]*=\s*\{{([^}}]+)\}}"
+    match = re.search(pattern, text, re.MULTILINE | re.DOTALL)
+    if not match:
+        raise SystemExit(f"{path}: could not find {symbol}")
+    values = [int(value) for value in re.findall(r"-?\d+", match.group(1))]
+    if not values:
+        raise SystemExit(f"{path}: {symbol} was empty")
+    return values
+
+
+def load_prefill_m_policy(path: Path) -> set[int]:
+    text = path.read_text()
+    small = _parse_int_array_from_header(text, "kDefaultNativeVNNISmallMRows", path)
+    buckets = _parse_int_array_from_header(text, "kDefaultPrefillGraphBucketSizes", path)
+    return {value for value in [*small, *buckets] if value > 0}
 
 
 def _parse_int(path: Path, row_index: int, column: str, value: str) -> int:
@@ -51,7 +91,13 @@ def _parse_int(path: Path, row_index: int, column: str, value: str) -> int:
         raise SystemExit(f"{path}:{row_index}: invalid {column}={value!r}") from exc
 
 
-def validate_file(path: Path, require_alias_group: bool) -> int:
+def validate_file(
+    path: Path,
+    require_alias_group: bool,
+    require_policy_prefill_m: bool,
+    m_policy: set[int],
+    seen_prefill_m: set[int],
+) -> int:
     rows = 0
     phases: set[str] = set()
     formats_by_codebook: dict[int, set[str]] = {}
@@ -108,6 +154,12 @@ def validate_file(path: Path, require_alias_group: bool) -> int:
                 m = _parse_int(path, row_index, "m", row.get("m", ""))
                 if m <= 1:
                     raise SystemExit(f"{path}:{row_index}: prefill trainer row must have M > 1")
+                if require_policy_prefill_m and m not in m_policy:
+                    raise SystemExit(
+                        f"{path}:{row_index}: prefill trainer M={m} is not in the "
+                        "canonical NativeVNNI training policy"
+                    )
+                seen_prefill_m.add(m)
                 is_best = _parse_int(path, row_index, "is_best", row.get("is_best", ""))
                 if is_best not in (0, 1):
                     raise SystemExit(f"{path}:{row_index}: is_best must be 0 or 1")
@@ -132,9 +184,23 @@ def validate_file(path: Path, require_alias_group: bool) -> int:
 
 def main() -> int:
     args = parse_args()
+    m_policy = load_prefill_m_policy(args.m_policy_header)
+    seen_prefill_m: set[int] = set()
     total = 0
     for path in args.csv:
-        total += validate_file(path, args.require_alias_group)
+        total += validate_file(
+            path,
+            args.require_alias_group,
+            args.require_policy_prefill_m,
+            m_policy,
+            seen_prefill_m,
+        )
+    missing_m = sorted(set(args.require_prefill_m) - seen_prefill_m)
+    if missing_m:
+        raise SystemExit(
+            "missing required prefill M row(s): "
+            + ", ".join(str(value) for value in missing_m)
+        )
     print(f"validated {total} ROCm NativeVNNI trainer CSV row(s)")
     return 0
 
