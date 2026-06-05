@@ -174,6 +174,51 @@ Add new production shapes to `kQwenShapes` in
 `tests/v2/performance/kernels/cuda/gemm/CUDANativeVNNIGemmPerfCommon.h` so the harness
 covers the exact GEMMs a model actually runs.
 
+### Generated GEMM/GEMV dispatch training pipeline
+
+Do not land source-level "one shape gets this tile" overrides for CUDA NativeVNNI
+unless the user explicitly asks for a temporary experiment. The durable path is:
+
+1. Add or confirm the production shapes in
+   `tests/v2/performance/kernels/cuda/gemm/CUDANativeVNNIGemmPerfCommon.h`.
+2. Sweep the relevant codebooks, shapes, and canonical `M` buckets with
+   `v2_perf_cuda_native_vnni_gemm`. Prefill dispatch training should align with
+   `src/v2/utils/PrefillGraphBucketDefaults.h`, especially verifier `M={2,3,4}`
+   and graph-prefill buckets such as `M=600`.
+3. Generate prefill tables with
+   `tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemm_dispatch.py`.
+   This reads `TileSweep_AllStrategies` CSVs, validates codebook ids through the
+   shared `tests/v2/performance/kernels/native_vnni_codebooks.py` map, skips
+   off-policy `M` rows by default, can merge an existing generated include via
+   `--base-include`, and emits
+   `src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc`.
+4. Generate decode/GEMV tables with
+   `tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemv_dispatch.py`.
+   This consumes best-row GEMV sweep CSVs and emits exact plus fallback tuning
+   rules for native-payload decode.
+5. Validate generated artifacts with
+   `tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py`
+   and the CUDA generator alias tests:
+   `V2_Unit_CUDAPrefillDispatchGeneratorAliases`,
+   `V2_Unit_CUDAGemvDispatchGeneratorAliases`, and
+   `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+
+Example prefill-generation shape:
+
+```bash
+python3 tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemm_dispatch.py \
+  --input benchmark_results/cuda_dense_mtp/.../Q4_K_sweep.csv \
+  --base-include src/v2/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc \
+  --output /tmp/CUDANativeVNNIPrefillDispatchGenerated.inc \
+  --summary /tmp/cuda_prefill_dispatch_summary.txt
+
+python3 tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py \
+  /tmp/CUDANativeVNNIPrefillDispatchGenerated.inc
+```
+
+After updating a checked-in generated include, rerun the focused CUDA GEMM route
+regression for the affected shape and the relevant Qwen3.6 CUDA parity cells.
+
 > **Build gotcha:** the MoE expert kernel `#include`s the decode header
 > `src/v2/kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh`. After editing that header you
 > MUST `touch src/v2/kernels/cuda/moe/CUDAMoEKernels.cu` before `ninja`, or the change

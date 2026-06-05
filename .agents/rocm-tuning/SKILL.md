@@ -207,6 +207,74 @@ select per shape; don't assume one kernel wins everywhere.
 
 ---
 
+## Step 6: Train generated NativeVNNI dispatch tables
+
+ROCm NativeVNNI dispatch should follow the same automatic sweep/generate/validate
+pipeline as CUDA. Avoid hand-coded per-shape overrides except as throwaway
+experiments.
+
+1. Keep the shape inventory in the perf harness aligned with real model routes:
+   `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp` for prefill
+   and `tests/v2/performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp` for
+   decode/GEMV.
+2. Run sweeps with `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1`. This is important:
+   AUTO normally consumes the checked-in generated tables, so training without
+   this guard can benchmark the previous table and emit no explicit winner.
+3. Validate CSVs with
+   `tests/v2/performance/kernels/rocm/validate_rocm_native_vnni_trainer_csv.py`.
+   It checks decode/prefill schema, shared codebook ids, and canonical prefill
+   bucket policy from `src/v2/utils/PrefillGraphBucketDefaults.h`.
+4. Generate prefill tables with
+   `tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_trainer.py` and
+   decode tables with
+   `tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_decode_trainer.py`.
+   The checked-in outputs are
+   `src/v2/kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc` and
+   `src/v2/kernels/rocm/gemm/ROCmNativeVNNIDecodeDispatchGenerated.inc`.
+5. Validate generated codebook references with
+   `tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py`
+   and run the focused units:
+   `V2_Unit_ROCmNativeVNNITrainerCsvValidator`,
+   `V2_Unit_ROCmNativeVNNITrainerGenerator`,
+   `V2_Unit_ROCmNativeVNNIDecodeTrainerGenerator`, and
+   `V2_Unit_NativeVNNIGeneratedDispatchCodebooks`.
+
+Compact refresh example:
+
+```bash
+LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 \
+LLAMINAR_ROCM_NVNNI_DECODE_FORMATS=Q4_K \
+LLAMINAR_ROCM_NVNNI_DECODE_SHAPES=Qwen36_GDN_TimeProjection \
+LLAMINAR_ROCM_NVNNI_DECODE_CSV=/tmp/decode.csv \
+HSA_OVERRIDE_GFX_VERSION=9.0.6 \
+./build_v2_release/tests/v2/v2_perf_native_vnni_throughput \
+  --gtest_filter='NativeVNNIPerfTest.TrainerCsv_CodebookTagged'
+
+LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 \
+LLAMINAR_ROCM_NVNNI_SWEEP_FORMATS=Q4_K \
+LLAMINAR_ROCM_NVNNI_SWEEP_SHAPES=Qwen36_GDN_TimeProjection \
+LLAMINAR_ROCM_NVNNI_SWEEP_M=600 \
+LLAMINAR_ROCM_NVNNI_SWEEP_CSV=/tmp/prefill.csv \
+HSA_OVERRIDE_GFX_VERSION=9.0.6 \
+./build_v2_release/tests/v2/v2_perf_native_vnni_sweep \
+  --gtest_filter='NativeVNNISweepTest.TrainerCsv_CodebookTagged'
+
+python3 tests/v2/performance/kernels/rocm/validate_rocm_native_vnni_trainer_csv.py \
+  --require-policy-prefill-m --require-prefill-m 600 /tmp/prefill.csv /tmp/decode.csv
+python3 tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_trainer.py \
+  --input /tmp/prefill.csv --output /tmp/prefill.inc --summary /tmp/prefill.summary
+python3 tests/v2/performance/kernels/rocm/analyze_rocm_native_vnni_decode_trainer.py \
+  --input /tmp/decode.csv --output /tmp/decode.inc --summary /tmp/decode.summary
+python3 tests/v2/performance/kernels/validate_native_vnni_generated_dispatch_ids.py \
+  /tmp/prefill.inc /tmp/decode.inc
+```
+
+After updating checked-in tables, rerun focused ROCm coverage:
+`V2_Integration_ROCm_NativeVNNI_GEMM` and
+`V2_Integration_ROCm_NativeVNNI_GEMV`.
+
+---
+
 ## Key lessons (hard-won)
 
 1. **Profile before optimizing.** `rocprof` revealed the real 6.6% gap hidden under a
