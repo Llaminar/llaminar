@@ -1295,14 +1295,14 @@ namespace llaminar2
         {
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
-            // Re-fetch dump info post-execute: stages like MoEExpertComputeStage stash
-            // runtime routing data during execute() and invalidate the cache.
-            // Since cached_dump_info aliases the stage's internal cached object,
-            // this getDumpInfo() call rebuilds it with post-execute data.
-            node.stage->getDumpInfo();
-            cached_dump_info.ensureOutputsOnHost();
+            // Rebuild dump info post-execute. Snapshot consumers need the
+            // runtime output metadata, and stages should not have to self-
+            // invalidate just to make callback snapshots trustworthy.
+            node.stage->invalidateDumpInfoCache();
+            const StageDumpInfo &snapshot_dump_info = node.stage->getDumpInfo();
+            snapshot_dump_info.ensureOutputsOnHost();
             LOG_DEBUG("[DeviceGraphExecutor::runStage] Invoking callback for " << node.name);
-            config_.snapshot_callback(node.name, cached_dump_info);
+            config_.snapshot_callback(node.name, snapshot_dump_info);
             if (profiling)
             {
                 phase_end = std::chrono::high_resolution_clock::now();

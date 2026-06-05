@@ -7,8 +7,36 @@
 
 #include "SnapshotCapture.h"
 
+#include <cctype>
+
 namespace llaminar2
 {
+    namespace
+    {
+        std::string snapshotContextPrefix(const std::string &context)
+        {
+            std::string result;
+            result.reserve(context.size());
+            bool previous_underscore = false;
+            for (char c : context)
+            {
+                const unsigned char uc = static_cast<unsigned char>(c);
+                if (std::isalnum(uc))
+                {
+                    result.push_back(static_cast<char>(std::toupper(uc)));
+                    previous_underscore = false;
+                }
+                else if (!previous_underscore)
+                {
+                    result.push_back('_');
+                    previous_underscore = true;
+                }
+            }
+            while (!result.empty() && result.back() == '_')
+                result.pop_back();
+            return result.empty() ? "CONTEXT" : result;
+        }
+    } // namespace
 
     // =========================================================================
     // Stage capture routing
@@ -16,6 +44,18 @@ namespace llaminar2
 
     void SnapshotCapture::captureStage(const std::string &name, const StageDumpInfo &dump)
     {
+        if (const size_t context_sep = name.find("::"); context_sep != std::string::npos)
+        {
+            SnapshotCapture scoped_capture;
+            scoped_capture.captureStage(name.substr(context_sep + 2), dump);
+            const std::string prefix = snapshotContextPrefix(name.substr(0, context_sep));
+            for (const auto &entry : scoped_capture.all())
+            {
+                snapshots_[prefix + "_" + entry.first] = entry.second;
+            }
+            return;
+        }
+
         LOG_TRACE("[Snapshot] Callback invoked for stage: " << name
                                                             << " outputs.size=" << dump.outputs.size());
 

@@ -337,6 +337,7 @@ namespace llaminar2::test::parity::qwen36
         const std::filesystem::path &metadata_path,
         const std::string &prompt,
         int decode_steps,
+        bool include_mtp_sidecar_snapshots,
         std::string *output)
     {
         std::filesystem::create_directories(metadata_path.parent_path());
@@ -352,6 +353,8 @@ namespace llaminar2::test::parity::qwen36
         script += " --decode-steps " + std::to_string(decode_steps);
         script += " --output " + shellQuote(metadata_path.parent_path().string());
         script += " --decode-snapshots-only";
+        if (include_mtp_sidecar_snapshots)
+            script += " --mtp-sidecar-snapshots";
 
         const std::string command = "bash -c " + shellQuote(script) + " 2>&1";
         FILE *pipe = popen(command.c_str(), "r");
@@ -381,7 +384,8 @@ namespace llaminar2::test::parity::qwen36
 
     inline bool qwen36MoEDecodeSnapshotsLookUsable(
         const std::filesystem::path &metadata_path,
-        int decode_steps)
+        int decode_steps,
+        bool require_mtp_sidecar_snapshots = false)
     {
         if (!metadataLooksUsable(metadata_path, decode_steps))
         {
@@ -394,16 +398,64 @@ namespace llaminar2::test::parity::qwen36
             return true;
         }
 
-        return std::filesystem::exists(dir / "decode_step0_LM_HEAD.npy") &&
-               std::filesystem::exists(dir / "decode_step0_layer0_ATTENTION_NORM.npy");
+        if (!std::filesystem::exists(dir / "decode_step0_LM_HEAD.npy") ||
+            !std::filesystem::exists(dir / "decode_step0_layer0_ATTENTION_NORM.npy"))
+        {
+            return false;
+        }
+
+        if (!require_mtp_sidecar_snapshots)
+        {
+            return true;
+        }
+
+        const std::vector<std::string> required_mtp_sidecar_files = {
+            "decode_step0_MTP_TERMINAL_HIDDEN_ROW_SELECT.npy",
+            "decode_step0_MTP0_EMBEDDING.npy",
+            "decode_step0_MTP0_NORM_HIDDEN.npy",
+            "decode_step0_MTP0_NORM_EMBEDDING.npy",
+            "decode_step0_MTP0_CONCAT.npy",
+            "decode_step0_MTP0_FC.npy",
+            "decode_step0_MTP0_ATTENTION_NORM.npy",
+            "decode_step0_MTP0_Q_PROJECTION.npy",
+            "decode_step0_MTP0_Q_NORM.npy",
+            "decode_step0_MTP0_K_PROJECTION.npy",
+            "decode_step0_MTP0_K_NORM.npy",
+            "decode_step0_MTP0_V_PROJECTION.npy",
+            "decode_step0_MTP0_ATTENTION_CONTEXT.npy",
+            "decode_step0_MTP0_ATTENTION_CONTEXT_GATED.npy",
+            "decode_step0_MTP0_ATTENTION_OUTPUT.npy",
+            "decode_step0_MTP0_FFN_NORM.npy",
+            "decode_step0_MTP0_MOE_ROUTER_OUTPUT.npy",
+            "decode_step0_MTP0_MOE_ROUTING_INDICES.npy",
+            "decode_step0_MTP0_MOE_ROUTING_WEIGHTS.npy",
+            "decode_step0_MTP0_MOE_EXPERT_OUTPUT.npy",
+            "decode_step0_MTP0_MOE_SHARED_EXPERT_OUTPUT.npy",
+            "decode_step0_MTP0_MOE_SHARED_GATE_OUTPUT.npy",
+            "decode_step0_MTP0_MOE_COMBINED_OUTPUT.npy",
+            "decode_step0_MTP0_FFN_RESIDUAL.npy",
+            "decode_step0_MTP0_FINAL_NORM.npy",
+            "decode_step0_MTP0_LM_HEAD.npy",
+        };
+        return std::all_of(
+            required_mtp_sidecar_files.begin(),
+            required_mtp_sidecar_files.end(),
+            [&](const std::string &file)
+            {
+                return std::filesystem::exists(dir / file);
+            });
     }
 
     inline void ensurePyTorchMoEDecodeSnapshots(
         const MoEPrefixRestoreParityCase &test_case,
         const std::string &model_path,
-        const std::filesystem::path &metadata_path)
+        const std::filesystem::path &metadata_path,
+        bool require_mtp_sidecar_snapshots = false)
     {
-        if (qwen36MoEDecodeSnapshotsLookUsable(metadata_path, test_case.decode_steps))
+        if (qwen36MoEDecodeSnapshotsLookUsable(
+                metadata_path,
+                test_case.decode_steps,
+                require_mtp_sidecar_snapshots))
         {
             return;
         }
@@ -414,12 +466,16 @@ namespace llaminar2::test::parity::qwen36
             metadata_path,
             test_case.prompt,
             test_case.decode_steps,
+            require_mtp_sidecar_snapshots,
             &output))
             << test_case.name << " failed to regenerate PyTorch MoE decode snapshots at "
             << metadata_path.parent_path() << "\n"
             << output;
 
-        ASSERT_TRUE(qwen36MoEDecodeSnapshotsLookUsable(metadata_path, test_case.decode_steps))
+        ASSERT_TRUE(qwen36MoEDecodeSnapshotsLookUsable(
+            metadata_path,
+            test_case.decode_steps,
+            require_mtp_sidecar_snapshots))
             << test_case.name << " regenerated MoE decode snapshots are incomplete at "
             << metadata_path.parent_path() << "\n"
             << output;
@@ -1227,6 +1283,10 @@ namespace llaminar2::test::parity::qwen36
         double cosine = 0.0;
         double rel_l2 = 0.0;
         double max_abs_diff = 0.0;
+        double left_l2 = 0.0;
+        double right_l2 = 0.0;
+        double left_mean = 0.0;
+        double right_mean = 0.0;
         std::string left_label = "baseline";
         std::string right_label = "mtp";
         bool present_in_baseline = false;
@@ -1276,6 +1336,8 @@ namespace llaminar2::test::parity::qwen36
         double dot = 0.0;
         double baseline_norm = 0.0;
         double mtp_norm = 0.0;
+        double baseline_sum = 0.0;
+        double mtp_sum = 0.0;
         double diff_norm = 0.0;
         for (size_t i = 0; i < baseline_size; ++i)
         {
@@ -1285,11 +1347,17 @@ namespace llaminar2::test::parity::qwen36
             dot += a * b;
             baseline_norm += a * a;
             mtp_norm += b * b;
+            baseline_sum += a;
+            mtp_sum += b;
             diff_norm += diff * diff;
             row.max_abs_diff = std::max(row.max_abs_diff, std::abs(diff));
         }
 
-        const double denom = std::sqrt(baseline_norm) * std::sqrt(mtp_norm);
+        row.left_l2 = std::sqrt(baseline_norm);
+        row.right_l2 = std::sqrt(mtp_norm);
+        row.left_mean = baseline_sum / static_cast<double>(baseline_size);
+        row.right_mean = mtp_sum / static_cast<double>(baseline_size);
+        const double denom = row.left_l2 * row.right_l2;
         row.cosine = denom > 0.0 ? dot / denom : 1.0;
         row.rel_l2 = baseline_norm > 0.0 ? std::sqrt(diff_norm / baseline_norm)
                                          : std::sqrt(diff_norm);
@@ -1332,6 +1400,8 @@ namespace llaminar2::test::parity::qwen36
         double dot = 0.0;
         double baseline_norm = 0.0;
         double mtp_norm = 0.0;
+        double baseline_sum = 0.0;
+        double mtp_sum = 0.0;
         double diff_norm = 0.0;
         for (size_t i = 0; i < baseline_data.size(); ++i)
         {
@@ -1341,11 +1411,17 @@ namespace llaminar2::test::parity::qwen36
             dot += a * b;
             baseline_norm += a * a;
             mtp_norm += b * b;
+            baseline_sum += a;
+            mtp_sum += b;
             diff_norm += diff * diff;
             row.max_abs_diff = std::max(row.max_abs_diff, std::abs(diff));
         }
 
-        const double denom = std::sqrt(baseline_norm) * std::sqrt(mtp_norm);
+        row.left_l2 = std::sqrt(baseline_norm);
+        row.right_l2 = std::sqrt(mtp_norm);
+        row.left_mean = baseline_sum / static_cast<double>(baseline_data.size());
+        row.right_mean = mtp_sum / static_cast<double>(baseline_data.size());
+        const double denom = row.left_l2 * row.right_l2;
         row.cosine = denom > 0.0 ? dot / denom : 1.0;
         row.rel_l2 = baseline_norm > 0.0 ? std::sqrt(diff_norm / baseline_norm)
                                          : std::sqrt(diff_norm);
@@ -1414,6 +1490,17 @@ namespace llaminar2::test::parity::qwen36
         return keys;
     }
 
+    inline std::string pytorchReferenceKeyForMoEDiagnosticKey(const std::string &key)
+    {
+        static constexpr const char *kDecodeSidecarPrefix = "MTP_DECODE_SIDECAR_";
+        const std::string prefix(kDecodeSidecarPrefix);
+        if (key.rfind(prefix, 0) == 0)
+        {
+            return key.substr(prefix.size());
+        }
+        return key;
+    }
+
     inline MoESnapshotCompareRow compareMoESnapshotVectors(
         const std::vector<float> &left,
         const float *right,
@@ -1461,6 +1548,8 @@ namespace llaminar2::test::parity::qwen36
         double dot = 0.0;
         double left_norm = 0.0;
         double right_norm = 0.0;
+        double left_sum = 0.0;
+        double right_sum = 0.0;
         double diff_norm = 0.0;
         for (size_t i = 0; i < left_size; ++i)
         {
@@ -1470,11 +1559,17 @@ namespace llaminar2::test::parity::qwen36
             dot += a * b;
             left_norm += a * a;
             right_norm += b * b;
+            left_sum += a;
+            right_sum += b;
             diff_norm += diff * diff;
             row.max_abs_diff = std::max(row.max_abs_diff, std::abs(diff));
         }
 
-        const double denom = std::sqrt(left_norm) * std::sqrt(right_norm);
+        row.left_l2 = std::sqrt(left_norm);
+        row.right_l2 = std::sqrt(right_norm);
+        row.left_mean = left_sum / static_cast<double>(left_size);
+        row.right_mean = right_sum / static_cast<double>(left_size);
+        const double denom = row.left_l2 * row.right_l2;
         row.cosine = denom > 0.0 ? dot / denom : 1.0;
         row.rel_l2 = left_norm > 0.0 ? std::sqrt(diff_norm / left_norm)
                                      : std::sqrt(diff_norm);
@@ -1512,7 +1607,7 @@ namespace llaminar2::test::parity::qwen36
     inline void writeMoESnapshotCsvHeader(std::ofstream &csv)
     {
         csv << "comparison,sync_idx,output_tokens,key,reference_key,elements,"
-               "cosine,rel_l2,max_abs_diff,left_label,right_label,"
+               "cosine,rel_l2,max_abs_diff,left_l2,right_l2,left_mean,right_mean,left_label,right_label,"
                "present_left,present_right\n";
     }
 
@@ -1527,6 +1622,10 @@ namespace llaminar2::test::parity::qwen36
             << row.cosine << ','
             << row.rel_l2 << ','
             << row.max_abs_diff << ','
+            << row.left_l2 << ','
+            << row.right_l2 << ','
+            << row.left_mean << ','
+            << row.right_mean << ','
             << csvEscapeMoEDiagnostic(row.left_label) << ','
             << csvEscapeMoEDiagnostic(row.right_label) << ','
             << (row.present_in_baseline ? "true" : "false") << ','
@@ -1706,7 +1805,11 @@ namespace llaminar2::test::parity::qwen36
         const std::filesystem::path metadata_path = firstEnvOrDefault(
             test_case.metadata_envs,
             test_case.default_metadata_path);
-        ensurePyTorchMoEDecodeSnapshots(test_case, model_path, metadata_path);
+        ensurePyTorchMoEDecodeSnapshots(
+            test_case,
+            model_path,
+            metadata_path,
+            /*require_mtp_sidecar_snapshots=*/true);
         if (moeReferenceInputsStoppedCurrentTest())
         {
             return;
@@ -1852,8 +1955,11 @@ namespace llaminar2::test::parity::qwen36
 
                 if (pytorch_decode_step < test_case.decode_steps)
                 {
+                    const std::string pytorch_reference_key =
+                        pytorchReferenceKeyForMoEDiagnosticKey(key);
                     const std::string pytorch_key =
-                        "decode_step" + std::to_string(pytorch_decode_step) + "_" + key;
+                        "decode_step" + std::to_string(pytorch_decode_step) + "_" +
+                        pytorch_reference_key;
                     const auto pytorch_data = loadMoEPyTorchSnapshot(
                         pytorch_snapshot_dir,
                         pytorch_key);
@@ -1907,6 +2013,25 @@ namespace llaminar2::test::parity::qwen36
         mtp->disableSnapshotCapture();
         mtp->shutdown();
 
+        auto find_mtp_sidecar_row = [&](const std::string &key) -> const MoESnapshotCompareRow *
+        {
+            for (const auto &row : all_snapshot_rows)
+            {
+                if (row.comparison == "pytorch_vs_mtp" &&
+                    row.key == key &&
+                    row.sync_idx == 0)
+                {
+                    return &row;
+                }
+            }
+            return nullptr;
+        };
+
+        const MoESnapshotCompareRow *sidecar_ffn_residual_row =
+            find_mtp_sidecar_row("MTP_DECODE_SIDECAR_MTP0_FFN_RESIDUAL");
+        const MoESnapshotCompareRow *sidecar_lm_head_row =
+            find_mtp_sidecar_row("MTP_DECODE_SIDECAR_MTP0_LM_HEAD");
+
         ASSERT_EQ(baseline_tokens.size(), mtp_tokens.size())
             << "diagnostic CSVs:\n"
             << token_csv_path << '\n'
@@ -1923,25 +2048,53 @@ namespace llaminar2::test::parity::qwen36
             << " mtp current_position=" << mtp_state.current_position;
         EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
         EXPECT_GE(mtp_state.mtp_verifier_runs, 1u);
+        ASSERT_NE(sidecar_ffn_residual_row, nullptr)
+            << "MTP sidecar diagnostic did not compare decode_step0_MTP0_FFN_RESIDUAL"
+            << "\ndiagnostic CSVs:\n"
+            << token_csv_path << '\n'
+            << snapshot_csv_path;
+        EXPECT_TRUE(isComparableMoEDiagnosticRow(*sidecar_ffn_residual_row))
+            << describeMoEDiagnosticRow(*sidecar_ffn_residual_row);
+        EXPECT_GE(sidecar_ffn_residual_row->cosine, 0.98)
+            << "MTP sidecar block-output PyTorch reference mismatch: "
+            << describeMoEDiagnosticRow(*sidecar_ffn_residual_row)
+            << "\ndiagnostic CSVs:\n"
+            << token_csv_path << '\n'
+            << snapshot_csv_path;
+        ASSERT_NE(sidecar_lm_head_row, nullptr)
+            << "MTP sidecar diagnostic did not compare decode_step0_MTP0_LM_HEAD"
+            << "\ndiagnostic CSVs:\n"
+            << token_csv_path << '\n'
+            << snapshot_csv_path;
+        EXPECT_TRUE(isComparableMoEDiagnosticRow(*sidecar_lm_head_row))
+            << describeMoEDiagnosticRow(*sidecar_lm_head_row);
+        EXPECT_GE(sidecar_lm_head_row->cosine, 0.98)
+            << "MTP sidecar PyTorch reference mismatch: "
+            << describeMoEDiagnosticRow(*sidecar_lm_head_row)
+            << "\ndiagnostic CSVs:\n"
+            << token_csv_path << '\n'
+            << snapshot_csv_path;
 
         const std::vector<std::string> required_sidecar_keys = {
-            "MTP0_NORM_HIDDEN",
-            "MTP0_CONCAT",
-            "MTP0_FC",
-            "MTP0_ATTENTION_NORM",
-            "MTP0_Q_PROJECTION",
-            "MTP0_ATTENTION_CONTEXT",
-            "MTP0_ATTENTION_OUTPUT",
-            "MTP0_FFN_NORM",
-            "MTP0_MOE_ROUTER_OUTPUT",
-            "MTP0_MOE_ROUTING_INDICES",
-            "MTP0_MOE_ROUTING_WEIGHTS",
-            "MTP0_MOE_EXPERT_OUTPUT",
-            "MTP0_MOE_SHARED_EXPERT_OUTPUT",
-            "MTP0_MOE_SHARED_GATE_OUTPUT",
-            "MTP0_MOE_COMBINED_OUTPUT",
-            "MTP0_FINAL_NORM",
-            "MTP0_LM_HEAD",
+            "MTP_DECODE_SIDECAR_MTP0_EMBEDDING",
+            "MTP_DECODE_SIDECAR_MTP0_NORM_HIDDEN",
+            "MTP_DECODE_SIDECAR_MTP0_CONCAT",
+            "MTP_DECODE_SIDECAR_MTP0_FC",
+            "MTP_DECODE_SIDECAR_MTP0_ATTENTION_NORM",
+            "MTP_DECODE_SIDECAR_MTP0_Q_PROJECTION",
+            "MTP_DECODE_SIDECAR_MTP0_ATTENTION_CONTEXT",
+            "MTP_DECODE_SIDECAR_MTP0_ATTENTION_OUTPUT",
+            "MTP_DECODE_SIDECAR_MTP0_FFN_NORM",
+            "MTP_DECODE_SIDECAR_MTP0_MOE_ROUTER_OUTPUT",
+            "MTP_DECODE_SIDECAR_MTP0_MOE_ROUTING_INDICES",
+            "MTP_DECODE_SIDECAR_MTP0_MOE_ROUTING_WEIGHTS",
+            "MTP_DECODE_SIDECAR_MTP0_MOE_EXPERT_OUTPUT",
+            "MTP_DECODE_SIDECAR_MTP0_MOE_SHARED_EXPERT_OUTPUT",
+            "MTP_DECODE_SIDECAR_MTP0_MOE_SHARED_GATE_OUTPUT",
+            "MTP_DECODE_SIDECAR_MTP0_MOE_COMBINED_OUTPUT",
+            "MTP_DECODE_SIDECAR_MTP0_FFN_RESIDUAL",
+            "MTP_DECODE_SIDECAR_MTP0_FINAL_NORM",
+            "MTP_DECODE_SIDECAR_MTP0_LM_HEAD",
         };
         std::vector<std::string> missing_sidecar_keys;
         for (const auto &key : required_sidecar_keys)

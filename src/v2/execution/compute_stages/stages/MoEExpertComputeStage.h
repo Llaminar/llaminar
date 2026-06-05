@@ -509,6 +509,11 @@ namespace llaminar2
     private:
         Params params_;
 
+        mutable std::shared_ptr<FP32Tensor> fp32_gate_inp_;
+        mutable TensorBase *fp32_gate_source_ = nullptr;
+        TensorBase *effectiveGateInput() const;
+        bool gateInputReadyForGraphCapture() const;
+
         /// Cached MoE kernel for sigmoid gating
         mutable IMoEKernel *moe_kernel_ = nullptr;
         IMoEKernel *ensureMoEKernel() const;

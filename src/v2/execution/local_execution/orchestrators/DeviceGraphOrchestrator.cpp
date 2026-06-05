@@ -70,6 +70,28 @@ namespace llaminar2
         constexpr size_t kStochasticTargetRows = 4; // verifier M=2..4 includes terminal row
         constexpr size_t kStochasticDraftRows = 3;  // --mtp-draft-tokens max
 
+        class ScopedStringOverride
+        {
+        public:
+            ScopedStringOverride(std::string &target, std::string value)
+                : target_(target), previous_(target)
+            {
+                target_ = std::move(value);
+            }
+
+            ~ScopedStringOverride()
+            {
+                target_ = std::move(previous_);
+            }
+
+            ScopedStringOverride(const ScopedStringOverride &) = delete;
+            ScopedStringOverride &operator=(const ScopedStringOverride &) = delete;
+
+        private:
+            std::string &target_;
+            std::string previous_;
+        };
+
         /// @brief Emit a coarse VRAM checkpoint for orchestrator allocation phases.
         void logOrchestratorVramTrace(DeviceId device, const char *label)
         {
@@ -4225,6 +4247,7 @@ namespace llaminar2
 
         bool ok = false;
         {
+            ScopedStringOverride snapshot_scope(snapshot_context_, sidecar_context);
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
                 "sidecar_execute_graph",

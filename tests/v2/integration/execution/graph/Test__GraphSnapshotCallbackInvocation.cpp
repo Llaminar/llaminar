@@ -451,6 +451,77 @@ TEST_F(GraphSnapshotCallbackTest, CallbackReceivesValidDumpInfo)
         << "RMSNormStage should report at least one output in dump info";
 }
 
+namespace
+{
+    class RuntimeShapeSnapshotStage final : public IComputeStage
+    {
+    public:
+        RuntimeShapeSnapshotStage()
+            : IComputeStage(DeviceId::cpu())
+        {
+        }
+
+        bool execute(IDeviceContext *) override
+        {
+            reported_cols_ = output_.size();
+            return true;
+        }
+
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        bool supportsBackend(ComputeBackendType backend) const override
+        {
+            return backend == ComputeBackendType::CPU;
+        }
+
+    protected:
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            ++build_count_;
+            StageDumpInfo info;
+            info.addOutput("dynamic_output", output_.data(), 1, reported_cols_);
+            info.addScalarInt("build_count", build_count_);
+            return info;
+        }
+
+    private:
+        std::vector<float> output_{1.0f, 2.0f, 3.0f, 4.0f};
+        size_t reported_cols_ = 1;
+        mutable int build_count_ = 0;
+    };
+} // namespace
+
+/**
+ * @brief Test that callback snapshots rebuild dump info after execute.
+ */
+TEST_F(GraphSnapshotCallbackTest, CallbackRebuildsRuntimeDumpInfoAfterExecute)
+{
+    ComputeGraph graph;
+    graph.addNode("runtime_shape", std::make_unique<RuntimeShapeSnapshotStage>(), DeviceId::cpu());
+
+    size_t captured_cols = 0;
+    int captured_build_count = 0;
+
+    GraphExecutorConfig config;
+    config.snapshot_callback = [&](const std::string &name, const StageDumpInfo &info)
+    {
+        ASSERT_EQ(name, "runtime_shape");
+        ASSERT_EQ(info.outputs.size(), 1u);
+        captured_cols = info.outputs[0].cols;
+        for (const auto &scalar : info.scalars)
+        {
+            if (std::string(scalar.name) == "build_count")
+                captured_build_count = static_cast<int>(scalar.value);
+        }
+    };
+
+    DeviceGraphExecutor executor(config);
+    ASSERT_TRUE(executor.execute(graph, ctx_.get()));
+
+    EXPECT_EQ(captured_cols, 4u);
+    EXPECT_GE(captured_build_count, 2)
+        << "Snapshot callback should see post-execute dump info, not the pre-execute cache";
+}
+
 // =============================================================================
 // MPI-aware main
 // =============================================================================

@@ -341,6 +341,27 @@ TEST(Test__SnapshotCapture_Capture, MTPSidecarMoERoutingUsesMTPKeys)
     EXPECT_EQ(weights_snapshot->data, weights);
 }
 
+TEST(Test__SnapshotCapture_Capture, ContextQualifiedMTPKeysRemainDisambiguated)
+{
+    std::vector<float> decode_embedding = {1.0f, 2.0f};
+    std::vector<float> catchup_embedding = {3.0f, 4.0f};
+
+    SnapshotCapture capture;
+    capture.captureStage(
+        "mtp_decode_sidecar::MTP0_embedding",
+        makeSingleOutputDump("output", decode_embedding.data(), 1, 2));
+    capture.captureStage(
+        "mtp_decode_catchup::MTP0_embedding",
+        makeSingleOutputDump("output", catchup_embedding.data(), 1, 2));
+
+    const auto *decode_snapshot = capture.get("MTP_DECODE_SIDECAR_MTP0_EMBEDDING");
+    const auto *catchup_snapshot = capture.get("MTP_DECODE_CATCHUP_MTP0_EMBEDDING");
+    ASSERT_NE(decode_snapshot, nullptr);
+    ASSERT_NE(catchup_snapshot, nullptr);
+    EXPECT_EQ(decode_snapshot->data, decode_embedding);
+    EXPECT_EQ(catchup_snapshot->data, catchup_embedding);
+}
+
 // =========================================================================
 // Test: captureStage Routing
 // =========================================================================

@@ -2027,6 +2027,8 @@ namespace llaminar2
             executor_.setSnapshotCallback(
                 [this](const std::string &name, const StageDumpInfo &dump)
                 {
+                    if (!snapshot_context_.empty())
+                        snapshot_capture_.captureStage(snapshot_context_ + "::" + name, dump);
                     snapshot_capture_.captureStage(name, dump);
                 });
         }
@@ -2471,6 +2473,9 @@ namespace llaminar2
 
         /// Whether snapshot capture is enabled
         bool snapshot_enabled_ = false;
+
+        /// Optional execution context prefix for disambiguating repeated stage keys.
+        std::string snapshot_context_;
 
         /// Snapshot capture engine (owns storage + routing logic)
         SnapshotCapture snapshot_capture_;

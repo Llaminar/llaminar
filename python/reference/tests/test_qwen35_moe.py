@@ -24,6 +24,7 @@ from python.reference.loaders.tensor_name_mapper import (
     TensorNameMapper,
     detect_model_type_from_metadata,
 )
+from python.reference.qwen35_moe import Qwen35MoEReferenceModel
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +368,20 @@ class TestApplyTransformsWithMetadata:
             metadata=MOE_METADATA,
         )
         torch.testing.assert_close(result, torch.tensor([2.0, 1.5, 1.0]))
+
+    def test_nextn_manual_rms_norm_uses_pre_rmsnorm_1p_effective_gamma(self):
+        """Manual nextn/MTP RMSNorm applies gamma_effective = 1 + stored."""
+        x = torch.tensor([[3.0, 4.0]], dtype=torch.float32)
+        stored_gamma = torch.tensor([-0.5, 0.25], dtype=torch.float32)
+        result = Qwen35MoEReferenceModel._rms_norm(
+            x,
+            stored_gamma,
+            0.0,
+            pre_rmsnorm_1p=True,
+        )
+        base = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True))
+        expected = base * torch.tensor([0.5, 1.25], dtype=torch.float32)
+        torch.testing.assert_close(result, expected)
 
     def test_a_log_transform_with_metadata(self):
         """A_log transform + V-head reversal should both apply."""

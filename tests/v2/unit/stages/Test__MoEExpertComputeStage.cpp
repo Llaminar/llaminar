@@ -32,6 +32,105 @@ using namespace llaminar2;
 using namespace llaminar2::test;
 using namespace llaminar2::testing;
 
+namespace
+{
+    class CapturingMoEKernel : public IMoEKernel
+    {
+    public:
+        int observed_gate_type_id = -1;
+
+        bool route(
+            const float *hidden,
+            const float *gate_weights,
+            int seq_len, int d_model,
+            int num_experts, int top_k,
+            bool normalize_weights,
+            MoERoutingResult &result) override
+        {
+            (void)hidden;
+            (void)gate_weights;
+            (void)seq_len;
+            (void)d_model;
+            (void)num_experts;
+            (void)top_k;
+            (void)normalize_weights;
+            (void)result;
+            return false;
+        }
+
+        void gatherTokenBatch(
+            const float *hidden,
+            float *batch_buffer,
+            const int *token_indices,
+            int num_tokens, int d_model) override
+        {
+            for (int i = 0; i < num_tokens; ++i)
+                std::copy_n(hidden + static_cast<size_t>(token_indices[i]) * d_model,
+                            d_model,
+                            batch_buffer + static_cast<size_t>(i) * d_model);
+        }
+
+        void scatterAddWeighted(
+            float *output,
+            const float *expert_output,
+            const int *token_indices,
+            const float *weights,
+            int num_tokens, int d_model) override
+        {
+            for (int i = 0; i < num_tokens; ++i)
+            {
+                float *dst = output + static_cast<size_t>(token_indices[i]) * d_model;
+                const float *src = expert_output + static_cast<size_t>(i) * d_model;
+                for (int j = 0; j < d_model; ++j)
+                    dst[j] += weights[i] * src[j];
+            }
+        }
+
+        void sharedExpertGate(
+            const float *input,
+            const float *gate_inp,
+            float *shared_output,
+            int seq_len, int d_model) override
+        {
+            for (int t = 0; t < seq_len; ++t)
+            {
+                const float *row = input + static_cast<size_t>(t) * d_model;
+                float dot = 0.0f;
+                for (int j = 0; j < d_model; ++j)
+                    dot += gate_inp[j] * row[j];
+
+                const float gate = 1.0f / (1.0f + std::exp(-dot));
+                float *out = shared_output + static_cast<size_t>(t) * d_model;
+                for (int j = 0; j < d_model; ++j)
+                    out[j] *= gate;
+            }
+        }
+
+        void sharedExpertGateFromTensors(
+            ITensor *input, ITensor *gate_inp, ITensor *shared_output,
+            int seq_len, int d_model) override
+        {
+            observed_gate_type_id = gate_inp ? gate_inp->native_type_id() : -1;
+            IMoEKernel::sharedExpertGateFromTensors(
+                input, gate_inp, shared_output, seq_len, d_model);
+        }
+
+        void swiGLU(float *gate, const float *up, int count) override
+        {
+            for (int i = 0; i < count; ++i)
+            {
+                const float x = gate[i];
+                gate[i] = x / (1.0f + std::exp(-x)) * up[i];
+            }
+        }
+
+        bool supports_device(int device_idx) const override
+        {
+            return device_idx < 0;
+        }
+    };
+}
+
 // =========================================================================
 // Test Fixture
 // =========================================================================
@@ -364,6 +463,53 @@ TEST_F(MoEExpertComputeStageTest, SharedGate_AppliesSigmoidGating)
     {
         EXPECT_NEAR(out[i], 1.0f, 1e-5f) << "Gate mismatch at index " << i;
     }
+}
+
+TEST_F(MoEExpertComputeStageTest, SharedGate_MaterializesBF16GateInputAsFP32ForTensorKernel)
+{
+    const int seq = 1;
+    const int d = 4;
+
+    auto input = TestTensorFactory::createFP32({seq, d});
+    BF16Tensor gate_inp({1, static_cast<size_t>(d)});
+    auto shared_output = TestTensorFactory::createFP32({seq, d});
+
+    const float input_values[d] = {1.0f, -2.0f, 0.5f, 3.0f};
+    const float gate_values[d] = {0.03125f, -0.125f, 0.0625f, 0.25f};
+    for (int i = 0; i < d; ++i)
+    {
+        input->mutable_data()[i] = input_values[i];
+        shared_output->mutable_data()[i] = 2.0f;
+    }
+    gate_inp.from_fp32(gate_values, d);
+    ASSERT_EQ(gate_inp.native_type(), TensorType::BF16);
+
+    SharedExpertGateStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.input = input.get();
+    params.gate_inp = &gate_inp;
+    params.shared_output = shared_output.get();
+    params.seq_len = seq;
+    params.d_model = d;
+
+    CapturingMoEKernel kernel;
+    SharedExpertGateStage stage(params);
+    stage.setMoEKernelForTesting(&kernel);
+    ASSERT_TRUE(stage.execute(cpu_ctx_.get()));
+
+    EXPECT_EQ(kernel.observed_gate_type_id, static_cast<int>(TensorType::FP32))
+        << "SharedExpertGateStage must not pass BF16 gate vectors into tensor-aware GPU-style kernels";
+
+    std::vector<float> gate_fp32(d);
+    gate_inp.to_fp32(gate_fp32.data());
+    float dot = 0.0f;
+    for (int i = 0; i < d; ++i)
+        dot += gate_fp32[i] * input_values[i];
+    const float expected_gate = 1.0f / (1.0f + std::exp(-dot));
+
+    const float *out = shared_output->data();
+    for (int i = 0; i < d; ++i)
+        EXPECT_NEAR(out[i], 2.0f * expected_gate, 1e-5f) << "Gate mismatch at dim " << i;
 }
 
 TEST_F(MoEExpertComputeStageTest, SharedGate_LargePositiveDotSaturates)

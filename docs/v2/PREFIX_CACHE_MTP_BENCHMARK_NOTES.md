@@ -1,14 +1,14 @@
 # Prefix Cache And MTP Benchmark Notes
 
-Phase 14 scoreboard: latest CUDA/ROCm evidence, llama.cpp anchors, and the
-active gap. Keep this concise; raw tuning history belongs in artifacts.
+Phase 14 scoreboard: latest CUDA/ROCm evidence, llama.cpp anchors, and current
+gaps. Keep this concise; raw tuning history belongs in artifacts.
 
 ## Headline Matrix
 
 | Scope | Device | Model | Mode | Prefill | Decode | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 671.37 | 40.82 | fits 24GB after planner fix |
-| Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 582.66 | 53.83 | near fixed d1; controller starts min |
+| Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 671.37 | 40.82 | fits 24GB |
+| Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 582.66 | 53.83 | near fixed d1 |
 | Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2158.10 | 107.14 | inverse-map top-k scatter |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1657.39 | 131.27 | depth 1, 78.52% accept |
@@ -35,41 +35,33 @@ Artifacts: `benchmark_results/llama_cpp_cuda/20260604T191903Z-6ddc943-mtp-recali
 
 ## Latest Evidence
 
-CUDA dense memory planner smoke:
-`benchmark_results/memory_planner/20260604T203612Z-cuda-dense-activation-cap`
-
-| Case | Context | Act.Seq | KV | Arena | Result |
-|---|---:|---:|---:|---:|---|
-| Qwen3.6 27B CUDA tiny prompt | 16384 | 4096 | 4.0 GB | 1785 MB | pass |
-
-CUDA MoE after token-direct verifier down accumulation:
+CUDA MoE ratchet:
 `benchmark_results/cuda_moe_mtp/20260604T222925Z-token-direct-down-no-mtp`
 `benchmark_results/cuda_moe_mtp/20260604T222925Z-token-direct-down-mtp-dynamic`
-Profiler export check:
-`benchmark_results/cuda_moe_mtp/20260604T230244Z-perf-export-no-stage-events`
-Stage-event fix: `benchmark_results/cuda_moe_mtp/20260604T231108Z-stage-timing-accumulator-fix`
-Greedy margin diagnostic:
-`benchmark_results/cuda_moe_mtp/20260604T220430Z-greedy-margin-verifier-rows`
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
 | no MTP | 2158.10 | 107.14 | n/a |
 | dynamic MTP | 1657.39 | 131.27 | 78.52% |
 
-Verifier-row top-2 margins are large on average (~8.1 logits; one <=1e-2
-near-tie bucket), so CUDA MoE MTP acceptance swings are real draft/main
-disagreement rather than mostly argmax tie noise. The diagnostic run itself is
-not a throughput ratchet because it intentionally adds top-k probes.
-Perf-export smoke verified 0 `stage_gpu` rows and graph sync-scope tags.
-Stage-event smoke no longer folds captured replay wall into eager tables;
-verifier correction suffix setup still shows eager events.
+Fresh checks:
+- Perf export/stage fix:
+  `20260604T230244Z-perf-export-no-stage-events`,
+  `20260604T231108Z-stage-timing-accumulator-fix`.
+- Qwen3.6 MoE CUDA MTP sidecar stage breakdown now passes after graph-aware
+  snapshot keying and BF16 shared-gate materialization; the formerly bad
+  shared-gate/combined/LM-head rows are above threshold.
+- Greedy margin diagnostic:
+  `20260604T220430Z-greedy-margin-verifier-rows`; margins show real
+  draft/main disagreement, not mostly argmax tie noise.
+- Rejected CUDA MoE sweeps:
+  `20260604T233501Z-kpart-sweep-d1` kept 16/16 split-K;
+  `20260604T233707Z-tilem-sweep-d1` kept auto verifier tile 2/64;
+  `20260604T234649Z-smallm-router-d1` and rerun rejected a shared-gate
+  small-M router path at 129.6-130.4 tok/s.
 
-Focused correctness gates:
-
-- `V2_Integration_CUDAMoEKernel`
-- Qwen3.6 MoE CUDA math prefill parity.
-- Qwen3.6 MoE CUDA benchmark-style parity: no-MTP skip-gather argmax,
-  fused verifier prefill, and MTP skip-gather reference.
+Focused CUDA correctness gates: `V2_Integration_CUDAMoEKernel`, Qwen3.6 MoE
+CUDA math prefill parity, and Qwen3.6 MoE CUDA benchmark-style parity.
 
 ## Retained Actions
 
@@ -81,18 +73,17 @@ Focused correctness gates:
   source-token MoE prefill activation quantization, workspace-bound FP32 mapped
   output redirects, inverse-map MoE top-k scatter, token-direct verifier down
   accumulation.
-- CUDA and ROCm GPU greedy argmax tie-break to lowest token id, matching CPU.
-- Memory planning charges terminal-row logits and prepared embedding workspace only.
-- GPU activation arenas are capped to prefill-bucket capacity while KV keeps the
-  requested context capacity; oversized monolithic graph shapes hard fail.
-- Stage profiling split: `stage_gpu` is explicit eager/capture setup event
-  timing, `stage_executor_cpu` is host attribution, and captured replay timing
-  is under `forward_graph`; JSON/CSV export alone stays non-intrusive.
+- CUDA and ROCm GPU greedy argmax tie-break to lowest token id.
+- Memory planning caps activation arenas to prefill-bucket capacity while KV
+  keeps requested context capacity; oversized monolithic graph shapes hard fail.
+- Stage profiling split: `stage_gpu` is explicit eager per-stage event timing,
+  `stage_executor_cpu` is host attribution, and captured replay timing is under
+  `forward_graph`; JSON/CSV export alone stays non-intrusive.
 - Explicit non-null GPU stream hard failures remain required.
 
 ## Next Work
 
-Updated goal is to beat llama.cpp CUDA on dense and MoE, prefill and decode, with
-MTP on and off. Dense decode is close; MoE dynamic MTP decode trails llama.cpp
-MTP d1 by about 8% and is near d3. Next target is CUDA MoE verifier and suffix
-replay cost without giving back the prefill scatter win.
+Beat llama.cpp CUDA on dense and MoE, prefill and decode, with MTP on/off.
+Dense decode is close; CUDA MoE dynamic MTP trails llama.cpp d1 by about 8%.
+Next targets are verifier/correction costs and acceptance quality without
+giving back the token-direct verifier down and prefill scatter wins.

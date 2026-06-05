@@ -100,6 +100,11 @@ Examples:
         action="store_true",
         help="Save decode-step snapshots but skip prefill snapshots",
     )
+    parser.add_argument(
+        "--mtp-sidecar-snapshots",
+        action="store_true",
+        help="Also save decode-step MTP0 sidecar reference snapshots",
+    )
 
     args = parser.parse_args()
 
@@ -113,6 +118,7 @@ Examples:
     print(f"  Decode steps: {args.decode_steps}")
     print(f"  Metadata only: {args.metadata_only}")
     print(f"  Decode snapshots only: {args.decode_snapshots_only}")
+    print(f"  MTP sidecar snapshots: {args.mtp_sidecar_snapshots}")
 
     # Create and load model via registry
     print("\nLoading model...")
@@ -130,6 +136,16 @@ Examples:
         save_prefill_snapshots=not args.decode_snapshots_only,
         save_decode_snapshots=True,
     )
+
+    if args.mtp_sidecar_snapshots and not args.metadata_only:
+        mtp_total = model.generate_mtp_sidecar_decode_snapshots(
+            args.prompt,
+            args.decode_steps,
+            args.output,
+            verbose=args.verbose,
+        )
+        total += mtp_total
+        print(f"  Captured {mtp_total} MTP sidecar snapshots")
 
     # Write metadata
     write_metadata(

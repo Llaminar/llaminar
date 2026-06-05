@@ -2766,6 +2766,39 @@ namespace llaminar2
     {
     }
 
+    TensorBase *SharedExpertGateStage::effectiveGateInput() const
+    {
+        if (!params_.gate_inp)
+            return nullptr;
+
+        if (params_.gate_inp->native_type() == TensorType::FP32)
+            return params_.gate_inp;
+
+        const size_t count = params_.gate_inp->numel();
+        if (!fp32_gate_inp_ || fp32_gate_source_ != params_.gate_inp ||
+            fp32_gate_inp_->shape() != params_.gate_inp->shape())
+        {
+            fp32_gate_inp_ = std::make_shared<FP32Tensor>(params_.gate_inp->shape());
+            params_.gate_inp->to_fp32(fp32_gate_inp_->mutable_data());
+            fp32_gate_source_ = params_.gate_inp;
+        }
+        else if (fp32_gate_inp_->numel() != count)
+        {
+            fp32_gate_inp_ = std::make_shared<FP32Tensor>(params_.gate_inp->shape());
+            params_.gate_inp->to_fp32(fp32_gate_inp_->mutable_data());
+            fp32_gate_source_ = params_.gate_inp;
+        }
+
+        return fp32_gate_inp_.get();
+    }
+
+    bool SharedExpertGateStage::gateInputReadyForGraphCapture() const
+    {
+        return params_.gate_inp &&
+               (params_.gate_inp->native_type() == TensorType::FP32 ||
+                (fp32_gate_inp_ && fp32_gate_source_ == params_.gate_inp));
+    }
+
     bool SharedExpertGateStage::execute(IDeviceContext *ctx)
     {
         if (!ctx)
@@ -2785,10 +2818,17 @@ namespace llaminar2
 
         // Delegate sigmoid gating to device-appropriate MoE kernel.
         // Tensor-aware API handles CPU/GPU dispatch internally.
+        TensorBase *gate_inp = effectiveGateInput();
+        if (!gate_inp)
+        {
+            LOG_ERROR("[SharedExpertGateStage] Failed to prepare gate input");
+            return false;
+        }
+
         IMoEKernel *kernel = ensureMoEKernel();
 
         kernel->sharedExpertGateFromTensors(
-            params_.input, params_.gate_inp, params_.shared_output,
+            params_.input, gate_inp, params_.shared_output,
             seq_len, d_model);
         markGpuTensorWritten(params_.shared_output, params_.device_id, gpuStream());
 
@@ -2846,7 +2886,9 @@ namespace llaminar2
         // Capturable for both decode (seq_len==1) and prefill (seq_len>1) on supported GPU backends
         // because the stage is just a kernel launch with stable device pointers.
         // MoE kernel must already be cached (from warmup execution).
-        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) && moe_kernel_ != nullptr;
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
+               moe_kernel_ != nullptr &&
+               gateInputReadyForGraphCapture();
 #endif
     }
 

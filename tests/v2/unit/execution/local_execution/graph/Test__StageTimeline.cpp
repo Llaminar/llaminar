@@ -296,17 +296,17 @@ TEST_F(Test__StageTimeline, RecordPerfStatsCarriesContextTags)
     const PerfStatsCollector::Tags base_tags{
         {"attribution", "gpu_event"},
         {"context", "main_verifier"},
-        {"graph_capture_scope", "eager_stage_events"},
+        {"graph_capture_scope", "eager_per_stage_events"},
         {"source", "stage_timeline"}};
     EXPECT_TRUE(has_record("total", base_tags));
     EXPECT_TRUE(has_record("type.GEMM", {{"attribution", "gpu_event"},
                                          {"context", "main_verifier"},
-                                         {"graph_capture_scope", "eager_stage_events"},
+                                         {"graph_capture_scope", "eager_per_stage_events"},
                                          {"source", "stage_timeline"},
                                          {"stage_count", "1"}}));
     EXPECT_TRUE(has_record("gemm_stage", {{"attribution", "gpu_event"},
                                           {"context", "main_verifier"},
-                                          {"graph_capture_scope", "eager_stage_events"},
+                                          {"graph_capture_scope", "eager_per_stage_events"},
                                           {"index", "0"},
                                           {"source", "stage_timeline"},
                                           {"type", "GEMM"}}));
