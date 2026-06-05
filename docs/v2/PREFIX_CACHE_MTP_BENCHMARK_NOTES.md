@@ -54,8 +54,7 @@ Fresh checks:
   `20260604T231108Z-stage-timing-accumulator-fix`,
   `20260605T024434Z-graph-replay-stage-stats`.
 - Captured replay exports `stage_gpu.graph_replay.*` wall timings and
-  `stage_gpu.graph_replay_plan_*` metadata to JSON/CSV; attribution shows main
-  verifier replay around 11.05 ms for 524 stages and MTP sidecar around 0.79 ms.
+  `stage_gpu.graph_replay_plan_*` metadata to JSON/CSV.
 - CUDA runtime-routed MoE decode has graph-replay regression coverage via
   `RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphReplays`; counter-only runs
   show `cuda_moe_grouped_decode_fused_calls`, `route=fused_kpart`.
@@ -63,6 +62,8 @@ Fresh checks:
   benchmark-style parity coverage with perf-counter evidence.
 - Dynamic MTP request state resets across benchmark-style `clearCache()`; JSON
   counters now describe the measured request rather than warmup plus all runs.
+- CUDA MoE prefill tile sweep `20260605T032239Z-cuda-moe-prefill-tile-sweep`:
+  tile 16 remains best; disabling fused SwiGLU regresses slightly.
 
 Focused gates: `V2_Integration_CUDAMoEKernel`, Qwen3.6 MoE CUDA math parity,
 and Qwen3.6 MoE CUDA benchmark-style parity.
