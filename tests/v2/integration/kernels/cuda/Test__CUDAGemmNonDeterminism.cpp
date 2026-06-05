@@ -1127,16 +1127,23 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
     struct Shape
     {
         const char *name;
+        int codebook;
         int m;
         int n;
         int k;
         int expected_tile;
+        int expected_split_k;
     };
 
     const Shape shapes[] = {
-        {"Qwen36_FFN_GateUp", 595, 17408, 5120, 4},
-        {"Qwen36_FFN_DownProjection", 595, 5120, 17408, 2},
-        {"Qwen36_GDN_InnerProjection", 595, 10240, 5120, 4},
+        {"Qwen36_FFN_GateUp_Q4_K", 5, 595, 17408, 5120, 4, 1},
+        {"Qwen36_FFN_DownProjection_Q4_K", 5, 595, 5120, 17408, 2, 1},
+        {"Qwen36_GDN_InnerProjection_Q4_K", 5, 595, 10240, 5120, 4, 1},
+        {"Qwen36_GDN_ZProjection_Q4_K", 5, 595, 6144, 5120, 2, 1},
+        {"Qwen36_GDN_OutputProjection_Q4_K", 5, 595, 5120, 6144, 2, 1},
+        {"Qwen36_GDN_InnerProjection_Q5_1", 7, 595, 10240, 5120, 4, 1},
+        {"Qwen36_GDN_ZProjection_Q5_1", 7, 595, 6144, 5120, 2, 1},
+        {"Qwen36_GDN_OutputProjection_Q5_1", 7, 595, 5120, 6144, 2, 1},
     };
 
     ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
@@ -1147,14 +1154,23 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
     {
         SCOPED_TRACE(shape.name);
 
-        auto weight = TestTensorFactory::createQ4_KRandom(
-            {static_cast<size_t>(shape.n), static_cast<size_t>(shape.k)},
-            static_cast<uint32_t>(9000 + shape.n + shape.k));
-        auto *w_q4k = dynamic_cast<Q4_KTensor *>(weight.get());
-        ASSERT_NE(w_q4k, nullptr);
-        ASSERT_TRUE(w_q4k->ensureOnDevice(gpu_device_));
+        std::unique_ptr<TensorBase> weight;
+        if (shape.codebook == 5)
+        {
+            weight = TestTensorFactory::createQ4_KRandom(
+                {static_cast<size_t>(shape.n), static_cast<size_t>(shape.k)},
+                static_cast<uint32_t>(9000 + shape.n + shape.k));
+        }
+        else
+        {
+            ASSERT_EQ(shape.codebook, 7);
+            weight = TestTensorFactory::createQ5_1Random(
+                {static_cast<size_t>(shape.n), static_cast<size_t>(shape.k)},
+                static_cast<uint32_t>(9000 + shape.n + shape.k));
+        }
+        ASSERT_TRUE(weight->ensureOnDevice(gpu_device_, stream));
 
-        auto *kernel = getPreparedKernel(w_q4k, gpu_device_);
+        auto *kernel = getPreparedKernel(weight.get(), gpu_device_);
         ASSERT_NE(kernel, nullptr);
 
         auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
@@ -1197,7 +1213,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
             &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
 
         EXPECT_EQ(selected_tile, shape.expected_tile);
-        EXPECT_EQ(selected_split_k, 1);
+        EXPECT_EQ(selected_split_k, shape.expected_split_k);
         EXPECT_EQ(used_bk256, 0);
         EXPECT_EQ(used_streamk, 0);
 
@@ -1214,14 +1230,15 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
                 return it == record.tags.end() ? std::string{} : it->second;
             };
 
-            if (tag("m") == std::to_string(shape.m) &&
+            if (tag("codebook") == std::to_string(shape.codebook) &&
+                tag("m") == std::to_string(shape.m) &&
                 tag("n") == std::to_string(shape.n) &&
                 tag("k") == std::to_string(shape.k))
             {
                 found = true;
-                EXPECT_EQ(tag("codebook"), "5");
+                EXPECT_EQ(tag("codebook"), std::to_string(shape.codebook));
                 EXPECT_EQ(tag("tile_id"), std::to_string(shape.expected_tile));
-                EXPECT_EQ(tag("split_k"), "1");
+                EXPECT_EQ(tag("split_k"), std::to_string(shape.expected_split_k));
                 EXPECT_EQ(tag("bk256"), "0");
                 EXPECT_EQ(tag("streamk"), "0");
                 EXPECT_EQ(record.device, "cuda:" + std::to_string(gpu_device_.ordinal));

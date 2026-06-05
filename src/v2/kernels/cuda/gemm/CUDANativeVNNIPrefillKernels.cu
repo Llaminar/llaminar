@@ -2522,12 +2522,10 @@ namespace
     // are baked into the generated tables.
 #include "kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc"
 
-    // Narrow Qwen3.6 dense prompt-prefill overrides from the production-shape
-    // Q4_K M=595 sweep in
-    // benchmark_results/cuda_dense_mtp/20260605T072031Z-dense-refresh/
-    // qwen36_dense_q4k_m595_tile_sweep.csv. Keep this ahead of the generated
-    // table so the production model gets the measured winner without
-    // regenerating all historical sweep inputs.
+    // Narrow Qwen3.6 dense prompt-prefill overrides from production-shape
+    // Q4_K/Q5_1 M=595..600 sweeps under benchmark_results/cuda_dense_mtp/.
+    // Keep these ahead of the generated table so the production model gets
+    // measured winners without regenerating all historical sweep inputs.
     template <uint8_t CB>
     bool selectManualPrefillTileOverride(
         int M,
@@ -2536,13 +2534,33 @@ namespace
         uint8_t &out_tile_id,
         uint8_t &out_split_k)
     {
+        if constexpr (CB == 5 || CB == 7)
+        {
+            if (binPrefillM(M) != 512)
+                return false;
+
+            if (N == 10240 && K == 5120)
+            {
+                out_tile_id = static_cast<uint8_t>(TileId::T128x128_w4x2);
+                out_split_k = 1;
+                return true;
+            }
+
+            if ((N == 6144 && K == 5120) ||
+                (N == 5120 && K == 6144))
+            {
+                out_tile_id = static_cast<uint8_t>(TileId::T64x128_w4x2);
+                out_split_k = 1;
+                return true;
+            }
+        }
+
         if constexpr (CB == 5)
         {
             if (binPrefillM(M) != 512)
                 return false;
 
-            if ((N == 17408 && K == 5120) ||
-                (N == 10240 && K == 5120))
+            if (N == 17408 && K == 5120)
             {
                 out_tile_id = static_cast<uint8_t>(TileId::T128x128_w4x2);
                 out_split_k = 1;
@@ -2556,7 +2574,6 @@ namespace
                 return true;
             }
         }
-
         return false;
     }
 
