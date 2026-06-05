@@ -23,15 +23,6 @@
 #include <string>
 #include <vector>
 
-struct CUDAPrefillStreamScratch_
-{
-    cudaStream_t stream = nullptr;
-    float *fixup_buf = nullptr;
-    size_t fixup_buf_size = 0; // in bytes
-    float *splitk_partials = nullptr;
-    size_t splitk_partials_size = 0; // in bytes
-};
-
 // =========================================================================
 // Per-device prefill context — replaces process-global statics for SM count
 // cache and stream-K fixup buffer.  Owned by KernelFactory, one per device.
@@ -40,12 +31,10 @@ struct CUDAPrefillContext_
 {
     int sm_count = 0;
     int device_id = -1;
-    std::vector<CUDAPrefillStreamScratch_> stream_scratch;
     float *workspace_splitk_partials = nullptr;
     size_t workspace_splitk_partials_size = 0;
     float *workspace_fixup_buf = nullptr;
     size_t workspace_fixup_buf_size = 0;
-    bool require_workspace_scratch = true;
 };
 
 struct LastLaunchSelection_
@@ -84,18 +73,6 @@ static int querySmCount(CUDAPrefillContext_ *ctx)
     return ctx->sm_count;
 }
 
-static CUDAPrefillStreamScratch_ *getOrCreateStreamScratch(CUDAPrefillContext_ *ctx, cudaStream_t stream)
-{
-    for (auto &scratch : ctx->stream_scratch)
-    {
-        if (scratch.stream == stream)
-            return &scratch;
-    }
-
-    ctx->stream_scratch.push_back({stream});
-    return &ctx->stream_scratch.back();
-}
-
 static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
 {
     if (ctx->workspace_fixup_buf && ctx->workspace_fixup_buf_size >= required_bytes)
@@ -103,23 +80,7 @@ static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_by
         cudaMemsetAsync(ctx->workspace_fixup_buf, 0, required_bytes, stream);
         return ctx->workspace_fixup_buf;
     }
-    if (ctx->require_workspace_scratch)
-        return nullptr;
-
-    auto *scratch = getOrCreateStreamScratch(ctx, stream);
-    if (scratch->fixup_buf_size < required_bytes)
-    {
-        if (scratch->fixup_buf)
-            cudaFree(scratch->fixup_buf);
-        scratch->fixup_buf = nullptr;
-        scratch->fixup_buf_size = 0;
-        cudaSetDevice(ctx->device_id);
-        if (cudaMalloc(&scratch->fixup_buf, required_bytes) != cudaSuccess)
-            return nullptr;
-        scratch->fixup_buf_size = required_bytes;
-    }
-    cudaMemsetAsync(scratch->fixup_buf, 0, required_bytes, stream);
-    return scratch->fixup_buf;
+    return nullptr;
 }
 
 static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
@@ -127,22 +88,7 @@ static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required
     (void)stream;
     if (ctx->workspace_splitk_partials && ctx->workspace_splitk_partials_size >= required_bytes)
         return ctx->workspace_splitk_partials;
-    if (ctx->require_workspace_scratch)
-        return nullptr;
-
-    auto *scratch = getOrCreateStreamScratch(ctx, stream);
-    if (scratch->splitk_partials_size < required_bytes)
-    {
-        if (scratch->splitk_partials)
-            cudaFree(scratch->splitk_partials);
-        scratch->splitk_partials = nullptr;
-        scratch->splitk_partials_size = 0;
-        cudaSetDevice(ctx->device_id);
-        if (cudaMalloc(&scratch->splitk_partials, required_bytes) != cudaSuccess)
-            return nullptr;
-        scratch->splitk_partials_size = required_bytes;
-    }
-    return scratch->splitk_partials;
+    return nullptr;
 }
 
 namespace
@@ -3892,14 +3838,6 @@ extern "C"
     {
         if (!ctx)
             return;
-        cudaSetDevice(ctx->device_id);
-        for (auto &scratch : ctx->stream_scratch)
-        {
-            if (scratch.fixup_buf)
-                cudaFree(scratch.fixup_buf);
-            if (scratch.splitk_partials)
-                cudaFree(scratch.splitk_partials);
-        }
         delete ctx;
     }
 
@@ -3942,7 +3880,6 @@ extern "C"
 
         CUDAPrefillContext_ temp_ctx;
         temp_ctx.device_id = cuda_device_id;
-        temp_ctx.require_workspace_scratch = true;
 
         PrefillWorkspacePlan plan;
         switch (codebook_id)
@@ -4351,7 +4288,6 @@ extern "C"
         // Benchmark helper: use a thread-local context for the sweep
         static thread_local CUDAPrefillContext_ tl_sweep_ctx{};
         tl_sweep_ctx.device_id = device_id;
-        tl_sweep_ctx.require_workspace_scratch = false;
         CUDAPrefillContext_ *pctx = &tl_sweep_ctx;
 
         cudaStream_t cs = static_cast<cudaStream_t>(stream);

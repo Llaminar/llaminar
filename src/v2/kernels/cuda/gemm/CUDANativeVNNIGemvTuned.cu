@@ -45,8 +45,6 @@ struct CUDAGemvContext_
     // KPAR two-phase reduction partials buffer
     float *kpar_partials = nullptr;
     size_t kpar_capacity = 0; // in floats
-    bool kpar_partials_owned = false;
-    bool require_workspace_scratch = true;
 };
 
 static int querySmCount(CUDAGemvContext_ *ctx)
@@ -66,33 +64,7 @@ static float *getKparPartials(CUDAGemvContext_ *ctx, size_t num_floats)
 {
     if (ctx->kpar_partials && ctx->kpar_capacity >= num_floats)
         return ctx->kpar_partials;
-    if (ctx->require_workspace_scratch)
-        return nullptr;
-
-    if (ctx->kpar_partials && ctx->kpar_partials_owned)
-    {
-        cudaSetDevice(ctx->device_id);
-        cudaFree(ctx->kpar_partials);
-        ctx->kpar_partials = nullptr;
-        ctx->kpar_capacity = 0;
-        ctx->kpar_partials_owned = false;
-    }
-    else
-    {
-        ctx->kpar_partials = nullptr;
-        ctx->kpar_capacity = 0;
-    }
-
-    cudaSetDevice(ctx->device_id);
-    if (cudaMalloc(&ctx->kpar_partials, num_floats * sizeof(float)) != cudaSuccess)
-    {
-        ctx->kpar_partials = nullptr;
-        ctx->kpar_capacity = 0;
-        return nullptr;
-    }
-    ctx->kpar_capacity = num_floats;
-    ctx->kpar_partials_owned = true;
-    return ctx->kpar_partials;
+    return nullptr;
 }
 
 // =====================================================================
@@ -2459,11 +2431,6 @@ extern "C"
     {
         if (!ctx)
             return;
-        if (ctx->kpar_partials && ctx->kpar_partials_owned)
-        {
-            cudaSetDevice(ctx->device_id);
-            cudaFree(ctx->kpar_partials);
-        }
         delete ctx;
     }
 
@@ -2474,15 +2441,8 @@ extern "C"
     {
         if (!ctx)
             return;
-        if (ctx->kpar_partials && ctx->kpar_partials_owned)
-        {
-            cudaSetDevice(ctx->device_id);
-            cudaFree(ctx->kpar_partials);
-        }
         ctx->kpar_partials = kpar_partials;
         ctx->kpar_capacity = kpar_partials_bytes / sizeof(float);
-        ctx->kpar_partials_owned = false;
-        ctx->require_workspace_scratch = true;
     }
 
     CUDARowMajorWeights *cudaRowMajorWeights_create(
