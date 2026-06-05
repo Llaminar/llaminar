@@ -62,17 +62,18 @@ Fresh checks:
   perf stats; CUDA/ROCm request scratch binds through `DeviceWorkspaceManager`.
 - CUDA dense prefill is generated-table driven for Qwen3.6 Q4_K-family `M=600`;
   temporary selector overrides are gone and `M=595` bucket routing is covered.
-- CUDA concurrent fused prefill now binds NativeVNNI split-K/stream-K scratch
-  per side-stream slot; Qwen3.6 Q/K/V regression and dense graph capture pass.
+- CUDA concurrent fused prefill binds split-K/stream-K scratch per side-stream.
 - NativeVNNI trainers share one codebook map and bucket policy across CUDA/ROCm.
-  ROCm generated decode/prefill dispatch came from:
-  `benchmark_results/rocm_native_vnni/20260605T211640Z-decode-prefill-generated-pipeline`.
+  ROCm decode/prefill dispatch came from:
+  `benchmark_results/rocm_native_vnni/20260605T211640Z-decode-prefill-generated-pipeline`;
+  refresh sweeps use `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` to avoid AUTO
+  learning the previous generated table.
 - ROCm Q4_K GDN-time decode cosine `0.999840` is a full native-VNNI-vs-FP32
   benchmark artifact, not dispatch divergence. Exact packed-contract regression
   passes with native cosine `1.0`; the asymmetric-format perf gate is `0.9998`.
 - Focused coverage green: codebook/generated-dispatch validators, ROCm trainer
   generator/CSV validators, CUDA GEMM route/workspace regressions, CUDA graph
-  stochastic smoke, and Qwen3.6 CUDA dense prefix/MTP parity.
+  stochastic smoke, and CUDA dense prefix/MTP parity.
 
 ## Retained Actions
 

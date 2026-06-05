@@ -2551,6 +2551,7 @@ namespace llaminar2
      * - `LLAMINAR_ROCM_NVNNI_GEMV_KB=<n>` - Force native-VNNI GEMV K partitions (`-1` = auto)
      * - `LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES=<n>` - Force native-VNNI GEMV target waves per CU (`-1` = auto)
      * - `LLAMINAR_ROCM_NVNNI_Q8_DIRECT=1` - Force Q8_0 native-VNNI GEMV direct path (KB=1, no reduce kernel)
+     * - `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` - Disable generated ROCm NativeVNNI dispatch tables during trainer sweeps
      * - `LLAMINAR_ROCM_CONCURRENT_M2_ROWS=1` - Enable experimental native-VNNI row-overlap for MTP verifier M==2 GEMV (default: off)
      * - `LLAMINAR_ROCM_GDN_CONCURRENT_DECODE=1` - Enable experimental multi-stream GDN decode projection GEMVs (default: off)
      * - `LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE=1` - Enable experimental shared-expert decode through MoE grouped FFN kernels (default: off)
@@ -2616,6 +2617,7 @@ namespace llaminar2
         int nvnni_gemv_target_waves = -1;          ///< Native-VNNI GEMV target waves/CU override (-1=auto) (LLAMINAR_ROCM_NVNNI_GEMV_TARGET_WAVES)
         bool nvnni_q8_direct = false;              ///< Force Q8_0 native-VNNI GEMV KB=1 direct path (LLAMINAR_ROCM_NVNNI_Q8_DIRECT)
         bool nvnni_atomic_reduce = false;          ///< Fuse GEMV reduce via atomicAdd (eliminates reduce kernel) (LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE)
+        bool nvnni_disable_generated = false;      ///< Disable generated ROCm NativeVNNI dispatch tables for trainer sweeps (LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED)
         int ratio_prefill_variant = -1;            ///< Ratio prefill tile variant override (-1=auto,0=16x16,1=32x8,2=8x32,3=8x8)
         int ratio_prefill_kb = 0;                  ///< Ratio prefill split-K blocks override (0=auto)
         int ratio_prefill_linear_variant = -1;     ///< Linear codebook ratio prefill tile override (-1=use global/auto)
@@ -2698,6 +2700,7 @@ namespace llaminar2
             nvnni_gemv_target_waves = -1;
             nvnni_q8_direct = false;
             nvnni_atomic_reduce = false;
+            nvnni_disable_generated = false;
             ratio_prefill_variant = -1;
             ratio_prefill_kb = 0;
             ratio_prefill_linear_variant = -1;
@@ -2997,6 +3000,12 @@ namespace llaminar2
             if (nvnni_atomic_reduce_env)
             {
                 nvnni_atomic_reduce = (std::atoi(nvnni_atomic_reduce_env) != 0);
+            }
+
+            const char *nvnni_disable_generated_env = std::getenv("LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED");
+            if (nvnni_disable_generated_env)
+            {
+                nvnni_disable_generated = (std::atoi(nvnni_disable_generated_env) != 0);
             }
 
             const char *ratio_prefill_variant_env = std::getenv("LLAMINAR_ROCM_RATIO_PREFILL_VARIANT");

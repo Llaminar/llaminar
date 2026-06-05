@@ -68,6 +68,9 @@ static NativeVNNIDecodeGeneratedRuntimeConfig resolveNativeVNNIDecodeGeneratedRu
 {
     NativeVNNIDecodeGeneratedRuntimeConfig resolved{};
     const auto& rocm_env = llaminar2::debugEnv().rocm;
+    if (rocm_env.nvnni_disable_generated)
+        return resolved;
+
     const bool has_explicit_override =
         g_native_vnni_kb_override.load(std::memory_order_relaxed) > 0 ||
         g_native_vnni_target_waves_override.load(std::memory_order_relaxed) > 0 ||

@@ -5,7 +5,8 @@ The ROCm native-VNNI GEMM launcher currently owns its runtime heuristic in the
 HIP translation unit. This analyzer gives the ROCm side the same repeatable
 "sweep CSV -> generated C++ artifact -> validator" loop used by CUDA, so policy
 changes can be trained and reviewed from measured rows instead of hand-copied
-overrides.
+overrides. Run sweeps with LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 when
+refreshing checked-in tables so AUTO rows do not benchmark the previous table.
 """
 
 from __future__ import annotations

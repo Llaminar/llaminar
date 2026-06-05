@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Generate ROCm NativeVNNI decode dispatch artifacts from trainer CSVs."""
+"""Generate ROCm NativeVNNI decode dispatch artifacts from trainer CSVs.
+
+Run sweeps with LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1 when refreshing
+checked-in tables so AUTO rows do not benchmark the previous table.
+"""
 
 from __future__ import annotations
 
