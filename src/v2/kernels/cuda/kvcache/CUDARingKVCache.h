@@ -531,9 +531,9 @@ namespace llaminar2
         /**
          * @brief Get workspace requirements for batched gather operations
          *
-         * Returns buffer requirements for pointer arrays used in launch_gather_kernel().
-         * When workspace is bound, gather operations use pre-allocated buffers
-         * instead of cudaMalloc/cudaFree per call.
+         * Returns required buffer requirements for pointer arrays used in
+         * launch_gather_kernel(). Gather operations must use workspace buffers;
+         * raw per-call cudaMalloc/cudaFree is not allowed in the inference path.
          *
          * @param m Batch size (number of sequences)
          * @param n Unused
@@ -546,8 +546,7 @@ namespace llaminar2
         /**
          * @brief Bind workspace manager for managed mode
          *
-         * When bound, gather operations use pre-allocated buffers instead of
-         * per-call cudaMalloc/cudaFree.
+         * Gather operations require this workspace binding before execution.
          *
          * @param workspace Pointer to workspace manager (NOT owned, must outlive cache)
          */
@@ -599,8 +598,8 @@ namespace llaminar2
         // When set, provides default stream for methods that accept optional streams
         IWorkerGPUContext *device_ctx_ = nullptr;
 
-        // Workspace manager for batched gather operations
-        // When bound, launch_gather_kernel() uses pre-allocated buffers instead of cudaMalloc/cudaFree
+        // Workspace manager for batched gather operations.
+        // launch_gather_kernel() requires these pre-allocated buffers.
         DeviceWorkspaceManager *workspace_ = nullptr;
 
         // Entry storage: [n_layers][batch_size]
@@ -638,7 +637,7 @@ namespace llaminar2
                                           const int *d_head, int num_tokens, cudaStream_t stream);
         void launch_linearize_kernel(const EntryT &entry, DataT *d_k_out, DataT *d_v_out,
                                      cudaStream_t stream);
-        void launch_gather_kernel(const std::vector<EntryT *> &entries,
+        bool launch_gather_kernel(const std::vector<EntryT *> &entries,
                                   DataT *d_k_out, DataT *d_v_out,
                                   int *kv_lens, int max_kv_len,
                                   int num_seqs, cudaStream_t stream);

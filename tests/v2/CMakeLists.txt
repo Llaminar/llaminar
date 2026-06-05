@@ -11407,6 +11407,17 @@ add_v2_test(V2_Unit_PrefillGraphCaptureGuards
     MPI_PROCS 1
 )
 
+add_executable(v2_test_gpu_workspace_allocation_policy unit/stages/Test__GpuWorkspaceAllocationPolicy.cpp)
+target_include_directories(v2_test_gpu_workspace_allocation_policy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(v2_test_gpu_workspace_allocation_policy
+    PRIVATE LLAMINAR_REPO_ROOT="${CMAKE_SOURCE_DIR}/../..")
+target_link_libraries(v2_test_gpu_workspace_allocation_policy llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_GpuWorkspaceAllocationPolicy
+    COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
+    LABELS "V2;Unit;CUDA;ROCm;Stages;GraphCapture;Workspace"
+    MPI_PROCS 1
+)
+
 add_executable(v2_test_prefill_graph_capture_dynamic_params unit/stages/Test__PrefillGraphCaptureDynamicParams.cpp)
 target_include_directories(v2_test_prefill_graph_capture_dynamic_params PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(v2_test_prefill_graph_capture_dynamic_params llaminar2_core GTest::gtest GTest::gtest_main)

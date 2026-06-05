@@ -13,7 +13,8 @@
  *
  * 1. **Memory Budgeting**: Centralized allocation allows global VRAM budget control
  * 2. **Hot-Path Efficiency**: No allocations during GEMM execution
- * 3. **Backward Compatibility**: Kernels work in both legacy and managed modes
+ * 3. **Capture Safety**: Capture-sensitive kernels fail loudly when required
+ *    workspace is missing instead of allocating scratch internally
  *
  * ## Usage Pattern
  *
@@ -51,8 +52,8 @@ namespace llaminar2
      * Kernels implementing this interface:
      * 1. Declare workspace requirements via getWorkspaceRequirements()
      * 2. Receive pre-allocated buffers via bindWorkspace()
-     * 3. Use bound workspace instead of internal allocations when available
-     * 4. Fall back to legacy internal buffers when workspace not bound
+     * 3. Use bound workspace instead of internal allocations
+     * 4. Treat missing required workspace as an execution error
      *
      * (Formerly IGpuWorkspaceConsumer)
      */
@@ -93,13 +94,12 @@ namespace llaminar2
         /**
          * @brief Bind a workspace manager to this kernel
          *
-         * After binding, the kernel uses buffers from the workspace manager
-         * instead of its internal ad-hoc allocations. The workspace manager
-         * must have allocated all buffers returned by getWorkspaceRequirements()
-         * for the maximum expected dimensions.
+         * After binding, the kernel uses buffers from the workspace manager.
+         * The workspace manager must have allocated all required buffers returned
+         * by getWorkspaceRequirements() for the maximum expected dimensions.
          *
          * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
-         *                  Pass nullptr to unbind and return to legacy mode.
+         *                  Pass nullptr to unbind during allocator rebuilds.
          *
          * @note Thread Safety: This method should only be called during setup,
          *       not during concurrent kernel execution.
@@ -109,8 +109,8 @@ namespace llaminar2
         /**
          * @brief Unbind workspace and return to legacy mode
          *
-         * Equivalent to bindWorkspace(nullptr). Kernel will use internal
-         * buffer management after this call.
+         * Equivalent to bindWorkspace(nullptr). Capture-sensitive kernels should
+         * fail execution while unbound.
          */
         virtual void unbindWorkspace()
         {

@@ -1615,17 +1615,20 @@ namespace llaminar2
         // Use provided max_kv_len or actual
         int out_max_kv_len = (max_kv_len > 0) ? max_kv_len : actual_max_kv_len;
 
-        launch_gather_kernel(entry_ptrs,
-                             static_cast<DataT *>(d_k_out),
-                             static_cast<DataT *>(d_v_out),
-                             kv_lens, out_max_kv_len,
-                             num_seqs, stream);
+        if (!launch_gather_kernel(entry_ptrs,
+                                  static_cast<DataT *>(d_k_out),
+                                  static_cast<DataT *>(d_v_out),
+                                  kv_lens, out_max_kv_len,
+                                  num_seqs, stream))
+        {
+            return -1;
+        }
 
         return actual_max_kv_len;
     }
 
     template <ActivationPrecision Precision>
-    void CUDARingKVCache<Precision>::launch_gather_kernel(
+    bool CUDARingKVCache<Precision>::launch_gather_kernel(
         const std::vector<EntryT *> &entries,
         DataT *d_k_out, DataT *d_v_out,
         int *kv_lens, int max_kv_len,
@@ -1636,36 +1639,31 @@ namespace llaminar2
         DataT **d_v_caches = nullptr;
         int *d_tails = nullptr;
         int *d_counts = nullptr;
-        bool using_workspace = false;
-
-        if (hasWorkspace())
+        if (!hasWorkspace() || !workspace_ || !workspace_->isAllocated())
         {
-            // Use pre-allocated workspace buffers (fast path)
-            d_k_caches = static_cast<DataT **>(
-                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_K_PTRS));
-            d_v_caches = static_cast<DataT **>(
-                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_V_PTRS));
-            d_tails = static_cast<int *>(
-                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_TAILS));
-            d_counts = static_cast<int *>(
-                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_COUNTS));
-
-            if (d_k_caches && d_v_caches && d_tails && d_counts)
-            {
-                using_workspace = true;
-                LOG_TRACE("[CUDARingKVCache] Using workspace buffers for gather, num_seqs=" << num_seqs);
-            }
+            LOG_ERROR("[CUDARingKVCache] Workspace is required for batched gather; "
+                      << "raw cudaMalloc fallback is disabled");
+            return false;
         }
 
-        if (!using_workspace)
+        // Use pre-allocated workspace buffers. These are required so gather stays
+        // visible to the memory planner and remains graph-capture compatible.
+        d_k_caches = static_cast<DataT **>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_K_PTRS));
+        d_v_caches = static_cast<DataT **>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_V_PTRS));
+        d_tails = static_cast<int *>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_TAILS));
+        d_counts = static_cast<int *>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_COUNTS));
+
+        if (!d_k_caches || !d_v_caches || !d_tails || !d_counts)
         {
-            // Fallback to per-call allocation (backward compatibility)
-            LOG_TRACE("[CUDARingKVCache] Fallback to per-call allocation for gather, num_seqs=" << num_seqs);
-            cudaMalloc(&d_k_caches, num_seqs * sizeof(DataT *));
-            cudaMalloc(&d_v_caches, num_seqs * sizeof(DataT *));
-            cudaMalloc(&d_tails, num_seqs * sizeof(int));
-            cudaMalloc(&d_counts, num_seqs * sizeof(int));
+            LOG_ERROR("[CUDARingKVCache] Missing required workspace buffers for batched gather");
+            return false;
         }
+
+        LOG_TRACE("[CUDARingKVCache] Using workspace buffers for gather, num_seqs=" << num_seqs);
 
         // Prepare host arrays
         std::vector<DataT *> h_k_caches(num_seqs);
@@ -1700,15 +1698,7 @@ namespace llaminar2
             d_k_caches, d_v_caches,
             d_tails, d_counts,
             num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_);
-
-        // Free temporary device arrays only if we allocated them
-        if (!using_workspace)
-        {
-            cudaFreeAsync(d_k_caches, stream);
-            cudaFreeAsync(d_v_caches, stream);
-            cudaFreeAsync(d_tails, stream);
-            cudaFreeAsync(d_counts, stream);
-        }
+        return cudaGetLastError() == cudaSuccess;
     }
 
     // =========================================================================
@@ -1733,27 +1723,27 @@ namespace llaminar2
         reqs.buffers.push_back({
             KVCacheWorkspaceBuffers::BATCH_K_PTRS,
             static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
-            256,  // Alignment
-            false // Not required - fallback to per-call allocation
+            256, // Alignment
+            true // Required: no raw cudaMalloc fallback in gather
         });
 
         // Buffer for V cache pointers: DataT* per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_V_PTRS,
                                 static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
                                 256,
-                                false});
+                                true});
 
         // Buffer for tail indices: int per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_TAILS,
                                 static_cast<size_t>(actual_batch_size) * sizeof(int),
                                 256,
-                                false});
+                                true});
 
         // Buffer for count values: int per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_COUNTS,
                                 static_cast<size_t>(actual_batch_size) * sizeof(int),
                                 256,
-                                false});
+                                true});
 
         LOG_DEBUG("[CUDARingKVCache] Workspace requirements: batch_size="
                   << actual_batch_size

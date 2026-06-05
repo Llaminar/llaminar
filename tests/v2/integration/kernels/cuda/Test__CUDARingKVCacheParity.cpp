@@ -20,6 +20,7 @@
 #include <cmath>
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
@@ -54,6 +55,7 @@ namespace
         }
 
         void *opaque() const { return static_cast<void *>(stream_); }
+        cudaStream_t stream() const { return stream_; }
 
         void synchronize() const
         {
@@ -90,6 +92,19 @@ namespace
         return max_err;
     }
 
+    std::unique_ptr<DeviceWorkspaceManager> bindRequiredWorkspace(
+        IWorkspaceConsumer *consumer,
+        int batch_size)
+    {
+        auto reqs = consumer->getWorkspaceRequirements(batch_size);
+        const size_t budget = reqs.total_bytes_with_alignment() + 4096;
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::cuda(0), budget);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        consumer->bindWorkspace(workspace.get());
+        EXPECT_TRUE(consumer->hasWorkspace());
+        return workspace;
+    }
+
 } // namespace
 
 // =============================================================================
@@ -116,6 +131,7 @@ TEST(Test__CUDARingKVCache, BasicAppendRetrieve_FP32)
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedCudaStream stream;
 
     // Generate test data (10 tokens)
     const int num_tokens = 10;
@@ -418,6 +434,11 @@ TEST(Test__CUDARingKVCache, BatchedGather)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    auto workspace = bindRequiredWorkspace(workspace_consumer, batch_size);
+    ASSERT_NE(workspace, nullptr);
+    ScopedCudaStream stream;
 
     // Fill each sequence with different lengths
     int seq_lens[] = {10, 20, 15, 25};
@@ -436,8 +457,9 @@ TEST(Test__CUDARingKVCache, BatchedGather)
         cudaMemcpy(d_K, h_Ks[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_V, h_Vs[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-        cache->append(0, seq, d_K, d_V, seq_lens[seq], 0);
+        cache->append(0, seq, d_K, d_V, seq_lens[seq], stream.stream());
     }
+    stream.synchronize();
 
     // Verify individual sequence lengths
     for (int seq = 0; seq < batch_size; ++seq)
@@ -454,7 +476,8 @@ TEST(Test__CUDARingKVCache, BatchedGather)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len, 0);
+                                              kv_lens.data(), max_kv_len, stream.stream());
+    stream.synchronize();
 
     EXPECT_EQ(actual_max, 25); // Max across sequences
 
@@ -1022,25 +1045,25 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
         {
             found_k_ptrs = true;
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(void *));
-            EXPECT_FALSE(buf.required); // Optional buffer
+            EXPECT_TRUE(buf.required);
         }
         else if (buf.name == KVCacheWorkspaceBuffers::BATCH_V_PTRS)
         {
             found_v_ptrs = true;
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(void *));
-            EXPECT_FALSE(buf.required);
+            EXPECT_TRUE(buf.required);
         }
         else if (buf.name == KVCacheWorkspaceBuffers::BATCH_TAILS)
         {
             found_tails = true;
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(int));
-            EXPECT_FALSE(buf.required);
+            EXPECT_TRUE(buf.required);
         }
         else if (buf.name == KVCacheWorkspaceBuffers::BATCH_COUNTS)
         {
             found_counts = true;
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(int));
-            EXPECT_FALSE(buf.required);
+            EXPECT_TRUE(buf.required);
         }
     }
 
@@ -1105,7 +1128,7 @@ TEST(Test__CUDARingKVCache, WorkspaceBinding)
 }
 
 // =============================================================================
-// Test: BatchedGather works without workspace (backward compatibility)
+// Test: BatchedGather fails without workspace
 // =============================================================================
 
 TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
@@ -1126,6 +1149,7 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedCudaStream stream;
 
     // Verify no workspace bound
     auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
@@ -1145,10 +1169,12 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
         int seq_len = 5 + seq * 3; // 5 and 8 tokens
         cudaMemcpy(d_K, h_K.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_V, h_V.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-        cache->append(0, seq, d_K, d_V, seq_len, 0);
+        cache->append(0, seq, d_K, d_V, seq_len, stream.stream());
     }
+    stream.synchronize();
 
-    // Gather without workspace - should fall back to per-call allocation
+    // Gather without workspace should hard-fail instead of allocating hidden
+    // scratch with cudaMalloc.
     int max_kv_len = 10;
     float *d_K_gathered, *d_V_gathered;
     cudaMalloc(&d_K_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
@@ -1157,16 +1183,14 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len, 0);
+                                              kv_lens.data(), max_kv_len, stream.stream());
 
-    EXPECT_GT(actual_max, 0);
-    EXPECT_EQ(kv_lens[0], 5);
-    EXPECT_EQ(kv_lens[1], 8);
+    EXPECT_EQ(actual_max, -1);
 
     cudaFree(d_K);
     cudaFree(d_V);
     cudaFree(d_K_gathered);
     cudaFree(d_V_gathered);
 
-    LOG_INFO("[BatchedGatherWithoutWorkspace] PASSED - backward compatibility verified");
+    LOG_INFO("[BatchedGatherWithoutWorkspace] PASSED - hard failure verified");
 }
