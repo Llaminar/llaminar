@@ -1609,6 +1609,40 @@ set_tests_properties(V2_Unit_CUDAGemvDispatchGeneratorAliases PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_CUDAPrefillDispatchGeneratorAliases
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_prefill_dispatch_generator.py
+            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/analyze_cuda_tc_gemm_dispatch.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/fixtures/cuda_prefill_dispatch_alias_smoke.csv
+)
+set_tests_properties(V2_Unit_CUDAPrefillDispatchGeneratorAliases PROPERTIES
+    LABELS "V2;Unit;CUDA;GEMM;Prefill;NativeVNNI;Codebook;Dispatch;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_NativeVNNIGeneratedDispatchCodebooks
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
+            ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc
+            ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc
+)
+set_tests_properties(V2_Unit_NativeVNNIGeneratedDispatchCodebooks PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;Quantization;Codebook;Dispatch;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_ROCmNativeVNNITrainerCsvValidator
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/validate_rocm_native_vnni_trainer_csv.py
+            --require-alias-group
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_decode_alias_smoke.csv
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/rocm/fixtures/rocm_native_vnni_prefill_alias_smoke.csv
+)
+set_tests_properties(V2_Unit_ROCmNativeVNNITrainerCsvValidator PROPERTIES
+    LABELS "V2;Unit;ROCm;GEMM;GEMV;NativeVNNI;Codebook;Trainer;Regression"
+    TIMEOUT 30
+)
+
 # Performance: Q16 Fixed-Scale SIMD Quantization
 add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
 target_link_libraries(v2_perf_q16_fixed_scale_simd

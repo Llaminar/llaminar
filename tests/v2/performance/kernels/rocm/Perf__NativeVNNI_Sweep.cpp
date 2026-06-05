@@ -139,6 +139,9 @@ namespace
         {"7B_FFN_Dn", "FFN_Down", 3584, 18944},
         {"7B_LM_Head", "LM_Head", 151936, 3584},
         // Qwen3.6 27B dense / hybrid GDN production shapes.
+        {"Qwen36_Attn_Q", "Attention", 5120, 5120},
+        {"Qwen36_Attn_KV", "Attention", 1024, 5120},
+        {"Qwen36_Attn_Wo", "Attention", 5120, 5120},
         {"Qwen36_FFN_GateUp", "FFN_Up", 17408, 5120},
         {"Qwen36_FFN_DownProjection", "FFN_Down", 5120, 17408},
         {"Qwen36_GDN_InnerProjection", "GDN", 10240, 5120},
@@ -148,7 +151,7 @@ namespace
         {"Qwen36_LM_Head", "LM_Head", 248320, 5120},
     };
 
-    static const std::vector<int> M_VALUES = {128, 256, 512};
+    static const std::vector<int> M_VALUES = {2, 3, 4, 128, 256, 512};
 
     struct FormatSpec
     {
@@ -701,7 +704,7 @@ namespace
             format_filters.insert("q4_0");
         const std::set<std::string> shape_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_SHAPES");
         const std::set<std::string> variant_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_VARIANTS");
-        const std::vector<int> m_values = getEnvCsvInts("LLAMINAR_ROCM_NVNNI_SWEEP_M", {128});
+        const std::vector<int> m_values = getEnvCsvInts("LLAMINAR_ROCM_NVNNI_SWEEP_M", {2, 3, 4, 128});
         const int max_cases = std::max(1, getEnvInt("LLAMINAR_ROCM_NVNNI_SWEEP_MAX_CASES").value_or(1));
         const std::string csv_path = getEnvString("LLAMINAR_ROCM_NVNNI_SWEEP_CSV");
 

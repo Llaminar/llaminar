@@ -104,9 +104,8 @@ namespace llaminar2
         /**
          * @brief Get workspace requirements from ALL THREE GEMM kernels (Q, K, V)
          *
-         * Override the default single-kernel delegation because each kernel has
-         * per-instance unique buffer names (e.g., gemm_temp_c_fp32_<id>).
-         * Reporting only Q's requirements would miss K's and V's unique buffers.
+         * Override the default single-kernel delegation so projection-specific
+         * dimensions are represented before workspace requirements are merged.
          */
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 

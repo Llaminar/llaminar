@@ -396,7 +396,8 @@ namespace llaminar2
 
     WorkspaceRequirements FusedQKVGEMMStage::getWorkspaceRequirements(int m, int n, int k) const
     {
-        // Ensure all three kernels are resolved so we report ALL per-instance buffers.
+        // Ensure all three kernels are resolved so each projection contributes
+        // its actual N/K shape before workspace requirements are merged.
         auto *self = const_cast<FusedQKVGEMMStage *>(this);
         if (!self->resolveIndividualKernels("FusedQKVGEMMStage::getWorkspaceRequirements"))
             return {};

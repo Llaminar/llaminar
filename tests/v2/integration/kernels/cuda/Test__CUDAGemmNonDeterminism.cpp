@@ -1139,6 +1139,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
         {"Qwen36_FFN_GateUp_Q4_K", 5, 595, 17408, 5120, 4, 1},
         {"Qwen36_FFN_DownProjection_Q4_K_exact", 5, 595, 5120, 17408, 2, 1},
         {"Qwen36_FFN_DownProjection_Q4_K_bucketed", 5, 600, 5120, 17408, 4, 4},
+        {"Qwen36_Attention_KVProjection_Q4_K_bucketed", 5, 600, 1024, 5120, 4, 1},
         {"Qwen36_GDN_InnerProjection_Q4_K", 5, 595, 10240, 5120, 4, 1},
         {"Qwen36_GDN_ZProjection_Q4_K", 5, 595, 6144, 5120, 2, 1},
         {"Qwen36_GDN_OutputProjection_Q4_K", 5, 595, 5120, 6144, 2, 1},
@@ -1295,7 +1296,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIPrefillForcedSplitKDeclaresWorksp
     bool found_splitk = false;
     for (const auto &buf : reqs.buffers)
     {
-        if (buf.name.find("cuda_native_vnni_prefill_splitk_partials_") == 0)
+        if (buf.name == GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS)
         {
             found_splitk = true;
             EXPECT_GE(buf.size_bytes, expected_splitk_bytes);

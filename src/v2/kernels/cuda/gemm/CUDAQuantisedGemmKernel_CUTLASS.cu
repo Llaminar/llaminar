@@ -349,6 +349,12 @@ extern "C"
      */
     bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream)
     {
+        if (!stream)
+        {
+            std::cerr << "[CUDAQuantGemm] Refusing async D2D copy on the CUDA default stream; "
+                      << "callers must bind an explicit stream\n";
+            return false;
+        }
         CUDA_CHECK(cudaSetDevice(cuda_device_id));
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         CUDA_CHECK(cudaMemcpyAsync(d_dst, d_src, count * sizeof(float),

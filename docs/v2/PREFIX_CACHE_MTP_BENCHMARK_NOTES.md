@@ -7,7 +7,7 @@ history belongs in artifacts.
 
 | Scope | Device | Model | Mode | Prefill | Decode | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 727.79 | 40.96 | M600 down split-K |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 716.00 | 40.94 | split-K workspace + KV route fixed |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP | 621.25 | 54.82 | accept 96.88%, graph clean |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 620.57 | 55.43 | depth 1, graph clean |
 | Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
@@ -16,7 +16,7 @@ history belongs in artifacts.
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1943.69 | 145.36 | accept 68.75%, depth 1 |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
-| LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
+| TP / PP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
 
 ## llama.cpp CUDA Anchors
 
@@ -37,13 +37,13 @@ history belongs in artifacts.
 ## Latest Evidence
 
 CUDA dense latest:
-`20260605T-current-refresh/no_mtp_after_down_sk4`; route sweeps:
-`20260605T-current-refresh/ffn_m600_sweep` and
+`benchmark_results/cuda_dense_mtp/20260605T172021Z-dense-default-after-kv-dispatch-fix`;
+route sweeps: `20260605T-current-refresh/ffn_m600_sweep` and
 `20260605T083341Z-qwen36-gdn-m600-tile-sweep`.
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
-| no MTP | 727.79 | 40.96 | n/a |
+| no MTP | 716.00 | 40.94 | n/a |
 | fixed d1 MTP | 621.25 | 54.82 | 96.88% |
 | dynamic MTP | 620.57 | 55.43 | 95.31% |
 
@@ -57,34 +57,35 @@ CUDA MoE latest:
 | dynamic MTP | 1943.69 | 145.36 | 68.75% |
 
 Fresh checks:
-- Trusted `stage_gpu` replay timing and CUDA NativeVNNI route counters export
-  through perf stats.
-- CUDA NativeVNNI, MoE request scratch, KV gather/conversion, GDN deinterleave,
-  and attention decode partials bind through `DeviceWorkspaceManager`; the old
-  CUDA cuBLAS attention fallback/env knob was removed.
-- CUDA dense no-MTP prefill uses the `M=600` Q4_K FFN down sweep winner
-  (`T128x128_w4x2`, split-K 4) while exact `M=595` keeps split-1.
-- NativeVNNI sweep CSVs now carry validated tensor-derived codebook ids across
-  CUDA/ROCm prefill/decode trainer smokes; Q5_K maps to codebook 7 everywhere.
-  Latest validation: 4 Q5_K smoke rows across CUDA prefill, CUDA decode,
-  ROCm prefill, and ROCm decode.
-- MTP sidecar KV caches now bind workspace too; fixed/dynamic dense MTP logs
-  have no `MTP0_kv_append` capture failures.
-- Focused coverage green: CUDA GEMM route regression, workspace extra-consumer
-  regression, CUDA graph stochastic smoke, and Qwen3.6 CUDA dense prefix/MTP
-  parity.
+- Trusted `stage_gpu` replay timing, CUDA NativeVNNI route counters, and GPU
+  workspace allocation counters export through perf stats.
+- CUDA NativeVNNI scratch, MoE request scratch, KV gather/conversion, GDN
+  deinterleave, attention decode partials, and MTP sidecar KV buffers bind via
+  `DeviceWorkspaceManager`.
+- CUDA dense no-MTP prefill uses tested Qwen3.6 Q4_K-family selector fixes:
+  FFN down `M=600` split-K 4, exact `M=595` split-1, and attention K/V
+  `1024x5120` avoids the rejected generated split-K-2 route.
+- NativeVNNI trainer infrastructure is now codebook-synchronized: shared
+  tensor-derived codebook map, production generated-dispatch validation,
+  CUDA alias tests, ROCm trainer schema tests,
+  Qwen3.6 dense attention/FFN/GDN/LM-head shapes, and M=2/3/4 sweep buckets.
+  Focused smokes passed for CUDA prefill M=2/3/4 and ROCm prefill/decode.
+  ROCm decode `Q4_K` on `Qwen36_GDN_TimeProjection` is a follow-up accuracy
+  edge: cosine 0.999840, while `Q4_1` there and `Q4_K` MoE expert
+  decode pass.
+- Focused coverage green: codebook/generated-dispatch validators, CUDA GEMM
+  route/workspace regressions, CUDA graph stochastic smoke, and Qwen3.6 CUDA
+  dense prefix/MTP parity.
 
 ## Retained Actions
 
-- ROCm: graph-safe sidecar streams, depth clamping, M=2/3/4 VNNI,
-  verifier-row GDN restore, compact active-expert MoE prefill grids.
-- CUDA: verifier-row GDN restore, graph-capturable small-M attention, grouped
-  verifier prefill, stream-explicit shared experts, fused split-K/runtime MoE,
-  parallel router/top-k/scatter, source-token activation quantization, mapped
-  outputs, checkpoint elision, batched GDN projections, and cuBLAS router
-  prefill, fused-runtime MoE down warp-reduce, and IQ4_NL word decode.
-- Shared: lowest-id greedy argmax tie-break, capped activation arenas, trusted
-  stage profiling split, and non-null GPU stream hard failures.
+- ROCm: graph-safe sidecar streams, M=2/3/4 VNNI, verifier-row GDN restore,
+  compact MoE prefill grids.
+- CUDA: verifier-row GDN restore, small-M attention, grouped verifier prefill,
+  stream-explicit shared experts, fused split-K/runtime MoE, batched GDN
+  projections, router/top-k/scatter work, and IQ4_NL word decode.
+- Shared: lowest-id greedy argmax, capped activation arenas, trusted stage
+  profiling, synchronized sweep trainers, and non-null GPU stream hard failures.
 
 ## Next Work
 

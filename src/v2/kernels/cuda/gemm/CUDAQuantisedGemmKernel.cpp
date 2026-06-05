@@ -47,7 +47,6 @@
 #include <cstring>
 #include <iomanip>
 #include <mutex>
-#include <atomic>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -163,6 +162,30 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream,
                 CUDAPrefillContext *prefill_ctx);
+
+            void cudaPrefillContext_bindWorkspace(
+                CUDAPrefillContext *ctx,
+                float *splitk_partials,
+                size_t splitk_partials_bytes,
+                float *streamk_fixup,
+                size_t streamk_fixup_bytes);
+
+            bool cudaNativeVNNIPrefill_getWorkspacePlan(
+                uint8_t codebook_id,
+                int M,
+                int N,
+                int K,
+                int cuda_device_id,
+                size_t *splitk_partials_bytes,
+                size_t *streamk_fixup_bytes,
+                int *planned_split_k,
+                int *planned_streamk);
+
+            void cudaNativeVNNIPrefill_getLastLaunchSelection(
+                int *tile_id,
+                int *split_k,
+                int *used_bk256,
+                int *used_streamk);
 
             // cuBLAS FP16 GEMM for Q4_0 native VNNI weights (CUDAcuBLASQuantGemm.cu)
             bool cudaCuBLAS_fp16_gemm_q40(
@@ -533,8 +556,19 @@ namespace llaminar2
                         return true;
                     }
 
+                    int tile_id = -99;
+                    int split_k = -1;
+                    int used_bk256 = 0;
+                    int used_streamk = 0;
+                    cudaNativeVNNIPrefill_getLastLaunchSelection(
+                        &tile_id, &split_k, &used_bk256, &used_streamk);
                     LOG_ERROR("[CUDAQuantisedGemmKernel] NativeVNNI prefill kernel failed for codebook "
                               << static_cast<int>(impl->native_codebook_id)
+                              << " M=" << m << " N=" << n << " K=" << k
+                              << " tile_id=" << tile_id
+                              << " split_k=" << split_k
+                              << " bk256=" << used_bk256
+                              << " streamk=" << used_streamk
                               << " (no fallback available — TC/CUTLASS paths have been removed)");
                 }
 
@@ -549,15 +583,6 @@ namespace llaminar2
         void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool /*enabled*/) {}
         bool CUDAQuantisedGemmKernel::isForceCutlassFallback() { return false; }
 
-        namespace
-        {
-            uint32_t nextCudaGemmWorkspaceSliceId()
-            {
-                static std::atomic<uint32_t> next_slice{0};
-                return next_slice.fetch_add(1, std::memory_order_relaxed);
-            }
-        } // namespace
-
         // =====================================================================
         // Constructor / Destructor
         // =====================================================================
@@ -570,7 +595,6 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),
               owns_weight_memory_(true), // Legacy path owns weight memory
-              slice_id_(nextCudaGemmWorkspaceSliceId()),
               impl_(std::make_unique<Impl>())
         {
             if (!weights)
@@ -628,7 +652,6 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),  // Not yet uploaded to device
               owns_weight_memory_(false), // CUDAPackedWeights owns the memory
-              slice_id_(nextCudaGemmWorkspaceSliceId()),
               impl_(std::make_unique<Impl>())
         {
             if (!packed)
@@ -658,7 +681,6 @@ namespace llaminar2
               K_(static_cast<size_t>(K)),
               weights_converted_(true),   // Already on device
               owns_weight_memory_(false), // Shared batch allocation owns it
-              slice_id_(nextCudaGemmWorkspaceSliceId()),
               impl_(std::make_unique<Impl>())
         {
             impl_->d_weights_native_vnni = d_vnni;
@@ -785,12 +807,10 @@ namespace llaminar2
               K_(other.K_),
               weights_converted_(other.weights_converted_),
               owns_weight_memory_(other.owns_weight_memory_),
-              slice_id_(other.slice_id_),
               impl_(std::move(other.impl_))
         {
             other.weights_ = nullptr;
             other.packed_ = nullptr;
-            other.slice_id_ = 0;
             other.weights_converted_ = false;
             other.owns_weight_memory_ = false;
         }
@@ -807,12 +827,10 @@ namespace llaminar2
                 K_ = other.K_;
                 weights_converted_ = other.weights_converted_;
                 owns_weight_memory_ = other.owns_weight_memory_;
-                slice_id_ = other.slice_id_;
                 impl_ = std::move(other.impl_);
 
                 other.weights_ = nullptr;
                 other.packed_ = nullptr;
-                other.slice_id_ = 0;
                 other.weights_converted_ = false;
                 other.owns_weight_memory_ = false;
             }
@@ -999,6 +1017,40 @@ namespace llaminar2
                       << " scales_A=" << workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A)
                       << " scales_A_blockwise=" << workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)
                       << " C_int32=" << workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+
+            if (!impl_->prefill_ctx)
+            {
+                impl_->prefill_ctx = cudaPrefillContext_create(cuda_device_id_);
+            }
+            if (impl_->prefill_ctx)
+            {
+                float *splitk_partials = nullptr;
+                size_t splitk_partials_bytes = 0;
+                if (workspace_->hasBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS))
+                {
+                    splitk_partials = static_cast<float *>(
+                        workspace_->getBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS));
+                    splitk_partials_bytes =
+                        workspace_->getBufferSize(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+                }
+
+                float *streamk_fixup = nullptr;
+                size_t streamk_fixup_bytes = 0;
+                if (workspace_->hasBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP))
+                {
+                    streamk_fixup = static_cast<float *>(
+                        workspace_->getBuffer(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP));
+                    streamk_fixup_bytes =
+                        workspace_->getBufferSize(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
+                }
+
+                cudaPrefillContext_bindWorkspace(
+                    impl_->prefill_ctx,
+                    splitk_partials,
+                    splitk_partials_bytes,
+                    streamk_fixup,
+                    streamk_fixup_bytes);
+            }
         }
 
         // =====================================================================
@@ -1130,7 +1182,7 @@ namespace llaminar2
                 // Bulk DMA from HBM workspace to mapped output
                 if (success && output_is_mapped)
                 {
-                    cudaQuantGemm_copyDeviceToDeviceAsync(
+                    success = cudaQuantGemm_copyDeviceToDeviceAsync(
                         d_mapped_output, d_C,
                         static_cast<size_t>(m) * n,
                         cuda_device_id_, gpu_stream_);
@@ -1184,7 +1236,7 @@ namespace llaminar2
                 // Bulk DMA from HBM workspace to mapped output
                 if (success && output_is_mapped)
                 {
-                    cudaQuantGemm_copyDeviceToDeviceAsync(
+                    success = cudaQuantGemm_copyDeviceToDeviceAsync(
                         d_mapped_output, d_C,
                         static_cast<size_t>(m) * n,
                         cuda_device_id_, gpu_stream_);
@@ -2429,6 +2481,76 @@ namespace llaminar2
             // This buffer provides an HBM target; we bulk-DMA to mapped memory after.
             size_t temp_c_fp32_bytes = static_cast<size_t>(workspace_m) * n * sizeof(float);
             reqs.buffers.push_back({tempCFp32BufferName(), temp_c_fp32_bytes, 256, true});
+
+            bool has_native_codebook = false;
+            uint8_t native_codebook_id = 0;
+            if (packed_)
+            {
+                native_codebook_id = packed_->native_codebook_id;
+                has_native_codebook = true;
+            }
+            else if (weights_converted_ && impl_ && impl_->d_weights_native_vnni)
+            {
+                native_codebook_id = impl_->native_codebook_id;
+                has_native_codebook = true;
+            }
+            else if (weights_)
+            {
+                if (const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights_))
+                {
+                    if (const auto *info = unpackable->vnniFormatInfo())
+                    {
+                        native_codebook_id = info->codebook_id;
+                        has_native_codebook = true;
+                    }
+                }
+            }
+
+            if (has_native_codebook && workspace_m > 1)
+            {
+                size_t splitk_partials_bytes = 0;
+                size_t streamk_fixup_bytes = 0;
+                int planned_split_k = 1;
+                int planned_streamk = 0;
+                if (cudaNativeVNNIPrefill_getWorkspacePlan(
+                        native_codebook_id,
+                        m,
+                        n,
+                        k,
+                        cuda_device_id_,
+                        &splitk_partials_bytes,
+                        &streamk_fixup_bytes,
+                        &planned_split_k,
+                        &planned_streamk))
+                {
+                    if (planned_split_k > 1)
+                    {
+                        const size_t padded_splitk_bytes =
+                            static_cast<size_t>(planned_split_k) *
+                            static_cast<size_t>(workspace_m) *
+                            static_cast<size_t>(n) *
+                            sizeof(float);
+                        splitk_partials_bytes = std::max(splitk_partials_bytes, padded_splitk_bytes);
+                    }
+
+                    if (splitk_partials_bytes > 0)
+                    {
+                        reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS,
+                                                splitk_partials_bytes, 256, true});
+                    }
+                    if (streamk_fixup_bytes > 0)
+                    {
+                        reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP,
+                                                streamk_fixup_bytes, 256, true});
+                    }
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
+                              << static_cast<int>(native_codebook_id)
+                              << " split_k=" << planned_split_k
+                              << " streamk=" << planned_streamk
+                              << " splitk_partials=" << (splitk_partials_bytes / 1024) << "KB"
+                              << " streamk_fixup=" << (streamk_fixup_bytes / 1024) << "KB");
+                }
+            }
 
             // GEMV kpar partials for decode (M=1): two-phase K-parallel reduction
             // Size: kpar_factor × N floats. kpar_factor ≈ ceil(K/tile_k) capped by SM count.

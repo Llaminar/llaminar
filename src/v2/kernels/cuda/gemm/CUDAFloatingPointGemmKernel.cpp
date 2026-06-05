@@ -348,7 +348,7 @@ namespace llaminar2
                 // Bulk DMA from HBM redirect buffer to mapped output
                 if (success && d_mapped_output)
                 {
-                    cudaQuantGemm_copyDeviceToDeviceAsync(
+                    success = cudaQuantGemm_copyDeviceToDeviceAsync(
                         d_mapped_output, d_C,
                         static_cast<size_t>(m) * n,
                         cuda_device_id_, gpu_stream_);
@@ -369,7 +369,7 @@ namespace llaminar2
                 // Bulk DMA from HBM redirect buffer to mapped output
                 if (success && d_mapped_output)
                 {
-                    cudaQuantGemm_copyDeviceToDeviceAsync(
+                    success = cudaQuantGemm_copyDeviceToDeviceAsync(
                         d_mapped_output, d_C,
                         static_cast<size_t>(m) * n,
                         cuda_device_id_, gpu_stream_);

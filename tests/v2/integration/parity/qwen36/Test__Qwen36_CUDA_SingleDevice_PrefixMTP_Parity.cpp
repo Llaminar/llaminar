@@ -42,9 +42,24 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPGreedyMatchesPyTorchDecodeTokens)
     runDenseMTPParity(cudaSingleDeviceCase(), false);
 }
 
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
+{
+    runDenseDynamicMTPParity(cudaSingleDeviceCase(), false);
+}
+
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, PrefixCacheMTPRestore)
 {
     runDenseMTPParity(cudaSingleDeviceCase(), true);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, PrefixCacheMTPDynamicDepthRestore)
+{
+    runDenseDynamicMTPParity(cudaSingleDeviceCase(), true);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptDynamicDepthMatchesPyTorchDecodeTokens)
+{
+    runDenseBenchmarkStyleDynamicMTPParity(cudaSingleDeviceCase());
 }
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPStochasticSamplingVerifierRuns)

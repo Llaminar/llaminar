@@ -1216,7 +1216,7 @@ inline bool selectPrefillTileGenerated(int M, int N, int K,
         };
         return findPrefillDispatchEntry(kTable, packed_key, out_tile_id, out_split_k);
     }
-        else if constexpr (CB == 18) { // Q8_0 (160 entries)
+        else if constexpr (CB == 19) { // Q8_0 (160 entries)
         static constexpr GeneratedPrefillDispatchEntry kTable[] = {
             { 0x000040000E000380ULL, 1, 1 }, // M=64 896x224 T64x128_w2x2 sk=1
             { 0x000040001C000380ULL, 0, 1 }, // M=64 896x448 T64x64_w2x2 sk=1
@@ -1383,4 +1383,3 @@ inline bool selectPrefillTileGenerated(int M, int N, int K,
     }
     return false;
 }
-

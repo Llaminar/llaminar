@@ -2454,7 +2454,7 @@ namespace
     // larger warp configs where Q4_0's heuristic would pick T128x128 or w2x4.
     enum class FormatComplexity
     {
-        Simple,     // CB 0,4,6,11,12,15,18 – single-scale, Q4_0 heuristic works
+        Simple,     // CB 0,4,6,11,12,15,19 – single-scale, Q4_0 heuristic works
         Asymmetric, // CB 5,7,16 – min-correction overhead, needs w2x2 bias
         DualScale   // CB 8,9,10,13,14,17 – dual-scale (profitability-gated)
     };
@@ -2505,6 +2505,13 @@ namespace
                 return false;
 
             if (N == 10240 && K == 5120)
+            {
+                out_tile_id = static_cast<uint8_t>(TileId::T128x128_w4x2);
+                out_split_k = 1;
+                return true;
+            }
+
+            if (N == 1024 && K == 5120)
             {
                 out_tile_id = static_cast<uint8_t>(TileId::T128x128_w4x2);
                 out_split_k = 1;

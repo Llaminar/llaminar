@@ -7,7 +7,9 @@
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "loaders/ModelContext.h"
 #include "utils/Sampler.h"
+#include "utils/Tokenizer.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -136,6 +138,99 @@ namespace llaminar2::test::parity::qwen36
             }
         }
         return fallback;
+    }
+
+    inline std::string formatTokenWindow(
+        const std::vector<int32_t> &tokens,
+        size_t center,
+        size_t context = 8)
+    {
+        if (tokens.empty())
+        {
+            return "[]";
+        }
+
+        const size_t begin = center > context ? center - context : 0;
+        const size_t end = std::min(tokens.size(), center + context + 1);
+        std::ostringstream oss;
+        oss << "[";
+        if (begin > 0)
+        {
+            oss << "... ";
+        }
+        for (size_t i = begin; i < end; ++i)
+        {
+            if (i != begin)
+            {
+                oss << ", ";
+            }
+            if (i == center)
+            {
+                oss << "{" << tokens[i] << "}";
+            }
+            else
+            {
+                oss << tokens[i];
+            }
+        }
+        if (end < tokens.size())
+        {
+            oss << " ...";
+        }
+        oss << "]";
+        return oss.str();
+    }
+
+    inline ::testing::AssertionResult tokenSequencesMatch(
+        const std::vector<int32_t> &actual,
+        const std::vector<int32_t> &expected,
+        const std::string &label)
+    {
+        if (actual == expected)
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        const size_t common = std::min(actual.size(), expected.size());
+        size_t mismatch = common;
+        for (size_t i = 0; i < common; ++i)
+        {
+            if (actual[i] != expected[i])
+            {
+                mismatch = i;
+                break;
+            }
+        }
+
+        std::ostringstream oss;
+        oss << label << " token sequence mismatch";
+        if (actual.size() != expected.size())
+        {
+            oss << " (actual size " << actual.size()
+                << ", expected size " << expected.size() << ")";
+        }
+
+        if (mismatch < common)
+        {
+            oss << " at decode index " << mismatch
+                << ": actual=" << actual[mismatch]
+                << ", expected=" << expected[mismatch]
+                << "\n  actual window:   "
+                << formatTokenWindow(actual, mismatch)
+                << "\n  expected window: "
+                << formatTokenWindow(expected, mismatch);
+        }
+        else
+        {
+            oss << "; all " << common
+                << " shared-prefix tokens match, extra tail differs"
+                << "\n  actual tail:   "
+                << formatTokenWindow(actual, common > 0 ? common - 1 : 0)
+                << "\n  expected tail: "
+                << formatTokenWindow(expected, common > 0 ? common - 1 : 0);
+        }
+
+        return ::testing::AssertionFailure() << oss.str();
     }
 
     inline int mpiWorldSize()
@@ -486,6 +581,61 @@ namespace llaminar2::test::parity::qwen36
         }
 
         return test_case;
+    }
+
+    inline std::string qwen36DefaultBenchmarkPrompt()
+    {
+        return "The following is a comprehensive analysis of machine learning systems "
+               "and their applications in modern computing environments. "
+               "We will explore the fundamental concepts, examine practical implementations, "
+               "and discuss the future directions of this rapidly evolving field. "
+               "Machine learning has transformed how we approach problem-solving across "
+               "numerous domains, from natural language processing to computer vision, "
+               "from autonomous vehicles to medical diagnosis. "
+               "The key to understanding these systems lies in grasping the underlying "
+               "mathematical foundations while also appreciating the engineering challenges "
+               "involved in deploying them at scale. "
+               "Let us begin our exploration with an overview of the main paradigms: "
+               "supervised learning, unsupervised learning, and reinforcement learning. "
+               "Each of these approaches has its own strengths and is suited to different "
+               "types of problems. In supervised learning, we train models using labeled data, "
+               "where the correct output is known for each input example. "
+               "This approach is particularly effective for classification and regression tasks. "
+               "Unsupervised learning, on the other hand, deals with finding patterns in data "
+               "without explicit labels. Clustering, dimensionality reduction, and anomaly detection "
+               "are common applications. Reinforcement learning takes a different approach, "
+               "where agents learn optimal behaviors through interaction with an environment, "
+               "receiving rewards or penalties based on their actions. "
+               "Deep learning, a subset of machine learning, has revolutionized the field "
+               "by enabling the training of neural networks with many layers. "
+               "These deep neural networks can learn hierarchical representations of data, "
+               "automatically extracting features at multiple levels of abstraction. "
+               "Convolutional neural networks have become the standard for image processing, "
+               "while recurrent neural networks and transformers excel at sequential data. "
+               "The transformer architecture, introduced in 2017, has become particularly influential, "
+               "forming the basis for large language models like GPT, BERT, and LLaMA. "
+               "These models are trained on vast amounts of text data and can perform "
+               "a wide range of natural language tasks with impressive accuracy. "
+               "The training process involves optimizing millions or billions of parameters "
+               "using gradient descent and backpropagation algorithms. "
+               "Modern training infrastructure relies on specialized hardware like GPUs and TPUs, "
+               "distributed computing frameworks, and sophisticated optimization techniques. "
+               "Transfer learning has emerged as a powerful paradigm, allowing models "
+               "pre-trained on large datasets to be fine-tuned for specific tasks "
+               "with relatively little additional data. This approach has democratized "
+               "access to state-of-the-art AI capabilities for researchers and practitioners "
+               "who may not have the resources to train large models from scratch. "
+               "As we look to the future, several exciting developments are on the horizon. "
+               "Multimodal models that can process text, images, audio, and video together "
+               "are becoming increasingly sophisticated. Federated learning enables "
+               "training on distributed data while preserving privacy. "
+               "Neural architecture search automates the design of optimal network structures. "
+               "And new hardware accelerators promise to make AI more efficient and accessible. "
+               "The ethical implications of these technologies cannot be overlooked. "
+               "Issues of bias, fairness, transparency, and accountability must be addressed "
+               "as AI systems become more prevalent in society. Responsible AI development "
+               "requires collaboration between technologists, policymakers, and the public "
+               "to ensure these powerful tools benefit humanity as a whole.";
     }
 
     inline void loadReferenceInputs(
@@ -840,6 +990,288 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_TRUE(after_second.prefix_request.mtp_state_restored);
         EXPECT_FALSE(after_second.mtp_bypassed) << after_second.mtp_bypass_reason;
         EXPECT_GE(after_second.mtp_depth_policy_windows, 1u);
+    }
+
+    inline void runDenseBenchmarkStyleDynamicMTPParity(
+        DensePrefixRestoreParityCase test_case)
+    {
+        test_case.name += " benchmark-style dynamic MTP parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+        });
+
+        std::string model_path;
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        auto model_context = ModelContext::create(model_path);
+        ASSERT_NE(model_context, nullptr);
+        auto tokenizer = createTokenizer(model_context);
+        ASSERT_NE(tokenizer, nullptr);
+
+        std::vector<int> encoded_prompt =
+            tokenizer->encode(test_case.prompt, /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded_prompt.empty());
+        std::vector<int32_t> prompt_tokens(
+            encoded_prompt.begin(),
+            encoded_prompt.end());
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size()) + test_case.decode_steps,
+            test_case.max_seq_len);
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        greedy.seed = 42;
+
+        auto run_decode = [&](bool enable_mtp,
+                              int mtp_draft_tokens,
+                              MTPDepthPolicyConfig depth_policy,
+                              PrefixRuntimeStateSnapshot *out_state) -> std::vector<int32_t>
+        {
+            std::vector<int32_t> tokens;
+            auto runner = factory->createFromOrchestrationConfig(
+                makeDensePrefixRestoreConfig(
+                    test_case,
+                    model_path,
+                    false,
+                    2,
+                    enable_mtp,
+                    mtp_draft_tokens,
+                    depth_policy));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                return tokens;
+            }
+
+            if (!runner->initialize())
+            {
+                ADD_FAILURE() << runner->lastError();
+                return tokens;
+            }
+
+            runner->setSamplingParams(greedy);
+            runner->setSkipLogitsGatherPrefill(true);
+            runner->setSkipLogitsGatherDecode(true);
+
+            if (!runner->prefill(prompt_tokens))
+            {
+                ADD_FAILURE() << runner->lastError();
+                runner->shutdown();
+                return tokens;
+            }
+
+            while (static_cast<int>(tokens.size()) < test_case.decode_steps)
+            {
+                const int remaining = test_case.decode_steps - static_cast<int>(tokens.size());
+                runner->setDecodeStepTokenBudget(remaining);
+                GenerationResult step = runner->decodeStep();
+                runner->setDecodeStepTokenBudget(0);
+                if (!step.error.empty())
+                {
+                    ADD_FAILURE() << step.error;
+                    break;
+                }
+                if (step.tokens.empty())
+                {
+                    ADD_FAILURE() << "benchmark-style decode produced no tokens";
+                    break;
+                }
+                if (step.tokens.size() > static_cast<size_t>(remaining))
+                {
+                    ADD_FAILURE()
+                        << "benchmark-style decode exceeded remaining token budget: "
+                        << step.tokens.size() << " > " << remaining;
+                    break;
+                }
+                tokens.insert(tokens.end(), step.tokens.begin(), step.tokens.end());
+            }
+
+            if (out_state)
+            {
+                *out_state = runner->prefixStateProbe();
+            }
+            runner->setSkipLogitsGatherDecode(false);
+            runner->setSkipLogitsGatherPrefill(false);
+            runner->shutdown();
+            return tokens;
+        };
+
+        auto run_reused_decode_cycles = [&](bool enable_mtp,
+                                            int mtp_draft_tokens,
+                                            MTPDepthPolicyConfig depth_policy,
+                                            int cycles,
+                                            PrefixRuntimeStateSnapshot *out_state)
+            -> std::vector<std::vector<int32_t>>
+        {
+            std::vector<std::vector<int32_t>> cycle_tokens;
+            auto runner = factory->createFromOrchestrationConfig(
+                makeDensePrefixRestoreConfig(
+                    test_case,
+                    model_path,
+                    false,
+                    2,
+                    enable_mtp,
+                    mtp_draft_tokens,
+                    depth_policy));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                return cycle_tokens;
+            }
+
+            if (!runner->initialize())
+            {
+                ADD_FAILURE() << runner->lastError();
+                return cycle_tokens;
+            }
+
+            runner->setSamplingParams(greedy);
+            runner->setSkipLogitsGatherPrefill(true);
+            runner->setSkipLogitsGatherDecode(true);
+
+            for (int cycle = 0; cycle < cycles; ++cycle)
+            {
+                runner->clearCache();
+                std::vector<int32_t> tokens;
+                if (!runner->prefill(prompt_tokens))
+                {
+                    ADD_FAILURE() << "cycle " << cycle << ": " << runner->lastError();
+                    break;
+                }
+
+                while (static_cast<int>(tokens.size()) < test_case.decode_steps)
+                {
+                    const int remaining = test_case.decode_steps - static_cast<int>(tokens.size());
+                    runner->setDecodeStepTokenBudget(remaining);
+                    GenerationResult step = runner->decodeStep();
+                    runner->setDecodeStepTokenBudget(0);
+                    if (!step.error.empty())
+                    {
+                        ADD_FAILURE() << "cycle " << cycle << ": " << step.error;
+                        break;
+                    }
+                    if (step.tokens.empty())
+                    {
+                        ADD_FAILURE() << "cycle " << cycle
+                                      << ": benchmark-style decode produced no tokens";
+                        break;
+                    }
+                    if (step.tokens.size() > static_cast<size_t>(remaining))
+                    {
+                        ADD_FAILURE()
+                            << "cycle " << cycle
+                            << ": benchmark-style decode exceeded remaining token budget: "
+                            << step.tokens.size() << " > " << remaining;
+                        break;
+                    }
+                    tokens.insert(tokens.end(), step.tokens.begin(), step.tokens.end());
+                }
+                cycle_tokens.push_back(std::move(tokens));
+            }
+
+            if (out_state)
+            {
+                *out_state = runner->prefixStateProbe();
+            }
+            runner->setSkipLogitsGatherDecode(false);
+            runner->setSkipLogitsGatherPrefill(false);
+            runner->shutdown();
+            return cycle_tokens;
+        };
+
+        PrefixRuntimeStateSnapshot baseline_state;
+        const auto baseline_tokens =
+            run_decode(false, 1, {}, &baseline_state);
+        ASSERT_EQ(baseline_tokens.size(), static_cast<size_t>(test_case.decode_steps));
+        EXPECT_EQ(baseline_state.mtp_draft_steps, 0u);
+
+        PrefixRuntimeStateSnapshot baseline_repeat_state;
+        const auto baseline_repeat_tokens =
+            run_decode(false, 1, {}, &baseline_repeat_state);
+        ASSERT_EQ(baseline_repeat_tokens.size(), baseline_tokens.size());
+        EXPECT_TRUE(tokenSequencesMatch(
+            baseline_repeat_tokens,
+            baseline_tokens,
+            "fresh no-MTP repeat"));
+        EXPECT_EQ(baseline_repeat_state.mtp_draft_steps, 0u);
+
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+
+        PrefixRuntimeStateSnapshot mtp_state;
+        const auto mtp_tokens =
+            run_decode(true, 3, depth_policy, &mtp_state);
+        ASSERT_EQ(mtp_tokens.size(), baseline_tokens.size());
+        EXPECT_TRUE(tokenSequencesMatch(
+            mtp_tokens,
+            baseline_tokens,
+            "fresh dynamic MTP"));
+        EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
+        EXPECT_TRUE(mtp_state.mtp_request.adaptive_depth_enabled);
+        EXPECT_EQ(mtp_state.mtp_request.depth_policy_mode, "dynamic");
+
+        PrefixRuntimeStateSnapshot fixed_depth_state;
+        const auto fixed_depth_tokens =
+            run_decode(true, 1, {}, &fixed_depth_state);
+        ASSERT_EQ(fixed_depth_tokens.size(), baseline_tokens.size());
+        EXPECT_TRUE(tokenSequencesMatch(
+            fixed_depth_tokens,
+            baseline_tokens,
+            "fresh fixed-depth MTP"));
+        EXPECT_FALSE(fixed_depth_state.mtp_bypassed) << fixed_depth_state.mtp_bypass_reason;
+
+        PrefixRuntimeStateSnapshot reused_baseline_state;
+        const auto reused_baseline_cycles =
+            run_reused_decode_cycles(false, 1, {}, 4, &reused_baseline_state);
+        ASSERT_EQ(reused_baseline_cycles.size(), 4u);
+        for (size_t i = 0; i < reused_baseline_cycles.size(); ++i)
+        {
+            ASSERT_EQ(reused_baseline_cycles[i].size(), baseline_tokens.size())
+                << "no-MTP reused-runner cycle " << i
+                << " produced the wrong token count";
+            EXPECT_TRUE(tokenSequencesMatch(
+                reused_baseline_cycles[i],
+                baseline_tokens,
+                "no-MTP reused-runner cycle " + std::to_string(i)))
+                << "no-MTP reused-runner cycle " << i
+                << " diverged from the fresh no-MTP benchmark-style baseline";
+        }
+        EXPECT_EQ(reused_baseline_state.mtp_draft_steps, 0u);
+
+        PrefixRuntimeStateSnapshot reused_dynamic_state;
+        const auto reused_dynamic_cycles =
+            run_reused_decode_cycles(true, 3, depth_policy, 4, &reused_dynamic_state);
+        ASSERT_EQ(reused_dynamic_cycles.size(), 4u);
+        for (size_t i = 0; i < reused_dynamic_cycles.size(); ++i)
+        {
+            ASSERT_EQ(reused_dynamic_cycles[i].size(), baseline_tokens.size())
+                << "dynamic MTP reused-runner cycle " << i
+                << " produced the wrong token count";
+            EXPECT_TRUE(tokenSequencesMatch(
+                reused_dynamic_cycles[i],
+                baseline_tokens,
+                "dynamic MTP reused-runner cycle " + std::to_string(i)))
+                << "dynamic MTP reused-runner cycle " << i
+                << " diverged from the no-MTP benchmark-style baseline";
+        }
+        EXPECT_FALSE(reused_dynamic_state.mtp_bypassed)
+            << reused_dynamic_state.mtp_bypass_reason;
     }
 
     inline void runDenseStochasticMTPVerifierParity(
