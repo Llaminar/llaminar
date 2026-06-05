@@ -328,6 +328,27 @@ namespace llaminar2
 
         namespace
         {
+            size_t paddedNativePrefillM(int m)
+            {
+                return (m > 1) ? static_cast<size_t>((m + 127) & ~127) : static_cast<size_t>(m);
+            }
+
+            size_t concurrentPrefillScratchSlotsForM(int m)
+            {
+                return (m > 16 && debugEnv().gemm.cuda_concurrent_prefill)
+                           ? static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots)
+                           : 1ULL;
+            }
+
+            size_t paddedSplitKPartialBytes(int m, int n, int split_k)
+            {
+                if (m <= 0 || n <= 0 || split_k <= 1)
+                    return 0;
+                return static_cast<size_t>(split_k) *
+                       paddedNativePrefillM(m) *
+                       static_cast<size_t>(n) *
+                       sizeof(float);
+            }
 
             template <typename T>
             bool uploadHostArrayToDevice(
@@ -1053,6 +1074,104 @@ namespace llaminar2
             }
         }
 
+        void CUDAQuantisedGemmKernel::bindConcurrentNativePrefillScratch(
+            int m,
+            int n,
+            int k,
+            int stream_idx) const
+        {
+            if (!impl_ || !impl_->prefill_ctx || !workspace_ || m <= 1)
+                return;
+
+            size_t splitk_bytes = 0;
+            size_t streamk_bytes = 0;
+            int planned_split_k = 1;
+            int planned_streamk = 0;
+            if (!cudaNativeVNNIPrefill_getWorkspacePlan(
+                    impl_->native_codebook_id,
+                    m,
+                    n,
+                    k,
+                    cuda_device_id_,
+                    &splitk_bytes,
+                    &streamk_bytes,
+                    &planned_split_k,
+                    &planned_streamk))
+            {
+                return;
+            }
+
+            splitk_bytes = std::max(splitk_bytes, paddedSplitKPartialBytes(m, n, planned_split_k));
+            if (splitk_bytes == 0 && streamk_bytes == 0)
+                return;
+
+            if (stream_idx < 0 || stream_idx >= kCudaConcurrentPrefillWorkspaceSlots)
+            {
+                throw std::runtime_error(
+                    "[ConcurrentPrefill] NativeVNNI scratch stream slot " +
+                    std::to_string(stream_idx) + " is outside the declared workspace slot range");
+            }
+
+            float *splitk_ptr = nullptr;
+            size_t splitk_slot_bytes = 0;
+            if (splitk_bytes > 0)
+            {
+                void *buffer = workspace_->getBuffer(
+                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+                const size_t total_bytes = workspace_->getBufferSize(
+                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+                splitk_slot_bytes = total_bytes / static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
+                const size_t required_total =
+                    splitk_bytes * static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
+                if (!buffer || total_bytes < required_total || splitk_slot_bytes < splitk_bytes)
+                {
+                    throw std::runtime_error(
+                        "[ConcurrentPrefill] " +
+                        std::string(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS) +
+                        " workspace is missing or undersized for concurrent split-K projection: need total " +
+                        std::to_string(required_total) + " bytes (" +
+                        std::to_string(splitk_bytes) + " per slot), have " +
+                        std::to_string(total_bytes));
+                }
+                auto *base = static_cast<unsigned char *>(buffer);
+                splitk_ptr = reinterpret_cast<float *>(
+                    base + static_cast<size_t>(stream_idx) * splitk_slot_bytes);
+            }
+
+            float *streamk_ptr = nullptr;
+            size_t streamk_slot_bytes = 0;
+            if (streamk_bytes > 0)
+            {
+                void *buffer = workspace_->getBuffer(
+                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
+                const size_t total_bytes = workspace_->getBufferSize(
+                    GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP);
+                streamk_slot_bytes = total_bytes / static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
+                const size_t required_total =
+                    streamk_bytes * static_cast<size_t>(kCudaConcurrentPrefillWorkspaceSlots);
+                if (!buffer || total_bytes < required_total || streamk_slot_bytes < streamk_bytes)
+                {
+                    throw std::runtime_error(
+                        "[ConcurrentPrefill] " +
+                        std::string(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP) +
+                        " workspace is missing or undersized for concurrent stream-K projection: need total " +
+                        std::to_string(required_total) + " bytes (" +
+                        std::to_string(streamk_bytes) + " per slot), have " +
+                        std::to_string(total_bytes));
+                }
+                auto *base = static_cast<unsigned char *>(buffer);
+                streamk_ptr = reinterpret_cast<float *>(
+                    base + static_cast<size_t>(stream_idx) * streamk_slot_bytes);
+            }
+
+            cudaPrefillContext_bindWorkspace(
+                impl_->prefill_ctx,
+                splitk_ptr,
+                splitk_slot_bytes,
+                streamk_ptr,
+                streamk_slot_bytes);
+        }
+
         // =====================================================================
         // ITensorGemm interface - multiply_tensor() PRIMARY ENTRY POINT
         // =====================================================================
@@ -1632,6 +1751,9 @@ namespace llaminar2
                             proj_d_C_int32 = reinterpret_cast<int32_t *>(
                                 extra_bytes_ptr + static_cast<size_t>(stream_idx - 1) * extra_slot_bytes);
                         }
+
+                        cuda_kernel->validateWorkspace();
+                        cuda_kernel->bindConcurrentNativePrefillScratch(m, n, k, stream_idx);
                     }
 
                     auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
@@ -2525,23 +2647,22 @@ namespace llaminar2
                 {
                     if (planned_split_k > 1)
                     {
-                        const size_t padded_splitk_bytes =
-                            static_cast<size_t>(planned_split_k) *
-                            static_cast<size_t>(workspace_m) *
-                            static_cast<size_t>(n) *
-                            sizeof(float);
-                        splitk_partials_bytes = std::max(splitk_partials_bytes, padded_splitk_bytes);
+                        splitk_partials_bytes = std::max(
+                            splitk_partials_bytes,
+                            paddedSplitKPartialBytes(m, n, planned_split_k));
                     }
+
+                    const size_t prefill_scratch_slots = concurrentPrefillScratchSlotsForM(m);
 
                     if (splitk_partials_bytes > 0)
                     {
                         reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS,
-                                                splitk_partials_bytes, 256, true});
+                                                splitk_partials_bytes * prefill_scratch_slots, 256, true});
                     }
                     if (streamk_fixup_bytes > 0)
                     {
                         reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP,
-                                                streamk_fixup_bytes, 256, true});
+                                                streamk_fixup_bytes * prefill_scratch_slots, 256, true});
                     }
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
                               << static_cast<int>(native_codebook_id)

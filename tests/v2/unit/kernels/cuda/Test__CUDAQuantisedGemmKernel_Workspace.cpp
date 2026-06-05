@@ -30,6 +30,7 @@ using llaminar2::test::TestTensorFactory;
 
 namespace
 {
+    constexpr int kConcurrentPrefillWorkspaceSlots = 3;
     constexpr int kConcurrentPrefillExtraAccumulatorSlots = 2;
 
     int paddedPrefillM(int m)
@@ -166,6 +167,29 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 
     EXPECT_GE(splitk->size_bytes,
               static_cast<size_t>(4) * paddedPrefillM(kM) * kN * sizeof(float));
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       NativeVNNIPrefillSplitKWorkspace_HasConcurrentSlotsForPromptPrefill)
+{
+    auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/1010);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+
+    constexpr int kM = 596;
+    constexpr int kN = 5120;
+    constexpr int kK = 17408;
+    auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+
+    const WorkspaceDescriptor *splitk =
+        reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+    ASSERT_NE(splitk, nullptr);
+
+    const size_t one_slot_bytes =
+        static_cast<size_t>(4) * paddedPrefillM(kM) * kN * sizeof(float);
+    EXPECT_GE(splitk->size_bytes,
+              static_cast<size_t>(kConcurrentPrefillWorkspaceSlots) * one_slot_bytes)
+        << "Concurrent CUDA prefill runs fused projections on side streams, so split-K "
+           "partials need disjoint per-stream slots instead of one serial scratch buffer.";
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,

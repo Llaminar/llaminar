@@ -7,7 +7,7 @@ stays in artifacts.
 
 | Scope | Device | Model | Mode | Prefill | Decode | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 716.00 | 40.94 | split-K workspace + KV route fixed |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 721.75 | 40.94 | split-K workspace + KV route fixed |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP | 621.25 | 54.82 | accept 96.88%, graph clean |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 620.57 | 55.43 | depth 1, graph clean |
 | Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
@@ -37,12 +37,14 @@ stays in artifacts.
 ## Latest Evidence
 
 CUDA dense latest: `20260605T172021Z-dense-default-after-kv-dispatch-fix`.
+Fresh no-MTP prefill probe after concurrent split-K fix:
+`20260605T205855Z-dense-prefill-concurrent-splitk-fix`.
 Route sweeps: `ffn_m600_sweep`, `20260605T083341Z-qwen36-gdn-m600-tile-sweep`,
 and policy smoke `20260605T195141Z-prefill-policy-smoke`.
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
-| no MTP | 716.00 | 40.94 | n/a |
+| no MTP | 721.75 | 40.94 | n/a |
 | fixed d1 MTP | 621.25 | 54.82 | 96.88% |
 | dynamic MTP | 620.57 | 55.43 | 95.31% |
 
@@ -61,6 +63,9 @@ Fresh checks:
 - CUDA dense prefill is generated-table driven for Qwen3.6 Q4_K-family `M=600`
   buckets; temporary source-level selector overrides are gone and `M=595`
   prompts route through bucket 600 under regression coverage.
+- CUDA concurrent fused prefill now binds NativeVNNI split-K/stream-K scratch
+  per side-stream slot; Qwen3.6-style Q/K/V split-K regression and real dense
+  prefill graph capture both pass.
 - NativeVNNI trainers share one codebook map and bucket policy across CUDA and
   ROCm. ROCm now consumes generated prefill dispatch tables from real sweep CSVs:
   `benchmark_results/rocm_native_vnni/20260605T202837Z-prefill-generated-pipeline`

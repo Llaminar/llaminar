@@ -1351,6 +1351,103 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIPrefillForcedSplitKDeclaresWorksp
 #endif
 }
 
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36QKVConcurrentPrefillUsesSplitKScratchSlots)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    constexpr int M = 600;
+    constexpr int N = 1024;
+    constexpr int K = 5120;
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    auto wq = TestTensorFactory::createQ4_KRandom({N, K}, 8101u);
+    auto wk = TestTensorFactory::createQ4_KRandom({N, K}, 8102u);
+    auto wv = TestTensorFactory::createQ4_KRandom({N, K}, 8103u);
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_, stream));
+
+    auto *q_kernel = getPreparedKernel(wq.get(), gpu_device_);
+    auto *k_kernel = getPreparedKernel(wk.get(), gpu_device_);
+    auto *v_kernel = getPreparedKernel(wv.get(), gpu_device_);
+    ASSERT_NE(q_kernel, nullptr);
+    ASSERT_NE(k_kernel, nullptr);
+    ASSERT_NE(v_kernel, nullptr);
+
+    auto *q_ws = dynamic_cast<IWorkspaceConsumer *>(q_kernel);
+    auto *k_ws = dynamic_cast<IWorkspaceConsumer *>(k_kernel);
+    auto *v_ws = dynamic_cast<IWorkspaceConsumer *>(v_kernel);
+    ASSERT_NE(q_ws, nullptr);
+    ASSERT_NE(k_ws, nullptr);
+    ASSERT_NE(v_ws, nullptr);
+
+    WorkspaceRequirements reqs;
+    reqs.merge(q_ws->getWorkspaceRequirements(M, N, K));
+    reqs.merge(k_ws->getWorkspaceRequirements(M, N, K));
+    reqs.merge(v_ws->getWorkspaceRequirements(M, N, K));
+
+    const auto *splitk =
+        reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+    ASSERT_NE(splitk, nullptr);
+    EXPECT_GE(splitk->size_bytes,
+              3ULL * 4ULL * 640ULL * static_cast<size_t>(N) * sizeof(float))
+        << "Fused concurrent Q/K/V prefill needs one split-K partial slot per side stream.";
+
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 256 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    q_ws->bindWorkspace(workspace_.get());
+    k_ws->bindWorkspace(workspace_.get());
+    v_ws->bindWorkspace(workspace_.get());
+
+    FP32Tensor input({M, K});
+    FP32Tensor q_output({M, N});
+    FP32Tensor k_output({M, N});
+    FP32Tensor v_output({M, N});
+    for (int i = 0; i < M * K; ++i)
+        input.mutable_data()[i] = dist_(rng_);
+
+    ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(q_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(k_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(v_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    q_kernel->setGPUStream(stream);
+    k_kernel->setGPUStream(stream);
+    v_kernel->setGPUStream(stream);
+
+    std::vector<TensorProjectionDesc> projections = {
+        {q_kernel, &q_output, N, nullptr, "Q"},
+        {k_kernel, &k_output, N, nullptr, "K"},
+        {v_kernel, &v_output, N, nullptr, "V"}};
+
+    ASSERT_TRUE(q_kernel->multiply_fused_tensor(
+        &input,
+        projections,
+        M,
+        K,
+        nullptr,
+        workspace_.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    q_ws->unbindWorkspace();
+    k_ws->unbindWorkspace();
+    v_ws->unbindWorkspace();
+    workspace_.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
 // ============================================================================
 // Custom main with MPI initialization
 // ============================================================================
