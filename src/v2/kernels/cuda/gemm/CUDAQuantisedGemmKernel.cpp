@@ -126,6 +126,10 @@ namespace llaminar2
             bool cudaNativeVNNIGemvTuned_supportsCodebook(uint8_t codebook_id);
 
             bool cudaNativeVNNIInitIQGridTables_tuned();
+            void cudaGemvContext_bindWorkspace(
+                CUDAGemvContext *ctx,
+                float *kpar_partials,
+                size_t kpar_partials_bytes);
 
             bool cudaNativeVNNIGemvTuned_fp32(
                 const int8_t *d_A_int8,
@@ -240,6 +244,23 @@ namespace llaminar2
                 return indexedWorkspaceBufferName(
                     GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP,
                     id);
+            }
+
+            void bindNativeGemvWorkspace(
+                CUDAGemvContext *ctx,
+                DeviceWorkspaceManager *workspace)
+            {
+                if (!ctx)
+                    return;
+
+                float *partials = nullptr;
+                size_t partials_bytes = 0;
+                if (workspace && workspace->hasBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS))
+                {
+                    partials = static_cast<float *>(workspace->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+                    partials_bytes = workspace->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                }
+                cudaGemvContext_bindWorkspace(ctx, partials, partials_bytes);
             }
 
             void bindNativePrefillWorkspace(
@@ -604,6 +625,7 @@ namespace llaminar2
                     // Lazy-create per-device GEMV context (SM count, kpar partials)
                     if (!impl->gemv_ctx)
                         impl->gemv_ctx = cudaGemvContext_create(cuda_device_id);
+                    bindNativeGemvWorkspace(impl->gemv_ctx, workspace);
 
                     return cudaNativeVNNIGemvTuned_fp32(
                         d_A_int8,
@@ -681,6 +703,7 @@ namespace llaminar2
                 const float *d_bias,
                 int cuda_device_id,
                 void *stream,
+                DeviceWorkspaceManager *workspace = nullptr,
                 CUDARowMajorWeights **rm_slot = nullptr)
             {
                 if (!impl || !d_A_int8 || !d_C_fp32 || !d_scales_A_blockwise ||
@@ -723,6 +746,7 @@ namespace llaminar2
                     impl->gemv_ctx = cudaGemvContext_create(cuda_device_id);
                 if (!impl->gemv_ctx)
                     return false;
+                bindNativeGemvWorkspace(impl->gemv_ctx, workspace);
 
                 const bool ok = cudaNativeVNNIGemvTuned_m2_fp32(
                     d_A_int8,
@@ -1616,6 +1640,7 @@ namespace llaminar2
                             d_bias,
                             cuda_device_id_,
                             gpu_stream_,
+                            cuda_kernel->workspace_,
                             cuda_kernel->packed_ ? &cuda_kernel->packed_->rowmajor_ : nullptr))
                     {
                         continue;
@@ -2411,6 +2436,7 @@ namespace llaminar2
                     d_bias,
                     cuda_device_id_,
                     gpu_stream_,
+                    workspace_,
                     packed_ ? &packed_->rowmajor_ : nullptr))
             {
                 return true;
@@ -2852,14 +2878,17 @@ namespace llaminar2
                 }
             }
 
-            // GEMV kpar partials for decode (M=1): two-phase K-parallel reduction
-            // Size: kpar_factor × N floats. kpar_factor ≈ ceil(K/tile_k) capped by SM count.
-            // Use conservative estimate: min(ceil(K/128), 84) × N × sizeof(float)
+            // GEMV kpar partials for small-M decode/verifier: two-phase
+            // K-parallel reduction writes one partial row per selected
+            // K-group split. selectKSplit() operates over 32-wide K groups
+            // and is capped by SM count, so size conservatively by all
+            // possible K groups up to the largest supported SM count.
             if (m <= 4)
             {
-                int kpar_factor = std::min((k + 127) / 128, 84); // 84 SMs is RTX 3090
-                size_t kpar_bytes = static_cast<size_t>(kpar_factor) * n * sizeof(float);
-                reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, false});
+                int kpar_factor = std::min((k + 31) / 32, 84); // 84 SMs is RTX 3090
+                const int kpar_rows = (m == 2) ? 2 : 1;
+                size_t kpar_bytes = static_cast<size_t>(kpar_factor) * static_cast<size_t>(kpar_rows) * n * sizeof(float);
+                reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, true});
             }
 
             LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "
@@ -2880,6 +2909,10 @@ namespace llaminar2
                 resetDynamicState();
             }
             workspace_ = workspace;
+            if (impl_ && impl_->gemv_ctx)
+            {
+                bindNativeGemvWorkspace(impl_->gemv_ctx, workspace_);
+            }
             if (impl_ && impl_->prefill_ctx)
             {
                 bindNativePrefillWorkspace(impl_->prefill_ctx, workspace_, slice_id_);

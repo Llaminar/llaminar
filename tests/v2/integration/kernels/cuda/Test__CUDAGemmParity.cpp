@@ -49,6 +49,7 @@
 
 #include <vector>
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
@@ -1006,6 +1007,22 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
     auto *cuda_kernel = getPreparedKernel(
         weights.get(), gpu_device_);
+
+    auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(cuda_kernel);
+    ASSERT_NE(ws_consumer, nullptr);
+    const auto reqs = ws_consumer->getWorkspaceRequirements(M, N, K);
+    const auto kpar_req = std::find_if(
+        reqs.buffers.begin(),
+        reqs.buffers.end(),
+        [](const WorkspaceDescriptor &buffer)
+        {
+            return buffer.name == GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS;
+        });
+    ASSERT_NE(kpar_req, reqs.buffers.end())
+        << "CUDA decode native-VNNI KPAR route must declare its partials workspace";
+    EXPECT_TRUE(kpar_req->required);
+    EXPECT_GE(kpar_req->size_bytes,
+              static_cast<size_t>((K + 31) / 32) * static_cast<size_t>(N) * sizeof(float));
 
     // Set up workspace for quantized kernel
     ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));

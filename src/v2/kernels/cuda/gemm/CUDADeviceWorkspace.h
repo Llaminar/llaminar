@@ -41,6 +41,10 @@ extern "C"
     // -----------------------------------------------------------------
     CUDAGemvContext *cudaGemvContext_create(int cuda_device_id);
     void cudaGemvContext_destroy(CUDAGemvContext *ctx);
+    void cudaGemvContext_bindWorkspace(
+        CUDAGemvContext *ctx,
+        float *kpar_partials,
+        size_t kpar_partials_bytes);
 
     // -----------------------------------------------------------------
     // Row-major weight transpose lifetime (per CUDAPackedWeights)
