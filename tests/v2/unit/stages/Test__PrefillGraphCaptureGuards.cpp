@@ -6,10 +6,14 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
 #include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
+
+#include <memory>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -63,12 +67,25 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_HasGroupingBufferCapacity_Empty)
 // MoE graph capture guards — prepareExpertGroupsAsync
 // =============================================================================
 
-TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_FailsDuringCapture)
+TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_RequiresBoundWorkspaceCapacity)
 {
 #ifdef HAVE_ROCM
     ROCmMoEKernel kernel(0);
+    auto bind_moe_workspace = [&](int max_seq, int num_experts, int top_k) {
+        auto reqs = MoEWorkspaceBuffers::rocmMoE(
+            max_seq,
+            /*d_model=*/2048,
+            /*intermediate=*/512,
+            num_experts,
+            top_k);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0),
+            reqs.total_bytes_with_alignment() + 4096);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        kernel.bindWorkspace(workspace.get());
+        return workspace;
+    };
 
-    // Create small routing tensors (seq=2, top_k=2, experts=4) to warm up buffers
     const int warm_seq = 2, warm_topk = 2, warm_experts = 4;
     const int warm_slots = warm_seq * warm_topk;
     auto routing_indices = std::make_unique<FP32Tensor>(
@@ -87,15 +104,12 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_FailsDuring
     routing_indices->ensureOnDevice(DeviceId::rocm(0));
     routing_weights->ensureOnDevice(DeviceId::rocm(0));
 
-    // Warm up: allocate buffers for small dimensions
+    auto warm_workspace = bind_moe_workspace(warm_seq, warm_experts, warm_topk);
+    ASSERT_NE(warm_workspace, nullptr);
     ASSERT_TRUE(kernel.prepareExpertGroupsAsync(
         routing_indices.get(), routing_weights.get(),
         warm_seq, warm_experts, warm_topk));
 
-    // Verify capacity was allocated
-    EXPECT_TRUE(kernel.hasGroupingBufferCapacity(warm_slots, warm_experts));
-
-    // Now create LARGER routing tensors that exceed capacity
     const int big_seq = 64, big_topk = 2, big_experts = 64;
     const int big_slots = big_seq * big_topk;
     auto big_indices = std::make_unique<FP32Tensor>(
@@ -114,7 +128,7 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_FailsDuring
     big_indices->ensureOnDevice(DeviceId::rocm(0));
     big_weights->ensureOnDevice(DeviceId::rocm(0));
 
-    // Under graph capture, the realloc should fail
+    // The kernel must not allocate a hidden larger scratch buffer under capture.
     {
         GraphCaptureGuard guard;
         EXPECT_FALSE(kernel.prepareExpertGroupsAsync(
@@ -122,7 +136,14 @@ TEST_F(Test__PrefillGraphCaptureGuards, MoE_PrepareExpertGroupsAsync_FailsDuring
             big_seq, big_experts, big_topk));
     }
 
-    // Outside capture, it should succeed
+    // It must not do that outside capture either; bind the correctly sized
+    // workspace before accepting the larger request.
+    EXPECT_FALSE(kernel.prepareExpertGroupsAsync(
+        big_indices.get(), big_weights.get(),
+        big_seq, big_experts, big_topk));
+
+    auto big_workspace = bind_moe_workspace(big_seq, big_experts, big_topk);
+    ASSERT_NE(big_workspace, nullptr);
     EXPECT_TRUE(kernel.prepareExpertGroupsAsync(
         big_indices.get(), big_weights.get(),
         big_seq, big_experts, big_topk));
@@ -250,7 +271,7 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_RecurrentStep_FailsDuringCapture_NoS
 // GDN graph capture guards — deinterleave_qkv_device
 // =============================================================================
 
-TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_FailsDuringCapture_Realloc)
+TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_RequiresBoundWorkspace)
 {
 #ifdef HAVE_ROCM
     ROCmGatedDeltaNet gdn(0);
@@ -258,8 +279,22 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_FailsDuringCapture_R
     gdn.setGPUStream(ctx.defaultStream());
 
     const int n_k_heads = 4, n_v_heads = 4, d_k = 64, d_v = 64;
+    auto bind_deinterleave_workspace = [&](size_t scratch_floats) {
+        WorkspaceRequirements reqs;
+        reqs.buffers.push_back({"gdn_deinterleave_scratch", scratch_floats * sizeof(float), 256, true});
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0),
+            reqs.total_bytes_with_alignment() + 4096);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        auto *scratch = static_cast<float *>(workspace->getBuffer("gdn_deinterleave_scratch"));
+        const size_t bound_floats =
+            workspace->getBufferSize("gdn_deinterleave_scratch") / sizeof(float);
+        EXPECT_NE(scratch, nullptr);
+        EXPECT_GE(bound_floats, scratch_floats);
+        gdn.bindDeinterleaveWorkspace(scratch, bound_floats);
+        return workspace;
+    };
 
-    // First call with small seq_len to allocate scratch
     const int small_seq = 2;
     size_t small_total = static_cast<size_t>(small_seq) * n_v_heads * d_k * 2 +
                          static_cast<size_t>(small_seq) * n_v_heads * d_v;
@@ -268,11 +303,19 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_FailsDuringCapture_R
     hipMemset(d_merged, 0, small_total * sizeof(float));
 
     float *d_q = nullptr, *d_k_out = nullptr, *d_v_out = nullptr;
+    EXPECT_FALSE(gdn.deinterleave_qkv_device(
+        d_merged, d_q, d_k_out, d_v_out,
+        small_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
+
+    auto small_workspace = bind_deinterleave_workspace(small_total);
+    ASSERT_NE(small_workspace, nullptr);
     ASSERT_TRUE(gdn.deinterleave_qkv_device(
         d_merged, d_q, d_k_out, d_v_out,
         small_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
 
-    // Now try with larger seq_len under capture — should fail (needs realloc)
+    // A larger request must fail with the too-small bound workspace both
+    // during and outside graph capture. The kernel no longer allocates a
+    // hidden scratch buffer to save the call.
     const int big_seq = 128;
     size_t big_total = static_cast<size_t>(big_seq) * n_v_heads * d_k * 2 +
                        static_cast<size_t>(big_seq) * n_v_heads * d_v;
@@ -288,11 +331,19 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_FailsDuringCapture_R
             big_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
     }
 
-    // Outside capture should succeed
     {
         float *dq3 = nullptr, *dk3 = nullptr, *dv3 = nullptr;
-        EXPECT_TRUE(gdn.deinterleave_qkv_device(
+        EXPECT_FALSE(gdn.deinterleave_qkv_device(
             d_merged_big, dq3, dk3, dv3,
+            big_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
+    }
+
+    auto big_workspace = bind_deinterleave_workspace(big_total);
+    ASSERT_NE(big_workspace, nullptr);
+    {
+        float *dq4 = nullptr, *dk4 = nullptr, *dv4 = nullptr;
+        EXPECT_TRUE(gdn.deinterleave_qkv_device(
+            d_merged_big, dq4, dk4, dv4,
             big_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
     }
 

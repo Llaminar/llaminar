@@ -164,3 +164,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEExecutionScratchUsesWorkspace)
     EXPECT_NE(async_grouping_scratch.find("bindWorkspaceBuffer"), std::string::npos);
     EXPECT_NE(source.find("requires graph-owned MoE workspace"), std::string::npos);
 }
+
+TEST(Test__GpuWorkspaceAllocationPolicy, GDNDeinterleaveScratchUsesBoundWorkspace)
+{
+    const auto cuda_source = readFile(repoRoot() / "src/v2/kernels/cuda/gdn/CUDAGatedDeltaNet.h");
+    const auto cuda_deinterleave = sliceBetween(
+        cuda_source,
+        "bool deinterleave_qkv_device(",
+        "        // =====================================================================\n        // IWorkspaceConsumer Interface");
+    expectNoRawGpuAllocationCalls(cuda_deinterleave, "CUDAGatedDeltaNet deinterleave scratch");
+    EXPECT_NE(cuda_deinterleave.find("requires bound graph workspace"), std::string::npos);
+
+    const auto rocm_source = readFile(repoRoot() / "src/v2/kernels/rocm/gdn/ROCmGatedDeltaNet.h");
+    const auto rocm_deinterleave = sliceBetween(
+        rocm_source,
+        "bool deinterleave_qkv_device(",
+        "    private:");
+    expectNoRawGpuAllocationCalls(rocm_deinterleave, "ROCmGatedDeltaNet deinterleave scratch");
+    EXPECT_NE(rocm_deinterleave.find("requires bound graph workspace"), std::string::npos);
+}
