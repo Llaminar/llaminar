@@ -22,7 +22,7 @@ namespace llaminar2::cuda
      * @brief Allocate pinned host scalar storage for selected row.
      *
      * Device scalar storage should normally be graph workspace. This helper
-     * owns only the stable host replay source for captured H2D copies.
+     * owns only the stable host source for pre-capture scalar uploads.
      */
     bool allocateRowSelectHostParam(
         int device_ordinal,

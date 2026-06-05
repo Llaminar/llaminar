@@ -139,6 +139,7 @@ namespace llaminar2
             cudaMalloc(&d_dequant_params_, n_layers * sizeof(TQDequantDynamicParams));
             cudaMallocHost(&h_dequant_params_, n_layers * sizeof(TQDequantDynamicParams));
             memset(h_dequant_params_, 0, n_layers * sizeof(TQDequantDynamicParams));
+            dequant_params_device_valid_.assign(static_cast<size_t>(n_layers), 0);
         }
 
         LOG_DEBUG("CUDARingKVCacheTQ created: " << n_layers << " layers, "
@@ -192,12 +193,13 @@ namespace llaminar2
     void CUDARingKVCacheTQ::setDynamicDequantParams(
         int layer, int seq_idx,
         float rope_theta, int position_start,
-        void * /*gpu_stream*/)
+        void *gpu_stream)
     {
         if (!d_dequant_params_ || !h_dequant_params_)
             return;
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return;
+        dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
 
         const auto &entry = entries_[layer][seq_idx];
 
@@ -210,6 +212,38 @@ namespace llaminar2
         h_dequant_params_[layer].out_offset_elems = entry.count * kv_dim_;
         h_dequant_params_[layer].rope_position =
             (rope_theta > 0.0f) ? position_start + entry.count : 0;
+
+        auto *stream = static_cast<cudaStream_t>(gpu_stream);
+        if (!stream)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::setDynamicDequantParams] Explicit CUDA stream required");
+            return;
+        }
+
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        const cudaError_t cap_err = cudaStreamIsCapturing(stream, &status);
+        if (cap_err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::setDynamicDequantParams] cudaStreamIsCapturing failed: "
+                      << cudaGetErrorString(cap_err));
+            return;
+        }
+        if (isGraphCaptureActive() || status == cudaStreamCaptureStatusActive)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::setDynamicDequantParams] Refusing to record TQ dequant-param H2D inside CUDA graph capture");
+            return;
+        }
+
+        const cudaError_t copy_err =
+            cudaMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
+                            sizeof(TQDequantDynamicParams), cudaMemcpyHostToDevice, stream);
+        if (copy_err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCacheTQ::setDynamicDequantParams] cudaMemcpyAsync failed: "
+                      << cudaGetErrorString(copy_err));
+            return;
+        }
+        dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
     }
 
     // =========================================================================
@@ -369,16 +403,12 @@ namespace llaminar2
             const float *d_rot = rotations_.d_rotations + layer_rot_offset;
 
             bool ok;
-            if (d_head_params_ && h_head_params_ && stream)
+            if (isGraphCaptureActive() && d_head_params_ && h_head_params_ && stream)
             {
-                // Graph-capturable path: H2D of ring_pos + dynamic kernel.
-                // During capture, both the H2D and kernel are recorded.
-                // On replay, setDynamicHead() updates h_head_params_ before
-                // the captured H2D re-reads it.
+                // Captured graphs read ring_pos from a stable device scalar
+                // uploaded by updateDynamicParams()/setDynamicHead() before
+                // capture/replay. Do not record H2D copies in the graph.
                 const int idx = layer * batch_size_ + seq_idx;
-                h_head_params_[idx] = entry.head;
-                cudaMemcpyAsync(&d_head_params_[idx], &h_head_params_[idx],
-                                sizeof(int), cudaMemcpyHostToDevice, stream);
                 ok = cuda_tq_quantize_fused_ring_dynamic(
                     d_K_new, d_V_new, d_rot,
                     entry.d_K, entry.d_V,
@@ -569,6 +599,8 @@ namespace llaminar2
 
         if (h_dequant_params_)
             std::memset(&h_dequant_params_[layer], 0, sizeof(TQDequantDynamicParams));
+        if (layer >= 0 && layer < static_cast<int>(dequant_params_device_valid_.size()))
+            dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
         if (d_dequant_params_)
         {
             cudaError_t err = cudaMemsetAsync(&d_dequant_params_[layer], 0,
@@ -710,18 +742,37 @@ namespace llaminar2
             bool ok;
             if (d_dequant_params_ && h_dequant_params_ && stream)
             {
-                // Graph-capturable path: H2D of dequant params + dynamic kernel.
-                // Passes base scratch pointers — kernel reads offset from device params.
-                // During capture, H2D + kernel are recorded. On replay,
-                // setDynamicDequantParams() updates h_dequant_params_ before
-                // the captured H2D re-reads it.
-                h_dequant_params_[layer].ring_pos = (tail + entry.count - 1) % max_seq_len_;
-                h_dequant_params_[layer].out_offset_elems = static_cast<int>((entry.count - 1) * kv_dim_);
-                h_dequant_params_[layer].rope_position =
-                    (rope_theta > 0.0f) ? position_start + entry.count - 1 : 0;
+                // Graph-capturable path: the kernel reads dynamic params from
+                // device memory. Captured execution must not record H2D; params
+                // are pre-uploaded by setDynamicDequantParams().
+                if (isGraphCaptureActive())
+                {
+                    if (layer < 0 ||
+                        layer >= static_cast<int>(dequant_params_device_valid_.size()) ||
+                        !dequant_params_device_valid_[static_cast<size_t>(layer)])
+                    {
+                        LOG_ERROR("[CUDARingKVCacheTQ::dequant_to_scratch] TQ dequant params were not ready before CUDA graph capture");
+                        return false;
+                    }
+                }
+                else
+                {
+                    h_dequant_params_[layer].ring_pos = (tail + entry.count - 1) % max_seq_len_;
+                    h_dequant_params_[layer].out_offset_elems = static_cast<int>((entry.count - 1) * kv_dim_);
+                    h_dequant_params_[layer].rope_position =
+                        (rope_theta > 0.0f) ? position_start + entry.count - 1 : 0;
 
-                cudaMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
-                                sizeof(TQDequantDynamicParams), cudaMemcpyHostToDevice, stream);
+                    cudaError_t copy_err =
+                        cudaMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
+                                        sizeof(TQDequantDynamicParams), cudaMemcpyHostToDevice, stream);
+                    if (copy_err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDARingKVCacheTQ::dequant_to_scratch] cudaMemcpyAsync failed: "
+                                  << cudaGetErrorString(copy_err));
+                        return false;
+                    }
+                    dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
+                }
 
                 ok = cuda_tq_incremental_single_fp16_dynamic(
                     scratch.d_K, scratch.d_V,

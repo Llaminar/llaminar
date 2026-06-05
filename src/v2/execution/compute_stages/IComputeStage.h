@@ -792,11 +792,12 @@ namespace llaminar2
         /**
          * @brief Update prefill replay bookkeeping before a captured graph launch.
          *
-         * The executor calls this on cached prefill graph hits after normal
+         * The executor calls this on cached prefill graph hits before normal
          * dynamic params are refreshed and before capture/replay callbacks can
          * run. Decode graph replay continues to use updateDynamicParams() only.
-         * Stages should ignore this unless their host-side replay callback must
-         * distinguish real tokens from padded bucket rows.
+         * Stages should ignore this unless their dynamic device metadata or
+         * host-side replay callback must distinguish real tokens from padded
+         * bucket rows.
          *
          * @param params Real-token and bucket metadata for the upcoming prefill replay.
          */

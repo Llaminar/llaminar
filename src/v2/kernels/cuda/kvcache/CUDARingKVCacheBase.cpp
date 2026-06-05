@@ -9,6 +9,7 @@
 
 #include "CUDARingKVCacheBase.h"
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include <cuda_runtime.h>
 #include <cstring>
@@ -156,7 +157,7 @@ namespace llaminar2
     // Graph Capture Support
     // =========================================================================
 
-    void CUDARingKVCacheBase::setDynamicHead(int layer, int seq_idx, void * /*gpu_stream*/)
+    void CUDARingKVCacheBase::setDynamicHead(int layer, int seq_idx, void *gpu_stream)
     {
         if (!d_head_params_ || !h_head_params_)
             return;
@@ -165,9 +166,25 @@ namespace llaminar2
 
         int idx = layer * batch_size_ + seq_idx;
         h_head_params_[idx] = entryHead(layer, seq_idx);
-        // No explicit H2D needed — the graph's captured cudaMemcpyAsync reads
-        // from this pinned host buffer on replay. For non-graph mode, the
-        // append path issues its own H2D during execute().
+        if (!gpu_stream)
+            return;
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[CUDARingKVCacheBase] Refusing to upload dynamic KV head inside CUDA graph capture");
+            return;
+        }
+
+        cudaError_t err = cudaMemcpyAsync(
+            &d_head_params_[idx],
+            &h_head_params_[idx],
+            sizeof(int),
+            cudaMemcpyHostToDevice,
+            static_cast<cudaStream_t>(gpu_stream));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCacheBase] Failed to upload dynamic KV head: "
+                      << cudaGetErrorString(err));
+        }
     }
 
     void CUDARingKVCacheBase::advanceHead(int layer, int seq_idx, int num_tokens)

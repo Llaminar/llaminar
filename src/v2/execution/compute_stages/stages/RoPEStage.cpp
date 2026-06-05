@@ -138,16 +138,16 @@ namespace llaminar2
         // Thread GPU stream for graph capture
         bindStageStream(kernel);
 
-        // Use provided position_ids if available (for batched execution with per-token positions)
-        // Otherwise, pass nullptr to the kernel to enable zero-copy contiguous path.
-        // The kernel computes positions on-the-fly on GPU: pos = pos_offset + seq_idx.
-        // This avoids a synchronous hipMemcpy that forces a full GPU pipeline drain.
+        // Use provided position_ids if available (for batched execution with per-token positions).
+        // Otherwise, pass nullptr to GPU kernels to keep the contiguous position path:
+        // positions are computed on device from pos_offset + seq_idx, and pos_offset
+        // is pre-uploaded by updateDynamicParams() before graph capture/replay.
         const int *position_ids_ptr = params_.position_ids;
 
-        // CPU paths and graph-capture paths both need an explicit position_ids
-        // buffer whenever pos_offset != 0. Otherwise kernels that treat
-        // nullptr as [0..seq_len-1] would ignore the offset.
-        if (!position_ids_ptr && seq_len > 0 && params_.pos_offset != 0)
+        // CPU paths need explicit position_ids whenever pos_offset != 0.
+        // GPU kernels have a contiguous pos_offset/device-param path, and
+        // manufacturing a host position_ids array would force an H2D upload.
+        if (!params_.device_id.is_gpu() && !position_ids_ptr && seq_len > 0 && params_.pos_offset != 0)
         {
             position_ids_cache_.resize(static_cast<size_t>(seq_len));
             for (int i = 0; i < seq_len; ++i)
@@ -157,23 +157,15 @@ namespace llaminar2
             position_ids_ptr = position_ids_cache_.data();
         }
 
-        if (gpuStream() != nullptr)
+        if (gpuStream() != nullptr && position_ids_ptr != nullptr)
         {
-            // Graph-capture path: ensure a stable position_ids pointer so the
-            // kernel can copy to device and avoid scalar pos_offset args.
+            // Explicit non-contiguous/batched position ids must use a stable
+            // host pointer. Contiguous GPU positions intentionally stay null.
             if (seq_len > 0)
             {
                 position_ids_cache_.resize(static_cast<size_t>(seq_len));
-                if (position_ids_ptr)
-                {
-                    std::memcpy(position_ids_cache_.data(), position_ids_ptr,
-                                static_cast<size_t>(seq_len) * sizeof(int));
-                }
-                else
-                {
-                    for (int i = 0; i < seq_len; ++i)
-                        position_ids_cache_[static_cast<size_t>(i)] = params_.pos_offset + i;
-                }
+                std::memcpy(position_ids_cache_.data(), position_ids_ptr,
+                            static_cast<size_t>(seq_len) * sizeof(int));
                 position_ids_ptr = position_ids_cache_.data();
             }
         }

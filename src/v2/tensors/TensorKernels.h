@@ -1484,10 +1484,10 @@ namespace llaminar2
         /**
          * @brief Update attention device params stored in pinned host memory for graph replay
          *
-         * During GPU graph capture, the kernel records an H2D memcpy of AttentionDeviceParams
-         * from pinned host memory to a device buffer. On graph replay, the memcpy re-reads
-         * from the same pinned address. This method updates the pinned values so the next
-         * replay picks up the new kv_len and position_offset.
+         * Graph-captured attention reads AttentionDeviceParams from device memory.
+         * Implementations update that device buffer before beginCapture()/graph
+         * replay on the explicit stage stream; captured stage bodies must not
+         * record H2D nodes.
          *
          * @param kv_len Number of cached tokens (including tokens to be appended this step)
          * @param position_offset Position offset for the current decode step
@@ -2454,12 +2454,11 @@ namespace llaminar2
             int rotary_dim = 0) = 0;
 
         /**
-         * @brief Update the pos_offset stored in pinned host memory for graph replay
+         * @brief Update the pos_offset stored in device params for graph replay
          *
-         * During GPU graph capture, the kernel records an H2D memcpy from a pinned
-         * host buffer to a device buffer. On graph replay, the memcpy re-reads
-         * from the same pinned address. This method updates that pinned value
-         * so the next replay picks up the new pos_offset.
+         * GPU implementations should use this as a pre-capture/pre-replay hook:
+         * upload the new value to a workspace-owned device buffer on the explicit
+         * stage stream. Captured RoPE execution must not record H2D memcpy nodes.
          *
          * @param pos_offset New position offset for the next decode step
          */
@@ -2929,10 +2928,11 @@ namespace llaminar2
         /**
          * @brief Prefill variant whose state commit length is read from device memory.
          *
-         * GPU graph capture records the H2D copy that updates the device scalar,
-         * then this kernel reads the current real length on each replay. CPU
-         * implementations normally do not use this entry point; stages pass the
-         * effective length directly to forward().
+         * GPU graph replay reads the current real length from device memory.
+         * Stages upload that scalar before capture/replay on an explicit stream;
+         * captured stage bodies must not record H2D nodes. CPU implementations
+         * normally do not use this entry point; stages pass the effective length
+         * directly to forward().
          */
         virtual bool forwardWithEffectiveSeqLen(
             const float *input, const float *weight, const float *bias,

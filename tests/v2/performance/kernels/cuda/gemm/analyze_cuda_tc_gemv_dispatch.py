@@ -2,8 +2,12 @@
 
 import argparse
 import csv
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from native_vnni_codebooks import CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK
 
 
 ASPECT_BUCKETS = (
@@ -14,24 +18,6 @@ ASPECT_BUCKETS = (
 
 ASPECT_ORDER = ["very_wide", "wide", "balanced", "tall"]
 FAMILY_ORDER = ["wide", "kpar", "direct"]
-FORMAT_TO_CODEBOOK = {
-    "Q4_0": 0,
-    "IQ4_NL": 4,
-    "Q4_1": 5,
-    "Q5_0": 6,
-    "Q5_1": 7,
-    "Q6_K": 8,
-    "Q3_K": 9,
-    "Q2_K": 10,
-    "IQ3_S": 11,
-    "IQ3_XXS": 12,
-    "IQ2_S": 13,
-    "IQ2_XS": 14,
-    "IQ2_XXS": 15,
-    "IQ1_S": 16,
-    "IQ1_M": 17,
-}
-CODEBOOK_TO_FORMAT = {value: key for key, value in FORMAT_TO_CODEBOOK.items()}
 ASPECT_CONDITIONS = {
     "very_wide": "aspect_ratio >= 16.0f",
     "wide": "aspect_ratio >= 2.0f",
@@ -75,6 +61,12 @@ def load_rows(path: Path):
             format_name = raw["format"]
             if format_name not in FORMAT_TO_CODEBOOK:
                 raise SystemExit(f"unsupported format in CSV: {format_name}")
+            codebook = FORMAT_TO_CODEBOOK[format_name]
+            if raw.get("codebook", "").strip():
+                csv_codebook = int(raw["codebook"])
+                if csv_codebook != codebook:
+                    raise SystemExit(
+                        f"codebook mismatch in CSV: format {format_name} maps to {codebook}, row has {csv_codebook}")
 
             n = int(raw["n"])
             k = int(raw["k"])
@@ -82,7 +74,7 @@ def load_rows(path: Path):
             work = n * k
             rows.append({
                 "format": format_name,
-                "codebook": FORMAT_TO_CODEBOOK[format_name],
+                "codebook": codebook,
                 "shape": raw["shape"],
                 "n": n,
                 "k": k,

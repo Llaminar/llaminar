@@ -92,8 +92,8 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
 
         /// Update position offset for cached graph reuse.
-        /// Also updates the kernel's pinned host device-params so the next
-        /// graph replay picks up the new pos_offset via the captured H2D memcpy.
+        /// Also pre-uploads the kernel's device params on the explicit stage
+        /// stream so captured RoPE execution records kernels only.
         bool hasDynamicParams() const override { return true; }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
@@ -103,8 +103,8 @@ namespace llaminar2
             position_ids_cache_.clear();
             if (cached_kernel_)
             {
-                // Propagate current stage stream to kernel so setDynamicPosOffset
-                // can issue H2D copies on the correct (capture/replay) stream.
+                // Propagate current stage stream so setDynamicPosOffset can
+                // pre-upload device params before capture/replay.
                 cached_kernel_->setGPUStream(gpuStream());
                 cached_kernel_->setDynamicPosOffset(pos_offset);
             }

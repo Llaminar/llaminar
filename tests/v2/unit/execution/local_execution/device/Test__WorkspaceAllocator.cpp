@@ -280,6 +280,55 @@ TEST(Test__WorkspaceAllocator, ReallocatesExistingWorkspaceWhenNamedBufferGrows)
     EXPECT_EQ(larger_consumer.lastK(), 13);
 }
 
+TEST(Test__WorkspaceAllocator, BindsAllExtraConsumersToMergedWorkspace)
+{
+    auto device = selectAvailableGpuWithMemory();
+    if (!device)
+    {
+        GTEST_SKIP() << "No CUDA/ROCm GPU with enough free memory for WorkspaceAllocator unit test";
+    }
+
+    WorkspaceAllocator allocator;
+    ComputeGraph graph;
+    const auto hints = tinyHints();
+    const auto config = unitBudgetConfig();
+
+    MockWorkspaceConsumer main_kv_cache({
+        {"kvcache_conv_scratch_k", 1024, 256, true},
+        {"kvcache_conv_scratch_v", 1024, 256, true},
+    });
+    MockWorkspaceConsumer mtp_kv_cache({
+        {"kvcache_conv_scratch_k", 4096, 256, true},
+        {"kvcache_conv_scratch_v", 4096, 256, true},
+    });
+
+    auto main_request = requestFor(main_kv_cache, *device);
+    main_request.m = 600;
+    main_request.n = 1;
+    auto mtp_request = requestFor(mtp_kv_cache, *device);
+    mtp_request.m = 600;
+    mtp_request.n = 1;
+
+    ASSERT_TRUE(allocator.allocateForGraph(
+        graph,
+        hints,
+        {main_request, mtp_request},
+        config));
+
+    auto *workspace = allocator.getDeviceWorkspace(*device);
+    ASSERT_NE(workspace, nullptr);
+    EXPECT_EQ(main_kv_cache.boundWorkspace(), workspace);
+    EXPECT_EQ(mtp_kv_cache.boundWorkspace(), workspace);
+    EXPECT_TRUE(workspace->hasBuffer("kvcache_conv_scratch_k"));
+    EXPECT_TRUE(workspace->hasBuffer("kvcache_conv_scratch_v"));
+    EXPECT_EQ(workspace->getBufferSize("kvcache_conv_scratch_k"), 4096u);
+    EXPECT_EQ(workspace->getBufferSize("kvcache_conv_scratch_v"), 4096u);
+    EXPECT_EQ(main_kv_cache.lastM(), 600);
+    EXPECT_EQ(main_kv_cache.lastN(), 1);
+    EXPECT_EQ(mtp_kv_cache.lastM(), 600);
+    EXPECT_EQ(mtp_kv_cache.lastN(), 1);
+}
+
 TEST(Test__WorkspaceAllocator, GraphConsumerUsesDeclaredStageShapeForWorkspaceM)
 {
     auto device = selectAvailableGpuWithMemory();
@@ -316,7 +365,7 @@ TEST(Test__WorkspaceAllocator, GraphConsumerUsesDeclaredStageShapeForWorkspaceM)
         << "Prepared kernels keep their own output width when no explicit N is required";
 }
 
-TEST(Test__WorkspaceAllocator, GraphConsumerAllocatesCPUWorkspaceForDeclaredStage)
+TEST(Test__WorkspaceAllocator, GraphConsumerSkipsCPUWorkspaceForDeclaredStage)
 {
     if (!hasCPUBackend())
     {
@@ -348,19 +397,14 @@ TEST(Test__WorkspaceAllocator, GraphConsumerAllocatesCPUWorkspaceForDeclaredStag
         config));
 
     auto *workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
-    ASSERT_NE(workspace, nullptr)
-        << "CPU IWorkspaceConsumer stages must receive declared workspace just like GPU stages";
-    EXPECT_EQ(raw_stage->boundWorkspace(), workspace);
-    EXPECT_TRUE(workspace->hasBuffer("declared_shape_scratch"));
-    EXPECT_GE(raw_stage->requirementsCalls(), 1);
-    EXPECT_EQ(raw_stage->bindCalls(), 1);
-    EXPECT_EQ(raw_stage->lastM(), 3)
-        << "CPU verifier replay workspace must honor graph-declared M";
-    EXPECT_EQ(raw_stage->lastK(), 8);
-    EXPECT_EQ(raw_stage->lastN(), 0);
+    EXPECT_EQ(workspace, nullptr)
+        << "Graph-level DeviceWorkspaceManager binding is GPU-only; CPU scratch is owned by CPU kernels";
+    EXPECT_EQ(raw_stage->boundWorkspace(), nullptr);
+    EXPECT_EQ(raw_stage->requirementsCalls(), 0);
+    EXPECT_EQ(raw_stage->bindCalls(), 0);
 }
 
-TEST(Test__WorkspaceAllocator, CPUReallocatesExistingWorkspaceWhenNamedBufferGrows)
+TEST(Test__WorkspaceAllocator, ExtraCPUConsumersAreIgnoredByGraphAllocator)
 {
     if (!hasCPUBackend())
     {
@@ -389,11 +433,12 @@ TEST(Test__WorkspaceAllocator, CPUReallocatesExistingWorkspaceWhenNamedBufferGro
         config));
 
     auto *initial_workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
-    ASSERT_NE(initial_workspace, nullptr);
+    EXPECT_EQ(initial_workspace, nullptr);
+    EXPECT_EQ(initial_consumer.boundWorkspace(), nullptr);
+    EXPECT_EQ(initial_consumer.requirementsCalls(), 0);
+    EXPECT_EQ(initial_consumer.bindCalls(), 0);
     const uint64_t initial_generation = allocator.deviceGeneration(DeviceId::cpu());
-    EXPECT_GT(initial_generation, 0u);
-    ASSERT_TRUE(initial_workspace->hasBuffer("shared_scratch"));
-    ASSERT_TRUE(initial_workspace->hasBuffer("old_only_scratch"));
+    EXPECT_EQ(initial_generation, 0u);
 
     MockWorkspaceConsumer larger_consumer({
         {"shared_scratch", 4096, 256, true},
@@ -407,16 +452,11 @@ TEST(Test__WorkspaceAllocator, CPUReallocatesExistingWorkspaceWhenNamedBufferGro
         config));
 
     auto *reallocated_workspace = allocator.getDeviceWorkspace(DeviceId::cpu());
-    ASSERT_NE(reallocated_workspace, nullptr)
-        << "Workspace reallocation must leave a live manager owned by the allocator";
-    EXPECT_EQ(larger_consumer.boundWorkspace(), reallocated_workspace);
-    EXPECT_GT(allocator.deviceGeneration(DeviceId::cpu()), initial_generation);
-    EXPECT_TRUE(reallocated_workspace->hasBuffer("shared_scratch"));
-    EXPECT_TRUE(reallocated_workspace->hasBuffer("old_only_scratch"));
-    EXPECT_TRUE(reallocated_workspace->hasBuffer("new_only_scratch"));
-    EXPECT_EQ(reallocated_workspace->getBufferSize("shared_scratch"), 4096u);
-    EXPECT_EQ(reallocated_workspace->getBufferSize("old_only_scratch"), 2048u);
-    EXPECT_EQ(reallocated_workspace->getBufferSize("new_only_scratch"), 512u);
+    EXPECT_EQ(reallocated_workspace, nullptr);
+    EXPECT_EQ(larger_consumer.boundWorkspace(), nullptr);
+    EXPECT_EQ(larger_consumer.requirementsCalls(), 0);
+    EXPECT_EQ(larger_consumer.bindCalls(), 0);
+    EXPECT_EQ(allocator.deviceGeneration(DeviceId::cpu()), initial_generation);
 }
 
 TEST(Test__WorkspaceAllocator, ReusesExistingWorkspaceWhenAllRequestedBuffersFit)

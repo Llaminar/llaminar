@@ -11,12 +11,15 @@
  */
 
 #include "CUDARingKVCache.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KVCacheProfiler.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cuda_runtime.h>
 
@@ -49,6 +52,51 @@ namespace llaminar2
 
     bool ICUDARingKVCache::ensureConvScratch(size_t bytes)
     {
+        if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(this))
+        {
+            DeviceWorkspaceManager *workspace = consumer->getWorkspace();
+            if (workspace && workspace->isAllocated())
+            {
+                void *workspace_k = workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+                void *workspace_v = workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+                const size_t workspace_k_size = workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+                const size_t workspace_v_size = workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+                if (!workspace_k || !workspace_v || workspace_k_size < bytes || workspace_v_size < bytes)
+                {
+                    LOG_ERROR("[ICUDARingKVCache] Bound workspace is missing conversion scratch: required="
+                              << bytes << " bytes, K_available=" << workspace_k_size
+                              << " V_available=" << workspace_v_size);
+                    return false;
+                }
+
+                if (conv_scratch_k_ && !conv_scratch_workspace_backed_)
+                    cudaFree(conv_scratch_k_);
+                if (conv_scratch_v_ && !conv_scratch_workspace_backed_)
+                    cudaFree(conv_scratch_v_);
+
+                conv_scratch_k_ = workspace_k;
+                conv_scratch_v_ = workspace_v;
+                conv_scratch_capacity_ = std::min(workspace_k_size, workspace_v_size);
+                conv_scratch_workspace_backed_ = true;
+                return true;
+            }
+        }
+
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[ICUDARingKVCache] Refusing to allocate conversion scratch during CUDA graph capture; "
+                      "bind KV-cache conversion scratch through IWorkspaceConsumer");
+            return false;
+        }
+
+        if (conv_scratch_workspace_backed_)
+        {
+            conv_scratch_k_ = nullptr;
+            conv_scratch_v_ = nullptr;
+            conv_scratch_capacity_ = 0;
+            conv_scratch_workspace_backed_ = false;
+        }
+
         if (bytes <= conv_scratch_capacity_)
             return true;
 
@@ -86,6 +134,15 @@ namespace llaminar2
 
     void ICUDARingKVCache::freeConvScratch()
     {
+        if (conv_scratch_workspace_backed_)
+        {
+            conv_scratch_k_ = nullptr;
+            conv_scratch_v_ = nullptr;
+            conv_scratch_capacity_ = 0;
+            conv_scratch_workspace_backed_ = false;
+            return;
+        }
+
         if (conv_scratch_k_)
         {
             cudaFree(conv_scratch_k_);

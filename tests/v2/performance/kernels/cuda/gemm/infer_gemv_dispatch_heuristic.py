@@ -29,23 +29,11 @@ from pathlib import Path
 import numpy as np
 from sklearn.tree import DecisionTreeClassifier
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from native_vnni_codebooks import CODEBOOK_PAYLOAD_BYTES, CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK
+
 
 # --- Codebook metadata ------------------------------------------------
-FORMAT_TO_CODEBOOK = {
-    "Q4_0": 0, "IQ4_NL": 4, "Q4_1": 5, "Q5_0": 6, "Q5_1": 7,
-    "Q6_K": 8, "Q3_K": 9, "Q2_K": 10, "IQ3_S": 11, "IQ3_XXS": 12,
-    "IQ2_S": 13, "IQ2_XS": 14, "IQ2_XXS": 15, "IQ1_S": 16, "IQ1_M": 17,
-    "Q8_0": 19,
-}
-CODEBOOK_TO_FORMAT = {v: k for k, v in FORMAT_TO_CODEBOOK.items()}
-
-CODEBOOK_PAYLOAD_BYTES = {
-    0: 16, 4: 16, 5: 20, 6: 20, 7: 24, 8: 24,
-    9: 12, 10: 8, 11: 12, 12: 8, 13: 8, 14: 8,
-    15: 4, 16: 4, 17: 4,
-    19: 32,
-}
-
 FAMILY_MAP = {"kpar": "KPAR", "wide": "WIDE", "direct": "DIRECT"}
 
 
@@ -75,9 +63,15 @@ def load_sweep_csv(path: Path) -> list[dict]:
             fmt = raw.get("format", "")
             if fmt not in FORMAT_TO_CODEBOOK:
                 continue
+            codebook = FORMAT_TO_CODEBOOK[fmt]
+            if raw.get("codebook", "").strip():
+                csv_codebook = int(raw["codebook"])
+                if csv_codebook != codebook:
+                    raise SystemExit(
+                        f"codebook mismatch in {path}: format {fmt} maps to {codebook}, row has {csv_codebook}")
             try:
                 rows.append({
-                    "fmt": fmt, "cb": FORMAT_TO_CODEBOOK[fmt],
+                    "fmt": fmt, "cb": codebook,
                     "n": int(raw["n"]), "k": int(raw["k"]),
                     "family": raw.get("family", "kpar"),
                     "tile_n": int(raw.get("tile_n", 128)),

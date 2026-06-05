@@ -7,9 +7,9 @@ history belongs in artifacts.
 
 | Scope | Device | Model | Mode | Prefill | Decode | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 709.61 | 40.80 | prefill improved |
-| Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP | 606.46 | 54.32 | accept 96.88%, below prior decode |
-| Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 607.03 | 56.15 | depth 1, beats l.cpp d1 |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 727.79 | 40.96 | M600 down split-K |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP | 621.25 | 54.82 | accept 96.88%, graph clean |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 620.57 | 55.43 | depth 1, graph clean |
 | Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | beats l.cpp no-MTP |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | accept 71.88%, beats l.cpp d1 |
@@ -37,14 +37,15 @@ history belongs in artifacts.
 ## Latest Evidence
 
 CUDA dense latest:
-`20260605T090657Z-qwen36-dense-gdn-split1-overrides`; route sweeps:
+`20260605T-current-refresh/no_mtp_after_down_sk4`; route sweeps:
+`20260605T-current-refresh/ffn_m600_sweep` and
 `20260605T083341Z-qwen36-gdn-m600-tile-sweep`.
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
-| no MTP | 709.61 | 40.80 | n/a |
-| fixed d1 MTP | 606.46 | 54.32 | 96.88% |
-| dynamic MTP | 607.03 | 56.15 | 96.88% |
+| no MTP | 727.79 | 40.96 | n/a |
+| fixed d1 MTP | 621.25 | 54.82 | 96.88% |
+| dynamic MTP | 620.57 | 55.43 | 95.31% |
 
 CUDA MoE latest:
 `20260605T070628Z-iq4nl-word-decode`.
@@ -56,23 +57,22 @@ CUDA MoE latest:
 | dynamic MTP | 1943.69 | 145.36 | 68.75% |
 
 Fresh checks:
-- Trusted `stage_gpu` graph-replay timing is now exportable without legacy
-  profiling, and CUDA NativeVNNI prompt-prefill emits structured
-  `kernel.cuda_native_vnni_prefill_calls` route counters.
-- CUDA NativeVNNI scratch, CUDA/ROCm MoE request scratch, CUDA KV gather, GDN
-  deinterleave scratch, and CUDA attention decode partials now bind through
-  `DeviceWorkspaceManager`; workspace suballocs emit structured memory counters.
-  The old CUDA cuBLAS attention fallback/env knob was removed rather than
-  preserving hidden O(seq^2) `cudaMalloc` state.
-- Dense diagnostic at graph bucket `M=600` recorded top prompt-prefill routes:
-  `17408x5120` Q4_K tile 4, `5120x17408` Q4_K tile 2, and GDN projection
-  shapes including `6144x5120`, `5120x6144`, `10240x5120`, and `1024x5120`.
-- GDN Z/output prefill now use split-1 `T64x128_w4x2` overrides for Q4_K/Q5_1.
-  The faster split-K 2/4 sweep winners were rejected because their partial
-  buffers caused a 24GB dense warmup OOM.
-- Focused coverage stayed green for CUDA GEMM parity, CUDA MoE graph replay,
-  Qwen3.6 MoE CUDA math parity, verifier-row shortcut parity, and the focused
-  Qwen3.6 CUDA dense SingleDevice prefix/MTP parity suite.
+- Trusted `stage_gpu` replay timing and CUDA NativeVNNI route counters export
+  through perf stats.
+- CUDA NativeVNNI, MoE request scratch, KV gather/conversion, GDN deinterleave,
+  and attention decode partials bind through `DeviceWorkspaceManager`; the old
+  CUDA cuBLAS attention fallback/env knob was removed.
+- CUDA dense no-MTP prefill uses the `M=600` Q4_K FFN down sweep winner
+  (`T128x128_w4x2`, split-K 4) while exact `M=595` keeps split-1.
+- NativeVNNI sweep CSVs now carry validated tensor-derived codebook ids across
+  CUDA/ROCm prefill/decode trainer smokes; Q5_K maps to codebook 7 everywhere.
+  Latest validation: 4 Q5_K smoke rows across CUDA prefill, CUDA decode,
+  ROCm prefill, and ROCm decode.
+- MTP sidecar KV caches now bind workspace too; fixed/dynamic dense MTP logs
+  have no `MTP0_kv_append` capture failures.
+- Focused coverage green: CUDA GEMM route regression, workspace extra-consumer
+  regression, CUDA graph stochastic smoke, and Qwen3.6 CUDA dense prefix/MTP
+  parity.
 
 ## Retained Actions
 
@@ -91,4 +91,7 @@ Fresh checks:
 Beat llama.cpp CUDA on dense and MoE, prefill and decode, with MTP on/off.
 CUDA MoE now clears the current no-MTP and MTP anchors on the default lane.
 Next targets are CUDA dense prefill/decode gaps, controller stability, and
-longer-prompt MoE evidence so the win is not just a short-lane artifact.
+longer-prompt MoE evidence so the win is not just a short-lane artifact. Dense
+prefill is now gate/up and GEMM-heavy; broad GDN split-K remains rejected on
+24GB memory grounds, so the next meaningful prefill win needs kernel/fusion
+work rather than another selector-only pass.

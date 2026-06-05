@@ -57,10 +57,6 @@ namespace llaminar2::test::native_vnni_gemm_perf
          { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
         {"Q4_1", 5, [](size_t n, size_t k)
          { return TestTensorFactory::createQ4_1Random({n, k}); }},
-        {"Q4_K", 5, [](size_t n, size_t k)
-         { return TestTensorFactory::createQ4_KRandom({n, k}); }},
-        {"Q5_K", 5, [](size_t n, size_t k)
-         { return TestTensorFactory::createQ5_KRandom({n, k}); }},
         {"Q5_0", 6, [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_0Random({n, k}); }},
         {"Q5_1", 7, [](size_t n, size_t k)
@@ -164,15 +160,6 @@ namespace llaminar2::test::native_vnni_gemm_perf
         {"14B_TP4_FFN_Up", 3456, 5120},
         {"14B_TP4_FFN_Down", 5120, 3456},
         {"14B_TP4_LM_Head", 38016, 5120},
-        // Qwen3.6 27B dense / hybrid GDN production shapes
-        // (d_model=5120, d_ff=17408, GDN qkv/z/time/output projections).
-        {"Qwen36_FFN_GateUp", 17408, 5120},
-        {"Qwen36_FFN_DownProjection", 5120, 17408},
-        {"Qwen36_GDN_InnerProjection", 10240, 5120},
-        {"Qwen36_GDN_ZProjection", 6144, 5120},
-        {"Qwen36_GDN_TimeProjection", 1024, 5120},
-        {"Qwen36_GDN_OutputProjection", 5120, 6144},
-        {"Qwen36_LM_Head", 248320, 5120},
     };
 
     inline const std::vector<int> kPrefillMValues = {32, 64, 128};

@@ -145,9 +145,9 @@ namespace llaminar2
      * @brief Device-side dynamic parameters for TQ incremental dequant.
      *
      * During HIP graph capture, kernel arguments are baked into the graph.
-     * This struct lives in device memory; the kernel reads from it at
-     * runtime. Between graph replays, the host writes new values to a
-     * pinned shadow buffer and a captured H2D memcpy re-copies them.
+     * This struct lives in device memory; the kernel reads from it at runtime.
+     * Between graph replays, host code uploads new values to that device buffer
+     * before graph launch on the explicit stage stream.
      */
     struct HIPTQDequantDynamicParams
     {

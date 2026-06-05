@@ -111,17 +111,15 @@ namespace llaminar2
             static void clearSharedPrefillPools();
 
             /**
-             * @brief Clear request-scoped CUDA execution state.
+             * @brief Release input-dependent CUDA execution contexts.
              *
-             * Per-device GEMV, prefill, and cuBLAS contexts are persistent
-             * scratch/handle owners. They must stay alive across request resets
-             * because CUDA graph captures may contain kernels that reference
-             * their device buffers. Kernel destruction / KernelFactory::clearCache()
-             * releases those resources.
+             * Keeps packed weights resident, but drops per-session GEMV, prefill,
+             * and cuBLAS scratch/handles so a new request cannot inherit state
+             * from the previous prompt shape or capture stream.
              */
             void resetDynamicState() override;
 
-            /// @brief Returns true when request-scoped state is live.
+            /// @brief Returns true when any CUDA execution context is live.
             bool hasDynamicStateActive() const override;
 
             /**
@@ -257,8 +255,6 @@ namespace llaminar2
                 int m, int k,
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override;
-
-            bool supports_fused_projection() const override { return true; }
 
             /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
@@ -414,8 +410,7 @@ namespace llaminar2
                 const TensorBase *gate, const TensorBase *up,
                 TensorBase *output,
                 int m, int n, int k,
-                float alpha = 1.0f, float beta = 0.0f,
-                DeviceWorkspaceManager *workspace = nullptr) override;
+                float alpha = 1.0f, float beta = 0.0f);
 
         private:
             // =========================================================================
@@ -457,11 +452,11 @@ namespace llaminar2
             /**
              * @brief Small-M FP32 activations -> native-VNNI row-wise GEMV.
              *
-             * Greedy MTP verifier forwards commonly use M=2, while graph-captured
-             * replay and parity smoke tests also hit tiny prefill batches. This
-             * helper quantizes all rows once, then dispatches the tuned GEMV
-             * kernel for native-VNNI small-M shapes on the caller-provided graph
-             * stream.
+             * Greedy MTP verifier forwards commonly use M=2. The generic native
+             * VNNI prefill path is correct for that shape, but it is much slower
+             * than the decode-class GEMV path. This helper quantizes all rows
+             * once, then dispatches the tuned M=1 GEMV kernel per row on the
+             * caller-provided graph stream.
              */
             bool multiply_fp32_to_fp32_small_m_gemv(
                 const float *d_A, float *d_C, const float *d_bias,

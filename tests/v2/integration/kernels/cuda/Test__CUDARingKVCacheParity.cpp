@@ -22,6 +22,7 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 
@@ -94,9 +95,11 @@ namespace
 
     std::unique_ptr<DeviceWorkspaceManager> bindRequiredWorkspace(
         IWorkspaceConsumer *consumer,
-        int batch_size)
+        int m,
+        int n = 0,
+        int k = 0)
     {
-        auto reqs = consumer->getWorkspaceRequirements(batch_size);
+        auto reqs = consumer->getWorkspaceRequirements(m, n, k);
         const size_t budget = reqs.total_bytes_with_alignment() + 4096;
         auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::cuda(0), budget);
         EXPECT_TRUE(workspace->allocate(reqs));
@@ -938,6 +941,146 @@ TEST(Test__CUDARingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 }
 
+TEST(Test__CUDARingKVCache, GraphCapturedFP32ToFP16AppendRequiresBoundConversionScratch)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 16;
+    const int n_kv_heads = 1;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 4;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP16,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    ASSERT_FALSE(workspace_consumer->hasWorkspace());
+
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < static_cast<size_t>(num_tokens) * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.125f * static_cast<float>(static_cast<int>(i % 7) - 3);
+        V_tensor->mutable_data()[i] = -0.0625f * static_cast<float>(static_cast<int>(i % 5) - 2);
+    }
+
+    ScopedCudaStream stream;
+    ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    stream.synchronize();
+
+    GraphCaptureGuard guard;
+    EXPECT_FALSE(cache->appendWithStream(0, 0,
+                                         static_cast<const ITensor *>(K_tensor.get()),
+                                         static_cast<const ITensor *>(V_tensor.get()),
+                                         num_tokens, stream.opaque()))
+        << "Graph-captured FP32->FP16 append must not allocate conversion scratch ad hoc";
+}
+
+TEST(Test__CUDARingKVCache, GraphCapturedFP32ToFP16AppendReplaysAfterClearWithWorkspaceScratch)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 16;
+    const int n_kv_heads = 1;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 6;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP16,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    auto workspace = bindRequiredWorkspace(workspace_consumer, num_tokens, batch_size, 0);
+    ASSERT_NE(workspace, nullptr);
+
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < static_cast<size_t>(num_tokens) * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.03125f * static_cast<float>(static_cast<int>(i % 17) - 8);
+        V_tensor->mutable_data()[i] = -0.015625f * static_cast<float>(static_cast<int>(i % 13) - 6);
+    }
+
+    ScopedCudaStream stream;
+    ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    stream.synchronize();
+
+    cache->setDynamicHead(0, 0, stream.opaque());
+    stream.synchronize();
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(cudaStreamBeginCapture(stream.stream(), cudaStreamCaptureModeGlobal), cudaSuccess);
+    bool capture_append_ok = false;
+    {
+        GraphCaptureGuard guard;
+        capture_append_ok = cache->appendWithStream(0, 0,
+                                                    static_cast<const ITensor *>(K_tensor.get()),
+                                                    static_cast<const ITensor *>(V_tensor.get()),
+                                                    num_tokens, stream.opaque());
+    }
+    ASSERT_EQ(cudaStreamEndCapture(stream.stream(), &graph), cudaSuccess);
+    ASSERT_TRUE(capture_append_ok);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_NE(graph_exec, nullptr);
+
+    cache->clear();
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
+    cache->setDynamicHead(0, 0, stream.opaque());
+    stream.synchronize();
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream.stream()), cudaSuccess);
+    stream.synchronize();
+    cache->advanceHead(0, 0, num_tokens);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
+
+    const void *d_K_out = nullptr;
+    const void *d_V_out = nullptr;
+    int kv_len = 0;
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
+    ASSERT_EQ(kv_len, num_tokens);
+
+    std::vector<uint16_t> h_K_out(static_cast<size_t>(num_tokens) * kv_dim);
+    ASSERT_EQ(cudaMemcpyAsync(h_K_out.data(), d_K_out,
+                              h_K_out.size() * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost, stream.stream()),
+              cudaSuccess);
+    stream.synchronize();
+
+    for (size_t i = 0; i < h_K_out.size(); ++i)
+    {
+        EXPECT_NEAR(fp16_to_fp32(h_K_out[i]), K_tensor->data()[i], 0.001f) << "i=" << i;
+    }
+
+    EXPECT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+}
+
 // =============================================================================
 // Test: Multi-Precision (BF16)
 // =============================================================================
@@ -1033,11 +1176,12 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
 
     // Get workspace requirements with default batch size
     auto reqs = workspace_consumer->getWorkspaceRequirements(0);
-    EXPECT_EQ(reqs.buffers.size(), 4u); // K_PTRS, V_PTRS, TAILS, COUNTS
+    EXPECT_EQ(reqs.buffers.size(), 6u); // K_PTRS, V_PTRS, TAILS, COUNTS, conversion scratch K/V
 
     // Verify buffer names and sizes
     bool found_k_ptrs = false, found_v_ptrs = false;
     bool found_tails = false, found_counts = false;
+    bool found_conv_scratch_k = false, found_conv_scratch_v = false;
 
     for (const auto &buf : reqs.buffers)
     {
@@ -1065,12 +1209,26 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(int));
             EXPECT_TRUE(buf.required);
         }
+        else if (buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_K)
+        {
+            found_conv_scratch_k = true;
+            EXPECT_GE(buf.size_bytes, static_cast<size_t>(max_seq_len) * n_kv_heads * head_dim * sizeof(uint16_t));
+            EXPECT_TRUE(buf.required);
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_V)
+        {
+            found_conv_scratch_v = true;
+            EXPECT_GE(buf.size_bytes, static_cast<size_t>(max_seq_len) * n_kv_heads * head_dim * sizeof(uint16_t));
+            EXPECT_TRUE(buf.required);
+        }
     }
 
     EXPECT_TRUE(found_k_ptrs) << "Missing BATCH_K_PTRS buffer";
     EXPECT_TRUE(found_v_ptrs) << "Missing BATCH_V_PTRS buffer";
     EXPECT_TRUE(found_tails) << "Missing BATCH_TAILS buffer";
     EXPECT_TRUE(found_counts) << "Missing BATCH_COUNTS buffer";
+    EXPECT_TRUE(found_conv_scratch_k) << "Missing CONV_SCRATCH_K buffer";
+    EXPECT_TRUE(found_conv_scratch_v) << "Missing CONV_SCRATCH_V buffer";
 
     // Test with explicit batch size
     auto reqs2 = workspace_consumer->getWorkspaceRequirements(8);
@@ -1085,6 +1243,11 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
                  buf.name == KVCacheWorkspaceBuffers::BATCH_COUNTS)
         {
             EXPECT_EQ(buf.size_bytes, 8u * sizeof(int));
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_K ||
+                 buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_V)
+        {
+            EXPECT_GE(buf.size_bytes, static_cast<size_t>(max_seq_len) * n_kv_heads * head_dim * sizeof(uint16_t));
         }
     }
 

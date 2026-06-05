@@ -2278,8 +2278,25 @@ namespace llaminar2
                 extras.push_back(WorkspaceConsumerRequest{
                     kv_consumer,
                     state_.device_id,
+                    std::max(1, hints.max_seq_len),
                     std::max(1, hints.batch_size),
                     0,
+                });
+            }
+        }
+        for (auto &mtp_kv_cache : state_.mtp_kv_caches)
+        {
+            if (!mtp_kv_cache)
+                continue;
+
+            auto *kv_consumer = dynamic_cast<IWorkspaceConsumer *>(mtp_kv_cache.get());
+            if (kv_consumer && state_.device_id.is_gpu())
+            {
+                extras.push_back(WorkspaceConsumerRequest{
+                    kv_consumer,
+                    state_.device_id,
+                    std::max(1, hints.max_seq_len),
+                    std::max(1, hints.batch_size),
                     0,
                 });
             }

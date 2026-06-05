@@ -1252,13 +1252,13 @@ namespace llaminar2
             }
             forward_cache.prefill_replay_param_stages_cached = true;
         }
-        for (auto *stage : forward_cache.dynamic_param_stages)
-        {
-            stage->updateDynamicParams(input.position_offset, input.seq_len);
-        }
         if (!is_decode)
         {
             updatePrefillReplayParamStages(input, forward_cache.prefill_replay_param_stages);
+        }
+        for (auto *stage : forward_cache.dynamic_param_stages)
+        {
+            stage->updateDynamicParams(input.position_offset, input.seq_len);
         }
 
         if (profiling_setup)

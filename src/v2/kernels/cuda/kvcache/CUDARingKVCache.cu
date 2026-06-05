@@ -22,6 +22,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "../../../tensors/BlockStructures.h"
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -1123,16 +1124,12 @@ namespace llaminar2
             LOG_DEBUG("[CUDARingKVCache::append] Auto-evicted " << to_evict << " tokens");
         }
 
-        // Use dynamic head params when available and stream is provided.
-        // This path is graph-capturable: the H2D copy and kernel launch are
-        // recorded in the graph, and on replay setDynamicHead() updates the
-        // pinned host buffer before the captured H2D re-reads it.
-        if (d_head_params_ && h_head_params_ && stream)
+        // Captured graphs read the ring head from a stable device scalar that
+        // updateDynamicParams()/setDynamicHead() uploads before capture/replay.
+        // Do not record H2D copies in the captured graph.
+        if (capture_active && d_head_params_ && h_head_params_ && stream)
         {
             int idx = layer * batch_size_ + seq_idx;
-            h_head_params_[idx] = entry.head;
-            cudaMemcpyAsync(&d_head_params_[idx], &h_head_params_[idx],
-                            sizeof(int), cudaMemcpyHostToDevice, stream);
             launch_append_kernel_dynamic(entry, d_k, d_v, &d_head_params_[idx], num_tokens, stream);
         }
         else
@@ -1709,48 +1706,70 @@ namespace llaminar2
     WorkspaceRequirements CUDARingKVCache<Precision>::getWorkspaceRequirements(
         int m, int n, int k) const
     {
-        // m = batch size (number of sequences in gather operation)
-        // n, k unused for KV cache
-        // Default to batch_size_ if m is 0
-        (void)n;
+        // New callers pass m=max graph tokens and n=batch size so conversion
+        // scratch can follow bucket/chunk size. Legacy one-arg callers used
+        // m=batch size; keep that behavior and size scratch to max_seq_len_.
         (void)k;
 
-        const int actual_batch_size = (m > 0) ? m : batch_size_;
+        const bool has_token_hint = n > 0;
+        const int actual_batch_size = has_token_hint ? n : ((m > 0) ? m : batch_size_);
+        const int scratch_tokens = has_token_hint ? m : max_seq_len_;
+        const int bounded_batch_size = std::max(1, actual_batch_size);
+        const int bounded_scratch_tokens = std::max(1, scratch_tokens);
+        const size_t fp32_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_dim_) * sizeof(float);
+        const size_t fp16_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_dim_) * sizeof(uint16_t);
+        const size_t native_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        const size_t conversion_scratch_bytes =
+            std::max(fp32_scratch_bytes, std::max(fp16_scratch_bytes, native_scratch_bytes));
 
         WorkspaceRequirements reqs;
 
         // Buffer for K cache pointers: DataT* per sequence
         reqs.buffers.push_back({
             KVCacheWorkspaceBuffers::BATCH_K_PTRS,
-            static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+            static_cast<size_t>(bounded_batch_size) * sizeof(DataT *),
             256, // Alignment
             true // Required: no raw cudaMalloc fallback in gather
         });
 
         // Buffer for V cache pointers: DataT* per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_V_PTRS,
-                                static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+                                static_cast<size_t>(bounded_batch_size) * sizeof(DataT *),
                                 256,
                                 true});
 
         // Buffer for tail indices: int per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_TAILS,
-                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                static_cast<size_t>(bounded_batch_size) * sizeof(int),
                                 256,
                                 true});
 
         // Buffer for count values: int per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_COUNTS,
-                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                static_cast<size_t>(bounded_batch_size) * sizeof(int),
+                                256,
+                                true});
+
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_K,
+                                conversion_scratch_bytes,
+                                256,
+                                true});
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_V,
+                                conversion_scratch_bytes,
                                 256,
                                 true});
 
         LOG_DEBUG("[CUDARingKVCache] Workspace requirements: batch_size="
-                  << actual_batch_size
-                  << " BATCH_K_PTRS=" << actual_batch_size * sizeof(DataT *)
-                  << " BATCH_V_PTRS=" << actual_batch_size * sizeof(DataT *)
-                  << " BATCH_TAILS=" << actual_batch_size * sizeof(int)
-                  << " BATCH_COUNTS=" << actual_batch_size * sizeof(int));
+                  << bounded_batch_size
+                  << " scratch_tokens=" << bounded_scratch_tokens
+                  << " BATCH_K_PTRS=" << bounded_batch_size * sizeof(DataT *)
+                  << " BATCH_V_PTRS=" << bounded_batch_size * sizeof(DataT *)
+                  << " BATCH_TAILS=" << bounded_batch_size * sizeof(int)
+                  << " BATCH_COUNTS=" << bounded_batch_size * sizeof(int)
+                  << " CONV_SCRATCH(each)=" << conversion_scratch_bytes);
 
         return reqs;
     }

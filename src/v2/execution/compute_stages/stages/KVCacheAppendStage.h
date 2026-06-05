@@ -91,9 +91,9 @@ namespace llaminar2
         ComputeStageType type() const override { return ComputeStageType::KV_CACHE_APPEND; }
         StageBufferContract bufferContract() const override;
         // KV cache append is graph-capturable when the KV cache supports
-        // device-side head parameters. The H2D memcpy + dynamic kernel are
-        // captured once; on replay, updateDynamicParams() writes the new head
-        // to the same pinned host buffer, which the captured H2D re-reads.
+        // device-side head parameters. updateDynamicParams() uploads the head
+        // to a stable device scalar before capture/replay; captured append
+        // records only the dynamic kernel that reads that scalar.
         bool isGraphCapturable() const override
         {
             return params_.kv_cache && params_.kv_cache->isGraphCaptureReady();
@@ -105,8 +105,7 @@ namespace llaminar2
             params_.seq_len = seq_len;
             if (params_.kv_cache)
             {
-                // Write current head position to the pinned host buffer and issue
-                // H2D async copy. The captured graph's H2D will re-read this value.
+                // Upload current head position to the graph-owned device scalar.
                 // NOTE: Do NOT advanceHead here — that happens in onGraphReplayed()
                 // after the graph launches. This preserves the invariant that
                 // get_cached_tokens() returns the previous step's count when

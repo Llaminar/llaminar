@@ -12,7 +12,9 @@
  * execution thread.
  *
  * Lifecycle: the device scalar is a declared graph workspace buffer. The stage
- * owns only a pinned host scalar used as the captured H2D replay source.
+ * owns only a pinned host scalar used to upload the selected row before capture
+ * or graph replay. Captured execution reads the already-resident device scalar
+ * and must not record a host-to-device scalar copy.
  */
 
 #pragma once
@@ -33,10 +35,9 @@ namespace llaminar2
     /**
      * @brief Selects the last real prefill row into a stable one-row buffer.
      *
-     * CPU execution performs a direct memcpy. GPU execution records a fixed H2D
-     * copy of a selected-row scalar followed by a fixed-grid row-copy kernel;
-     * updating PrefillReplayParams changes the pinned scalar that captured graph
-     * replays read at launch time.
+     * CPU execution performs a direct memcpy. GPU execution uploads the selected
+     * row scalar before capture/replay, then records only a fixed-grid row-copy
+     * kernel that reads the graph-workspace device scalar.
      */
     class HiddenStateRowSelectStage : public IComputeStage, public IWorkspaceConsumer
     {
@@ -115,6 +116,7 @@ namespace llaminar2
         bool executeCPU(TensorBase *input_base, TensorBase *output_base);
         bool executeGPU(TensorBase *input_base, TensorBase *output_base);
         bool ensureGpuParamStateInitialized();
+        bool uploadGpuSelectedRow();
         void refreshPinnedSelectedRow();
         void releaseGpuParamState();
     };

@@ -121,8 +121,8 @@ namespace llaminar2
         {
             // TQ KV cache dequant runs inside execute() via get_kv_converted() with
             // iteration-varying arguments (ring_pos, out_offset grow each step).
-            // With device-side dynamic params, the captured H2D + kernel can be
-            // replayed with updated values from pinned host memory.
+            // Device-side dynamic params are pre-uploaded before capture/replay,
+            // so captured execution records kernels only.
             if (params_.kv_cache)
             {
                 const auto kp = params_.kv_cache->k_precision();
@@ -139,19 +139,23 @@ namespace llaminar2
         /// Target device for coherence management
 
         /// Update position offset for cached graph reuse.
-        /// Also updates the kernel's pinned host device-params so the next
-        /// graph replay picks up the new kv_len and position_offset via
-        /// the captured H2D memcpy.
+        /// Also pre-uploads kernel device params so the next graph replay sees
+        /// the new kv_len and position_offset without captured H2D nodes.
         /// Note: updateDynamicParams is called BEFORE KVCacheAppend runs for
         /// this step, so get_cached_tokens() returns previous step's count.
         /// We add seq_len to get the count after appending.
         bool hasDynamicParams() const override { return true; }
         void updateDynamicParams(int pos_offset, int seq_len) override;
+        bool hasPrefillReplayParams() const override { return params_.kv_cache != nullptr; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
 
         void resetSessionState() override
         {
             IComputeStage::resetSessionState();
             params_.position_offset = 0;
+            prefill_replay_params_set_ = false;
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
             debug_effective_k_snapshot_.clear();
             debug_effective_v_snapshot_.clear();
             debug_effective_k_rows_ = 0;
@@ -197,6 +201,13 @@ namespace llaminar2
         mutable size_t debug_effective_k_cols_ = 0;
         mutable size_t debug_effective_v_rows_ = 0;
         mutable size_t debug_effective_v_cols_ = 0;
+
+        /// Real-token metadata for fixed-bucket prefill graph replay. The graph
+        /// launch remains bucket-shaped, but dynamic attention/KV metadata must
+        /// expose only rows that are real prompt tokens.
+        bool prefill_replay_params_set_ = false;
+        int prefill_effective_seq_len_ = 0;
+        int prefill_bucket_seq_len_ = 0;
 
         /**
          * @brief Get or create the attention kernel

@@ -9,6 +9,7 @@
 
 #include "ROCmRingKVCacheBase.h"
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include <hip/hip_runtime.h>
 #include <cstring>
@@ -155,7 +156,7 @@ namespace llaminar2
     // Graph Capture Support
     // =========================================================================
 
-    void ROCmRingKVCacheBase::setDynamicHead(int layer, int seq_idx, void * /*gpu_stream*/)
+    void ROCmRingKVCacheBase::setDynamicHead(int layer, int seq_idx, void *gpu_stream)
     {
         if (!d_head_params_ || !h_head_params_)
             return;
@@ -164,9 +165,25 @@ namespace llaminar2
 
         int idx = layer * batch_size_ + seq_idx;
         h_head_params_[idx] = entryHead(layer, seq_idx);
-        // No explicit H2D needed — the graph's captured hipMemcpyAsync reads
-        // from this pinned host buffer on replay. For non-graph mode, the
-        // append path issues its own H2D during execute().
+        if (!gpu_stream)
+            return;
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[ROCmRingKVCacheBase] Refusing to upload dynamic KV head inside HIP graph capture");
+            return;
+        }
+
+        hipError_t err = hipMemcpyAsync(
+            &d_head_params_[idx],
+            &h_head_params_[idx],
+            sizeof(int),
+            hipMemcpyHostToDevice,
+            static_cast<hipStream_t>(gpu_stream));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCacheBase] Failed to upload dynamic KV head: "
+                      << hipGetErrorString(err));
+        }
     }
 
     void ROCmRingKVCacheBase::advanceHead(int layer, int seq_idx, int num_tokens)

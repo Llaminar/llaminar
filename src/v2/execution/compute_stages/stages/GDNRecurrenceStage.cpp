@@ -22,6 +22,7 @@
 #include "GDNRecurrenceStage.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
@@ -124,8 +125,9 @@ namespace llaminar2
     struct GDNRecurrenceStage::GpuEffectiveSeqLenState
     {
         DeviceId device = DeviceId::invalid();   ///< Device that owns device_effective_seq_len.
-        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar captured by H2D memcpy.
+        int *host_effective_seq_len = nullptr;   ///< Pinned host scalar uploaded before capture/replay.
         int *device_effective_seq_len = nullptr; ///< Device scalar read by the recurrence kernel.
+        bool device_value_uploaded = false;       ///< True once the current host scalar is resident.
     };
 
     GDNRecurrenceStage::GDNRecurrenceStage(Params params)
@@ -189,7 +191,10 @@ namespace llaminar2
     {
         bound_workspace_ = workspace;
         if (gpu_effective_seq_len_state_)
+        {
             gpu_effective_seq_len_state_->device_effective_seq_len = nullptr;
+            gpu_effective_seq_len_state_->device_value_uploaded = false;
+        }
         bindKernelWorkspace();
     }
 
@@ -374,6 +379,10 @@ namespace llaminar2
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
         prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
         refreshPinnedEffectiveSeqLen();
+        if (gpu_effective_seq_len_state_)
+            gpu_effective_seq_len_state_->device_value_uploaded = false;
+        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_)
+            (void)(ensureGpuEffectiveSeqLenStateInitialized() && uploadGpuEffectiveSeqLen());
     }
 
     bool GDNRecurrenceStage::supportsPaddedPrefillRealLengthContract() const
@@ -437,6 +446,8 @@ namespace llaminar2
         if (gpu_effective_seq_len_state_)
         {
             gpu_effective_seq_len_state_->device_effective_seq_len = device_effective_seq_len;
+            if (!device_effective_seq_len)
+                gpu_effective_seq_len_state_->device_value_uploaded = false;
             return true;
         }
 
@@ -486,10 +497,21 @@ namespace llaminar2
             return false;
         refreshPinnedEffectiveSeqLen();
 
+        if (isGraphCaptureActive())
+        {
+            if (!gpu_effective_seq_len_state_->device_value_uploaded)
+            {
+                LOG_ERROR("[GDNRecurrenceStage] Effective sequence length scalar was not uploaded before graph capture");
+                return false;
+            }
+            return true;
+        }
+
+        bool uploaded = false;
         if (params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
-            return cuda::uploadRowSelectParam(
+            uploaded = cuda::uploadRowSelectParam(
                 gpu_effective_seq_len_state_->device_effective_seq_len,
                 gpu_effective_seq_len_state_->host_effective_seq_len,
                 gpuStream());
@@ -498,13 +520,14 @@ namespace llaminar2
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
-            return rocm::uploadRowSelectParam(
+            uploaded = rocm::uploadRowSelectParam(
                 gpu_effective_seq_len_state_->device_effective_seq_len,
                 gpu_effective_seq_len_state_->host_effective_seq_len,
                 gpuStream());
 #endif
         }
-        return false;
+        gpu_effective_seq_len_state_->device_value_uploaded = uploaded;
+        return uploaded;
     }
 
     void GDNRecurrenceStage::releaseGpuEffectiveSeqLenState()

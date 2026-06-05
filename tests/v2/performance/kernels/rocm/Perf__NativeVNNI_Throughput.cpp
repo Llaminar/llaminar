@@ -32,13 +32,19 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -169,6 +175,9 @@ namespace
     // All K values are multiples of 32 (minimum block size).
     // Super-block formats (256-element) handle non-256-aligned K via sub-block iteration.
     static const std::vector<GEMVShape> SHAPES = {
+        // Qwen3.5/Qwen3.6 MoE expert FFN decode shapes.
+        {"35BMoE_Expert_GateUp", 512, 2048},
+        {"35BMoE_Expert_Down", 2048, 512},
         // Qwen2.5-0.5B
         {"0.5B_AttnOut", 896, 896},    // Qwen2.5-0.5B attention output projection
         {"0.5B_QKV", 896 * 3, 896},    // Qwen2.5-0.5B attention QKV projection
@@ -184,7 +193,80 @@ namespace
         {"7B_QKV", 3584 * 3, 3584}, // Qwen2.5-7B attention projection
         {"7B_FFN_Up", 18944, 3584}, // Qwen2.5-7B FFN gate/up
         {"7B_FFN_Dn", 3584, 18944}, // Qwen2.5-7B FFN down
+        // Qwen3.6 27B dense / hybrid GDN production shapes.
+        {"Qwen36_FFN_GateUp", 17408, 5120},
+        {"Qwen36_FFN_DownProjection", 5120, 17408},
+        {"Qwen36_GDN_InnerProjection", 10240, 5120},
+        {"Qwen36_GDN_ZProjection", 6144, 5120},
+        {"Qwen36_GDN_TimeProjection", 1024, 5120},
+        {"Qwen36_GDN_OutputProjection", 5120, 6144},
+        {"Qwen36_LM_Head", 248320, 5120},
     };
+
+    static std::string toLower(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        return value;
+    }
+
+    static std::string trim(std::string value)
+    {
+        const auto begin = value.find_first_not_of(" \t\n\r");
+        if (begin == std::string::npos)
+            return {};
+        const auto end = value.find_last_not_of(" \t\n\r");
+        return value.substr(begin, end - begin + 1);
+    }
+
+    static std::string getEnvString(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return {};
+        return trim(raw);
+    }
+
+    static std::optional<int> getEnvInt(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return std::nullopt;
+        return std::atoi(raw);
+    }
+
+    static std::set<std::string> getEnvCsvSet(const char *name)
+    {
+        std::set<std::string> values;
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return values;
+
+        std::stringstream stream(raw);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            token = toLower(trim(token));
+            if (!token.empty())
+                values.insert(token);
+        }
+        return values;
+    }
+
+    static bool shouldRunName(const std::set<std::string> &filters, const std::string &name)
+    {
+        return filters.empty() || filters.count(toLower(name)) > 0;
+    }
+
+    static const NativeVnniFormatInfo &requireNativeVnniInfo(const TensorBase *weights, const std::string &format_name)
+    {
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+        const NativeVnniFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (!info)
+            throw std::runtime_error("ROCm NativeVNNI decode format " + format_name + " did not expose vnniFormatInfo()");
+        return *info;
+    }
 
     // =============================================================================
     // Benchmark result
@@ -550,6 +632,107 @@ namespace
         }
 
         fprintf(stderr, "\n%s\n", table.to_string().c_str());
+#endif
+    }
+
+    TEST_F(NativeVNNIPerfTest, TrainerCsv_CodebookTagged)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device available";
+
+        std::set<std::string> format_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_DECODE_FORMATS");
+        if (format_filters.empty())
+            format_filters.insert("q4_0");
+        std::set<std::string> shape_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_DECODE_SHAPES");
+        if (shape_filters.empty())
+            shape_filters.insert("0.5b_attnout");
+        const int max_cases = std::max(1, getEnvInt("LLAMINAR_ROCM_NVNNI_DECODE_MAX_CASES").value_or(1));
+        const std::string csv_path = getEnvString("LLAMINAR_ROCM_NVNNI_DECODE_CSV");
+
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr) << "Failed to open ROCm NativeVNNI decode CSV: " << csv_path;
+            std::fprintf(csv,
+                         "backend,phase,format,codebook,shape,n,k,weight_bytes,min_us,mean_us,stddev_us,eff_bw_gbs,bw_efficiency,speedup_vs_int8,theoretical_speedup,kernel_efficiency,cosine,correctness_pass\n");
+        }
+
+        int executed_cases = 0;
+        int executed_rows = 0;
+        for (const auto &fmt : ALL_PERF_FORMATS)
+        {
+            if (!shouldRunName(format_filters, fmt.name))
+                continue;
+
+            for (const auto &shape : SHAPES)
+            {
+                if (!shouldRunName(shape_filters, shape.name))
+                    continue;
+                if (executed_cases >= max_cases)
+                    break;
+
+                auto weights = fmt.create(static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
+                const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), fmt.name).codebook_id;
+
+                GpuWeightsCache gpu_w;
+                if (weights)
+                {
+                    std::vector<float> fp32(static_cast<size_t>(shape.N) * shape.K);
+                    weights->to_fp32(fp32.data());
+                    gpu_w.upload(fp32.data(), shape.N, shape.K, 0);
+                }
+
+                const double int8_us = benchmarkINT8Reference(shape, 0);
+                auto r = benchmarkFormat(fmt, shape, int8_us, weights.get(), &gpu_w, 0);
+
+                if (csv)
+                {
+                    std::fprintf(csv,
+                                 "rocm,decode,%s,%u,%s,%d,%d,%.0f,%.3f,%.3f,%.3f,%.3f,%.3f,%.6f,%.6f,%.3f,%.6f,%d\n",
+                                 fmt.name.c_str(),
+                                 static_cast<unsigned>(codebook_id),
+                                 shape.name.c_str(),
+                                 shape.N,
+                                 shape.K,
+                                 r.weight_bytes,
+                                 r.min_us,
+                                 r.mean_us,
+                                 r.stddev_us,
+                                 r.eff_bw_gbps,
+                                 r.bw_efficiency,
+                                 r.speedup_vs_int8,
+                                 r.theoretical_speedup,
+                                 r.kernel_efficiency,
+                                 r.cosine_sim,
+                                 r.correctness_pass ? 1 : 0);
+                    std::fflush(csv);
+                    ++executed_rows;
+                }
+
+                std::fprintf(stderr,
+                             "[ROCmNativeVNNI][DECODE][TRAINER] format=%s codebook=%u shape=%s time_us=%.3f cosine=%.6f speedup_vs_int8=%.3fx\n",
+                             fmt.name.c_str(),
+                             static_cast<unsigned>(codebook_id),
+                             shape.name.c_str(),
+                             r.min_us,
+                             r.cosine_sim,
+                             r.speedup_vs_int8);
+                ASSERT_TRUE(r.correctness_pass)
+                    << fmt.name << "/" << shape.name << " cosine=" << r.cosine_sim;
+                ++executed_cases;
+            }
+        }
+
+        if (csv)
+        {
+            std::fclose(csv);
+            ASSERT_GT(executed_rows, 0) << "ROCm NativeVNNI decode trainer CSV had no rows.";
+        }
+        ASSERT_GT(executed_cases, 0) << "No ROCm NativeVNNI decode trainer cases selected.";
 #endif
     }
 

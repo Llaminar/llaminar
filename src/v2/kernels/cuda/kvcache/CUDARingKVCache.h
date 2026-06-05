@@ -68,6 +68,10 @@ namespace llaminar2
         constexpr const char *BATCH_TAILS = "kvcache_batch_tails";
         /// Array of count values [batch_size × sizeof(int)]
         constexpr const char *BATCH_COUNTS = "kvcache_batch_counts";
+        /// K conversion scratch used by append/read precision adaptation.
+        constexpr const char *CONV_SCRATCH_K = "kvcache_conv_scratch_k";
+        /// V conversion scratch used by append/read precision adaptation.
+        constexpr const char *CONV_SCRATCH_V = "kvcache_conv_scratch_v";
     }
 
     // =========================================================================
@@ -254,6 +258,7 @@ namespace llaminar2
         void *conv_scratch_k_ = nullptr;   ///< Scratch buffer for K conversion
         void *conv_scratch_v_ = nullptr;   ///< Scratch buffer for V conversion
         size_t conv_scratch_capacity_ = 0; ///< Current capacity in bytes (per buffer)
+        bool conv_scratch_workspace_backed_ = false;
     };
 
     // =========================================================================

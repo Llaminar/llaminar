@@ -98,6 +98,7 @@ namespace llaminar2
             hipHostMalloc(&h_dequant_params_, n_layers_ * sizeof(HIPTQDequantDynamicParams),
                           hipHostMallocDefault);
             memset(h_dequant_params_, 0, n_layers_ * sizeof(HIPTQDequantDynamicParams));
+            dequant_params_device_valid_.assign(static_cast<size_t>(n_layers_), 0);
             LOG_DEBUG("ROCmRingKVCacheTQ: graph capture params allocated for " << n_layers_ << " layers");
         }
 
@@ -378,6 +379,8 @@ namespace llaminar2
 
         if (h_dequant_params_)
             std::memset(&h_dequant_params_[layer], 0, sizeof(HIPTQDequantDynamicParams));
+        if (layer >= 0 && layer < static_cast<int>(dequant_params_device_valid_.size()))
+            dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
         if (d_dequant_params_)
         {
             hipError_t err = hipMemsetAsync(&d_dequant_params_[layer], 0,
@@ -518,14 +521,37 @@ namespace llaminar2
             bool ok;
             if (d_dequant_params_ && h_dequant_params_ && stream)
             {
-                // Graph-capturable path: H2D of dequant params + dynamic kernel.
-                h_dequant_params_[layer].ring_pos = (tail + entry.count - 1) % max_seq_len_;
-                h_dequant_params_[layer].out_offset_elems = static_cast<int>((entry.count - 1) * kv_dim_);
-                h_dequant_params_[layer].rope_position =
-                    (rope_theta > 0.0f) ? position_start + entry.count - 1 : 0;
+                // Graph-capturable path: the kernel reads dynamic params from
+                // device memory. Captured execution must not record H2D; params
+                // are pre-uploaded by setDynamicDequantParams().
+                if (isGraphCaptureActive())
+                {
+                    if (layer < 0 ||
+                        layer >= static_cast<int>(dequant_params_device_valid_.size()) ||
+                        !dequant_params_device_valid_[static_cast<size_t>(layer)])
+                    {
+                        LOG_ERROR("[ROCmRingKVCacheTQ::dequant_to_scratch] TQ dequant params were not ready before HIP graph capture");
+                        return false;
+                    }
+                }
+                else
+                {
+                    h_dequant_params_[layer].ring_pos = (tail + entry.count - 1) % max_seq_len_;
+                    h_dequant_params_[layer].out_offset_elems = static_cast<int>((entry.count - 1) * kv_dim_);
+                    h_dequant_params_[layer].rope_position =
+                        (rope_theta > 0.0f) ? position_start + entry.count - 1 : 0;
 
-                hipMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
-                                sizeof(HIPTQDequantDynamicParams), hipMemcpyHostToDevice, stream);
+                    hipError_t copy_err =
+                        hipMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
+                                        sizeof(HIPTQDequantDynamicParams), hipMemcpyHostToDevice, stream);
+                    if (copy_err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmRingKVCacheTQ::dequant_to_scratch] hipMemcpyAsync failed: "
+                                  << hipGetErrorString(copy_err));
+                        return false;
+                    }
+                    dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
+                }
 
                 ok = hip_tq_incremental_single_fp16_dynamic(
                     scratch.d_K, scratch.d_V,
@@ -755,10 +781,59 @@ namespace llaminar2
         if (!d_dequant_params_ || !h_dequant_params_)
             return;
 
-        // The actual params are set in dequant_to_scratch() during the graph-captured path.
-        // setDynamicHead is called before graph replay to ensure the host buffer is ready.
-        // Nothing to do here — the dequant_to_scratch() graph-capturable path
-        // updates h_dequant_params_ and enqueues the H2D.
+        (void)gpu_stream;
+        // Append head params are handled by ROCmRingKVCacheBase. TQ dequant
+        // metadata is prepared through setDynamicDequantParams().
+    }
+
+    void ROCmRingKVCacheTQ::setDynamicDequantParams(
+        int layer, int seq_idx,
+        float rope_theta, int position_start,
+        void *gpu_stream)
+    {
+        if (!d_dequant_params_ || !h_dequant_params_)
+            return;
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+        dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
+
+        const auto &entry = entries_[layer][seq_idx];
+        h_dequant_params_[layer].ring_pos = entry.head;
+        h_dequant_params_[layer].out_offset_elems = entry.count * kv_dim_;
+        h_dequant_params_[layer].rope_position =
+            (rope_theta > 0.0f) ? position_start + entry.count : 0;
+
+        auto *stream = static_cast<hipStream_t>(gpu_stream);
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] Explicit HIP stream required");
+            return;
+        }
+
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        const hipError_t cap_err = hipStreamIsCapturing(stream, &status);
+        if (cap_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] hipStreamIsCapturing failed: "
+                      << hipGetErrorString(cap_err));
+            return;
+        }
+        if (isGraphCaptureActive() || status == hipStreamCaptureStatusActive)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] Refusing to record TQ dequant-param H2D inside HIP graph capture");
+            return;
+        }
+
+        const hipError_t copy_err =
+            hipMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
+                           sizeof(HIPTQDequantDynamicParams), hipMemcpyHostToDevice, stream);
+        if (copy_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] hipMemcpyAsync failed: "
+                      << hipGetErrorString(copy_err));
+            return;
+        }
+        dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
     }
 
     // advanceHead() is now provided by ROCmRingKVCacheBase.

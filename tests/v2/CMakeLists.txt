@@ -1574,6 +1574,20 @@ add_v2_test(V2_Unit_TensorLayout
     MPI_PROCS 1
 )
 
+# Test: NativeVNNI intrinsic format metadata
+# Backend-independent regression for codebook IDs consumed by CUDA/ROCm/CPU sweep generators.
+add_executable(v2_test_native_vnni_format_info unit/tensors/Test__NativeVnniFormatInfo.cpp)
+target_link_libraries(v2_test_native_vnni_format_info
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_NativeVnniFormatInfo
+    COMMAND $<TARGET_FILE:v2_test_native_vnni_format_info>
+    LABELS "V2;Unit;TensorOperations;NativeVNNI;Quantization;Codebook;Regression"
+    MPI_PROCS 1
+)
+
 # Performance: Q16 Fixed-Scale SIMD Quantization
 add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
 target_link_libraries(v2_perf_q16_fixed_scale_simd
@@ -4461,6 +4475,21 @@ add_v2_test(V2_Integration_CUDAHiddenStateRowSelectStage
     LABELS "V2;Integration;CUDA;GraphCapture;RowSelect;LMHead;Phase6;FP32"
     MPI_PROCS 1
 )
+
+if(HAVE_CUDA)
+# Test: CUDA RoPE graph-capture dynamic metadata
+# Verifies contiguous RoPE replay uses pre-uploaded device params and explicit
+# non-contiguous position IDs fail before H2D during graph capture.
+add_executable(v2_integration_cuda_rope_graph_capture_no_h2d integration/kernels/Test__RoPEGraphCaptureNoH2D.cpp)
+target_compile_definitions(v2_integration_cuda_rope_graph_capture_no_h2d PRIVATE GPU_CONTEXT_TEST_BACKEND_CUDA=1)
+target_include_directories(v2_integration_cuda_rope_graph_capture_no_h2d PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(v2_integration_cuda_rope_graph_capture_no_h2d llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Integration_CUDARoPEGraphCaptureNoH2D
+    COMMAND $<TARGET_FILE:v2_integration_cuda_rope_graph_capture_no_h2d>
+    LABELS "V2;Integration;CUDA;GraphCapture;RoPE;NoH2D;FP32"
+    MPI_PROCS 1
+)
+endif()
 
 # Test: CUDA Flash Attention Parity
 # Tests Flash Attention 2 (prefill) and Flash Decoding (decode) CUDA kernels
@@ -9497,6 +9526,26 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm hidden-state row-select graph replay tests")
+
+    # Integration Test: ROCm RoPE graph-capture dynamic metadata
+    # Verifies contiguous RoPE replay uses pre-uploaded device params and explicit
+    # non-contiguous position IDs fail before H2D during graph capture.
+    add_executable(v2_integration_rocm_rope_graph_capture_no_h2d
+        integration/kernels/Test__RoPEGraphCaptureNoH2D.cpp
+    )
+    target_compile_definitions(v2_integration_rocm_rope_graph_capture_no_h2d PRIVATE GPU_CONTEXT_TEST_BACKEND_ROCM=1)
+    target_include_directories(v2_integration_rocm_rope_graph_capture_no_h2d PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(v2_integration_rocm_rope_graph_capture_no_h2d
+        llaminar2_core
+        GTest::gtest
+        GTest::gtest_main
+    )
+    add_v2_test(V2_Integration_ROCmRoPEGraphCaptureNoH2D
+        COMMAND $<TARGET_FILE:v2_integration_rocm_rope_graph_capture_no_h2d>
+        LABELS "V2;Integration;ROCm;GraphCapture;RoPE;NoH2D;FP32;gfx906"
+        MPI_PROCS 1
+    )
+    message(STATUS "V2 Tests: Added ROCm RoPE graph-capture no-H2D tests")
 
     # ROCm ResidualAdd Parity Tests
     # =============================================================================

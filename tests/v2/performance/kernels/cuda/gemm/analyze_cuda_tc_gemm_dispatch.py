@@ -24,25 +24,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-FORMAT_TO_CODEBOOK = {
-    "Q4_0": 0,
-    "IQ4_NL": 4,
-    "Q4_1": 5,
-    "Q5_0": 6,
-    "Q5_1": 7,
-    "Q6_K": 8,
-    "Q3_K": 9,
-    "Q2_K": 10,
-    "IQ3_S": 11,
-    "IQ3_XXS": 12,
-    "IQ2_S": 13,
-    "IQ2_XS": 14,
-    "IQ2_XXS": 15,
-    "IQ1_S": 16,
-    "IQ1_M": 17,
-    "Q8_0": 18,
-}
-CODEBOOK_TO_FORMAT = {v: k for k, v in FORMAT_TO_CODEBOOK.items()}
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from native_vnni_codebooks import CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK, infer_format_from_filename
 
 # M binning: map arbitrary M to nearest swept bucket
 M_BINS = [64, 128, 256, 512]
@@ -111,18 +94,7 @@ def load_rows(paths, format_override=None):
                 elif format_override:
                     fmt = format_override
                 else:
-                    # Try to infer from filename: sweep_final_q4_0.csv → Q4_0
-                    name = p.stem.upper()
-                    for candidate in FORMAT_TO_CODEBOOK:
-                        if candidate.replace("_", "").lower() in name.replace("_", "").lower():
-                            fmt = candidate
-                            break
-                    if not fmt:
-                        # Try harder: sweep_final_iq4_nl → IQ4_NL
-                        for candidate in FORMAT_TO_CODEBOOK:
-                            if candidate.lower().replace("_", "") in name.lower().replace("_", ""):
-                                fmt = candidate
-                                break
+                    fmt = infer_format_from_filename(p)
 
                 if not fmt:
                     print(f"WARNING: Cannot determine format for {p}, skipping row", file=sys.stderr)
@@ -131,6 +103,14 @@ def load_rows(paths, format_override=None):
                 if fmt not in FORMAT_TO_CODEBOOK:
                     print(f"WARNING: Unknown format '{fmt}' in {p}, skipping", file=sys.stderr)
                     continue
+
+                codebook = FORMAT_TO_CODEBOOK[fmt]
+                if "codebook" in raw and raw["codebook"].strip():
+                    csv_codebook = int(raw["codebook"])
+                    if csv_codebook != codebook:
+                        raise SystemExit(
+                            f"codebook mismatch in {p}: format {fmt} maps to {codebook}, CSV row has {csv_codebook}")
+                    codebook = csv_codebook
 
                 m = int(raw["m"])
                 n = int(raw["n"])
@@ -142,7 +122,7 @@ def load_rows(paths, format_override=None):
 
                 rows.append({
                     "format": fmt,
-                    "codebook": FORMAT_TO_CODEBOOK[fmt],
+                    "codebook": codebook,
                     "shape": raw.get("shape", f"{n}x{k}"),
                     "m": m,
                     "m_bin": bin_m(m),
@@ -175,14 +155,18 @@ def load_auto_rows(paths, format_override=None):
                 elif format_override:
                     fmt = format_override
                 else:
-                    name = p.stem.upper()
-                    for candidate in FORMAT_TO_CODEBOOK:
-                        if candidate.replace("_", "").lower() in name.replace("_", "").lower():
-                            fmt = candidate
-                            break
+                    fmt = infer_format_from_filename(p)
 
                 if not fmt or fmt not in FORMAT_TO_CODEBOOK:
                     continue
+
+                codebook = FORMAT_TO_CODEBOOK[fmt]
+                if "codebook" in raw and raw["codebook"].strip():
+                    csv_codebook = int(raw["codebook"])
+                    if csv_codebook != codebook:
+                        raise SystemExit(
+                            f"codebook mismatch in {p}: format {fmt} maps to {codebook}, CSV row has {csv_codebook}")
+                    codebook = csv_codebook
 
                 m = int(raw["m"])
                 n = int(raw["n"])
@@ -191,7 +175,7 @@ def load_auto_rows(paths, format_override=None):
 
                 rows.append({
                     "format": fmt,
-                    "codebook": FORMAT_TO_CODEBOOK[fmt],
+                    "codebook": codebook,
                     "m": m,
                     "m_bin": bin_m(m),
                     "n": n,

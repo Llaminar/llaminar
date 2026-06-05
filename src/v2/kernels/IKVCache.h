@@ -392,20 +392,16 @@ namespace llaminar2
         virtual bool isGraphCaptureReady() const { return false; }
 
         /**
-         * @brief Copy current head position to device buffer for graph replay
+         * @brief Prepare current head position in a device buffer for graph replay
          *
-         * Updates the pinned host buffer with the current ring buffer head
-         * position and issues an H2D copy on the given stream. This ensures
-         * the device buffer has the correct value before the graph replays
-         * the captured ring_append_kernel.
-         *
-         * For graph mode: the captured H2D in the graph also re-reads from
-         * the pinned host buffer, making the explicit copy here a no-op
-         * (but it's needed for stream-only mode without graph capture).
+         * Implementations upload the current ring buffer head position to a
+         * workspace-owned device buffer on the explicit graph stream. Captured
+         * append execution must record the dynamic append kernel only, never an
+         * H2D metadata copy.
          *
          * @param layer Layer index
          * @param seq_idx Sequence index
-         * @param gpu_stream GPU stream for the H2D copy
+         * @param gpu_stream Explicit GPU stream for the pre-capture upload
          */
         virtual void setDynamicHead(int layer, int seq_idx, void *gpu_stream)
         {
@@ -417,10 +413,9 @@ namespace llaminar2
         /**
          * @brief Update device-side dequant params for graph-capturable read.
          *
-         * TQ caches override this to write incremental dequant parameters
-         * (ring_pos, out_offset, rope_position) to a pinned host buffer.
-         * The captured H2D memcpy in the graph re-reads from pinned host
-         * on replay, so the kernel receives updated values.
+         * TQ caches override this to upload incremental dequant parameters
+         * (ring_pos, out_offset, rope_position) to a device buffer before graph
+         * capture/replay. Captured dequant execution must record kernels only.
          *
          * Called from AttentionComputeStage::updateDynamicParams() before
          * graph replay. Not needed for non-TQ caches.

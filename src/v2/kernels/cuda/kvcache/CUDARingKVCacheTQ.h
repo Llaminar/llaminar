@@ -295,6 +295,7 @@ namespace llaminar2
         // Incremental dequant params (TQ-specific, for graph-capturable attention)
         TQDequantDynamicParams *d_dequant_params_ = nullptr; ///< [n_layers_] device
         TQDequantDynamicParams *h_dequant_params_ = nullptr; ///< [n_layers_] pinned host
+        mutable std::vector<uint8_t> dequant_params_device_valid_; ///< Per-layer pre-upload readiness
 
         mutable cudaStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
 

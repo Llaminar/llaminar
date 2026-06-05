@@ -45,9 +45,9 @@ namespace llaminar2
      * @brief Device-side dynamic parameters for TQ incremental dequant.
      *
      * During CUDA graph capture, kernel arguments are baked into the graph.
-     * This struct lives in device memory; the kernel reads from it at
-     * runtime. Between graph replays, the host writes new values to a
-     * pinned shadow buffer and a captured H2D memcpy re-copies them.
+     * This struct lives in device memory; the kernel reads from it at runtime.
+     * Between graph replays, host code uploads new values to that device buffer
+     * before graph launch on the explicit stage stream.
      */
     struct TQDequantDynamicParams
     {
@@ -198,7 +198,7 @@ namespace llaminar2
      *
      * Same as cuda_tq_quantize_fused_ring but ring_pos is read from a
      * device pointer, enabling CUDA graph capture. Between replays,
-     * the host updates the pinned shadow and the captured H2D re-copies.
+     * host code uploads the new scalar before graph launch.
      */
     extern "C" bool cuda_tq_quantize_fused_ring_dynamic(
         const float *d_K_input, const float *d_V_input,
@@ -424,8 +424,8 @@ namespace llaminar2
      *
      * Outputs are BASE pointers (no pre-applied offset). The kernel reads
      * ring_pos, out_offset_elems, and rope_position from d_params, enabling
-     * CUDA graph capture. Between replays, the host updates the pinned
-     * shadow and the captured H2D re-copies.
+     * CUDA graph capture. Between replays, host code uploads new params before
+     * graph launch.
      */
     extern "C" bool cuda_tq_incremental_single_fp16_dynamic(
         __half *d_K_base, __half *d_V_base,

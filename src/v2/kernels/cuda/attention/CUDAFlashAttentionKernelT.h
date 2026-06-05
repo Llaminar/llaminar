@@ -458,7 +458,7 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host memory for graph-captured H2D copy of attention device params
+            /// Pinned host staging for pre-capture attention-param uploads
             attention::AttentionDeviceParams *h_attn_params_ = nullptr;
             int h_attn_params_capacity_ = 0;
             int dynamic_attn_kv_len_ = 0;
@@ -609,7 +609,7 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host memory for graph-captured H2D copy of attention device params
+            /// Pinned host staging for pre-capture attention-param uploads
             attention::AttentionDeviceParams *h_attn_params_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
@@ -749,7 +749,7 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host memory for graph-captured H2D copy of attention device params
+            /// Pinned host staging for pre-capture attention-param uploads
             attention::AttentionDeviceParams *h_attn_params_ = nullptr;
 
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);

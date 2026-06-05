@@ -14,6 +14,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "backends/DeviceId.h"
+#include "../../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -30,6 +31,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <sys/wait.h>
 #include <tuple>
@@ -68,10 +70,14 @@ namespace
          { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
         {"Q4_1", [](size_t n, size_t k)
          { return TestTensorFactory::createQ4_1Random({n, k}); }},
+        {"Q4_K", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ4_KRandom({n, k}); }},
         {"Q5_0", [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_0Random({n, k}); }},
         {"Q5_1", [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_1Random({n, k}); }},
+        {"Q5_K", [](size_t n, size_t k)
+         { return TestTensorFactory::createQ5_KRandom({n, k}); }},
         {"Q6_K", [](size_t n, size_t k)
          { return TestTensorFactory::createQ6_KRandom({n, k}); }},
         {"Q3_K", [](size_t n, size_t k)
@@ -96,6 +102,15 @@ namespace
          { return TestTensorFactory::createQ8_0Random({n, k}); }},
     };
 
+    const NativeVnniFormatInfo &requireNativeVnniInfo(const TensorBase *weights, const std::string &format_name)
+    {
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+        const NativeVnniFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (!info)
+            throw std::runtime_error("CUDA decode sweep format " + format_name + " did not expose vnniFormatInfo()");
+        return *info;
+    }
+
     struct Shape
     {
         std::string name;
@@ -104,6 +119,11 @@ namespace
     };
 
     const std::vector<Shape> kQwenShapes = {
+        // Qwen3.5-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
+        // These are the production hot-path GEMVs for grouped MoE decode and mirror the
+        // CUDA NativeVNNI prefill sweep inventory.
+        {"35BMoE_Expert_GateUp", 512, 2048},
+        {"35BMoE_Expert_Down", 2048, 512},
         {"0.5B_Attn", 896, 896},
         {"0.5B_FFN_Up", 4864, 896},
         {"0.5B_FFN_Down", 896, 4864},
@@ -146,6 +166,10 @@ namespace
         {"7B_TP4_FFN_Up", 4736, 3584},
         {"7B_TP4_FFN_Down", 3584, 4736},
         {"7B_TP4_LM_Head", 38016, 3584},
+        {"9B_Attn", 4096, 4096},
+        {"9B_FFN_Up", 12288, 4096},
+        {"9B_FFN_Down", 4096, 12288},
+        {"9B_LM_Head", 248320, 4096},
         {"14B_Attn", 5120, 5120},
         {"14B_FFN_Up", 13824, 5120},
         {"14B_FFN_Down", 5120, 13824},
@@ -160,6 +184,15 @@ namespace
         {"14B_TP4_FFN_Up", 3456, 5120},
         {"14B_TP4_FFN_Down", 5120, 3456},
         {"14B_TP4_LM_Head", 38016, 5120},
+        // Qwen3.6 27B dense / hybrid GDN production shapes
+        // (d_model=5120, d_ff=17408, GDN qkv/z/time/output projections).
+        {"Qwen36_FFN_GateUp", 17408, 5120},
+        {"Qwen36_FFN_DownProjection", 5120, 17408},
+        {"Qwen36_GDN_InnerProjection", 10240, 5120},
+        {"Qwen36_GDN_ZProjection", 6144, 5120},
+        {"Qwen36_GDN_TimeProjection", 1024, 5120},
+        {"Qwen36_GDN_OutputProjection", 5120, 6144},
+        {"Qwen36_LM_Head", 248320, 5120},
     };
 
     enum class SweepFamily
@@ -570,15 +603,15 @@ namespace
                 candidate.max_kb,
                 candidate.force_two_phase);
 
-            EXPECT_TRUE(weights->ensureOnDevice(device_));
-            auto kernel = KernelFactory::createGemm(weights, DeviceType::CUDA);
+            auto prepared = makeGpuPreparedGemm(weights, device_, "perf.cuda_native_vnni_gemv_sweep.weight");
+            ITensorGemm *kernel = prepared.kernel;
             if (!kernel)
             {
                 cudaNativeVNNIGemvSweep_clearConfig();
-                throw std::runtime_error("KernelFactory::createGemm returned null");
+                throw std::runtime_error("makeGpuPreparedGemm returned null GEMM kernel");
             }
 
-            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
             std::unique_ptr<DeviceWorkspaceManager> workspace;
             if (ws_consumer)
             {
@@ -676,7 +709,7 @@ namespace
         std::FILE *csv = std::fopen(cfg.csv_path.c_str(), "w");
         ASSERT_NE(csv, nullptr) << "Failed to open CSV: " << cfg.csv_path;
         std::fprintf(csv,
-                     "format,shape,n,k,weight_bytes,family,tile_n,cpt,target_waves,mkg,max_kb,force_two_phase,min_us,eff_bw_gbs,pct_peak,is_best\n");
+                     "format,codebook,shape,n,k,weight_bytes,family,tile_n,cpt,target_waves,mkg,max_kb,force_two_phase,min_us,eff_bw_gbs,pct_peak,is_best\n");
 
         int executed_cases = 0;
         int executed_rows = 0;
@@ -696,6 +729,7 @@ namespace
                     break;
 
                 auto weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), format.name).codebook_id;
                 const size_t weight_bytes = weights->size_bytes();
                 const size_t total_bytes = weight_bytes + static_cast<size_t>(shape.k) * sizeof(float) + static_cast<size_t>(shape.n) * sizeof(float);
 
@@ -724,8 +758,10 @@ namespace
                 {
                     const int is_best = (&result == &(*best_it)) ? 1 : 0;
                     std::fprintf(csv,
-                                 "%s,%s,%d,%d,%zu,%s,%d,%d,%d,%d,%d,%d,%.3f,%.1f,%.1f,%d\n",
-                                 format.name.c_str(), shape.name.c_str(), shape.n, shape.k,
+                                 "%s,%u,%s,%d,%d,%zu,%s,%d,%d,%d,%d,%d,%d,%.3f,%.1f,%.1f,%d\n",
+                                 format.name.c_str(),
+                                 static_cast<unsigned>(codebook_id),
+                                 shape.name.c_str(), shape.n, shape.k,
                                  weight_bytes,
                                  familyName(result.candidate.family).c_str(),
                                  result.candidate.tile_n,
@@ -743,8 +779,10 @@ namespace
                 std::fflush(csv);
 
                 std::fprintf(stderr,
-                             "[CUDABlockwiseTC][SWEEP][BEST] format=%s shape=%s family=%s tile=%dx%d waves=%d mkg=%d force_phase=%d time_us=%.3f eff_bw=%.1fGB/s pct_peak=%.1f%%\n",
-                             format.name.c_str(), shape.name.c_str(),
+                             "[CUDABlockwiseTC][SWEEP][BEST] format=%s codebook=%u shape=%s family=%s tile=%dx%d waves=%d mkg=%d force_phase=%d time_us=%.3f eff_bw=%.1fGB/s pct_peak=%.1f%%\n",
+                             format.name.c_str(),
+                             static_cast<unsigned>(codebook_id),
+                             shape.name.c_str(),
                              familyName(best_it->candidate.family).c_str(),
                              best_it->candidate.tile_n,
                              best_it->candidate.cpt,

@@ -13,14 +13,11 @@
 
 #include "../gemm/CUDADeviceWorkspace.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
-#include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
-#include "../../../utils/PerfStatsCollector.h"
 
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -96,36 +93,6 @@ namespace
     void markSynced(llaminar2::ITensor *tensor)
     {
         tensor->transitionTo(llaminar2::TensorCoherenceState::SYNCED);
-    }
-
-    void recordGroupedDecodeCounter(
-        const std::string &name,
-        const char *source,
-        const char *route,
-        llaminar2::DeviceId device,
-        int active_slots,
-        int d_model,
-        int intermediate,
-        int codebook_id,
-        int k_partitions)
-    {
-        if (!llaminar2::PerfStatsCollector::isEnabled())
-            return;
-
-        llaminar2::PerfStatsCollector::addCounter(
-            "kernel",
-            name,
-            1.0,
-            "moe",
-            device.to_string(),
-            llaminar2::PerfStatsCollector::Tags{
-                {"source", source},
-                {"route", route},
-                {"active_slots", std::to_string(active_slots)},
-                {"d_model", std::to_string(d_model)},
-                {"intermediate", std::to_string(intermediate)},
-                {"codebook", std::to_string(codebook_id)},
-                {"k_partitions", std::to_string(k_partitions)}});
     }
 
     int *runtimeTopKExpertIdsDevice(llaminar2::DeviceMoELayerRuntime *runtime_layer)
@@ -221,11 +188,6 @@ extern "C"
         int seq_len, int d_model, int num_experts,
         int device_idx, void *stream);
 
-    bool cudaMoE_route_logits_bf16_gate(
-        const float *hidden, const void *gate_weights, float *logits,
-        int seq_len, int d_model, int num_experts,
-        int device_idx, void *stream);
-
     bool cudaMoE_softmax_topk(
         float *logits, int *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k, bool normalize_weights,
@@ -276,43 +238,9 @@ extern "C"
     bool cudaMoE_scatter_tokens(
         const int *routing_indices, const float *routing_weights,
         int *write_heads, const int *expert_offsets,
-        int *grouped_token_indices, int *original_to_grouped,
-        int *original_expert_ids,
-        float *grouped_weights,
+        int *grouped_token_indices, float *grouped_weights,
         int total_slots, int top_k, int num_experts,
         int device_idx, void *stream);
-
-    bool cudaMoE_scatter_tokens_deterministic(
-        const int *routing_indices, const float *routing_weights,
-        const int *expert_offsets, const int *expert_counts,
-        int *grouped_token_indices, int *original_to_grouped,
-        int *original_expert_ids,
-        float *grouped_weights,
-        int total_slots, int top_k, int num_experts,
-        int device_idx, void *stream);
-
-    bool cudaMoE_group_tokens_small_float(
-        const float *routing_indices, const float *routing_weights,
-        int *expert_counts, int *expert_offsets,
-        int *grouped_token_indices, int *original_to_grouped,
-        int *original_expert_ids,
-        float *grouped_weights,
-        int *active_expert_ids,
-        int total_slots, int num_experts, int top_k,
-        int max_active_experts,
-        int device_idx, void *stream);
-
-    bool cudaMoE_prepare_shared_expert_prefill_group(
-        int *expert_counts,
-        int *expert_offsets,
-        int *grouped_token_indices,
-        int *original_to_grouped,
-        int *original_expert_ids,
-        float *grouped_weights,
-        int *active_expert_ids,
-        int seq_len,
-        int device_idx,
-        void *stream);
 
     bool cudaMoE_gather_expert_fixed(
         const float *hidden, float *batch_buffer,
@@ -398,31 +326,6 @@ extern "C"
         int device_idx,
         void *stream);
 
-    bool cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart(
-        const float *d_hidden,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
-        const llaminar2::DeviceNativeVNNIMatrixDesc *d_down_desc_table,
-        const int *d_expert_ids,
-        const float *d_weights,
-        int8_t *d_hidden_int8,
-        float *d_hidden_scales,
-        float *d_gate_partials,
-        float *d_up_partials,
-        int8_t *d_swiglu_int8,
-        float *d_swiglu_scales,
-        float *d_down_partials,
-        float *d_output,
-        int top_k,
-        int d_model,
-        int intermediate,
-        uint8_t gateup_codebook_id,
-        uint8_t down_codebook_id,
-        int gateup_k_partitions,
-        int down_k_partitions,
-        int device_idx,
-        void *stream);
-
     bool cudaMoE_grouped_prefill_pipeline(
         const float *d_hidden,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
@@ -431,10 +334,7 @@ extern "C"
         const int *d_group_counts,
         const int *d_group_offsets,
         const int *d_group_token_indices,
-        const int *d_group_original_to_grouped,
-        const int *d_group_original_expert_ids,
         const float *d_group_weights,
-        const int *d_active_expert_ids,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
         float *d_scratch_gate,
@@ -442,21 +342,14 @@ extern "C"
         int8_t *d_scratch_swiglu_int8,
         float *d_scratch_swiglu_scales,
         float *d_scratch_down_out,
-        float *d_gate_partials,
-        float *d_up_partials,
-        float *d_down_partials,
         float *d_output,
         int num_experts,
         int d_model,
         int intermediate,
-        int source_tokens,
         int max_tokens_per_expert,
         int total_slots,
-        int active_expert_slots,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
-        int gateup_k_partitions,
-        int down_k_partitions,
         int device_idx,
         void *stream);
 }
@@ -466,32 +359,12 @@ namespace llaminar2
     CUDAMoEKernel::CUDAMoEKernel(int device_ordinal)
         : device_ordinal_(device_ordinal)
     {
-        if (setMoEDevice(device_ordinal_, "CUDAMoEKernel::CUDAMoEKernel"))
-        {
-            cublasHandle_t handle = nullptr;
-            const cublasStatus_t status = cublasCreate(&handle);
-            if (status == CUBLAS_STATUS_SUCCESS)
-            {
-                cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
-                router_cublas_handle_ = handle;
-            }
-            else
-            {
-                LOG_WARN("[CUDAMoEKernel] cuBLAS router handle creation failed: "
-                         << static_cast<int>(status));
-            }
-        }
+        setMoEDevice(device_ordinal_, "CUDAMoEKernel::CUDAMoEKernel");
     }
 
     CUDAMoEKernel::~CUDAMoEKernel()
     {
         releaseDeviceBuffers();
-        if (router_cublas_handle_)
-        {
-            cudaSetDevice(device_ordinal_);
-            cublasDestroy(static_cast<cublasHandle_t>(router_cublas_handle_));
-            router_cublas_handle_ = nullptr;
-        }
     }
 
     void CUDAMoEKernel::resetDynamicState()
@@ -501,100 +374,6 @@ namespace llaminar2
         host_grouped_indices_.clear();
         host_grouped_weights_.clear();
         prepared_num_experts_ = 0;
-        group_active_expert_slots_ = 0;
-    }
-
-    void CUDAMoEKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
-    {
-        if (workspace_ == workspace)
-            return;
-        CUDAKernelBase::bindWorkspace(workspace);
-        clearWorkspaceScratchBindings();
-    }
-
-    bool CUDAMoEKernel::bindWorkspaceBuffer(
-        void **ptr,
-        const char *name,
-        size_t bytes,
-        const char *context)
-    {
-        if (!ptr || !name || bytes == 0)
-            return false;
-        if (!workspace_ || !workspace_->isAllocated())
-        {
-            LOG_ERROR("[CUDAMoEKernel] " << context
-                                         << " requires graph-owned MoE workspace; no workspace is bound");
-            return false;
-        }
-        void *buffer = workspace_->getBuffer(name);
-        const size_t available = workspace_->getBufferSize(name);
-        if (!buffer || available < bytes)
-        {
-            LOG_ERROR("[CUDAMoEKernel] " << context << " missing required workspace buffer '"
-                                         << name << "' (need " << bytes << " bytes, have "
-                                         << available << ")");
-            return false;
-        }
-        *ptr = buffer;
-        scratch_workspace_bound_ = true;
-        return true;
-    }
-
-    void CUDAMoEKernel::clearWorkspaceScratchBindings() noexcept
-    {
-        d_staging_indices_ = nullptr;
-        d_staging_weights_ = nullptr;
-        d_route_logits_ = nullptr;
-        d_route_indices_ = nullptr;
-        d_route_weights_ = nullptr;
-        d_group_int_indices_ = nullptr;
-        d_group_offsets_ = nullptr;
-        d_group_counts_ = nullptr;
-        d_group_token_indices_ = nullptr;
-        d_group_original_to_grouped_ = nullptr;
-        d_group_original_expert_ids_ = nullptr;
-        d_group_write_heads_ = nullptr;
-        d_group_weights_ = nullptr;
-        d_group_active_expert_ids_ = nullptr;
-        d_prefill_A_int8_ = nullptr;
-        d_prefill_A_scales_ = nullptr;
-        d_prefill_swiglu_int8_ = nullptr;
-        d_prefill_swiglu_scales_ = nullptr;
-        d_prefill_gate_ = nullptr;
-        d_prefill_up_ = nullptr;
-        d_decode_hidden_int8_ = nullptr;
-        d_decode_hidden_scales_ = nullptr;
-        d_grouped_gateup_gate_partials_ = nullptr;
-        d_grouped_gateup_up_partials_ = nullptr;
-        d_grouped_down_partials_ = nullptr;
-        d_decode_swiglu_int8_ = nullptr;
-        d_decode_swiglu_scales_ = nullptr;
-        d_grouped_decode_expert_ids_ = nullptr;
-        d_grouped_decode_weights_ = nullptr;
-
-        staging_capacity_ = 0;
-        route_logits_capacity_ = 0;
-        route_topk_capacity_ = 0;
-        group_slots_cap_ = 0;
-        group_experts_cap_ = 0;
-        group_active_expert_slots_ = 0;
-        prefill_slots_cap_ = 0;
-        prefill_d_model_cap_ = 0;
-        prefill_intermediate_cap_ = 0;
-        decode_gateup_topk_cap_ = 0;
-        decode_gateup_d_model_cap_ = 0;
-        grouped_gateup_kpart_active_cap_ = 0;
-        grouped_gateup_kpart_partitions_cap_ = 0;
-        grouped_gateup_kpart_intermediate_cap_ = 0;
-        decode_down_topk_cap_ = 0;
-        decode_down_intermediate_cap_ = 0;
-        grouped_decode_metadata_cap_ = 0;
-        grouped_decode_cached_expert_ids_.clear();
-        grouped_decode_cached_weights_.clear();
-        grouped_down_kpart_partitions_cap_ = 0;
-        grouped_down_kpart_d_model_cap_ = 0;
-        grouped_down_kpart_slots_cap_ = 0;
-        scratch_workspace_bound_ = false;
     }
 
     void CUDAMoEKernel::releaseDeviceBuffers() noexcept
@@ -608,28 +387,18 @@ namespace llaminar2
                 ptr = nullptr;
             }
         };
-        auto release_scratch = [&](auto *&ptr)
-        {
-            if (scratch_workspace_bound_)
-                ptr = nullptr;
-            else
-                release(ptr);
-        };
 
-        release_scratch(d_staging_indices_);
-        release_scratch(d_staging_weights_);
-        release_scratch(d_route_logits_);
-        release_scratch(d_route_indices_);
-        release_scratch(d_route_weights_);
-        release_scratch(d_group_int_indices_);
-        release_scratch(d_group_offsets_);
-        release_scratch(d_group_counts_);
-        release_scratch(d_group_token_indices_);
-        release_scratch(d_group_original_to_grouped_);
-        release_scratch(d_group_original_expert_ids_);
-        release_scratch(d_group_write_heads_);
-        release_scratch(d_group_weights_);
-        release_scratch(d_group_active_expert_ids_);
+        release(d_staging_indices_);
+        release(d_staging_weights_);
+        release(d_route_logits_);
+        release(d_route_indices_);
+        release(d_route_weights_);
+        release(d_group_int_indices_);
+        release(d_group_offsets_);
+        release(d_group_counts_);
+        release(d_group_token_indices_);
+        release(d_group_write_heads_);
+        release(d_group_weights_);
         for (auto &table : grouped_down_desc_tables_)
             release(table.device_descs);
         for (auto &table : grouped_gateup_desc_tables_)
@@ -637,21 +406,17 @@ namespace llaminar2
             release(table.device_gate_descs);
             release(table.device_up_descs);
         }
-        release_scratch(d_prefill_A_int8_);
-        release_scratch(d_prefill_A_scales_);
-        release_scratch(d_prefill_swiglu_int8_);
-        release_scratch(d_prefill_swiglu_scales_);
-        release_scratch(d_prefill_gate_);
-        release_scratch(d_prefill_up_);
-        release_scratch(d_decode_hidden_int8_);
-        release_scratch(d_decode_hidden_scales_);
-        release_scratch(d_grouped_gateup_gate_partials_);
-        release_scratch(d_grouped_gateup_up_partials_);
-        release_scratch(d_grouped_down_partials_);
-        release_scratch(d_decode_swiglu_int8_);
-        release_scratch(d_decode_swiglu_scales_);
-        release_scratch(d_grouped_decode_expert_ids_);
-        release_scratch(d_grouped_decode_weights_);
+        release(d_prefill_A_int8_);
+        release(d_prefill_A_scales_);
+        release(d_prefill_gate_);
+        release(d_prefill_up_);
+        release(d_decode_hidden_int8_);
+        release(d_decode_hidden_scales_);
+        release(d_grouped_gateup_gate_partials_);
+        release(d_grouped_gateup_up_partials_);
+        release(d_grouped_down_partials_);
+        release(d_decode_swiglu_int8_);
+        release(d_decode_swiglu_scales_);
         for (auto &entry : runtime_gateup_pointer_cache_)
         {
             release(entry.d_gate_ptrs);
@@ -668,7 +433,6 @@ namespace llaminar2
         route_topk_capacity_ = 0;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
-        group_active_expert_slots_ = 0;
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
@@ -679,48 +443,63 @@ namespace llaminar2
         grouped_gateup_kpart_intermediate_cap_ = 0;
         decode_down_topk_cap_ = 0;
         decode_down_intermediate_cap_ = 0;
-        grouped_decode_metadata_cap_ = 0;
-        grouped_decode_cached_expert_ids_.clear();
-        grouped_decode_cached_weights_.clear();
         grouped_down_kpart_partitions_cap_ = 0;
         grouped_down_kpart_d_model_cap_ = 0;
-        grouped_down_kpart_slots_cap_ = 0;
         grouped_down_desc_tables_.clear();
         grouped_gateup_desc_tables_.clear();
         runtime_gateup_pointer_cache_.clear();
         runtime_down_pointer_cache_.clear();
-        scratch_workspace_bound_ = false;
     }
 
     bool CUDAMoEKernel::ensureStagingCapacity(int count)
     {
         if (count <= staging_capacity_)
             return true;
-        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_staging_indices_),
-                                 MoEWorkspaceBuffers::STAGING_INDICES,
-                                 static_cast<size_t>(count) * sizeof(int),
-                                 "ensureStagingCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_staging_weights_),
-                                 MoEWorkspaceBuffers::STAGING_WEIGHTS,
-                                 static_cast<size_t>(count) * sizeof(float),
-                                 "ensureStagingCapacity"))
+        if (!setMoEDevice(device_ordinal_, "ensureStagingCapacity"))
+            return false;
+
+        if (d_staging_indices_)
+            cudaFree(d_staging_indices_);
+        if (d_staging_weights_)
+            cudaFree(d_staging_weights_);
+        d_staging_indices_ = nullptr;
+        d_staging_weights_ = nullptr;
+
+        cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_staging_indices_), static_cast<size_t>(count) * sizeof(int));
+        if (err != cudaSuccess)
         {
+            LOG_ERROR("[CUDAMoEKernel] cudaMalloc staging indices failed: " << cudaGetErrorString(err));
             staging_capacity_ = 0;
             return false;
         }
+        err = cudaMalloc(reinterpret_cast<void **>(&d_staging_weights_), static_cast<size_t>(count) * sizeof(float));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel] cudaMalloc staging weights failed: " << cudaGetErrorString(err));
+            cudaFree(d_staging_indices_);
+            d_staging_indices_ = nullptr;
+            staging_capacity_ = 0;
+            return false;
+        }
+
         staging_capacity_ = count;
         return true;
     }
 
     bool CUDAMoEKernel::ensureRouteBufferCapacity(size_t logits_count, size_t topk_count)
     {
+        if (!setMoEDevice(device_ordinal_, "ensureRouteBufferCapacity"))
+            return false;
+
         if (logits_count > route_logits_capacity_)
         {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_logits_),
-                                     MoEWorkspaceBuffers::ROUTE_LOGITS,
-                                     logits_count * sizeof(float),
-                                     "ensureRouteBufferCapacity"))
+            if (d_route_logits_)
+                cudaFree(d_route_logits_);
+            d_route_logits_ = nullptr;
+            cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_route_logits_), logits_count * sizeof(float));
+            if (err != cudaSuccess)
             {
+                LOG_ERROR("[CUDAMoEKernel] cudaMalloc route logits failed: " << cudaGetErrorString(err));
                 route_logits_capacity_ = 0;
                 return false;
             }
@@ -729,15 +508,26 @@ namespace llaminar2
 
         if (topk_count > route_topk_capacity_)
         {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_indices_),
-                                     MoEWorkspaceBuffers::ROUTE_INDICES,
-                                     topk_count * sizeof(int),
-                                     "ensureRouteBufferCapacity") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_route_weights_),
-                                     MoEWorkspaceBuffers::ROUTE_WEIGHTS,
-                                     topk_count * sizeof(float),
-                                     "ensureRouteBufferCapacity"))
+            if (d_route_indices_)
+                cudaFree(d_route_indices_);
+            if (d_route_weights_)
+                cudaFree(d_route_weights_);
+            d_route_indices_ = nullptr;
+            d_route_weights_ = nullptr;
+
+            cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_route_indices_), topk_count * sizeof(int));
+            if (err != cudaSuccess)
             {
+                LOG_ERROR("[CUDAMoEKernel] cudaMalloc route indices failed: " << cudaGetErrorString(err));
+                route_topk_capacity_ = 0;
+                return false;
+            }
+            err = cudaMalloc(reinterpret_cast<void **>(&d_route_weights_), topk_count * sizeof(float));
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAMoEKernel] cudaMalloc route weights failed: " << cudaGetErrorString(err));
+                cudaFree(d_route_indices_);
+                d_route_indices_ = nullptr;
                 route_topk_capacity_ = 0;
                 return false;
             }
@@ -747,127 +537,68 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::routeLogitsCuBLAS(const float *hidden, const float *gate_weights, float *logits,
-                                          int seq_len, int d_model, int num_experts)
-    {
-        void *stream = requireStream("CUDAMoEKernel::routeLogitsCuBLAS");
-        auto handle = static_cast<cublasHandle_t>(router_cublas_handle_);
-        if (!handle)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cuBLAS handle is not available");
-            return false;
-        }
-        if (!hidden || !gate_weights || !logits || seq_len <= 0 || d_model <= 0 || num_experts <= 0)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] invalid pointers or dimensions");
-            return false;
-        }
-        if (!setMoEDevice(device_ordinal_, "routeLogitsCuBLAS"))
-            return false;
-
-        cublasStatus_t status = cublasSetStream(handle, static_cast<cudaStream_t>(stream));
-        if (status != CUBLAS_STATUS_SUCCESS)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasSetStream failed: "
-                      << static_cast<int>(status));
-            return false;
-        }
-
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        status = cublasSgemm(
-            handle,
-            CUBLAS_OP_T,
-            CUBLAS_OP_N,
-            num_experts,
-            seq_len,
-            d_model,
-            &alpha,
-            gate_weights,
-            d_model,
-            hidden,
-            d_model,
-            &beta,
-            logits,
-            num_experts);
-        if (status != CUBLAS_STATUS_SUCCESS)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasSgemm failed: "
-                      << static_cast<int>(status));
-            return false;
-        }
-
-        if (PerfStatsCollector::isEnabled())
-        {
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cuda_moe_router_cublas_prefill_calls",
-                1.0,
-                "moe",
-                deviceId().to_string(),
-                PerfStatsCollector::Tags{
-                    {"seq_len", std::to_string(seq_len)},
-                    {"d_model", std::to_string(d_model)},
-                    {"num_experts", std::to_string(num_experts)}});
-        }
-        return true;
-    }
-
     bool CUDAMoEKernel::ensureGroupingBufferCapacity(int total_slots, int num_experts)
     {
+        if (!setMoEDevice(device_ordinal_, "ensureGroupingBufferCapacity"))
+            return false;
+
         if (total_slots > group_slots_cap_)
         {
-            const size_t slot_count = static_cast<size_t>(total_slots);
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_int_indices_),
-                                     MoEWorkspaceBuffers::GROUP_INT_INDICES,
-                                     slot_count * sizeof(int),
-                                     "ensureGroupingBufferCapacity") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_token_indices_),
-                                     MoEWorkspaceBuffers::GROUP_TOKEN_INDICES,
-                                     slot_count * sizeof(int),
-                                     "ensureGroupingBufferCapacity") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_to_grouped_),
-                                     MoEWorkspaceBuffers::GROUP_ORIGINAL_TO_GROUPED,
-                                     slot_count * sizeof(int),
-                                     "ensureGroupingBufferCapacity") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_original_expert_ids_),
-                                     MoEWorkspaceBuffers::GROUP_ORIGINAL_EXPERT_IDS,
-                                     slot_count * sizeof(int),
-                                     "ensureGroupingBufferCapacity") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_weights_),
-                                     MoEWorkspaceBuffers::GROUP_WEIGHTS,
-                                     slot_count * sizeof(float),
-                                     "ensureGroupingBufferCapacity") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_active_expert_ids_),
-                                     MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS,
-                                     slot_count * sizeof(int),
-                                     "ensureGroupingBufferCapacity"))
+            if (isGraphCaptureActive())
             {
-                group_slots_cap_ = 0;
+                LOG_ERROR("[CUDAMoEKernel] grouping buffer realloc during graph capture (need "
+                          << total_slots << " slots, have " << group_slots_cap_ << ")");
                 return false;
             }
+            if (d_group_int_indices_)
+                cudaFree(d_group_int_indices_);
+            if (d_group_token_indices_)
+                cudaFree(d_group_token_indices_);
+            if (d_group_weights_)
+                cudaFree(d_group_weights_);
+            d_group_int_indices_ = nullptr;
+            d_group_token_indices_ = nullptr;
+            d_group_weights_ = nullptr;
+
+            cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_group_int_indices_), static_cast<size_t>(total_slots) * sizeof(int));
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(reinterpret_cast<void **>(&d_group_token_indices_), static_cast<size_t>(total_slots) * sizeof(int));
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(reinterpret_cast<void **>(&d_group_weights_), static_cast<size_t>(total_slots) * sizeof(float));
+            if (err != cudaSuccess)
+                return false;
             group_slots_cap_ = total_slots;
         }
 
         if (num_experts > group_experts_cap_)
         {
-            const size_t expert_count = static_cast<size_t>(num_experts);
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_offsets_),
-                                     MoEWorkspaceBuffers::GROUP_OFFSETS,
-                                     expert_count * sizeof(int),
-                                     "ensureGroupingBufferCapacity") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_counts_),
-                                     MoEWorkspaceBuffers::GROUP_COUNTS,
-                                     expert_count * sizeof(int),
-                                     "ensureGroupingBufferCapacity") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_write_heads_),
-                                     MoEWorkspaceBuffers::GROUP_WRITE_HEADS,
-                                     expert_count * sizeof(int),
-                                     "ensureGroupingBufferCapacity"))
+            if (isGraphCaptureActive())
             {
-                group_experts_cap_ = 0;
+                LOG_ERROR("[CUDAMoEKernel] expert grouping buffer realloc during graph capture (need "
+                          << num_experts << " experts, have " << group_experts_cap_ << ")");
                 return false;
             }
+            if (d_group_offsets_)
+                cudaFree(d_group_offsets_);
+            if (d_group_counts_)
+                cudaFree(d_group_counts_);
+            if (d_group_write_heads_)
+                cudaFree(d_group_write_heads_);
+            d_group_offsets_ = nullptr;
+            d_group_counts_ = nullptr;
+            d_group_write_heads_ = nullptr;
+
+            cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_group_offsets_), static_cast<size_t>(num_experts) * sizeof(int));
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(reinterpret_cast<void **>(&d_group_counts_), static_cast<size_t>(num_experts) * sizeof(int));
+            if (err != cudaSuccess)
+                return false;
+            err = cudaMalloc(reinterpret_cast<void **>(&d_group_write_heads_), static_cast<size_t>(num_experts) * sizeof(int));
+            if (err != cudaSuccess)
+                return false;
             group_experts_cap_ = num_experts;
         }
 
@@ -882,35 +613,50 @@ namespace llaminar2
         if (!need_realloc)
             return true;
 
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[CUDAMoEKernel] grouped prefill scratch realloc during graph capture (need slots="
+                      << total_slots << " d_model=" << d_model << " intermediate=" << intermediate
+                      << ", have slots=" << prefill_slots_cap_ << " d_model=" << prefill_d_model_cap_
+                      << " intermediate=" << prefill_intermediate_cap_ << ")");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "ensureGroupedPrefillScratchCapacity"))
+            return false;
+
+        auto release = [](auto *&ptr)
+        {
+            if (ptr)
+            {
+                cudaFree(ptr);
+                ptr = nullptr;
+            }
+        };
+        release(d_prefill_A_int8_);
+        release(d_prefill_A_scales_);
+        release(d_prefill_gate_);
+        release(d_prefill_up_);
+
         const int max_dim = std::max(d_model, intermediate);
         const int max_blocks = (max_dim + 31) / 32;
-        const int intermediate_blocks = (intermediate + 31) / 32;
-        const size_t slots = static_cast<size_t>(total_slots);
-        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_A_int8_),
-                                 MoEWorkspaceBuffers::PREFILL_A_INT8,
-                                 slots * static_cast<size_t>(max_dim) * sizeof(int8_t),
-                                 "ensureGroupedPrefillScratchCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_A_scales_),
-                                 MoEWorkspaceBuffers::PREFILL_A_SCALES,
-                                 slots * static_cast<size_t>(max_blocks) * sizeof(float),
-                                 "ensureGroupedPrefillScratchCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_swiglu_int8_),
-                                 MoEWorkspaceBuffers::PREFILL_SWIGLU_INT8,
-                                 slots * static_cast<size_t>(intermediate) * sizeof(int8_t),
-                                 "ensureGroupedPrefillScratchCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_swiglu_scales_),
-                                 MoEWorkspaceBuffers::PREFILL_SWIGLU_SCALES,
-                                 slots * static_cast<size_t>(intermediate_blocks) * sizeof(float),
-                                 "ensureGroupedPrefillScratchCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_gate_),
-                                 MoEWorkspaceBuffers::PREFILL_GATE,
-                                 slots * static_cast<size_t>(max_dim) * sizeof(float),
-                                 "ensureGroupedPrefillScratchCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_prefill_up_),
-                                 MoEWorkspaceBuffers::PREFILL_UP,
-                                 slots * static_cast<size_t>(intermediate) * sizeof(float),
-                                 "ensureGroupedPrefillScratchCapacity"))
+        cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_prefill_A_int8_),
+                                     static_cast<size_t>(total_slots) * max_dim * sizeof(int8_t));
+        if (err == cudaSuccess)
+            err = cudaMalloc(reinterpret_cast<void **>(&d_prefill_A_scales_),
+                             static_cast<size_t>(total_slots) * max_blocks * sizeof(float));
+        if (err == cudaSuccess)
+            err = cudaMalloc(reinterpret_cast<void **>(&d_prefill_gate_),
+                             static_cast<size_t>(total_slots) * max_dim * sizeof(float));
+        if (err == cudaSuccess)
+            err = cudaMalloc(reinterpret_cast<void **>(&d_prefill_up_),
+                             static_cast<size_t>(total_slots) * intermediate * sizeof(float));
+        if (err != cudaSuccess)
         {
+            LOG_ERROR("[CUDAMoEKernel] grouped prefill scratch cudaMalloc failed: " << cudaGetErrorString(err));
+            release(d_prefill_A_int8_);
+            release(d_prefill_A_scales_);
+            release(d_prefill_gate_);
+            release(d_prefill_up_);
             prefill_slots_cap_ = 0;
             prefill_d_model_cap_ = 0;
             prefill_intermediate_cap_ = 0;
@@ -935,16 +681,39 @@ namespace llaminar2
         if (!need_growth)
             return true;
 
-        const int blocks_per_row = d_model / 32;
-        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_decode_hidden_int8_),
-                                 MoEWorkspaceBuffers::DECODE_HIDDEN_INT8,
-                                 static_cast<size_t>(d_model) * sizeof(int8_t),
-                                 "ensureGroupedGateUpDecodeCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_decode_hidden_scales_),
-                                 MoEWorkspaceBuffers::DECODE_HIDDEN_SCALES,
-                                 static_cast<size_t>(blocks_per_row) * sizeof(float),
-                                 "ensureGroupedGateUpDecodeCapacity"))
+        if (isGraphCaptureActive())
         {
+            LOG_ERROR("[CUDAMoEKernel] grouped gate/up decode scratch growth during graph capture (need top_k="
+                      << top_k << " d_model=" << d_model << ", have top_k=" << decode_gateup_topk_cap_
+                      << " d_model=" << decode_gateup_d_model_cap_ << ")");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "ensureGroupedGateUpDecodeCapacity"))
+            return false;
+
+        auto release = [](auto *&ptr)
+        {
+            if (ptr)
+            {
+                cudaFree(ptr);
+                ptr = nullptr;
+            }
+        };
+        release(d_decode_hidden_int8_);
+        release(d_decode_hidden_scales_);
+
+        const int blocks_per_row = d_model / 32;
+        cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_decode_hidden_int8_),
+                                     static_cast<size_t>(d_model) * sizeof(int8_t));
+        if (err == cudaSuccess)
+            err = cudaMalloc(reinterpret_cast<void **>(&d_decode_hidden_scales_),
+                             static_cast<size_t>(blocks_per_row) * sizeof(float));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel] grouped gate/up decode scratch cudaMalloc failed: "
+                      << cudaGetErrorString(err));
+            release(d_decode_hidden_int8_);
+            release(d_decode_hidden_scales_);
             decode_gateup_topk_cap_ = 0;
             decode_gateup_d_model_cap_ = 0;
             return false;
@@ -970,18 +739,41 @@ namespace llaminar2
             grouped_gateup_kpart_intermediate_cap_ >= intermediate)
             return true;
 
+        // Growth requires fresh allocations, which is illegal mid-capture.
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[CUDAMoEKernel] grouped gate/up kpart scratch growth during graph capture (need top_k="
+                      << top_k << " k_partitions=" << k_partitions << " intermediate=" << intermediate << ")");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "ensureGroupedGateUpKPartScratchCapacity"))
+            return false;
+
+        auto release = [](auto *&ptr)
+        {
+            if (ptr)
+            {
+                cudaFree(ptr);
+                ptr = nullptr;
+            }
+        };
+        release(d_grouped_gateup_gate_partials_);
+        release(d_grouped_gateup_up_partials_);
+
         const size_t partial_count = static_cast<size_t>(top_k) *
                                      static_cast<size_t>(k_partitions) *
                                      static_cast<size_t>(intermediate);
-        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gateup_gate_partials_),
-                                 MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,
-                                 partial_count * sizeof(float),
-                                 "ensureGroupedGateUpKPartScratchCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_gateup_up_partials_),
-                                 MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
-                                 partial_count * sizeof(float),
-                                 "ensureGroupedGateUpKPartScratchCapacity"))
+        cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_grouped_gateup_gate_partials_),
+                                     partial_count * sizeof(float));
+        if (err == cudaSuccess)
+            err = cudaMalloc(reinterpret_cast<void **>(&d_grouped_gateup_up_partials_),
+                             partial_count * sizeof(float));
+        if (err != cudaSuccess)
         {
+            LOG_ERROR("[CUDAMoEKernel] grouped gate/up kpart scratch cudaMalloc failed: "
+                      << cudaGetErrorString(err));
+            release(d_grouped_gateup_gate_partials_);
+            release(d_grouped_gateup_up_partials_);
             grouped_gateup_kpart_active_cap_ = 0;
             grouped_gateup_kpart_partitions_cap_ = 0;
             grouped_gateup_kpart_intermediate_cap_ = 0;
@@ -994,10 +786,10 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model, int slots)
+    bool CUDAMoEKernel::ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model)
     {
         // Only the discrete partition counts the kpart launcher accepts are valid.
-        if (d_model <= 0 || slots <= 0 ||
+        if (d_model <= 0 ||
             !(k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
               k_partitions == 16))
             return false;
@@ -1005,31 +797,47 @@ namespace llaminar2
         // Fast path: the existing partial buffer already covers the requested shape.
         if (d_grouped_down_partials_ &&
             grouped_down_kpart_partitions_cap_ >= k_partitions &&
-            grouped_down_kpart_d_model_cap_ >= d_model &&
-            grouped_down_kpart_slots_cap_ >= slots)
+            grouped_down_kpart_d_model_cap_ >= d_model)
             return true;
 
-        // The down partials buffer is [slots][k_partitions][d_model] floats
-        // (the output dimension is d_model, not intermediate). Decode uses one
-        // slot; verifier grouped prefill uses one slot per active routed row.
-        const size_t partial_count =
-            static_cast<size_t>(slots) *
-            static_cast<size_t>(k_partitions) *
-            static_cast<size_t>(d_model);
-        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_down_partials_),
-                                 MoEWorkspaceBuffers::DOWN_PARTIALS,
-                                 partial_count * sizeof(float),
-                                 "ensureGroupedDownKPartScratchCapacity"))
+        // Growth requires a fresh allocation, which is illegal mid-capture.
+        if (isGraphCaptureActive())
         {
+            LOG_ERROR("[CUDAMoEKernel] grouped down kpart scratch growth during graph capture (need k_partitions="
+                      << k_partitions << " d_model=" << d_model << ")");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "ensureGroupedDownKPartScratchCapacity"))
+            return false;
+
+        auto release = [](auto *&ptr)
+        {
+            if (ptr)
+            {
+                cudaFree(ptr);
+                ptr = nullptr;
+            }
+        };
+        release(d_grouped_down_partials_);
+
+        // The down partials buffer is [k_partitions][d_model] floats (the output
+        // dimension is d_model, not intermediate).
+        const size_t partial_count =
+            static_cast<size_t>(k_partitions) * static_cast<size_t>(d_model);
+        cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_grouped_down_partials_),
+                                     partial_count * sizeof(float));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel] grouped down kpart scratch cudaMalloc failed: "
+                      << cudaGetErrorString(err));
+            release(d_grouped_down_partials_);
             grouped_down_kpart_partitions_cap_ = 0;
             grouped_down_kpart_d_model_cap_ = 0;
-            grouped_down_kpart_slots_cap_ = 0;
             return false;
         }
 
         grouped_down_kpart_partitions_cap_ = k_partitions;
         grouped_down_kpart_d_model_cap_ = d_model;
-        grouped_down_kpart_slots_cap_ = slots;
         return true;
     }
 
@@ -1045,16 +853,39 @@ namespace llaminar2
         if (!need_growth)
             return true;
 
-        const int blocks_per_row = intermediate / 32;
-        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_decode_swiglu_int8_),
-                                 MoEWorkspaceBuffers::DECODE_SWIGLU_INT8,
-                                 static_cast<size_t>(top_k) * intermediate * sizeof(int8_t),
-                                 "ensureGroupedDownDecodeCapacity") ||
-            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_decode_swiglu_scales_),
-                                 MoEWorkspaceBuffers::DECODE_SWIGLU_SCALES,
-                                 static_cast<size_t>(top_k) * blocks_per_row * sizeof(float),
-                                 "ensureGroupedDownDecodeCapacity"))
+        if (isGraphCaptureActive())
         {
+            LOG_ERROR("[CUDAMoEKernel] grouped down decode scratch growth during graph capture (need top_k="
+                      << top_k << " intermediate=" << intermediate << ", have top_k=" << decode_down_topk_cap_
+                      << " intermediate=" << decode_down_intermediate_cap_ << ")");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "ensureGroupedDownDecodeCapacity"))
+            return false;
+
+        auto release = [](auto *&ptr)
+        {
+            if (ptr)
+            {
+                cudaFree(ptr);
+                ptr = nullptr;
+            }
+        };
+        release(d_decode_swiglu_int8_);
+        release(d_decode_swiglu_scales_);
+
+        const int blocks_per_row = intermediate / 32;
+        cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&d_decode_swiglu_int8_),
+                                     static_cast<size_t>(top_k) * intermediate * sizeof(int8_t));
+        if (err == cudaSuccess)
+            err = cudaMalloc(reinterpret_cast<void **>(&d_decode_swiglu_scales_),
+                             static_cast<size_t>(top_k) * blocks_per_row * sizeof(float));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel] grouped down decode scratch cudaMalloc failed: "
+                      << cudaGetErrorString(err));
+            release(d_decode_swiglu_int8_);
+            release(d_decode_swiglu_scales_);
             decode_down_topk_cap_ = 0;
             decode_down_intermediate_cap_ = 0;
             return false;
@@ -1062,103 +893,6 @@ namespace llaminar2
 
         decode_down_topk_cap_ = top_k;
         decode_down_intermediate_cap_ = intermediate;
-        return true;
-    }
-
-    bool CUDAMoEKernel::ensureGroupedDecodeMetadata(
-        const int *expert_ids,
-        const float *expert_weights,
-        int num_active,
-        bool include_weights)
-    {
-        if (!expert_ids || num_active <= 0 ||
-            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            (include_weights && !expert_weights))
-            return false;
-
-        auto cached_matches = [&]()
-        {
-            if (static_cast<int>(grouped_decode_cached_expert_ids_.size()) != num_active)
-                return false;
-            for (int i = 0; i < num_active; ++i)
-            {
-                if (grouped_decode_cached_expert_ids_[i] != expert_ids[i])
-                    return false;
-            }
-            if (include_weights)
-            {
-                if (static_cast<int>(grouped_decode_cached_weights_.size()) != num_active)
-                    return false;
-                for (int i = 0; i < num_active; ++i)
-                {
-                    if (grouped_decode_cached_weights_[i] != expert_weights[i])
-                        return false;
-                }
-            }
-            return true;
-        };
-
-        if (num_active <= grouped_decode_metadata_cap_ &&
-            d_grouped_decode_expert_ids_ &&
-            (!include_weights || d_grouped_decode_weights_) &&
-            cached_matches())
-        {
-            return true;
-        }
-
-        if (isGraphCaptureActive())
-        {
-            LOG_ERROR("[CUDAMoEKernel] grouped decode metadata cache miss during graph capture");
-            return false;
-        }
-        if (!setMoEDevice(device_ordinal_, "ensureGroupedDecodeMetadata"))
-            return false;
-
-        if (num_active > grouped_decode_metadata_cap_)
-        {
-            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_decode_expert_ids_),
-                                     MoEWorkspaceBuffers::DECODE_EXPERT_IDS,
-                                     static_cast<size_t>(num_active) * sizeof(int),
-                                     "ensureGroupedDecodeMetadata") ||
-                !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_decode_weights_),
-                                     MoEWorkspaceBuffers::DECODE_WEIGHTS,
-                                     static_cast<size_t>(num_active) * sizeof(float),
-                                     "ensureGroupedDecodeMetadata"))
-            {
-                grouped_decode_metadata_cap_ = 0;
-                grouped_decode_cached_expert_ids_.clear();
-                grouped_decode_cached_weights_.clear();
-                return false;
-            }
-            grouped_decode_metadata_cap_ = num_active;
-        }
-
-        cudaStream_t stream = static_cast<cudaStream_t>(getStream());
-        cudaError_t err = cudaMemcpyAsync(
-            d_grouped_decode_expert_ids_,
-            expert_ids,
-            static_cast<size_t>(num_active) * sizeof(int),
-            cudaMemcpyHostToDevice,
-            stream);
-        if (err == cudaSuccess && include_weights)
-        {
-            err = cudaMemcpyAsync(
-                d_grouped_decode_weights_,
-                expert_weights,
-                static_cast<size_t>(num_active) * sizeof(float),
-                cudaMemcpyHostToDevice,
-                stream);
-        }
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDAMoEKernel] grouped decode metadata upload failed: "
-                      << cudaGetErrorString(err));
-            return false;
-        }
-
-        grouped_decode_cached_expert_ids_.assign(expert_ids, expert_ids + num_active);
-        if (include_weights)
-            grouped_decode_cached_weights_.assign(expert_weights, expert_weights + num_active);
         return true;
     }
 
@@ -1328,7 +1062,7 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::routeCore(const float *hidden, const void *gate_weights, TensorType gate_type,
+    bool CUDAMoEKernel::routeCore(const float *hidden, const float *gate_weights,
                                   int seq_len, int d_model, int num_experts, int top_k,
                                   bool normalize_weights, DeviceRouteBuffers &buffers)
     {
@@ -1346,35 +1080,10 @@ namespace llaminar2
         if (!ensureRouteBufferCapacity(logits_count, topk_count))
             return false;
 
-        switch (gate_type)
-        {
-        case TensorType::FP32:
-            if (seq_len >= 16)
-            {
-                if (!routeLogitsCuBLAS(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
-                                       seq_len, d_model, num_experts))
-                    return false;
-            }
-            else
-            {
-                if (!cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
-                                          seq_len, d_model, num_experts,
-                                          device_ordinal_, getStream()))
-                    return false;
-            }
-            break;
-        case TensorType::BF16:
-            if (!cudaMoE_route_logits_bf16_gate(hidden, gate_weights, d_route_logits_,
-                                                seq_len, d_model, num_experts,
-                                                device_ordinal_, getStream()))
-                return false;
-            break;
-        default:
-            LOG_ERROR("[CUDAMoEKernel] Unsupported MoE router gate tensor type "
-                      << tensorTypeName(gate_type) << " for CUDA routing");
+        if (!cudaMoE_route_logits(hidden, gate_weights, d_route_logits_,
+                                  seq_len, d_model, num_experts,
+                                  device_ordinal_, getStream()))
             return false;
-        }
-
         if (!cudaMoE_softmax_topk(d_route_logits_, d_route_indices_, d_route_weights_,
                                   seq_len, num_experts, top_k, normalize_weights,
                                   device_ordinal_, getStream()))
@@ -1497,29 +1206,15 @@ namespace llaminar2
             !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
             return false;
 
-        if (hidden->native_type() != TensorType::FP32)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] hidden must be FP32, got "
-                      << tensorTypeName(hidden->native_type()));
-            return false;
-        }
-        if (output_indices->native_type() != TensorType::FP32 ||
-            output_weights->native_type() != TensorType::FP32)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] routing outputs must be FP32 tensors");
-            return false;
-        }
-
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        const void *d_gate = gate_weights->gpu_data_ptr();
+        const float *d_gate = static_cast<const float *>(gate_weights->gpu_data_ptr());
         float *d_idx = static_cast<float *>(output_indices->gpu_data_ptr());
         float *d_wt = static_cast<float *>(output_weights->gpu_data_ptr());
         if (!d_hidden || !d_gate || !d_idx || !d_wt)
             return false;
 
         DeviceRouteBuffers buffers;
-        if (!routeCore(d_hidden, d_gate, gate_weights->native_type(),
-                       seq_len, d_model, num_experts, top_k, normalize_weights, buffers))
+        if (!routeCore(d_hidden, d_gate, seq_len, d_model, num_experts, top_k, normalize_weights, buffers))
             return false;
 
         if (!cudaMoE_int_to_float(buffers.d_indices, d_idx, static_cast<int>(buffers.topk_count), device_ordinal_, stream))
@@ -1538,22 +1233,11 @@ namespace llaminar2
         host_result.expert_weights.clear();
         host_result.router_logits.clear();
 
-        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-        err = cudaStreamIsCapturing(cuda_stream, &capture_status);
-        if (err != cudaSuccess)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] cudaStreamIsCapturing failed: "
-                      << cudaGetErrorString(err));
-            return false;
-        }
-        const bool stream_capturing = (capture_status != cudaStreamCaptureStatusNone);
-
         float *h_idx = nullptr;
         float *h_wt = nullptr;
-        const bool needs_decode_host_topk = (seq_len == 1) && !stream_capturing;
+        const bool needs_decode_host_topk = (seq_len == 1);
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-        const bool needs_snapshot_host_topk = !stream_capturing;
+        const bool needs_snapshot_host_topk = true;
 #else
         const bool needs_snapshot_host_topk = false;
 #endif
@@ -1576,20 +1260,17 @@ namespace llaminar2
         }
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-        if (!stream_capturing)
-        {
-            host_result.router_logits.resize(buffers.logits_count);
-            err = cudaMemcpyAsync(host_result.router_logits.data(), buffers.d_logits,
-                                  buffers.logits_count * sizeof(float),
-                                  cudaMemcpyDeviceToHost, cuda_stream);
-            if (err != cudaSuccess)
-                return false;
-        }
+        host_result.router_logits.resize(buffers.logits_count);
+        err = cudaMemcpyAsync(host_result.router_logits.data(), buffers.d_logits,
+                              buffers.logits_count * sizeof(float),
+                              cudaMemcpyDeviceToHost, static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+            return false;
 #endif
 
         if (needs_host_topk || !host_result.router_logits.empty())
         {
-            err = cudaStreamSynchronize(cuda_stream);
+            err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
             if (err != cudaSuccess)
             {
                 LOG_ERROR("[CUDAMoEKernel::routeWithTensors] stream sync failed: " << cudaGetErrorString(err));
@@ -1630,12 +1311,6 @@ namespace llaminar2
         if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
             !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights"))
             return false;
-        if (hidden->native_type() != TensorType::FP32)
-        {
-            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] hidden must be FP32, got "
-                      << tensorTypeName(hidden->native_type()));
-            return false;
-        }
 
         float *legacy_indices = nullptr;
         float *legacy_weights = nullptr;
@@ -1645,42 +1320,21 @@ namespace llaminar2
                 !ensureOutputOnDevice(output_indices, device, stream, "output_indices") ||
                 !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
                 return false;
-            if (output_indices->native_type() != TensorType::FP32 ||
-                output_weights->native_type() != TensorType::FP32)
-            {
-                LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] legacy routing outputs must be FP32 tensors");
-                return false;
-            }
             legacy_indices = static_cast<float *>(output_indices->gpu_data_ptr());
             legacy_weights = static_cast<float *>(output_weights->gpu_data_ptr());
         }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
-        const void *d_gate = gate_weights->gpu_data_ptr();
+        const float *d_gate = static_cast<const float *>(gate_weights->gpu_data_ptr());
         if (!d_hidden || !d_gate)
             return false;
 
         if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), static_cast<size_t>(top_k)))
             return false;
-        switch (gate_weights->native_type())
-        {
-        case TensorType::FP32:
-            if (!cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
-                                      /*seq_len=*/1, d_model, num_experts,
-                                      device_ordinal_, stream))
-                return false;
-            break;
-        case TensorType::BF16:
-            if (!cudaMoE_route_logits_bf16_gate(d_hidden, d_gate, d_route_logits_,
-                                                /*seq_len=*/1, d_model, num_experts,
-                                                device_ordinal_, stream))
-                return false;
-            break;
-        default:
-            LOG_ERROR("[CUDAMoEKernel] Unsupported MoE router gate tensor type "
-                      << tensorTypeName(gate_weights->native_type()) << " for CUDA decode routing");
+        if (!cudaMoE_route_logits(d_hidden, d_gate, d_route_logits_,
+                                  /*seq_len=*/1, d_model, num_experts,
+                                  device_ordinal_, stream))
             return false;
-        }
         if (!cudaMoE_softmax_topk_decode_runtime(d_route_logits_,
                              runtimeTopKExpertIdsDevice(runtime_layer),
                              runtimeTopKWeightsDevice(runtime_layer),
@@ -1819,33 +1473,7 @@ namespace llaminar2
                                                   const float *d_routing_weights,
                                                   int seq_len, int num_experts, int top_k,
                                                   int *d_expert_offsets, int *d_expert_counts,
-                                                  int *d_grouped_token_indices,
-                                                  float *d_grouped_weights)
-    {
-        const int total_slots = seq_len * top_k;
-        if (!ensureGroupingBufferCapacity(total_slots, num_experts))
-            return false;
-        return groupTokensByExpertDeviceMapped(d_routing_indices,
-                                               d_routing_weights,
-                                               seq_len,
-                                               num_experts,
-                                               top_k,
-                                               d_expert_offsets,
-                                               d_expert_counts,
-                                               d_grouped_token_indices,
-                                               d_group_original_to_grouped_,
-                                               d_group_original_expert_ids_,
-                                               d_grouped_weights);
-    }
-
-    bool CUDAMoEKernel::groupTokensByExpertDeviceMapped(const int *d_routing_indices,
-                                                        const float *d_routing_weights,
-                                                        int seq_len, int num_experts, int top_k,
-                                                        int *d_expert_offsets, int *d_expert_counts,
-                                                        int *d_grouped_token_indices,
-                                                        int *d_original_to_grouped,
-                                                        int *d_original_expert_ids,
-                                                        float *d_grouped_weights)
+                                                  int *d_grouped_token_indices, float *d_grouped_weights)
     {
         const int total_slots = seq_len * top_k;
         void *stream = requireStream("CUDAMoEKernel::groupTokensByExpertDevice");
@@ -1857,26 +1485,15 @@ namespace llaminar2
                               static_cast<cudaStream_t>(stream));
         if (err != cudaSuccess)
             return false;
-        err = cudaMemsetAsync(d_original_to_grouped, 0xff, static_cast<size_t>(total_slots) * sizeof(int),
-                              static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-            return false;
-        err = cudaMemsetAsync(d_original_expert_ids, 0xff, static_cast<size_t>(total_slots) * sizeof(int),
-                              static_cast<cudaStream_t>(stream));
-        if (err != cudaSuccess)
-            return false;
         return cudaMoE_count_per_expert(d_routing_indices, d_expert_counts, total_slots,
                                         num_experts, device_ordinal_, stream) &&
                cudaMoE_exclusive_scan(d_expert_counts, d_expert_offsets,
                                        num_experts, device_ordinal_, stream) &&
-               cudaMoE_scatter_tokens_deterministic(d_routing_indices, d_routing_weights,
-                                                    d_expert_offsets, d_expert_counts,
-                                                    d_grouped_token_indices,
-                                                    d_original_to_grouped,
-                                                    d_original_expert_ids,
-                                                    d_grouped_weights,
-                                                    total_slots, top_k, num_experts,
-                                                    device_ordinal_, stream);
+               cudaMoE_scatter_tokens(d_routing_indices, d_routing_weights,
+                                      d_group_write_heads_, d_expert_offsets,
+                                      d_grouped_token_indices, d_grouped_weights,
+                                      total_slots, top_k, num_experts,
+                                      device_ordinal_, stream);
     }
 
     bool CUDAMoEKernel::prepareExpertGroups(ITensor *routing_indices, ITensor *routing_weights,
@@ -1899,14 +1516,10 @@ namespace llaminar2
 
         if (!cudaMoE_float_to_int(d_float_indices, d_group_int_indices_, total_slots, device_ordinal_, stream))
             return false;
-        group_active_expert_slots_ = 0;
-        if (!groupTokensByExpertDeviceMapped(d_group_int_indices_, d_float_weights,
-                                             seq_len, num_experts, top_k,
-                                             d_group_offsets_, d_group_counts_,
-                                             d_group_token_indices_,
-                                             d_group_original_to_grouped_,
-                                             d_group_original_expert_ids_,
-                                             d_group_weights_))
+        if (!groupTokensByExpertDevice(d_group_int_indices_, d_float_weights,
+                                       seq_len, num_experts, top_k,
+                                       d_group_offsets_, d_group_counts_,
+                                       d_group_token_indices_, d_group_weights_))
             return false;
 
         host_expert_counts_.resize(num_experts);
@@ -2131,112 +1744,15 @@ namespace llaminar2
         if (!d_float_indices || !d_float_weights)
             return false;
 
-        const bool use_small_grouping =
-            total_slots <= 64 &&
-            num_experts <= 256 &&
-            top_k <= 16;
-        if (use_small_grouping)
-        {
-            const int active_expert_slots = std::min(total_slots, num_experts);
-            if (!cudaMoE_group_tokens_small_float(
-                    d_float_indices,
-                    d_float_weights,
-                    d_group_counts_,
-                    d_group_offsets_,
-                    d_group_token_indices_,
-                    d_group_original_to_grouped_,
-                    d_group_original_expert_ids_,
-                    d_group_weights_,
-                    d_group_active_expert_ids_,
-                    total_slots,
-                    num_experts,
-                    top_k,
-                    active_expert_slots,
-                    device_ordinal_,
-                    stream))
-            {
-                LOG_ERROR("[CUDAMoEKernel::prepareExpertGroupsAsync] small-M grouping failed");
-                group_active_expert_slots_ = 0;
-                return false;
-            }
-
-            group_active_expert_slots_ = active_expert_slots;
-            prepared_num_experts_ = num_experts;
-            if (PerfStatsCollector::isEnabled())
-            {
-                PerfStatsCollector::addCounter(
-                    "kernel",
-                    "cuda_moe_small_prefill_grouping_calls",
-                    1.0,
-                    "moe",
-                    device.to_string(),
-                    PerfStatsCollector::Tags{
-                        {"total_slots", std::to_string(total_slots)},
-                        {"num_experts", std::to_string(num_experts)},
-                        {"top_k", std::to_string(top_k)}});
-            }
-            return true;
-        }
-
-        group_active_expert_slots_ = 0;
         if (!cudaMoE_float_to_int(d_float_indices, d_group_int_indices_, total_slots, device_ordinal_, stream))
             return false;
-        if (!groupTokensByExpertDeviceMapped(d_group_int_indices_, d_float_weights,
-                                             seq_len, num_experts, top_k,
-                                             d_group_offsets_, d_group_counts_,
-                                             d_group_token_indices_,
-                                             d_group_original_to_grouped_,
-                                             d_group_original_expert_ids_,
-                                             d_group_weights_))
+        if (!groupTokensByExpertDevice(d_group_int_indices_, d_float_weights,
+                                       seq_len, num_experts, top_k,
+                                       d_group_offsets_, d_group_counts_,
+                                       d_group_token_indices_, d_group_weights_))
             return false;
 
         prepared_num_experts_ = num_experts;
-        return true;
-    }
-
-    bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(int seq_len)
-    {
-        if (seq_len <= 0)
-            return false;
-        void *stream = requireStream("CUDAMoEKernel::prepareSharedExpertPrefillGroup");
-        const DeviceId device = deviceId();
-        if (!ensureGroupingBufferCapacity(seq_len, 1))
-            return false;
-
-        if (!setMoEDevice(device_ordinal_, "prepareSharedExpertPrefillGroup"))
-            return false;
-
-        if (!cudaMoE_prepare_shared_expert_prefill_group(
-                d_group_counts_,
-                d_group_offsets_,
-                d_group_token_indices_,
-                d_group_original_to_grouped_,
-                d_group_original_expert_ids_,
-                d_group_weights_,
-                d_group_active_expert_ids_,
-                seq_len,
-                device_ordinal_,
-                stream))
-        {
-            group_active_expert_slots_ = 0;
-            return false;
-        }
-
-        group_active_expert_slots_ = 1;
-        prepared_num_experts_ = 1;
-        if (PerfStatsCollector::isEnabled())
-        {
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cuda_moe_shared_expert_prefill_group_calls",
-                1.0,
-                "moe",
-                device.to_string(),
-                PerfStatsCollector::Tags{
-                    {"seq_len", std::to_string(seq_len)},
-                    {"active_expert_slots", "1"},
-                    {"top_k", "1"}});
-        }
         return true;
     }
 
@@ -2276,54 +1792,26 @@ namespace llaminar2
         const DeviceId device = deviceId();
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
-        const int active_expert_slots = group_active_expert_slots_;
-        if (active_expert_slots > 0 && !d_group_active_expert_ids_)
-        {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] compact active expert list missing");
-            return false;
-        }
         if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
             !ensureTensorOnDevice(hidden, device, stream, "hidden") ||
             !ensureOutputOnDevice(output, device, stream, "output"))
             return false;
-        const int selected_tile_m = debugEnv().gemm.cuda_moe_prefill_tile_m == 0
-                                        ? (seq_len <= 2 ? 2 : (seq_len <= 4 ? 4 : 16))
-                                        : debugEnv().gemm.cuda_moe_prefill_tile_m;
-        const int selected_tile_n = selected_tile_m <= 2 ? 64 : 128;
-        const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_gateup_kpart_swiglu =
-            debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-            debugEnv().gemm.cuda_moe_prefill_fuse_swiglu &&
-            active_expert_slots > 0 &&
-            selected_tile_m <= 4 &&
-            seq_len <= 4;
-        const bool use_down_kpart_prefill =
-            debugEnv().gemm.cuda_moe_down_kpart_decode &&
-            active_expert_slots > 0 &&
-            selected_tile_m <= 4 &&
-            seq_len <= 4;
-        const bool use_down_token_direct_prefill =
-            use_down_kpart_prefill &&
-            seq_len <= 4 &&
-            top_k <= 16;
-        if (use_gateup_kpart_swiglu &&
-            !ensureGroupedGateUpKPartScratchCapacity(total_slots, gateup_k_partitions, intermediate))
-        {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] verifier small-M split-K gate/up scratch unavailable");
-            return false;
-        }
-        if (use_down_kpart_prefill &&
-            !ensureGroupedDownKPartScratchCapacity(down_k_partitions, d_model, total_slots))
-        {
-            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] verifier small-M split-K down scratch unavailable");
-            return false;
-        }
 
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
         if (!d_hidden || !d_output)
             return false;
+
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        cudaError_t err = cudaMemsetAsync(d_output, 0,
+                                          static_cast<size_t>(seq_len) * d_model * sizeof(float),
+                                          cuda_stream);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel::executeGroupedPrefillPipeline] output memset failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
 
         const bool ok = cudaMoE_grouped_prefill_pipeline(
             d_hidden,
@@ -2333,34 +1821,22 @@ namespace llaminar2
             d_group_counts_,
             d_group_offsets_,
             d_group_token_indices_,
-            d_group_original_to_grouped_,
-            d_group_original_expert_ids_,
             d_group_weights_,
-            d_group_active_expert_ids_,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
             d_prefill_gate_,
             d_prefill_up_,
-            // The fused gate/up epilogue reads A while writing SwiGLU quant output,
-            // so SwiGLU scratch must not alias d_prefill_A_*.
-            d_prefill_swiglu_int8_,
-            d_prefill_swiglu_scales_,
+            d_prefill_A_int8_,
+            d_prefill_A_scales_,
             d_prefill_gate_,
-            use_gateup_kpart_swiglu ? d_grouped_gateup_gate_partials_ : nullptr,
-            use_gateup_kpart_swiglu ? d_grouped_gateup_up_partials_ : nullptr,
-            use_down_kpart_prefill ? d_grouped_down_partials_ : nullptr,
             d_output,
             num_experts,
             d_model,
             intermediate,
-            seq_len,
             max_tokens_per_expert,
             total_slots,
-            active_expert_slots,
             gateup_table.codebook_id,
             down_table.codebook_id,
-            gateup_k_partitions,
-            down_k_partitions,
             device_ordinal_,
             stream);
         if (!ok)
@@ -2370,345 +1846,7 @@ namespace llaminar2
         }
 
         markDeviceWritten(output, device, stream);
-        if (PerfStatsCollector::isEnabled())
-        {
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cuda_moe_grouped_prefill_swiglu_path_calls",
-                1.0,
-                "moe",
-                device.to_string(),
-                PerfStatsCollector::Tags{
-                    {"swiglu_path", debugEnv().gemm.cuda_moe_prefill_fuse_swiglu ? "fused" : "split"},
-                    {"total_slots", std::to_string(total_slots)},
-                    {"seq_len", std::to_string(seq_len)},
-                    {"active_expert_slots", std::to_string(active_expert_slots)},
-                    {"activation_quant_rows", std::to_string(seq_len)},
-                    {"num_experts", std::to_string(num_experts)},
-                    {"tile_m", std::to_string(selected_tile_m)},
-                    {"tile_n", std::to_string(selected_tile_n)},
-                    {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"},
-                    {"down_route", use_down_kpart_prefill ? "kpart_prefill" : "serial"},
-                    {"down_accumulation", use_down_token_direct_prefill ? "token_direct" : "slot_scatter"}});
-        }
-        if (PerfStatsCollector::isEnabled() && active_expert_slots > 0)
-        {
-            PerfStatsCollector::addCounter(
-                "kernel",
-                "cuda_moe_grouped_prefill_active_expert_grid_calls",
-                1.0,
-                "moe",
-                device.to_string(),
-                PerfStatsCollector::Tags{
-                    {"total_slots", std::to_string(total_slots)},
-                    {"seq_len", std::to_string(seq_len)},
-                    {"active_expert_slots", std::to_string(active_expert_slots)},
-                    {"num_experts", std::to_string(num_experts)},
-                    {"tile_m", std::to_string(selected_tile_m)},
-                    {"tile_n", std::to_string(selected_tile_n)},
-                    {"swiglu_path", debugEnv().gemm.cuda_moe_prefill_fuse_swiglu ? "fused" : "split"},
-                    {"gateup_route", use_gateup_kpart_swiglu ? "kpart_swiglu" : "serial"},
-                    {"down_route", use_down_kpart_prefill ? "kpart_prefill" : "serial"}});
-        }
         return true;
-    }
-
-    bool CUDAMoEKernel::groupedExpertGateUpDecodeFromTable(
-        const TensorBase *input,
-        const int *expert_ids,
-        int table_id,
-        int num_active,
-        ITensor *const *gate_outputs,
-        ITensor *const *up_outputs,
-        int d_model,
-        int intermediate)
-    {
-        if (!input || !expert_ids || table_id < 0 || num_active <= 0 ||
-            !gate_outputs || !up_outputs || d_model <= 0 || intermediate <= 0)
-            return false;
-        if (num_active > static_cast<int>(kDeviceMoEMaxTopK) ||
-            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            (d_model % 32) != 0)
-            return false;
-        if (table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()))
-            return false;
-
-        const auto &table = grouped_gateup_desc_tables_[table_id];
-        if (!table.valid || !table.device_gate_descs || !table.device_up_descs ||
-            table.num_experts <= 0 || table.d_model != d_model ||
-            table.intermediate != intermediate)
-        {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] descriptor table mismatch");
-            return false;
-        }
-        for (int slot = 0; slot < num_active; ++slot)
-        {
-            if (expert_ids[slot] < 0 || expert_ids[slot] >= table.num_experts)
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] invalid expert id "
-                          << expert_ids[slot] << " at slot " << slot);
-                return false;
-            }
-        }
-
-        void *stream = requireStream("CUDAMoEKernel::groupedExpertGateUpDecodeFromTable");
-        const DeviceId device = deviceId();
-        if (!ensureGroupedGateUpDecodeCapacity(num_active, d_model) ||
-            !ensureGroupedDecodeMetadata(expert_ids, nullptr, num_active, false))
-            return false;
-
-        const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-                               ensureGroupedGateUpKPartScratchCapacity(num_active, k_partitions, intermediate);
-
-        if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromTable"))
-            return false;
-
-        const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
-        if (!d_hidden)
-        {
-            if (isGraphCaptureActive())
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] input upload required during graph capture");
-                return false;
-            }
-            if (!const_cast<TensorBase *>(input)->ensureOnDevice(device, stream))
-                return false;
-            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
-        }
-
-        std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
-        std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
-        for (int slot = 0; slot < num_active; ++slot)
-        {
-            if (!gate_outputs[slot] || !up_outputs[slot])
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] null output tensor for slot "
-                          << slot);
-                return false;
-            }
-            if ((!gate_outputs[slot]->gpu_data_ptr() || !up_outputs[slot]->gpu_data_ptr()) &&
-                isGraphCaptureActive())
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] output allocation required during graph capture");
-                return false;
-            }
-            if (!ensureOutputOnDevice(gate_outputs[slot], device, stream, "gate_output") ||
-                !ensureOutputOnDevice(up_outputs[slot], device, stream, "up_output"))
-                return false;
-
-            gate_ptrs[slot] = static_cast<float *>(gate_outputs[slot]->gpu_data_ptr());
-            up_ptrs[slot] = static_cast<float *>(up_outputs[slot]->gpu_data_ptr());
-            if (!gate_ptrs[slot] || !up_ptrs[slot])
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] missing output device pointer for slot "
-                          << slot);
-                return false;
-            }
-        }
-
-        float **d_gate_ptrs = nullptr;
-        float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(table_id, num_active, gate_ptrs, up_ptrs,
-                                              &d_gate_ptrs, &d_up_ptrs))
-            return false;
-
-        const bool ok = use_kpart
-                            ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_grouped_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  d_grouped_gateup_gate_partials_,
-                                  d_grouped_gateup_up_partials_,
-                                  num_active,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  k_partitions,
-                                  device_ordinal_,
-                                  stream)
-                            : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                  d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
-                                  d_grouped_decode_expert_ids_,
-                                  d_gate_ptrs,
-                                  d_up_ptrs,
-                                  d_decode_hidden_int8_,
-                                  d_decode_hidden_scales_,
-                                  num_active,
-                                  intermediate,
-                                  d_model,
-                                  table.codebook_id,
-                                  device_ordinal_,
-                                  stream);
-
-        if (ok)
-        {
-            for (int slot = 0; slot < num_active; ++slot)
-            {
-                markDeviceWritten(gate_outputs[slot], device, stream);
-                markDeviceWritten(up_outputs[slot], device, stream);
-            }
-            recordGroupedDecodeCounter(
-                "cuda_moe_grouped_decode_gateup_calls",
-                "table",
-                use_kpart ? "kpart" : "serial",
-                device,
-                num_active,
-                d_model,
-                intermediate,
-                table.codebook_id,
-                use_kpart ? k_partitions : 1);
-        }
-        return ok;
-    }
-
-    bool CUDAMoEKernel::groupedExpertDownDecodeFromTable(
-        ITensor *const *gate_tensors,
-        ITensor *const *up_tensors,
-        const int *expert_ids,
-        const float *expert_weights,
-        int table_id,
-        int num_active,
-        ITensor *output,
-        int d_model,
-        int intermediate)
-    {
-        if (!gate_tensors || !up_tensors || !expert_ids || !expert_weights || !output ||
-            table_id < 0 || num_active <= 0 || d_model <= 0 || intermediate <= 0)
-            return false;
-        if (num_active > static_cast<int>(kDeviceMoEMaxTopK) ||
-            num_active > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            (intermediate % 32) != 0)
-            return false;
-        if (table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
-            return false;
-
-        const auto &table = grouped_down_desc_tables_[table_id];
-        if (!table.valid || !table.device_descs || table.num_experts <= 0 ||
-            table.d_model != d_model || table.intermediate != intermediate)
-        {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] descriptor table mismatch");
-            return false;
-        }
-        for (int slot = 0; slot < num_active; ++slot)
-        {
-            if (expert_ids[slot] < 0 || expert_ids[slot] >= table.num_experts)
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] invalid expert id "
-                          << expert_ids[slot] << " at slot " << slot);
-                return false;
-            }
-        }
-
-        void *stream = requireStream("CUDAMoEKernel::groupedExpertDownDecodeFromTable");
-        const DeviceId device = deviceId();
-        if (!ensureGroupedDownDecodeCapacity(num_active, intermediate) ||
-            !ensureGroupedDecodeMetadata(expert_ids, expert_weights, num_active, true))
-            return false;
-        if (!setMoEDevice(device_ordinal_, "groupedExpertDownDecodeFromTable"))
-            return false;
-
-        std::array<const float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
-        std::array<const float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
-        for (int slot = 0; slot < num_active; ++slot)
-        {
-            if (!gate_tensors[slot] || !up_tensors[slot])
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] null gate/up tensor for slot "
-                          << slot);
-                return false;
-            }
-            gate_ptrs[slot] = static_cast<const float *>(gate_tensors[slot]->gpu_data_ptr());
-            up_ptrs[slot] = static_cast<const float *>(up_tensors[slot]->gpu_data_ptr());
-            if (!gate_ptrs[slot] || !up_ptrs[slot])
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] missing gate/up device pointer for slot "
-                          << slot);
-                return false;
-            }
-        }
-
-        if (!output->gpu_data_ptr() && isGraphCaptureActive())
-        {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] output allocation required during graph capture");
-            return false;
-        }
-        if (!ensureOutputOnDevice(output, device, stream, "moe_output"))
-            return false;
-
-        const float **d_gate_ptrs = nullptr;
-        const float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(table_id, num_active, gate_ptrs, up_ptrs,
-                                            &d_gate_ptrs, &d_up_ptrs))
-            return false;
-
-        const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode &&
-                               ensureGroupedDownKPartScratchCapacity(k_partitions, d_model);
-
-        float *d_output = static_cast<float *>(output->gpu_data_ptr());
-        if (!d_output)
-        {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] missing output device pointer");
-            return false;
-        }
-
-        const bool ok = use_kpart
-            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_grouped_decode_expert_ids_,
-                  d_grouped_decode_weights_,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_grouped_down_partials_,
-                  d_output,
-                  num_active,
-                  d_model,
-                  intermediate,
-                  table.codebook_id,
-                  k_partitions,
-                  device_ordinal_,
-                  stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                  d_gate_ptrs,
-                  d_up_ptrs,
-                  table.device_descs,
-                  d_grouped_decode_expert_ids_,
-                  d_grouped_decode_weights_,
-                  d_decode_swiglu_int8_,
-                  d_decode_swiglu_scales_,
-                  d_output,
-                  num_active,
-                  d_model,
-                  intermediate,
-                  table.codebook_id,
-                  device_ordinal_,
-                  stream);
-
-        if (ok)
-        {
-            markDeviceWritten(output, device, stream);
-            recordGroupedDecodeCounter(
-                "cuda_moe_grouped_decode_down_calls",
-                "table",
-                use_kpart ? "kpart" : "serial",
-                device,
-                num_active,
-                d_model,
-                intermediate,
-                table.codebook_id,
-                use_kpart ? k_partitions : 1);
-        }
-        return ok;
     }
 
     bool CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime(
@@ -2853,16 +1991,6 @@ namespace llaminar2
                 markDeviceWritten(gate_outputs[slot], device, stream);
                 markDeviceWritten(up_outputs[slot], device, stream);
             }
-            recordGroupedDecodeCounter(
-                "cuda_moe_grouped_decode_gateup_calls",
-                "runtime",
-                use_kpart ? "kpart" : "serial",
-                device,
-                top_k,
-                d_model,
-                intermediate,
-                table.codebook_id,
-                use_kpart ? k_partitions : 1);
         }
         return ok;
     }
@@ -2987,146 +2115,7 @@ namespace llaminar2
                   stream);
 
         if (ok)
-        {
             markDeviceWritten(output, device, stream);
-            recordGroupedDecodeCounter(
-                "cuda_moe_grouped_decode_down_calls",
-                "runtime",
-                use_kpart ? "kpart" : "serial",
-                device,
-                top_k,
-                d_model,
-                intermediate,
-                table.codebook_id,
-                use_kpart ? k_partitions : 1);
-        }
-        return ok;
-    }
-
-    bool CUDAMoEKernel::groupedExpertDecodeFromRuntime(
-        DeviceMoELayerRuntime *runtime_layer,
-        const TensorBase *input,
-        int gateup_table_id,
-        int down_table_id,
-        int top_k,
-        ITensor *output,
-        int d_model,
-        int intermediate)
-    {
-        if (!runtime_layer || !input || !output ||
-            gateup_table_id < 0 || down_table_id < 0 ||
-            top_k <= 0 || d_model <= 0 || intermediate <= 0)
-            return false;
-        if (top_k > static_cast<int>(kDeviceMoEMaxTopK) ||
-            top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
-            (d_model % 32) != 0 || (intermediate % 32) != 0)
-            return false;
-        if (gateup_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
-            down_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
-            return false;
-
-        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
-        const auto &down_table = grouped_down_desc_tables_[down_table_id];
-        if (!gateup_table.valid || !gateup_table.device_gate_descs || !gateup_table.device_up_descs ||
-            gateup_table.num_experts <= 0 || gateup_table.d_model != d_model ||
-            gateup_table.intermediate != intermediate)
-        {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] gate/up descriptor table mismatch");
-            return false;
-        }
-        if (!down_table.valid || !down_table.device_descs || down_table.num_experts <= 0 ||
-            down_table.d_model != d_model || down_table.intermediate != intermediate ||
-            down_table.num_experts != gateup_table.num_experts)
-        {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] down descriptor table mismatch");
-            return false;
-        }
-
-        const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        if (!debugEnv().gemm.cuda_moe_gateup_kpart_decode ||
-            !debugEnv().gemm.cuda_moe_down_kpart_decode)
-            return false;
-
-        void *stream = requireStream("CUDAMoEKernel::groupedExpertDecodeFromRuntime");
-        const DeviceId device = deviceId();
-        if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model) ||
-            !ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate) ||
-            !ensureGroupedDownDecodeCapacity(top_k, intermediate) ||
-            !ensureGroupedDownKPartScratchCapacity(down_k_partitions, d_model))
-            return false;
-        if (!setMoEDevice(device_ordinal_, "groupedExpertDecodeFromRuntime"))
-            return false;
-
-        const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
-        if (!d_hidden)
-        {
-            if (isGraphCaptureActive())
-            {
-                LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] input upload required during graph capture");
-                return false;
-            }
-            if (!const_cast<TensorBase *>(input)->ensureOnDevice(device, stream))
-                return false;
-            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
-        }
-
-        if (!output->gpu_data_ptr() && isGraphCaptureActive())
-        {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] output allocation required during graph capture");
-            return false;
-        }
-        if (!ensureOutputOnDevice(output, device, stream, "moe_output"))
-            return false;
-
-        const int *d_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
-        const float *d_weights = runtimeTopKWeightsDevice(runtime_layer);
-        float *d_output = static_cast<float *>(output->gpu_data_ptr());
-        if (!d_hidden || !d_expert_ids || !d_weights || !d_output)
-        {
-            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] missing runtime/input/output device pointer");
-            return false;
-        }
-
-        const bool ok = cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart(
-            d_hidden,
-            gateup_table.device_gate_descs,
-            gateup_table.device_up_descs,
-            down_table.device_descs,
-            d_expert_ids,
-            d_weights,
-            d_decode_hidden_int8_,
-            d_decode_hidden_scales_,
-            d_grouped_gateup_gate_partials_,
-            d_grouped_gateup_up_partials_,
-            d_decode_swiglu_int8_,
-            d_decode_swiglu_scales_,
-            d_grouped_down_partials_,
-            d_output,
-            top_k,
-            d_model,
-            intermediate,
-            gateup_table.codebook_id,
-            down_table.codebook_id,
-            gateup_k_partitions,
-            down_k_partitions,
-            device_ordinal_,
-            stream);
-
-        if (ok)
-        {
-            markDeviceWritten(output, device, stream);
-            recordGroupedDecodeCounter(
-                "cuda_moe_grouped_decode_fused_calls",
-                "runtime",
-                "fused_block_down",
-                device,
-                top_k,
-                d_model,
-                intermediate,
-                gateup_table.codebook_id,
-                gateup_k_partitions);
-        }
         return ok;
     }
 

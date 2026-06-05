@@ -14,6 +14,7 @@
 #include "execution/compute_stages/stages/AttentionComputeStage.h"
 #include "execution/compute_stages/stages/LMHeadStage.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/KernelFactory.h"
 #include "utils/MPIContext.h"
 #include "../../../../utils/PreparedWeightTestHarness.h"
@@ -653,6 +654,14 @@ TEST_F(Test__CUDAAttentionPaddingParity, DecodeContinuationUsesRealKVLengthOnGPU
 
     AttentionComputeStage stage(params);
     stage.setGPUStream(stream);
+
+    const WorkspaceRequirements stage_reqs =
+        stage.getWorkspaceRequirements(/*m=*/1, /*n=*/n_heads, /*k=*/head_dim);
+    DeviceWorkspaceManager stage_workspace(
+        device, stage_reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(stage_workspace.allocate(stage_reqs));
+    stage.bindWorkspace(&stage_workspace);
+
     ASSERT_TRUE(with_gpu_coherence(
         device,
         {query.get()},

@@ -94,11 +94,16 @@ namespace llaminar2
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void setGPUStream(void *stream) override
+            {
+                if (gpu_stream_ != stream)
+                    dynamic_pos_device_valid_ = false;
+                gpu_stream_ = stream;
+            }
 
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            /// Update the pos_offset in pinned host memory for graph replay
+            /// Pre-upload pos_offset device params for graph replay
             void setDynamicPosOffset(int pos_offset) override;
 
             /// @brief Drop request-scoped RoPE workspace state at a session boundary.
@@ -107,6 +112,8 @@ namespace llaminar2
                 inv_freq_initialized_ = false;
                 inv_freq_head_dim_ = 0;
                 inv_freq_theta_ = 0.0f;
+                dynamic_pos_device_valid_ = false;
+                dynamic_pos_offset_ = 0;
                 if (h_device_params_)
                 {
                     h_device_params_->pos_offset = 0;
@@ -187,8 +194,10 @@ namespace llaminar2
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
 
-            /// Pinned host memory for graph-captured H2D copy of device params
+            /// Pinned host staging for pre-capture device-param uploads
             rope::RoPEDeviceParams *h_device_params_ = nullptr;
+            bool dynamic_pos_device_valid_ = false;
+            int dynamic_pos_offset_ = 0;
         };
 
         // =========================================================================
@@ -234,10 +243,15 @@ namespace llaminar2
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void setGPUStream(void *stream) override
+            {
+                if (gpu_stream_ != stream)
+                    dynamic_pos_device_valid_ = false;
+                gpu_stream_ = stream;
+            }
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            /// Update the pos_offset in pinned host memory for graph replay
+            /// Pre-upload pos_offset device params for graph replay
             void setDynamicPosOffset(int pos_offset) override;
 
             /// @brief Drop request-scoped RoPE workspace state at a session boundary.
@@ -246,6 +260,8 @@ namespace llaminar2
                 inv_freq_initialized_ = false;
                 inv_freq_head_dim_ = 0;
                 inv_freq_theta_ = 0.0f;
+                dynamic_pos_device_valid_ = false;
+                dynamic_pos_offset_ = 0;
                 if (h_device_params_)
                 {
                     h_device_params_->pos_offset = 0;
@@ -303,8 +319,10 @@ namespace llaminar2
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
 
-            /// Pinned host memory for graph-captured H2D copy of device params
+            /// Pinned host staging for pre-capture device-param uploads
             rope::RoPEDeviceParams *h_device_params_ = nullptr;
+            bool dynamic_pos_device_valid_ = false;
+            int dynamic_pos_offset_ = 0;
         };
 
         // =========================================================================
@@ -350,10 +368,15 @@ namespace llaminar2
             void *getStream() const { return device_ctx_ ? device_ctx_->defaultStream() : nullptr; }
 
             // ===== GPU Stream Support (Graph Capture) =====
-            void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+            void setGPUStream(void *stream) override
+            {
+                if (gpu_stream_ != stream)
+                    dynamic_pos_device_valid_ = false;
+                gpu_stream_ = stream;
+            }
             bool supports_device(int device_idx) const override { return device_idx >= 0; }
 
-            /// Update the pos_offset in pinned host memory for graph replay
+            /// Pre-upload pos_offset device params for graph replay
             void setDynamicPosOffset(int pos_offset) override;
 
             /// @brief Drop request-scoped RoPE workspace state at a session boundary.
@@ -362,6 +385,8 @@ namespace llaminar2
                 inv_freq_initialized_ = false;
                 inv_freq_head_dim_ = 0;
                 inv_freq_theta_ = 0.0f;
+                dynamic_pos_device_valid_ = false;
+                dynamic_pos_offset_ = 0;
                 if (h_device_params_)
                 {
                     h_device_params_->pos_offset = 0;
@@ -419,8 +444,10 @@ namespace llaminar2
             mutable int inv_freq_head_dim_ = 0;
             mutable float inv_freq_theta_ = 0.0f;
 
-            /// Pinned host memory for graph-captured H2D copy of device params
+            /// Pinned host staging for pre-capture device-param uploads
             rope::RoPEDeviceParams *h_device_params_ = nullptr;
+            bool dynamic_pos_device_valid_ = false;
+            int dynamic_pos_offset_ = 0;
         };
 
     } // namespace rocm

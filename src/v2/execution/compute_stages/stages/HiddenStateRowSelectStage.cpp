@@ -3,15 +3,16 @@
  * @brief Implementation of graph-capturable hidden-state row selection.
  *
  * Key algorithm: copy the dynamic last-real-token row into a stable one-row
- * scratch tensor before LM head. On GPU, the dynamic row lives in a pinned host
- * scalar whose H2D copy is captured with the row-copy kernel; replay changes the
- * selected row by changing the pinned scalar contents before graph launch.
+ * scratch tensor before LM head. On GPU, the selected row lives in a graph
+ * workspace scalar that is uploaded before capture/replay; captured execution
+ * records only the row-copy kernel.
  */
 
 #include "HiddenStateRowSelectStage.h"
 
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 
@@ -38,8 +39,9 @@ namespace llaminar2
     struct HiddenStateRowSelectStage::GpuParamState
     {
         DeviceId device = DeviceId::invalid(); ///< Device that owns device_selected_row.
-        int *host_selected_row = nullptr;      ///< Pinned host scalar captured by H2D memcpy.
+        int *host_selected_row = nullptr;      ///< Pinned host scalar used for pre-capture upload.
         int *device_selected_row = nullptr;    ///< Device scalar read by row-select kernel.
+        bool device_value_uploaded = false;    ///< True once the current host scalar is resident.
     };
 
     HiddenStateRowSelectStage::HiddenStateRowSelectStage(Params params)
@@ -87,7 +89,10 @@ namespace llaminar2
     {
         bound_workspace_ = workspace;
         if (gpu_state_)
+        {
             gpu_state_->device_selected_row = nullptr;
+            gpu_state_->device_value_uploaded = false;
+        }
     }
 
     void HiddenStateRowSelectStage::unbindWorkspace()
@@ -102,12 +107,16 @@ namespace llaminar2
         // the final bucket row.
         const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
         setSelectedRowForReplay(real_seq_len - 1);
+        if (params_.device_id.is_gpu() && gpuStream() && bound_workspace_)
+            (void)(ensureGpuParamStateInitialized() && uploadGpuSelectedRow());
     }
 
     void HiddenStateRowSelectStage::setSelectedRowForReplay(int selected_row_idx)
     {
         selected_row_idx_ = normalizeSelectedRow(selected_row_idx);
         refreshPinnedSelectedRow();
+        if (gpu_state_)
+            gpu_state_->device_value_uploaded = false;
     }
 
     bool HiddenStateRowSelectStage::validateCommon(TensorBase **input_base, TensorBase **output_base)
@@ -212,6 +221,8 @@ namespace llaminar2
         if (gpu_state_)
         {
             gpu_state_->device_selected_row = device_selected_row;
+            if (!device_selected_row)
+                gpu_state_->device_value_uploaded = false;
             return true;
         }
 
@@ -253,6 +264,52 @@ namespace llaminar2
         return true;
     }
 
+    bool HiddenStateRowSelectStage::uploadGpuSelectedRow()
+    {
+        if (!ensureGpuParamStateInitialized())
+            return false;
+        if (!gpuStream())
+        {
+            LOG_ERROR("[HiddenStateRowSelectStage] GPU selected-row upload requires an explicit non-null stream");
+            return false;
+        }
+
+        refreshPinnedSelectedRow();
+
+        if (isGraphCaptureActive())
+        {
+            if (!gpu_state_->device_value_uploaded)
+            {
+                LOG_ERROR("[HiddenStateRowSelectStage] Selected-row scalar was not uploaded before graph capture");
+                return false;
+            }
+            return true;
+        }
+
+        bool uploaded = false;
+        if (params_.device_id.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            uploaded = cuda::uploadRowSelectParam(
+                gpu_state_->device_selected_row,
+                gpu_state_->host_selected_row,
+                gpuStream());
+#endif
+        }
+        else if (params_.device_id.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            uploaded = rocm::uploadRowSelectParam(
+                gpu_state_->device_selected_row,
+                gpu_state_->host_selected_row,
+                gpuStream());
+#endif
+        }
+
+        gpu_state_->device_value_uploaded = uploaded;
+        return uploaded;
+    }
+
     void HiddenStateRowSelectStage::refreshPinnedSelectedRow()
     {
         if (gpu_state_ && gpu_state_->host_selected_row)
@@ -263,8 +320,6 @@ namespace llaminar2
     {
         if (!ensureGpuParamStateInitialized())
             return false;
-
-        refreshPinnedSelectedRow();
 
         // Direct tests may bypass DeviceGraphExecutor coherence. These calls are
         // no-ops after warmup when the arena has already prepared the buffers.
@@ -282,38 +337,41 @@ namespace llaminar2
             return false;
         }
 
-        bool uploaded = false;
+        if (!uploadGpuSelectedRow())
+        {
+            LOG_ERROR("[HiddenStateRowSelectStage] Failed to update GPU selected-row scalar");
+            return false;
+        }
+
         bool launched = false;
         if (params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
             auto stream = gpuStream();
-            uploaded = cuda::uploadRowSelectParam(gpu_state_->device_selected_row, gpu_state_->host_selected_row, stream);
-            launched = uploaded && cuda::launchRowSelectFP32(
-                                       input_device,
-                                       output_device,
-                                       gpu_state_->device_selected_row,
-                                       params_.seq_len,
-                                       params_.d_model,
-                                       stream);
+            launched = cuda::launchRowSelectFP32(
+                input_device,
+                output_device,
+                gpu_state_->device_selected_row,
+                params_.seq_len,
+                params_.d_model,
+                stream);
 #endif
         }
         else if (params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
             auto stream = gpuStream();
-            uploaded = rocm::uploadRowSelectParam(gpu_state_->device_selected_row, gpu_state_->host_selected_row, stream);
-            launched = uploaded && rocm::launchRowSelectFP32(
-                                       input_device,
-                                       output_device,
-                                       gpu_state_->device_selected_row,
-                                       params_.seq_len,
-                                       params_.d_model,
-                                       stream);
+            launched = rocm::launchRowSelectFP32(
+                input_device,
+                output_device,
+                gpu_state_->device_selected_row,
+                params_.seq_len,
+                params_.d_model,
+                stream);
 #endif
         }
 
-        if (!uploaded || !launched)
+        if (!launched)
         {
             LOG_ERROR("[HiddenStateRowSelectStage] GPU row-select launch failed on " << params_.device_id.toString());
             return false;

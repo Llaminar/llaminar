@@ -149,6 +149,22 @@ namespace llaminar2
     // IROCmRingKVCache destructor + conversion scratch buffer management
     // =========================================================================
 
+    namespace
+    {
+        void free_conversion_scratch(void *ptr, const char *name)
+        {
+            if (!ptr)
+                return;
+
+            const hipError_t err = hipFree(ptr);
+            if (err != hipSuccess && err != hipErrorDeinitialized && err != hipErrorNoDevice)
+            {
+                LOG_WARN("[IROCmRingKVCache] hipFree(" << name << ") failed: "
+                                                       << hipGetErrorString(err));
+            }
+        }
+    }
+
     IROCmRingKVCache::~IROCmRingKVCache()
     {
         freeConvScratch();
@@ -156,6 +172,51 @@ namespace llaminar2
 
     bool IROCmRingKVCache::ensureConvScratch(size_t bytes)
     {
+        if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(this))
+        {
+            DeviceWorkspaceManager *workspace = consumer->getWorkspace();
+            if (workspace && workspace->isAllocated())
+            {
+                void *workspace_k = workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+                void *workspace_v = workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+                const size_t workspace_k_size = workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+                const size_t workspace_v_size = workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+                if (!workspace_k || !workspace_v || workspace_k_size < bytes || workspace_v_size < bytes)
+                {
+                    LOG_ERROR("[IROCmRingKVCache] Bound workspace is missing conversion scratch: required="
+                              << bytes << " bytes, K_available=" << workspace_k_size
+                              << " V_available=" << workspace_v_size);
+                    return false;
+                }
+
+                if (conv_scratch_k_ && !conv_scratch_workspace_backed_)
+                    free_conversion_scratch(conv_scratch_k_, "conv_scratch_k");
+                if (conv_scratch_v_ && !conv_scratch_workspace_backed_)
+                    free_conversion_scratch(conv_scratch_v_, "conv_scratch_v");
+
+                conv_scratch_k_ = workspace_k;
+                conv_scratch_v_ = workspace_v;
+                conv_scratch_capacity_ = std::min(workspace_k_size, workspace_v_size);
+                conv_scratch_workspace_backed_ = true;
+                return true;
+            }
+        }
+
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[IROCmRingKVCache] Refusing to allocate conversion scratch during HIP graph capture; "
+                      "bind KV-cache conversion scratch through IWorkspaceConsumer");
+            return false;
+        }
+
+        if (conv_scratch_workspace_backed_)
+        {
+            conv_scratch_k_ = nullptr;
+            conv_scratch_v_ = nullptr;
+            conv_scratch_capacity_ = 0;
+            conv_scratch_workspace_backed_ = false;
+        }
+
         if (bytes <= conv_scratch_capacity_)
             return true;
 
@@ -168,9 +229,9 @@ namespace llaminar2
             hipMalloc(&new_v, alloc_size) != hipSuccess)
         {
             if (new_k)
-                hipFree(new_k);
+                free_conversion_scratch(new_k, "new_conv_scratch_k");
             if (new_v)
-                hipFree(new_v);
+                free_conversion_scratch(new_v, "new_conv_scratch_v");
             LOG_ERROR("[IROCmRingKVCache] Failed to allocate conversion scratch buffers ("
                       << alloc_size << " bytes each)");
             return false;
@@ -178,9 +239,9 @@ namespace llaminar2
 
         // Free old buffers
         if (conv_scratch_k_)
-            hipFree(conv_scratch_k_);
+            free_conversion_scratch(conv_scratch_k_, "conv_scratch_k");
         if (conv_scratch_v_)
-            hipFree(conv_scratch_v_);
+            free_conversion_scratch(conv_scratch_v_, "conv_scratch_v");
 
         conv_scratch_k_ = new_k;
         conv_scratch_v_ = new_v;
@@ -193,14 +254,23 @@ namespace llaminar2
 
     void IROCmRingKVCache::freeConvScratch()
     {
+        if (conv_scratch_workspace_backed_)
+        {
+            conv_scratch_k_ = nullptr;
+            conv_scratch_v_ = nullptr;
+            conv_scratch_capacity_ = 0;
+            conv_scratch_workspace_backed_ = false;
+            return;
+        }
+
         if (conv_scratch_k_)
         {
-            hipFree(conv_scratch_k_);
+            free_conversion_scratch(conv_scratch_k_, "conv_scratch_k");
             conv_scratch_k_ = nullptr;
         }
         if (conv_scratch_v_)
         {
-            hipFree(conv_scratch_v_);
+            free_conversion_scratch(conv_scratch_v_, "conv_scratch_v");
             conv_scratch_v_ = nullptr;
         }
         conv_scratch_capacity_ = 0;
@@ -834,17 +904,13 @@ namespace llaminar2
             const DataT *d_v_adjusted = d_v + static_cast<size_t>(tokens_to_skip) * kv_storage_dim_;
 
             // Use dynamic head params only while recording a graph. In regular
-            // execution, the scalar-head append path avoids an unnecessary
-            // pinned-host H2D dependency and snapshots the host head value at
-            // launch time. Captured graphs still need the dynamic path so replay
-            // can refresh the head through setDynamicHead() before the captured
-            // H2D copy runs.
+            // execution, the scalar-head append path snapshots the host head
+            // value at launch time. Captured graphs read a stable device scalar
+            // uploaded by updateDynamicParams()/setDynamicHead() before
+            // capture/replay; do not record H2D copies in the captured graph.
             if (capture_active && d_head_params_ && h_head_params_ && stream)
             {
                 int idx = layer * batch_size_ + seq_idx;
-                h_head_params_[idx] = entry.head;
-                hipMemcpyAsync(&d_head_params_[idx], &h_head_params_[idx],
-                               sizeof(int), hipMemcpyHostToDevice, stream);
                 launch_append_kernel_dynamic(entry, d_k_adjusted, d_v_adjusted,
                                              &d_head_params_[idx], tokens_to_write, stream);
             }
@@ -1780,43 +1846,67 @@ namespace llaminar2
     WorkspaceRequirements ROCmRingKVCache<Precision>::getWorkspaceRequirements(
         int m, int n, int k) const
     {
-        // m = batch size (number of sequences in gather operation)
-        // n, k unused for KV cache
-        // Default to batch_size_ if m is 0
-        const int actual_batch_size = (m > 0) ? m : batch_size_;
+        // New callers pass m=max graph tokens and n=batch size so conversion
+        // scratch can follow bucket/chunk size. Legacy one-arg callers used
+        // m=batch size; keep that behavior and size scratch to max_seq_len_.
+        (void)k;
+        const bool has_token_hint = n > 0;
+        const int actual_batch_size = has_token_hint ? n : ((m > 0) ? m : batch_size_);
+        const int scratch_tokens = has_token_hint ? m : max_seq_len_;
+        const int bounded_batch_size = std::max(1, actual_batch_size);
+        const int bounded_scratch_tokens = std::max(1, scratch_tokens);
+        const size_t fp32_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_dim_) * sizeof(float);
+        const size_t fp16_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_dim_) * sizeof(uint16_t);
+        const size_t native_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        const size_t conversion_scratch_bytes =
+            std::max(fp32_scratch_bytes, std::max(fp16_scratch_bytes, native_scratch_bytes));
 
         WorkspaceRequirements reqs;
 
         // Buffer for K cache pointers: DataT* per sequence
         reqs.buffers.push_back({
             KVCacheWorkspaceBuffers::K_CACHE_PTRS,
-            static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+            static_cast<size_t>(bounded_batch_size) * sizeof(DataT *),
             sizeof(void *) // Pointer alignment
         });
 
         // Buffer for V cache pointers: DataT* per sequence
         reqs.buffers.push_back({
             KVCacheWorkspaceBuffers::V_CACHE_PTRS,
-            static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+            static_cast<size_t>(bounded_batch_size) * sizeof(DataT *),
             sizeof(void *) // Pointer alignment
         });
 
         // Buffer for tail indices: int per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::TAILS,
-                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                static_cast<size_t>(bounded_batch_size) * sizeof(int),
                                 sizeof(int)});
 
         // Buffer for count values: int per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::COUNTS,
-                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                static_cast<size_t>(bounded_batch_size) * sizeof(int),
                                 sizeof(int)});
 
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_K,
+                                conversion_scratch_bytes,
+                                256,
+                                true});
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_V,
+                                conversion_scratch_bytes,
+                                256,
+                                true});
+
         LOG_DEBUG("[ROCmRingKVCache] Workspace requirements: batch_size="
-                  << actual_batch_size
-                  << " K_CACHE_PTRS=" << actual_batch_size * sizeof(DataT *)
-                  << " V_CACHE_PTRS=" << actual_batch_size * sizeof(DataT *)
-                  << " TAILS=" << actual_batch_size * sizeof(int)
-                  << " COUNTS=" << actual_batch_size * sizeof(int));
+                  << bounded_batch_size
+                  << " scratch_tokens=" << bounded_scratch_tokens
+                  << " K_CACHE_PTRS=" << bounded_batch_size * sizeof(DataT *)
+                  << " V_CACHE_PTRS=" << bounded_batch_size * sizeof(DataT *)
+                  << " TAILS=" << bounded_batch_size * sizeof(int)
+                  << " COUNTS=" << bounded_batch_size * sizeof(int)
+                  << " CONV_SCRATCH(each)=" << conversion_scratch_bytes);
 
         return reqs;
     }

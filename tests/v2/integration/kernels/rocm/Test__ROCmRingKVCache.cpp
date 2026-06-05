@@ -25,7 +25,9 @@
 #include <hip/hip_bfloat16.h>
 #include "kernels/rocm/kvcache/ROCmRingKVCache.h"
 #include "kernels/rocm/kvcache/ROCmRingKVCacheFactory.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "backends/DeviceId.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
@@ -56,10 +58,14 @@ namespace
         ~ScopedHipStream()
         {
             if (stream_)
-                hipStreamDestroy(stream_);
+            {
+                const hipError_t err = hipStreamDestroy(stream_);
+                (void)err;
+            }
         }
 
         void *opaque() const { return static_cast<void *>(stream_); }
+        hipStream_t stream() const { return stream_; }
 
         void synchronize() const
         {
@@ -641,6 +647,145 @@ TEST(Test__ROCmRingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream
                                         num_tokens, stream.opaque()));
     stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
+}
+
+TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendRequiresBoundConversionScratch)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 16;
+    const int n_kv_heads = 1;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 4;
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP16>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    ASSERT_FALSE(workspace_consumer->hasWorkspace());
+
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < static_cast<size_t>(num_tokens) * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.125f * static_cast<float>(static_cast<int>(i % 7) - 3);
+        V_tensor->mutable_data()[i] = -0.0625f * static_cast<float>(static_cast<int>(i % 5) - 2);
+    }
+
+    ScopedHipStream stream;
+    ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+    ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+    stream.synchronize();
+
+    GraphCaptureGuard guard;
+    EXPECT_FALSE(cache->appendWithStream(0, 0,
+                                         static_cast<const ITensor *>(K_tensor.get()),
+                                         static_cast<const ITensor *>(V_tensor.get()),
+                                         num_tokens, stream.opaque()))
+        << "Graph-captured FP32->FP16 append must not allocate conversion scratch ad hoc";
+}
+
+TEST(Test__ROCmRingKVCache, GraphCapturedFP32ToFP16AppendReplaysAfterClearWithWorkspaceScratch)
+{
+    if (!hasROCm())
+    {
+        GTEST_SKIP() << "ROCm not available";
+    }
+
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 16;
+    const int n_kv_heads = 1;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 6;
+
+    auto cache = std::make_unique<ROCmRingKVCache<ActivationPrecision::FP16>>(
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim, 0);
+    ASSERT_NE(cache, nullptr);
+
+    auto reqs = cache->getWorkspaceRequirements(num_tokens, batch_size, 0);
+    DeviceWorkspaceManager workspace(DeviceId::rocm(0), reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(workspace.allocate(reqs));
+    cache->bindWorkspace(&workspace);
+    ASSERT_TRUE(cache->hasWorkspace());
+
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < static_cast<size_t>(num_tokens) * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.03125f * static_cast<float>(static_cast<int>(i % 17) - 8);
+        V_tensor->mutable_data()[i] = -0.015625f * static_cast<float>(static_cast<int>(i % 13) - 6);
+    }
+
+    ScopedHipStream stream;
+    ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+    ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::rocm(0), stream.opaque()));
+    stream.synchronize();
+
+    cache->setDynamicHead(0, 0, stream.opaque());
+    stream.synchronize();
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(hipStreamBeginCapture(stream.stream(), hipStreamCaptureModeGlobal), hipSuccess);
+    bool capture_append_ok = false;
+    {
+        GraphCaptureGuard guard;
+        capture_append_ok = cache->appendWithStream(0, 0,
+                                                    static_cast<const ITensor *>(K_tensor.get()),
+                                                    static_cast<const ITensor *>(V_tensor.get()),
+                                                    num_tokens, stream.opaque());
+    }
+    ASSERT_EQ(hipStreamEndCapture(stream.stream(), &graph), hipSuccess);
+    ASSERT_TRUE(capture_append_ok);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(hipGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), hipSuccess);
+    ASSERT_NE(graph_exec, nullptr);
+
+    cache->clear();
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
+    cache->setDynamicHead(0, 0, stream.opaque());
+    stream.synchronize();
+
+    ASSERT_EQ(hipGraphLaunch(graph_exec, stream.stream()), hipSuccess);
+    stream.synchronize();
+    cache->advanceHead(0, 0, num_tokens);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
+
+    const void *d_K_out = nullptr;
+    const void *d_V_out = nullptr;
+    int kv_len = 0;
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
+    ASSERT_EQ(kv_len, num_tokens);
+
+    std::vector<_Float16> h_K_out(static_cast<size_t>(num_tokens) * kv_dim);
+    ASSERT_EQ(hipMemcpyAsync(h_K_out.data(), d_K_out,
+                             h_K_out.size() * sizeof(_Float16),
+                             hipMemcpyDeviceToHost, stream.stream()),
+              hipSuccess);
+    stream.synchronize();
+
+    for (size_t i = 0; i < h_K_out.size(); ++i)
+    {
+        EXPECT_NEAR(static_cast<float>(h_K_out[i]), K_tensor->data()[i], 0.001f) << "i=" << i;
+    }
+
+    EXPECT_EQ(hipGraphExecDestroy(graph_exec), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
 }
 
 // =============================================================================

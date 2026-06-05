@@ -166,13 +166,23 @@ namespace llaminar2
             return;
         }
 
+        const bool padded_prefill_replay =
+            prefill_replay_params_set_ &&
+            prefill_effective_seq_len_ > 0 &&
+            prefill_bucket_seq_len_ > 0 &&
+            prefill_bucket_seq_len_ == seq_len &&
+            prefill_effective_seq_len_ < seq_len;
+        const int logical_seq_len = padded_prefill_replay
+                                        ? prefill_effective_seq_len_
+                                        : seq_len;
+
         // Propagate current stage stream to the kernel so device-side dynamic
         // params are uploaded on the same explicit stream used for capture/replay.
         cached_kernel_->setGPUStream(gpuStream());
 
         int kv_len = params_.kv_cache->get_cached_tokens(params_.layer_idx, 0);
-        kv_len += seq_len; // This step will append seq_len tokens.
-        const int logical_pos_offset = std::max(0, kv_len - seq_len);
+        kv_len += logical_seq_len; // This step will append logical_seq_len real tokens.
+        const int logical_pos_offset = std::max(0, kv_len - logical_seq_len);
 
         constexpr int kCudaSmallDecodeMaxRows = 4;
         int query_rows_for_params = 1;
@@ -192,10 +202,10 @@ namespace llaminar2
                 params_.batch_size == 1 &&
                 params_.causal &&
                 !rocm_env.fa_decode_via_prefill &&
-                seq_len > 1 &&
-                seq_len <= 2 &&
-                kv_len > seq_len;
-            query_rows_for_params = small_native_decode ? seq_len : 1;
+                logical_seq_len > 1 &&
+                logical_seq_len <= 2 &&
+                kv_len > logical_seq_len;
+            query_rows_for_params = small_native_decode ? logical_seq_len : 1;
         }
         else
         {
@@ -207,10 +217,10 @@ namespace llaminar2
                 vp == ActivationPrecision::FP16 &&
                 params_.batch_size == 1 &&
                 params_.causal &&
-                seq_len > 1 &&
-                seq_len <= kCudaSmallDecodeMaxRows &&
-                kv_len > seq_len;
-            query_rows_for_params = cuda_small_fp16_decode ? seq_len : 1;
+                logical_seq_len > 1 &&
+                logical_seq_len <= kCudaSmallDecodeMaxRows &&
+                kv_len > logical_seq_len;
+            query_rows_for_params = cuda_small_fp16_decode ? logical_seq_len : 1;
         }
 
         if (!cached_kernel_->prepareDynamicAttnParams(
@@ -224,10 +234,10 @@ namespace llaminar2
             throw std::runtime_error(msg);
         }
 
-        // TQ dequant: update pinned host params for captured H2D.
+        // TQ dequant: pre-upload device params for graph-capturable reads.
         // setDynamicDequantParams computes ring_pos, out_offset, rope_position
-        // from the pre-append entry state. On graph replay, the captured
-        // H2D re-reads from pinned host, giving the kernel updated values.
+        // from the pre-append entry state; the captured dequant path records
+        // only the dynamic kernel that reads those params.
         // position_start=0 matches execute() which always passes 0 — cache
         // rows are stored in position order, so position = entry.count.
         const float dequant_rope_theta =
@@ -235,6 +245,14 @@ namespace llaminar2
         params_.kv_cache->setDynamicDequantParams(
             params_.layer_idx, 0, dequant_rope_theta,
             0, gpuStream());
+    }
+
+    void AttentionComputeStage::updatePrefillReplayParams(const PrefillReplayParams &replay)
+    {
+        prefill_bucket_seq_len_ = replay.bucket_seq_len > 0 ? replay.bucket_seq_len : params_.seq_len;
+        const int real_seq_len = replay.real_seq_len > 0 ? replay.real_seq_len : params_.seq_len;
+        prefill_effective_seq_len_ = std::clamp(real_seq_len, 1, std::max(1, params_.seq_len));
+        prefill_replay_params_set_ = true;
     }
 
     uint64_t AttentionComputeStage::graphCaptureVariantSignature() const
@@ -996,6 +1014,12 @@ namespace llaminar2
             -1, // local_n_heads (n_heads is already local)
             -1, // local_n_kv_heads (n_kv_heads is already local)
             params_.gqa_n_rep);
+
+        if (!success)
+        {
+            LOG_ERROR("[AttentionComputeStage] Attention kernel execution failed");
+            return false;
+        }
 
         if (kv_rot)
         {

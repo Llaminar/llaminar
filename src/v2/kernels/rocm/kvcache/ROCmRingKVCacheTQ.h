@@ -105,9 +105,14 @@ namespace llaminar2
 
         /**
          * @brief Set dynamic dequant params for graph capture.
-         * Copies current head/count to pinned host buffer and enqueues H2D.
+         * Kept for legacy append-position setup; dequant metadata is prepared
+         * through setDynamicDequantParams().
          */
         void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override;
+
+        void setDynamicDequantParams(int layer, int seq_idx,
+                                     float rope_theta, int position_start,
+                                     void *gpu_stream) override;
 
         // =====================================================================
         // ROCm-Specific Accessors
@@ -255,6 +260,7 @@ namespace llaminar2
         // Graph capture dynamic params (per-layer)
         HIPTQDequantDynamicParams *d_dequant_params_ = nullptr; ///< Device array [n_layers_]
         HIPTQDequantDynamicParams *h_dequant_params_ = nullptr; ///< Pinned host array [n_layers_]
+        mutable std::vector<uint8_t> dequant_params_device_valid_; ///< Per-layer pre-upload readiness
 
         mutable hipStream_t cached_stream_; ///< Last explicit stream used by append/read operations.
     };

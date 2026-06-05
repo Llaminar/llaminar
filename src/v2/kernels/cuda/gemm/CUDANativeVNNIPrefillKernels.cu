@@ -2534,8 +2534,36 @@ namespace
 
             if (N == 5120 && K == 17408)
             {
-                out_tile_id = static_cast<uint8_t>(TileId::T64x128_w4x2);
+                if (M >= 596)
+                {
+                    out_tile_id = static_cast<uint8_t>(TileId::T128x128_w4x2);
+                    out_split_k = 4;
+                }
+                else
+                {
+                    out_tile_id = static_cast<uint8_t>(TileId::T64x128_w4x2);
+                    out_split_k = 1;
+                }
+                return true;
+            }
+        }
+
+        if constexpr (CB == 7)
+        {
+            if (binPrefillM(M) != 512 || M < 596)
+                return false;
+
+            if (N == 17408 && K == 5120)
+            {
+                out_tile_id = static_cast<uint8_t>(TileId::T128x128_w4x2);
                 out_split_k = 1;
+                return true;
+            }
+
+            if (N == 5120 && K == 17408)
+            {
+                out_tile_id = static_cast<uint8_t>(TileId::T128x128_w4x2);
+                out_split_k = 4;
                 return true;
             }
         }
@@ -4021,14 +4049,14 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
         break;
 
     // --- Asymmetric formats (need min correction, d_mins required) ---
-    case 5: // Q4_1 / Q4_K / Q5_K
+    case 5: // Q4_1 / Q4_K
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<5>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
-    case 7: // Q5_1
+    case 7: // Q5_1 / Q5_K
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<7>(
