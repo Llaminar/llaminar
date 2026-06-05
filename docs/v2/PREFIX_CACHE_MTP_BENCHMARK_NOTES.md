@@ -45,8 +45,10 @@ CUDA MoE latest:
 | dynamic MTP | 1821.56 | 140.51 | 82.81% |
 
 Fresh checks:
-- Graph replay stage stats export trusted GPU-event rows in `stage_gpu`; host
-  bookkeeping stays in `forward_graph` (`20260605T024434Z`).
+- Graph replay stage stats export trusted GPU-event rows in `stage_gpu`; CUDA
+  fused MoE decode now exports sub-kernel `kernel_cuda` rows
+  (`20260605T065818Z-profile-fused-subkernels`). Routed down warp-reduce is the
+  largest sub-kernel, followed by gate/up k-part.
 - CUDA runtime-routed MoE decode and shared-expert grouped decode have graph
   replay / benchmark-style parity coverage with perf-counter evidence.
 - Dynamic MTP request state resets across benchmark-style `clearCache()`.

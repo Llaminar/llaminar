@@ -13,10 +13,12 @@
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 
 namespace
 {
@@ -53,6 +55,146 @@ namespace
         }
         return true;
     }
+
+    bool streamIsCapturing(cudaStream_t stream)
+    {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        const cudaError_t err = cudaStreamIsCapturing(stream, &status);
+        if (err != cudaSuccess)
+        {
+            cudaGetLastError();
+            return true;
+        }
+        return status != cudaStreamCaptureStatusNone;
+    }
+
+    class ScopedCudaMoESubkernelTimer
+    {
+    public:
+        ScopedCudaMoESubkernelTimer(
+            cudaStream_t stream,
+            const char *name,
+            int device_idx,
+            uint8_t codebook_id,
+            int top_k,
+            int d_model,
+            int intermediate)
+            : stream_(stream),
+              name_(name),
+              device_(std::string("CUDA:") + std::to_string(device_idx)),
+              tags_{
+                  {"attribution", "gpu_event"},
+                  {"codebook", std::to_string(static_cast<unsigned>(codebook_id))},
+                  {"d_model", std::to_string(d_model)},
+                  {"intermediate", std::to_string(intermediate)},
+                  {"source", "fused_runtime"},
+                  {"stage_type", "MOE_EXPERT_FFN"},
+                  {"top_k", std::to_string(top_k)}}
+        {
+            enabled_ = llaminar2::PerfStatsCollector::isEnabled() &&
+                       stream_ != nullptr &&
+                       !streamIsCapturing(stream_);
+            if (!enabled_)
+                return;
+
+            cudaError_t err = cudaEventCreate(&start_);
+            if (err != cudaSuccess)
+            {
+                cudaGetLastError();
+                enabled_ = false;
+                return;
+            }
+            err = cudaEventCreate(&stop_);
+            if (err != cudaSuccess)
+            {
+                cudaGetLastError();
+                cudaEventDestroy(start_);
+                start_ = nullptr;
+                enabled_ = false;
+                return;
+            }
+            err = cudaEventRecord(start_, stream_);
+            if (err != cudaSuccess)
+            {
+                cudaGetLastError();
+                cleanup();
+                enabled_ = false;
+            }
+        }
+
+        ScopedCudaMoESubkernelTimer(const ScopedCudaMoESubkernelTimer &) = delete;
+        ScopedCudaMoESubkernelTimer &operator=(const ScopedCudaMoESubkernelTimer &) = delete;
+
+        ~ScopedCudaMoESubkernelTimer()
+        {
+            cleanup();
+        }
+
+        bool finish()
+        {
+            if (!enabled_)
+                return true;
+            cudaError_t err = cudaEventRecord(stop_, stream_);
+            if (err != cudaSuccess)
+            {
+                std::fprintf(stderr, "%s timing stop failed: %s\n", name_, cudaGetErrorString(err));
+                cleanup();
+                enabled_ = false;
+                return false;
+            }
+            err = cudaEventSynchronize(stop_);
+            if (err != cudaSuccess)
+            {
+                std::fprintf(stderr, "%s timing synchronize failed: %s\n", name_, cudaGetErrorString(err));
+                cleanup();
+                enabled_ = false;
+                return false;
+            }
+            float elapsed_ms = 0.0f;
+            err = cudaEventElapsedTime(&elapsed_ms, start_, stop_);
+            if (err != cudaSuccess)
+            {
+                std::fprintf(stderr, "%s timing elapsed failed: %s\n", name_, cudaGetErrorString(err));
+                cleanup();
+                enabled_ = false;
+                return false;
+            }
+
+            llaminar2::PerfStatsCollector::recordTimingNs(
+                "kernel_cuda",
+                name_,
+                static_cast<uint64_t>(elapsed_ms * 1000000.0f),
+                "decode",
+                device_,
+                tags_);
+            cleanup();
+            enabled_ = false;
+            return true;
+        }
+
+    private:
+        void cleanup()
+        {
+            if (start_)
+            {
+                cudaEventDestroy(start_);
+                start_ = nullptr;
+            }
+            if (stop_)
+            {
+                cudaEventDestroy(stop_);
+                stop_ = nullptr;
+            }
+        }
+
+        bool enabled_ = false;
+        cudaStream_t stream_ = nullptr;
+        cudaEvent_t start_ = nullptr;
+        cudaEvent_t stop_ = nullptr;
+        const char *name_ = "";
+        std::string device_;
+        llaminar2::PerfStatsCollector::Tags tags_;
+    };
 
     // Router GEMV: one block per (expert, token) computes logit = dot(hidden_token, gate_expert).
     //
@@ -3341,10 +3483,21 @@ extern "C"
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         const int hidden_blocks_per_row = d_model / 32;
-        grouped_hidden_quantize_blockwise_kernel<<<hidden_blocks_per_row, 32, 0, cuda_stream>>>(
-            d_hidden, d_hidden_int8, d_hidden_scales, d_model);
-        if (!finishLaunch("cudaMoE_grouped_fused_decode_hidden_quantize"))
-            return false;
+        {
+            ScopedCudaMoESubkernelTimer timer(
+                cuda_stream,
+                "cuda_moe_fused_decode_hidden_quantize",
+                device_idx,
+                gateup_codebook_id,
+                top_k,
+                d_model,
+                intermediate);
+            grouped_hidden_quantize_blockwise_kernel<<<hidden_blocks_per_row, 32, 0, cuda_stream>>>(
+                d_hidden, d_hidden_int8, d_hidden_scales, d_model);
+            if (!finishLaunch("cudaMoE_grouped_fused_decode_hidden_quantize") ||
+                !timer.finish())
+                return false;
+        }
 
         constexpr int kTileN = 64;
         dim3 gateup_grid((intermediate + kTileN - 1) / kTileN, gateup_k_partitions, top_k);
@@ -3355,46 +3508,68 @@ extern "C"
         d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,           \
         d_gate_partials, d_up_partials, top_k, intermediate, d_model, gateup_k_partitions)
 
-        switch (gateup_codebook_id)
         {
-        case 0:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(0); break;
-        case 4:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(4); break;
-        case 5:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(5); break;
-        case 6:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(6); break;
-        case 7:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(7); break;
-        case 8:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(8); break;
-        case 9:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(9); break;
-        case 10: LAUNCH_GROUPED_FUSED_GATEUP_KPART(10); break;
-        case 11: LAUNCH_GROUPED_FUSED_GATEUP_KPART(11); break;
-        case 12: LAUNCH_GROUPED_FUSED_GATEUP_KPART(12); break;
-        case 13: LAUNCH_GROUPED_FUSED_GATEUP_KPART(13); break;
-        case 14: LAUNCH_GROUPED_FUSED_GATEUP_KPART(14); break;
-        case 15: LAUNCH_GROUPED_FUSED_GATEUP_KPART(15); break;
-        case 16: LAUNCH_GROUPED_FUSED_GATEUP_KPART(16); break;
-        case 17: LAUNCH_GROUPED_FUSED_GATEUP_KPART(17); break;
-        case 19: LAUNCH_GROUPED_FUSED_GATEUP_KPART(19); break;
-        default:
-            std::fprintf(stderr, "[cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart] unsupported gate/up codebook_id=%u\n",
-                         static_cast<unsigned>(gateup_codebook_id));
-            return false;
+            ScopedCudaMoESubkernelTimer timer(
+                cuda_stream,
+                "cuda_moe_fused_decode_gateup_kpart",
+                device_idx,
+                gateup_codebook_id,
+                top_k,
+                d_model,
+                intermediate);
+            switch (gateup_codebook_id)
+            {
+            case 0:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(0); break;
+            case 4:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(4); break;
+            case 5:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(5); break;
+            case 6:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(6); break;
+            case 7:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(7); break;
+            case 8:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(8); break;
+            case 9:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(9); break;
+            case 10: LAUNCH_GROUPED_FUSED_GATEUP_KPART(10); break;
+            case 11: LAUNCH_GROUPED_FUSED_GATEUP_KPART(11); break;
+            case 12: LAUNCH_GROUPED_FUSED_GATEUP_KPART(12); break;
+            case 13: LAUNCH_GROUPED_FUSED_GATEUP_KPART(13); break;
+            case 14: LAUNCH_GROUPED_FUSED_GATEUP_KPART(14); break;
+            case 15: LAUNCH_GROUPED_FUSED_GATEUP_KPART(15); break;
+            case 16: LAUNCH_GROUPED_FUSED_GATEUP_KPART(16); break;
+            case 17: LAUNCH_GROUPED_FUSED_GATEUP_KPART(17); break;
+            case 19: LAUNCH_GROUPED_FUSED_GATEUP_KPART(19); break;
+            default:
+                std::fprintf(stderr, "[cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart] unsupported gate/up codebook_id=%u\n",
+                             static_cast<unsigned>(gateup_codebook_id));
+                return false;
+            }
+
+            if (!finishLaunch("cudaMoE_grouped_fused_decode_gateup_kpart") ||
+                !timer.finish())
+                return false;
         }
 
 #undef LAUNCH_GROUPED_FUSED_GATEUP_KPART
 
-        if (!finishLaunch("cudaMoE_grouped_fused_decode_gateup_kpart"))
-            return false;
-
         dim3 swiglu_grid((intermediate + kTileN - 1) / kTileN, top_k);
-        grouped_native_vnni_gate_up_swiglu_kpart_reduce_decode_kernel<<<swiglu_grid, block, 0, cuda_stream>>>(
-            d_gate_partials,
-            d_up_partials,
-            d_swiglu_int8,
-            d_swiglu_scales,
-            top_k,
-            intermediate,
-            gateup_k_partitions);
-        if (!finishLaunch("cudaMoE_grouped_fused_decode_swiglu_quantize"))
-            return false;
+        {
+            ScopedCudaMoESubkernelTimer timer(
+                cuda_stream,
+                "cuda_moe_fused_decode_swiglu_quantize",
+                device_idx,
+                gateup_codebook_id,
+                top_k,
+                d_model,
+                intermediate);
+            grouped_native_vnni_gate_up_swiglu_kpart_reduce_decode_kernel<<<swiglu_grid, block, 0, cuda_stream>>>(
+                d_gate_partials,
+                d_up_partials,
+                d_swiglu_int8,
+                d_swiglu_scales,
+                top_k,
+                intermediate,
+                gateup_k_partitions);
+            if (!finishLaunch("cudaMoE_grouped_fused_decode_swiglu_quantize") ||
+                !timer.finish())
+                return false;
+        }
 
         constexpr int kDownWarpsPerBlock = 8;
         dim3 down_grid((d_model + kDownWarpsPerBlock - 1) / kDownWarpsPerBlock);
@@ -3406,33 +3581,47 @@ extern "C"
         d_swiglu_int8, d_swiglu_scales, d_down_desc_table, d_expert_ids, d_weights,                 \
         d_output, top_k, d_model, intermediate)
 
-        switch (down_codebook_id)
         {
-        case 0:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(0); break;
-        case 4:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(4); break;
-        case 5:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(5); break;
-        case 6:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(6); break;
-        case 7:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(7); break;
-        case 8:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(8); break;
-        case 9:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(9); break;
-        case 10: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(10); break;
-        case 11: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(11); break;
-        case 12: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(12); break;
-        case 13: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(13); break;
-        case 14: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(14); break;
-        case 15: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(15); break;
-        case 16: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(16); break;
-        case 17: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(17); break;
-        case 19: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(19); break;
-        default:
-            std::fprintf(stderr, "[cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart] unsupported down codebook_id=%u\n",
-                         static_cast<unsigned>(down_codebook_id));
-            return false;
+            ScopedCudaMoESubkernelTimer timer(
+                cuda_stream,
+                "cuda_moe_fused_decode_down_warp_reduce",
+                device_idx,
+                down_codebook_id,
+                top_k,
+                d_model,
+                intermediate);
+            switch (down_codebook_id)
+            {
+            case 0:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(0); break;
+            case 4:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(4); break;
+            case 5:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(5); break;
+            case 6:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(6); break;
+            case 7:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(7); break;
+            case 8:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(8); break;
+            case 9:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(9); break;
+            case 10: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(10); break;
+            case 11: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(11); break;
+            case 12: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(12); break;
+            case 13: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(13); break;
+            case 14: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(14); break;
+            case 15: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(15); break;
+            case 16: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(16); break;
+            case 17: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(17); break;
+            case 19: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(19); break;
+            default:
+                std::fprintf(stderr, "[cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart] unsupported down codebook_id=%u\n",
+                             static_cast<unsigned>(down_codebook_id));
+                return false;
+            }
+
+            if (!finishLaunch("cudaMoE_grouped_fused_decode_down_block_reduce") ||
+                !timer.finish())
+                return false;
         }
 
 #undef LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE
 
-        return finishLaunch("cudaMoE_grouped_fused_decode_down_block_reduce");
+        return true;
     }
 
     bool cudaMoE_grouped_prefill_pipeline(

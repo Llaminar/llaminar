@@ -312,6 +312,46 @@ namespace
         EXPECT_GE(match->value, 1.0);
     }
 
+    void expectFusedDecodeSubkernelTimer(
+        const char *timer_name,
+        int top_k,
+        int d_model,
+        int intermediate)
+    {
+        const auto records =
+            llaminar2::PerfStatsCollector::snapshot({std::string("kernel_cuda.") + timer_name});
+        ASSERT_FALSE(records.empty()) << "missing perf timer " << timer_name;
+
+        const auto expected_top_k = std::to_string(top_k);
+        const auto expected_d_model = std::to_string(d_model);
+        const auto expected_intermediate = std::to_string(intermediate);
+        const auto match = std::find_if(
+            records.begin(),
+            records.end(),
+            [&](const llaminar2::PerfStatRecord &record)
+            {
+                auto tag_equals = [&](const char *key, const std::string &value)
+                {
+                    const auto it = record.tags.find(key);
+                    return it != record.tags.end() && it->second == value;
+                };
+                return record.name == timer_name &&
+                       record.domain == "kernel_cuda" &&
+                       tag_equals("source", "fused_runtime") &&
+                       tag_equals("stage_type", "MOE_EXPERT_FFN") &&
+                       tag_equals("top_k", expected_top_k) &&
+                       tag_equals("d_model", expected_d_model) &&
+                       tag_equals("intermediate", expected_intermediate);
+            });
+        ASSERT_NE(match, records.end()) << "missing matching perf timer " << timer_name
+                                        << "\n"
+                                        << llaminar2::PerfStatsCollector::summaryString(
+                                               {std::string("kernel_cuda.") + timer_name});
+        EXPECT_EQ(match->count, 1u)
+            << "captured graph replay must not add eager sub-kernel timing events";
+        EXPECT_GT(match->total_ns, 0u);
+    }
+
     void expectPrefillSwiGLUPathRecord(
         const char *swiglu_path,
         int seq_len,
@@ -2143,6 +2183,14 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
     expectGroupedDecodeCounter(
         "cuda_moe_grouped_decode_fused_calls", "runtime", top_k, d_model, intermediate,
         "fused_block_down");
+    expectFusedDecodeSubkernelTimer(
+        "cuda_moe_fused_decode_hidden_quantize", top_k, d_model, intermediate);
+    expectFusedDecodeSubkernelTimer(
+        "cuda_moe_fused_decode_gateup_kpart", top_k, d_model, intermediate);
+    expectFusedDecodeSubkernelTimer(
+        "cuda_moe_fused_decode_swiglu_quantize", top_k, d_model, intermediate);
+    expectFusedDecodeSubkernelTimer(
+        "cuda_moe_fused_decode_down_warp_reduce", top_k, d_model, intermediate);
     llaminar2::PerfStatsCollector::reset();
 #endif
 }
