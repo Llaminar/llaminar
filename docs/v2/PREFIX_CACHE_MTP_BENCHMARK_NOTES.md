@@ -61,7 +61,8 @@ Fresh checks:
   `kernel.cuda_native_vnni_prefill_calls` route counters.
 - CUDA NativeVNNI prefill split-K/fixup and GEMV KPAR scratch now bind
   through `DeviceWorkspaceManager`; workspace suballocs emit structured memory
-  counters, and exact-M/padded-M plus KPAR sizing regressions cover the path.
+  counters. CUDA/ROCm MoE request scratch and GDN deinterleave scratch now also
+  require bound graph workspace instead of raw hot-path allocation.
 - Dense diagnostic at graph bucket `M=600` recorded top prompt-prefill routes:
   `17408x5120` Q4_K tile 4, `5120x17408` Q4_K tile 2, and GDN projection
   shapes including `6144x5120`, `5120x6144`, `10240x5120`, and `1024x5120`.
