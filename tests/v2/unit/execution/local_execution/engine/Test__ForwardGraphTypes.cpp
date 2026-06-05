@@ -1008,6 +1008,75 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     PerfStatsCollector::reset();
 }
 
+TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapturedEvents)
+{
+    ScopedEnvVar disable_legacy_profile("LLAMINAR_PROFILING", "0");
+    ScopedEnvVar disable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "0");
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar stage_gpu_filter("LLAMINAR_PERF_STATS_FILTER", "stage_gpu");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "main_decode";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"captured_decode_graph"};
+    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*current_step=*/5,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+
+    const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
+    const PerfStatsCollector::Tags total_tags = {
+        {"attribution", "gpu_event"},
+        {"context", "main_decode"},
+        {"graph_capture_scope", "segmented_replay_events"},
+        {"segment_count", "1"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"sync_scope", "stream_synchronized"},
+        {"timing_scope", "total_replay_gpu_event"},
+        {"type", "capturable"}};
+    const PerfStatsCollector::Tags segment_tags = {
+        {"attribution", "gpu_event"},
+        {"context", "main_decode"},
+        {"graph_capture_scope", "segmented_replay_events"},
+        {"segment_index", "0"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"sync_scope", "stream_synchronized"},
+        {"timing_scope", "segment_replay_gpu_event"},
+        {"type", "capturable"}};
+
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", segment_tags), 1u);
+    EXPECT_EQ(gpu_ctx.events_created_, 4);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 4);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvents)
 {
     ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");

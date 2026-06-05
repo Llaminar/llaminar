@@ -148,11 +148,63 @@ TEST(Test__PerfStatsCollector, PerfStatsExportAloneDoesNotEnableGpuStageEventTim
     ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
     ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
     ScopedEnv stage_detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", nullptr);
+    ScopedEnv perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", nullptr);
     ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
 
     EXPECT_TRUE(PerfStatsCollector::isEnabled());
     EXPECT_FALSE(PerfStatsCollector::gpuStageEventTimingEnabled());
+}
+
+TEST(Test__PerfStatsCollector, GpuStageTimingEnablesStructuredCollection)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+    ScopedEnv perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", nullptr);
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", nullptr);
+    ScopedEnv csv("LLAMINAR_PERF_STATS_CSV", nullptr);
+    PerfStatsCollector::reset();
+
+    EXPECT_TRUE(PerfStatsCollector::isEnabled());
+    EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
+
+    PerfStatsCollector::recordTimingNs(
+        "stage_gpu",
+        "graph_replay.total",
+        1000,
+        "decode",
+        "cuda:0",
+        {{"attribution", "gpu_event"}});
+    EXPECT_EQ(PerfStatsCollector::snapshot({"stage_gpu"}).size(), 1u);
+}
+
+TEST(Test__PerfStatsCollector, PerfStatsStageGpuRequestsEnableGpuStageEventTiming)
+{
+    {
+        ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+        ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
+        ScopedEnv stage_detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", nullptr);
+        ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+        ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "stage_gpu");
+        ScopedEnv perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+        PerfStatsCollector::reset();
+
+        EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
+    }
+
+    {
+        ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+        ScopedEnv stage_timing("LLAMINAR_GPU_STAGE_TIMING", nullptr);
+        ScopedEnv stage_detail("LLAMINAR_GPU_STAGE_TIMING_DETAIL", nullptr);
+        ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+        ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", nullptr);
+        ScopedEnv perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", "1");
+        PerfStatsCollector::reset();
+
+        EXPECT_TRUE(PerfStatsCollector::gpuStageEventTimingEnabled());
+    }
 }
 
 TEST(Test__PerfStatsCollector, ExplicitProfilingOrGpuStageTimingEnablesGpuStageEventTiming)

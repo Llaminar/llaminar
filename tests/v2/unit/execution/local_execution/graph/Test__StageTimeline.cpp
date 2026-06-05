@@ -80,6 +80,7 @@ namespace
         void synchronizeEvent(void *event) override
         {
             events_synchronized_++;
+            synchronized_events_.push_back(event);
             if (fail_synchronize_)
             {
                 // Simulate the "invalid argument" error behavior
@@ -115,6 +116,7 @@ namespace
         int synchronize_failures_ = 0;
         int elapsed_time_queries_ = 0;
         void *last_recorded_event_ = nullptr;
+        std::vector<void *> synchronized_events_;
         bool fail_synchronize_ = false;
         bool fail_elapsed_time_ = false;
         float simulated_elapsed_ms_ = 1.5f;
@@ -256,6 +258,37 @@ TEST_F(Test__StageTimeline, RecordAndCollect_BasicFlow)
 
     // Check total GPU time
     EXPECT_FLOAT_EQ(timeline.totalGpuMs(), 1.5f * 3);
+}
+
+TEST_F(Test__StageTimeline, CollectSynchronizesLastStopEventOnEachStream)
+{
+    StageTimeline timeline;
+    timeline.initialize(gpu_ctx_.get(), 3);
+    timeline.setStageInfo(0, "capture_segment", ComputeStageType::GEMM);
+    timeline.setStageInfo(1, "collective_segment", ComputeStageType::ALLREDUCE);
+    timeline.setStageInfo(2, "capture_tail", ComputeStageType::LM_HEAD);
+
+    int capture_stream = 0;
+    int collective_stream = 0;
+
+    timeline.recordStart(0, gpu_ctx_.get(), &capture_stream);
+    timeline.recordStop(0, gpu_ctx_.get(), &capture_stream);
+    timeline.recordStart(1, gpu_ctx_.get(), &collective_stream);
+    timeline.recordStop(1, gpu_ctx_.get(), &collective_stream);
+    timeline.recordStart(2, gpu_ctx_.get(), &capture_stream);
+    timeline.recordStop(2, gpu_ctx_.get(), &capture_stream);
+
+    gpu_ctx_->events_synchronized_ = 0;
+    gpu_ctx_->elapsed_time_queries_ = 0;
+    gpu_ctx_->synchronized_events_.clear();
+
+    timeline.collect(gpu_ctx_.get());
+
+    EXPECT_EQ(gpu_ctx_->events_synchronized_, 2)
+        << "stage timing must wait for every explicit stream before querying elapsed events";
+    EXPECT_EQ(gpu_ctx_->elapsed_time_queries_, 3);
+    ASSERT_EQ(gpu_ctx_->synchronized_events_.size(), 2u);
+    EXPECT_NE(gpu_ctx_->synchronized_events_[0], gpu_ctx_->synchronized_events_[1]);
 }
 
 TEST_F(Test__StageTimeline, RecordPerfStatsCarriesContextTags)

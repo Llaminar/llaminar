@@ -2264,8 +2264,10 @@ Before considering a file complete, verify:
 | `LLAMINAR_PROFILING` | Enable all profiling (kernel timing + executor overhead + GPU stage timing) | Disabled |
 | `LLAMINAR_PROFILE_KERNELS` | (Legacy) Enable per-kernel timing in benchmark mode | Disabled |
 | `LLAMINAR_EXECUTOR_PROFILING` | (Legacy) Enable per-stage profiling in DeviceGraphExecutor | Disabled |
-| `LLAMINAR_GPU_STAGE_TIMING` | GPU event-based per-stage timing (also enabled by LLAMINAR_PROFILING=1) | Disabled |
+| `LLAMINAR_GPU_STAGE_TIMING` | GPU event-based per-stage timing on production graph paths (also enables structured `stage_gpu` records) | Disabled |
 | `LLAMINAR_GPU_STAGE_TIMING_DETAIL` | Print per-stage detail in GPU stage timing (implies GPU_STAGE_TIMING) | Disabled |
+| `LLAMINAR_PERF_STATS_GPU_STAGE_TIMING` | Enable GPU event timing for JSON/CSV perf stats without legacy profiling | Disabled |
+| `LLAMINAR_PERF_STATS_JSON` / `LLAMINAR_PERF_STATS_CSV` | Export unified perf counters and timers as JSON/CSV; use `LLAMINAR_PERF_STATS_FILTER=stage_gpu` for graph-safe stage timing export | Disabled |
 | `LLAMINAR_VALIDATE_BUFFERS` | Enable buffer validation after stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_VALIDATE_INPUTS` | Enable input validation before stage execution | Auto-ON in Debug/Integration |
 | `LLAMINAR_FAIL_ON_ZERO` | Fail on zero tensors during validation | Disabled |

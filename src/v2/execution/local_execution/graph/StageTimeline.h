@@ -53,6 +53,7 @@ namespace llaminar2
             ComputeStageType type;
             void *event_start = nullptr;
             void *event_stop = nullptr;
+            void *event_stream = nullptr;
             float gpu_ms = 0.0f;
             bool valid = false; ///< True if both events were recorded
         };
@@ -170,6 +171,7 @@ namespace llaminar2
             if (idx < records_.size() && records_[idx].event_stop)
             {
                 gpu_ctx->recordEvent(records_[idx].event_stop, stream);
+                records_[idx].event_stream = stream;
                 records_[idx].valid = true;
             }
         }
@@ -184,22 +186,26 @@ namespace llaminar2
          */
         void collect(IWorkerGPUContext *gpu_ctx)
         {
-            // Find the last valid stop event to sync on
-            void *last_stop = nullptr;
-            for (auto it = records_.rbegin(); it != records_.rend(); ++it)
+            // Synchronize the last valid stop event on every stream. A single
+            // "last stage" event is only sufficient when all stages used one
+            // ordered stream; graph-replay boundaries and collectives can use
+            // distinct explicit streams.
+            std::unordered_map<void *, void *> last_stop_by_stream;
+            for (auto &rec : records_)
             {
-                if (it->valid && it->event_stop)
+                if (rec.valid && rec.event_stop)
                 {
-                    last_stop = it->event_stop;
-                    break;
+                    last_stop_by_stream[rec.event_stream] = rec.event_stop;
                 }
             }
 
-            if (!last_stop)
+            if (last_stop_by_stream.empty())
                 return;
 
-            // Single GPU sync — blocks until all stages complete
-            gpu_ctx->synchronizeEvent(last_stop);
+            for (const auto &[_, stop_event] : last_stop_by_stream)
+            {
+                gpu_ctx->synchronizeEvent(stop_event);
+            }
 
             // Query all elapsed times (CPU-only after sync, no GPU waits)
             for (auto &rec : records_)
@@ -315,6 +321,7 @@ namespace llaminar2
             for (auto &rec : records_)
             {
                 rec.valid = false;
+                rec.event_stream = nullptr;
                 rec.gpu_ms = 0.0f;
             }
         }

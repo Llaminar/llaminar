@@ -142,6 +142,13 @@ namespace llaminar2
             return value;
         }
 
+        bool isExportRequested()
+        {
+            return exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
+                   exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv").size() > 0 ||
+                   isSummaryRequested();
+        }
+
         std::vector<std::string> filterListFromEnv()
         {
             std::vector<std::string> filters;
@@ -158,6 +165,29 @@ namespace llaminar2
                     filters.push_back(std::move(item));
             }
             return filters;
+        }
+
+        bool filterRequestsStageGpuTiming()
+        {
+            if (!isExportRequested())
+                return false;
+
+            const auto filters = filterListFromEnv();
+            return std::any_of(filters.begin(), filters.end(), [](const std::string &filter)
+                               {
+                                   return filter == "stage_gpu" ||
+                                          filter == "stage_gpu.*" ||
+                                          filter.starts_with("stage_gpu.") ||
+                                          filter == "mtp_stage_gpu" ||
+                                          filter == "mtp_stage_gpu.*" ||
+                                          filter.starts_with("mtp_stage_gpu.");
+                               });
+        }
+
+        bool perfStatsGpuStageTimingRequested()
+        {
+            return isTruthyEnvValue(std::getenv("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING")) ||
+                   filterRequestsStageGpuTiming();
         }
 
         bool recordMatchesFilters(const PerfStatRecord &record, const std::vector<std::string> &filters)
@@ -281,6 +311,8 @@ namespace llaminar2
     bool PerfStatsCollector::isEnabled()
     {
         return debugEnv().profile.enabled ||
+               debugEnv().gpu_stage_timing ||
+               perfStatsGpuStageTimingRequested() ||
                isSummaryRequested() ||
                exportPathFromEnv("LLAMINAR_PERF_STATS_JSON", "/tmp/llaminar_perf_stats.json").size() > 0 ||
                exportPathFromEnv("LLAMINAR_PERF_STATS_CSV", "/tmp/llaminar_perf_stats.csv").size() > 0;
@@ -288,7 +320,9 @@ namespace llaminar2
 
     bool PerfStatsCollector::gpuStageEventTimingEnabled()
     {
-        return debugEnv().gpu_stage_timing || debugEnv().profile.enabled;
+        return debugEnv().gpu_stage_timing ||
+               debugEnv().profile.enabled ||
+               perfStatsGpuStageTimingRequested();
     }
 
     void PerfStatsCollector::reset()
