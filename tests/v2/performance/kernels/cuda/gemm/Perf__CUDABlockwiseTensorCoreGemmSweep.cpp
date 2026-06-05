@@ -68,6 +68,8 @@ namespace
          { return TestTensorFactory::createQ4_0Random({n, k}); }},
         {"IQ4_NL", [](size_t n, size_t k)
          { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+        {"IQ4_XS", [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ4_XSRandom({n, k}); }},
         {"Q4_1", [](size_t n, size_t k)
          { return TestTensorFactory::createQ4_1Random({n, k}); }},
         {"Q4_K", [](size_t n, size_t k)
@@ -555,7 +557,7 @@ namespace
     {
         const std::string path = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_SCRIPT");
         return path.empty()
-                   ? "/workspaces/llaminar/tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemv_dispatch.py"
+                   ? "/workspaces/llaminar/tests/v2/performance/kernels/cuda/gemm/infer_gemv_dispatch_heuristic.py"
                    : path;
     }
 
@@ -825,16 +827,21 @@ namespace
         std::filesystem::create_directories(std::filesystem::path(output_path).parent_path());
         std::filesystem::create_directories(std::filesystem::path(summary_path).parent_path());
 
-        const std::string command =
+        std::string command =
             "python3 " + shellQuote(script_path) +
             " --input " + shellQuote(input_csv) +
             " --output " + shellQuote(output_path) +
-            " --summary " + shellQuote(summary_path) +
-            " --min-overall-family-pct 99.0" +
-            " --min-overall-exact-pct 99.0" +
-            " --min-fallback-family-pct 97.0" +
-            " --min-fallback-exact-pct 30.0" +
-            " 2>&1";
+            " --summary " + shellQuote(summary_path);
+
+        if (script_path.find("analyze_cuda_tc_gemv_dispatch.py") != std::string::npos)
+        {
+            command +=
+                " --min-overall-family-pct 99.0"
+                " --min-overall-exact-pct 99.0"
+                " --min-fallback-family-pct 97.0"
+                " --min-fallback-exact-pct 30.0";
+        }
+        command += " 2>&1";
 
         FILE *pipe = popen(command.c_str(), "r");
         ASSERT_NE(pipe, nullptr) << "Failed to spawn heuristic generator";

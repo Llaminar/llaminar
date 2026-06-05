@@ -50,6 +50,10 @@ Thumbs.db
 # Logs
 *.log
 *.csv
+!tests/v2/performance/kernels/fixtures/
+!tests/v2/performance/kernels/fixtures/*.csv
+!tests/v2/performance/kernels/cuda/gemm/fixtures/
+!tests/v2/performance/kernels/cuda/gemm/fixtures/*.csv
 
 # Temporary files
 *.backup

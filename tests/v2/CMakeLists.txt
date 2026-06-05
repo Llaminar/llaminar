@@ -1588,6 +1588,27 @@ add_v2_test(V2_Unit_NativeVnniFormatInfo
     MPI_PROCS 1
 )
 
+add_test(NAME V2_Unit_NativeVNNICodebookCsvValidator
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_codebook_csv.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/fixtures/native_vnni_codebook_aliases.csv
+)
+set_tests_properties(V2_Unit_NativeVNNICodebookCsvValidator PROPERTIES
+    LABELS "V2;Unit;NativeVNNI;Quantization;Codebook;CSV;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_CUDAGemvDispatchGeneratorAliases
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_gemv_dispatch_generator.py
+            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/infer_gemv_dispatch_heuristic.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/fixtures/cuda_gemv_dispatch_alias_smoke.csv
+)
+set_tests_properties(V2_Unit_CUDAGemvDispatchGeneratorAliases PROPERTIES
+    LABELS "V2;Unit;CUDA;GEMV;NativeVNNI;Codebook;Dispatch;Regression"
+    TIMEOUT 30
+)
+
 # Performance: Q16 Fixed-Scale SIMD Quantization
 add_executable(v2_perf_q16_fixed_scale_simd performance/tensors/Perf__Q16_FixedScaleSIMD.cpp)
 target_link_libraries(v2_perf_q16_fixed_scale_simd
@@ -4213,6 +4234,16 @@ add_v2_test(V2_Integration_CUDAFlashAttention_DecodeKVLen
     MPI_PROCS 1  # Tests GPU attention locally, no MPI needed
 )
 
+# Test: CUDA Quantized GEMM workspace declarations
+# Host-only structural regressions for workspace-owned CUDA GEMM scratch.
+add_executable(v2_unit_cuda_quantised_gemm_workspace unit/kernels/cuda/Test__CUDAQuantisedGemmKernel_Workspace.cpp)
+target_link_libraries(v2_unit_cuda_quantised_gemm_workspace llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_CUDAQuantisedGemmWorkspace
+    COMMAND $<TARGET_FILE:v2_unit_cuda_quantised_gemm_workspace>
+    LABELS "V2;Unit;CUDA;GEMM;Workspace;GraphCapture;Regression"
+    MPI_PROCS 1
+)
+
 # Integration Test: cuBLAS GEMM (Phase 1 - dense GEMM via cuBLAS for FP32/FP16/BF16)
 # Tests correctness against CPU reference, various matrix sizes, transpose variants
 add_executable(v2_test_cublas_gemm integration/kernels/cuda/Test__CuBLASGemm.cpp)
@@ -4547,7 +4578,7 @@ add_executable(v2_perf_cuda_blockwise_tensorcore_gemm_sweep performance/kernels/
 target_link_libraries(v2_perf_cuda_blockwise_tensorcore_gemm_sweep llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Perf_CUDABlockwiseTensorCoreGemmSweep
     COMMAND $<TARGET_FILE:v2_perf_cuda_blockwise_tensorcore_gemm_sweep>
-    LABELS "V2;Performance;CUDA;GEMM;GEMV;TensorCore;BlockwiseQuantization;Qwen;Tuning;Sweep"
+    LABELS "V2;Performance;CUDA;GEMV;Decode;NativeVNNI;Codebook;Qwen;Tuning;Sweep;Trainer"
     MPI_PROCS 1
 )
 
@@ -4555,7 +4586,7 @@ add_executable(v2_perf_cuda_native_vnni_gemm performance/kernels/cuda/gemm/Perf_
 target_link_libraries(v2_perf_cuda_native_vnni_gemm llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Perf_CUDANativeVNNIGemm
     COMMAND $<TARGET_FILE:v2_perf_cuda_native_vnni_gemm>
-    LABELS "V2;Performance;CUDA;GEMM;NativeVNNI;Prefill;Qwen;Tuning;StreamK"
+    LABELS "V2;Performance;CUDA;GEMM;Prefill;NativeVNNI;Codebook;Qwen;Tuning;StreamK;Sweep"
     MPI_PROCS 1
 )
 
@@ -8989,7 +9020,7 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm IQ4 decode microbenchmark")
 
-    # Performance Test: Native-VNNI Throughput (all 16 formats)
+    # Performance Test: Native-VNNI decode throughput/trainer (all NativeVNNI GPU formats)
     # Measures per-format bandwidth efficiency at model-realistic dimensions.
     add_executable(v2_perf_native_vnni_throughput
         performance/kernels/rocm/Perf__NativeVNNI_Throughput.cpp
@@ -9006,10 +9037,10 @@ if(HAVE_ROCM)
     target_link_options(v2_perf_native_vnni_throughput PRIVATE -fopenmp)
     add_v2_test(V2_Perf_NativeVNNI_Throughput
         COMMAND $<TARGET_FILE:v2_perf_native_vnni_throughput>
-        LABELS "V2;Performance;ROCm;GEMV;NativeVNNI;Quantized;gfx906;Benchmark;Bandwidth"
+        LABELS "V2;Performance;ROCm;GEMV;Decode;NativeVNNI;Codebook;Quantized;gfx906;Benchmark;Bandwidth;Trainer"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added Native-VNNI throughput benchmark (18 formats, multi-GPU)")
+    message(STATUS "V2 Tests: Added Native-VNNI decode throughput/trainer benchmark (all GPU codebooks, multi-GPU)")
 
     # Performance Test: Native-VNNI GEMM (Q4_0 + IQ4_NL, M>1 prefill)
     # Benchmarks native-VNNI GEMM kernel against INT8 V3/V7 baseline.
@@ -9035,9 +9066,9 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added Native-VNNI GEMM benchmark (Q4_0 + IQ4_NL)")
 
-    # Performance Test: Native-VNNI Q4_0 Sweep
+    # Performance Test: Native-VNNI prefill sweep/trainer (all NativeVNNI GPU formats)
     # Per-shape tuning sweep over N_TILE, M_TILE, MIN_BLOCKS, UNROLL_G.
-    # Outputs best variant per shape for dispatch heuristic tuning.
+    # Outputs codebook-tagged candidate rows and best variant per shape for dispatch heuristic tuning.
     add_executable(v2_perf_native_vnni_sweep
         performance/kernels/rocm/Perf__NativeVNNI_Sweep.cpp
         performance/kernels/rocm/GpuVerification.hip
@@ -9053,10 +9084,10 @@ if(HAVE_ROCM)
     target_link_options(v2_perf_native_vnni_sweep PRIVATE -fopenmp)
     add_v2_test(V2_Perf_NativeVNNI_Sweep
         COMMAND $<TARGET_FILE:v2_perf_native_vnni_sweep>
-        LABELS "V2;Performance;ROCm;GEMM;NativeVNNI;Quantized;gfx906;Benchmark;Prefill;Sweep"
+        LABELS "V2;Performance;ROCm;GEMM;Prefill;NativeVNNI;Codebook;Quantized;gfx906;Benchmark;Sweep;Trainer"
         MPI_PROCS 1
     )
-    message(STATUS "V2 Tests: Added Native-VNNI Q4_0 sweep benchmark")
+    message(STATUS "V2 Tests: Added Native-VNNI prefill sweep benchmark (all GPU codebooks)")
 
     # Performance Test: Q8_0 Native-VNNI GEMV Tuning
     # Compares INT8-VNNI vs Native-VNNI decode paths for Q8_0 weights.

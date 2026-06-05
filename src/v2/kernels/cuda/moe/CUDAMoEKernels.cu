@@ -9,6 +9,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "utils/DebugEnv.h"
@@ -99,6 +100,44 @@ namespace
 
         // Combine per-warp partials. blockDim is a multiple of 32 and <= 1024, so at
         // most 32 warps; warp 0 reduces the per-warp sums in a single shuffle pass.
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int num_warps = blockDim.x >> 5;
+        __shared__ float warp_sums[32];
+        if (lane == 0)
+            warp_sums[warp] = sum;
+        __syncthreads();
+        if (warp == 0)
+        {
+            float v = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1)
+                v += __shfl_down_sync(0xffffffffu, v, offset);
+            if (lane == 0)
+                logits[static_cast<size_t>(token) * num_experts + expert] = v;
+        }
+    }
+
+    __global__ void route_logits_bf16_kernel(
+        const float *__restrict__ hidden,
+        const __nv_bfloat16 *__restrict__ gate_weights,
+        float *__restrict__ logits,
+        int seq_len, int d_model, int num_experts)
+    {
+        const int expert = blockIdx.x;
+        const int token = blockIdx.y;
+        if (expert >= num_experts || token >= seq_len)
+            return;
+
+        const float *h = hidden + static_cast<size_t>(token) * d_model;
+        const __nv_bfloat16 *g = gate_weights + static_cast<size_t>(expert) * d_model;
+
+        float sum = 0.0f;
+        for (int j = threadIdx.x; j < d_model; j += blockDim.x)
+            sum += h[j] * __bfloat162float(g[j]);
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+
         const int lane = threadIdx.x & 31;
         const int warp = threadIdx.x >> 5;
         const int num_warps = blockDim.x >> 5;
@@ -734,6 +773,133 @@ namespace
         grouped_weights[dest] = routing_weights[idx];
     }
 
+    __global__ void scatter_tokens_deterministic_kernel(
+        const int *__restrict__ routing_indices,
+        const float *__restrict__ routing_weights,
+        const int *__restrict__ expert_offsets,
+        const int *__restrict__ expert_counts,
+        int *__restrict__ grouped_token_indices,
+        int *__restrict__ original_to_grouped,
+        int *__restrict__ original_expert_ids,
+        float *__restrict__ grouped_weights,
+        int total_slots,
+        int top_k,
+        int num_experts)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= total_slots)
+            return;
+
+        const int expert = routing_indices[idx];
+        if (expert < 0 || expert >= num_experts)
+            return;
+
+        int local = 0;
+        for (int prev = 0; prev < idx; ++prev)
+        {
+            if (routing_indices[prev] == expert)
+                ++local;
+        }
+        if (local >= expert_counts[expert])
+            return;
+
+        const int dest = expert_offsets[expert] + local;
+        grouped_token_indices[dest] = idx / top_k;
+        original_to_grouped[idx] = dest;
+        original_expert_ids[idx] = expert;
+        grouped_weights[dest] = routing_weights[idx];
+    }
+
+    __global__ void group_tokens_small_float_kernel(
+        const float *__restrict__ routing_indices,
+        const float *__restrict__ routing_weights,
+        int *__restrict__ expert_counts,
+        int *__restrict__ expert_offsets,
+        int *__restrict__ grouped_token_indices,
+        int *__restrict__ original_to_grouped,
+        int *__restrict__ original_expert_ids,
+        float *__restrict__ grouped_weights,
+        int *__restrict__ active_expert_ids,
+        int total_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            expert_counts[expert] = 0;
+            expert_offsets[expert] = 0;
+        }
+        for (int idx = 0; idx < total_slots; ++idx)
+        {
+            original_to_grouped[idx] = -1;
+            original_expert_ids[idx] = -1;
+        }
+        for (int slot = 0; slot < max_active_experts; ++slot)
+            active_expert_ids[slot] = -1;
+
+        for (int idx = 0; idx < total_slots; ++idx)
+        {
+            const int expert = static_cast<int>(routing_indices[idx]);
+            if (expert >= 0 && expert < num_experts)
+                ++expert_counts[expert];
+        }
+
+        int running = 0;
+        int active_count = 0;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            expert_offsets[expert] = running;
+            const int count = expert_counts[expert];
+            if (count > 0 && active_count < max_active_experts)
+                active_expert_ids[active_count++] = expert;
+            running += count;
+        }
+
+        for (int idx = 0; idx < total_slots; ++idx)
+        {
+            const int expert = static_cast<int>(routing_indices[idx]);
+            if (expert < 0 || expert >= num_experts)
+                continue;
+
+            int local = 0;
+            for (int prev = 0; prev < idx; ++prev)
+            {
+                if (static_cast<int>(routing_indices[prev]) == expert)
+                    ++local;
+            }
+
+            const int dest = expert_offsets[expert] + local;
+            grouped_token_indices[dest] = idx / top_k;
+            original_to_grouped[idx] = dest;
+            original_expert_ids[idx] = expert;
+            grouped_weights[dest] = routing_weights[idx];
+        }
+    }
+
+    __global__ void prepare_shared_expert_group_kernel(
+        int *__restrict__ expert_offsets,
+        int *__restrict__ expert_counts,
+        int *__restrict__ grouped_token_indices,
+        float *__restrict__ grouped_weights,
+        int seq_len)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx == 0)
+        {
+            expert_offsets[0] = 0;
+            expert_counts[0] = seq_len;
+        }
+        if (idx < seq_len)
+        {
+            grouped_token_indices[idx] = idx;
+            grouped_weights[idx] = 1.0f;
+        }
+    }
+
     __global__ void gather_expert_fixed_kernel(
         const float *__restrict__ hidden,
         float *__restrict__ batch_buffer,
@@ -929,8 +1095,8 @@ namespace
                 break;
 
             // Per-token activation row: a4_base/scale_a_base point at a staged shared-memory
-            // tile (contiguous, stride = 8 int32 / 1 scale). The 8 int32 are read as 2×128-bit
-            // vector loads to cut the LDS instruction count 4× (relieves the MIO pipe).
+            // tile (contiguous, stride = 8 int32 / 1 scale). The 8 int32 are read as 2x128-bit
+            // vector loads to cut the LDS instruction count 4x (relieves the MIO pipe).
             // Requires a4_base + m*stride to be 16-byte aligned (s_a is __align__(16), stride=8).
             const int4 *a4v = reinterpret_cast<const int4 *>(a4_base + static_cast<size_t>(m) * a4_stride_i32);
             const int4 av0 = a4v[0];
@@ -1431,6 +1597,36 @@ namespace
         atomicAdd(output + static_cast<size_t>(token) * d_model + col, weight * value);
     }
 
+    __global__ void grouped_prefill_scatter_weighted_ordered_kernel(
+        float *__restrict__ output,
+        const float *__restrict__ expert_output,
+        const int *__restrict__ original_to_grouped,
+        const float *__restrict__ grouped_weights,
+        int seq_len,
+        int top_k,
+        int d_model)
+    {
+        constexpr int kTileN = 64;
+        const int col = blockIdx.x * kTileN + threadIdx.x;
+        const int token = blockIdx.y;
+        if (token >= seq_len || col >= d_model)
+            return;
+
+        float sum = 0.0f;
+#pragma unroll 1
+        for (int k = 0; k < top_k; ++k)
+        {
+            const int original_slot = token * top_k + k;
+            const int grouped_slot = original_to_grouped[original_slot];
+            if (grouped_slot < 0)
+                continue;
+            const float weight = grouped_weights[grouped_slot];
+            const float value = expert_output[static_cast<size_t>(grouped_slot) * d_model + col];
+            sum += weight * value;
+        }
+        output[static_cast<size_t>(token) * d_model + col] = sum;
+    }
+
     /**
      * @brief Compute a partial dot product over a K-block subrange [b_start, b_end).
      *
@@ -1854,6 +2050,28 @@ namespace
     {
         return (count + kThreads - 1) / kThreads;
     }
+
+    int select_grouped_prefill_tile_m(int requested_tile_m, int max_tokens_per_expert)
+    {
+        switch (requested_tile_m)
+        {
+        case 2:
+        case 4:
+        case 8:
+        case 16:
+            return requested_tile_m;
+        default:
+            break;
+        }
+
+        if (max_tokens_per_expert <= 2)
+            return 2;
+        if (max_tokens_per_expert <= 4)
+            return 4;
+        if (max_tokens_per_expert <= 8)
+            return 8;
+        return 16;
+    }
 }
 
 extern "C"
@@ -1889,6 +2107,18 @@ extern "C"
         route_logits_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             hidden, gate_weights, logits, seq_len, d_model, num_experts);
         return finishLaunch("cudaMoE_route_logits");
+    }
+
+    bool cudaMoE_route_logits_bf16(const float *hidden, const void *gate_weights, float *logits,
+                                   int seq_len, int d_model, int num_experts,
+                                   int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+        dim3 grid(num_experts, seq_len);
+        route_logits_bf16_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            hidden, static_cast<const __nv_bfloat16 *>(gate_weights), logits,
+            seq_len, d_model, num_experts);
+        return finishLaunch("cudaMoE_route_logits_bf16");
     }
 
     bool cudaMoE_softmax_topk(float *logits, int *expert_indices, float *expert_weights,
@@ -2052,6 +2282,73 @@ extern "C"
             routing_indices, routing_weights, write_heads, expert_offsets,
             grouped_token_indices, grouped_weights, total_slots, top_k, num_experts);
         return finishLaunch("cudaMoE_scatter_tokens");
+    }
+
+    bool cudaMoE_scatter_tokens_deterministic(
+        const int *routing_indices,
+        const float *routing_weights,
+        const int *expert_offsets,
+        const int *expert_counts,
+        int *grouped_token_indices,
+        int *original_to_grouped,
+        int *original_expert_ids,
+        float *grouped_weights,
+        int total_slots,
+        int top_k,
+        int num_experts,
+        int device_idx,
+        void *stream)
+    {
+        if (!stream)
+            return false;
+        cudaSetDevice(device_idx);
+        scatter_tokens_deterministic_kernel<<<blocksFor(total_slots), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            routing_indices, routing_weights, expert_offsets, expert_counts,
+            grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
+            total_slots, top_k, num_experts);
+        return finishLaunch("cudaMoE_scatter_tokens_deterministic");
+    }
+
+    bool cudaMoE_group_tokens_small_float(
+        const float *routing_indices,
+        const float *routing_weights,
+        int *expert_counts,
+        int *expert_offsets,
+        int *grouped_token_indices,
+        int *original_to_grouped,
+        int *original_expert_ids,
+        float *grouped_weights,
+        int *active_expert_ids,
+        int total_slots,
+        int num_experts,
+        int top_k,
+        int max_active_experts,
+        int device_idx,
+        void *stream)
+    {
+        if (!stream)
+            return false;
+        cudaSetDevice(device_idx);
+        group_tokens_small_float_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            routing_indices, routing_weights, expert_counts, expert_offsets,
+            grouped_token_indices, original_to_grouped, original_expert_ids, grouped_weights,
+            active_expert_ids, total_slots, num_experts, top_k, max_active_experts);
+        return finishLaunch("cudaMoE_group_tokens_small_float");
+    }
+
+    bool cudaMoE_prepare_shared_expert_group(
+        int *expert_offsets,
+        int *expert_counts,
+        int *grouped_token_indices,
+        float *grouped_weights,
+        int seq_len,
+        int device_idx,
+        void *stream)
+    {
+        cudaSetDevice(device_idx);
+        prepare_shared_expert_group_kernel<<<blocksFor(seq_len), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            expert_offsets, expert_counts, grouped_token_indices, grouped_weights, seq_len);
+        return finishLaunch("cudaMoE_prepare_shared_expert_group");
     }
 
     bool cudaMoE_gather_expert_fixed(const float *hidden, float *batch_buffer,
@@ -2407,6 +2704,7 @@ extern "C"
         const int *d_group_counts,
         const int *d_group_offsets,
         const int *d_group_token_indices,
+        const int *d_original_to_grouped,
         const float *d_group_weights,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
@@ -2421,6 +2719,7 @@ extern "C"
         int intermediate,
         int max_tokens_per_expert,
         int total_slots,
+        int top_k,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         int device_idx,
@@ -2431,7 +2730,7 @@ extern "C"
             !d_scratch_A_int8 || !d_scratch_scales || !d_scratch_gate || !d_scratch_up ||
             !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out || !d_output ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
-            max_tokens_per_expert <= 0 || total_slots <= 0 ||
+            max_tokens_per_expert <= 0 || total_slots <= 0 || top_k <= 0 ||
             (d_model % 32) != 0 || (intermediate % 32) != 0)
         {
             std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] invalid arguments\n");
@@ -2456,10 +2755,9 @@ extern "C"
 
         {
             constexpr int kTileN = 128;
-            // kTileM is tunable (debugEnv) to amortize IQ-codebook weight decode across more
-            // tokens. Valid values 8 or 16; larger reduces redundant decode but uses more regs.
-            const int tile_m = llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const int kTileM = (tile_m == 16) ? 16 : 8;
+            const int kTileM = select_grouped_prefill_tile_m(
+                llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m,
+                max_tokens_per_expert);
             // When fusion is enabled the gate/up kernel computes SwiGLU + blockwise int8 quant
             // in its epilogue, writing the down-projection input directly (no FP32 gate/up
             // round-trip, no separate swiglu_quantize launch).
@@ -2481,11 +2779,15 @@ extern "C"
 #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                          \
     do {                                                                                           \
         if (fuse_swiglu) {                                                                          \
-            if (kTileM == 16) LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);                      \
-            else              LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                        \
+            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 16);                 \
+            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 8);                  \
+            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 4);                  \
+            else                   LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, 2);                  \
         } else {                                                                                    \
-            if (kTileM == 16) LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                             \
-            else              LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                              \
+            if (kTileM == 16)      LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 16);                        \
+            else if (kTileM == 8)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 8);                         \
+            else if (kTileM == 4)  LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 4);                         \
+            else                   LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, 2);                         \
         }                                                                                           \
     } while (0)
 
@@ -2536,8 +2838,9 @@ extern "C"
 
         {
             constexpr int kTileN = 128;
-            const int tile_m = llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m;
-            const int kTileM = (tile_m == 16) ? 16 : 8;
+            const int kTileM = select_grouped_prefill_tile_m(
+                llaminar2::debugEnv().gemm.cuda_moe_prefill_tile_m,
+                max_tokens_per_expert);
             dim3 grid((d_model + kTileN - 1) / kTileN,
                       (max_tokens_per_expert + kTileM - 1) / kTileM,
                       num_experts);
@@ -2549,8 +2852,10 @@ extern "C"
         d_group_counts, d_group_offsets, d_scratch_down_out, d_model, intermediate)
 #define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
     do {                                                                                           \
-        if (kTileM == 16) LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 16);                                   \
-        else              LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 8);                                    \
+        if (kTileM == 16)      LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 16);                              \
+        else if (kTileM == 8)  LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 8);                               \
+        else if (kTileM == 4)  LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 4);                               \
+        else                   LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 2);                               \
     } while (0)
 
             switch (down_codebook_id)
@@ -2586,12 +2891,24 @@ extern "C"
 
         {
             constexpr int kTileN = 64;
-            dim3 grid((d_model + kTileN - 1) / kTileN, total_slots);
             dim3 block(kTileN);
-            grouped_prefill_scatter_weighted_kernel<<<grid, block, 0, cuda_stream>>>(
-                d_output, d_scratch_down_out,
-                d_group_token_indices, d_group_weights,
-                total_slots, d_model);
+            if (d_original_to_grouped)
+            {
+                const int seq_len = total_slots / top_k;
+                dim3 grid((d_model + kTileN - 1) / kTileN, seq_len);
+                grouped_prefill_scatter_weighted_ordered_kernel<<<grid, block, 0, cuda_stream>>>(
+                    d_output, d_scratch_down_out,
+                    d_original_to_grouped, d_group_weights,
+                    seq_len, top_k, d_model);
+            }
+            else
+            {
+                dim3 grid((d_model + kTileN - 1) / kTileN, total_slots);
+                grouped_prefill_scatter_weighted_kernel<<<grid, block, 0, cuda_stream>>>(
+                    d_output, d_scratch_down_out,
+                    d_group_token_indices, d_group_weights,
+                    total_slots, d_model);
+            }
             if (!finishLaunch("cudaMoE_grouped_scatter_prefill"))
                 return false;
         }

@@ -1,0 +1,9 @@
+format,codebook,shape,n,k
+IQ4_NL,4,alias_smoke,512,2048
+IQ4_XS,4,alias_smoke,512,2048
+Q4_1,5,alias_smoke,512,2048
+Q4_K,5,alias_smoke,512,2048
+Q5_1,7,alias_smoke,512,2048
+Q5_K,7,alias_smoke,512,2048
+Q8_0,19,alias_smoke,512,2048
+Q8_1,20,alias_smoke,512,2048

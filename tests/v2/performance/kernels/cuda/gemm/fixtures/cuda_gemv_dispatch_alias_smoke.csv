@@ -1,0 +1,7 @@
+format,codebook,shape,n,k,weight_bytes,family,tile_n,cpt,target_waves,mkg,max_kb,force_two_phase,min_us,eff_bw_gbs,pct_peak,is_best
+Q4_1,5,alias_q4_1,512,2048,589824,kpar,64,1,8,2,0,2,12.0,2800.0,50.0,1
+Q4_K,5,alias_q4_k,2048,512,589824,kpar,64,1,8,2,0,2,10.0,2900.0,51.0,1
+Q5_1,7,alias_q5_1,512,2048,720896,kpar,64,1,8,2,0,2,13.0,2600.0,47.0,1
+Q5_K,7,alias_q5_k,2048,512,720896,kpar,64,1,8,2,0,2,11.0,2700.0,48.0,1
+IQ4_NL,4,alias_iq4_nl,512,2048,589824,kpar,64,1,8,2,0,2,12.5,2750.0,49.0,1
+IQ4_XS,4,alias_iq4_xs,2048,512,589824,kpar,64,1,8,2,0,2,10.5,2850.0,50.5,1

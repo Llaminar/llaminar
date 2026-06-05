@@ -55,12 +55,18 @@ namespace llaminar2::test::native_vnni_gemm_perf
          { return TestTensorFactory::createQ4_0Random({n, k}); }},
         {"IQ4_NL", 4, [](size_t n, size_t k)
          { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+        {"IQ4_XS", 4, [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ4_XSRandom({n, k}); }},
         {"Q4_1", 5, [](size_t n, size_t k)
          { return TestTensorFactory::createQ4_1Random({n, k}); }},
+        {"Q4_K", 5, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ4_KRandom({n, k}); }},
         {"Q5_0", 6, [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_0Random({n, k}); }},
         {"Q5_1", 7, [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_1Random({n, k}); }},
+        {"Q5_K", 7, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ5_KRandom({n, k}); }},
         {"Q6_K", 8, [](size_t n, size_t k)
          { return TestTensorFactory::createQ6_KRandom({n, k}); }},
         {"Q3_K", 9, [](size_t n, size_t k)

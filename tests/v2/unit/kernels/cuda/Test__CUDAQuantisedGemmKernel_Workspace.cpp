@@ -51,6 +51,12 @@ namespace
     // (not a pointer) so we can do prefix comparisons regardless of whether
     // the kernel returns the bare prefix or a "<prefix>_<id>" suffixed slice.
     const std::string kTempCFp32Prefix = std::string(GemmWorkspaceBuffers::TEMP_C_FP32);
+    constexpr int kConcurrentPrefillExtraAccumulatorSlots = 2;
+
+    int paddedPrefillM(int m)
+    {
+        return (m > 1) ? ((m + 127) & ~127) : m;
+    }
 
     // Helper: count buffers in a WorkspaceRequirements whose name starts with
     // the TEMP_C_FP32 prefix. Both the buggy (single shared slot) and fixed
@@ -249,5 +255,65 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
     }
     ASSERT_NE(temp_c, nullptr);
     EXPECT_EQ(temp_c->size_bytes,
-              static_cast<size_t>(kM) * kN * sizeof(float));
+              static_cast<size_t>(paddedPrefillM(kM)) * kN * sizeof(float));
+}
+
+// ----------------------------------------------------------------------------
+// REGRESSION: concurrent prefill accumulator scratch must be declared as
+// workspace, not hidden cudaMalloc-owned per-stream pool memory.
+// ----------------------------------------------------------------------------
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       ConcurrentPrefillAccumulatorWorkspace_HasTwoExtraPaddedSlots)
+{
+    auto weights = TestTensorFactory::createQ8_0Random({64, 128}, /*seed=*/11);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+
+    constexpr int kM = 17; // exercises tile-padding, not the M=1 decode path
+    constexpr int kN = 64;
+    constexpr int kK = 128;
+    auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+
+    const WorkspaceDescriptor *acc = reqs.find(GemmWorkspaceBuffers::ACC_INT32);
+    const WorkspaceDescriptor *concurrent_acc =
+        reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
+
+    ASSERT_NE(acc, nullptr);
+    ASSERT_NE(concurrent_acc, nullptr)
+        << "Concurrent prefill must declare workspace-owned extra accumulator slots; "
+        << "a hidden per-stream cudaMalloc pool is not graph/V RAM accounting friendly.";
+
+    const size_t one_slot_bytes =
+        static_cast<size_t>(paddedPrefillM(kM)) * kN * sizeof(int32_t);
+    EXPECT_EQ(acc->size_bytes, one_slot_bytes);
+    EXPECT_EQ(concurrent_acc->size_bytes,
+              static_cast<size_t>(kConcurrentPrefillExtraAccumulatorSlots) * one_slot_bytes);
+}
+
+// The concurrent accumulator is intentionally shared across all CUDA quantized
+// GEMM kernels on a device. WorkspaceRequirements::merge() should keep one
+// buffer sized to the largest projection, unlike TEMP_C_FP32 which is uniquely
+// sliced per kernel instance.
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       MergedRequirements_KeepLargestConcurrentPrefillAccumulator)
+{
+    auto weights_small = TestTensorFactory::createQ8_0Random({64, 128}, /*seed=*/12);
+    auto weights_large = TestTensorFactory::createQ8_0Random({96, 128}, /*seed=*/13);
+
+    CUDAQuantisedGemmKernel kernel_small(weights_small.get(), kFakeCudaDeviceId);
+    CUDAQuantisedGemmKernel kernel_large(weights_large.get(), kFakeCudaDeviceId);
+
+    auto reqs_small = kernel_small.getWorkspaceRequirements(/*m=*/17, /*n=*/64, /*k=*/128);
+    auto reqs_large = kernel_large.getWorkspaceRequirements(/*m=*/17, /*n=*/96, /*k=*/128);
+
+    const auto *small = reqs_small.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
+    const auto *large = reqs_large.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
+    ASSERT_NE(small, nullptr);
+    ASSERT_NE(large, nullptr);
+    ASSERT_GT(large->size_bytes, small->size_bytes);
+
+    reqs_small.merge(reqs_large);
+
+    const auto *merged = reqs_small.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
+    ASSERT_NE(merged, nullptr);
+    EXPECT_EQ(merged->size_bytes, large->size_bytes);
 }

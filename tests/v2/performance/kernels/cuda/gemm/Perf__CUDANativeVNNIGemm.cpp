@@ -34,6 +34,29 @@ extern "C"
 
 namespace
 {
+    const llaminar2::NativeVnniFormatInfo &requireNativeVnniInfo(
+        const TensorBase *weights,
+        const std::string &format_name)
+    {
+        const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(weights);
+        const llaminar2::NativeVnniFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (!info)
+            throw std::runtime_error("CUDA NativeVNNI sweep format " + format_name + " did not expose vnniFormatInfo()");
+        return *info;
+    }
+
+    TEST(CUDANativeVNNIGemmPerfOffline, FormatListCodebookIdsMatchTensorMetadata)
+    {
+        for (const auto &format : kFormats)
+        {
+            auto weights = format.create(/*n=*/2, /*k=*/256);
+            ASSERT_NE(weights, nullptr) << format.name;
+
+            const auto &info = requireNativeVnniInfo(weights.get(), format.name);
+            EXPECT_EQ(info.codebook_id, format.codebook_id) << format.name;
+        }
+    }
+
     class CUDANativeVNNIGemmPerf : public ::testing::Test
     {
     protected:
@@ -531,10 +554,12 @@ namespace
         // Q4_0 weight: n*k / 2 (4 bits per element) + scale overhead
         const size_t w_bytes = static_cast<size_t>(n) * k / 2 + static_cast<size_t>(n) * (k / 32) * 2;
         // Workspace: quant_a(M*K) + scales_a(M*4) + acc_int32(M*N*4) +
+        //            concurrent prefill extra acc slots(2*M*N*4) +
         //            scales_a_blockwise(M*(K/32)*4) + temp_c_fp32(M*N*4)
         const size_t workspace_bytes = static_cast<size_t>(m) * k                     // quant_a (int8)
                                        + static_cast<size_t>(m) * 4                   // scales_a
                                        + static_cast<size_t>(m) * n * 4               // acc_int32
+                                       + 2 * static_cast<size_t>(m) * n * 4           // concurrent prefill extra acc
                                        + static_cast<size_t>(m) * ((k + 31) / 32) * 4 // scales_a_blockwise
                                        + static_cast<size_t>(m) * n * 4;              // temp_c_fp32
         return a_bytes + c_bytes + w_bytes + workspace_bytes;

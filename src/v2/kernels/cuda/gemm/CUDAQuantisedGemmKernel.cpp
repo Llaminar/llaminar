@@ -179,8 +179,16 @@ namespace llaminar2
         }
 
         // =====================================================================
-        // Concurrent prefill stream pool (per-kernel instance, not static)
+        // Concurrent prefill stream pool (per-device stream/event handles only)
         // =====================================================================
+
+        // Current graph builders form at most three quantized projection groups
+        // that benefit from concurrent prefill dispatch: fused QKV (3), gate/up
+        // (2), and GDN qkv/z (2). Slot 0 reuses the normal ACC_INT32 workspace;
+        // the remaining slots live in CUDA_CONCURRENT_PREFILL_ACC_INT32.
+        constexpr int kCudaConcurrentPrefillWorkspaceSlots = 3;
+        constexpr int kCudaConcurrentPrefillExtraAccumulatorSlots =
+            kCudaConcurrentPrefillWorkspaceSlots - 1;
 
         struct CUDAConcurrentPrefillPool
         {
@@ -189,8 +197,6 @@ namespace llaminar2
             void *streams[MAX_STREAMS] = {};
             void *completion[MAX_STREAMS] = {};
             void *quant_ready = nullptr;
-            int32_t *scratch[MAX_STREAMS] = {};        // Per-stream INT32 accumulator
-            size_t scratch_capacity[MAX_STREAMS] = {}; // In elements (M*N)
             int count = 0;
             int device_id = -1;
             bool initialized = false;
@@ -199,8 +205,11 @@ namespace llaminar2
             {
                 if (initialized)
                     return;
+                (void)num_streams;
                 device_id = dev_id;
-                count = std::min(num_streams, MAX_STREAMS);
+                // Create the full stream/event set during eager setup so a
+                // later graph capture never has to grow the pool.
+                count = MAX_STREAMS;
                 for (int i = 0; i < count; ++i)
                 {
                     cudaQuantGemm_createStream(&streams[i], dev_id);
@@ -210,39 +219,6 @@ namespace llaminar2
                 initialized = true;
                 LOG_DEBUG("[CUDAConcurrentPrefillPool] Initialized " << count
                                                                      << " streams on device " << dev_id);
-            }
-
-            /// Ensure per-stream scratch buffer has at least `elements` int32s.
-            bool ensureScratch(int idx, size_t elements)
-            {
-                if (idx < 0 || idx >= count)
-                    return false;
-                if (scratch_capacity[idx] >= elements)
-                    return true;
-
-                // Free old
-                if (scratch[idx])
-                {
-                    cudaQuantGemm_freeDevice(scratch[idx]);
-                    scratch[idx] = nullptr;
-                    scratch_capacity[idx] = 0;
-                }
-
-                cudaQuantGemm_setDevice(device_id);
-                float *tmp = nullptr;
-                // Allocate int32 buffer via allocFloat (same underlying cudaMalloc)
-                size_t float_count = (elements * sizeof(int32_t) + sizeof(float) - 1) / sizeof(float);
-                if (!cudaQuantGemm_allocFloat(&tmp, float_count, device_id))
-                {
-                    LOG_ERROR("[CUDAConcurrentPrefillPool] Failed to allocate scratch["
-                              << idx << "] (" << (elements * 4 / 1024) << " KB)");
-                    return false;
-                }
-                scratch[idx] = reinterpret_cast<int32_t *>(tmp);
-                scratch_capacity[idx] = elements;
-                LOG_DEBUG("[CUDAConcurrentPrefillPool] Allocated scratch[" << idx
-                                                                           << "] = " << (elements * 4 / 1024) << " KB");
-                return true;
             }
 
             void destroy()
@@ -255,12 +231,6 @@ namespace llaminar2
                     streams[i] = nullptr;
                     cudaQuantGemm_destroyEvent(completion[i]);
                     completion[i] = nullptr;
-                    if (scratch[i])
-                    {
-                        cudaQuantGemm_freeDevice(scratch[i]);
-                        scratch[i] = nullptr;
-                        scratch_capacity[i] = 0;
-                    }
                 }
                 cudaQuantGemm_destroyEvent(quant_ready);
                 quant_ready = nullptr;
@@ -579,6 +549,15 @@ namespace llaminar2
         void CUDAQuantisedGemmKernel::setForceCutlassFallback(bool /*enabled*/) {}
         bool CUDAQuantisedGemmKernel::isForceCutlassFallback() { return false; }
 
+        namespace
+        {
+            uint32_t nextCudaGemmWorkspaceSliceId()
+            {
+                static std::atomic<uint32_t> next_slice{0};
+                return next_slice.fetch_add(1, std::memory_order_relaxed);
+            }
+        } // namespace
+
         // =====================================================================
         // Constructor / Destructor
         // =====================================================================
@@ -591,6 +570,7 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),
               owns_weight_memory_(true), // Legacy path owns weight memory
+              slice_id_(nextCudaGemmWorkspaceSliceId()),
               impl_(std::make_unique<Impl>())
         {
             if (!weights)
@@ -648,6 +628,7 @@ namespace llaminar2
               K_(0),
               weights_converted_(false),  // Not yet uploaded to device
               owns_weight_memory_(false), // CUDAPackedWeights owns the memory
+              slice_id_(nextCudaGemmWorkspaceSliceId()),
               impl_(std::make_unique<Impl>())
         {
             if (!packed)
@@ -677,6 +658,7 @@ namespace llaminar2
               K_(static_cast<size_t>(K)),
               weights_converted_(true),   // Already on device
               owns_weight_memory_(false), // Shared batch allocation owns it
+              slice_id_(nextCudaGemmWorkspaceSliceId()),
               impl_(std::make_unique<Impl>())
         {
             impl_->d_weights_native_vnni = d_vnni;
@@ -803,10 +785,12 @@ namespace llaminar2
               K_(other.K_),
               weights_converted_(other.weights_converted_),
               owns_weight_memory_(other.owns_weight_memory_),
+              slice_id_(other.slice_id_),
               impl_(std::move(other.impl_))
         {
             other.weights_ = nullptr;
             other.packed_ = nullptr;
+            other.slice_id_ = 0;
             other.weights_converted_ = false;
             other.owns_weight_memory_ = false;
         }
@@ -823,10 +807,12 @@ namespace llaminar2
                 K_ = other.K_;
                 weights_converted_ = other.weights_converted_;
                 owns_weight_memory_ = other.owns_weight_memory_;
+                slice_id_ = other.slice_id_;
                 impl_ = std::move(other.impl_);
 
                 other.weights_ = nullptr;
                 other.packed_ = nullptr;
+                other.slice_id_ = 0;
                 other.weights_converted_ = false;
                 other.owns_weight_memory_ = false;
             }
@@ -1131,7 +1117,7 @@ namespace llaminar2
                 {
                     validateWorkspace();
                     d_mapped_output = d_C;
-                    d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
+                    d_C = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
                     static std::once_flag q8_mapped_once;
                     std::call_once(q8_mapped_once, [&]()
                                    { LOG_WARN("[CUDAQuantisedGemmKernel] Q8→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
@@ -1168,7 +1154,7 @@ namespace llaminar2
                 {
                     validateWorkspace();
                     d_mapped_output = d_C;
-                    d_C = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
+                    d_C = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
                     static std::once_flag fp32_mapped_once;
                     std::call_once(fp32_mapped_once, [&]()
                                    { LOG_WARN("[CUDAQuantisedGemmKernel] FP32→FP32 MAPPED REDIRECT: M=" << m << " N=" << n
@@ -1507,6 +1493,15 @@ namespace llaminar2
             if (concurrent_safe)
             {
                 const int num_proj = static_cast<int>(projections.size());
+                if (!concurrent_decode && num_proj > kCudaConcurrentPrefillWorkspaceSlots)
+                {
+                    throw std::runtime_error(
+                        "[ConcurrentPrefill] Quantized prefill supports at most " +
+                        std::to_string(kCudaConcurrentPrefillWorkspaceSlots) +
+                        " concurrent projections with workspace-backed INT32 accumulators; got " +
+                        std::to_string(num_proj));
+                }
+
                 auto &pool = getSharedCUDAPrefillPool(cuda_device_id_);
                 pool.init(cuda_device_id_, num_proj);
 
@@ -1527,25 +1522,64 @@ namespace llaminar2
                     const int n = proj.n;
                     cuda_kernel->ensureWeightsConverted();
 
-                    // Use per-stream scratch buffer instead of shared workspace ACC_INT32
-                    // to avoid write-after-write races between concurrent projections.
+                    // Use separate workspace accumulator slots instead of hidden per-stream
+                    // cudaMalloc scratch. Slot 0 reuses the normal ACC_INT32 buffer; slots
+                    // 1..N come from CUDA_CONCURRENT_PREFILL_ACC_INT32.
                     int stream_idx = pi % pool.count;
                     size_t acc_elements = static_cast<size_t>(m) * static_cast<size_t>(n);
-                    if (!pool.ensureScratch(stream_idx, acc_elements))
-                    {
-                        throw std::runtime_error(
-                            "[ConcurrentPrefill] Failed to allocate scratch for projection " +
-                            std::to_string(pi) + " (" + std::to_string(acc_elements * sizeof(int32_t)) +
-                            " bytes) — GPU OOM");
-                    }
                     // The decode (m == 1) GEMV path ignores the INT32 accumulator entirely
                     // (it reduces directly into FP32 via the per-kernel GEMV context), so we
-                    // skip the scratch allocation there — this also keeps the captured-decode
-                    // path free of any cudaMalloc.
+                    // skip accumulator selection there.
                     int32_t *proj_d_C_int32 = nullptr;
                     if (!concurrent_decode)
                     {
-                        proj_d_C_int32 = pool.scratch[stream_idx];
+                        if (!cuda_kernel->workspace_)
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentPrefill] Projection " + std::to_string(pi) +
+                                " has no bound workspace for concurrent accumulator selection");
+                        }
+
+                        if (stream_idx == 0)
+                        {
+                            proj_d_C_int32 = static_cast<int32_t *>(
+                                cuda_kernel->workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
+                            const size_t acc_bytes =
+                                cuda_kernel->workspace_->getBufferSize(GemmWorkspaceBuffers::ACC_INT32);
+                            const size_t needed_bytes = acc_elements * sizeof(int32_t);
+                            if (!proj_d_C_int32 || acc_bytes < needed_bytes)
+                            {
+                                throw std::runtime_error(
+                                    "[ConcurrentPrefill] ACC_INT32 workspace is missing or undersized for projection " +
+                                    std::to_string(pi) + ": need " + std::to_string(needed_bytes) +
+                                    " bytes, have " + std::to_string(acc_bytes));
+                            }
+                        }
+                        else
+                        {
+                            void *extra_buffer = cuda_kernel->workspace_->getBuffer(
+                                GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
+                            const size_t extra_bytes = cuda_kernel->workspace_->getBufferSize(
+                                GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32);
+                            const size_t extra_slot_bytes =
+                                extra_bytes / static_cast<size_t>(kCudaConcurrentPrefillExtraAccumulatorSlots);
+                            const size_t needed_bytes = acc_elements * sizeof(int32_t);
+                            if (!extra_buffer || extra_slot_bytes < needed_bytes ||
+                                stream_idx > kCudaConcurrentPrefillExtraAccumulatorSlots)
+                            {
+                                throw std::runtime_error(
+                                    "[ConcurrentPrefill] " +
+                                    std::string(GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32) +
+                                    " workspace is missing or undersized for projection " +
+                                    std::to_string(pi) + ": need slot " +
+                                    std::to_string(needed_bytes) + " bytes, have " +
+                                    std::to_string(extra_slot_bytes) + " bytes");
+                            }
+
+                            auto *extra_bytes_ptr = static_cast<unsigned char *>(extra_buffer);
+                            proj_d_C_int32 = reinterpret_cast<int32_t *>(
+                                extra_bytes_ptr + static_cast<size_t>(stream_idx - 1) * extra_slot_bytes);
+                        }
                     }
 
                     auto *fp32_output = dynamic_cast<FP32Tensor *>(proj.output);
@@ -2376,10 +2410,14 @@ namespace llaminar2
             // NativeVNNI doesn't use INT32 accumulator split-K, so 1 chunk is sufficient.
             constexpr size_t partial_chunk_blocks = 1;
             size_t acc_int32_bytes = static_cast<size_t>(workspace_m) * n * partial_chunk_blocks * sizeof(int32_t);
+            size_t concurrent_prefill_acc_bytes =
+                static_cast<size_t>(kCudaConcurrentPrefillExtraAccumulatorSlots) * acc_int32_bytes;
 
             reqs.buffers.push_back({GemmWorkspaceBuffers::QUANT_A, quant_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A, scales_a_bytes, 256, true});
             reqs.buffers.push_back({GemmWorkspaceBuffers::ACC_INT32, acc_int32_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_CONCURRENT_PREFILL_ACC_INT32,
+                                    concurrent_prefill_acc_bytes, 256, true});
 
             // Blockwise activation quantization scales: one float per 32-element block
             size_t num_blocks_per_row = static_cast<size_t>((k + 31) / 32);
@@ -2390,7 +2428,7 @@ namespace llaminar2
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
             // This buffer provides an HBM target; we bulk-DMA to mapped memory after.
             size_t temp_c_fp32_bytes = static_cast<size_t>(workspace_m) * n * sizeof(float);
-            reqs.buffers.push_back({GemmWorkspaceBuffers::TEMP_C_FP32, temp_c_fp32_bytes, 256, true});
+            reqs.buffers.push_back({tempCFp32BufferName(), temp_c_fp32_bytes, 256, true});
 
             // GEMV kpar partials for decode (M=1): two-phase K-parallel reduction
             // Size: kpar_factor × N floats. kpar_factor ≈ ceil(K/tile_k) capped by SM count.
@@ -2407,6 +2445,7 @@ namespace llaminar2
                       << "scales_a=" << (scales_a_bytes) << "B, "
                       << "scales_a_blockwise=" << (scales_a_blockwise_bytes) << "B, "
                       << "acc=" << (acc_int32_bytes / 1024) << "KB"
+                      << ", concurrent_acc=" << (concurrent_prefill_acc_bytes / 1024) << "KB"
                       << " (chunk_blocks=" << partial_chunk_blocks << ")"
                       << ", temp_c_fp32=" << (temp_c_fp32_bytes / 1024) << "KB");
 

@@ -40,7 +40,7 @@ FAMILY_MAP = {"kpar": "KPAR", "wide": "WIDE", "direct": "DIRECT"}
 # --- Data types -------------------------------------------------------
 @dataclass
 class FormatTreeResult:
-    fmt: str
+    label: str
     cb: int
     n_shapes: int
     n_raw_configs: int
@@ -93,13 +93,18 @@ def cfg_tuple(r: dict) -> tuple:
 
 
 # --- Per-format set-cover + tree training ------------------------------
-def train_format_tree(fmt: str, all_rows: list[dict],
+def train_codebook_tree(cb: int, all_rows: list[dict],
                       threshold: float = 0.03) -> FormatTreeResult:
-    """Train a decision tree for a single format using set-cover relabeling."""
+    """Train a decision tree for a single NativeVNNI codebook.
 
-    cb = FORMAT_TO_CODEBOOK[fmt]
-    fmt_all = [r for r in all_rows if r["fmt"] == fmt]
+    Format aliases such as Q4_1/Q4_K and Q5_1/Q5_K share the same packed
+    NativeVNNI codebook id, which is the production dispatch key. Train on the
+    union so alias rows cannot generate duplicate CB helper functions.
+    """
+
+    fmt_all = [r for r in all_rows if r["cb"] == cb]
     fmt_best = [r for r in fmt_all if r["is_best"]]
+    label = CODEBOOK_TO_FORMAT.get(cb, f"CB{cb}")
 
     # Oracle BW per (N,K)
     nk_oracle: dict[tuple, float] = {}
@@ -171,7 +176,7 @@ def train_format_tree(fmt: str, all_rows: list[dict],
             penalties.append(max(0.0, 1.0 - pred_bw / oracle_bw))
 
     return FormatTreeResult(
-        fmt=fmt, cb=cb,
+        label=label, cb=cb,
         n_shapes=len(shapes),
         n_raw_configs=n_raw,
         n_master_configs=len(master_configs),
@@ -243,7 +248,7 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
     lines.append(f"// Overall: mean BW penalty {overall_mean:.2f}%, max {overall_max:.2f}%")
     lines.append(f"// Formats: {len(results)}")
     for r in results:
-        lines.append(f"//   CB={r.cb:2d} ({r.fmt:8s}): {r.n_master_configs:2d} configs, "
+        lines.append(f"//   CB={r.cb:2d} ({r.label:12s}): {r.n_master_configs:2d} configs, "
                       f"depth={r.depth:2d}, leaves={r.n_leaves:2d}, "
                       f"mean={r.mean_penalty_pct:.2f}% max={r.max_penalty_pct:.2f}%")
     lines.append("//")
@@ -268,7 +273,7 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
 
     # ---- Per-CB internal helper functions ----
     for r in results:
-        lines.append(f"// --- CB={r.cb} ({r.fmt}) ---")
+        lines.append(f"// --- CB={r.cb} ({r.label}) ---")
         lines.append(f"// {r.n_master_configs} master configs, "
                       f"depth={r.depth}, leaves={r.n_leaves}, "
                       f"mean_bw_penalty={r.mean_penalty_pct:.2f}%")
@@ -359,13 +364,13 @@ def write_summary(path: Path, results: list[FormatTreeResult], input_path: Path)
     lines.append("=" * 72)
     lines.append("")
 
-    lines.append(f"{'Format':12s} {'CB':>3s} {'Shapes':>6s} {'Raw':>5s} "
+    lines.append(f"{'Codebook':16s} {'CB':>3s} {'Shapes':>6s} {'Raw':>5s} "
                  f"{'SC':>4s} {'Depth':>5s} {'Leaves':>6s} "
                  f"{'Mean%':>6s} {'P95%':>6s} {'Max%':>6s}")
     lines.append("-" * 72)
 
     for r in results:
-        lines.append(f"{r.fmt:12s} {r.cb:3d} {r.n_shapes:6d} {r.n_raw_configs:5d} "
+        lines.append(f"{r.label:16s} {r.cb:3d} {r.n_shapes:6d} {r.n_raw_configs:5d} "
                      f"{r.n_master_configs:4d} {r.depth:5d} {r.n_leaves:6d} "
                      f"{r.mean_penalty_pct:5.2f}% {r.p95_penalty_pct:5.2f}% "
                      f"{r.max_penalty_pct:5.2f}%")
@@ -404,14 +409,15 @@ def main():
     all_rows = load_sweep_csv(input_path)
     print(f"  Total rows: {len(all_rows)}")
 
-    formats = sorted(set(r["fmt"] for r in all_rows if r["is_best"]))
-    print(f"  Formats with best data: {len(formats)} ({', '.join(formats)})")
+    codebooks = sorted(set(r["cb"] for r in all_rows if r["is_best"]))
+    codebook_labels = [f"{cb}:{CODEBOOK_TO_FORMAT.get(cb, 'unknown')}" for cb in codebooks]
+    print(f"  Codebooks with best data: {len(codebooks)} ({', '.join(codebook_labels)})")
 
-    # Train per-format
+    # Train per-codebook
     results = []
-    for fmt in formats:
-        print(f"\n  Training {fmt} (CB={FORMAT_TO_CODEBOOK[fmt]}) ...")
-        r = train_format_tree(fmt, all_rows, threshold=args.threshold)
+    for cb in codebooks:
+        print(f"\n  Training CB={cb} ({CODEBOOK_TO_FORMAT.get(cb, 'unknown')}) ...")
+        r = train_codebook_tree(cb, all_rows, threshold=args.threshold)
         results.append(r)
         print(f"    {r.n_master_configs} master configs, "
               f"depth={r.depth}, leaves={r.n_leaves}, "
