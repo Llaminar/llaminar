@@ -203,6 +203,17 @@ namespace llaminar2
             int d_model,
             int intermediate) override;
 
+        /// @brief Execute fused graph-capturable runtime-routed gate/up, SwiGLU, and down decode.
+        bool groupedExpertDecodeFromRuntime(
+            DeviceMoELayerRuntime *runtime_layer,
+            const TensorBase *input,
+            int gateup_table_id,
+            int down_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate) override;
+
         int getExpertTokenCount(int expert_id) const override;
 
         void gatherExpertBatch(

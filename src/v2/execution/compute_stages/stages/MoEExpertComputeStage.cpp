@@ -940,35 +940,60 @@ namespace llaminar2
 
             if (grouped_tables_ready)
             {
-                ITensor *gate_outputs[16] = {};
-                ITensor *up_outputs[16] = {};
-                for (int k = 0; k < top_k; ++k)
+                const bool try_fused_runtime_decode = params_.device_id.is_cuda();
+                if (try_fused_runtime_decode)
                 {
-                    gate_outputs[k] = scratch_gate_batch_[k].get();
-                    up_outputs[k] = scratch_up_batch_[k].get();
-                }
-
-                const bool gateup_done = kernel->groupedExpertGateUpDecodeFromRuntime(
-                    moe_runtime_layer_,
-                    input_tensor,
-                    grouped_gateup_desc_table_id_,
-                    top_k,
-                    gate_outputs,
-                    up_outputs,
-                    d_model,
-                    intermediate);
-
-                if (gateup_done)
-                {
-                    device_routed_done = kernel->groupedExpertDownDecodeFromRuntime(
-                        gate_outputs,
-                        up_outputs,
+                    device_routed_done = kernel->groupedExpertDecodeFromRuntime(
                         moe_runtime_layer_,
+                        input_tensor,
+                        grouped_gateup_desc_table_id_,
                         grouped_down_desc_table_id_,
                         top_k,
                         params_.output,
                         d_model,
                         intermediate);
+
+                    if (!device_routed_done && isGraphCaptureActive())
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage] CUDA fused runtime grouped decode path unavailable during graph capture "
+                                  "for layer "
+                                  << params_.layer_idx);
+                        return false;
+                    }
+                }
+
+                if (!device_routed_done)
+                {
+                    ITensor *gate_outputs[16] = {};
+                    ITensor *up_outputs[16] = {};
+                    for (int k = 0; k < top_k; ++k)
+                    {
+                        gate_outputs[k] = scratch_gate_batch_[k].get();
+                        up_outputs[k] = scratch_up_batch_[k].get();
+                    }
+
+                    const bool gateup_done = kernel->groupedExpertGateUpDecodeFromRuntime(
+                        moe_runtime_layer_,
+                        input_tensor,
+                        grouped_gateup_desc_table_id_,
+                        top_k,
+                        gate_outputs,
+                        up_outputs,
+                        d_model,
+                        intermediate);
+
+                    if (gateup_done)
+                    {
+                        device_routed_done = kernel->groupedExpertDownDecodeFromRuntime(
+                            gate_outputs,
+                            up_outputs,
+                            moe_runtime_layer_,
+                            grouped_down_desc_table_id_,
+                            top_k,
+                            params_.output,
+                            d_model,
+                            intermediate);
+                    }
                 }
             }
 

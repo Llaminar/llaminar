@@ -396,6 +396,31 @@ extern "C"
         int device_idx,
         void *stream);
 
+    bool cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart(
+        const float *d_hidden,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_down_desc_table,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_down_partials,
+        float *d_output,
+        int top_k,
+        int d_model,
+        int intermediate,
+        uint8_t gateup_codebook_id,
+        uint8_t down_codebook_id,
+        int gateup_k_partitions,
+        int down_k_partitions,
+        int device_idx,
+        void *stream);
+
     bool cudaMoE_grouped_prefill_pipeline(
         const float *d_hidden,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
@@ -2961,6 +2986,133 @@ namespace llaminar2
                 intermediate,
                 table.codebook_id,
                 use_kpart ? k_partitions : 1);
+        }
+        return ok;
+    }
+
+    bool CUDAMoEKernel::groupedExpertDecodeFromRuntime(
+        DeviceMoELayerRuntime *runtime_layer,
+        const TensorBase *input,
+        int gateup_table_id,
+        int down_table_id,
+        int top_k,
+        ITensor *output,
+        int d_model,
+        int intermediate)
+    {
+        if (!runtime_layer || !input || !output ||
+            gateup_table_id < 0 || down_table_id < 0 ||
+            top_k <= 0 || d_model <= 0 || intermediate <= 0)
+            return false;
+        if (top_k > static_cast<int>(kDeviceMoEMaxTopK) ||
+            top_k > static_cast<int>(kRuntimePointerArrayMaxTopK) ||
+            (d_model % 32) != 0 || (intermediate % 32) != 0)
+            return false;
+        if (gateup_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+            return false;
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if (!gateup_table.valid || !gateup_table.device_gate_descs || !gateup_table.device_up_descs ||
+            gateup_table.num_experts <= 0 || gateup_table.d_model != d_model ||
+            gateup_table.intermediate != intermediate)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] gate/up descriptor table mismatch");
+            return false;
+        }
+        if (!down_table.valid || !down_table.device_descs || down_table.num_experts <= 0 ||
+            down_table.d_model != d_model || down_table.intermediate != intermediate ||
+            down_table.num_experts != gateup_table.num_experts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] down descriptor table mismatch");
+            return false;
+        }
+
+        const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
+        const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
+        if (!debugEnv().gemm.cuda_moe_gateup_kpart_decode ||
+            !debugEnv().gemm.cuda_moe_down_kpart_decode)
+            return false;
+
+        void *stream = requireStream("CUDAMoEKernel::groupedExpertDecodeFromRuntime");
+        const DeviceId device = deviceId();
+        if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model) ||
+            !ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate) ||
+            !ensureGroupedDownDecodeCapacity(top_k, intermediate) ||
+            !ensureGroupedDownKPartScratchCapacity(down_k_partitions, d_model))
+            return false;
+        if (!setMoEDevice(device_ordinal_, "groupedExpertDecodeFromRuntime"))
+            return false;
+
+        const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        if (!d_hidden)
+        {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] input upload required during graph capture");
+                return false;
+            }
+            if (!const_cast<TensorBase *>(input)->ensureOnDevice(device, stream))
+                return false;
+            d_hidden = static_cast<const float *>(input->gpu_data_ptr());
+        }
+
+        if (!output->gpu_data_ptr() && isGraphCaptureActive())
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] output allocation required during graph capture");
+            return false;
+        }
+        if (!ensureOutputOnDevice(output, device, stream, "moe_output"))
+            return false;
+
+        const int *d_expert_ids = runtimeTopKExpertIdsDevice(runtime_layer);
+        const float *d_weights = runtimeTopKWeightsDevice(runtime_layer);
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!d_hidden || !d_expert_ids || !d_weights || !d_output)
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] missing runtime/input/output device pointer");
+            return false;
+        }
+
+        const bool ok = cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart(
+            d_hidden,
+            gateup_table.device_gate_descs,
+            gateup_table.device_up_descs,
+            down_table.device_descs,
+            d_expert_ids,
+            d_weights,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            d_grouped_gateup_gate_partials_,
+            d_grouped_gateup_up_partials_,
+            d_decode_swiglu_int8_,
+            d_decode_swiglu_scales_,
+            d_grouped_down_partials_,
+            d_output,
+            top_k,
+            d_model,
+            intermediate,
+            gateup_table.codebook_id,
+            down_table.codebook_id,
+            gateup_k_partitions,
+            down_k_partitions,
+            device_ordinal_,
+            stream);
+
+        if (ok)
+        {
+            markDeviceWritten(output, device, stream);
+            recordGroupedDecodeCounter(
+                "cuda_moe_grouped_decode_fused_calls",
+                "runtime",
+                "fused_kpart",
+                device,
+                top_k,
+                d_model,
+                intermediate,
+                gateup_table.codebook_id,
+                gateup_k_partitions);
         }
         return ok;
     }

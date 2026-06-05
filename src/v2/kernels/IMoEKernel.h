@@ -519,6 +519,35 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Fused runtime-table single-token expert decode.
+         *
+         * Backends may fuse runtime-routed gate/up projection, SwiGLU
+         * quantization, and down projection into one graph-capturable launch
+         * sequence. The default returns false so existing backends keep the
+         * established gate/up plus down path.
+         */
+        virtual bool groupedExpertDecodeFromRuntime(
+            DeviceMoELayerRuntime *runtime_layer,
+            const TensorBase *input,
+            int gateup_descriptor_table_id,
+            int down_descriptor_table_id,
+            int top_k,
+            ITensor *output,
+            int d_model,
+            int intermediate)
+        {
+            (void)runtime_layer;
+            (void)input;
+            (void)gateup_descriptor_table_id;
+            (void)down_descriptor_table_id;
+            (void)top_k;
+            (void)output;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
         // =================================================================
         // Device-resident histogram + expert mask (Phase 2)
         //

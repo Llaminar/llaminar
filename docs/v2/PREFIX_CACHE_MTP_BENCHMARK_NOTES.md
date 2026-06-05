@@ -10,9 +10,9 @@ history belongs in artifacts.
 | Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 671.37 | 40.82 | fits 24GB |
 | Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 582.66 | 53.83 | near fixed d1 |
 | Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2158.10 | 107.14 | inverse-map top-k scatter |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1602.93 | 140.10 | skipped post-sidecar checkpoint, 87.11% accept |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1600.38 | 137.60 | depth 1, 86.33% accept |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2156.47 | 108.19 | inverse-map top-k scatter |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1660.13 | 140.50 | fused runtime decode, 88.28% accept |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1659.24 | 141.55 | depth 1, 87.50% accept |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
@@ -40,20 +40,23 @@ not exact apples-to-apples quality data.
 ## Latest Evidence
 
 CUDA MoE ratchet:
-`benchmark_results/cuda_moe_mtp/20260604T222925Z-token-direct-down-no-mtp`
-`benchmark_results/cuda_moe_mtp/20260605T015002Z-skip-post-sidecar-checkpoint-mtp-d1`
-`benchmark_results/cuda_moe_mtp/20260605T015045Z-skip-post-sidecar-checkpoint-mtp-dynamic`
+`benchmark_results/cuda_moe_mtp/20260605T022856Z-fused-runtime-decode`
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
-| no MTP | 2158.10 | 107.14 | n/a |
-| fixed d1 MTP | 1602.93 | 140.10 | 87.11% |
-| dynamic MTP | 1600.38 | 137.60 | 86.33% |
+| no MTP | 2156.47 | 108.19 | n/a |
+| fixed d1 MTP | 1660.13 | 140.50 | 88.28% |
+| dynamic MTP | 1659.24 | 141.55 | 87.50% |
 
 Fresh checks:
 - Perf export/stage fix:
   `20260604T230244Z-perf-export-no-stage-events`,
   `20260604T231108Z-stage-timing-accumulator-fix`.
+- CUDA runtime-routed MoE decode now has a graph-replay regression:
+  `RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphReplays`.
+  Counter-only run shows `cuda_moe_grouped_decode_fused_calls`,
+  `route=fused_kpart`. Throughput impact is neutral to slight-positive on
+  dynamic, not a decisive speedup.
 - Qwen3.6 MoE CUDA MTP sidecar stage breakdown now passes after graph-aware
   snapshot keying and BF16 shared-gate materialization.
 - CUDA hybrid d1 skips the post-sidecar hybrid checkpoint when verifier-row
@@ -74,7 +77,8 @@ CUDA math prefill parity, and Qwen3.6 MoE CUDA benchmark-style parity.
   grouped verifier prefill, stream-explicit shared experts, fused split-K MoE,
   cuBLAS batched GDN projections, parallel router top-k, source-token MoE
   activation quantization, mapped output redirects, inverse-map top-k scatter,
-  token-direct verifier down accumulation, and post-sidecar checkpoint elision.
+  token-direct verifier down accumulation, post-sidecar checkpoint elision, and
+  fused runtime-routed MoE decode.
 - CUDA and ROCm GPU greedy argmax tie-break to lowest token id.
 - Memory planning caps activation arenas to prefill-bucket capacity while KV
   keeps requested context capacity; oversized monolithic graph shapes hard fail.
@@ -86,6 +90,6 @@ CUDA math prefill parity, and Qwen3.6 MoE CUDA benchmark-style parity.
 ## Next Work
 
 Beat llama.cpp CUDA on dense and MoE, prefill and decode, with MTP on/off.
-Dense decode is close; CUDA MoE fixed d1 is now within noise of the llama.cpp
-MTP d1 anchor. Next targets are verifier/correction costs, prefill gap, and a
-strict same-prompt llama.cpp/Llaminar comparison.
+Dense decode is close; CUDA MoE dynamic is now within noise of the llama.cpp MTP
+d1 anchor. Next targets are verifier/correction costs, prefill gap, and a strict
+same-prompt llama.cpp/Llaminar comparison.

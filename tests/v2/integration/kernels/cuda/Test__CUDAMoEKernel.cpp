@@ -268,7 +268,8 @@ namespace
                        tag_equals("d_model", expected_d_model) &&
                        tag_equals("intermediate", expected_intermediate) &&
                        route != record.tags.end() &&
-                       (route->second == "kpart" || route->second == "serial");
+                       (route->second == "kpart" || route->second == "serial" ||
+                        route->second == "fused_kpart");
             });
         ASSERT_NE(match, records.end()) << "missing matching perf counter " << counter_name
                                         << " source=" << source;
@@ -1640,6 +1641,193 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
         prefill_output->data() + prefill_output->numel());
 
     expectVectorsClose(decode_values, prefill_values, 0.999, 0.025);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphReplays)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedCudaMoEGemmConfig gemm_config;
+    gemm_config.set(
+        /*gateup_kpart=*/true,
+        /*gateup_kparts=*/16,
+        /*down_kpart=*/true,
+        /*down_kparts=*/16);
+    llaminar2::PerfStatsCollector::reset();
+
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int num_layers = 1;
+    constexpr int seq_len = 1;
+    constexpr int top_k = 8;
+    constexpr int num_experts = 8;
+    constexpr int d_model = 512;
+    constexpr int intermediate = 256;
+    const auto device = llaminar2::DeviceId::cuda(0);
+
+    std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
+    std::vector<llaminar2::test::GpuPreparedGemm> prepared_weights;
+    owned_weights.reserve(static_cast<size_t>(num_experts * 3));
+    prepared_weights.reserve(static_cast<size_t>(num_experts * 3));
+
+    auto add_prepared_desc = [&](int rows, int cols, int seed, const char *role, int expected_codebook)
+    {
+        std::unique_ptr<llaminar2::TensorBase> weight;
+        if (expected_codebook == 13)
+        {
+            weight = llaminar2::test::TestTensorFactory::createIQ2_SRandom(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
+        }
+        else
+        {
+            weight = llaminar2::test::TestTensorFactory::createIQ4_NLRandom(
+                {static_cast<size_t>(rows), static_cast<size_t>(cols)},
+                static_cast<unsigned>(seed));
+        }
+        auto *weight_ptr = weight.get();
+        owned_weights.push_back(std::move(weight));
+        prepared_weights.push_back(llaminar2::test::makeGpuPreparedGemm(
+            weight_ptr,
+            device,
+            std::string("test.cuda_moe.runtime_fused.") + role + "." + std::to_string(seed),
+            llaminar2::ModelContextId{620000 + static_cast<uint64_t>(seed)}));
+
+        llaminar2::DeviceNativeVNNIMatrixDesc desc{};
+        EXPECT_TRUE(prepared_weights.back().kernel->exportNativeVNNIMatrixDesc(desc))
+            << "failed to export native descriptor for " << role;
+        EXPECT_EQ(desc.n, rows);
+        EXPECT_EQ(desc.k, cols);
+        EXPECT_EQ(desc.codebook_id, expected_codebook);
+        return desc;
+    };
+
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> gate_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> up_descs;
+    std::vector<llaminar2::DeviceNativeVNNIMatrixDesc> down_descs;
+    gate_descs.reserve(num_experts);
+    up_descs.reserve(num_experts);
+    down_descs.reserve(num_experts);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        gate_descs.push_back(add_prepared_desc(intermediate, d_model, 5100 + expert, "gate", 13));
+        up_descs.push_back(add_prepared_desc(intermediate, d_model, 5200 + expert, "up", 13));
+        down_descs.push_back(add_prepared_desc(d_model, intermediate, 5300 + expert, "down", 4));
+    }
+
+    const int gateup_table = cuda_kernel_->uploadGroupedExpertGateUpDescriptorTables(
+        gate_descs.data(), up_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(gateup_table, 0);
+    const int down_table = cuda_kernel_->uploadGroupedExpertDownDescriptorTable(
+        down_descs.data(), num_experts, d_model, intermediate);
+    ASSERT_GE(down_table, 0);
+
+    DeviceMoERuntimeTable::Config cuda_config;
+    cuda_config.device_id = device;
+    cuda_config.num_layers = num_layers;
+    cuda_config.num_experts = num_experts;
+    cuda_config.top_k = top_k;
+    cuda_config.mirror_to_device = true;
+    DeviceMoERuntimeTable cuda_table(cuda_config);
+    auto *runtime_layer = cuda_table.deviceLayerState(0);
+    ASSERT_NE(runtime_layer, nullptr);
+
+    std::vector<float> hidden_values(static_cast<size_t>(d_model));
+    std::vector<float> router_values(static_cast<size_t>(num_experts) * static_cast<size_t>(d_model));
+    for (int i = 0; i < d_model; ++i)
+    {
+        hidden_values[static_cast<size_t>(i)] =
+            0.011f * static_cast<float>((i % 23) - 11) +
+            0.002f * static_cast<float>((i % 5) - 2);
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            router_values[static_cast<size_t>(expert) * static_cast<size_t>(d_model) +
+                          static_cast<size_t>(i)] =
+                0.001f * static_cast<float>((i + 3 * expert) % 17) -
+                0.007f * static_cast<float>(expert);
+        }
+    }
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto router = makeTensor({num_experts, d_model}, router_values);
+
+    auto gate0 = makeZeros({intermediate});
+    auto gate1 = makeZeros({intermediate});
+    auto gate2 = makeZeros({intermediate});
+    auto gate3 = makeZeros({intermediate});
+    auto gate4 = makeZeros({intermediate});
+    auto gate5 = makeZeros({intermediate});
+    auto gate6 = makeZeros({intermediate});
+    auto gate7 = makeZeros({intermediate});
+    auto up0 = makeZeros({intermediate});
+    auto up1 = makeZeros({intermediate});
+    auto up2 = makeZeros({intermediate});
+    auto up3 = makeZeros({intermediate});
+    auto up4 = makeZeros({intermediate});
+    auto up5 = makeZeros({intermediate});
+    auto up6 = makeZeros({intermediate});
+    auto up7 = makeZeros({intermediate});
+    std::array<llaminar2::ITensor *, top_k> gate_outputs = {
+        gate0.get(), gate1.get(), gate2.get(), gate3.get(),
+        gate4.get(), gate5.get(), gate6.get(), gate7.get()};
+    std::array<llaminar2::ITensor *, top_k> up_outputs = {
+        up0.get(), up1.get(), up2.get(), up3.get(),
+        up4.get(), up5.get(), up6.get(), up7.get()};
+    auto two_step_output = makeZeros({d_model});
+    auto fused_output = makeZeros({d_model});
+
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
+        true, nullptr, nullptr, /*write_legacy_outputs=*/false, /*update_runtime_histogram=*/false));
+    ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromRuntime(
+        runtime_layer, hidden.get(), gateup_table, top_k,
+        gate_outputs.data(), up_outputs.data(), d_model, intermediate));
+    ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromRuntime(
+        gate_outputs.data(), up_outputs.data(), runtime_layer, down_table, top_k,
+        two_step_output.get(), d_model, intermediate));
+    ASSERT_TRUE(cuda_kernel_->groupedExpertDecodeFromRuntime(
+        runtime_layer, hidden.get(), gateup_table, down_table, top_k,
+        fused_output.get(), d_model, intermediate));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    std::vector<float> two_step_values(
+        two_step_output->data(),
+        two_step_output->data() + two_step_output->numel());
+    std::vector<float> fused_values(
+        fused_output->data(),
+        fused_output->data() + fused_output->numel());
+    expectVectorsClose(fused_values, two_step_values, 0.999, 0.025);
+
+    ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
+    const bool captured_fused = cuda_kernel_->groupedExpertDecodeFromRuntime(
+        runtime_layer, hidden.get(), gateup_table, down_table, top_k,
+        fused_output.get(), d_model, intermediate);
+    cudaGraph_t graph = nullptr;
+    const cudaError_t capture_status = cudaStreamEndCapture(stream_, &graph);
+    EXPECT_TRUE(captured_fused);
+    ASSERT_EQ(capture_status, cudaSuccess) << cudaGetErrorString(capture_status);
+    ASSERT_NE(graph, nullptr);
+
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream_), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+
+    std::vector<float> replay_values(
+        fused_output->data(),
+        fused_output->data() + fused_output->numel());
+    expectVectorsClose(replay_values, two_step_values, 0.999, 0.025);
+
+    expectGroupedDecodeCounter(
+        "cuda_moe_grouped_decode_fused_calls", "runtime", top_k, d_model, intermediate);
+    llaminar2::PerfStatsCollector::reset();
 #endif
 }
 

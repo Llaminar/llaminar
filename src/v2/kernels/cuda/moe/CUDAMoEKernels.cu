@@ -2308,6 +2308,58 @@ namespace
         }
     }
 
+    __global__ void grouped_native_vnni_gate_up_swiglu_kpart_reduce_decode_kernel(
+        const float *__restrict__ gate_partials,
+        const float *__restrict__ up_partials,
+        int8_t *__restrict__ swiglu_int8,
+        float *__restrict__ swiglu_scales,
+        int num_active,
+        int N,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int slot = blockIdx.y;
+        if (slot >= num_active)
+            return;
+
+        const bool active = n < N;
+        float gate_sum = 0.0f;
+        float up_sum = 0.0f;
+        if (active)
+        {
+            const size_t slot_base =
+                static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) * static_cast<size_t>(N);
+            for (int k_part = 0; k_part < k_partitions; ++k_part)
+            {
+                const size_t idx = slot_base +
+                                   static_cast<size_t>(k_part) * static_cast<size_t>(N) +
+                                   static_cast<size_t>(n);
+                gate_sum += gate_partials[idx];
+                up_sum += up_partials[idx];
+            }
+        }
+
+        const float value = active ? (silu(gate_sum) * up_sum) : 0.0f;
+        float abs_value = fabsf(value);
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+
+        if (active)
+        {
+            const int lane = threadIdx.x & 31;
+            const int blocks_per_row_out = N / 32;
+            const int quant_block = n >> 5;
+            const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+            if (lane == 0)
+                swiglu_scales[static_cast<size_t>(slot) * blocks_per_row_out + quant_block] = scale;
+            const float q = value / scale;
+            swiglu_int8[static_cast<size_t>(slot) * static_cast<size_t>(N) + static_cast<size_t>(n)] =
+                static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+        }
+    }
+
     template <uint8_t CodebookId>
     __global__ void grouped_native_vnni_gate_up_decode_kernel(
         const int8_t *__restrict__ A_int8,
@@ -3146,6 +3198,153 @@ extern "C"
             d_down_partials, d_output, N, k_partitions);
 
         return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart reduce");
+    }
+
+    bool cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart(
+        const float *d_hidden,
+        const DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
+        const DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const DeviceNativeVNNIMatrixDesc *d_down_desc_table,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_down_partials,
+        float *d_output,
+        int top_k,
+        int d_model,
+        int intermediate,
+        uint8_t gateup_codebook_id,
+        uint8_t down_codebook_id,
+        int gateup_k_partitions,
+        int down_k_partitions,
+        int device_idx,
+        void *stream)
+    {
+        const bool valid_gateup_k_partitions =
+            (gateup_k_partitions == 2 || gateup_k_partitions == 4 ||
+             gateup_k_partitions == 8 || gateup_k_partitions == 16 ||
+             gateup_k_partitions == 32);
+        const bool valid_down_k_partitions =
+            (down_k_partitions == 2 || down_k_partitions == 4 ||
+             down_k_partitions == 8 || down_k_partitions == 16);
+        if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_down_desc_table ||
+            !d_expert_ids || !d_weights || !d_hidden_int8 || !d_hidden_scales ||
+            !d_gate_partials || !d_up_partials || !d_swiglu_int8 || !d_swiglu_scales ||
+            !d_down_partials || !d_output ||
+            top_k <= 0 || top_k > kMaxTopK ||
+            d_model <= 0 || intermediate <= 0 ||
+            (d_model % 32) != 0 || (intermediate % 32) != 0 ||
+            !valid_gateup_k_partitions || !valid_down_k_partitions || !stream)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+
+        const int hidden_blocks_per_row = d_model / 32;
+        grouped_hidden_quantize_blockwise_kernel<<<hidden_blocks_per_row, 32, 0, cuda_stream>>>(
+            d_hidden, d_hidden_int8, d_hidden_scales, d_model);
+        if (!finishLaunch("cudaMoE_grouped_fused_decode_hidden_quantize"))
+            return false;
+
+        constexpr int kTileN = 64;
+        dim3 gateup_grid((intermediate + kTileN - 1) / kTileN, gateup_k_partitions, top_k);
+        dim3 block(kTileN);
+
+#define LAUNCH_GROUPED_FUSED_GATEUP_KPART(CB)                                                       \
+    grouped_native_vnni_gate_up_kpart_decode_kernel<CB><<<gateup_grid, block, 0, cuda_stream>>>(   \
+        d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table, d_expert_ids,           \
+        d_gate_partials, d_up_partials, top_k, intermediate, d_model, gateup_k_partitions)
+
+        switch (gateup_codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(0); break;
+        case 4:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(4); break;
+        case 5:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(5); break;
+        case 6:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(6); break;
+        case 7:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(7); break;
+        case 8:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(8); break;
+        case 9:  LAUNCH_GROUPED_FUSED_GATEUP_KPART(9); break;
+        case 10: LAUNCH_GROUPED_FUSED_GATEUP_KPART(10); break;
+        case 11: LAUNCH_GROUPED_FUSED_GATEUP_KPART(11); break;
+        case 12: LAUNCH_GROUPED_FUSED_GATEUP_KPART(12); break;
+        case 13: LAUNCH_GROUPED_FUSED_GATEUP_KPART(13); break;
+        case 14: LAUNCH_GROUPED_FUSED_GATEUP_KPART(14); break;
+        case 15: LAUNCH_GROUPED_FUSED_GATEUP_KPART(15); break;
+        case 16: LAUNCH_GROUPED_FUSED_GATEUP_KPART(16); break;
+        case 17: LAUNCH_GROUPED_FUSED_GATEUP_KPART(17); break;
+        case 19: LAUNCH_GROUPED_FUSED_GATEUP_KPART(19); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart] unsupported gate/up codebook_id=%u\n",
+                         static_cast<unsigned>(gateup_codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_FUSED_GATEUP_KPART
+
+        if (!finishLaunch("cudaMoE_grouped_fused_decode_gateup_kpart"))
+            return false;
+
+        dim3 swiglu_grid((intermediate + kTileN - 1) / kTileN, top_k);
+        grouped_native_vnni_gate_up_swiglu_kpart_reduce_decode_kernel<<<swiglu_grid, block, 0, cuda_stream>>>(
+            d_gate_partials,
+            d_up_partials,
+            d_swiglu_int8,
+            d_swiglu_scales,
+            top_k,
+            intermediate,
+            gateup_k_partitions);
+        if (!finishLaunch("cudaMoE_grouped_fused_decode_swiglu_quantize"))
+            return false;
+
+        dim3 down_grid((d_model + kTileN - 1) / kTileN, down_k_partitions);
+
+#define LAUNCH_GROUPED_FUSED_DOWN_KPART(CB)                                                         \
+    grouped_native_vnni_down_kpart_decode_kernel<CB><<<down_grid, block, 0, cuda_stream>>>(         \
+        d_swiglu_int8, d_swiglu_scales, d_down_desc_table, d_expert_ids, d_weights,                 \
+        d_down_partials, top_k, d_model, intermediate, down_k_partitions)
+
+        switch (down_codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_FUSED_DOWN_KPART(0); break;
+        case 4:  LAUNCH_GROUPED_FUSED_DOWN_KPART(4); break;
+        case 5:  LAUNCH_GROUPED_FUSED_DOWN_KPART(5); break;
+        case 6:  LAUNCH_GROUPED_FUSED_DOWN_KPART(6); break;
+        case 7:  LAUNCH_GROUPED_FUSED_DOWN_KPART(7); break;
+        case 8:  LAUNCH_GROUPED_FUSED_DOWN_KPART(8); break;
+        case 9:  LAUNCH_GROUPED_FUSED_DOWN_KPART(9); break;
+        case 10: LAUNCH_GROUPED_FUSED_DOWN_KPART(10); break;
+        case 11: LAUNCH_GROUPED_FUSED_DOWN_KPART(11); break;
+        case 12: LAUNCH_GROUPED_FUSED_DOWN_KPART(12); break;
+        case 13: LAUNCH_GROUPED_FUSED_DOWN_KPART(13); break;
+        case 14: LAUNCH_GROUPED_FUSED_DOWN_KPART(14); break;
+        case 15: LAUNCH_GROUPED_FUSED_DOWN_KPART(15); break;
+        case 16: LAUNCH_GROUPED_FUSED_DOWN_KPART(16); break;
+        case 17: LAUNCH_GROUPED_FUSED_DOWN_KPART(17); break;
+        case 19: LAUNCH_GROUPED_FUSED_DOWN_KPART(19); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart] unsupported down codebook_id=%u\n",
+                         static_cast<unsigned>(down_codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_FUSED_DOWN_KPART
+
+        if (!finishLaunch("cudaMoE_grouped_fused_decode_down_kpart"))
+            return false;
+
+        dim3 reduce_grid((d_model + kTileN - 1) / kTileN);
+        grouped_native_vnni_down_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
+            d_down_partials, d_output, d_model, down_k_partitions);
+
+        return finishLaunch("cudaMoE_grouped_fused_decode_down_reduce");
     }
 
     bool cudaMoE_grouped_prefill_pipeline(
