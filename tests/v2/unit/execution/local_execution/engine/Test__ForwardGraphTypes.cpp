@@ -18,6 +18,7 @@
 #include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "backends/IGPUGraphCapture.h"
 #include "backends/IWorkerGPUContext.h"
+#include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h"
 
@@ -126,12 +127,20 @@ namespace
         void *createStream() override { return &capture_stream_; }
         void destroyStream(void *) override {}
 
-        void *createEvent() override { return nullptr; }
-        void destroyEvent(void *) override {}
-        void recordEvent(void *, void *) override {}
+        void *createEvent() override
+        {
+            ++events_created_;
+            return reinterpret_cast<void *>(static_cast<uintptr_t>(0xEF000000 + events_created_));
+        }
+        void destroyEvent(void *) override { ++events_destroyed_; }
+        void recordEvent(void *, void *) override { ++events_recorded_; }
         void waitEvent(void *, void *) override {}
-        void synchronizeEvent(void *) override {}
-        float eventElapsedTime(void *, void *) override { return 0.0f; }
+        void synchronizeEvent(void *) override { ++events_synchronized_; }
+        float eventElapsedTime(void *, void *) override
+        {
+            ++event_elapsed_queries_;
+            return elapsed_ms_;
+        }
         void *blasHandle() override { return nullptr; }
         void *blasLtHandle() override { return nullptr; }
         void setCollectiveComm(void *) override {}
@@ -151,6 +160,12 @@ namespace
         }
 
         int synchronize_stream_calls_ = 0;
+        int events_created_ = 0;
+        int events_destroyed_ = 0;
+        int events_recorded_ = 0;
+        int events_synchronized_ = 0;
+        int event_elapsed_queries_ = 0;
+        float elapsed_ms_ = 0.25f;
 
     private:
         int default_stream_ = 0;
@@ -193,6 +208,7 @@ namespace
                 existing_ = existing;
             }
             setenv(name, value, 1);
+            mutableDebugEnv().reload();
         }
 
         ~ScopedEnvVar()
@@ -205,6 +221,7 @@ namespace
             {
                 unsetenv(name_.c_str());
             }
+            mutableDebugEnv().reload();
         }
 
         ScopedEnvVar(const ScopedEnvVar &) = delete;
@@ -894,6 +911,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
 TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
 {
     ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
     PerfStatsCollector::reset();
 
     ComputeGraph graph;
@@ -943,43 +961,132 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
         {"segment_count", "1"},
         {"stage_count", "1"},
         {"type", "capturable"}};
+    const PerfStatsCollector::Tags host_aggregate_tags = {
+        {"attribution", "host_wall"},
+        {"context", "main_verifier"},
+        {"graph_capture_scope", "segmented_replay_host"},
+        {"segment_count", "1"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"timing_scope", "final_stream_sync_host_wall"},
+        {"type", "capturable"}};
 
     EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", capture_tags), 1u);
     EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", default_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", aggregate_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", host_aggregate_tags), 1u);
 
     const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
     const PerfStatsCollector::Tags stage_total_tags = {
-        {"attribution", "graph_replay_wall"},
+        {"attribution", "gpu_event"},
         {"context", "main_verifier"},
-        {"graph_capture_scope", "segmented_replay"},
+        {"graph_capture_scope", "segmented_replay_events"},
         {"segment_count", "1"},
         {"source", "segmented_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
-        {"timing_scope", "total_replay_wall"},
+        {"timing_scope", "total_replay_gpu_event"},
         {"type", "capturable"}};
     const PerfStatsCollector::Tags stage_segment_tags = {
-        {"attribution", "graph_replay_wall"},
+        {"attribution", "gpu_event"},
         {"context", "main_verifier"},
-        {"graph_capture_scope", "segmented_replay"},
+        {"graph_capture_scope", "segmented_replay_events"},
+        {"segment_index", "0"},
         {"source", "segmented_graph_capture"},
         {"stage_count", "1"},
-        {"timing_scope", "segment_replay_wall"},
-        {"type", "capturable"}};
-    const PerfStatsCollector::Tags stage_final_sync_tags = {
-        {"attribution", "graph_replay_wall"},
-        {"context", "main_verifier"},
-        {"graph_capture_scope", "segmented_replay"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
-        {"stage_count", "1"},
-        {"timing_scope", "final_stream_sync"},
+        {"sync_scope", "stream_synchronized"},
+        {"timing_scope", "segment_replay_gpu_event"},
         {"type", "capturable"}};
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", stage_total_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", stage_segment_tags), 1u);
-    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.final_sync", stage_final_sync_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.final_sync", aggregate_tags), 0u);
+    EXPECT_EQ(gpu_ctx.events_created_, 4);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 4);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvents)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "mtp_decode_sidecar";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"sidecar_graph"};
+    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*current_step=*/7,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+
+    const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
+    const PerfStatsCollector::Tags total_tags = {
+        {"attribution", "gpu_event"},
+        {"context", "mtp_decode_sidecar"},
+        {"graph_capture_scope", "segmented_replay_events"},
+        {"segment_count", "1"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"sync_scope", "profiling_event_synchronized"},
+        {"timing_scope", "total_replay_gpu_event"},
+        {"type", "capturable"}};
+    const PerfStatsCollector::Tags segment_tags = {
+        {"attribution", "gpu_event"},
+        {"context", "mtp_decode_sidecar"},
+        {"graph_capture_scope", "segmented_replay_events"},
+        {"segment_index", "0"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"sync_scope", "profiling_event_synchronized"},
+        {"timing_scope", "segment_replay_gpu_event"},
+        {"type", "capturable"}};
+
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", segment_tags), 1u);
+    EXPECT_EQ(gpu_ctx.events_created_, 4);
+    EXPECT_EQ(gpu_ctx.events_recorded_, 4);
+    EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
+    EXPECT_EQ(gpu_ctx.events_destroyed_, 4);
+
+    const auto forward_records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags deferred_tags = {
+        {"context", "mtp_decode_sidecar"},
+        {"segment_count", "1"},
+        {"stage_count", "1"},
+        {"type", "capturable"}};
+    EXPECT_DOUBLE_EQ(findCounterValue(
+                         forward_records,
+                         "segmented_replay_final_sync_deferred",
+                         deferred_tags),
+                     1.0);
 
     PerfStatsCollector::reset();
 }

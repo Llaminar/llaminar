@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <memory>
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
@@ -70,12 +72,25 @@ namespace llaminar2
             return tags;
         }
 
-        PerfStatsCollector::Tags graphReplayTimingTags(PerfStatsCollector::Tags tags,
-                                                       const char *timing_scope)
+        PerfStatsCollector::Tags graphReplayHostTimingTags(PerfStatsCollector::Tags tags,
+                                                           const char *timing_scope)
         {
-            tags.emplace("attribution", "graph_replay_wall");
+            tags.emplace("attribution", "host_wall");
             tags.emplace("source", "segmented_graph_capture");
-            tags.emplace("graph_capture_scope", "segmented_replay");
+            tags.emplace("graph_capture_scope", "segmented_replay_host");
+            if (timing_scope && timing_scope[0] != '\0')
+            {
+                tags.emplace("timing_scope", timing_scope);
+            }
+            return tags;
+        }
+
+        PerfStatsCollector::Tags graphReplayGpuEventTags(PerfStatsCollector::Tags tags,
+                                                         const char *timing_scope)
+        {
+            tags.emplace("attribution", "gpu_event");
+            tags.emplace("source", "segmented_graph_capture");
+            tags.emplace("graph_capture_scope", "segmented_replay_events");
             if (timing_scope && timing_scope[0] != '\0')
             {
                 tags.emplace("timing_scope", timing_scope);
@@ -92,6 +107,159 @@ namespace llaminar2
             addContextTag(tags, perf_context);
             return tags;
         }
+
+        class ReplayGpuEventTimer
+        {
+        public:
+            ReplayGpuEventTimer(IWorkerGPUContext *gpu_ctx,
+                                void *stream,
+                                std::string name,
+                                std::string phase,
+                                std::string device,
+                                PerfStatsCollector::Tags tags)
+                : gpu_ctx_(gpu_ctx),
+                  stream_(stream),
+                  name_(std::move(name)),
+                  phase_(std::move(phase)),
+                  device_(std::move(device)),
+                  tags_(std::move(tags))
+            {
+                if (!PerfStatsCollector::gpuStageEventTimingEnabled() ||
+                    !gpu_ctx_ ||
+                    !stream_)
+                {
+                    return;
+                }
+
+                start_event_ = gpu_ctx_->createEvent();
+                stop_event_ = gpu_ctx_->createEvent();
+                if (!start_event_ || !stop_event_)
+                {
+                    destroyEvents();
+                    return;
+                }
+
+                gpu_ctx_->recordEvent(start_event_, stream_);
+                active_ = true;
+            }
+
+            ~ReplayGpuEventTimer()
+            {
+                destroyEvents();
+            }
+
+            ReplayGpuEventTimer(const ReplayGpuEventTimer &) = delete;
+            ReplayGpuEventTimer &operator=(const ReplayGpuEventTimer &) = delete;
+
+            ReplayGpuEventTimer(ReplayGpuEventTimer &&other) noexcept
+                : gpu_ctx_(other.gpu_ctx_),
+                  stream_(other.stream_),
+                  start_event_(other.start_event_),
+                  stop_event_(other.stop_event_),
+                  active_(other.active_),
+                  stopped_(other.stopped_),
+                  recorded_(other.recorded_),
+                  name_(std::move(other.name_)),
+                  phase_(std::move(other.phase_)),
+                  device_(std::move(other.device_)),
+                  tags_(std::move(other.tags_))
+            {
+                other.gpu_ctx_ = nullptr;
+                other.stream_ = nullptr;
+                other.start_event_ = nullptr;
+                other.stop_event_ = nullptr;
+                other.active_ = false;
+                other.stopped_ = false;
+                other.recorded_ = true;
+            }
+
+            ReplayGpuEventTimer &operator=(ReplayGpuEventTimer &&other) noexcept
+            {
+                if (this != &other)
+                {
+                    destroyEvents();
+                    gpu_ctx_ = other.gpu_ctx_;
+                    stream_ = other.stream_;
+                    start_event_ = other.start_event_;
+                    stop_event_ = other.stop_event_;
+                    active_ = other.active_;
+                    stopped_ = other.stopped_;
+                    recorded_ = other.recorded_;
+                    name_ = std::move(other.name_);
+                    phase_ = std::move(other.phase_);
+                    device_ = std::move(other.device_);
+                    tags_ = std::move(other.tags_);
+
+                    other.gpu_ctx_ = nullptr;
+                    other.stream_ = nullptr;
+                    other.start_event_ = nullptr;
+                    other.stop_event_ = nullptr;
+                    other.active_ = false;
+                    other.stopped_ = false;
+                    other.recorded_ = true;
+                }
+                return *this;
+            }
+
+            bool active() const { return active_; }
+
+            void stop()
+            {
+                if (!active_ || stopped_)
+                    return;
+                gpu_ctx_->recordEvent(stop_event_, stream_);
+                stopped_ = true;
+            }
+
+            void record(bool synchronize_stop_event)
+            {
+                if (!active_ || !stopped_ || recorded_)
+                    return;
+
+                if (synchronize_stop_event)
+                    gpu_ctx_->synchronizeEvent(stop_event_);
+
+                const float elapsed_ms = gpu_ctx_->eventElapsedTime(start_event_, stop_event_);
+                if (elapsed_ms >= 0.0f)
+                {
+                    PerfStatsCollector::recordTimingNs(
+                        "stage_gpu",
+                        name_,
+                        static_cast<uint64_t>(static_cast<double>(elapsed_ms) * 1.0e6),
+                        phase_,
+                        device_,
+                        tags_);
+                }
+                recorded_ = true;
+            }
+
+        private:
+            void destroyEvents()
+            {
+                if (gpu_ctx_)
+                {
+                    if (start_event_)
+                        gpu_ctx_->destroyEvent(start_event_);
+                    if (stop_event_)
+                        gpu_ctx_->destroyEvent(stop_event_);
+                }
+                start_event_ = nullptr;
+                stop_event_ = nullptr;
+                active_ = false;
+            }
+
+            IWorkerGPUContext *gpu_ctx_ = nullptr;
+            void *stream_ = nullptr;
+            void *start_event_ = nullptr;
+            void *stop_event_ = nullptr;
+            bool active_ = false;
+            bool stopped_ = false;
+            bool recorded_ = false;
+            std::string name_;
+            std::string phase_;
+            std::string device_;
+            PerfStatsCollector::Tags tags_;
+        };
     }
 
 
@@ -1795,21 +1963,34 @@ namespace llaminar2
             "segmented_replay_total",
             "decode",
             device_name,
-            std::move(replay_total_tags));
-        std::optional<PerfStatsCollector::ScopedTimer> stage_replay_timer;
-        if (PerfStatsCollector::isEnabled())
+            graphReplayHostTimingTags(std::move(replay_total_tags), "total_replay_host_wall"));
+
+        std::vector<ReplayGpuEventTimer> replay_event_timers;
+        replay_event_timers.reserve(segment_cache.segments.size());
+        auto total_replay_event_tags = replayCacheTags(segment_cache);
+        total_replay_event_tags.emplace(
+            "sync_scope",
+            can_defer_final_sync ? "profiling_event_synchronized" : "stream_synchronized");
+        ReplayGpuEventTimer total_replay_event_timer(
+            gpu_ctx,
+            capture_stream,
+            "graph_replay.total",
+            "decode",
+            device_name,
+            graphReplayGpuEventTags(std::move(total_replay_event_tags), "total_replay_gpu_event"));
+
+        auto collect_replay_gpu_events = [&](bool synchronize_total_event)
         {
-            auto stage_replay_total_tags = replayCacheTags(segment_cache);
-            stage_replay_total_tags.emplace(
-                "sync_scope",
-                can_defer_final_sync ? "launch_only_deferred" : "stream_synchronized");
-            stage_replay_timer.emplace(
-                "stage_gpu",
-                "graph_replay.total",
-                "decode",
-                device_name,
-                graphReplayTimingTags(std::move(stage_replay_total_tags), "total_replay_wall"));
-        }
+            if (total_replay_event_timer.active())
+            {
+                total_replay_event_timer.stop();
+                total_replay_event_timer.record(synchronize_total_event);
+            }
+            for (auto &timer : replay_event_timers)
+            {
+                timer.record(false);
+            }
+        };
 
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
@@ -1835,6 +2016,19 @@ namespace llaminar2
                 "decode",
                 device_name,
                 seg_tags);
+
+            auto event_tags = seg_tags;
+            event_tags.emplace("segment_index", std::to_string(seg_idx));
+            event_tags.emplace(
+                "sync_scope",
+                can_defer_final_sync ? "profiling_event_synchronized" : "stream_synchronized");
+            replay_event_timers.emplace_back(
+                gpu_ctx,
+                capture_stream,
+                "graph_replay.segment",
+                "decode",
+                device_name,
+                graphReplayGpuEventTags(std::move(event_tags), "segment_replay_gpu_event"));
 
             const auto segment_t0 = std::chrono::high_resolution_clock::now();
             // Segment execution picks capturable or manual behavior based on
@@ -1866,14 +2060,7 @@ namespace llaminar2
                     segment_ns,
                     "decode",
                     device_name,
-                    seg_tags);
-                PerfStatsCollector::recordTimingNs(
-                    "stage_gpu",
-                    "graph_replay.segment",
-                    segment_ns,
-                    "decode",
-                    device_name,
-                    graphReplayTimingTags(seg_tags, "segment_replay_wall"));
+                    graphReplayHostTimingTags(seg_tags, "segment_replay_host_wall"));
             }
 
             if (!replay_result.success)
@@ -1881,6 +2068,8 @@ namespace llaminar2
                 result.launch_failure_fallback = replay_result.launch_failure_fallback;
                 return result;
             }
+
+            replay_event_timers.back().stop();
 
             if (trace_replay)
             {
@@ -1891,6 +2080,9 @@ namespace llaminar2
 
             seg_idx++;
         }
+
+        if (total_replay_event_timer.active())
+            total_replay_event_timer.stop();
 
         if (trace_replay)
         {
@@ -1919,6 +2111,11 @@ namespace llaminar2
                     device_name,
                     replayCacheTags(segment_cache));
             }
+            // Production MTP sidecar replay can deliberately defer the final
+            // stream sync. When GPU stage timing is requested, synchronize only
+            // the replay stop event here so exported stage_gpu graph-replay
+            // rows are true GPU elapsed time, not host enqueue duration.
+            collect_replay_gpu_events(/*synchronize_total_event=*/true);
             result.success = true;
             return result;
         }
@@ -1959,16 +2156,10 @@ namespace llaminar2
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()),
                     "decode",
                     device_name,
-                    replayCacheTags(segment_cache));
-                PerfStatsCollector::recordTimingNs(
-                    "stage_gpu",
-                    "graph_replay.final_sync",
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()),
-                    "decode",
-                    device_name,
-                    graphReplayTimingTags(replayCacheTags(segment_cache), "final_stream_sync"));
+                    graphReplayHostTimingTags(replayCacheTags(segment_cache), "final_stream_sync_host_wall"));
             }
         }
+        collect_replay_gpu_events(/*synchronize_total_event=*/false);
         if (trace_replay)
         {
             LOG_DEBUG("[ReplayTrace] " << device_id.toString()

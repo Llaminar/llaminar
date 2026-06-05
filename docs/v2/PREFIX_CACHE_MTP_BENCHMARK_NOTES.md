@@ -53,8 +53,9 @@ Fresh checks:
   `20260604T230244Z-perf-export-no-stage-events`,
   `20260604T231108Z-stage-timing-accumulator-fix`,
   `20260605T024434Z-graph-replay-stage-stats`.
-- Captured replay exports `stage_gpu.graph_replay.*` wall timings and
-  `stage_gpu.graph_replay_plan_*` metadata to JSON/CSV.
+- Captured replay exports `stage_gpu.graph_replay.*` GPU-event timings when
+  stage timing is enabled, plus `stage_gpu.graph_replay_plan_*` metadata to
+  JSON/CSV; host replay bookkeeping remains in `forward_graph`.
 - CUDA runtime-routed MoE decode has graph-replay regression coverage via
   `RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphReplays`; counter-only runs
   show `cuda_moe_grouped_decode_fused_calls`, `route=fused_kpart`.
@@ -82,13 +83,13 @@ and Qwen3.6 MoE CUDA benchmark-style parity.
 - Memory planning caps activation arenas to prefill-bucket capacity while KV
   keeps requested context capacity; oversized monolithic graph shapes hard fail.
 - Stage profiling split: `stage_gpu` has eager per-stage event timing plus
-  captured graph replay wall/plan stats, `stage_executor_cpu` is host
+  captured graph replay GPU-event/plan stats, `stage_executor_cpu` is host
   attribution, and `forward_graph` remains graph-control attribution.
-- Explicit non-null GPU stream hard failures remain required.
+- Non-null stream hard failures remain required.
 
 ## Next Work
 
 Beat llama.cpp CUDA on dense and MoE, prefill and decode, with MTP on/off.
 Dense decode is close; CUDA MoE fixed d1 best observed edges the llama.cpp MTP
 d1 anchor, while latest dynamic remains acceptance-sensitive. Next targets are
-controller stability, verifier/correction costs, prefill gap, and same-prompt comparison.
+controller stability, verifier/correction costs, and the prefill gap.
