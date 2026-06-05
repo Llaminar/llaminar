@@ -2400,50 +2400,6 @@ extern "C"
     }
 
     /**
-     * @brief Allocate workspace for Flash Decoding
-     */
-    int cudaFlashAttn_allocWorkspace(
-        void **partial_output, void **partial_m, void **partial_l,
-        int batch_size, int n_heads, int head_dim, int num_splits)
-    {
-        size_t output_size = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
-        size_t scalar_size = static_cast<size_t>(batch_size) * n_heads * num_splits * sizeof(float);
-
-        cudaError_t err1 = cudaMalloc(partial_output, output_size);
-        cudaError_t err2 = cudaMalloc(partial_m, scalar_size);
-        cudaError_t err3 = cudaMalloc(partial_l, scalar_size);
-
-        if (err1 != cudaSuccess || err2 != cudaSuccess || err3 != cudaSuccess)
-        {
-            if (*partial_output)
-                cudaFree(*partial_output);
-            if (*partial_m)
-                cudaFree(*partial_m);
-            if (*partial_l)
-                cudaFree(*partial_l);
-            *partial_output = nullptr;
-            *partial_m = nullptr;
-            *partial_l = nullptr;
-            return -1;
-        }
-
-        return 0;
-    }
-
-    /**
-     * @brief Free workspace
-     */
-    void cudaFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l)
-    {
-        if (partial_output)
-            cudaFree(partial_output);
-        if (partial_m)
-            cudaFree(partial_m);
-        if (partial_l)
-            cudaFree(partial_l);
-    }
-
-    /**
      * @brief Set CUDA device
      */
     int cudaFlashAttn_setDevice(int device_idx)

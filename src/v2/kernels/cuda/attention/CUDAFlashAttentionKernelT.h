@@ -379,8 +379,7 @@ namespace llaminar2
             /**
              * @brief Bind workspace manager for managed mode
              *
-             * When bound, Flash Decoding uses pre-allocated buffers instead of
-             * internal cudaMalloc allocations.
+             * Flash Decoding requires pre-allocated buffers from this workspace.
              *
              * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
              */
@@ -473,7 +472,7 @@ namespace llaminar2
             bool uploadDynamicAttnParams(void *stream);
             bool dynamicAttnParamsReady(
                 int kv_len, int position_offset, int query_rows) const;
-            void allocateWorkspace(int n_heads, int head_dim, int num_splits);
+            bool allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
         };
 

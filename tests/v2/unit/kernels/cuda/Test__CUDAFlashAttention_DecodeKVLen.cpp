@@ -29,6 +29,7 @@
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include <cuda_runtime.h>
@@ -43,6 +44,7 @@
 #include <random>
 #include <iostream>
 #include <iomanip>
+#include <memory>
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -98,6 +100,25 @@ protected:
         }
         return data;
     }
+
+#ifdef HAVE_CUDA
+    std::unique_ptr<DeviceWorkspaceManager> bindAttentionWorkspace(
+        llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> &kernel,
+        int n_heads,
+        int head_dim)
+    {
+        auto requirements = kernel.getWorkspaceRequirements(1, n_heads, head_dim);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            gpu_device_, requirements.total_bytes_with_alignment() + 4096);
+        if (!workspace->allocate(requirements))
+        {
+            ADD_FAILURE() << "Failed to allocate CUDA attention workspace";
+            return nullptr;
+        }
+        kernel.bindWorkspace(workspace.get());
+        return workspace;
+    }
+#endif
 };
 
 #ifdef HAVE_CUDA
@@ -200,7 +221,9 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, DecodeMode_SeqLen1_KVLen7)
     }
 
     // CUDA kernel using compute_decode()
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     // Allocate device memory
     float *d_Q, *d_K, *d_V, *d_output;
@@ -274,7 +297,9 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, WrongKVLen_ProducesWrongOutput)
     std::vector<float> correct_output(out_size, 0.0f);
     std::vector<float> wrong_output(out_size, 0.0f);
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -331,7 +356,9 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, MultipleDecodeSteps_GrowingKVCache)
     constexpr int initial_kv_len = 6;
     constexpr int num_decode_steps = 3;
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     // Pre-allocate K/V buffer for maximum size
     const int max_kv_len = initial_kv_len + num_decode_steps;

@@ -27,6 +27,7 @@
 // Include project headers BEFORE CUDATestUtils.h
 #include "tensors/Tensors.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "utils/MPIContext.h"
 #include "backends/cuda/CUDABackend.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionKernelT.h"
@@ -43,6 +44,7 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <memory>
 
 using namespace llaminar2;
 using namespace llaminar2::cuda;
@@ -265,6 +267,11 @@ namespace
             const size_t q_size = n_heads * head_dim;
             const size_t kv_size = kv_len * n_kv_heads * head_dim;
             const size_t out_size = n_heads * head_dim;
+            auto requirements = kernel_->getWorkspaceRequirements(1, n_heads, head_dim);
+            workspace_ = std::make_unique<DeviceWorkspaceManager>(
+                DeviceId::cuda(0), requirements.total_bytes_with_alignment() + 4096);
+            ASSERT_TRUE(workspace_->allocate(requirements));
+            kernel_->bindWorkspace(workspace_.get());
 
             // Generate host data
             auto Q_data = randomFP32(q_size);
@@ -402,6 +409,7 @@ namespace
         cudaEvent_t stop_event_ = nullptr;
         std::unique_ptr<IMPIContext> mpi_ctx_;
         std::unique_ptr<CUDAFlashAttentionKernelT<ActivationPrecision::FP32>> kernel_;
+        std::unique_ptr<DeviceWorkspaceManager> workspace_;
     };
 
     // ============================================================================

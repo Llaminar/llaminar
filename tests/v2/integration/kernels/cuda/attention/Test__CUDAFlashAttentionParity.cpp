@@ -47,6 +47,7 @@
 #include <random>
 #include <iostream>
 #include <iomanip>
+#include <memory>
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -274,6 +275,23 @@ protected:
                   << ", count=" << count
                   << std::endl;
     }
+
+    std::unique_ptr<DeviceWorkspaceManager> bindAttentionWorkspace(
+        llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> &kernel,
+        int n_heads,
+        int head_dim)
+    {
+        auto requirements = kernel.getWorkspaceRequirements(1, n_heads, head_dim);
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(
+            gpu_device_, requirements.total_bytes_with_alignment() + 4096);
+        if (!workspace->allocate(requirements))
+        {
+            ADD_FAILURE() << "Failed to allocate CUDA attention workspace";
+            return nullptr;
+        }
+        kernel.bindWorkspace(workspace.get());
+        return workspace;
+    }
 };
 
 #ifdef HAVE_CUDA
@@ -471,7 +489,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Small)
     ASSERT_TRUE(cpu_success) << "CPU attention failed";
 
     // CUDA kernel
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     // Allocate device memory
     float *d_Q, *d_K, *d_V, *d_output;
@@ -556,7 +576,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Medium)
     ASSERT_TRUE(cpu_success);
 
     // CUDA kernel
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -622,7 +644,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_FP32_Large)
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, -1);
     ASSERT_TRUE(cpu_success);
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -696,7 +720,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Short_Parity)
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -769,7 +795,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_Long_Parity)
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -876,7 +904,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
         1, kv_len, n_heads, n_kv_heads, head_dim,
         true, kv_len - 1));
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q = nullptr;
     float *d_K = nullptr;
@@ -954,7 +984,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
     // CUDA decode
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -1020,7 +1052,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
         1, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1);
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -1086,7 +1120,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
         1, kv_len, n_heads, n_kv_heads, head_dim, true, kv_len - 1);
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -1152,7 +1188,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
         1, kv_len, n_heads, n_kv_heads, head_dim, false); // non-causal
     ASSERT_TRUE(cpu_success) << "CPU compute_decode failed";
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -1224,7 +1262,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_HeadDim128)
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, -1);
     ASSERT_TRUE(cpu_success);
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -1295,7 +1335,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_NonCausal)
         -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, -1);
     ASSERT_TRUE(cpu_success);
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -1395,7 +1437,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashAttn2_CausalMasking)
         -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, -1);
     ASSERT_TRUE(cpu_success);
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     float *d_Q, *d_K, *d_V, *d_output;
     cudaMalloc(&d_Q, q_size * sizeof(float));
@@ -1475,7 +1519,9 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_BatchDecoding)
     std::vector<float> V_data = randomFP32(batch_size * kv_per_batch);
     std::vector<float> cuda_output(batch_size * out_per_batch, 0.0f);
 
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
 
     // Allocate device memory for largest batch element
     float *d_Q, *d_K, *d_V, *d_output;
@@ -1635,14 +1681,16 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_Parity)
     memset(output_tensor->mutable_data(), 0, out_size * sizeof(float));
 
     // Upload all tensors to GPU
-    DeviceId gpu_dev = DeviceId::cuda(0);
+    DeviceId gpu_dev = gpu_device_;
     ASSERT_TRUE(Q_tensor->ensureOnDevice(gpu_dev));
     ASSERT_TRUE(k_q81->ensureOnDevice(gpu_dev));
     ASSERT_TRUE(v_q81->ensureOnDevice(gpu_dev));
     ASSERT_TRUE(output_tensor->ensureOnDevice(gpu_dev));
 
     // Call compute_tensor with Q8_1 K/V — should trigger fused kernel
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
     bool success = cuda_kernel.compute_tensor(
         Q_tensor.get(), k_q81.get(), v_q81.get(), output_tensor.get(),
         1, // batch_size
@@ -1652,7 +1700,7 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_Parity)
         true,  // causal
         0,     // window_size
         nullptr, nullptr, nullptr, // workspace, mask, mpi
-        0);    // device_idx
+        cuda_ordinal_);    // device_idx
     ASSERT_TRUE(success) << "Fused Q8_1 CUDA decode kernel failed";
 
     // Sync GPU→host
@@ -1736,20 +1784,22 @@ TEST_F(Test__CUDAFlashAttentionParity, FlashDecode_FusedQ81_HeadDim128_Parity)
     memset(output_tensor->mutable_data(), 0, out_size * sizeof(float));
 
     // Upload to GPU
-    DeviceId gpu_dev = DeviceId::cuda(0);
+    DeviceId gpu_dev = gpu_device_;
     ASSERT_TRUE(Q_tensor->ensureOnDevice(gpu_dev));
     ASSERT_TRUE(k_q81->ensureOnDevice(gpu_dev));
     ASSERT_TRUE(v_q81->ensureOnDevice(gpu_dev));
     ASSERT_TRUE(output_tensor->ensureOnDevice(gpu_dev));
 
     // Fused Q8_1 decode
-    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(0);
+    llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> cuda_kernel(cuda_ordinal_);
+    auto attention_workspace = bindAttentionWorkspace(cuda_kernel, n_heads, head_dim);
+    ASSERT_NE(attention_workspace, nullptr);
     bool success = cuda_kernel.compute_tensor(
         Q_tensor.get(), k_q81.get(), v_q81.get(), output_tensor.get(),
         1, 1, kv_len,
         n_heads, n_kv_heads, head_dim,
         true, 0,
-        nullptr, nullptr, nullptr, 0);
+        nullptr, nullptr, nullptr, cuda_ordinal_);
     ASSERT_TRUE(success) << "Fused Q8_1 CUDA decode (hd=128) failed";
 
     output_tensor->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
