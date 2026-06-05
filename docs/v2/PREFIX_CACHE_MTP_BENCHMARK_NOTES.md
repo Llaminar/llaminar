@@ -10,9 +10,9 @@ history belongs in artifacts.
 | Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 671.37 | 40.82 | fits 24GB |
 | Dense default, 595p/64d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 582.66 | 53.83 | near fixed d1 |
 | Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2463.36 | 113.78 | down warp-reduce default |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1816.81 | 143.99 | accept 92.19%, beats l.cpp d1 |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1821.56 | 140.51 | accept-sensitive, depth 1 |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | beats l.cpp no-MTP |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | accept 71.88%, beats l.cpp d1 |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1943.69 | 145.36 | accept 68.75%, depth 1 |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
 | LocalTP / LocalPP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
@@ -36,34 +36,24 @@ history belongs in artifacts.
 ## Latest Evidence
 
 CUDA MoE latest:
-`20260605T050420Z-down-warp-reduce`.
+`20260605T070628Z-iq4nl-word-decode`.
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
-| no MTP | 2463.36 | 113.78 | n/a |
-| fixed d1 MTP | 1816.81 | 143.99 | 92.19% |
-| dynamic MTP | 1821.56 | 140.51 | 82.81% |
+| no MTP | 2707.70 | 119.91 | n/a |
+| fixed d1 MTP | 1946.82 | 148.50 | 71.88% |
+| dynamic MTP | 1943.69 | 145.36 | 68.75% |
 
 Fresh checks:
-- Graph replay stage stats export trusted GPU-event rows in `stage_gpu`; CUDA
-  fused MoE decode now exports sub-kernel `kernel_cuda` rows
-  (`20260605T065818Z-profile-fused-subkernels`). Routed down warp-reduce is the
-  largest sub-kernel, followed by gate/up k-part.
-- CUDA runtime-routed MoE decode and shared-expert grouped decode have graph
-  replay / benchmark-style parity coverage with perf-counter evidence.
-- Dynamic MTP request state resets across benchmark-style `clearCache()`.
-- CUDA MoE prefill checks: tile 16 remains best; down prefill decode-hoist
-  was neutral/slightly negative (`2146p/109.79d`) and reverted.
-- CUDA deterministic scatter now uses block-per-expert chunk scans. nsys
-  `20260605T041258Z-nsys-parallel-scatter-skipzero` shows scatter down from
-  `67.2ms` to `4.6ms`; no-MTP prefill improved `2156.95 -> 2286.11 tok/s`.
-- CUDA MoE FP32 prompt routing now uses cuBLAS SGEMM for `seq_len >= 16`,
-  lifting no-MTP prefill above the llama.cpp `llama-bench` anchor while decode
-  remains the open no-MTP gap.
-- CUDA fused runtime MoE decode now uses a deterministic warp-reduce down
-  projection that writes final outputs directly, replacing split-K FP32 partial
-  traffic plus a separate reduce in the hot fused path. Fixed d1 MTP now beats
-  the llama.cpp d1 decode anchor; no-MTP decode improved but still trails.
+- Graph replay stage stats export trusted GPU-event `stage_gpu` rows; fused
+  CUDA MoE decode also exports capture-safe `kernel_cuda` sub-kernel rows.
+- The sub-kernel export identified IQ4_NL down decode as the next hot path.
+  CUDA IQ4_NL decode now reuses the packed word decoder in the shared VNNI
+  helper, lifting MoE no-MTP and MTP decode beyond the llama.cpp anchors.
+- Focused coverage stayed green for CUDA GEMM IQ4_NL parity, CUDA MoE kernel
+  graph replay, Qwen3.6 MoE CUDA math decode parity, verifier-row shortcut
+  parity, dynamic-depth request reset parity, fused verifier prefill parity,
+  skip-gather greedy parity, and prefix-cache plus MTP restore parity.
 
 Focused gates: `V2_Integration_CUDAMoEKernel`, Qwen3.6 MoE CUDA math parity,
 Qwen3.6 dense/MoE CUDA prefix+MTP restore parity, and Qwen3.6 MoE CUDA
@@ -78,13 +68,13 @@ segfault breadcrumb from this run.
   verifier prefill, stream-explicit shared experts, fused split-K/runtime MoE,
   parallel router/top-k/scatter, source-token activation quantization, mapped
   outputs, checkpoint elision, batched GDN projections, and cuBLAS router
-  prefill, plus fused-runtime MoE down warp-reduce.
+  prefill, fused-runtime MoE down warp-reduce, and IQ4_NL word decode.
 - Shared: lowest-id greedy argmax tie-break, capped activation arenas, trusted
   stage profiling split, and non-null GPU stream hard failures.
 
 ## Next Work
 
 Beat llama.cpp CUDA on dense and MoE, prefill and decode, with MTP on/off.
-Dense decode is close. CUDA MoE no-MTP prefill and fixed d1 MTP decode now beat
-their llama.cpp anchors; no-MTP decode still trails `118.26 tok/s`. Next targets
-are controller stability plus the remaining CUDA MoE decode and verifier costs.
+CUDA MoE now clears the current no-MTP and MTP anchors on the default lane.
+Next targets are CUDA dense prefill/decode gaps, controller stability, and
+longer-prompt MoE evidence so the win is not just a short-lane artifact.
