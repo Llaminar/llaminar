@@ -8,6 +8,7 @@
 #include "../../../execution/moe/ExpertWeightTransfer.h"
 #include "../../../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../../../execution/moe/MoEExpertWeightService.h"
+#include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
@@ -378,7 +379,15 @@ namespace llaminar2
     {
         if (!moe_kernel_)
             moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
-        return bindStageStream(moe_kernel_);
+        auto *kernel = bindStageStream(moe_kernel_);
+        if (bound_workspace_)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel))
+            {
+                consumer->bindWorkspace(bound_workspace_);
+            }
+        }
+        return kernel;
     }
 
     bool MoEExpertComputeStage::execute(IDeviceContext *ctx)
@@ -2218,6 +2227,17 @@ namespace llaminar2
 
     WorkspaceRequirements MoEExpertComputeStage::getWorkspaceRequirements(int m, int n, int k) const
     {
+        WorkspaceRequirements combined;
+        if (params_.device_id.is_cuda())
+        {
+            combined.merge(MoEWorkspaceBuffers::expertExecution(
+                params_.seq_len,
+                params_.d_model,
+                params_.expert_intermediate,
+                params_.num_experts,
+                params_.top_k));
+        }
+
         // All expert GEMM engines use shared buffer names (not per-instance),
         // so requirements from any one engine represent all of them.
         const auto &engines = params_.prepared_gate_gemm.empty()
@@ -2229,9 +2249,12 @@ namespace llaminar2
                 continue;
             auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
             if (consumer)
-                return consumer->getWorkspaceRequirements(m, n, k);
+            {
+                combined.merge(consumer->getWorkspaceRequirements(m, n, k));
+                return combined;
+            }
         }
-        return WorkspaceRequirements{};
+        return combined;
     }
 
     void MoEExpertComputeStage::bindWorkspace(DeviceWorkspaceManager *workspace)
@@ -2256,6 +2279,12 @@ namespace llaminar2
         bindAll(gate);
         bindAll(up);
         bindAll(down);
+
+        if (moe_kernel_)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(moe_kernel_))
+                consumer->bindWorkspace(workspace);
+        }
 
         bound_workspace_ = workspace;
         LOG_DEBUG("[MoEExpertComputeStage] Bound workspace to "
@@ -2283,6 +2312,12 @@ namespace llaminar2
         unbindAll(gate);
         unbindAll(up);
         unbindAll(down);
+
+        if (moe_kernel_)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(moe_kernel_))
+                consumer->unbindWorkspace();
+        }
 
         bound_workspace_ = nullptr;
     }

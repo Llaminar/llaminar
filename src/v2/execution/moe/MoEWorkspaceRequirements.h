@@ -1,0 +1,148 @@
+#pragma once
+
+#include "../local_execution/device/WorkspaceDescriptor.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
+namespace llaminar2
+{
+    namespace MoEWorkspaceBuffers
+    {
+        constexpr const char *STAGING_INDICES = "moe_staging_indices";
+        constexpr const char *STAGING_WEIGHTS = "moe_staging_weights";
+        constexpr const char *ROUTE_LOGITS = "moe_route_logits";
+        constexpr const char *ROUTE_INDICES = "moe_route_indices";
+        constexpr const char *ROUTE_WEIGHTS = "moe_route_weights";
+
+        constexpr const char *GROUP_INT_INDICES = "moe_group_int_indices";
+        constexpr const char *GROUP_OFFSETS = "moe_group_offsets";
+        constexpr const char *GROUP_COUNTS = "moe_group_counts";
+        constexpr const char *GROUP_TOKEN_INDICES = "moe_group_token_indices";
+        constexpr const char *GROUP_ORIGINAL_TO_GROUPED = "moe_group_original_to_grouped";
+        constexpr const char *GROUP_ORIGINAL_EXPERT_IDS = "moe_group_original_expert_ids";
+        constexpr const char *GROUP_WRITE_HEADS = "moe_group_write_heads";
+        constexpr const char *GROUP_WEIGHTS = "moe_group_weights";
+        constexpr const char *GROUP_ACTIVE_EXPERT_IDS = "moe_group_active_expert_ids";
+
+        constexpr const char *PREFILL_A_INT8 = "moe_prefill_a_int8";
+        constexpr const char *PREFILL_A_SCALES = "moe_prefill_a_scales";
+        constexpr const char *PREFILL_SWIGLU_INT8 = "moe_prefill_swiglu_int8";
+        constexpr const char *PREFILL_SWIGLU_SCALES = "moe_prefill_swiglu_scales";
+        constexpr const char *PREFILL_GATE = "moe_prefill_gate";
+        constexpr const char *PREFILL_UP = "moe_prefill_up";
+
+        constexpr const char *DECODE_HIDDEN_INT8 = "moe_decode_hidden_int8";
+        constexpr const char *DECODE_HIDDEN_SCALES = "moe_decode_hidden_scales";
+        constexpr const char *GATEUP_GATE_PARTIALS = "moe_grouped_gateup_gate_partials";
+        constexpr const char *GATEUP_UP_PARTIALS = "moe_grouped_gateup_up_partials";
+        constexpr const char *DOWN_PARTIALS = "moe_grouped_down_partials";
+        constexpr const char *DECODE_SWIGLU_INT8 = "moe_decode_swiglu_int8";
+        constexpr const char *DECODE_SWIGLU_SCALES = "moe_decode_swiglu_scales";
+        constexpr const char *DECODE_EXPERT_IDS = "moe_grouped_decode_expert_ids";
+        constexpr const char *DECODE_WEIGHTS = "moe_grouped_decode_weights";
+
+        inline int ceilDiv(int value, int divisor)
+        {
+            return (value + divisor - 1) / divisor;
+        }
+
+        inline void add(WorkspaceRequirements &reqs, const char *name, std::size_t bytes)
+        {
+            if (bytes == 0)
+                return;
+            reqs.buffers.push_back({name, bytes, 256, true});
+        }
+
+        inline WorkspaceRequirements routing(int max_seq_len, int num_experts, int top_k)
+        {
+            WorkspaceRequirements reqs;
+            max_seq_len = std::max(1, max_seq_len);
+            num_experts = std::max(1, num_experts);
+            top_k = std::max(1, top_k);
+
+            const std::size_t tokens = static_cast<std::size_t>(max_seq_len);
+            const std::size_t route_slots = tokens * static_cast<std::size_t>(top_k);
+            add(reqs, ROUTE_LOGITS, tokens * static_cast<std::size_t>(num_experts) * sizeof(float));
+            add(reqs, ROUTE_INDICES, route_slots * sizeof(int));
+            add(reqs, ROUTE_WEIGHTS, route_slots * sizeof(float));
+            return reqs;
+        }
+
+        inline WorkspaceRequirements expertExecution(
+            int max_seq_len,
+            int d_model,
+            int intermediate,
+            int num_experts,
+            int top_k)
+        {
+            WorkspaceRequirements reqs;
+            max_seq_len = std::max(1, max_seq_len);
+            d_model = std::max(1, d_model);
+            intermediate = std::max(1, intermediate);
+            num_experts = std::max(1, num_experts);
+            top_k = std::max(1, top_k);
+
+            const std::size_t tokens = static_cast<std::size_t>(max_seq_len);
+            const std::size_t total_slots = tokens * static_cast<std::size_t>(top_k);
+            const int max_dim = std::max(d_model, intermediate);
+            const int max_blocks = ceilDiv(max_dim, 32);
+            const int d_model_blocks = ceilDiv(d_model, 32);
+            const int intermediate_blocks = ceilDiv(intermediate, 32);
+
+            add(reqs, STAGING_INDICES, tokens * sizeof(int));
+            add(reqs, STAGING_WEIGHTS, tokens * sizeof(float));
+
+            add(reqs, GROUP_INT_INDICES, total_slots * sizeof(int));
+            add(reqs, GROUP_TOKEN_INDICES, total_slots * sizeof(int));
+            add(reqs, GROUP_ORIGINAL_TO_GROUPED, total_slots * sizeof(int));
+            add(reqs, GROUP_ORIGINAL_EXPERT_IDS, total_slots * sizeof(int));
+            add(reqs, GROUP_WEIGHTS, total_slots * sizeof(float));
+            add(reqs, GROUP_ACTIVE_EXPERT_IDS, total_slots * sizeof(int));
+            add(reqs, GROUP_OFFSETS, static_cast<std::size_t>(num_experts) * sizeof(int));
+            add(reqs, GROUP_COUNTS, static_cast<std::size_t>(num_experts) * sizeof(int));
+            add(reqs, GROUP_WRITE_HEADS, static_cast<std::size_t>(num_experts) * sizeof(int));
+
+            add(reqs, PREFILL_A_INT8, total_slots * static_cast<std::size_t>(max_dim) * sizeof(int8_t));
+            add(reqs, PREFILL_A_SCALES, total_slots * static_cast<std::size_t>(max_blocks) * sizeof(float));
+            add(reqs, PREFILL_SWIGLU_INT8, total_slots * static_cast<std::size_t>(intermediate) * sizeof(int8_t));
+            add(reqs, PREFILL_SWIGLU_SCALES, total_slots * static_cast<std::size_t>(intermediate_blocks) * sizeof(float));
+            add(reqs, PREFILL_GATE, total_slots * static_cast<std::size_t>(max_dim) * sizeof(float));
+            add(reqs, PREFILL_UP, total_slots * static_cast<std::size_t>(intermediate) * sizeof(float));
+
+            constexpr int kMaxGateUpPartitions = 32;
+            constexpr int kMaxDownPartitions = 16;
+            const std::size_t decode_slots = static_cast<std::size_t>(top_k);
+            const std::size_t verifier_down_slots = (max_seq_len <= 4) ? total_slots : 1;
+
+            add(reqs, DECODE_HIDDEN_INT8, static_cast<std::size_t>(d_model) * sizeof(int8_t));
+            add(reqs, DECODE_HIDDEN_SCALES, static_cast<std::size_t>(d_model_blocks) * sizeof(float));
+            add(reqs, GATEUP_GATE_PARTIALS,
+                decode_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
+            add(reqs, GATEUP_UP_PARTIALS,
+                decode_slots * kMaxGateUpPartitions * static_cast<std::size_t>(intermediate) * sizeof(float));
+            add(reqs, DOWN_PARTIALS,
+                verifier_down_slots * kMaxDownPartitions * static_cast<std::size_t>(d_model) * sizeof(float));
+            add(reqs, DECODE_SWIGLU_INT8,
+                decode_slots * static_cast<std::size_t>(intermediate) * sizeof(int8_t));
+            add(reqs, DECODE_SWIGLU_SCALES,
+                decode_slots * static_cast<std::size_t>(intermediate_blocks) * sizeof(float));
+            add(reqs, DECODE_EXPERT_IDS, decode_slots * sizeof(int));
+            add(reqs, DECODE_WEIGHTS, decode_slots * sizeof(float));
+            return reqs;
+        }
+
+        inline WorkspaceRequirements cudaMoE(
+            int max_seq_len,
+            int d_model,
+            int intermediate,
+            int num_experts,
+            int top_k)
+        {
+            WorkspaceRequirements reqs = routing(max_seq_len, num_experts, top_k);
+            reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
+            return reqs;
+        }
+    } // namespace MoEWorkspaceBuffers
+} // namespace llaminar2

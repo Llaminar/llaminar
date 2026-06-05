@@ -11,6 +11,7 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../moe/DecodeExpertHistogram.h"
@@ -31,7 +32,7 @@ namespace llaminar2
      * - output_indices: FP32 [seq_len * top_k] expert IDs cast to float
      * - output_weights: FP32 [seq_len * top_k] normalized routing weights
      */
-    class MoERoutingStage : public IComputeStage
+    class MoERoutingStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
         struct Params
@@ -84,6 +85,12 @@ namespace llaminar2
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
 
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override;
+        DeviceWorkspaceManager *getWorkspace() const override;
+
         /**
          * @brief Clear per-request routing metadata while preserving kernel handles.
          */
@@ -109,6 +116,7 @@ namespace llaminar2
 
         /// Cached MoE kernel
         mutable IMoEKernel *moe_kernel_ = nullptr;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
 
         /// Pre-allocated routing result (avoids heap allocs per decode token)
         mutable MoERoutingResult cached_routing_;

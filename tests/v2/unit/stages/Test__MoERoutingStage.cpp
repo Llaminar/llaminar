@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/MoERoutingStage.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockComputeStage.h"
 #include "utils/TestTensorFactory.h"
@@ -498,7 +499,7 @@ TEST_F(MoERoutingStageTest, OutputDimensions)
     }
 }
 
-TEST_F(MoERoutingStageTest, CUDAFallbackRoutingOutputsRemainDeviceCoherent)
+TEST_F(MoERoutingStageTest, CUDARoutingOutputsRemainDeviceCoherentWithWorkspace)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "Built without CUDA support";
@@ -538,9 +539,13 @@ TEST_F(MoERoutingStageTest, CUDAFallbackRoutingOutputsRemainDeviceCoherent)
     params.norm_topk_prob = true;
     params.layer_idx = 0;
 
-    MoERoutingStage stage(params);
-    stage.setGPUStream(stream.stream);
-    ASSERT_TRUE(stage.execute(&cuda_ctx));
+	MoERoutingStage stage(params);
+	stage.setGPUStream(stream.stream);
+	auto reqs = stage.getWorkspaceRequirements(0, 0, 0);
+	DeviceWorkspaceManager workspace(cuda_device, reqs.total_bytes_with_alignment() + 1024 * 1024);
+	ASSERT_TRUE(workspace.allocate(reqs));
+	stage.bindWorkspace(&workspace);
+	ASSERT_TRUE(stage.execute(&cuda_ctx));
     ASSERT_TRUE(output_indices->is_on_device(cuda_device));
     ASSERT_TRUE(output_weights->is_on_device(cuda_device));
 

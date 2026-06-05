@@ -8,8 +8,11 @@
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
 
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/moe/DecodeExpertHistogram.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "interfaces/IWorkspaceConsumer.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -478,12 +481,37 @@ namespace
             ASSERT_NE(cuda_kernel_, nullptr);
             ASSERT_NE(cpu_kernel_, nullptr);
             cuda_kernel_->setGPUStream(stream_);
+            auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(cuda_kernel_);
+            ASSERT_NE(workspace_consumer, nullptr);
+            auto reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
+                /*max_seq_len=*/64,
+                /*d_model=*/2048,
+                /*intermediate=*/512,
+                /*num_experts=*/256,
+                /*top_k=*/16);
+            reqs.merge(llaminar2::MoEWorkspaceBuffers::cudaMoE(
+                /*max_seq_len=*/4,
+                /*d_model=*/2048,
+                /*intermediate=*/512,
+                /*num_experts=*/256,
+                /*top_k=*/16));
+            workspace_ = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+                llaminar2::DeviceId::cuda(0),
+                reqs.total_bytes_with_alignment() + 4 * 1024 * 1024);
+            ASSERT_TRUE(workspace_->allocate(reqs));
+            workspace_consumer->bindWorkspace(workspace_.get());
 #endif
         }
 
         void TearDown() override
         {
 #ifdef HAVE_CUDA
+            if (cuda_kernel_)
+            {
+                if (auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(cuda_kernel_))
+                    workspace_consumer->unbindWorkspace();
+            }
+            workspace_.reset();
             if (stream_)
                 cudaStreamDestroy(stream_);
 #endif
@@ -491,6 +519,7 @@ namespace
 
 #ifdef HAVE_CUDA
         cudaStream_t stream_ = nullptr;
+        std::unique_ptr<llaminar2::DeviceWorkspaceManager> workspace_;
 #endif
         llaminar2::IMoEKernel *cuda_kernel_ = nullptr;
         llaminar2::IMoEKernel *cpu_kernel_ = nullptr;

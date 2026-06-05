@@ -6,6 +6,8 @@
 #include "MoERoutingStage.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
+#include "../../../execution/moe/MoEWorkspaceRequirements.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../utils/Assertions.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -106,7 +108,15 @@ namespace llaminar2
     {
         if (!moe_kernel_)
             moe_kernel_ = KernelFactory::getOrCreateMoEKernel(params_.device_id);
-        return bindStageStream(moe_kernel_);
+        auto *kernel = bindStageStream(moe_kernel_);
+        if (bound_workspace_)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(kernel))
+            {
+                consumer->bindWorkspace(bound_workspace_);
+            }
+        }
+        return kernel;
     }
 
     void MoERoutingStage::stashRoutingResults(
@@ -475,6 +485,41 @@ namespace llaminar2
         info.addScalarInt("num_experts", params_.num_experts);
         info.addScalarInt("top_k", params_.top_k);
         return info;
+    }
+
+    WorkspaceRequirements MoERoutingStage::getWorkspaceRequirements(int, int, int) const
+    {
+        if (!params_.device_id.is_cuda())
+            return WorkspaceRequirements{};
+        return MoEWorkspaceBuffers::routing(
+            params_.seq_len,
+            params_.num_experts,
+            params_.top_k);
+    }
+
+    void MoERoutingStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        bound_workspace_ = workspace;
+        if (moe_kernel_)
+        {
+            if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(moe_kernel_))
+                consumer->bindWorkspace(workspace);
+        }
+    }
+
+    void MoERoutingStage::unbindWorkspace()
+    {
+        bindWorkspace(nullptr);
+    }
+
+    bool MoERoutingStage::hasWorkspace() const
+    {
+        return bound_workspace_ != nullptr;
+    }
+
+    DeviceWorkspaceManager *MoERoutingStage::getWorkspace() const
+    {
+        return bound_workspace_;
     }
 
 } // namespace llaminar2

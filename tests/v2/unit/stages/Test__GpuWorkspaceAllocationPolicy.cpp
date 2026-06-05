@@ -107,3 +107,22 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeVNNIWorkspaceCriticalFilesHav
         expectNoRawGpuAllocationCalls(source, relative.string());
     }
 }
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoEExecutionScratchUsesWorkspace)
+{
+    const auto source = readFile(repoRoot() / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
+    const auto route_scratch = sliceBetween(
+        source,
+        "bool CUDAMoEKernel::ensureStagingCapacity(",
+        "bool CUDAMoEKernel::routeLogitsCuBLAS(");
+    const auto grouped_scratch = sliceBetween(
+        source,
+        "bool CUDAMoEKernel::ensureGroupingBufferCapacity(",
+        "bool CUDAMoEKernel::ensureRuntimeGateUpPointerArrays(");
+
+    expectNoRawGpuAllocationCalls(route_scratch, "CUDAMoEKernel route/staging scratch");
+    expectNoRawGpuAllocationCalls(grouped_scratch, "CUDAMoEKernel grouped execution scratch");
+    EXPECT_NE(route_scratch.find("bindWorkspaceBuffer"), std::string::npos);
+    EXPECT_NE(grouped_scratch.find("bindWorkspaceBuffer"), std::string::npos);
+    EXPECT_NE(source.find("requires graph-owned MoE workspace"), std::string::npos);
+}

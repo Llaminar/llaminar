@@ -237,6 +237,11 @@ namespace llaminar2
         /// @brief Forward stage stream binding into the CUDA base class.
         void setGPUStream(void *stream) override { CUDAKernelBase::setGPUStream(stream); }
 
+        /// @brief Bind graph-owned workspace scratch used by routing/grouped MoE kernels.
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+
+        void unbindWorkspace() override { bindWorkspace(nullptr); }
+
     private:
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
 
@@ -294,6 +299,8 @@ namespace llaminar2
             const std::array<const float *, kRuntimePointerArrayMaxTopK> &up_ptrs,
             const float ***d_gate_ptrs,
             const float ***d_up_ptrs);
+        bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
+        void clearWorkspaceScratchBindings() noexcept;
         void releaseDeviceBuffers() noexcept;
 
         struct GroupedDownDescriptorTable
@@ -412,6 +419,8 @@ namespace llaminar2
         int grouped_down_kpart_partitions_cap_ = 0;
         int grouped_down_kpart_d_model_cap_ = 0;
         int grouped_down_kpart_slots_cap_ = 0;
+
+        bool scratch_workspace_bound_ = false;
     };
 
 } // namespace llaminar2
