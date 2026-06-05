@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <functional>
 #include <map>
+#include <optional>
 
 namespace llaminar2
 {
@@ -66,6 +67,29 @@ namespace llaminar2
                 {"segment_count", std::to_string(cache.segments.size())},
                 {"stage_count", std::to_string(stage_count)}};
             addContextTag(tags, cache.perf_context);
+            return tags;
+        }
+
+        PerfStatsCollector::Tags graphReplayTimingTags(PerfStatsCollector::Tags tags,
+                                                       const char *timing_scope)
+        {
+            tags.emplace("attribution", "graph_replay_wall");
+            tags.emplace("source", "segmented_graph_capture");
+            tags.emplace("graph_capture_scope", "segmented_replay");
+            if (timing_scope && timing_scope[0] != '\0')
+            {
+                tags.emplace("timing_scope", timing_scope);
+            }
+            return tags;
+        }
+
+        PerfStatsCollector::Tags graphReplayMetadataTags(PerfStatsCollector::Tags tags,
+                                                         const std::string &perf_context)
+        {
+            tags.emplace("attribution", "graph_replay_metadata");
+            tags.emplace("source", "segmented_graph_capture");
+            tags.emplace("graph_capture_scope", "segmented_capture_plan");
+            addContextTag(tags, perf_context);
             return tags;
         }
     }
@@ -398,6 +422,55 @@ namespace llaminar2
                     static_cast<double>(count),
                     "decode",
                     "",
+                    {{"segment_type", "manual"}, {"stage_type", type_name}});
+            }
+
+            auto record_stage_gpu_plan = [&](const char *name,
+                                             double value,
+                                             PerfStatsCollector::Tags tags)
+            {
+                PerfStatsCollector::addCounter(
+                    "stage_gpu",
+                    name,
+                    value,
+                    "decode",
+                    "",
+                    graphReplayMetadataTags(std::move(tags), segment_cache.perf_context));
+            };
+
+            record_stage_gpu_plan(
+                "graph_replay_plan_segments",
+                static_cast<double>(segment_cache.segments.size()),
+                {{"type", "total"}});
+            record_stage_gpu_plan(
+                "graph_replay_plan_segments",
+                static_cast<double>(capturable_segments),
+                {{"type", "capturable"}});
+            record_stage_gpu_plan(
+                "graph_replay_plan_segments",
+                static_cast<double>(manual_segments),
+                {{"type", "manual"}});
+            record_stage_gpu_plan(
+                "graph_replay_plan_stages",
+                static_cast<double>(capturable_stages),
+                {{"type", "capturable"}});
+            record_stage_gpu_plan(
+                "graph_replay_plan_stages",
+                static_cast<double>(manual_stages),
+                {{"type", "manual"}});
+
+            for (const auto &[type_name, count] : capturable_stage_types)
+            {
+                record_stage_gpu_plan(
+                    "graph_replay_plan_stage_types",
+                    static_cast<double>(count),
+                    {{"segment_type", "capturable"}, {"stage_type", type_name}});
+            }
+            for (const auto &[type_name, count] : manual_stage_types)
+            {
+                record_stage_gpu_plan(
+                    "graph_replay_plan_stage_types",
+                    static_cast<double>(count),
                     {{"segment_type", "manual"}, {"stage_type", type_name}});
             }
         }
@@ -1723,6 +1796,20 @@ namespace llaminar2
             "decode",
             device_name,
             std::move(replay_total_tags));
+        std::optional<PerfStatsCollector::ScopedTimer> stage_replay_timer;
+        if (PerfStatsCollector::isEnabled())
+        {
+            auto stage_replay_total_tags = replayCacheTags(segment_cache);
+            stage_replay_total_tags.emplace(
+                "sync_scope",
+                can_defer_final_sync ? "launch_only_deferred" : "stream_synchronized");
+            stage_replay_timer.emplace(
+                "stage_gpu",
+                "graph_replay.total",
+                "decode",
+                device_name,
+                graphReplayTimingTags(std::move(stage_replay_total_tags), "total_replay_wall"));
+        }
 
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
@@ -1771,13 +1858,22 @@ namespace llaminar2
             if (PerfStatsCollector::isEnabled())
             {
                 const auto segment_t1 = std::chrono::high_resolution_clock::now();
+                const auto segment_ns =
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(segment_t1 - segment_t0).count());
                 PerfStatsCollector::recordTimingNs(
                     "forward_graph",
                     "segmented_replay_segment",
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(segment_t1 - segment_t0).count()),
+                    segment_ns,
                     "decode",
                     device_name,
                     seg_tags);
+                PerfStatsCollector::recordTimingNs(
+                    "stage_gpu",
+                    "graph_replay.segment",
+                    segment_ns,
+                    "decode",
+                    device_name,
+                    graphReplayTimingTags(seg_tags, "segment_replay_wall"));
             }
 
             if (!replay_result.success)
@@ -1864,6 +1960,13 @@ namespace llaminar2
                     "decode",
                     device_name,
                     replayCacheTags(segment_cache));
+                PerfStatsCollector::recordTimingNs(
+                    "stage_gpu",
+                    "graph_replay.final_sync",
+                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()),
+                    "decode",
+                    device_name,
+                    graphReplayTimingTags(replayCacheTags(segment_cache), "final_stream_sync"));
             }
         }
         if (trace_replay)

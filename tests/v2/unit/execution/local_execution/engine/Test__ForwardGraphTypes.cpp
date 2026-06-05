@@ -217,13 +217,14 @@ namespace
     };
 
     double findCounterValue(const std::vector<PerfStatRecord> &records,
+                            const std::string &domain,
                             const std::string &name,
                             const PerfStatsCollector::Tags &tags)
     {
         for (const auto &record : records)
         {
             if (record.kind == PerfStatRecord::Kind::Counter &&
-                record.domain == "forward_graph" &&
+                record.domain == domain &&
                 record.name == name &&
                 record.tags == tags)
             {
@@ -233,14 +234,22 @@ namespace
         return -1.0;
     }
 
+    double findCounterValue(const std::vector<PerfStatRecord> &records,
+                            const std::string &name,
+                            const PerfStatsCollector::Tags &tags)
+    {
+        return findCounterValue(records, "forward_graph", name, tags);
+    }
+
     uint64_t findTimerCount(const std::vector<PerfStatRecord> &records,
+                            const std::string &domain,
                             const std::string &name,
                             const PerfStatsCollector::Tags &tags)
     {
         for (const auto &record : records)
         {
             if (record.kind == PerfStatRecord::Kind::Timer &&
-                record.domain == "forward_graph" &&
+                record.domain == domain &&
                 record.name == name &&
                 record.tags == tags)
             {
@@ -248,6 +257,13 @@ namespace
             }
         }
         return 0;
+    }
+
+    uint64_t findTimerCount(const std::vector<PerfStatRecord> &records,
+                            const std::string &name,
+                            const PerfStatsCollector::Tags &tags)
+    {
+        return findTimerCount(records, "forward_graph", name, tags);
     }
 }
 
@@ -766,6 +782,40 @@ TEST(Test__GraphSegmentCache, SegmentedPlanPublishesPerfStats)
             {{"segment_type", "capturable"}, {"stage_type", "GEMM"}}),
         1.0);
 
+    const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            stage_records,
+            "stage_gpu",
+            "graph_replay_plan_segments",
+            {{"attribution", "graph_replay_metadata"},
+             {"graph_capture_scope", "segmented_capture_plan"},
+             {"source", "segmented_graph_capture"},
+             {"type", "total"}}),
+        3.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            stage_records,
+            "stage_gpu",
+            "graph_replay_plan_stage_types",
+            {{"attribution", "graph_replay_metadata"},
+             {"graph_capture_scope", "segmented_capture_plan"},
+             {"segment_type", "manual"},
+             {"source", "segmented_graph_capture"},
+             {"stage_type", "ATTENTION"}}),
+        1.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            stage_records,
+            "stage_gpu",
+            "graph_replay_plan_stage_types",
+            {{"attribution", "graph_replay_metadata"},
+             {"graph_capture_scope", "segmented_capture_plan"},
+             {"segment_type", "capturable"},
+             {"source", "segmented_graph_capture"},
+             {"stage_type", "GEMM"}}),
+        1.0);
+
     PerfStatsCollector::reset();
 }
 
@@ -789,6 +839,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
         &capture_stream,
         /*needs_segment_sync=*/true,
         /*perf_context=*/"",
+        /*device_name=*/"CUDA:0",
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
@@ -826,6 +877,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
         &capture_stream,
         /*needs_segment_sync=*/false,
         /*perf_context=*/"main_verifier",
+        /*device_name=*/"CUDA:0",
         [](DeviceGraphExecutor::GraphSegment &, void *) {}));
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
@@ -895,6 +947,39 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", capture_tags), 1u);
     EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", default_tags), 1u);
     EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", aggregate_tags), 1u);
+
+    const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
+    const PerfStatsCollector::Tags stage_total_tags = {
+        {"attribution", "graph_replay_wall"},
+        {"context", "main_verifier"},
+        {"graph_capture_scope", "segmented_replay"},
+        {"segment_count", "1"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"sync_scope", "stream_synchronized"},
+        {"timing_scope", "total_replay_wall"},
+        {"type", "capturable"}};
+    const PerfStatsCollector::Tags stage_segment_tags = {
+        {"attribution", "graph_replay_wall"},
+        {"context", "main_verifier"},
+        {"graph_capture_scope", "segmented_replay"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"timing_scope", "segment_replay_wall"},
+        {"type", "capturable"}};
+    const PerfStatsCollector::Tags stage_final_sync_tags = {
+        {"attribution", "graph_replay_wall"},
+        {"context", "main_verifier"},
+        {"graph_capture_scope", "segmented_replay"},
+        {"segment_count", "1"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"timing_scope", "final_stream_sync"},
+        {"type", "capturable"}};
+
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", stage_total_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", stage_segment_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.final_sync", stage_final_sync_tags), 1u);
 
     PerfStatsCollector::reset();
 }
