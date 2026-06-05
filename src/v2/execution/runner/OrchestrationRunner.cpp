@@ -1349,6 +1349,16 @@ namespace llaminar2
         }
 
         const int base_sidecar_position = runner_->get_position();
+        const bool first_token_is_stop =
+            std::find(stop_tokens_.begin(), stop_tokens_.end(), first_token) != stop_tokens_.end();
+        const bool can_skip_post_sidecar_checkpoint =
+            speculative_draft_count == 1 &&
+            !first_token_is_stop &&
+            !stochastic_verify &&
+            !use_sampling_penalties &&
+            active_sampling_params_.is_greedy() &&
+            runner_->primaryDeviceId().is_gpu() &&
+            runner_->supportsMTPVerifierStateRowRestore();
 
         std::vector<int32_t> draft_tokens;
         draft_tokens.reserve(static_cast<size_t>(speculative_draft_count) + 1);
@@ -1361,6 +1371,7 @@ namespace llaminar2
 
         std::vector<PrefixStateSnapshot> sidecar_checkpoints;
         sidecar_checkpoints.reserve(1);
+        bool post_sidecar_checkpoint_requires_verifier_row_restore = false;
         std::vector<std::vector<SamplingDistributionEntry>> draft_distributions;
         draft_distributions.reserve(static_cast<size_t>(speculative_draft_count));
 
@@ -1518,11 +1529,30 @@ namespace llaminar2
 
             if (draft_idx == 0)
             {
-                PerfStatsCollector::ScopedTimer timer("mtp", "capture_post_sidecar_prefix_state", "decode");
-                sidecar_checkpoints.push_back(runner_->captureLivePrefixCheckpoint());
-                if (!sidecar_checkpoints.back().valid)
+                if (can_skip_post_sidecar_checkpoint)
                 {
-                    return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
+                    PrefixStateSnapshot anchor;
+                    anchor.valid = true;
+                    anchor.logical_checkpoint = true;
+                    anchor.cached_tokens = base_sidecar_position;
+                    sidecar_checkpoints.push_back(std::move(anchor));
+                    post_sidecar_checkpoint_requires_verifier_row_restore = true;
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "post_sidecar_checkpoint_skipped_verifier_row_restore",
+                        1.0,
+                        "decode",
+                        {},
+                        {{"cached_tokens", std::to_string(base_sidecar_position)}});
+                }
+                else
+                {
+                    PerfStatsCollector::ScopedTimer timer("mtp", "capture_post_sidecar_prefix_state", "decode");
+                    sidecar_checkpoints.push_back(runner_->captureLivePrefixCheckpoint());
+                    if (!sidecar_checkpoints.back().valid)
+                    {
+                        return fail_after_checkpoint("MTP decode could not capture post-sidecar shifted state");
+                    }
                 }
             }
             else
@@ -2361,6 +2391,13 @@ namespace llaminar2
                 "decode",
                 {},
                 {{"reason", rejected_speculative_token ? "reject" : "partial_commit"}});
+        }
+
+        if (post_sidecar_checkpoint_requires_verifier_row_restore)
+        {
+            result.error =
+                "MTP verifier-row restore was required after skipping post-sidecar checkpoint";
+            return result;
         }
 
         bool restored = false;

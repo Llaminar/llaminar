@@ -329,6 +329,11 @@ namespace
             return supports_mtp_sidecar_sample_fusion_;
         }
 
+        bool supportsMTPVerifierStateRowRestore() const override
+        {
+            return verifier_row_restore_supported_;
+        }
+
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override
         {
             ++forward_mtp_and_sample_count_;
@@ -728,7 +733,16 @@ namespace
         int lastVerifierRestoreRow() const { return last_verifier_restore_row_; }
         int lastVerifierRestoreTargetTokens() const { return last_verifier_restore_target_tokens_; }
         bool verifierRestoreAfterCheckpointRestore() const { return verifier_restore_after_checkpoint_restore_; }
-        void enableVerifierRowRestore() { verifier_row_restore_enabled_ = true; }
+        void enableVerifierRowRestore()
+        {
+            verifier_row_restore_supported_ = true;
+            verifier_row_restore_enabled_ = true;
+        }
+        void advertiseVerifierRowRestoreWithoutImplementation()
+        {
+            verifier_row_restore_supported_ = true;
+            verifier_row_restore_enabled_ = false;
+        }
 
     private:
         static int greedyArgmax(const float *logits, int vocab)
@@ -992,6 +1006,7 @@ namespace
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
         bool last_commit_mtp_allow_speculative_discard_{false};
+        bool verifier_row_restore_supported_{false};
         bool verifier_row_restore_enabled_{false};
         bool verifier_restore_after_checkpoint_restore_{false};
         DeviceId primary_device_{DeviceId::cpu()};
@@ -2339,6 +2354,9 @@ namespace
             EXPECT_EQ(mock->lastVerifierRestoreRow(), 0);
             EXPECT_EQ(mock->lastVerifierRestoreTargetTokens(), 6);
             EXPECT_EQ(mock->restoreCount(), 0);
+            EXPECT_EQ(mock->captureCheckpointCount(), 1)
+                << "CUDA verifier-row restore support should make the post-sidecar "
+                   "hybrid checkpoint unnecessary for draft=1 greedy rejects";
             EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 1);
@@ -2361,6 +2379,19 @@ namespace
                                "rollback_verifier_state_row_shortcuts");
             ASSERT_NE(shortcut, nullptr);
             EXPECT_DOUBLE_EQ(shortcut->value, 1.0);
+
+            const PerfStatRecord *skipped_checkpoint =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "post_sidecar_checkpoint_skipped_verifier_row_restore");
+            ASSERT_NE(skipped_checkpoint, nullptr);
+            EXPECT_DOUBLE_EQ(skipped_checkpoint->value, 1.0);
+
+            const PerfStatRecord *post_sidecar_capture =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Timer,
+                               "capture_post_sidecar_prefix_state");
+            EXPECT_EQ(post_sidecar_capture, nullptr);
 
             const PerfStatRecord *replay_tokens =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
@@ -2386,6 +2417,60 @@ namespace
                                "verifier_state_row_replay_suffix_all_position_forwards");
             ASSERT_NE(suffix_all_position, nullptr);
             EXPECT_DOUBLE_EQ(suffix_all_position->value, 1.0);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, CUDAMTPHardFailsIfAdvertisedVerifierRowRestoreCannotRestore)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_cuda_mtp_required_verifier_row_restore_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/false,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/false,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0));
+            mock->advertiseVerifierRowRestoreWithoutImplementation();
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step1 = runner->decodeStep();
+            EXPECT_FALSE(step1.success());
+            EXPECT_NE(step1.error.find("verifier-row restore was required"), std::string::npos)
+                << step1.error;
+            EXPECT_EQ(mock->restoreCount(), 0)
+                << "the skipped post-sidecar checkpoint is only a position anchor";
+            EXPECT_EQ(mock->restoreVerifierRowCount(), 0);
+            EXPECT_EQ(mock->captureCheckpointCount(), 1);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *skipped_checkpoint =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "post_sidecar_checkpoint_skipped_verifier_row_restore");
+            ASSERT_NE(skipped_checkpoint, nullptr);
+            EXPECT_DOUBLE_EQ(skipped_checkpoint->value, 1.0);
+
+            const PerfStatRecord *shortcut_unavailable =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Counter,
+                               "rollback_verifier_state_row_shortcut_unavailable");
+            ASSERT_NE(shortcut_unavailable, nullptr);
+            EXPECT_DOUBLE_EQ(shortcut_unavailable->value, 1.0);
+
+            const PerfStatRecord *post_sidecar_capture =
+                findPerfRecord(records,
+                               PerfStatRecord::Kind::Timer,
+                               "capture_post_sidecar_prefix_state");
+            EXPECT_EQ(post_sidecar_capture, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

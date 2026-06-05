@@ -6918,6 +6918,39 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::supportsMTPVerifierStateRowRestore() const
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled || !state_.kv_cache)
+        {
+            return false;
+        }
+
+        auto *hybrid = dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
+        if (!hybrid)
+        {
+            return false;
+        }
+
+        int restorable_layers = 0;
+        for (int layer = 0; layer < state_.kv_cache->n_layers(); ++layer)
+        {
+            if (!hybrid->isGDNLayer(layer))
+            {
+                continue;
+            }
+            if (!hybrid->getConvKernel(layer) ||
+                !hybrid->getConvState(layer) ||
+                !hybrid->getRecurrenceKernel(layer) ||
+                !hybrid->getRecurrenceState(layer))
+            {
+                return false;
+            }
+            ++restorable_layers;
+        }
+
+        return restorable_layers > 0;
+    }
+
     bool DeviceGraphOrchestrator::restoreMTPVerifierStateRow(
         int verifier_row,
         int target_cached_tokens,

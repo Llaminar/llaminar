@@ -3367,6 +3367,17 @@ namespace llaminar2
         return false;
     }
 
+    bool RankOrchestrator::supportsMTPVerifierStateRowRestore() const
+    {
+        if (pp_stage_runners_.empty() &&
+            device_runners_.size() == 1 &&
+            device_runners_[0])
+        {
+            return device_runners_[0]->supportsMTPVerifierStateRowRestore();
+        }
+        return false;
+    }
+
     PrefixRuntimeStateSnapshot RankOrchestrator::prefixStateProbe() const
     {
         PrefixRuntimeStateSnapshot snapshot;

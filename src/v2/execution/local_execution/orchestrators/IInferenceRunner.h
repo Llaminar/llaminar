@@ -1008,6 +1008,19 @@ namespace llaminar2
         }
 
         /**
+         * @brief Whether the runner can restore mutable MTP verifier state
+         *        directly from the most recent verifier-row captures.
+         *
+         * When true, the MTP decode path may skip expensive post-sidecar
+         * checkpoint payload captures for narrow greedy paths and require
+         * restoreMTPVerifierStateRow() to succeed on rollback.
+         */
+        virtual bool supportsMTPVerifierStateRowRestore() const
+        {
+            return false;
+        }
+
+        /**
          * @brief Restore mutable verifier state from a captured all-position
          *        verifier row, without replaying the accepted verifier prefix.
          *
