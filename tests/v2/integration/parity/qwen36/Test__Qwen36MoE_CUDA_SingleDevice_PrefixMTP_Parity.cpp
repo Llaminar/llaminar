@@ -3,6 +3,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "collective/BackendRouter.h"
 
+#include <algorithm>
 #include <unistd.h>
 
 using namespace llaminar2;
@@ -102,6 +103,46 @@ namespace
         return test_case;
     }
 
+    void expectCudaMoESharedExpertGroupedDecodePath()
+    {
+        const auto records = PerfStatsCollector::snapshot(
+            {"kernel.cuda_moe_grouped_decode_gateup_calls",
+             "kernel.cuda_moe_grouped_decode_down_calls"});
+        auto tag_equals = [](const PerfStatRecord &record,
+                             const char *key,
+                             const char *value) -> bool
+        {
+            const auto it = record.tags.find(key);
+            return it != record.tags.end() && it->second == value;
+        };
+        auto has_shared_decode_record = [&](const char *name) -> bool
+        {
+            return std::find_if(
+                       records.begin(),
+                       records.end(),
+                       [&](const PerfStatRecord &record)
+                       {
+                           return record.name == name &&
+                                  tag_equals(record, "source", "table") &&
+                                  tag_equals(record, "route", "kpart") &&
+                                  tag_equals(record, "active_slots", "1") &&
+                                  tag_equals(record, "d_model", "2048") &&
+                                  tag_equals(record, "intermediate", "512");
+                       }) != records.end();
+        };
+
+        ASSERT_TRUE(has_shared_decode_record("cuda_moe_grouped_decode_gateup_calls"))
+            << "CUDA shared expert decode must use the grouped table gate/up path by default.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_grouped_decode_gateup_calls",
+                    "kernel.cuda_moe_grouped_decode_down_calls"});
+        ASSERT_TRUE(has_shared_decode_record("cuda_moe_grouped_decode_down_calls"))
+            << "CUDA shared expert decode must use the grouped table down path by default.\n"
+            << PerfStatsCollector::summaryString(
+                   {"kernel.cuda_moe_grouped_decode_gateup_calls",
+                    "kernel.cuda_moe_grouped_decode_down_calls"});
+    }
+
 } // namespace
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, PrefixRestoreFullHit)
@@ -170,9 +211,15 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesBaselineTok
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleSkipGatherGreedyMatchesGatheredArgmax)
 {
+    ScopedEnvironmentValues perf_stats_enabled({
+        {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
+    });
+    PerfStatsCollector::reset();
     runMoENoMTPBenchmarkStyleSkipGatherArgmaxParity(
         cudaSingleDeviceBenchmarkPromptCase(),
         16);
+    expectCudaMoESharedExpertGroupedDecodePath();
+    PerfStatsCollector::reset();
 }
 
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, VerifierRowShortcutTwoRowStateMatchesFullReplay)

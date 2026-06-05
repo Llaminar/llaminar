@@ -159,6 +159,24 @@ namespace llaminar2
             return false;
 #endif
         }
+
+        bool shouldUseSharedExpertGroupedDecode(DeviceId device)
+        {
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
+            (void)device;
+            return false;
+#else
+#if defined(HAVE_CUDA)
+            if (device.is_cuda())
+                return true;
+#endif
+#if defined(HAVE_ROCM)
+            if (device.is_rocm())
+                return debugEnv().rocm.shared_expert_grouped_decode;
+#endif
+            return false;
+#endif
+        }
     } // anonymous namespace
 
     // =========================================================================
@@ -2480,7 +2498,7 @@ namespace llaminar2
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
         if (!params_.device_id.is_gpu() || params_.seq_len != 1 ||
-            !debugEnv().rocm.shared_expert_grouped_decode)
+            !shouldUseSharedExpertGroupedDecode(params_.device_id))
         {
             return false;
         }
@@ -2576,8 +2594,17 @@ namespace llaminar2
             return true;
         }
 
-        if (tryGroupedDecode(kernel, d_model, intermediate))
+        const bool grouped_decode_required =
+            params_.device_id.is_gpu() &&
+            seq_len == 1 &&
+            shouldUseSharedExpertGroupedDecode(params_.device_id);
+        if (grouped_decode_required)
         {
+            if (!tryGroupedDecode(kernel, d_model, intermediate))
+            {
+                LOG_ERROR("[SharedExpertFFNStage] Grouped shared expert decode path failed");
+                return false;
+            }
             markGpuTensorWritten(params_.output, params_.device_id, gpuStream());
             return true;
         }
