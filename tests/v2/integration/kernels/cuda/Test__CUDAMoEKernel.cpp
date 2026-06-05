@@ -272,7 +272,8 @@ namespace
         const char *source,
         int active_slots,
         int d_model,
-        int intermediate)
+        int intermediate,
+        const char *expected_route = nullptr)
     {
         const auto records =
             llaminar2::PerfStatsCollector::snapshot({std::string("kernel.") + counter_name});
@@ -292,14 +293,18 @@ namespace
                     return it != record.tags.end() && it->second == value;
                 };
                 const auto route = record.tags.find("route");
+                const bool route_matches =
+                    route != record.tags.end() &&
+                    (expected_route
+                         ? route->second == expected_route
+                         : (route->second == "kpart" || route->second == "serial" ||
+                            route->second == "fused_kpart" || route->second == "fused_block_down"));
                 return record.name == counter_name &&
                        tag_equals("source", source) &&
                        tag_equals("active_slots", expected_active_slots) &&
                        tag_equals("d_model", expected_d_model) &&
                        tag_equals("intermediate", expected_intermediate) &&
-                       route != record.tags.end() &&
-                       (route->second == "kpart" || route->second == "serial" ||
-                        route->second == "fused_kpart");
+                       route_matches;
             });
         ASSERT_NE(match, records.end()) << "missing matching perf counter " << counter_name
                                         << " source=" << source;
@@ -2136,7 +2141,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
     expectVectorsClose(replay_values, two_step_values, 0.999, 0.025);
 
     expectGroupedDecodeCounter(
-        "cuda_moe_grouped_decode_fused_calls", "runtime", top_k, d_model, intermediate);
+        "cuda_moe_grouped_decode_fused_calls", "runtime", top_k, d_model, intermediate,
+        "fused_block_down");
     llaminar2::PerfStatsCollector::reset();
 #endif
 }

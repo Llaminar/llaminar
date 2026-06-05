@@ -3202,7 +3202,7 @@ namespace llaminar2
             recordGroupedDecodeCounter(
                 "cuda_moe_grouped_decode_fused_calls",
                 "runtime",
-                "fused_kpart",
+                "fused_block_down",
                 device,
                 top_k,
                 d_model,

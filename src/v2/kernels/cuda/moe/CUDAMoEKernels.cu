@@ -2529,6 +2529,67 @@ namespace
     }
 
     /**
+     * @brief Deterministic block-reduce down projection for decode.
+     *
+     * The split-K down decode path writes [k_partitions][N] FP32 partials and
+     * launches a second reduction kernel. That improves occupancy versus the
+     * serial kernel, but it leaves a large amount of partial traffic in the hot
+     * single-token MoE path. This kernel assigns one warp to one output column:
+     * lanes cover the cartesian product of active expert slots and K-blocks,
+     * then reduce inside the warp in a fixed order and write the final
+     * route-weighted output directly.
+     *
+     * Grid: (ceil(N / 8))   Block: (256 = 8 warps)
+     */
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_down_warp_reduce_decode_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
+        const int *__restrict__ expert_ids,
+        const float *__restrict__ route_weights,
+        float *__restrict__ output,
+        int num_active,
+        int N,
+        int K)
+    {
+        constexpr int kWarpsPerBlock = 8;
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int n = blockIdx.x * kWarpsPerBlock + warp;
+        if (warp >= kWarpsPerBlock || n >= N)
+            return;
+
+        const int blocks_per_row = K / 32;
+        const int work_items = num_active * blocks_per_row;
+        float sum = 0.0f;
+
+        for (int item = lane; item < work_items; item += 32)
+        {
+            const int slot = item / blocks_per_row;
+            const int block_idx = item - slot * blocks_per_row;
+            const int expert_id = expert_ids[slot];
+            if (expert_id < 0)
+                continue;
+
+            const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * static_cast<size_t>(K);
+            const float *slot_scales =
+                scales_A_blockwise + static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row);
+            const float expert_value = native_vnni_dot_desc_range<CodebookId>(
+                desc, n, slot_A, slot_scales, N, K, block_idx, block_idx + 1);
+            sum += route_weights[slot] * expert_value;
+        }
+
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+
+        if (lane == 0)
+            output[n] = sum;
+    }
+
+    /**
      * @brief Reduce K-partition partials into the final grouped down output.
      *
      * Sums the k_partitions partial contributions for each output column n
@@ -3335,47 +3396,42 @@ extern "C"
         if (!finishLaunch("cudaMoE_grouped_fused_decode_swiglu_quantize"))
             return false;
 
-        dim3 down_grid((d_model + kTileN - 1) / kTileN, down_k_partitions);
+        constexpr int kDownWarpsPerBlock = 8;
+        dim3 down_grid((d_model + kDownWarpsPerBlock - 1) / kDownWarpsPerBlock);
+        dim3 down_block(kDownWarpsPerBlock * 32);
 
-#define LAUNCH_GROUPED_FUSED_DOWN_KPART(CB)                                                         \
-    grouped_native_vnni_down_kpart_decode_kernel<CB><<<down_grid, block, 0, cuda_stream>>>(         \
+#define LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(CB)                                                  \
+    grouped_native_vnni_down_warp_reduce_decode_kernel<CB><<<down_grid, down_block, 0, cuda_stream>>>( \
         d_swiglu_int8, d_swiglu_scales, d_down_desc_table, d_expert_ids, d_weights,                 \
-        d_down_partials, top_k, d_model, intermediate, down_k_partitions)
+        d_output, top_k, d_model, intermediate)
 
         switch (down_codebook_id)
         {
-        case 0:  LAUNCH_GROUPED_FUSED_DOWN_KPART(0); break;
-        case 4:  LAUNCH_GROUPED_FUSED_DOWN_KPART(4); break;
-        case 5:  LAUNCH_GROUPED_FUSED_DOWN_KPART(5); break;
-        case 6:  LAUNCH_GROUPED_FUSED_DOWN_KPART(6); break;
-        case 7:  LAUNCH_GROUPED_FUSED_DOWN_KPART(7); break;
-        case 8:  LAUNCH_GROUPED_FUSED_DOWN_KPART(8); break;
-        case 9:  LAUNCH_GROUPED_FUSED_DOWN_KPART(9); break;
-        case 10: LAUNCH_GROUPED_FUSED_DOWN_KPART(10); break;
-        case 11: LAUNCH_GROUPED_FUSED_DOWN_KPART(11); break;
-        case 12: LAUNCH_GROUPED_FUSED_DOWN_KPART(12); break;
-        case 13: LAUNCH_GROUPED_FUSED_DOWN_KPART(13); break;
-        case 14: LAUNCH_GROUPED_FUSED_DOWN_KPART(14); break;
-        case 15: LAUNCH_GROUPED_FUSED_DOWN_KPART(15); break;
-        case 16: LAUNCH_GROUPED_FUSED_DOWN_KPART(16); break;
-        case 17: LAUNCH_GROUPED_FUSED_DOWN_KPART(17); break;
-        case 19: LAUNCH_GROUPED_FUSED_DOWN_KPART(19); break;
+        case 0:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(0); break;
+        case 4:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(4); break;
+        case 5:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(5); break;
+        case 6:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(6); break;
+        case 7:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(7); break;
+        case 8:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(8); break;
+        case 9:  LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(9); break;
+        case 10: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(10); break;
+        case 11: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(11); break;
+        case 12: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(12); break;
+        case 13: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(13); break;
+        case 14: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(14); break;
+        case 15: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(15); break;
+        case 16: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(16); break;
+        case 17: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(17); break;
+        case 19: LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE(19); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_gateup_swiglu_down_native_vnni_decode_runtime_kpart] unsupported down codebook_id=%u\n",
                          static_cast<unsigned>(down_codebook_id));
             return false;
         }
 
-#undef LAUNCH_GROUPED_FUSED_DOWN_KPART
+#undef LAUNCH_GROUPED_FUSED_DOWN_BLOCK_REDUCE
 
-        if (!finishLaunch("cudaMoE_grouped_fused_decode_down_kpart"))
-            return false;
-
-        dim3 reduce_grid((d_model + kTileN - 1) / kTileN);
-        grouped_native_vnni_down_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
-            d_down_partials, d_output, d_model, down_k_partitions);
-
-        return finishLaunch("cudaMoE_grouped_fused_decode_down_reduce");
+        return finishLaunch("cudaMoE_grouped_fused_decode_down_block_reduce");
     }
 
     bool cudaMoE_grouped_prefill_pipeline(
