@@ -12,6 +12,7 @@
 #include "CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <atomic>
@@ -19,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <string>
 #include <vector>
 
 struct CUDAPrefillStreamScratch_
@@ -3782,101 +3784,144 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
 
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
+    bool ok = false;
     switch (codebook_id)
     {
     // --- Single-scale formats (no min correction) ---
     case 0:
-        return launchGenericPrefillBK64<0>(
+        ok = launchGenericPrefillBK64<0>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 4:
-        return launchGenericPrefillBK64<4>(
+        ok = launchGenericPrefillBK64<4>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 6: // Q5_0
-        return launchGenericPrefillBK64<6>(
+        ok = launchGenericPrefillBK64<6>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 11: // IQ3_S
-        return launchGenericPrefillBK64<11>(
+        ok = launchGenericPrefillBK64<11>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 12: // IQ3_XXS
-        return launchGenericPrefillBK64<12>(
+        ok = launchGenericPrefillBK64<12>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 15: // IQ2_XXS
-        return launchGenericPrefillBK64<15>(
+        ok = launchGenericPrefillBK64<15>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
 
     // --- Asymmetric formats (need min correction, d_mins required) ---
     case 5: // Q4_1 / Q4_K / Q5_K
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<5>(
+        ok = launchGenericPrefillBK64<5>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 7: // Q5_1
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<7>(
+        ok = launchGenericPrefillBK64<7>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 16: // IQ1_S
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<16>(
+        ok = launchGenericPrefillBK64<16>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
 
     // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
     case 8: // Q6_K
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<8>(
+        ok = launchGenericPrefillBK64<8>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 9: // Q3_K
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<9>(
+        ok = launchGenericPrefillBK64<9>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 10: // Q2_K (dual-scale + asymmetric via emins)
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<10>(
+        ok = launchGenericPrefillBK64<10>(
             d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 13: // IQ2_S
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<13>(
+        ok = launchGenericPrefillBK64<13>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 14: // IQ2_XS
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<14>(
+        ok = launchGenericPrefillBK64<14>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 17: // IQ1_M (dual-scale + delta correction)
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<17>(
+        ok = launchGenericPrefillBK64<17>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
 
     // --- 8-bit format (no decode overhead, single-scale) ---
     case 19: // Q8_0
-        return launchGenericPrefillBK64<19>(
+        ok = launchGenericPrefillBK64<19>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
             M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
 
     default:
         return false;
     }
+
+    if (ok && llaminar2::PerfStatsCollector::isEnabled())
+    {
+        int tile_id = -1;
+        int split_k = 1;
+        int used_bk256 = 0;
+        int used_streamk = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &tile_id, &split_k, &used_bk256, &used_streamk);
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_native_vnni_prefill_calls",
+            1.0,
+            "gemm",
+            "cuda:" + std::to_string(cuda_device_id),
+            llaminar2::PerfStatsCollector::Tags{
+                {"codebook", std::to_string(static_cast<int>(codebook_id))},
+                {"m", std::to_string(M)},
+                {"n", std::to_string(N)},
+                {"k", std::to_string(K)},
+                {"tile_id", std::to_string(tile_id)},
+                {"split_k", std::to_string(split_k)},
+                {"bk256", used_bk256 ? "1" : "0"},
+                {"streamk", std::to_string(used_streamk)}});
+    }
+    return ok;
 }
 
 // =========================================================================

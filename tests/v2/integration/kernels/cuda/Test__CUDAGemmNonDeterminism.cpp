@@ -27,6 +27,7 @@
 #include "../../../utils/TestModelHelper.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/MPIContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -952,6 +953,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
     // NativeVNNI is now the sole CUDA GEMM path. Verify it produces
     // bitwise-identical results across repeated invocations.
     ScopedCudaPrefillModes mode_guard;
+
     cudaNativeVNNIPrefill_setForceTile(-1, 0);
     cudaNativeVNNIPrefill_setStreamKMode(0);
     cudaNativeVNNIPrefill_setBK256Mode(0);
@@ -1044,6 +1046,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIs
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
+
     cudaNativeVNNIPrefill_setForceTile(-1, 0);
     cudaNativeVNNIPrefill_setStreamKMode(0);
     cudaNativeVNNIPrefill_setBK256Mode(0);
@@ -1112,6 +1115,10 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
     GTEST_SKIP() << "CUDA build required";
 #else
     ScopedCudaPrefillModes mode_guard;
+    ScopedEnvVar perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    ASSERT_TRUE(PerfStatsCollector::isEnabled());
+
     cudaNativeVNNIPrefill_setForceTile(-1, 0);
     cudaNativeVNNIPrefill_setStreamKMode(0);
     cudaNativeVNNIPrefill_setBK256Mode(0);
@@ -1194,11 +1201,44 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
         EXPECT_EQ(used_bk256, 0);
         EXPECT_EQ(used_streamk, 0);
 
+        const auto records = PerfStatsCollector::snapshot({"kernel"});
+        bool found = false;
+        for (const auto &record : records)
+        {
+            if (record.name != "cuda_native_vnni_prefill_calls")
+                continue;
+
+            auto tag = [&](const char *name) -> std::string
+            {
+                auto it = record.tags.find(name);
+                return it == record.tags.end() ? std::string{} : it->second;
+            };
+
+            if (tag("m") == std::to_string(shape.m) &&
+                tag("n") == std::to_string(shape.n) &&
+                tag("k") == std::to_string(shape.k))
+            {
+                found = true;
+                EXPECT_EQ(tag("codebook"), "5");
+                EXPECT_EQ(tag("tile_id"), std::to_string(shape.expected_tile));
+                EXPECT_EQ(tag("split_k"), "1");
+                EXPECT_EQ(tag("bk256"), "0");
+                EXPECT_EQ(tag("streamk"), "0");
+                EXPECT_EQ(record.device, "cuda:" + std::to_string(gpu_device_.ordinal));
+                EXPECT_EQ(record.phase, "gemm");
+                break;
+            }
+        }
+        EXPECT_TRUE(found) << "NativeVNNI prefill dispatch must emit structured route counters for "
+                           << shape.name << "\n"
+                           << PerfStatsCollector::summaryString({"kernel"}, 0);
+
         ws->unbindWorkspace();
         workspace_.reset();
     }
 
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    PerfStatsCollector::reset();
 #endif
 }
 

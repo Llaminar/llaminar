@@ -37,7 +37,8 @@ history belongs in artifacts.
 ## Latest Evidence
 
 CUDA dense latest:
-`20260605T075427Z-qwen36-q4k-prefill-tile-override`.
+`20260605T075427Z-qwen36-q4k-prefill-tile-override`; route-stats diagnostic:
+`20260605T082625Z-qwen36-dense-kernel-route-stats`.
 
 | Case | Prefill | Decode | Acceptance |
 |---|---:|---:|---:|
@@ -55,23 +56,15 @@ CUDA MoE latest:
 | dynamic MTP | 1943.69 | 145.36 | 68.75% |
 
 Fresh checks:
-- Graph replay stage stats export trusted GPU-event `stage_gpu` rows; fused
-  CUDA MoE decode also exports capture-safe `kernel_cuda` sub-kernel rows.
-- The sub-kernel export identified IQ4_NL down decode as the next hot path.
-  CUDA IQ4_NL decode now reuses the packed word decoder in the shared VNNI
-  helper, lifting MoE no-MTP and MTP decode beyond the llama.cpp anchors.
-- CUDA dense Q4_K prompt-prefill now uses sweep-selected tiles for the Qwen3.6
-  FFN gate/up, FFN down, and GDN inner projection M-bin 512 shapes.
-- Focused coverage stayed green for CUDA GEMM IQ4_NL parity, CUDA MoE kernel
-  graph replay, Qwen3.6 MoE CUDA math decode parity, verifier-row shortcut
-  parity, dynamic-depth request reset parity, fused verifier prefill parity,
-  skip-gather greedy parity, prefix-cache plus MTP restore parity, and the
-  focused Qwen3.6 CUDA dense SingleDevice prefix/MTP parity suite.
-
-Focused gates: `V2_Integration_CUDAMoEKernel`, Qwen3.6 MoE CUDA math parity,
-Qwen3.6 dense/MoE CUDA prefix+MTP restore parity, and Qwen3.6 MoE CUDA
-benchmark-style parity. ROCm LocalTP prefix smoke currently has an unrelated
-segfault breadcrumb from this run.
+- Trusted `stage_gpu` graph-replay timing is now exportable without legacy
+  profiling, and CUDA NativeVNNI prompt-prefill emits structured
+  `kernel.cuda_native_vnni_prefill_calls` route counters.
+- Dense diagnostic at graph bucket `M=600` recorded top prompt-prefill routes:
+  `17408x5120` Q4_K tile 4, `5120x17408` Q4_K tile 2, and GDN projection
+  shapes including `6144x5120`, `5120x6144`, `10240x5120`, and `1024x5120`.
+- Focused coverage stayed green for CUDA GEMM parity, CUDA MoE graph replay,
+  Qwen3.6 MoE CUDA math parity, verifier-row shortcut parity, and the focused
+  Qwen3.6 CUDA dense SingleDevice prefix/MTP parity suite.
 
 ## Retained Actions
 
