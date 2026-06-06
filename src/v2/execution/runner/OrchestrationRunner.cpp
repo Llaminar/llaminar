@@ -14,6 +14,7 @@
 #include "../factory/InferenceRunnerFactory.h"
 #include "../mtp/MTPStateTransaction.h"
 #include "../mtp/MTPDecodeCatchup.h"
+#include "../mtp/MTPSpecDecodeMetadata.h"
 #include "../mtp/MTPSpecDecodeTransaction.h"
 #include "../mtp/MTPVerifierPolicy.h"
 #include "../mtp/MTPWeightManifest.h"
@@ -1383,8 +1384,8 @@ namespace llaminar2
                 (!stopped_on_output && all_drafts_accepted)
                     ? ready_token
                     : std::optional<int32_t>{};
-            MTPSpecDecodeTransaction tx =
-                buildMTPSpecDecodeTransactionFromVerifierOutput(
+            MTPSpecDecodeRequest spec_request =
+                buildMTPSpecDecodeRequestFromVerifierOutput(
                     /*request_id=*/0,
                     vocab,
                     draft_tokens_for_tx,
@@ -1392,6 +1393,34 @@ namespace llaminar2
                     bonus_token,
                     all_drafts_accepted,
                     stopped_on_output);
+            MTPSpecDecodeMetadataShape metadata_shape;
+            metadata_shape.max_requests = 1;
+            metadata_shape.max_draft_tokens =
+                static_cast<int>(draft_tokens_for_tx.size());
+            MTPSpecDecodeMetadataBatch metadata =
+                buildMTPSpecDecodeMetadataBatch(
+                    metadata_shape,
+                    {spec_request},
+                    {static_cast<int32_t>(committed_output_tokens.size())},
+                    {stopped_on_output ? 1 : 0});
+            if (!metadata.ok)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "spec_decode_transaction_metadata_failures",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"path", path},
+                     {"implementation", implementation},
+                     {"reason", metadata.error}});
+                return std::string("MTP spec-decode metadata batch failed on ") +
+                       path + ": " + metadata.error;
+            }
+            if (metadata.transactions.empty())
+                return std::string("MTP spec-decode metadata batch produced no transaction");
+
+            const MTPSpecDecodeTransaction &tx = metadata.transactions.front();
             if (!tx.ok)
             {
                 PerfStatsCollector::addCounter(
@@ -1460,6 +1489,8 @@ namespace llaminar2
                 {{"path", path},
                  {"implementation", implementation},
                  {"target_query_len", std::to_string(tx.target_query_len)},
+                 {"metadata_total_target_query_tokens",
+                  std::to_string(metadata.total_target_query_tokens)},
                  {"valid_sampled_count", std::to_string(tx.valid_sampled_count)},
                  {"accepted_verifier_input_prefix",
                   std::to_string(tx.accepted_speculative_prefix)},
