@@ -1,22 +1,24 @@
 # Prefix Cache And MTP Benchmark Notes
 
-Phase 14 scoreboard: latest CUDA/ROCm evidence and current gaps. Raw history
-stays in artifacts.
+Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
+`benchmark_results/` and `/tmp/llaminar-mtp-bench`.
 
 ## Headline Matrix
 
-| Scope | Device | Model | Mode | Prefill | Decode | Status |
+| Scope | Device | Model | Mode | Prefill tok/s | Decode tok/s | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 721.75 | 40.94 | split-K workspace + KV route fixed |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP | 621.25 | 54.82 | accept 96.88%, graph clean |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 620.57 | 55.43 | depth 1, graph clean |
-| Dense long `qbf`, `-c64 -n48` | CUDA | Qwen3.6 27B Q4_K_S | best MTP | n/a | 53.30 | depth 1 best |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 623.12 | 16.69 | current correctness baseline |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP, replay | 426.11 | 7.30 | correct but regresses |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, replay | 426.44 | 8.25 | correct but regresses |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | beats l.cpp no-MTP |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | accept 71.88%, beats l.cpp d1 |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1943.69 | 145.36 | accept 68.75%, depth 1 |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | pre-hardening MoE ratchet |
+| Dense long `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP | n/a | 54.78 | 1.77x over 30.93 baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
 | TP / PP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
+
+Current CUDA dense artifacts:
+`benchmark_results/cuda_dense_mtp/20260606T055941Z-cuda-verifier-hardening`.
 
 ## llama.cpp CUDA Anchors
 
@@ -24,7 +26,7 @@ stays in artifacts.
 `mtp-*` sidecars with `llama-cli --single-turn`. Artifact:
 `benchmark_results/llama_cpp_cuda/20260604T191903Z-6ddc943-mtp-recalibration`.
 
-| Lane | Model | Prefill | Decode | Acceptance |
+| Lane | Model | Prefill tok/s | Decode tok/s | Acceptance |
 |---|---|---:|---:|---:|
 | `llama-bench` no-MTP | Dense 27B | 1161.03 | 41.83 | n/a |
 | `llama-cli` MTP d1 | Dense 27B | 608.9 | 54.9 | 93.75% |
@@ -34,62 +36,31 @@ stays in artifacts.
 | `llama-cli` MTP d1 | MoE 35B A3B | 1032.9 | 142.0 | 96.88% |
 | `llama-cli` MTP d3 | MoE 35B A3B | 1064.5 | 132.8 | 75.44% |
 
-## Latest Evidence
+## Current Findings
 
-CUDA dense latest: `20260605T172021Z-dense-default-after-kv-dispatch-fix`.
-Fresh no-MTP prefill probe after concurrent split-K fix:
-`20260605T205855Z-dense-prefill-concurrent-splitk-fix`.
-Route sweeps: `ffn_m600_sweep`, `20260605T083341Z-qwen36-gdn-m600-tile-sweep`,
-and policy smoke `20260605T195141Z-prefill-policy-smoke`.
-
-| Case | Prefill | Decode | Acceptance |
-|---|---:|---:|---:|
-| no MTP | 721.75 | 40.94 | n/a |
-| fixed d1 MTP | 621.25 | 54.82 | 96.88% |
-| dynamic MTP | 620.57 | 55.43 | 95.31% |
-
-CUDA MoE latest:
-`20260605T070628Z-iq4nl-word-decode`.
-
-| Case | Prefill | Decode | Acceptance |
-|---|---:|---:|---:|
-| no MTP | 2707.70 | 119.91 | n/a |
-| fixed d1 MTP | 1946.82 | 148.50 | 71.88% |
-| dynamic MTP | 1943.69 | 145.36 | 68.75% |
-
-Fresh checks:
-- `stage_gpu`, CUDA NativeVNNI route, and GPU workspace counters export through
-  perf stats; CUDA/ROCm request scratch binds through `DeviceWorkspaceManager`.
-- CUDA dense prefill is generated-table driven for Qwen3.6 Q4_K-family `M=600`;
-  temporary selector overrides are gone, `M=595` bucket routing is covered, and
-  concurrent fused prefill binds split-K/stream-K scratch per side-stream.
-- CUDA MTP no longer uses verifier-row recurrent state as a decode shortcut:
-  the diagnostic now proves M=4 row state is not decode-equivalent, while depth
-  1/3 parity with strict commit-replay checking and prefix+MTP restore parity
-  pass. CUDA small-M KPAR scratch is required/max-sized for graph capture, and
-  quantized GEMM advertises fused projection support for GDN batching.
-- NativeVNNI trainers share one codebook map and bucket policy across CUDA/ROCm;
-  ROCm decode/prefill dispatch came from `20260605T211640Z-decode-prefill-generated-pipeline`.
-- ROCm Q4_K GDN-time decode cosine `0.999840` is a native-VNNI-vs-FP32
-  artifact, not dispatch divergence; packed-contract regression is cosine `1.0`.
-- Focused coverage green: generated-dispatch validators, CUDA/ROCm GEMM route
-  regressions, CUDA graph stochastic smoke, and CUDA dense prefix/MTP parity.
+- CUDA dense verifier-row state shortcuts are unsafe for Qwen3.6 today.
+  Forced shortcut d3 fails immediately after accumulated shortcut state:
+  `condition=674`, accepted `258,10608,20271,92217`, committed next `48567`,
+  sequential replay next `1473`.
+- Forced shortcut d1 also fails a deeper continuation check: first next token
+  matches, but the committed continuation diverges within 16 greedy tokens.
+- The clean local M=4 verifier terminal token can match sequential decode, but
+  the captured/restored GDN/KV/hidden payload is not decode-equivalent and later
+  contaminates the stream. CUDA therefore keeps verifier-row shortcuts disabled
+  and pays replay for correctness.
+- CUDA replay path is not economically viable: fixed d1 records 64 rollbacks for
+  64 verifier runs, and fixed d3 records 33 rollbacks for 33 verifier runs.
+- ROCm remains the proven dense MTP speed lane because its verifier-row restore
+  shortcut has parity coverage and avoids accepted-token replay.
 
 ## Retained Actions
 
-- ROCm: graph-safe sidecar streams, M=2/3/4 VNNI, verifier-row GDN restore,
-  compact MoE prefill grids.
-- CUDA: verifier-row GDN restore, small-M attention, grouped verifier prefill,
-  fused split-K/runtime MoE, batched GDN projections, router/top-k/scatter work.
-- Shared: lowest-id greedy argmax, capped activation arenas, trusted profiling,
-  synchronized sweep trainers, and non-null GPU stream hard failures.
-
-## Next Work
-
-Beat llama.cpp CUDA on dense and MoE, prefill and decode, with MTP on/off.
-CUDA MoE now clears the current no-MTP and MTP anchors on the default lane.
-Next targets are CUDA dense prefill/decode gaps, controller stability, and
-longer-prompt MoE evidence so the win is not just a short-lane artifact. Dense
-prefill is now gate/up and GEMM-heavy; broad GDN split-K remains rejected on
-24GB memory grounds, so the next meaningful prefill win needs kernel/fusion
-work rather than another selector-only pass.
+- CUDA dense: make small-M verifier execution decode-equivalent, or build a
+  graph-native sequential verifier that avoids duplicated all-position verifier
+  plus replay work. Until then, do not re-enable CUDA verifier-row shortcuts.
+- CUDA MoE: rerun after dense hardening before treating pre-hardening MTP wins as
+  production evidence.
+- ROCm: continue toward the 2x dense target by reducing captured verifier GPU
+  work in ordinary GEMM, fused Gate/Up, GDN projection, recurrence, and LM head.
+- Shared: keep generated GEMM/GEMV dispatch tables aligned with prefill buckets,
+  keep GPU streams explicit, and keep parity tests in the normal suite.

@@ -3207,15 +3207,12 @@ namespace llaminar2::test::parity::qwen36
         size_t first_token_index = expected_tokens.size();
         for (size_t i = 1; i + 7 < expected_tokens.size(); ++i)
         {
-            if (expected_tokens[i - 1] == 13 &&
-                expected_tokens[i] == 220 &&
-                expected_tokens[i + 1] == 2972 &&
-                expected_tokens[i + 2] == 674 &&
-                expected_tokens[i + 3] == 258 &&
-                expected_tokens[i + 4] == 10608 &&
-                expected_tokens[i + 5] == 20271 &&
-                expected_tokens[i + 6] == 92217 &&
-                expected_tokens[i + 7] == 48567)
+            if (expected_tokens[i - 1] == 674 &&
+                expected_tokens[i] == 258 &&
+                expected_tokens[i + 1] == 10608 &&
+                expected_tokens[i + 2] == 20271 &&
+                expected_tokens[i + 3] == 92217 &&
+                expected_tokens[i + 4] == 48567)
             {
                 first_token_index = i;
             }
@@ -3336,6 +3333,38 @@ namespace llaminar2::test::parity::qwen36
         const PrefixStateSnapshot sequential_row3_state =
             runner->captureLivePrefixState();
         ASSERT_TRUE(sequential_row3_state.valid);
+        const int32_t sequential_terminal_token =
+            runner->sampleGreedyOnDevice();
+        EXPECT_EQ(sequential_terminal_token, next_verifier_inputs[0])
+            << "Clean sequential replay no longer matches PyTorch at the "
+               "known CUDA M=4 terminal-row regression window"
+            << "\ncondition token: " << expected_tokens[first_token_index - 1]
+            << "\naccepted verifier inputs: "
+            << accepted_verifier_inputs[0] << ','
+            << accepted_verifier_inputs[1] << ','
+            << accepted_verifier_inputs[2] << ','
+            << accepted_verifier_inputs[3];
+        EXPECT_EQ(accepted_rows[3], sequential_terminal_token)
+            << "M=4 all-position terminal row must match clean sequential "
+               "decode before any verifier-row state restore shortcut is used"
+            << "\ncondition token: " << expected_tokens[first_token_index - 1]
+            << "\naccepted verifier inputs: "
+            << accepted_verifier_inputs[0] << ','
+            << accepted_verifier_inputs[1] << ','
+            << accepted_verifier_inputs[2] << ','
+            << accepted_verifier_inputs[3]
+            << "\nall-position terminal: " << accepted_rows[3]
+            << "\nsequential terminal: " << sequential_terminal_token;
+        if (std::getenv("LLAMINAR_QWEN36_DUMP_M4_VERIFIER_DIVERGENCE"))
+        {
+            std::cerr << "M=4 verifier clean sequential terminal token="
+                      << sequential_terminal_token
+                      << " all_position_terminal_token="
+                      << accepted_rows[3]
+                      << " expected_next_token="
+                      << next_verifier_inputs[0]
+                      << std::endl;
+        }
         bool any_stage_row_diverged = false;
         for (int row = 0; row < 4; ++row)
         {
@@ -3348,6 +3377,10 @@ namespace llaminar2::test::parity::qwen36
             if (!stage_match)
             {
                 any_stage_row_diverged = true;
+                if (std::getenv("LLAMINAR_QWEN36_DUMP_M4_VERIFIER_DIVERGENCE"))
+                {
+                    std::cerr << stage_match.message() << std::endl;
+                }
             }
         }
         EXPECT_TRUE(any_stage_row_diverged)
