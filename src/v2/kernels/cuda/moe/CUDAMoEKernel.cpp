@@ -154,6 +154,110 @@ namespace
         return false;
     }
 
+    bool requireTensorType(const llaminar2::TensorBase *tensor, llaminar2::TensorType expected,
+                           const char *name, const char *context)
+    {
+        if (tensor && tensor->native_type() == expected)
+            return true;
+        LOG_ERROR("[CUDAMoEKernel] " << context << " requires " << name << " type "
+                                      << llaminar2::tensorTypeName(expected)
+                                      << ", got "
+                                      << (tensor ? llaminar2::tensorTypeName(tensor->native_type()) : "null"));
+        return false;
+    }
+
+    bool requireTensorTypeOneOf(const llaminar2::TensorBase *tensor,
+                                llaminar2::TensorType a,
+                                llaminar2::TensorType b,
+                                const char *name,
+                                const char *context)
+    {
+        if (tensor && (tensor->native_type() == a || tensor->native_type() == b))
+            return true;
+        LOG_ERROR("[CUDAMoEKernel] " << context << " requires " << name << " type "
+                                      << llaminar2::tensorTypeName(a) << " or "
+                                      << llaminar2::tensorTypeName(b)
+                                      << ", got "
+                                      << (tensor ? llaminar2::tensorTypeName(tensor->native_type()) : "null"));
+        return false;
+    }
+
+    bool requireTensorElements(const llaminar2::ITensor *tensor, size_t required,
+                               const char *name, const char *context)
+    {
+        if (tensor && tensor->numel() >= required)
+            return true;
+        LOG_ERROR("[CUDAMoEKernel] " << context << " requires " << name
+                                      << " to have at least " << required
+                                      << " elements, got " << (tensor ? tensor->numel() : 0));
+        return false;
+    }
+
+    bool requireMatrixCapacity(const llaminar2::ITensor *tensor,
+                               int required_rows,
+                               int required_cols,
+                               const char *name,
+                               const char *context)
+    {
+        if (!tensor || required_rows < 0 || required_cols < 0)
+            return false;
+        const auto &shape = tensor->shape();
+        const bool ok = shape.size() >= 2 &&
+                        shape[0] >= static_cast<size_t>(required_rows) &&
+                        shape[1] >= static_cast<size_t>(required_cols);
+        if (ok)
+            return true;
+        LOG_ERROR("[CUDAMoEKernel] " << context << " requires " << name
+                                      << " matrix capacity at least "
+                                      << required_rows << "x" << required_cols
+                                      << ", got shape "
+                                      << (shape.empty() ? 0 : shape[0]) << "x"
+                                      << (shape.size() > 1 ? shape[1] : 1));
+        return false;
+    }
+
+    bool requireCudaDevicePointer(const void *ptr, int expected_device,
+                                  const char *name, const char *context, void *stream)
+    {
+        if (!ptr)
+        {
+            LOG_ERROR("[CUDAMoEKernel] " << context << " requires non-null " << name << " pointer");
+            return false;
+        }
+        if (llaminar2::isGraphCaptureActive())
+            return true;
+        if (stream)
+        {
+            cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+            const cudaError_t capture_err =
+                cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &capture_status);
+            if (capture_err == cudaSuccess && capture_status != cudaStreamCaptureStatusNone)
+                return true;
+            if (capture_err != cudaSuccess)
+                cudaGetLastError();
+        }
+
+        cudaPointerAttributes attr{};
+        const cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+        if (err != cudaSuccess)
+        {
+            cudaGetLastError();
+            LOG_ERROR("[CUDAMoEKernel] " << context << " cudaPointerGetAttributes failed for "
+                                          << name << " pointer " << ptr << ": "
+                                          << cudaGetErrorString(err));
+            return false;
+        }
+        const bool type_ok = attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged;
+        if (type_ok && attr.device == expected_device)
+            return true;
+        LOG_ERROR("[CUDAMoEKernel] " << context << " requires " << name
+                                      << " pointer on CUDA device " << expected_device
+                                      << ", got attr.device=" << attr.device
+                                      << " attr.type=" << static_cast<int>(attr.type)
+                                      << " ptr=" << ptr);
+        return false;
+    }
+
     int selectGroupedPrefillTileM(int requested_tile_m, int max_tokens_per_expert)
     {
         switch (requested_tile_m)
@@ -564,8 +668,6 @@ namespace llaminar2
 
     void CUDAMoEKernel::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
-        if (workspace_ == workspace)
-            return;
         CUDAKernelBase::bindWorkspace(workspace);
         clearWorkspaceScratchBindings();
     }
@@ -1366,19 +1468,24 @@ namespace llaminar2
         if (!ensureRouteBufferCapacity(logits_count, topk_count))
             return false;
 
+        void *stream = getStream();
         if (!requireAlignedPointer(hidden, 16, "hidden", "routeCore") ||
             !requireAlignedPointer(d_route_logits_, 16, "route logits", "routeCore"))
             return false;
         if (gate_is_fp32 && !requireAlignedPointer(gate_weights, 16, "FP32 gate", "routeCore"))
             return false;
+        if (!requireCudaDevicePointer(hidden, device_ordinal_, "hidden", "routeCore", stream) ||
+            !requireCudaDevicePointer(gate_weights, device_ordinal_, "gate weights", "routeCore", stream) ||
+            !requireCudaDevicePointer(d_route_logits_, device_ordinal_, "route logits", "routeCore", stream))
+            return false;
 
         const bool route_ok = gate_is_fp32
                                   ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
                                                          seq_len, d_model, num_experts,
-                                                         device_ordinal_, getStream())
+                                                         device_ordinal_, stream)
                                   : cudaMoE_route_logits_bf16(hidden, gate_weights, d_route_logits_,
                                                               seq_len, d_model, num_experts,
-                                                              device_ordinal_, getStream());
+                                                              device_ordinal_, stream);
         if (!route_ok)
             return false;
         if (gate_is_fp32 && seq_len >= 16)
@@ -1511,19 +1618,44 @@ namespace llaminar2
             !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
             return false;
 
+        if (seq_len <= 0 || d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        {
+            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] invalid routing shape seq_len="
+                      << seq_len << " d_model=" << d_model
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+
+        auto *hidden_base = asTensorBase(hidden, "routeWithTensors hidden");
+        auto *gate_base = asTensorBase(gate_weights, "routeWithTensors gate_weights");
+        auto *indices_base = asTensorBase(output_indices, "routeWithTensors output_indices");
+        auto *weights_base = asTensorBase(output_weights, "routeWithTensors output_weights");
+        if (!hidden_base || !gate_base || !indices_base || !weights_base)
+            return false;
+
+        if (!requireTensorType(hidden_base, TensorType::FP32, "hidden", "routeWithTensors") ||
+            !requireTensorTypeOneOf(gate_base, TensorType::FP32, TensorType::BF16, "gate_weights", "routeWithTensors") ||
+            !requireTensorType(indices_base, TensorType::FP32, "output_indices", "routeWithTensors") ||
+            !requireTensorType(weights_base, TensorType::FP32, "output_weights", "routeWithTensors"))
+            return false;
+
+        const size_t required_hidden = static_cast<size_t>(seq_len) * static_cast<size_t>(d_model);
+        const size_t required_gate = static_cast<size_t>(num_experts) * static_cast<size_t>(d_model);
+        const size_t required_topk = static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (!requireMatrixCapacity(hidden, seq_len, d_model, "hidden", "routeWithTensors") ||
+            !requireMatrixCapacity(gate_weights, num_experts, d_model, "gate_weights", "routeWithTensors") ||
+            !requireTensorElements(hidden, required_hidden, "hidden", "routeWithTensors") ||
+            !requireTensorElements(gate_weights, required_gate, "gate_weights", "routeWithTensors") ||
+            !requireTensorElements(output_indices, required_topk, "output_indices", "routeWithTensors") ||
+            !requireTensorElements(output_weights, required_topk, "output_weights", "routeWithTensors"))
+            return false;
+
         const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
         const void *d_gate = gate_weights->gpu_data_ptr();
         float *d_idx = static_cast<float *>(output_indices->gpu_data_ptr());
         float *d_wt = static_cast<float *>(output_weights->gpu_data_ptr());
         if (!d_hidden || !d_gate || !d_idx || !d_wt)
             return false;
-
-        auto *gate_base = dynamic_cast<TensorBase *>(gate_weights);
-        if (!gate_base)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeWithTensors] gate_weights must be TensorBase-backed");
-            return false;
-        }
 
         DeviceRouteBuffers buffers;
         if (!routeCore(d_hidden, d_gate, gate_base->native_type(),
@@ -2324,6 +2456,10 @@ namespace llaminar2
         const DeviceId device = deviceId();
         if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromTable"))
             return false;
+        if (!requireTensorType(input, TensorType::FP32, "input", "groupedExpertGateUpDecodeFromTable") ||
+            !requireMatrixCapacity(input, 1, d_model, "input", "groupedExpertGateUpDecodeFromTable") ||
+            !requireTensorElements(input, static_cast<size_t>(d_model), "input", "groupedExpertGateUpDecodeFromTable"))
+            return false;
 
         const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
         const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
@@ -2346,6 +2482,17 @@ namespace llaminar2
         }
         if (!d_hidden)
             return false;
+        const int blocks_per_row = d_model / 32;
+        if (!requireCudaDevicePointer(d_hidden, device_ordinal_, "input", "groupedExpertGateUpDecodeFromTable", stream) ||
+            !requireCudaDevicePointer(d_decode_hidden_int8_, device_ordinal_, "decode hidden int8", "groupedExpertGateUpDecodeFromTable", stream) ||
+            !requireCudaDevicePointer(d_decode_hidden_scales_, device_ordinal_, "decode hidden scales", "groupedExpertGateUpDecodeFromTable", stream))
+            return false;
+        if (use_kpart &&
+            (!requireCudaDevicePointer(d_grouped_gateup_gate_partials_, device_ordinal_, "gate partials", "groupedExpertGateUpDecodeFromTable", stream) ||
+             !requireCudaDevicePointer(d_grouped_gateup_up_partials_, device_ordinal_, "up partials", "groupedExpertGateUpDecodeFromTable", stream)))
+            return false;
+        if (!requireTensorElements(input, static_cast<size_t>(blocks_per_row) * 32u, "input", "groupedExpertGateUpDecodeFromTable"))
+            return false;
 
         std::array<float *, kRuntimePointerArrayMaxTopK> gate_ptrs = {};
         std::array<float *, kRuntimePointerArrayMaxTopK> up_ptrs = {};
@@ -2362,9 +2509,21 @@ namespace llaminar2
             if (!ensureOutputOnDevice(gate_outputs[slot], device, stream, "gate_output") ||
                 !ensureOutputOnDevice(up_outputs[slot], device, stream, "up_output"))
                 return false;
+            auto *gate_output_base = asTensorBase(gate_outputs[slot], "groupedExpertGateUpDecodeFromTable gate_output");
+            auto *up_output_base = asTensorBase(up_outputs[slot], "groupedExpertGateUpDecodeFromTable up_output");
+            if (!requireTensorType(gate_output_base, TensorType::FP32, "gate_output", "groupedExpertGateUpDecodeFromTable") ||
+                !requireTensorType(up_output_base, TensorType::FP32, "up_output", "groupedExpertGateUpDecodeFromTable") ||
+                !requireTensorElements(gate_outputs[slot], static_cast<size_t>(intermediate), "gate_output", "groupedExpertGateUpDecodeFromTable") ||
+                !requireTensorElements(up_outputs[slot], static_cast<size_t>(intermediate), "up_output", "groupedExpertGateUpDecodeFromTable"))
+                return false;
             gate_ptrs[slot] = static_cast<float *>(gate_outputs[slot]->gpu_data_ptr());
             up_ptrs[slot] = static_cast<float *>(up_outputs[slot]->gpu_data_ptr());
             if (!gate_ptrs[slot] || !up_ptrs[slot])
+                return false;
+            if (!requireAlignedPointer(gate_ptrs[slot], 16, "gate_output", "groupedExpertGateUpDecodeFromTable") ||
+                !requireAlignedPointer(up_ptrs[slot], 16, "up_output", "groupedExpertGateUpDecodeFromTable") ||
+                !requireCudaDevicePointer(gate_ptrs[slot], device_ordinal_, "gate_output", "groupedExpertGateUpDecodeFromTable", stream) ||
+                !requireCudaDevicePointer(up_ptrs[slot], device_ordinal_, "up_output", "groupedExpertGateUpDecodeFromTable", stream))
                 return false;
         }
 

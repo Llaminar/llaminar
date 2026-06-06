@@ -1625,6 +1625,50 @@ TEST_F(Test__CUDAMoEKernel, RouteWithTensorsBF16GateMatchesCPU)
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, RouteWithTensorsRejectsInvalidTensorContractsBeforeLaunch)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int seq_len = 1;
+    constexpr int d_model = 4;
+    constexpr int num_experts = 3;
+    constexpr int top_k = 2;
+
+    auto hidden = makeTensor({seq_len, d_model}, {0.2f, -0.1f, 0.3f, 0.5f});
+    auto hidden_bf16 = makeBF16Tensor({seq_len, d_model}, {0.2f, -0.1f, 0.3f, 0.5f});
+    auto hidden_too_narrow = makeTensor({seq_len, d_model - 1}, {0.2f, -0.1f, 0.3f});
+    auto gate = makeTensor({num_experts, d_model}, {0.1f, 0.2f, 0.3f, 0.4f,
+                                                    -0.2f, 0.0f, 0.1f, 0.2f,
+                                                    0.5f, -0.3f, 0.2f, -0.1f});
+    auto gate_too_short = makeTensor({num_experts - 1, d_model}, {0.1f, 0.2f, 0.3f, 0.4f,
+                                                                  -0.2f, 0.0f, 0.1f, 0.2f});
+    auto indices = makeZeros({seq_len, top_k});
+    auto weights = makeZeros({seq_len, top_k});
+    auto short_indices = makeZeros({seq_len, top_k - 1});
+    llaminar2::MoERoutingResult result;
+
+    cudaGetLastError();
+    EXPECT_FALSE(cuda_kernel_->routeWithTensors(hidden_bf16.get(), gate.get(), seq_len, d_model,
+                                                num_experts, top_k, true,
+                                                indices.get(), weights.get(), result));
+    EXPECT_FALSE(cuda_kernel_->routeWithTensors(hidden_too_narrow.get(), gate.get(), seq_len, d_model,
+                                                num_experts, top_k, true,
+                                                indices.get(), weights.get(), result));
+    EXPECT_FALSE(cuda_kernel_->routeWithTensors(hidden.get(), gate_too_short.get(), seq_len, d_model,
+                                                num_experts, top_k, true,
+                                                indices.get(), weights.get(), result));
+    EXPECT_FALSE(cuda_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
+                                                num_experts, top_k, true,
+                                                short_indices.get(), weights.get(), result));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    EXPECT_EQ(cudaGetLastError(), cudaSuccess);
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, GatherAndScatterMatchCPU)
 {
     constexpr int rows = 4;
@@ -2362,6 +2406,9 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
             0.017f * static_cast<float>((i % 19) - 9) +
             0.003f * static_cast<float>((i % 7) - 3);
     auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto hidden_bf16 = makeBF16Tensor({seq_len, d_model}, hidden_values);
+    std::vector<float> narrow_hidden_values(static_cast<size_t>(d_model - 1), 0.05f);
+    auto hidden_too_narrow = makeTensor({seq_len, d_model - 1}, narrow_hidden_values);
 
     const std::array<int, top_k> expert_ids = {0, 1, 2, 3, 4, 5, 6, 7};
     const std::array<float, top_k> expert_weights = {
@@ -2400,6 +2447,16 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
         decode_up0.get(), decode_up1.get(), decode_up2.get(), decode_up3.get(),
         decode_up4.get(), decode_up5.get(), decode_up6.get(), decode_up7.get()};
     auto decode_output = makeZeros({d_model});
+
+    cudaGetLastError();
+    EXPECT_FALSE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
+        hidden_bf16.get(), expert_ids.data(), gateup_table, top_k,
+        gate_outputs.data(), up_outputs.data(), d_model, intermediate));
+    EXPECT_FALSE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
+        hidden_too_narrow.get(), expert_ids.data(), gateup_table, top_k,
+        gate_outputs.data(), up_outputs.data(), d_model, intermediate));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    EXPECT_EQ(cudaGetLastError(), cudaSuccess);
 
     ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromTable(
         hidden.get(), expert_ids.data(), gateup_table, top_k,

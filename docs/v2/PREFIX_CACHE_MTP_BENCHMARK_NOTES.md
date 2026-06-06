@@ -11,7 +11,7 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP, sequential verifier | 595.72 | 38.63 | correct, verifier still slower than baseline |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 595.50 | 32.06 | correct, deeper verifier overhead |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | beats l.cpp no-MTP |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | pre-hardening MoE ratchet |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | parity re-green after workspace rebind fix |
 | Dense long `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP | n/a | 54.78 | 1.77x over 30.93 baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
@@ -50,6 +50,11 @@ Current CUDA dense artifacts:
   verifier state decode-equivalence, not the low-level restore primitive alone.
 - Focused CUDA stage regressions also prove Q5_1/Q5_K Qwen3.6 gate/up,
   fused-SwiGLU down, and FP16-KV M=4 attention match single-row decode.
+- CUDA MoE MTP parity crash was a stale singleton-kernel workspace binding:
+  `CUDAMoEKernel` retained old MoE scratch subpointers after a runner/workspace
+  lifetime change. MoE now invalidates workspace scratch on every bind, and
+  route/grouped gate-up launches validate tensor contracts and live CUDA pointers
+  before launch.
 - CUDA therefore keeps verifier-row shortcuts disabled and uses a
   decode-equivalent sequential greedy verifier. It is correctness-green but still
   slower than baseline because each accepted verifier row pays one-token main
@@ -62,8 +67,8 @@ Current CUDA dense artifacts:
 - CUDA dense: keep the sequential verifier and attack its remaining overhead,
   especially one-token main graph replay, shifted-row commit, and sidecar restore
   cost. Do not re-enable CUDA verifier-row shortcuts.
-- CUDA MoE: rerun after dense hardening before treating pre-hardening MTP wins as
-  production evidence.
+- CUDA MoE: refresh d1/d3 benchmarks after the workspace rebind fix before
+  treating the current MTP win as production evidence.
 - ROCm: continue toward the 2x dense target by reducing captured verifier GPU
   work in ordinary GEMM, fused Gate/Up, GDN projection, recurrence, and LM head.
 - Shared: keep generated GEMM/GEMV dispatch tables aligned with prefill buckets,
