@@ -402,6 +402,7 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
         StageDumpInfo buildDumpInfoImpl() const override;
+        bool usesGroupedVerifierPrefillRouteForTesting() const;
 
         // =====================================================================
         // IWorkspaceConsumer Implementation
@@ -439,6 +440,7 @@ namespace llaminar2
         void ensureGemmEnginesCached() const;
         bool ensureSharedGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool ensureSharedGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate) const;
+        bool shouldUseGroupedVerifierPrefillRoute() const;
         bool tryGroupedVerifierPrefill(IMoEKernel *kernel, int d_model, int intermediate) const;
         bool tryGroupedDecode(IMoEKernel *kernel, int d_model, int intermediate) const;
 

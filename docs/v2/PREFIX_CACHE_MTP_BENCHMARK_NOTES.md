@@ -12,7 +12,7 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 595.50 | 32.06 | correct, deeper verifier overhead |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2460.26 | 111.30 | stable after MoE graph-boundary fix |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP, sequential verifier | 1824.38 | 102.05 | default, parity green |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP, all-position verifier | 1827.47 | 69.50 | M=2 GEMV route; grouped MoE verifier still slow |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP, all-position verifier | 1821.09 | 85.59 | shared expert on small-M fused route |
 | Dense long `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP | n/a | 54.78 | 1.77x over 30.93 baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
@@ -23,7 +23,8 @@ CUDA dense `benchmark_results/cuda_dense_mtp/20260606T070336Z-dense-cuda-stage-a
 CUDA MoE crash fix `benchmark_results/cuda_moe_mtp/20260606T111408Z-d1-crash-isolation`;
 CUDA MoE checkpoint pool `benchmark_results/cuda_moe_mtp/20260606T122032Z-checkpoint-pool`;
 CUDA MoE sequential default `benchmark_results/cuda_moe_mtp/20260606T124045Z-m2-route-sequential-sanity`;
-CUDA MoE all-position M=2 route `benchmark_results/cuda_moe_mtp/20260606T124008Z-m2-gemv-route`.
+CUDA MoE all-position shared small-M route `benchmark_results/cuda_moe_mtp/20260606T125319Z-shared-smallm-route`;
+CUDA MoE attribution `benchmark_results/cuda_moe_mtp/20260606T125355Z-shared-smallm-attribution`.
 
 ## llama.cpp CUDA Anchors
 
@@ -60,17 +61,16 @@ CUDA MoE all-position M=2 route `benchmark_results/cuda_moe_mtp/20260606T124008Z
 - CUDA greedy MTP now defaults to the sequential verifier path. On MoE fixed d1,
   this lifts decode to 102.1 tok/s with parity green, close to but still below
   the 111.3 tok/s no-MTP baseline.
-- CUDA small-M quantized GEMM now calls the two-row NativeVNNI route directly
-  for M=2 verifier shapes. MoE all-position d1 improved from 64.1 to 69.5
-  tok/s, but the grouped MoE verifier prefill pipeline still dominates, so
-  this is not enough to make all-position MTP the default.
+- CUDA small-M quantized GEMM now calls the two-row NativeVNNI route directly.
+  Shared-expert verifier rows M=2..4 use the graph-native fused small-M path
+  instead of grouped prefill, lifting all-position MoE d1 from 69.5 to 85.6
+  tok/s. Remaining time is spread across GDN projection plus routed/shared MoE.
 
 ## Retained Actions
 
-- CUDA: recover MTP speed after the correctness fixes. Fixed d1 MoE is stable
-  at 102.1 tok/s versus 111.3 tok/s no-MTP. Next target is a decode-class
-  small-M route inside grouped MoE verifier gate/up/down rather than the
-  prefill-style pipeline.
+- CUDA: recover MTP speed after correctness fixes. Fixed d1 MoE is stable
+  at 102.1 tok/s versus 111.3 tok/s no-MTP; all-position d1 is now 85.6 tok/s.
+  Next target is routed MoE verifier work and GDN projection.
 - ROCm: continue toward the 2x dense target by reducing captured verifier GPU
   work in GEMM, fused Gate/Up, GDN projection, recurrence, and LM head.
 - Shared: keep generated GEMM/GEMV dispatch tables aligned with prefill buckets,

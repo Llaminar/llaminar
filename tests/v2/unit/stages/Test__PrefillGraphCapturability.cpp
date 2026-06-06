@@ -866,6 +866,81 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, DecodeAlwaysCapturableOnRocmWithoutSc
 #endif
 }
 
+TEST_F(SharedExpertFFNPrefillGraphCapture, CudaVerifierRowsUseGenericSmallMFusedRoute)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    for (int seq_len : {2, 3, 4})
+    {
+        SharedExpertFFNStage::Params params;
+        params.device_id = DeviceId::cuda(0);
+        params.seq_len = seq_len;
+        params.d_model = D_MODEL;
+        params.intermediate = INTERMEDIATE;
+        params.input = input_.get();
+        params.output = output_.get();
+
+        SharedExpertFFNStage stage(params);
+        EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
+            << "CUDA all-position verifier shared expert M=" << seq_len
+            << " should use the graph-native fused small-M GEMV route, not the grouped prefill pipeline";
+    }
+}
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, CudaForcedDecodeReplayKeepsGroupedPrefillRoute)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    SharedExpertFFNStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.intermediate = INTERMEDIATE;
+    params.input = input_.get();
+    params.gate_w = gate_w.get();
+    params.up_w = up_w.get();
+    params.down_w = down_w.get();
+    params.output = output_.get();
+    params.force_grouped_verifier_prefill_for_decode = true;
+
+    SharedExpertFFNStage stage(params);
+#if defined(HAVE_CUDA)
+    EXPECT_TRUE(stage.usesGroupedVerifierPrefillRouteForTesting())
+        << "Forced single-row verifier replay should stay on the grouped prefill route";
+#else
+    EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting());
+#endif
+}
+
+TEST_F(SharedExpertFFNPrefillGraphCapture, CudaForcedDecodeReplayRequiresGroupedPrefillEnabled)
+{
+    ScopedRocmMoEFlags flags(true, true, false);
+
+    auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
+    auto down_w = TestTensorFactory::createFP32({D_MODEL, INTERMEDIATE});
+
+    SharedExpertFFNStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.intermediate = INTERMEDIATE;
+    params.input = input_.get();
+    params.gate_w = gate_w.get();
+    params.up_w = up_w.get();
+    params.down_w = down_w.get();
+    params.output = output_.get();
+    params.force_grouped_verifier_prefill_for_decode = true;
+
+    SharedExpertFFNStage stage(params);
+    EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
+        << "No verifier replay should silently enter grouped prefill when grouped prefill is disabled";
+}
+
 // =========================================================================
 // SharedExpertGateStage — Prefill Graph Capturability
 // =========================================================================

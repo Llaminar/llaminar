@@ -2500,18 +2500,24 @@ namespace llaminar2
         return true;
     }
 
+    bool SharedExpertFFNStage::shouldUseGroupedVerifierPrefillRoute() const
+    {
+        return params_.device_id.is_cuda() &&
+               params_.force_grouped_verifier_prefill_for_decode &&
+               params_.seq_len == 1 &&
+               supportsGroupedPrefillExecutionBackend(params_.device_id);
+    }
+
+    bool SharedExpertFFNStage::usesGroupedVerifierPrefillRouteForTesting() const
+    {
+        return shouldUseGroupedVerifierPrefillRoute();
+    }
+
     bool SharedExpertFFNStage::tryGroupedVerifierPrefill(
         IMoEKernel *kernel, int d_model, int intermediate) const
     {
-        const bool forced_decode_replay =
-            params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
-        if (!params_.device_id.is_cuda() ||
-            (params_.seq_len <= 1 && !forced_decode_replay) ||
-            params_.seq_len > 4 ||
-            !supportsGroupedPrefillExecutionBackend(params_.device_id))
-        {
+        if (!shouldUseGroupedVerifierPrefillRoute())
             return false;
-        }
 
         if (!ensureSharedGroupedGateUpDescriptorTable(kernel, d_model, intermediate) ||
             !ensureSharedGroupedDownDescriptorTable(kernel, d_model, intermediate))
@@ -2622,12 +2628,7 @@ namespace llaminar2
         }
 
         IMoEKernel *kernel = ensureMoEKernel();
-        const bool cuda_verifier_shared_prefill =
-            params_.device_id.is_cuda() &&
-            (seq_len > 1 || params_.force_grouped_verifier_prefill_for_decode) &&
-            seq_len <= 4 &&
-            supportsGroupedPrefillExecutionBackend(params_.device_id);
-        if (cuda_verifier_shared_prefill)
+        if (shouldUseGroupedVerifierPrefillRoute())
         {
             if (!tryGroupedVerifierPrefill(kernel, d_model, intermediate))
             {
