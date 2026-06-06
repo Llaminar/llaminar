@@ -20,6 +20,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -859,6 +860,77 @@ namespace llaminar2
         grouped_gateup_desc_tables_.clear();
         runtime_gateup_pointer_cache_.clear();
         runtime_down_pointer_cache_.clear();
+
+        if (router_cublas_handle_)
+        {
+            cublasDestroy(static_cast<cublasHandle_t>(router_cublas_handle_));
+            router_cublas_handle_ = nullptr;
+        }
+    }
+
+    bool CUDAMoEKernel::routeLogitsCuBLAS(const float *hidden, const float *gate_weights, float *logits,
+                                          int seq_len, int d_model, int num_experts)
+    {
+        void *stream = getStream();
+        if (!stream)
+        {
+            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] CUDA router requires an explicit stream");
+            return false;
+        }
+
+        if (!router_cublas_handle_)
+        {
+            if (isGraphCaptureActive() || isCudaStreamCapturing(stream))
+            {
+                LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cuBLAS handle was not warmed before graph capture");
+                return false;
+            }
+            if (!setMoEDevice(device_ordinal_, "CUDAMoEKernel::routeLogitsCuBLAS"))
+                return false;
+            cublasHandle_t handle = nullptr;
+            const cublasStatus_t create_status = cublasCreate(&handle);
+            if (create_status != CUBLAS_STATUS_SUCCESS)
+            {
+                LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasCreate failed: "
+                          << static_cast<int>(create_status));
+                return false;
+            }
+            cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
+            router_cublas_handle_ = handle;
+        }
+
+        auto *handle = static_cast<cublasHandle_t>(router_cublas_handle_);
+        cublasStatus_t status = cublasSetStream(handle, static_cast<cudaStream_t>(stream));
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasSetStream failed: "
+                      << static_cast<int>(status));
+            return false;
+        }
+
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        // Row-major logits[S,E] = hidden[S,D] * gate[E,D]^T.
+        // In cuBLAS column-major views this is C^T[E,S] = gate[E,D] * hidden^T[D,S].
+        status = cublasSgemm(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            num_experts, seq_len, d_model,
+            &alpha,
+            gate_weights, d_model,
+            hidden, d_model,
+            &beta,
+            logits, num_experts);
+        if (status != CUBLAS_STATUS_SUCCESS)
+        {
+            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasSgemm failed: "
+                      << static_cast<int>(status)
+                      << " seq_len=" << seq_len
+                      << " d_model=" << d_model
+                      << " num_experts=" << num_experts);
+            return false;
+        }
+        return true;
     }
 
     bool CUDAMoEKernel::ensureStagingCapacity(int count)
@@ -1479,15 +1551,28 @@ namespace llaminar2
             !requireCudaDevicePointer(d_route_logits_, device_ordinal_, "route logits", "routeCore", stream))
             return false;
 
-        const bool route_ok = gate_is_fp32
-                                  ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
-                                                         seq_len, d_model, num_experts,
-                                                         device_ordinal_, stream)
-                                  : cudaMoE_route_logits_bf16(hidden, gate_weights, d_route_logits_,
-                                                              seq_len, d_model, num_experts,
-                                                              device_ordinal_, stream);
+        const bool use_cublas_small_m =
+            gate_is_fp32 && seq_len >= 2 && seq_len <= 4;
+        const bool route_ok = use_cublas_small_m
+                                  ? routeLogitsCuBLAS(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
+                                                      seq_len, d_model, num_experts)
+                                  : (gate_is_fp32
+                                         ? cudaMoE_route_logits(hidden, static_cast<const float *>(gate_weights), d_route_logits_,
+                                                                seq_len, d_model, num_experts,
+                                                                device_ordinal_, stream)
+                                         : cudaMoE_route_logits_bf16(hidden, gate_weights, d_route_logits_,
+                                                                     seq_len, d_model, num_experts,
+                                                                     device_ordinal_, stream));
         if (!route_ok)
             return false;
+        if (use_cublas_small_m)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel", "cuda_moe_router_cublas_small_m_calls", 1.0, {}, {},
+                {{"seq_len", std::to_string(seq_len)},
+                 {"d_model", std::to_string(d_model)},
+                 {"num_experts", std::to_string(num_experts)}});
+        }
         if (gate_is_fp32 && seq_len >= 16)
         {
             PerfStatsCollector::addCounter(
