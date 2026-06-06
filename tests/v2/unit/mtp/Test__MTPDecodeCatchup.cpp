@@ -1,0 +1,199 @@
+#include <gtest/gtest.h>
+#include <gmock/gmock.h>
+
+#include "execution/mtp/MTPDecodeCatchup.h"
+#include "execution/local_execution/orchestrators/IInferenceRunner.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <utility>
+#include <vector>
+
+using namespace llaminar2;
+using namespace testing;
+
+namespace
+{
+    class FakeCatchupRunner : public IInferenceRunner
+    {
+    public:
+        bool forward(const int *tokens, int seq_len) override
+        {
+            if (!tokens || seq_len != 1)
+                return false;
+            ++forward_count;
+            forward_tokens.push_back(tokens[0]);
+            ++position;
+            return forward_ok;
+        }
+
+        const float *logits() const override { return nullptr; }
+        int vocab_size() const override { return 16; }
+        void clear_cache() override
+        {
+            position = 0;
+            forward_tokens.clear();
+            committed_tokens.clear();
+            committed_indices.clear();
+        }
+        int get_position() const override { return position; }
+        ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
+        const char *architecture() const override { return "fake-catchup"; }
+
+        bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override
+        {
+            if (!commit_ok)
+                return false;
+            ++commit_count;
+            committed_tokens.push_back(token);
+            committed_indices.push_back(already_appended_tokens);
+            committed_allow_discard.push_back(allow_speculative_discard);
+            committed_position_offsets.push_back(position_offset_override);
+            return true;
+        }
+
+        bool forward_ok = true;
+        bool commit_ok = true;
+        int position = 0;
+        int forward_count = 0;
+        int commit_count = 0;
+        std::vector<int> forward_tokens;
+        std::vector<int32_t> committed_tokens;
+        std::vector<int> committed_indices;
+        std::vector<bool> committed_allow_discard;
+        std::vector<int> committed_position_offsets;
+    };
+
+    class ScriptedSampler
+    {
+    public:
+        explicit ScriptedSampler(std::vector<int32_t> tokens)
+            : tokens_(std::move(tokens))
+        {
+        }
+
+        int32_t operator()()
+        {
+            if (index_ >= tokens_.size())
+                return -1;
+            return tokens_[index_++];
+        }
+
+        size_t calls() const { return index_; }
+
+    private:
+        std::vector<int32_t> tokens_;
+        size_t index_ = 0;
+    };
+
+} // namespace
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseAcceptsMultiRowDraftAndReturnsReadyToken)
+{
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({9, 8, 6, 4});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8, 6};
+    request.base_sidecar_position = 42;
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 8, 6));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9, 8, 6));
+    EXPECT_TRUE(result.all_speculative_accepted);
+    EXPECT_EQ(result.accepted_speculative_prefix, 3);
+    EXPECT_EQ(result.ready_token, 4);
+    EXPECT_EQ(result.main_forward_token_count, 4);
+    EXPECT_EQ(result.shifted_commit_count, 4);
+    EXPECT_THAT(runner.forward_tokens, ElementsAre(7, 9, 8, 6));
+    EXPECT_THAT(runner.committed_tokens, ElementsAre(7, 9, 8, 6));
+    EXPECT_THAT(runner.committed_indices, ElementsAre(0, 1, 2, 3));
+    EXPECT_THAT(runner.committed_position_offsets, ElementsAre(42, 42, 42, 42));
+    EXPECT_TRUE(std::all_of(
+        runner.committed_allow_discard.begin(),
+        runner.committed_allow_discard.end(),
+        [](bool v) { return v; }));
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseRejectsAndForwardsCorrectionForReadyToken)
+{
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({9, 3, 5});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 9};
+    request.base_sidecar_position = 5;
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9, 3));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9, 3));
+    EXPECT_FALSE(result.all_speculative_accepted);
+    EXPECT_EQ(result.accepted_speculative_prefix, 1);
+    EXPECT_EQ(result.rejected_verified_token, 3);
+    EXPECT_EQ(result.ready_token, 5);
+    EXPECT_EQ(result.main_forward_token_count, 3);
+    EXPECT_THAT(runner.forward_tokens, ElementsAre(7, 9, 3));
+    EXPECT_THAT(runner.committed_tokens, ElementsAre(7, 9, 3));
+    EXPECT_THAT(runner.committed_indices, ElementsAre(0, 1, 2));
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseStopTokenDiscardsReadyToken)
+{
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({9, 5});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+    request.stop_tokens = {9};
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9));
+    EXPECT_THAT(result.verifier_tokens, ElementsAre(9));
+    EXPECT_TRUE(result.stopped_on_output);
+    EXPECT_EQ(result.ready_token, -1);
+    EXPECT_EQ(result.main_forward_token_count, 2)
+        << "the accepted stop output is still forwarded before completion";
+    EXPECT_THAT(runner.forward_tokens, ElementsAre(7, 9));
+    EXPECT_THAT(runner.committed_tokens, ElementsAre(7, 9));
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWithoutDraftTokens)
+{
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({1});
+
+    MTPDecodeCatchupGreedyRequest request;
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("no draft tokens"));
+    EXPECT_EQ(runner.forward_count, 0);
+    EXPECT_EQ(runner.commit_count, 0);
+    EXPECT_EQ(sampler.calls(), 0u);
+}

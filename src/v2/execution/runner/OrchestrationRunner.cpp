@@ -13,6 +13,7 @@
 #include "../mpi_orchestration/ExecutionPlanBuilder.h"
 #include "../factory/InferenceRunnerFactory.h"
 #include "../mtp/MTPStateTransaction.h"
+#include "../mtp/MTPDecodeCatchup.h"
 #include "../mtp/MTPVerifierPolicy.h"
 #include "../mtp/MTPWeightManifest.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
@@ -2351,163 +2352,54 @@ namespace llaminar2
                     "Decode-equivalent sequential MTP verifier could not restore verifier base checkpoint after sidecar draft");
             }
 
-            std::vector<int32_t> accepted_tokens;
-            accepted_tokens.reserve(draft_tokens.size() + 1);
-            accepted_tokens.push_back(first_token);
-            std::vector<int32_t> verifier_tokens;
-            verifier_tokens.reserve(static_cast<size_t>(speculative_draft_count));
-
-            bool all_speculative_accepted = true;
-            int accepted_speculative_prefix = 0;
-            int32_t rejected_verified_token = -1;
-            int32_t ready_token = -1;
-            bool replay_ok = true;
-            bool shifted_commit_ok = true;
-            bool stopped_on_output = false;
-            int main_forward_token_count = 0;
-
-            auto forward_one_and_sample = [&](int32_t token) -> int32_t
+            auto sample_after_forward = [&]() -> int32_t
             {
-                bool ok = false;
-                {
-                    PerfStatsCollector::ScopedTimer timer(
-                        "mtp",
-                        "decode_equivalent_sequential_verifier_forward_one",
-                        "decode");
-                    ok = runner_->forward(&token, 1);
-                }
-                if (!ok)
-                {
-                    replay_ok = false;
+                int32_t sampled = runner_->sampleGreedyOnDevice();
+                if (sampled >= 0)
+                    return sampled;
+
+                const float *main_logits = runner_->logits();
+                if (!main_logits)
                     return -1;
-                }
-                ++main_forward_token_count;
 
-                int32_t sampled = -1;
-                {
-                    PerfStatsCollector::ScopedTimer timer(
-                        "mtp",
-                        "decode_equivalent_sequential_verifier_sample_one",
-                        "decode");
-                    sampled = runner_->sampleGreedyOnDevice();
-                }
-                if (sampled < 0)
-                {
-                    const float *main_logits = runner_->logits();
-                    if (main_logits)
-                    {
-                        PerfStatsCollector::ScopedTimer timer(
-                            "mtp",
-                            "decode_equivalent_sequential_verifier_sample_one_host",
-                            "decode");
-                        sampled = sampler_.sample(
-                            main_logits,
-                            static_cast<size_t>(vocab),
-                            active_sampling_params_);
-                    }
-                }
-                return sampled;
-            };
-
-            auto commit_shifted_before_forward = [&](int32_t token, int token_index) -> bool
-            {
-                bool ok = false;
-                {
-                    PerfStatsCollector::ScopedTimer timer(
-                        "mtp",
-                        "decode_equivalent_sequential_verifier_shifted_commit",
-                        "decode");
-                    ok = runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
-                        token,
-                        token_index,
-                        /*allow_speculative_discard=*/true,
-                        base_sidecar_position);
-                }
-                if (!ok)
-                    shifted_commit_ok = false;
-                return ok;
-            };
-
-            if (!commit_shifted_before_forward(first_token, 0))
-            {
-                return fail_after_checkpoint(
-                    "Decode-equivalent sequential MTP verifier initial shifted-cache commit failed");
-            }
-
-            int32_t verifier_sample = forward_one_and_sample(first_token);
-            if (verifier_sample < 0)
-            {
-                return fail_after_checkpoint(
-                    replay_ok
-                        ? "Decode-equivalent sequential MTP verifier could not sample first verifier row"
-                        : "Decode-equivalent sequential MTP verifier failed to forward first accepted token");
-            }
-
-            for (int draft_idx = 1;
-                 draft_idx < static_cast<int>(draft_tokens.size());
-                 ++draft_idx)
-            {
-                const int32_t draft_token = draft_tokens[static_cast<size_t>(draft_idx)];
-                verifier_tokens.push_back(verifier_sample);
-                PerfStatsCollector::addCounter(
+                PerfStatsCollector::ScopedTimer timer(
                     "mtp",
-                    "greedy_verifier_token",
-                    1.0,
+                    "decode_equivalent_catchup_sample_one_host",
                     "decode",
                     {},
-                    {{"row", std::to_string(draft_idx - 1)},
-                     {"draft_token", std::to_string(draft_token)},
-                     {"verified_token", std::to_string(verifier_sample)},
-                     {"verifier_path", "decode_equivalent_sequential"}});
+                    {{"implementation", "shared_stepwise"}});
+                return sampler_.sample(
+                    main_logits,
+                    static_cast<size_t>(vocab),
+                    active_sampling_params_);
+            };
 
-                const bool accepted = verifier_sample == draft_token;
-                const int32_t output_token = accepted ? draft_token : verifier_sample;
-                if (accepted)
-                {
-                    ++accepted_speculative_prefix;
-                }
-                else
-                {
-                    all_speculative_accepted = false;
-                    rejected_verified_token = verifier_sample;
-                }
+            MTPDecodeCatchupGreedyRequest catchup_request;
+            catchup_request.draft_tokens = draft_tokens;
+            catchup_request.stop_tokens = stop_tokens_;
+            catchup_request.base_sidecar_position = base_sidecar_position;
+            catchup_request.allow_speculative_discard = true;
+            catchup_request.verifier_path = "decode_equivalent_catchup";
 
-                accepted_tokens.push_back(output_token);
-                const int token_index = static_cast<int>(accepted_tokens.size()) - 1;
-                if (!commit_shifted_before_forward(output_token, token_index))
-                {
-                    return fail_after_checkpoint(
-                        "Decode-equivalent sequential MTP verifier shifted-cache commit failed");
-                }
-
-                verifier_sample = forward_one_and_sample(output_token);
-                if (verifier_sample < 0)
-                {
-                    return fail_after_checkpoint(
-                        replay_ok
-                            ? "Decode-equivalent sequential MTP verifier could not sample ready logits"
-                            : "Decode-equivalent sequential MTP verifier failed while forwarding accepted output");
-                }
-
-                if (std::find(stop_tokens_.begin(), stop_tokens_.end(), output_token) != stop_tokens_.end())
-                {
-                    result.is_complete = true;
-                    stopped_on_output = true;
-                    break;
-                }
-                if (!accepted)
-                    break;
-            }
-
-            if (!shifted_commit_ok || !replay_ok)
+            MTPDecodeCatchupGreedyResult catchup =
+                runSharedStepwiseMTPDecodeCatchupGreedy(
+                    *runner_,
+                    catchup_request,
+                    sample_after_forward);
+            if (!catchup.ok)
             {
-                return fail_after_checkpoint("Decode-equivalent sequential MTP verifier failed");
+                return fail_after_checkpoint(catchup.error);
             }
 
-            if (!stopped_on_output)
-            {
-                ready_token = verifier_sample;
-            }
+            std::vector<int32_t> accepted_tokens = std::move(catchup.accepted_tokens);
+            std::vector<int32_t> verifier_tokens = std::move(catchup.verifier_tokens);
+            const bool all_speculative_accepted = catchup.all_speculative_accepted;
+            const int accepted_speculative_prefix = catchup.accepted_speculative_prefix;
+            const int32_t rejected_verified_token = catchup.rejected_verified_token;
+            const int32_t ready_token = catchup.ready_token;
+            const bool stopped_on_output = catchup.stopped_on_output;
+            const int main_forward_token_count = catchup.main_forward_token_count;
+            result.is_complete = result.is_complete || stopped_on_output;
 
             ++mtp_stats_.verifier_runs;
             mtp_stats_.verifier_token_count +=
@@ -2526,7 +2418,8 @@ namespace llaminar2
                 {},
                 {{"forward_tokens", std::to_string(main_forward_token_count)},
                  {"draft_tokens", std::to_string(draft_tokens.size())},
-                 {"restored_verifier_base", restored_verifier_base ? "true" : "false"}});
+                 {"restored_verifier_base", restored_verifier_base ? "true" : "false"},
+                 {"catchup_implementation", "shared_stepwise"}});
 
             recordMTPDepthObservation(
                 requested_speculative_draft_count,
@@ -2574,7 +2467,8 @@ namespace llaminar2
                  {"accepted_speculative_prefix", std::to_string(accepted_speculative_prefix)},
                  {"all_speculative_accepted", all_speculative_accepted ? "true" : "false"},
                  {"verifier_state_matches_output", "true"},
-                 {"verifier_path", "decode_equivalent_sequential"},
+                 {"verifier_path", "decode_equivalent_catchup"},
+                 {"catchup_implementation", "shared_stepwise"},
                  {"decode_equivalent_replay_required", "true"},
                  {"output_tokens", std::to_string(accepted_tokens.size())},
                  {"ready_token", std::to_string(ready_token)},

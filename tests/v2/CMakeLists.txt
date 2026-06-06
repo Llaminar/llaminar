@@ -6208,6 +6208,18 @@ add_v2_test(V2_Unit_MTPDepthController
     MPI_PROCS 1
 )
 
+# Test: Shared MTP decode-equivalent catch-up contract
+add_executable(v2_test_mtp_decode_catchup unit/mtp/Test__MTPDecodeCatchup.cpp)
+target_link_libraries(v2_test_mtp_decode_catchup llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_mtp_decode_catchup PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPDecodeCatchup
+    COMMAND $<TARGET_FILE:v2_test_mtp_decode_catchup>
+    LABELS "V2;Unit;MTP;DecodeCatchup;Rollback"
+    MPI_PROCS 1
+)
+
 # Test: MTP transaction state and rollback invariants
 add_executable(v2_test_mtp_state_transaction unit/mtp/Test__MTPStateTransaction.cpp)
 target_link_libraries(v2_test_mtp_state_transaction llaminar2_core GTest::gtest GTest::gtest_main)

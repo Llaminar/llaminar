@@ -1,0 +1,209 @@
+/**
+ * @file MTPDecodeCatchup.cpp
+ * @brief Shared decode-equivalent MTP catch-up implementation.
+ */
+
+#include "MTPDecodeCatchup.h"
+
+#include "../local_execution/orchestrators/IInferenceRunner.h"
+#include "../../utils/PerfStatsCollector.h"
+
+#include <algorithm>
+
+namespace llaminar2
+{
+    namespace
+    {
+        bool tokenIsStop(
+            const std::vector<int32_t> &stop_tokens,
+            int32_t token)
+        {
+            return std::find(stop_tokens.begin(), stop_tokens.end(), token) !=
+                   stop_tokens.end();
+        }
+
+        std::string joinTokens(const std::vector<int32_t> &tokens)
+        {
+            std::string out;
+            for (size_t i = 0; i < tokens.size(); ++i)
+            {
+                if (i > 0)
+                    out += ",";
+                out += std::to_string(tokens[i]);
+            }
+            return out;
+        }
+
+    } // namespace
+
+    MTPDecodeCatchupGreedyResult runSharedStepwiseMTPDecodeCatchupGreedy(
+        IInferenceRunner &runner,
+        const MTPDecodeCatchupGreedyRequest &request,
+        const MTPDecodeCatchupGreedySampler &sample_after_forward)
+    {
+        MTPDecodeCatchupGreedyResult result;
+        result.accepted_tokens.reserve(request.draft_tokens.size() + 1);
+        result.verifier_tokens.reserve(request.draft_tokens.size());
+
+        auto fail = [&](std::string reason) -> MTPDecodeCatchupGreedyResult
+        {
+            result.ok = false;
+            result.error = std::move(reason);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "decode_equivalent_catchup_failures",
+                1.0,
+                "decode",
+                {},
+                {{"implementation", "shared_stepwise"},
+                 {"reason", result.error}});
+            return result;
+        };
+
+        if (request.draft_tokens.empty())
+            return fail("MTP decode-equivalent catch-up received no draft tokens");
+        if (!sample_after_forward)
+            return fail("MTP decode-equivalent catch-up received no sampler callback");
+
+        auto forward_one_and_sample = [&](int32_t token) -> int32_t
+        {
+            int forward_token = static_cast<int>(token);
+            bool ok = false;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "decode_equivalent_catchup_forward_one",
+                    "decode",
+                    {},
+                    {{"implementation", "shared_stepwise"}});
+                ok = runner.forward(&forward_token, 1);
+            }
+            if (!ok)
+                return -1;
+
+            ++result.main_forward_token_count;
+
+            int32_t sampled = -1;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "decode_equivalent_catchup_sample_one",
+                    "decode",
+                    {},
+                    {{"implementation", "shared_stepwise"}});
+                sampled = sample_after_forward();
+            }
+            return sampled;
+        };
+
+        auto commit_shifted_before_forward = [&](int32_t token, int token_index) -> bool
+        {
+            bool ok = false;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "decode_equivalent_catchup_shifted_commit",
+                    "decode",
+                    {},
+                    {{"implementation", "shared_stepwise"}});
+                ok = runner.commitMTPShiftedRowFromCurrentTerminalHidden(
+                    token,
+                    token_index,
+                    request.allow_speculative_discard,
+                    request.base_sidecar_position);
+            }
+            if (ok)
+                ++result.shifted_commit_count;
+            return ok;
+        };
+
+        const int32_t first_token = request.draft_tokens.front();
+        result.accepted_tokens.push_back(first_token);
+
+        if (!commit_shifted_before_forward(first_token, 0))
+            return fail("MTP decode-equivalent catch-up initial shifted-cache commit failed");
+
+        int32_t verifier_sample = forward_one_and_sample(first_token);
+        if (verifier_sample < 0)
+            return fail("MTP decode-equivalent catch-up failed to forward/sample first token");
+
+        for (int draft_idx = 1;
+             draft_idx < static_cast<int>(request.draft_tokens.size());
+             ++draft_idx)
+        {
+            const int32_t draft_token =
+                request.draft_tokens[static_cast<size_t>(draft_idx)];
+            result.verifier_tokens.push_back(verifier_sample);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "greedy_verifier_token",
+                1.0,
+                "decode",
+                {},
+                {{"row", std::to_string(draft_idx - 1)},
+                 {"draft_token", std::to_string(draft_token)},
+                 {"verified_token", std::to_string(verifier_sample)},
+                 {"verifier_path", request.verifier_path},
+                 {"implementation", "shared_stepwise"}});
+
+            const bool accepted = verifier_sample == draft_token;
+            const int32_t output_token = accepted ? draft_token : verifier_sample;
+            if (accepted)
+            {
+                ++result.accepted_speculative_prefix;
+            }
+            else
+            {
+                result.all_speculative_accepted = false;
+                result.rejected_verified_token = verifier_sample;
+            }
+
+            result.accepted_tokens.push_back(output_token);
+            const int token_index =
+                static_cast<int>(result.accepted_tokens.size()) - 1;
+            if (!commit_shifted_before_forward(output_token, token_index))
+                return fail("MTP decode-equivalent catch-up shifted-cache commit failed");
+
+            verifier_sample = forward_one_and_sample(output_token);
+            if (verifier_sample < 0)
+                return fail("MTP decode-equivalent catch-up failed while forwarding accepted output");
+
+            if (tokenIsStop(request.stop_tokens, output_token))
+            {
+                result.stopped_on_output = true;
+                break;
+            }
+            if (!accepted)
+                break;
+        }
+
+        if (!result.stopped_on_output)
+            result.ready_token = verifier_sample;
+
+        result.ok = true;
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "decode_equivalent_catchup_runs",
+            1.0,
+            "decode",
+            {},
+            {{"implementation", "shared_stepwise"},
+             {"draft_tokens", joinTokens(request.draft_tokens)},
+             {"accepted_tokens", joinTokens(result.accepted_tokens)},
+             {"verifier_tokens", joinTokens(result.verifier_tokens)},
+             {"accepted_speculative_prefix",
+              std::to_string(result.accepted_speculative_prefix)},
+             {"all_speculative_accepted",
+              result.all_speculative_accepted ? "true" : "false"},
+             {"stopped_on_output", result.stopped_on_output ? "true" : "false"}});
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "decode_equivalent_catchup_forward_tokens",
+            static_cast<double>(result.main_forward_token_count),
+            "decode",
+            {},
+            {{"implementation", "shared_stepwise"}});
+        return result;
+    }
+
+} // namespace llaminar2

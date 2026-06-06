@@ -355,6 +355,11 @@ namespace
             return verifier_row_restore_supported_;
         }
 
+        bool requiresMTPDecodeEquivalentVerifierReplay() const override
+        {
+            return requires_mtp_decode_equivalent_replay_;
+        }
+
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override
         {
             ++forward_mtp_and_sample_count_;
@@ -805,6 +810,10 @@ namespace
             verifier_row_restore_supported_ = true;
             verifier_row_restore_enabled_ = false;
         }
+        void requireMTPDecodeEquivalentReplay()
+        {
+            requires_mtp_decode_equivalent_replay_ = true;
+        }
 
     private:
         static int greedyArgmax(const float *logits, int vocab)
@@ -1073,6 +1082,7 @@ namespace
         bool supports_mtp_sidecar_sample_fusion_{false};
         bool supports_mtp_sidecar_preserves_main_state_{false};
         bool supports_stochastic_device_sampling_{false};
+        bool requires_mtp_decode_equivalent_replay_{false};
         bool hide_local_logits_{false};
         bool use_captured_snapshot_{false};
         bool last_commit_mtp_allow_speculative_discard_{false};
@@ -1601,6 +1611,7 @@ namespace
                 /*mtp_draft_tokens=*/2,
                 /*chained_mtp_support=*/true,
                 /*sidecar_sample_fusion=*/true);
+            mock->requireMTPDecodeEquivalentReplay();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
@@ -1641,10 +1652,15 @@ namespace
             EXPECT_EQ(probe.mtp_rollbacks, 0u);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
-            const PerfStatRecord *sequential =
-                findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_runs");
-            ASSERT_NE(sequential, nullptr);
-            EXPECT_DOUBLE_EQ(sequential->value, 1.0);
+            const PerfStatRecord *catchup =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_catchup_runs",
+                                       {{"implementation", "shared_stepwise"},
+                                        {"draft_tokens", "7,9,9"},
+                                        {"accepted_tokens", "7,9,9"},
+                                        {"verifier_tokens", "9,9"}});
+            ASSERT_NE(catchup, nullptr);
             const PerfStatRecord *all_position =
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "verifier_forward");
             EXPECT_EQ(all_position, nullptr);
@@ -1673,6 +1689,7 @@ namespace
                 /*chained_mtp_support=*/false,
                 /*sidecar_sample_fusion=*/true);
             mock->enableMTPSidecarPreservesMainState();
+            mock->requireMTPDecodeEquivalentReplay();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
@@ -1698,21 +1715,26 @@ namespace
             EXPECT_THAT(mock->forwardHistory()[2], ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
-            const PerfStatRecord *sequential =
-                findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_runs");
-            ASSERT_NE(sequential, nullptr);
-            EXPECT_DOUBLE_EQ(sequential->value, 1.0);
+            const PerfStatRecord *catchup =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_catchup_runs",
+                                       {{"implementation", "shared_stepwise"},
+                                        {"draft_tokens", "7,9"},
+                                        {"accepted_tokens", "7,9"},
+                                        {"verifier_tokens", "9"}});
+            ASSERT_NE(catchup, nullptr);
 
             const PerfStatRecord *restore_counter =
-                findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_base_restores");
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "decode_equivalent_sequential_verifier_base_restores");
             EXPECT_EQ(restore_counter, nullptr);
             const PerfStatRecord *restore_timer =
-                findPerfRecord(records, PerfStatRecord::Kind::Timer, "cuda_sequential_verifier_restore_base_checkpoint");
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "decode_equivalent_sequential_verifier_restore_base_checkpoint");
             EXPECT_EQ(restore_timer, nullptr);
             const PerfStatRecord *skipped_restore =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
-                               "cuda_sequential_verifier_base_restore_skipped_sidecar_preserved");
+                               "decode_equivalent_sequential_verifier_base_restore_skipped_sidecar_preserved");
             ASSERT_NE(skipped_restore, nullptr);
             EXPECT_DOUBLE_EQ(skipped_restore->value, 1.0);
         }
@@ -2257,6 +2279,95 @@ namespace
         PerfStatsCollector::reset();
     }
 
+    TEST_F(Test__PrefillDecodeTransition, StatefulMTPVerifierUsesSharedDecodeEquivalentCatchup)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_shared_catchup_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/3,
+                /*chained_mtp_support=*/true);
+            mock->requireMTPDecodeEquivalentReplay();
+            mock->setDecodeArgmaxScript({
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN});
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+            const int forward_count_after_prefill = mock->forwardCallCount();
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->setAllPositionCount(), 0)
+                << "stateful catch-up must not use all-position verifier rows";
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 3);
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 3);
+            EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 2);
+            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
+            EXPECT_THAT(mock->lastCommitMTPTokens(),
+                        ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+            EXPECT_THAT(mock->forwardHistory()[static_cast<size_t>(forward_count_after_prefill)],
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+            EXPECT_THAT(mock->forwardHistory()[static_cast<size_t>(forward_count_after_prefill + 1)],
+                        ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+            EXPECT_THAT(mock->forwardHistory()[static_cast<size_t>(forward_count_after_prefill + 2)],
+                        ElementsAre(MockInferenceRunner::DECODE_ARGMAX_TOKEN));
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *catchup =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_catchup_runs",
+                                       {{"implementation", "shared_stepwise"},
+                                        {"draft_tokens", "7,9,9,9"},
+                                        {"accepted_tokens", "7,9,3"},
+                                        {"verifier_tokens", "9,3"},
+                                        {"accepted_speculative_prefix", "1"},
+                                        {"all_speculative_accepted", "false"}});
+            ASSERT_NE(catchup, nullptr);
+
+            const PerfStatRecord *legacy_run_counter =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_sequential_verifier_runs",
+                                       {{"forward_tokens", "3"},
+                                        {"draft_tokens", "4"},
+                                        {"catchup_implementation", "shared_stepwise"}});
+            ASSERT_NE(legacy_run_counter, nullptr);
+
+            const PerfStatRecord *accept_trace =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "acceptance_trace",
+                                       {{"first_token", std::to_string(MockInferenceRunner::PREFILL_ARGMAX_TOKEN)},
+                                        {"accepted_speculative_prefix", "1"},
+                                        {"all_speculative_accepted", "false"},
+                                        {"verifier_path", "decode_equivalent_catchup"},
+                                        {"catchup_implementation", "shared_stepwise"},
+                                        {"decode_equivalent_replay_required", "true"},
+                                        {"output_tokens", "3"}});
+            ASSERT_NE(accept_trace, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
     TEST_F(Test__PrefillDecodeTransition, ROCmMTPHardFailsWithBroadConcurrentDecodeFlag)
     {
         ScopedEnv broad_concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE", "1");
@@ -2562,6 +2673,7 @@ namespace
                 /*hide_local_logits=*/false,
                 DeviceId::cuda(0));
             mock->enableVerifierRowRestore();
+            mock->requireMTPDecodeEquivalentReplay();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::VERIFY_REJECT_TOKEN,
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
@@ -2578,9 +2690,9 @@ namespace
                                     MockInferenceRunner::VERIFY_REJECT_TOKEN));
             EXPECT_EQ(mock->restoreVerifierRowCount(), 0);
             EXPECT_EQ(mock->restoreCount(), 1);
-            EXPECT_EQ(mock->captureCheckpointCount(), 1)
-                << "CUDA depth-1 sequential verification restores the verifier base "
-                   "and skips the post-sidecar payload checkpoint.";
+            EXPECT_EQ(mock->captureCheckpointCount(), 2)
+                << "shared catch-up keeps the post-sidecar checkpoint until a "
+                   "backend-optimized multi-row path is explicitly promoted.";
             EXPECT_EQ(mock->commitMTPShiftedCount(), 2);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 0);
@@ -2605,14 +2717,13 @@ namespace
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
                                "post_sidecar_checkpoint_skipped_verifier_row_restore");
-            ASSERT_NE(skipped_checkpoint, nullptr);
-            EXPECT_DOUBLE_EQ(skipped_checkpoint->value, 1.0);
+            EXPECT_EQ(skipped_checkpoint, nullptr);
 
             const PerfStatRecord *post_sidecar_capture =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Timer,
                                "capture_post_sidecar_prefix_state");
-            EXPECT_EQ(post_sidecar_capture, nullptr);
+            ASSERT_NE(post_sidecar_capture, nullptr);
 
             const PerfStatRecord *replay_tokens =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
@@ -2622,10 +2733,15 @@ namespace
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "replay_forward_sequential_shifted_commit");
             EXPECT_EQ(replay_forward, nullptr);
 
-            const PerfStatRecord *sequential =
-                findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_runs");
-            ASSERT_NE(sequential, nullptr);
-            EXPECT_DOUBLE_EQ(sequential->value, 1.0);
+            const PerfStatRecord *catchup =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_catchup_runs",
+                                       {{"implementation", "shared_stepwise"},
+                                        {"draft_tokens", "7,9"},
+                                        {"accepted_tokens", "7,4"},
+                                        {"verifier_tokens", "4"}});
+            ASSERT_NE(catchup, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -2648,6 +2764,7 @@ namespace
                 /*hide_local_logits=*/false,
                 DeviceId::cuda(0));
             mock->advertiseVerifierRowRestoreWithoutImplementation();
+            mock->requireMTPDecodeEquivalentReplay();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::VERIFY_REJECT_TOKEN,
                 MockInferenceRunner::DECODE_ARGMAX_TOKEN,
@@ -2661,15 +2778,14 @@ namespace
                 << "depth-1 CUDA sequential verification restores the verifier base "
                    "but does not require verifier-row restore";
             EXPECT_EQ(mock->restoreVerifierRowCount(), 0);
-            EXPECT_EQ(mock->captureCheckpointCount(), 1);
+            EXPECT_EQ(mock->captureCheckpointCount(), 2);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *skipped_checkpoint =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
                                "post_sidecar_checkpoint_skipped_verifier_row_restore");
-            ASSERT_NE(skipped_checkpoint, nullptr);
-            EXPECT_DOUBLE_EQ(skipped_checkpoint->value, 1.0);
+            EXPECT_EQ(skipped_checkpoint, nullptr);
 
             const PerfStatRecord *shortcut_unavailable =
                 findPerfRecord(records,
@@ -2681,11 +2797,17 @@ namespace
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Timer,
                                "capture_post_sidecar_prefix_state");
-            EXPECT_EQ(post_sidecar_capture, nullptr);
+            ASSERT_NE(post_sidecar_capture, nullptr);
 
-            const PerfStatRecord *sequential =
-                findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_runs");
-            ASSERT_NE(sequential, nullptr);
+            const PerfStatRecord *catchup =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_catchup_runs",
+                                       {{"implementation", "shared_stepwise"},
+                                        {"draft_tokens", "7,9"},
+                                        {"accepted_tokens", "7,4"},
+                                        {"verifier_tokens", "4"}});
+            ASSERT_NE(catchup, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

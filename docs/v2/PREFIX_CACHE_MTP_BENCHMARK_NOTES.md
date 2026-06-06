@@ -44,11 +44,11 @@ CUDA MoE `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`.
 - CUDA dense no-MTP decode is restored by generated NativeVNNI GEMV dispatch
   rules. Dense MTP remains speed-negative because accepted speculative tokens
   still pay decode-equivalent verifier forwards.
-- ROCm and CUDA now share the same GDN verifier policy. Long-prefix one-row
-  restore parity is green on both backends, but M=4 all-position verifier state
-  is explicitly not decode-equivalent on both. `MTPVerifierPolicy` therefore
-  routes stateful greedy GDN MTP through decode-equivalent sequential replay and
-  prevents all-position verifier rows from being committed as safe state.
+- ROCm and CUDA now share the same GDN verifier policy and the same
+  `MTPDecodeCatchup` contract. The promoted path is `shared_stepwise`: commit
+  shifted row, forward one decode row, sample, and repeat. Long-prefix one-row
+  restore and M=2 sequential-equivalence parity are green on both backends, while
+  raw all-position GDN verifier rows remain unpromoted.
 - CUDA transaction validation is green again: committed-state stamps are scalar,
   payload-bearing snapshots are not cloned for metadata, and moved snapshots
   leave nested payload handles empty.
@@ -57,10 +57,9 @@ CUDA MoE `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`.
 
 ## Retained Actions
 
-- CUDA/ROCm dense: replace the sequential verifier wall with a proven
-  decode-equivalent multi-row verifier/catchup design. Do not re-enable raw
-  GDN all-position verifier-row shortcuts until continuation-equivalence tests
-  pass.
+- CUDA/ROCm dense: promote an optimized graph-captured catch-up only after it
+  proves equivalence to `MTPDecodeCatchup` and beats the `shared_stepwise`
+  verifier wall. Do not re-enable raw GDN all-position verifier-row shortcuts.
 - CUDA MoE: keep the 148.5 tok/s ratchet and extend long-prompt/controller
   evidence without weakening parity.
 - ROCm: continue toward the 2x dense target by reducing captured verifier GPU
