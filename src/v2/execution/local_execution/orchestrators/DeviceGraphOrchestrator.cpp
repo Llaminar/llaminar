@@ -6646,33 +6646,106 @@ namespace llaminar2
             return true;
         }
 
-        if (handle.layout.hybrid_host_state_bytes > 0)
+        return acquireLiveHybridCheckpointStorage(handle);
+    }
+
+    bool DeviceGraphOrchestrator::acquireLiveHybridCheckpointStorage(PrefixBlockHandle &handle) const
+    {
+        if (!handle.layout.includes_hybrid_state)
         {
-            handle.hybrid_storage =
-                std::make_shared<std::vector<uint8_t>>(handle.layout.hybrid_host_state_bytes);
-            handle.hybrid_payload = handle.hybrid_storage->data();
-        }
-        else
-        {
-            handle.hybrid_storage.reset();
-            handle.hybrid_payload = nullptr;
+            return true;
         }
 
-        if (handle.layout.hybrid_device_state_bytes > 0)
+        const size_t host_bytes = handle.layout.hybrid_host_state_bytes;
+        const size_t device_bytes = handle.layout.hybrid_device_state_bytes;
+        const bool needs_host = host_bytes > 0;
+        const bool needs_device = device_bytes > 0;
+        auto assign_slot = [&](LiveHybridCheckpointStorageSlot &slot)
         {
-            handle.device_hybrid_storage =
-                allocateDeviceByteStorage(handle.layout.hybrid_device_state_bytes,
-                                          state_.device_id);
-            if (!handle.device_hybrid_storage)
+            if (needs_host)
+            {
+                slot.host_storage->resize(host_bytes);
+                handle.hybrid_storage = slot.host_storage;
+                handle.hybrid_payload = slot.host_storage->data();
+            }
+            else
+            {
+                handle.hybrid_storage.reset();
+                handle.hybrid_payload = nullptr;
+            }
+
+            if (needs_device)
+            {
+                handle.device_hybrid_storage = slot.device_storage;
+            }
+            else
+            {
+                handle.device_hybrid_storage.reset();
+            }
+        };
+
+        for (auto &slot : live_hybrid_checkpoint_storage_pool_)
+        {
+            const bool slot_free =
+                (!slot.host_storage || slot.host_storage.use_count() == 1) &&
+                (!slot.device_storage || slot.device_storage.use_count() == 1);
+            const bool host_ok =
+                !needs_host ||
+                (slot.host_storage && slot.host_capacity_bytes >= host_bytes);
+            const bool device_ok =
+                !needs_device ||
+                (slot.device_storage &&
+                 slot.device_capacity_bytes >= device_bytes &&
+                 slot.device == state_.device_id);
+            if (!slot_free || !host_ok || !device_ok)
+            {
+                continue;
+            }
+
+            assign_slot(slot);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "live_prefix_checkpoint_hybrid_storage_pool_hits",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"host_bytes", std::to_string(host_bytes)},
+                 {"device_bytes", std::to_string(device_bytes)}});
+            return true;
+        }
+
+        LiveHybridCheckpointStorageSlot slot;
+        slot.device = state_.device_id;
+
+        if (needs_host)
+        {
+            slot.host_storage =
+                std::make_shared<std::vector<uint8_t>>(host_bytes);
+            slot.host_capacity_bytes = slot.host_storage->capacity();
+        }
+
+        if (needs_device)
+        {
+            slot.device_storage =
+                allocateDeviceByteStorage(device_bytes, state_.device_id);
+            if (!slot.device_storage)
             {
                 return false;
             }
-        }
-        else
-        {
-            handle.device_hybrid_storage.reset();
+            slot.device_capacity_bytes = device_bytes;
         }
 
+        live_hybrid_checkpoint_storage_pool_.push_back(std::move(slot));
+        assign_slot(live_hybrid_checkpoint_storage_pool_.back());
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "live_prefix_checkpoint_hybrid_storage_pool_misses",
+            1.0,
+            "decode",
+            state_.device_id.toString(),
+            {{"host_bytes", std::to_string(host_bytes)},
+             {"device_bytes", std::to_string(device_bytes)},
+             {"pool_size", std::to_string(live_hybrid_checkpoint_storage_pool_.size())}});
         return true;
     }
 

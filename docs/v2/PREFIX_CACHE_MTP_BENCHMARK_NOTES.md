@@ -11,7 +11,7 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP, sequential verifier | 595.72 | 38.63 | correct, verifier still slower than baseline |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 595.50 | 32.06 | correct, deeper verifier overhead |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2460.26 | 111.30 | stable after MoE graph-boundary fix |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1667.00 | 32.02 | crash fixed; perf regressed, next tuning target |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1823.36 | 64.14 | checkpoint allocation pool restored half the gap |
 | Dense long `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP | n/a | 54.78 | 1.77x over 30.93 baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
@@ -19,7 +19,8 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 
 Artifacts:
 CUDA dense `benchmark_results/cuda_dense_mtp/20260606T070336Z-dense-cuda-stage-attribution`;
-CUDA MoE `benchmark_results/cuda_moe_mtp/20260606T111408Z-d1-crash-isolation`.
+CUDA MoE crash fix `benchmark_results/cuda_moe_mtp/20260606T111408Z-d1-crash-isolation`;
+CUDA MoE checkpoint pool `benchmark_results/cuda_moe_mtp/20260606T122032Z-checkpoint-pool`.
 
 ## llama.cpp CUDA Anchors
 
@@ -49,16 +50,16 @@ CUDA MoE `benchmark_results/cuda_moe_mtp/20260606T111408Z-d1-crash-isolation`.
 - Graph failure attribution is stricter: checked stream syncs, full segment
   names in failure logs, optional CUDA embedding pointer validation, and passive
   perf JSON export.
-- CUDA MTP correctness is green but perf is not: sequential greedy verification
-  pays main replay, shifted-row commit, and sidecar restore overhead. ROCm remains
-  the proven dense MTP speed lane because its verifier-row restore shortcut has
-  parity coverage.
+- CUDA MoE MTP live hybrid checkpoints now reuse pooled storage. The measured
+  checkpoint storage timer dropped from about 25.9 ms/step to 0.002 ms/step,
+  lifting fixed d1 decode from 32.0 to 64.1 tok/s. The remaining CUDA MoE MTP
+  wall is verifier replay plus shifted-row commit, not checkpoint allocation.
 
 ## Retained Actions
 
 - CUDA: recover MTP speed after the correctness fixes. Fixed d1 MoE is stable
-  but only 32.0 tok/s versus 111.3 tok/s no-MTP, so target verifier/sidecar
-  overhead before re-chasing depth policy.
+  at 64.1 tok/s versus 111.3 tok/s no-MTP, so target verifier replay and
+  shifted-row commit before re-chasing depth policy.
 - ROCm: continue toward the 2x dense target by reducing captured verifier GPU
   work in GEMM, fused Gate/Up, GDN projection, recurrence, and LM head.
 - Shared: keep generated GEMM/GEMV dispatch tables aligned with prefill buckets,

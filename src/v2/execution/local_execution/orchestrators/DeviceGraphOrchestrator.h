@@ -2299,6 +2299,15 @@ namespace llaminar2
         uint64_t prefix_fingerprint_ = 0;
         bool prefix_cache_bypassed_ = false;
         std::string prefix_cache_bypass_reason_;
+        struct LiveHybridCheckpointStorageSlot
+        {
+            size_t host_capacity_bytes = 0;
+            size_t device_capacity_bytes = 0;
+            DeviceId device = DeviceId::invalid();
+            std::shared_ptr<std::vector<uint8_t>> host_storage;
+            std::shared_ptr<TensorBase> device_storage;
+        };
+        mutable std::vector<LiveHybridCheckpointStorageSlot> live_hybrid_checkpoint_storage_pool_;
         bool ensurePrefixCacheReady();
         bool isPrefixCacheMoEModel() const;
         void *explicitGPUStreamForOperation(const char *operation) const;
@@ -2312,6 +2321,7 @@ namespace llaminar2
             int block_index,
             uint64_t parent_hash) const;
         void disablePrefixCacheForRunner(const std::string &reason);
+        bool acquireLiveHybridCheckpointStorage(PrefixBlockHandle &handle) const;
         bool ensureLiveHybridCheckpointStorage(PrefixBlockHandle &handle) const;
         bool initializeMTPKVCaches(
             int batch_size,

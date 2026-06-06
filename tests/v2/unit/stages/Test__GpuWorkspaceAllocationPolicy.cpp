@@ -698,3 +698,33 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineStartsFreshGraphSegment
     EXPECT_NE(combine_section.find("copy_params.graph_capture_boundary_before = true"), std::string::npos)
         << "The no-shared-expert copy form of MoE combine has the same graph-boundary contract.";
 }
+
+TEST(Test__GpuWorkspaceAllocationPolicy, LiveHybridCheckpointStorageUsesReusablePool)
+{
+    const auto header_source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.h");
+    EXPECT_NE(header_source.find("LiveHybridCheckpointStorageSlot"), std::string::npos);
+    EXPECT_NE(header_source.find("live_hybrid_checkpoint_storage_pool_"), std::string::npos);
+
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto ensure_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::ensureLiveHybridCheckpointStorage(",
+        "bool DeviceGraphOrchestrator::acquireLiveHybridCheckpointStorage(");
+    EXPECT_NE(ensure_body.find("return acquireLiveHybridCheckpointStorage(handle);"), std::string::npos)
+        << "The hot live-checkpoint path must not allocate fresh hybrid storage on every MTP decode step.";
+    EXPECT_EQ(ensure_body.find("allocateDeviceByteStorage("), std::string::npos)
+        << "Per-step checkpoint device allocation regresses CUDA MoE MTP decode.";
+
+    const auto acquire_body = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::acquireLiveHybridCheckpointStorage(",
+        "PrefixStateSnapshot DeviceGraphOrchestrator::captureLivePrefixCheckpoint(");
+    EXPECT_NE(acquire_body.find("host_storage.use_count() == 1"), std::string::npos)
+        << "Pool slots must not be reused while a PrefixStateSnapshot still owns host payload storage.";
+    EXPECT_NE(acquire_body.find("device_storage.use_count() == 1"), std::string::npos)
+        << "Pool slots must not be reused while a PrefixStateSnapshot still owns device payload storage.";
+    EXPECT_NE(acquire_body.find("live_prefix_checkpoint_hybrid_storage_pool_hits"), std::string::npos);
+    EXPECT_NE(acquire_body.find("live_prefix_checkpoint_hybrid_storage_pool_misses"), std::string::npos);
+}
