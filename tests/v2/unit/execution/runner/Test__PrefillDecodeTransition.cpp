@@ -2455,9 +2455,9 @@ namespace
                                     MockInferenceRunner::VERIFY_REJECT_TOKEN));
             EXPECT_EQ(mock->restoreVerifierRowCount(), 0);
             EXPECT_EQ(mock->restoreCount(), 0);
-            EXPECT_EQ(mock->captureCheckpointCount(), 2)
-                << "CUDA keeps a real post-sidecar checkpoint because verifier rows "
-                   "are not decode-equivalent shifted-cache inputs";
+            EXPECT_EQ(mock->captureCheckpointCount(), 1)
+                << "CUDA depth-1 sequential verification uses the base checkpoint "
+                   "and skips the post-sidecar payload checkpoint.";
             EXPECT_EQ(mock->commitMTPShiftedCount(), 1);
             EXPECT_EQ(mock->lastCommitMTPAlreadyAppended(), 1);
             EXPECT_EQ(mock->lastCommitMTPMainForwardTokenCount(), 0);
@@ -2482,13 +2482,14 @@ namespace
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
                                "post_sidecar_checkpoint_skipped_verifier_row_restore");
-            EXPECT_EQ(skipped_checkpoint, nullptr);
+            ASSERT_NE(skipped_checkpoint, nullptr);
+            EXPECT_DOUBLE_EQ(skipped_checkpoint->value, 1.0);
 
             const PerfStatRecord *post_sidecar_capture =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Timer,
                                "capture_post_sidecar_prefix_state");
-            ASSERT_NE(post_sidecar_capture, nullptr);
+            EXPECT_EQ(post_sidecar_capture, nullptr);
 
             const PerfStatRecord *replay_tokens =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
@@ -2536,14 +2537,15 @@ namespace
             EXPECT_EQ(mock->restoreCount(), 0)
                 << "depth-1 CUDA sequential verification does not need any state restore";
             EXPECT_EQ(mock->restoreVerifierRowCount(), 0);
-            EXPECT_EQ(mock->captureCheckpointCount(), 2);
+            EXPECT_EQ(mock->captureCheckpointCount(), 1);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *skipped_checkpoint =
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Counter,
                                "post_sidecar_checkpoint_skipped_verifier_row_restore");
-            EXPECT_EQ(skipped_checkpoint, nullptr);
+            ASSERT_NE(skipped_checkpoint, nullptr);
+            EXPECT_DOUBLE_EQ(skipped_checkpoint->value, 1.0);
 
             const PerfStatRecord *shortcut_unavailable =
                 findPerfRecord(records,
@@ -2555,7 +2557,7 @@ namespace
                 findPerfRecord(records,
                                PerfStatRecord::Kind::Timer,
                                "capture_post_sidecar_prefix_state");
-            ASSERT_NE(post_sidecar_capture, nullptr);
+            EXPECT_EQ(post_sidecar_capture, nullptr);
 
             const PerfStatRecord *sequential =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_runs");

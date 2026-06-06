@@ -1831,14 +1831,16 @@ namespace llaminar2
             }
         }
 
+        const bool disable_cuda_sequential_greedy_verifier =
+            DebugEnv::isTruthyEnvValue(
+                std::getenv("LLAMINAR_MTP_CUDA_DISABLE_SEQUENTIAL_GREEDY_VERIFIER"));
         const bool use_cuda_sequential_greedy_verifier =
             runner_ &&
             runner_->primaryDeviceId().is_cuda() &&
             !stochastic_verify &&
             !use_sampling_penalties &&
             active_sampling_params_.is_greedy() &&
-            DebugEnv::isTruthyEnvValue(
-                std::getenv("LLAMINAR_MTP_CUDA_SEQUENTIAL_GREEDY_VERIFIER"));
+            !disable_cuda_sequential_greedy_verifier;
         if (use_cuda_sequential_greedy_verifier)
         {
             if (sidecar_checkpoints.empty())
