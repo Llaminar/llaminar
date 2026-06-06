@@ -7,9 +7,9 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 
 | Scope | Device | Model | Mode | Prefill tok/s | Decode tok/s | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 623.12 | 16.69 | current correctness baseline |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP, replay | 426.11 | 7.30 | correct but regresses |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, replay | 426.44 | 8.25 | correct but regresses |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 704.05 | 41.61 | decode restored after GEMV dispatch fix |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP, sequential verifier | 595.72 | 38.63 | correct, verifier still slower than baseline |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 595.50 | 32.06 | correct, deeper verifier overhead |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | beats l.cpp no-MTP |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | pre-hardening MoE ratchet |
 | Dense long `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP | n/a | 54.78 | 1.77x over 30.93 baseline |
@@ -18,7 +18,7 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 | TP / PP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
 
 Current CUDA dense artifacts:
-`benchmark_results/cuda_dense_mtp/20260606T055941Z-cuda-verifier-hardening`.
+`benchmark_results/cuda_dense_mtp/20260606T070336Z-dense-cuda-stage-attribution`.
 
 ## llama.cpp CUDA Anchors
 
@@ -38,26 +38,28 @@ Current CUDA dense artifacts:
 
 ## Current Findings
 
-- CUDA dense verifier-row state shortcuts are unsafe for Qwen3.6 today.
-  Forced shortcut d3 fails immediately after accumulated shortcut state:
-  `condition=674`, accepted `258,10608,20271,92217`, committed next `48567`,
-  sequential replay next `1473`.
-- Forced shortcut d1 also fails a deeper continuation check: first next token
-  matches, but the committed continuation diverges within 16 greedy tokens.
-- The clean local M=4 verifier terminal token can match sequential decode, but
-  the captured/restored GDN/KV/hidden payload is not decode-equivalent and later
-  contaminates the stream. CUDA therefore keeps verifier-row shortcuts disabled
-  and pays replay for correctness.
-- CUDA replay path is not economically viable: fixed d1 records 64 rollbacks for
-  64 verifier runs, and fixed d3 records 33 rollbacks for 33 verifier runs.
+- A stale generated CUDA NativeVNNI GEMV dispatch table caused the dense decode
+  collapse. Exact Qwen3.6 decode-shape rules restored no-MTP decode from about
+  16.7 tok/s to 41.6 tok/s, matching the llama.cpp no-MTP decode anchor.
+- CUDA dense verifier-row state shortcuts remain unsafe for Qwen3.6. The latest
+  forced shortcut strict check diverged after `condition=27775`, accepted
+  `383,279`, next `1414`: committed continuation `3294,11,1092,513` versus
+  replay `3294,11,1092,369`.
+- Direct CUDA recurrence and short-conv verifier-row restore regressions now
+  pass multi-step replay checks. The remaining blocker is full-graph all-position
+  verifier state decode-equivalence, not the low-level restore primitive alone.
+- CUDA therefore keeps verifier-row shortcuts disabled and uses a
+  decode-equivalent sequential greedy verifier. It is correctness-green but still
+  slower than baseline because each accepted verifier row pays one-token main
+  replay, shifted-row commit, and sidecar restore overhead.
 - ROCm remains the proven dense MTP speed lane because its verifier-row restore
   shortcut has parity coverage and avoids accepted-token replay.
 
 ## Retained Actions
 
-- CUDA dense: make small-M verifier execution decode-equivalent, or build a
-  graph-native sequential verifier that avoids duplicated all-position verifier
-  plus replay work. Until then, do not re-enable CUDA verifier-row shortcuts.
+- CUDA dense: keep the sequential verifier and attack its remaining overhead,
+  especially one-token main graph replay, shifted-row commit, and sidecar restore
+  cost. Do not re-enable CUDA verifier-row shortcuts.
 - CUDA MoE: rerun after dense hardening before treating pre-hardening MTP wins as
   production evidence.
 - ROCm: continue toward the 2x dense target by reducing captured verifier GPU

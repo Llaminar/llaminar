@@ -1609,6 +1609,19 @@ set_tests_properties(V2_Unit_CUDAGemvDispatchGeneratorAliases PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_CUDAGemvDispatchBaseMerge
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_gemv_dispatch_base_merge.py
+            --generator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/analyze_cuda_tc_gemv_dispatch.py
+            --input ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/fixtures/cuda_gemv_dispatch_alias_smoke.csv
+            --base-include ${CMAKE_SOURCE_DIR}/kernels/cuda/gemm/CUDANativeVNNIGemvDispatchHeuristicGenerated.inc
+            --dispatch-validator ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/validate_native_vnni_generated_dispatch_ids.py
+)
+set_tests_properties(V2_Unit_CUDAGemvDispatchBaseMerge PROPERTIES
+    LABELS "V2;Unit;CUDA;GEMV;NativeVNNI;Codebook;Dispatch;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_CUDAPrefillDispatchGeneratorAliases
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_prefill_dispatch_generator.py

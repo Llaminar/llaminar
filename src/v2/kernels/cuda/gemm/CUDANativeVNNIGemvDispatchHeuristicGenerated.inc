@@ -4237,12 +4237,82 @@ inline __host__ void selectGeneratedDispatch_(
     }
 }
 
+// BEGIN generated known-shape overrides from analyze_cuda_tc_gemv_dispatch.py
+// Source CSV: benchmark_results/cuda_dense_mtp/20260606T070336Z-dense-cuda-stage-attribution/qwen36_q4q5_kpar_sweep.csv
+// Known-shape override coverage: 8/8 (100.00%)
+// These exact (N,K) winners are layered over the existing broad fallback table.
+
+struct GeneratedKnownShapeEntry
+{
+    uint64_t packed_key;
+    NativeGemvShape shape;
+    GeneratedDispatchTuning tuning;
+};
+
+inline constexpr uint64_t packGeneratedDispatchKey(int N, int K)
+{
+    return (static_cast<uint64_t>(static_cast<uint32_t>(K)) << 32) |
+           static_cast<uint32_t>(N);
+}
+
+template <size_t Count>
+inline bool findGeneratedKnownShape(const GeneratedKnownShapeEntry (&table)[Count], uint64_t packed_key, NativeGemvShape &out_shape, GeneratedDispatchTuning &out_tuning)
+{
+    size_t lo = 0;
+    size_t hi = Count;
+    while (lo < hi)
+    {
+        const size_t mid = lo + ((hi - lo) / 2);
+        const uint64_t candidate = table[mid].packed_key;
+        if (candidate == packed_key)
+        {
+            out_shape = table[mid].shape;
+            out_tuning = table[mid].tuning;
+            return true;
+        }
+        if (candidate < packed_key)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return false;
+}
+
+template <uint8_t CB>
+inline bool selectKnownShapeGenerated(int N, int K, NativeGemvShape &out_shape, GeneratedDispatchTuning &out_tuning)
+{
+    const uint64_t packed_key = packGeneratedDispatchKey(N, K);
+    if constexpr (CB == 5) { // Q4_1
+        static constexpr GeneratedKnownShapeEntry kTable[] = {
+            { 0x0000140000001800ULL, NativeGemvShape::KPAR, { 64, 1, 8, 2, 0, 2 } }, // 6144x5120 1/1
+            { 0x0000140000002800ULL, NativeGemvShape::KPAR, { 64, 1, 8, 8, 0, 2 } }, // 10240x5120 1/1
+            { 0x0000180000001400ULL, NativeGemvShape::KPAR, { 64, 1, 8, 4, 0, 1 } }, // 5120x6144 1/1
+            { 0x0000440000001400ULL, NativeGemvShape::KPAR, { 64, 1, 8, 2, 0, 2 } }, // 5120x17408 1/1
+        };
+        return findGeneratedKnownShape(kTable, packed_key, out_shape, out_tuning);
+    }
+    else if constexpr (CB == 7) { // Q5_1
+        static constexpr GeneratedKnownShapeEntry kTable[] = {
+            { 0x0000140000001800ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 0, 0 } }, // 6144x5120 1/1
+            { 0x0000140000002800ULL, NativeGemvShape::KPAR, { 128, 1, 8, 4, 8, 0 } }, // 10240x5120 1/1
+            { 0x0000180000001400ULL, NativeGemvShape::KPAR, { 64, 1, 16, 4, 0, 0 } }, // 5120x6144 1/1
+            { 0x0000440000001400ULL, NativeGemvShape::KPAR, { 128, 1, 8, 2, 0, 0 } }, // 5120x17408 1/1
+        };
+        return findGeneratedKnownShape(kTable, packed_key, out_shape, out_tuning);
+    }
+    return false;
+}
+
+// END generated known-shape overrides from analyze_cuda_tc_gemv_dispatch.py
+
 // Public API consumed by dispatchCodebook<CB>()
 template <uint8_t CB>
 inline NativeGemvShape classifyShapeGenerated(int N, int K)
 {
-    NativeGemvShape shape;
-    GeneratedDispatchTuning tuning;
+    NativeGemvShape shape = NativeGemvShape::KPAR;
+    GeneratedDispatchTuning tuning{};
+    if (selectKnownShapeGenerated<CB>(N, K, shape, tuning))
+        return shape;
     selectGeneratedDispatch_<CB>(N, K, shape, tuning);
     return shape;
 }
@@ -4250,8 +4320,10 @@ inline NativeGemvShape classifyShapeGenerated(int N, int K)
 template <uint8_t CB>
 inline GeneratedDispatchTuning selectGeneratedTuning(int N, int K)
 {
-    NativeGemvShape shape;
-    GeneratedDispatchTuning tuning;
+    NativeGemvShape shape = NativeGemvShape::KPAR;
+    GeneratedDispatchTuning tuning{};
+    if (selectKnownShapeGenerated<CB>(N, K, shape, tuning))
+        return tuning;
     selectGeneratedDispatch_<CB>(N, K, shape, tuning);
     return tuning;
 }

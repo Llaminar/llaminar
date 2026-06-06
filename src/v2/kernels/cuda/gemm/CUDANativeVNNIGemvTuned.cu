@@ -26,6 +26,7 @@
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -216,6 +217,54 @@ namespace
             enabled = llaminar2::debugEnv().gemm.cuda_gemv_rowpar ? 1 : 0;
         }
         return enabled == 1;
+    }
+
+    static const char *shapeName(NativeGemvShape shape)
+    {
+        switch (shape)
+        {
+        case NativeGemvShape::WIDE:
+            return "wide";
+        case NativeGemvShape::KPAR:
+            return "kpar";
+        case NativeGemvShape::DIRECT:
+            return "direct";
+        case NativeGemvShape::ROWPAR:
+            return "rowpar";
+        }
+        return "unknown";
+    }
+
+    template <uint8_t CB>
+    static void recordGemvDispatch(
+        NativeGemvShape shape,
+        const GeneratedDispatchTuning &tuning,
+        int N,
+        int K,
+        bool rowmajor_available,
+        int cuda_device_id)
+    {
+        if (!llaminar2::PerfStatsCollector::isEnabled())
+            return;
+
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_native_vnni_gemv_dispatch",
+            1.0,
+            "decode",
+            "cuda:" + std::to_string(cuda_device_id),
+            llaminar2::PerfStatsCollector::Tags{
+                {"codebook", std::to_string(static_cast<int>(CB))},
+                {"n", std::to_string(N)},
+                {"k", std::to_string(K)},
+                {"route", shapeName(shape)},
+                {"tile_n", std::to_string(tuning.tile_n)},
+                {"cpt", std::to_string(tuning.cpt)},
+                {"target_waves", std::to_string(tuning.target_waves)},
+                {"mkg", std::to_string(tuning.mkg)},
+                {"max_kb", std::to_string(tuning.max_kb)},
+                {"force_two_phase", std::to_string(tuning.force_two_phase)},
+                {"rowmajor_available", rowmajor_available ? "true" : "false"}});
     }
 
     // =====================================================================
@@ -2018,6 +2067,14 @@ namespace
                 }
             }
 
+            recordGemvDispatch<CB>(
+                shape,
+                tuning,
+                N,
+                K,
+                rm_slot && *rm_slot && (*rm_slot)->d_payload,
+                cuda_device_id);
+
             return dispatchGeneratedTuning<CB>(
                 shape, tuning,
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C,
@@ -2057,6 +2114,14 @@ namespace
                 }
             }
         }
+
+        recordGemvDispatch<CB>(
+            shape,
+            tuning,
+            N,
+            K,
+            rm_slot && *rm_slot && (*rm_slot)->d_payload,
+            cuda_device_id);
 
         return dispatchGeneratedTuning<CB>(
             shape, tuning,

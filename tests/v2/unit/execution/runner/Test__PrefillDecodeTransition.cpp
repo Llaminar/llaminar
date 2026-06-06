@@ -685,6 +685,11 @@ namespace
             verifier_accepted_prefix_script_ = std::move(script);
             verifier_accepted_prefix_script_index_ = 0;
         }
+        void setDecodeArgmaxScript(std::vector<int> script)
+        {
+            decode_argmax_script_ = std::move(script);
+            decode_argmax_script_index_ = 0;
+        }
         PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
         {
             (void)seq_idx;
@@ -891,11 +896,17 @@ namespace
         void setupDecodeLogits()
         {
             logits_.assign(VOCAB_SIZE, -10.0f);
-            logits_[DECODE_ARGMAX_TOKEN] = 10.0f; // Token 3 is argmax
+            int token = DECODE_ARGMAX_TOKEN;
+            if (decode_argmax_script_index_ < decode_argmax_script_.size())
+            {
+                token = decode_argmax_script_[decode_argmax_script_index_++];
+                token = std::clamp(token, 0, VOCAB_SIZE - 1);
+            }
+            logits_[token] = 10.0f;
             if (column_parallel_logits_)
             {
                 resetLocalTensor(logits_local_, 1);
-                setLocalToken(logits_local_, 0, DECODE_ARGMAX_TOKEN, 10.0f);
+                setLocalToken(logits_local_, 0, token, 10.0f);
             }
         }
 
@@ -1037,10 +1048,12 @@ namespace
         std::vector<std::vector<int>> forward_history_;
         std::vector<int> last_commit_mtp_tokens_;
         std::vector<int> verifier_accepted_prefix_script_;
+        std::vector<int> decode_argmax_script_;
         std::array<std::vector<SamplingDistributionEntry>, 4> target_device_distributions_;
         std::array<std::vector<SamplingDistributionEntry>, 3> draft_device_distributions_;
         std::vector<SamplingDistributionEntry> invalid_distribution_;
         size_t verifier_accepted_prefix_script_index_{0};
+        size_t decode_argmax_script_index_{0};
         int last_forward_seq_len_{0};
         int position_{0};
     };
@@ -1514,6 +1527,77 @@ namespace
             const PerfStatRecord *host_sample =
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "sample_mtp_token_host");
             EXPECT_EQ(host_sample, nullptr);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, CUDAMTPUsesSequentialGreedyVerifierInsteadOfAllPositionReplay)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_cuda_sequential_verifier_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/true);
+            mock->setDecodeArgmaxScript({
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+            });
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->setAllPositionCount(), 0)
+                << "CUDA dense must not enter the unsafe multi-row verifier shortcut path";
+            EXPECT_EQ(mock->sampleAllPositionLogitsCount(), 0);
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
+            EXPECT_EQ(mock->restoreCount(), 1)
+                << "depth>1 speculative sidecar rows are discarded back to the first sidecar checkpoint";
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 2);
+            EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
+            EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
+
+            ASSERT_GE(mock->forwardHistory().size(), 4u);
+            EXPECT_THAT(mock->forwardHistory()[0], ElementsAre(1, 2, 3, 4, 5));
+            EXPECT_THAT(mock->forwardHistory()[1], ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN));
+            EXPECT_THAT(mock->forwardHistory()[2], ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+            EXPECT_THAT(mock->forwardHistory()[3], ElementsAre(MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            const auto probe = runner->prefixStateProbe();
+            EXPECT_EQ(probe.mtp_draft_steps, 2u);
+            EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+            EXPECT_EQ(probe.mtp_verifier_token_count, 3u);
+            EXPECT_EQ(probe.mtp_accepted_tokens, 2u);
+            EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+            EXPECT_EQ(probe.mtp_rollbacks, 1u);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *sequential =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_runs");
+            ASSERT_NE(sequential, nullptr);
+            EXPECT_DOUBLE_EQ(sequential->value, 1.0);
+            const PerfStatRecord *all_position =
+                findPerfRecord(records, PerfStatRecord::Kind::Timer, "verifier_forward");
+            EXPECT_EQ(all_position, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -2338,7 +2422,7 @@ namespace
         PerfStatsCollector::reset();
     }
 
-    TEST_F(Test__PrefillDecodeTransition, CUDAMTPForcedRejectUsesCheckpointAndSequentialShiftedCommit)
+    TEST_F(Test__PrefillDecodeTransition, CUDAMTPForcedRejectUsesSequentialVerifierAndShiftedCommit)
     {
         const std::filesystem::path export_path =
             std::filesystem::temp_directory_path() / "llaminar_cuda_mtp_verifier_row_shortcut_unit.json";
@@ -2355,6 +2439,10 @@ namespace
                 /*hide_local_logits=*/false,
                 DeviceId::cuda(0));
             mock->enableVerifierRowRestore();
+            mock->setDecodeArgmaxScript({
+                MockInferenceRunner::VERIFY_REJECT_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+            });
 
             std::vector<int32_t> prompt = {1, 2, 3, 4, 5};
             ASSERT_TRUE(runner->prefill(prompt));
@@ -2366,7 +2454,7 @@ namespace
                         ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
                                     MockInferenceRunner::VERIFY_REJECT_TOKEN));
             EXPECT_EQ(mock->restoreVerifierRowCount(), 0);
-            EXPECT_EQ(mock->restoreCount(), 1);
+            EXPECT_EQ(mock->restoreCount(), 0);
             EXPECT_EQ(mock->captureCheckpointCount(), 2)
                 << "CUDA keeps a real post-sidecar checkpoint because verifier rows "
                    "are not decode-equivalent shifted-cache inputs";
@@ -2376,15 +2464,12 @@ namespace
             EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 1);
             EXPECT_TRUE(mock->lastCommitMTPAllowSpeculativeDiscard());
             EXPECT_EQ(mock->lastCommitMTPPositionOffsetOverride(), 5);
-            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 3)
-                << "CUDA replays accepted output tokens sequentially before returning them";
+            EXPECT_EQ(mock->forwardCallCount(), forward_count_after_prefill + 2)
+                << "CUDA verifies the first row, commits the correction, and forwards it exactly once";
             EXPECT_THAT(mock->lastForwardTokens(),
                         ElementsAre(MockInferenceRunner::VERIFY_REJECT_TOKEN));
-            EXPECT_EQ(mock->setAllPositionCount(), 2)
-                << "only the verifier forward needs all-position logits";
-            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 1);
-            EXPECT_EQ(mock->lastSampleAllPositionStartRow(), 0);
-            EXPECT_EQ(mock->lastSampleAllPositionRowCount(), 2);
+            EXPECT_EQ(mock->setAllPositionCount(), 0);
+            EXPECT_EQ(mock->sampleAllPositionLogitsBatchedCount(), 0);
 
             const auto records = PerfStatsCollector::snapshot({"mtp"});
             const PerfStatRecord *shortcut =
@@ -2407,13 +2492,16 @@ namespace
 
             const PerfStatRecord *replay_tokens =
                 findPerfRecord(records, PerfStatRecord::Kind::Counter, "replay_tokens");
-            ASSERT_NE(replay_tokens, nullptr);
-            EXPECT_DOUBLE_EQ(replay_tokens->value, 2.0);
+            EXPECT_EQ(replay_tokens, nullptr);
 
             const PerfStatRecord *replay_forward =
                 findPerfRecord(records, PerfStatRecord::Kind::Timer, "replay_forward_sequential_shifted_commit");
-            ASSERT_NE(replay_forward, nullptr);
-            EXPECT_EQ(replay_forward->count, 1u);
+            EXPECT_EQ(replay_forward, nullptr);
+
+            const PerfStatRecord *sequential =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_runs");
+            ASSERT_NE(sequential, nullptr);
+            EXPECT_DOUBLE_EQ(sequential->value, 1.0);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();
@@ -2436,13 +2524,17 @@ namespace
                 /*hide_local_logits=*/false,
                 DeviceId::cuda(0));
             mock->advertiseVerifierRowRestoreWithoutImplementation();
+            mock->setDecodeArgmaxScript({
+                MockInferenceRunner::VERIFY_REJECT_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+            });
 
             ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
 
             GenerationResult step1 = runner->decodeStep();
             ASSERT_TRUE(step1.success()) << step1.error;
-            EXPECT_EQ(mock->restoreCount(), 1)
-                << "CUDA restores the real post-sidecar checkpoint instead of relying on verifier-row restore";
+            EXPECT_EQ(mock->restoreCount(), 0)
+                << "depth-1 CUDA sequential verification does not need any state restore";
             EXPECT_EQ(mock->restoreVerifierRowCount(), 0);
             EXPECT_EQ(mock->captureCheckpointCount(), 2);
 
@@ -2464,6 +2556,10 @@ namespace
                                PerfStatRecord::Kind::Timer,
                                "capture_post_sidecar_prefix_state");
             ASSERT_NE(post_sidecar_capture, nullptr);
+
+            const PerfStatRecord *sequential =
+                findPerfRecord(records, PerfStatRecord::Kind::Counter, "cuda_sequential_verifier_runs");
+            ASSERT_NE(sequential, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

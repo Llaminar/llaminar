@@ -1831,6 +1831,299 @@ namespace llaminar2
             }
         }
 
+        const bool use_cuda_sequential_greedy_verifier =
+            runner_ &&
+            runner_->primaryDeviceId().is_cuda() &&
+            !stochastic_verify &&
+            !use_sampling_penalties &&
+            active_sampling_params_.is_greedy();
+        if (use_cuda_sequential_greedy_verifier)
+        {
+            if (sidecar_checkpoints.empty())
+            {
+                return fail_after_checkpoint(
+                    "CUDA sequential MTP verifier requires a post-sidecar checkpoint");
+            }
+
+            const PrefixStateSnapshot &sidecar_checkpoint = sidecar_checkpoints.front();
+            if (!sidecar_checkpoint.valid)
+            {
+                return fail_after_checkpoint(
+                    "CUDA sequential MTP verifier received an invalid post-sidecar checkpoint");
+            }
+
+            const bool restore_speculative_sidecars = draft_tokens.size() > 2;
+            bool restored_speculative_sidecars = false;
+            if (restore_speculative_sidecars)
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "cuda_sequential_verifier_restore_sidecar_checkpoint",
+                    "decode");
+                restored_speculative_sidecars =
+                    runner_->restoreLivePrefixState(sidecar_checkpoint);
+                if (!restored_speculative_sidecars)
+                {
+                    return fail_after_checkpoint(
+                        "CUDA sequential MTP verifier could not restore post-sidecar checkpoint");
+                }
+                ++mtp_stats_.rollbacks;
+                PerfStatsCollector::addCounter("mtp", "rollbacks", 1.0, "decode");
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "cuda_sequential_verifier_sidecar_restores",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"draft_tokens", std::to_string(draft_tokens.size())},
+                     {"cached_tokens", std::to_string(sidecar_checkpoint.cached_tokens)}});
+            }
+
+            std::vector<int32_t> accepted_tokens;
+            accepted_tokens.reserve(draft_tokens.size() + 1);
+            accepted_tokens.push_back(first_token);
+            std::vector<int32_t> verifier_tokens;
+            verifier_tokens.reserve(static_cast<size_t>(speculative_draft_count));
+
+            bool all_speculative_accepted = true;
+            int accepted_speculative_prefix = 0;
+            int32_t rejected_verified_token = -1;
+            int32_t ready_token = -1;
+            bool replay_ok = true;
+            bool shifted_commit_ok = true;
+            bool stopped_on_output = false;
+            int main_forward_token_count = 0;
+
+            auto forward_one_and_sample = [&](int32_t token) -> int32_t
+            {
+                bool ok = false;
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "cuda_sequential_verifier_forward_one",
+                        "decode");
+                    ok = runner_->forward(&token, 1);
+                }
+                if (!ok)
+                {
+                    replay_ok = false;
+                    return -1;
+                }
+                ++main_forward_token_count;
+
+                int32_t sampled = -1;
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "cuda_sequential_verifier_sample_one",
+                        "decode");
+                    sampled = runner_->sampleGreedyOnDevice();
+                }
+                if (sampled < 0)
+                {
+                    const float *main_logits = runner_->logits();
+                    if (main_logits)
+                    {
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "cuda_sequential_verifier_sample_one_host",
+                            "decode");
+                        sampled = sampler_.sample(
+                            main_logits,
+                            static_cast<size_t>(vocab),
+                            active_sampling_params_);
+                    }
+                }
+                return sampled;
+            };
+
+            auto commit_shifted_before_forward = [&](int32_t token, int token_index) -> bool
+            {
+                if (token_index <= 0)
+                    return true;
+                bool ok = false;
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "cuda_sequential_verifier_shifted_commit",
+                        "decode");
+                    ok = runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                        token,
+                        token_index,
+                        /*allow_speculative_discard=*/true,
+                        base_sidecar_position);
+                }
+                if (!ok)
+                    shifted_commit_ok = false;
+                return ok;
+            };
+
+            int32_t verifier_sample = forward_one_and_sample(first_token);
+            if (verifier_sample < 0)
+            {
+                return fail_after_checkpoint(
+                    replay_ok
+                        ? "CUDA sequential MTP verifier could not sample first verifier row"
+                        : "CUDA sequential MTP verifier failed to forward first accepted token");
+            }
+
+            for (int draft_idx = 1;
+                 draft_idx < static_cast<int>(draft_tokens.size());
+                 ++draft_idx)
+            {
+                const int32_t draft_token = draft_tokens[static_cast<size_t>(draft_idx)];
+                verifier_tokens.push_back(verifier_sample);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "greedy_verifier_token",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"row", std::to_string(draft_idx - 1)},
+                     {"draft_token", std::to_string(draft_token)},
+                     {"verified_token", std::to_string(verifier_sample)},
+                     {"verifier_path", "cuda_sequential"}});
+
+                const bool accepted = verifier_sample == draft_token;
+                const int32_t output_token = accepted ? draft_token : verifier_sample;
+                if (accepted)
+                {
+                    ++accepted_speculative_prefix;
+                }
+                else
+                {
+                    all_speculative_accepted = false;
+                    rejected_verified_token = verifier_sample;
+                }
+
+                accepted_tokens.push_back(output_token);
+                const int token_index = static_cast<int>(accepted_tokens.size()) - 1;
+                if (!commit_shifted_before_forward(output_token, token_index))
+                {
+                    return fail_after_checkpoint(
+                        "CUDA sequential MTP verifier shifted-cache commit failed");
+                }
+
+                verifier_sample = forward_one_and_sample(output_token);
+                if (verifier_sample < 0)
+                {
+                    return fail_after_checkpoint(
+                        replay_ok
+                            ? "CUDA sequential MTP verifier could not sample ready logits"
+                            : "CUDA sequential MTP verifier failed while forwarding accepted output");
+                }
+
+                if (std::find(stop_tokens_.begin(), stop_tokens_.end(), output_token) != stop_tokens_.end())
+                {
+                    result.is_complete = true;
+                    stopped_on_output = true;
+                    break;
+                }
+                if (!accepted)
+                    break;
+            }
+
+            if (!shifted_commit_ok || !replay_ok)
+            {
+                return fail_after_checkpoint("CUDA sequential MTP verifier failed");
+            }
+
+            if (!stopped_on_output)
+            {
+                ready_token = verifier_sample;
+                prefill_logits_ready_ = true;
+                ready_sampled_token_ = ready_token;
+            }
+            else
+            {
+                prefill_logits_ready_ = false;
+                ready_sampled_token_.reset();
+            }
+
+            ++mtp_stats_.verifier_runs;
+            mtp_stats_.verifier_token_count +=
+                static_cast<uint64_t>(main_forward_token_count);
+            PerfStatsCollector::addCounter("mtp", "verifier_runs", 1.0, "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "verifier_tokens",
+                static_cast<double>(main_forward_token_count),
+                "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "cuda_sequential_verifier_runs",
+                1.0,
+                "decode",
+                {},
+                {{"forward_tokens", std::to_string(main_forward_token_count)},
+                 {"draft_tokens", std::to_string(draft_tokens.size())},
+                 {"restored_sidecars", restored_speculative_sidecars ? "true" : "false"}});
+
+            recordMTPDepthObservation(
+                requested_speculative_draft_count,
+                speculative_draft_count,
+                accepted_speculative_prefix,
+                draft_count_budget_limited,
+                restored_speculative_sidecars);
+
+            if (!all_speculative_accepted)
+            {
+                ++mtp_stats_.rejected_tokens;
+                PerfStatsCollector::addCounter("mtp", "rejected_tokens", 1.0, "decode");
+            }
+
+            if (accepted_speculative_prefix > 0)
+            {
+                mtp_stats_.accepted_tokens +=
+                    static_cast<uint64_t>(accepted_speculative_prefix);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "accepted_tokens",
+                    static_cast<double>(accepted_speculative_prefix),
+                    "decode");
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "accepted_second_draft_tokens",
+                    accepted_speculative_prefix > 0 ? 1.0 : 0.0,
+                    "decode");
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "output_tokens",
+                static_cast<double>(accepted_tokens.size()),
+                "decode");
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "acceptance_trace",
+                1.0,
+                "decode",
+                {},
+                {{"draft_step", std::to_string(mtp_stats_.draft_steps)},
+                 {"condition_token", std::to_string(condition_token)},
+                 {"first_token", std::to_string(first_token)},
+                 {"rejected_verified_token", std::to_string(rejected_verified_token)},
+                 {"accepted_speculative_prefix", std::to_string(accepted_speculative_prefix)},
+                 {"all_speculative_accepted", all_speculative_accepted ? "true" : "false"},
+                 {"verifier_state_matches_output", "true"},
+                 {"verifier_path", "cuda_sequential"},
+                 {"decode_equivalent_replay_required", "false"},
+                 {"output_tokens", std::to_string(accepted_tokens.size())},
+                 {"ready_token", std::to_string(ready_token)},
+                 {"used_ready_logits", use_ready_logits ? "true" : "false"}});
+
+            for (int32_t token : accepted_tokens)
+            {
+                sampler_.record_token(token);
+                result.tokens.push_back(token);
+            }
+            if (!accepted_tokens.empty())
+            {
+                last_token_ = accepted_tokens.back();
+            }
+
+            return result;
+        }
+
         bool all_position_enabled = false;
         {
             PerfStatsCollector::ScopedTimer timer("mtp", "enable_all_position_logits", "decode");

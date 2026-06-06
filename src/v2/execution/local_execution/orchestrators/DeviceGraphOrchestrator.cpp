@@ -6648,12 +6648,8 @@ namespace llaminar2
 
         if (handle.layout.hybrid_host_state_bytes > 0)
         {
-            if (!live_hybrid_checkpoint_host_storage_)
-            {
-                live_hybrid_checkpoint_host_storage_ = std::make_shared<std::vector<uint8_t>>();
-            }
-            live_hybrid_checkpoint_host_storage_->resize(handle.layout.hybrid_host_state_bytes);
-            handle.hybrid_storage = live_hybrid_checkpoint_host_storage_;
+            handle.hybrid_storage =
+                std::make_shared<std::vector<uint8_t>>(handle.layout.hybrid_host_state_bytes);
             handle.hybrid_payload = handle.hybrid_storage->data();
         }
         else
@@ -6664,25 +6660,13 @@ namespace llaminar2
 
         if (handle.layout.hybrid_device_state_bytes > 0)
         {
-            const bool needs_allocation =
-                !live_hybrid_checkpoint_device_storage_ ||
-                live_hybrid_checkpoint_device_ != state_.device_id ||
-                live_hybrid_checkpoint_device_bytes_ < handle.layout.hybrid_device_state_bytes;
-            if (needs_allocation)
+            handle.device_hybrid_storage =
+                allocateDeviceByteStorage(handle.layout.hybrid_device_state_bytes,
+                                          state_.device_id);
+            if (!handle.device_hybrid_storage)
             {
-                live_hybrid_checkpoint_device_storage_ =
-                    allocateDeviceByteStorage(handle.layout.hybrid_device_state_bytes,
-                                              state_.device_id);
-                if (!live_hybrid_checkpoint_device_storage_)
-                {
-                    live_hybrid_checkpoint_device_bytes_ = 0;
-                    live_hybrid_checkpoint_device_ = DeviceId::invalid();
-                    return false;
-                }
-                live_hybrid_checkpoint_device_bytes_ = handle.layout.hybrid_device_state_bytes;
-                live_hybrid_checkpoint_device_ = state_.device_id;
+                return false;
             }
-            handle.device_hybrid_storage = live_hybrid_checkpoint_device_storage_;
         }
         else
         {

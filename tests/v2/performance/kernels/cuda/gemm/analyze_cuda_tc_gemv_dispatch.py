@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import re
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -32,11 +33,22 @@ def parse_args():
     parser.add_argument("--input", required=True, help="Input sweep CSV path")
     parser.add_argument("--output", required=True, help="Generated heuristic include path")
     parser.add_argument("--summary", required=True, help="Human-readable summary output path")
+    parser.add_argument("--base-include", default=None,
+                        help="Existing generated include to preserve as fallback while applying CSV known-shape winners")
     parser.add_argument("--min-overall-family-pct", type=float, default=0.0)
     parser.add_argument("--min-overall-exact-pct", type=float, default=0.0)
     parser.add_argument("--min-fallback-family-pct", type=float, default=0.0)
     parser.add_argument("--min-fallback-exact-pct", type=float, default=0.0)
     return parser.parse_args()
+
+
+KNOWN_OVERRIDE_BEGIN = "// BEGIN generated known-shape overrides from analyze_cuda_tc_gemv_dispatch.py"
+KNOWN_OVERRIDE_END = "// END generated known-shape overrides from analyze_cuda_tc_gemv_dispatch.py"
+PUBLIC_API_MARKER = "// Public API consumed by dispatchCodebook<CB>()"
+
+
+def canonical_branch_label(codebook: int) -> str:
+    return CODEBOOK_TO_FORMAT.get(codebook, f"CB{codebook}").split("/")[0]
 
 
 def aspect_bucket(ratio: float) -> str:
@@ -332,9 +344,9 @@ def write_exact_override_function(lines, exact_rules):
     lines.append("    const uint64_t packed_key = packGeneratedDispatchKey(N, K);")
     first_codebook = True
     for codebook in sorted(exact_rules):
-        prefix = "    if constexpr" if first_codebook else "    else if constexpr"
+        prefix = "if constexpr" if first_codebook else "else if constexpr"
         first_codebook = False
-        format_name = CODEBOOK_TO_FORMAT[codebook]
+        format_name = canonical_branch_label(codebook)
         lines.append(f"    {prefix} (CB == {codebook}) {{ // {format_name}")
         lines.append("        static constexpr GeneratedKnownShapeEntry kTable[] = {")
         for rule in exact_rules[codebook]:
@@ -475,6 +487,95 @@ def write_output(path: Path, input_path: Path, exact_rules, family_rules, tuning
     path.write_text("\n".join(lines) + "\n")
 
 
+def render_known_shape_override_block(input_path: Path, exact_rules, overall_metrics) -> str:
+    lines = []
+    lines.append(KNOWN_OVERRIDE_BEGIN)
+    lines.append(f"// Source CSV: {input_path}")
+    lines.append(f"// Known-shape override coverage: {overall_metrics['exact_override_hits']}/{overall_metrics['total']} ({overall_metrics['exact_override_pct']:.2f}%)")
+    lines.append("// These exact (N,K) winners are layered over the existing broad fallback table.")
+    lines.append("")
+    write_exact_override_function(lines, exact_rules)
+    lines.append(KNOWN_OVERRIDE_END)
+    return "\n".join(lines)
+
+
+def render_known_shape_public_api() -> str:
+    return "\n".join([
+        PUBLIC_API_MARKER,
+        "template <uint8_t CB>",
+        "inline NativeGemvShape classifyShapeGenerated(int N, int K)",
+        "{",
+        "    NativeGemvShape shape = NativeGemvShape::KPAR;",
+        "    GeneratedDispatchTuning tuning{};",
+        "    if (selectKnownShapeGenerated<CB>(N, K, shape, tuning))",
+        "        return shape;",
+        "    selectGeneratedDispatch_<CB>(N, K, shape, tuning);",
+        "    return shape;",
+        "}",
+        "",
+        "template <uint8_t CB>",
+        "inline GeneratedDispatchTuning selectGeneratedTuning(int N, int K)",
+        "{",
+        "    NativeGemvShape shape = NativeGemvShape::KPAR;",
+        "    GeneratedDispatchTuning tuning{};",
+        "    if (selectKnownShapeGenerated<CB>(N, K, shape, tuning))",
+        "        return tuning;",
+        "    selectGeneratedDispatch_<CB>(N, K, shape, tuning);",
+        "    return tuning;",
+        "}",
+    ])
+
+
+def strip_existing_known_shape_block(text: str) -> str:
+    pattern = re.compile(
+        rf"\n?{re.escape(KNOWN_OVERRIDE_BEGIN)}.*?{re.escape(KNOWN_OVERRIDE_END)}\n?",
+        re.DOTALL,
+    )
+    return re.sub(pattern, "\n", text)
+
+
+def replace_public_api(text: str) -> str:
+    marker_index = text.find(PUBLIC_API_MARKER)
+    if marker_index < 0:
+        raise SystemExit("base include does not contain the GEMV generated public API marker")
+
+    pattern = re.compile(
+        rf"{re.escape(PUBLIC_API_MARKER)}\n"
+        r"template <uint8_t CB>\n"
+        r"inline NativeGemvShape classifyShapeGenerated\(int N, int K\)\n"
+        r"\{\n"
+        r".*?"
+        r"\n\}\n\n"
+        r"template <uint8_t CB>\n"
+        r"inline GeneratedDispatchTuning selectGeneratedTuning\(int N, int K\)\n"
+        r"\{\n"
+        r".*?"
+        r"\n\}",
+        re.DOTALL,
+    )
+    replaced, count = re.subn(pattern, render_known_shape_public_api(), text, count=1)
+    if count != 1:
+        raise SystemExit("failed to replace generated GEMV dispatch public API in base include")
+    return replaced
+
+
+def write_output_with_base(path: Path, input_path: Path, base_include: Path, exact_rules, overall_metrics):
+    if not base_include.is_file():
+        raise SystemExit(f"base include not found: {base_include}")
+
+    text = strip_existing_known_shape_block(base_include.read_text())
+    public_api_index = text.find(PUBLIC_API_MARKER)
+    if public_api_index < 0:
+        raise SystemExit(f"base include does not contain public API marker: {base_include}")
+
+    block = render_known_shape_override_block(input_path, exact_rules, overall_metrics)
+    text = text[:public_api_index].rstrip() + "\n\n" + block + "\n\n" + text[public_api_index:].lstrip()
+    text = replace_public_api(text)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.rstrip() + "\n")
+
+
 def write_summary(path: Path, input_path: Path, exact_rules, family_rules, tuning_rules, overall_metrics, fallback_metrics):
     lines = []
     lines.append("CUDA Native-Payload GEMV Dispatch Heuristic Summary")
@@ -556,7 +657,10 @@ def main():
     fallback_metrics = compute_metrics(rows, exact_rules, family_rules, tuning_rules, use_exact_overrides=False)
 
     validate_thresholds(args, overall_metrics, fallback_metrics)
-    write_output(output_path, input_path, exact_rules, family_rules, tuning_rules, overall_metrics, fallback_metrics)
+    if args.base_include:
+        write_output_with_base(output_path, input_path, Path(args.base_include), exact_rules, overall_metrics)
+    else:
+        write_output(output_path, input_path, exact_rules, family_rules, tuning_rules, overall_metrics, fallback_metrics)
     write_summary(summary_path, input_path, exact_rules, family_rules, tuning_rules, overall_metrics, fallback_metrics)
 
     print(f"generated heuristic include: {output_path}")

@@ -2299,11 +2299,6 @@ namespace llaminar2
         uint64_t prefix_fingerprint_ = 0;
         bool prefix_cache_bypassed_ = false;
         std::string prefix_cache_bypass_reason_;
-        mutable std::shared_ptr<std::vector<uint8_t>> live_hybrid_checkpoint_host_storage_;
-        mutable std::shared_ptr<TensorBase> live_hybrid_checkpoint_device_storage_;
-        mutable size_t live_hybrid_checkpoint_device_bytes_ = 0;
-        mutable DeviceId live_hybrid_checkpoint_device_ = DeviceId::invalid();
-
         bool ensurePrefixCacheReady();
         bool isPrefixCacheMoEModel() const;
         void *explicitGPUStreamForOperation(const char *operation) const;
