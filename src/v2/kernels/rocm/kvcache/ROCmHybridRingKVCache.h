@@ -474,8 +474,9 @@ namespace llaminar2
             HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
             const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
             const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
+            const bool host_staged_device_state = needs_device && !dst_device && dst_host;
             if ((needs_host && !dst_host) ||
-                (needs_device && !dst_device))
+                (needs_device && !dst_device && !host_staged_device_state))
             {
                 return false;
             }
@@ -486,7 +487,9 @@ namespace llaminar2
                                        .getAMDContext(this->device_id())
                                        .defaultStream();
 
-            auto *host_cursor = needs_host ? reinterpret_cast<uint8_t *>(dst_host) : nullptr;
+            auto *host_cursor = (needs_host || host_staged_device_state)
+                                    ? reinterpret_cast<uint8_t *>(dst_host)
+                                    : nullptr;
             auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
             const bool ok = exportHybridStatePayload(
                 host_cursor,
@@ -512,8 +515,9 @@ namespace llaminar2
             HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
             const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
             const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
+            const bool host_staged_device_state = needs_device && !src_device && src_host;
             if ((needs_host && !src_host) ||
-                (needs_device && !src_device))
+                (needs_device && !src_device && !host_staged_device_state))
             {
                 return false;
             }
@@ -524,7 +528,9 @@ namespace llaminar2
                                        .getAMDContext(this->device_id())
                                        .defaultStream();
 
-            const auto *host_cursor = needs_host ? reinterpret_cast<const uint8_t *>(src_host) : nullptr;
+            const auto *host_cursor = (needs_host || host_staged_device_state)
+                                          ? reinterpret_cast<const uint8_t *>(src_host)
+                                          : nullptr;
             const auto *device_cursor = needs_device ? reinterpret_cast<const uint8_t *>(src_device) : nullptr;
             const bool ok = importHybridStatePayload(
                 host_cursor,
@@ -614,9 +620,19 @@ namespace llaminar2
                     const size_t bytes = state->conv_kernel->stateBytes();
                     if (bytes > 0)
                     {
-                        if (!state->conv_kernel->exportState(nullptr, device_cursor, stream))
-                            return false;
-                        device_cursor += bytes;
+                        if (device_cursor)
+                        {
+                            if (!state->conv_kernel->exportState(nullptr, device_cursor, stream))
+                                return false;
+                            device_cursor += bytes;
+                        }
+                        else
+                        {
+                            if (!host_cursor ||
+                                !state->conv_kernel->exportState(host_cursor, nullptr, stream))
+                                return false;
+                            host_cursor += bytes;
+                        }
                     }
                 }
                 if (include_device_state && state->rec_kernel)
@@ -624,9 +640,19 @@ namespace llaminar2
                     const size_t bytes = state->rec_kernel->stateBytes();
                     if (bytes > 0)
                     {
-                        if (!state->rec_kernel->exportState(nullptr, device_cursor, stream))
-                            return false;
-                        device_cursor += bytes;
+                        if (device_cursor)
+                        {
+                            if (!state->rec_kernel->exportState(nullptr, device_cursor, stream))
+                                return false;
+                            device_cursor += bytes;
+                        }
+                        else
+                        {
+                            if (!host_cursor ||
+                                !state->rec_kernel->exportState(host_cursor, nullptr, stream))
+                                return false;
+                            host_cursor += bytes;
+                        }
                     }
                 }
             }
@@ -664,9 +690,19 @@ namespace llaminar2
                     const size_t bytes = state->conv_kernel->stateBytes();
                     if (bytes > 0)
                     {
-                        if (!state->conv_kernel->importState(nullptr, device_cursor, stream))
-                            return false;
-                        device_cursor += bytes;
+                        if (device_cursor)
+                        {
+                            if (!state->conv_kernel->importState(nullptr, device_cursor, stream))
+                                return false;
+                            device_cursor += bytes;
+                        }
+                        else
+                        {
+                            if (!host_cursor ||
+                                !state->conv_kernel->importState(host_cursor, nullptr, stream))
+                                return false;
+                            host_cursor += bytes;
+                        }
                     }
                 }
                 if (include_device_state && state->rec_kernel)
@@ -674,9 +710,19 @@ namespace llaminar2
                     const size_t bytes = state->rec_kernel->stateBytes();
                     if (bytes > 0)
                     {
-                        if (!state->rec_kernel->importState(nullptr, device_cursor, stream))
-                            return false;
-                        device_cursor += bytes;
+                        if (device_cursor)
+                        {
+                            if (!state->rec_kernel->importState(nullptr, device_cursor, stream))
+                                return false;
+                            device_cursor += bytes;
+                        }
+                        else
+                        {
+                            if (!host_cursor ||
+                                !state->rec_kernel->importState(host_cursor, nullptr, stream))
+                                return false;
+                            host_cursor += bytes;
+                        }
                     }
                 }
             }

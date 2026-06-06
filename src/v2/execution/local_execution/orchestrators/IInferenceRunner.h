@@ -206,6 +206,31 @@ namespace llaminar2
         virtual bool supportsMTPSidecarSampleFusion() const { return false; }
 
         /**
+         * @brief True when MTP sidecar execution is isolated from main live state.
+         *
+         * Runners that return true guarantee forwardMTP*() may append speculative
+         * MTP-side shifted KV rows and mutate MTP scratch/logits, but it does not
+         * advance or otherwise mutate the main verifier state: main KV cache,
+         * main hybrid/GDN state, main logits, terminal hidden, positions, or
+         * decode bookkeeping. The caller may then skip restoring the verifier
+         * base checkpoint after a sidecar draft and rely on explicit shifted-row
+         * commit/truncate calls to discard speculative MTP rows.
+         */
+        virtual bool supportsMTPSidecarPreservesMainState() const { return false; }
+
+        /**
+         * @brief True when the verifier path must replay accepted tokens through
+         *        normal one-token decode to preserve mutable model state exactly.
+         *
+         * Stateful architectures such as hybrid GDN may produce all-position
+         * verifier logits whose token rows look plausible while the final
+         * recurrent/conv state is not byte-for-byte decode-equivalent. Returning
+         * true makes the MTP runner use the common sequential verifier replay
+         * path instead of the batched all-position verifier for greedy decode.
+         */
+        virtual bool requiresMTPDecodeEquivalentVerifierReplay() const { return false; }
+
+        /**
          * @brief Run a chained MTP sidecar step from the previous sidecar hidden.
          *
          * @param draft_condition_token Token whose shifted MTP KV row is appended.

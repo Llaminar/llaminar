@@ -103,6 +103,10 @@ namespace llaminar2
                snapshot.mtp_bypasses != 0 ||
                snapshot.mtp_verifier_runs != 0 ||
                snapshot.mtp_verifier_token_count != 0 ||
+               snapshot.mtp_transaction_commits != 0 ||
+               snapshot.mtp_transaction_rollbacks != 0 ||
+               snapshot.mtp_transaction_validation_failures != 0 ||
+               snapshot.mtp_unsafe_verifier_state_rejections != 0 ||
                snapshot.mtp_depth_policy_windows != 0 ||
                snapshot.mtp_depth_policy_updates != 0 ||
                snapshot.mtp_depth_policy_promotions != 0 ||
@@ -254,6 +258,10 @@ namespace llaminar2
                       {"bypasses", state.mtp_bypasses},
                       {"verifier_runs", state.mtp_verifier_runs},
                       {"verifier_token_count", state.mtp_verifier_token_count},
+                      {"transaction_commits", state.mtp_transaction_commits},
+                      {"transaction_rollbacks", state.mtp_transaction_rollbacks},
+                      {"transaction_validation_failures", state.mtp_transaction_validation_failures},
+                      {"unsafe_verifier_state_rejections", state.mtp_unsafe_verifier_state_rejections},
                       {"stochastic_accept_tests", state.mtp_stochastic_accept_tests},
                       {"stochastic_accepts", state.mtp_stochastic_accepts},
                       {"stochastic_residual_samples", state.mtp_stochastic_residual_samples},
@@ -1286,6 +1294,10 @@ namespace llaminar2
                 prefix_state.mtp_bypasses != 0 ||
                 prefix_state.mtp_verifier_runs != 0 ||
                 prefix_state.mtp_verifier_token_count != 0 ||
+                prefix_state.mtp_transaction_commits != 0 ||
+                prefix_state.mtp_transaction_rollbacks != 0 ||
+                prefix_state.mtp_transaction_validation_failures != 0 ||
+                prefix_state.mtp_unsafe_verifier_state_rejections != 0 ||
                 prefix_state.mtp_config_enabled ||
                 prefix_state.mtp_bypassed)
             {
@@ -1345,6 +1357,9 @@ namespace llaminar2
                         << prefix_state.mtp_bypasses << " bypasses, "
                         << prefix_state.mtp_verifier_runs << " verifier runs, "
                         << prefix_state.mtp_verifier_token_count << " verifier tokens, "
+                        << prefix_state.mtp_transaction_commits << " tx commits, "
+                        << prefix_state.mtp_transaction_rollbacks << " tx rollbacks, "
+                        << prefix_state.mtp_transaction_validation_failures << " tx validation failures, "
                         << "depth=" << prefix_state.mtp_current_depth
                         << " [" << prefix_state.mtp_min_depth << "," << prefix_state.mtp_max_depth << "]"
                         << " depth_updates=" << prefix_state.mtp_depth_policy_updates

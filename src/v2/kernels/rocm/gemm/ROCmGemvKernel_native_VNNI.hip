@@ -3632,7 +3632,8 @@ bool rocmLaunch_native_vnni_small_m_fp32(
     const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
     const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
     const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
-    const bool use_atomic_reduce = graph_capture_enabled || rocm_env.nvnni_atomic_reduce;
+    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+    const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
@@ -3799,7 +3800,8 @@ bool rocmLaunch_native_vnni_small_m_batched_fp32(
     const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
     const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
     const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
-    const bool use_atomic_reduce = graph_capture_enabled || rocm_env.nvnni_atomic_reduce;
+    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+    const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
@@ -4064,7 +4066,8 @@ bool rocmLaunch_native_vnni_small_m_batched_mixed_fp32(
     const int kb_override = (api_kb_override > 0) ? api_kb_override : rocm_env.nvnni_gemv_kb;
     const int waves_override = (api_waves_override > 0) ? api_waves_override : rocm_env.nvnni_gemv_target_waves;
     const bool graph_capture_enabled = llaminar2::debugEnv().execution.gpu_graphs;
-    const bool use_atomic_reduce = graph_capture_enabled || rocm_env.nvnni_atomic_reduce;
+    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+    const bool use_atomic_reduce = !deterministic && (graph_capture_enabled || rocm_env.nvnni_atomic_reduce);
     if (kb_override > KB_CAP)
     {
         fprintf(stderr,
@@ -4669,7 +4672,8 @@ bool rocmGemv_native_vnni_fp32(
     const uint32_t* d_emins_u32  = static_cast<const uint32_t*>(d_block_emins);
 
     const auto& rocm_env = llaminar2::debugEnv().rocm;
-    const bool use_atomic_reduce = rocm_env.nvnni_atomic_reduce;
+    const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+    const bool use_atomic_reduce = !deterministic && rocm_env.nvnni_atomic_reduce;
     const NativeVNNIDecodeGeneratedRuntimeConfig generated_cfg =
         resolveNativeVNNIDecodeGeneratedRuntimeConfig(codebook_id, N, K);
 

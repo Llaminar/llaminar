@@ -2818,6 +2818,19 @@ add_v2_test(V2_Unit_Sampler
     MPI_PROCS 1  # Sampler is single-rank only
 )
 
+# Test: Deterministic mode policy gates
+add_executable(v2_test_deterministic_mode unit/utils/Test__DeterministicMode.cpp)
+target_link_libraries(v2_test_deterministic_mode
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_DeterministicMode
+    COMMAND $<TARGET_FILE:v2_test_deterministic_mode>
+    LABELS "V2;Unit;Determinism;DebugEnv;CUDA;ROCm;Policy"
+    MPI_PROCS 1
+)
+
 # Test: BenchmarkRunnerCPU (CPU device handling in benchmark runner)
 add_executable(v2_test_benchmark_runner_cpu unit/utils/Test__BenchmarkRunnerCPU.cpp)
 target_include_directories(v2_test_benchmark_runner_cpu PRIVATE
@@ -6192,6 +6205,30 @@ target_include_directories(v2_test_mtp_depth_controller PRIVATE
 add_v2_test(V2_Unit_MTPDepthController
     COMMAND $<TARGET_FILE:v2_test_mtp_depth_controller>
     LABELS "V2;Unit;MTP;DepthPolicy"
+    MPI_PROCS 1
+)
+
+# Test: MTP transaction state and rollback invariants
+add_executable(v2_test_mtp_state_transaction unit/mtp/Test__MTPStateTransaction.cpp)
+target_link_libraries(v2_test_mtp_state_transaction llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_mtp_state_transaction PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPStateTransaction
+    COMMAND $<TARGET_FILE:v2_test_mtp_state_transaction>
+    LABELS "V2;Unit;MTP;StateTransaction;Rollback"
+    MPI_PROCS 1
+)
+
+# Test: MTP verifier execution-policy selection
+add_executable(v2_test_mtp_verifier_policy unit/mtp/Test__MTPVerifierPolicy.cpp)
+target_link_libraries(v2_test_mtp_verifier_policy llaminar2_core GTest::gtest GTest::gtest_main)
+target_include_directories(v2_test_mtp_verifier_policy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPVerifierPolicy
+    COMMAND $<TARGET_FILE:v2_test_mtp_verifier_policy>
+    LABELS "V2;Unit;MTP;VerifierPolicy;Rollback"
     MPI_PROCS 1
 )
 

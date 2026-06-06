@@ -48,6 +48,10 @@ namespace llaminar2
         uint64_t stochastic_accepts = 0;
         uint64_t stochastic_residual_samples = 0;
         uint64_t stochastic_terminal_samples = 0;
+        uint64_t transaction_commits = 0;
+        uint64_t transaction_rollbacks = 0;
+        uint64_t transaction_validation_failures = 0;
+        uint64_t unsafe_verifier_state_rejections = 0;
         uint64_t depth_policy_windows = 0;
         uint64_t depth_policy_updates = 0;
         uint64_t depth_policy_promotions = 0;

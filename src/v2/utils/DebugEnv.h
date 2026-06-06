@@ -417,10 +417,12 @@ namespace llaminar2
                 trace_q8_1_direct = (std::atoi(trace_q8_env) != 0);
 
             const char *cuda_concurrent_env = std::getenv("LLAMINAR_CUDA_CONCURRENT_PREFILL");
+            cuda_concurrent_prefill = true;
             if (cuda_concurrent_env)
                 cuda_concurrent_prefill = (std::atoi(cuda_concurrent_env) != 0);
 
             const char *cuda_concurrent_decode_env = std::getenv("LLAMINAR_CUDA_CONCURRENT_DECODE");
+            cuda_concurrent_decode = true;
             if (cuda_concurrent_decode_env)
                 cuda_concurrent_decode = (std::atoi(cuda_concurrent_decode_env) != 0);
 
@@ -430,6 +432,11 @@ namespace llaminar2
 
             const char *deterministic_env = std::getenv("LLAMINAR_DETERMINISTIC");
             deterministic = deterministic_env && std::atoi(deterministic_env) != 0;
+            if (deterministic)
+            {
+                cuda_concurrent_prefill = false;
+                cuda_concurrent_decode = false;
+            }
 
             const char *cublas_gemm_env = std::getenv("LLAMINAR_CUBLAS_GEMM");
             cuda_cublas_gemm = cublas_gemm_env && std::atoi(cublas_gemm_env) == 1;
@@ -3142,6 +3149,11 @@ namespace llaminar2
             const char *deterministic_env = std::getenv("LLAMINAR_DETERMINISTIC");
             if (deterministic_env && std::atoi(deterministic_env) != 0)
             {
+                nvnni_atomic_reduce = false;
+                concurrent_prefill = false;
+                concurrent_decode = false;
+                concurrent_m2_rows = false;
+                gdn_concurrent_decode = false;
                 moe_router_q8 = false;
                 moe_router_fp16 = false;
                 moe_router_kpart_decode = false;

@@ -532,7 +532,10 @@ namespace llaminar2
         PrefixStateSnapshot aggregate;
         bool saw_runner = false;
         bool have_common_tokens = false;
+        bool have_common_provenance = false;
+        bool same_provenance = true;
         int common_tokens = 0;
+        PrefixStateProvenance common_provenance = PrefixStateProvenance::Unknown;
 
         auto capture_runner = [&](const IInferenceRunner &runner)
         {
@@ -549,6 +552,16 @@ namespace llaminar2
             else if (child.cached_tokens != common_tokens)
             {
                 return false;
+            }
+
+            if (!have_common_provenance)
+            {
+                common_provenance = child.provenance;
+                have_common_provenance = true;
+            }
+            else if (child.provenance != common_provenance)
+            {
+                same_provenance = false;
             }
 
             aggregate.participant_snapshots.push_back(std::move(child));
@@ -571,6 +584,8 @@ namespace llaminar2
 
         aggregate.valid = true;
         aggregate.cached_tokens = common_tokens;
+        aggregate.provenance = same_provenance ? common_provenance
+                                               : PrefixStateProvenance::PayloadCheckpoint;
         return aggregate;
     }
 
@@ -579,8 +594,11 @@ namespace llaminar2
         PrefixStateSnapshot aggregate;
         bool saw_runner = false;
         bool have_common_tokens = false;
+        bool have_common_provenance = false;
+        bool same_provenance = true;
         bool all_logical = true;
         int common_tokens = 0;
+        PrefixStateProvenance common_provenance = PrefixStateProvenance::Unknown;
 
         auto capture_runner = [&](const IInferenceRunner &runner)
         {
@@ -600,6 +618,15 @@ namespace llaminar2
             }
 
             all_logical = all_logical && child.logical_checkpoint;
+            if (!have_common_provenance)
+            {
+                common_provenance = child.provenance;
+                have_common_provenance = true;
+            }
+            else if (child.provenance != common_provenance)
+            {
+                same_provenance = false;
+            }
             aggregate.participant_snapshots.push_back(std::move(child));
             return true;
         };
@@ -621,6 +648,11 @@ namespace llaminar2
         aggregate.valid = true;
         aggregate.logical_checkpoint = all_logical;
         aggregate.cached_tokens = common_tokens;
+        aggregate.provenance = same_provenance
+                                   ? common_provenance
+                                   : (all_logical
+                                          ? PrefixStateProvenance::LogicalCheckpoint
+                                          : PrefixStateProvenance::PayloadCheckpoint);
         return aggregate;
     }
 

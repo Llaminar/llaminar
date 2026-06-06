@@ -90,19 +90,19 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, M2VerifierLongPrefixMatchesSequentia
     runDenseM2VerifierLongPrefixMatchesSequential(cudaSingleDeviceCase());
 }
 
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierLongPrefixMatchesSequential)
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, OneRowRestoreLongPrefixMatchesSequential)
 {
-    runDenseM4VerifierLongPrefixMatchesSequential(cudaSingleDeviceCase());
+    runDenseOneRowRestoreLongPrefixMatchesSequential(cudaSingleDeviceCase());
 }
 
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierAfterSidecarChainMatchesSequential)
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, M2VerifierFinalStateLongPrefixIsNotDecodeEquivalent)
 {
-    runDenseM4VerifierAfterSidecarChainMatchesSequential(cudaSingleDeviceCase());
+    runDenseM2VerifierFinalStateLongPrefixIsNotDecodeEquivalent(cudaSingleDeviceCase());
 }
 
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierRow2RestoreLongPrefixMatchesSequential)
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierLongPrefixIsNotDecodeEquivalent)
 {
-    runDenseM4VerifierRow2RestoreLongPrefixMatchesSequential(cudaSingleDeviceCase());
+    runDenseM4VerifierLongPrefixIsNotDecodeEquivalent(cudaSingleDeviceCase());
 }
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierRow3RestoreIsNotDecodeEquivalent)

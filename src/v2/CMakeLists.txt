@@ -1228,6 +1228,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/prefix_cache/PrefixStorageBackend.cpp
     execution/prefix_cache/RamPrefixStorageBackend.cpp
     execution/mtp/MTPDepthController.cpp
+    execution/mtp/MTPStateTransaction.cpp
     execution/mtp/MTPWeightManifest.cpp
     execution/cache/HybridCacheManager.cpp
     execution/compute_stages/stages/KVCacheAppendStage.cpp

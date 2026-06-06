@@ -125,6 +125,26 @@ namespace
         HipIntBuffer &operator=(const HipIntBuffer &) = delete;
     };
 
+    /// @brief RAII wrapper for a non-blocking HIP stream used by direct kernel tests.
+    struct HipStreamHandle
+    {
+        hipStream_t stream = nullptr; ///< HIP stream owned by this wrapper.
+
+        HipStreamHandle()
+        {
+            checkHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "hipStreamCreateWithFlags");
+        }
+
+        ~HipStreamHandle()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+
+        HipStreamHandle(const HipStreamHandle &) = delete;
+        HipStreamHandle &operator=(const HipStreamHandle &) = delete;
+    };
+
     /**
      * @brief Builds row-major sequence data with hostile padding rows.
      *
@@ -194,6 +214,19 @@ namespace
         std::vector<float> values(static_cast<size_t>(count));
         for (int i = 0; i < count; ++i)
             values[static_cast<size_t>(i)] = 0.0025f * static_cast<float>((i % 7) - 3);
+        return values;
+    }
+
+    /// @brief Creates deterministic nonzero recurrent/conv state.
+    std::vector<float> makeInitialState(size_t count, float scale)
+    {
+        std::vector<float> values(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const float wave = static_cast<float>(static_cast<int>(i % 23) - 11);
+            const float slow = static_cast<float>(static_cast<int>((i / 23) % 17) - 8);
+            values[i] = scale * (0.7f * wave + 0.13f * slow);
+        }
         return values;
     }
 
@@ -503,6 +536,452 @@ TEST(Test__ROCmGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAccep
     EXPECT_LT(diff.second, 1e-4);
 }
 
+TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_heads = 40;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 4;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_stride);
+
+    const auto Q = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, 0.0021f, 0.0f, 0.0021f);
+    const auto K = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, -0.0019f, 0.0f, -0.0019f);
+    const auto V = makeSequenceRows(verifier_len, v_stride, verifier_len, verifier_len, 0.0025f, 0.0f, 0.0025f);
+    const auto alpha = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, 0.025f, 0.0f, 0.025f);
+    const auto beta = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, -0.021f, 0.0f, -0.021f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.00091f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    HipFloatBuffer d_Q_m4(Q);
+    HipFloatBuffer d_K_m4(K);
+    HipFloatBuffer d_V_m4(V);
+    HipFloatBuffer d_alpha_m4(alpha);
+    HipFloatBuffer d_beta_m4(beta);
+    HipFloatBuffer d_Q_step(Q);
+    HipFloatBuffer d_K_step(K);
+    HipFloatBuffer d_V_step(V);
+    HipFloatBuffer d_alpha_step(alpha);
+    HipFloatBuffer d_beta_step(beta);
+    HipFloatBuffer d_A_log(A_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_m4_out(output_elems, 0.0f);
+    HipFloatBuffer d_step_out(output_elems, 0.0f);
+    HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    HipStreamHandle stream;
+
+    ROCmGatedDeltaNet m4_kernel(0);
+    m4_kernel.allocateGPUState(state_floats);
+    m4_kernel.setGPUStream(stream.stream);
+    m4_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m4_kernel.chunk_forward(
+        d_Q_m4.ptr, d_K_m4.ptr, d_V_m4.ptr, d_alpha_m4.ptr, d_beta_m4.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_m4_out.ptr, nullptr,
+        verifier_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(M4 recurrence)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    ROCmGatedDeltaNet step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            d_Q_step.ptr + static_cast<size_t>(row) * qk_stride,
+            d_K_step.ptr + static_cast<size_t>(row) * qk_stride,
+            d_V_step.ptr + static_cast<size_t>(row) * v_stride,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(stepwise recurrence)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 2e-4f);
+    EXPECT_LT(out_diff.second, 1e-4);
+    EXPECT_LT(state_diff.first, 2e-4f);
+    EXPECT_LT(state_diff.second, 1e-4)
+        << "ROCm M=4 recurrence must leave the same kernel-owned state as four decode steps";
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, RecurrenceM4DV64FinalStateMatchesStepwiseReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_heads = 48;
+    constexpr int d_k = 128;
+    constexpr int d_v = 64;
+    constexpr int verifier_len = 4;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_stride);
+
+    const auto Q = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, 0.0071f, 0.0f, 0.0071f);
+    const auto K = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, -0.0063f, 0.0f, -0.0063f);
+    const auto V = makeSequenceRows(verifier_len, v_stride, verifier_len, verifier_len, 0.0085f, 0.0f, 0.0085f);
+    const auto alpha = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, 0.11f, 0.0f, 0.11f);
+    const auto beta = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, -0.09f, 0.0f, -0.09f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.018f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    HipFloatBuffer d_Q_m4(Q);
+    HipFloatBuffer d_K_m4(K);
+    HipFloatBuffer d_V_m4(V);
+    HipFloatBuffer d_alpha_m4(alpha);
+    HipFloatBuffer d_beta_m4(beta);
+    HipFloatBuffer d_Q_step(Q);
+    HipFloatBuffer d_K_step(K);
+    HipFloatBuffer d_V_step(V);
+    HipFloatBuffer d_alpha_step(alpha);
+    HipFloatBuffer d_beta_step(beta);
+    HipFloatBuffer d_A_log(A_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_m4_out(output_elems, 0.0f);
+    HipFloatBuffer d_step_out(output_elems, 0.0f);
+    HipStreamHandle stream;
+
+    ROCmGatedDeltaNet m4_kernel(0);
+    m4_kernel.allocateGPUState(state_floats);
+    m4_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m4_kernel.chunk_forward(
+        d_Q_m4.ptr, d_K_m4.ptr, d_V_m4.ptr, d_alpha_m4.ptr, d_beta_m4.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_m4_out.ptr, nullptr,
+        verifier_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(M4 d_v=64 recurrence)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    ROCmGatedDeltaNet step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            d_Q_step.ptr + static_cast<size_t>(row) * qk_stride,
+            d_K_step.ptr + static_cast<size_t>(row) * qk_stride,
+            d_V_step.ptr + static_cast<size_t>(row) * v_stride,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(stepwise d_v=64 recurrence)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 2e-4f);
+    EXPECT_LT(out_diff.second, 1e-4);
+    EXPECT_LT(state_diff.first, 2e-4f);
+    EXPECT_LT(state_diff.second, 1e-4)
+        << "ROCm M=4 d_v=64 recurrence must match four decode steps";
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_k_heads = 16;
+    constexpr int n_v_heads = 40;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 4;
+    constexpr int q_src_dim = n_k_heads * d_k;
+    constexpr int k_src_dim = n_k_heads * d_k;
+    constexpr int v_dim = n_v_heads * d_v;
+    constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
+    constexpr int qk_stride = n_v_heads * d_k;
+    constexpr int state_floats = n_v_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_dim);
+    constexpr size_t deinterleave_elems =
+        static_cast<size_t>(verifier_len) *
+        static_cast<size_t>(qk_stride + qk_stride + v_dim);
+
+    const auto Q_src = makeSequenceRows(verifier_len, q_src_dim, verifier_len, verifier_len, 0.0021f, 0.0f, 0.0021f);
+    const auto K_src = makeSequenceRows(verifier_len, k_src_dim, verifier_len, verifier_len, -0.0019f, 0.0f, -0.0019f);
+    const auto V_src = makeSequenceRows(verifier_len, v_dim, verifier_len, verifier_len, 0.0025f, 0.0f, 0.0025f);
+
+    std::vector<float> merged(static_cast<size_t>(verifier_len) * static_cast<size_t>(qkv_stride));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *dst = merged.data() + static_cast<size_t>(row) * qkv_stride;
+        std::copy_n(Q_src.data() + static_cast<size_t>(row) * q_src_dim, q_src_dim, dst);
+        std::copy_n(K_src.data() + static_cast<size_t>(row) * k_src_dim, k_src_dim, dst + q_src_dim);
+        std::copy_n(V_src.data() + static_cast<size_t>(row) * v_dim, v_dim, dst + q_src_dim + k_src_dim);
+    }
+
+    const auto alpha = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, 0.025f, 0.0f, 0.025f);
+    const auto beta = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, -0.021f, 0.0f, -0.021f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.00091f);
+    const std::vector<float> A_log(static_cast<size_t>(n_v_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_v_heads), 0.1f);
+
+    HipFloatBuffer d_merged_m4(merged);
+    HipFloatBuffer d_merged_step(merged);
+    HipFloatBuffer d_alpha_m4(alpha);
+    HipFloatBuffer d_beta_m4(beta);
+    HipFloatBuffer d_alpha_step(alpha);
+    HipFloatBuffer d_beta_step(beta);
+    HipFloatBuffer d_A_log(A_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_m4_out(output_elems, 0.0f);
+    HipFloatBuffer d_step_out(output_elems, 0.0f);
+    HipFloatBuffer d_m4_scratch(deinterleave_elems, 0.0f);
+    HipFloatBuffer d_step_scratch(
+        static_cast<size_t>(qk_stride + qk_stride + v_dim),
+        0.0f);
+    HipStreamHandle stream;
+
+    ROCmGatedDeltaNet m4_kernel(0);
+    m4_kernel.allocateGPUState(state_floats);
+    m4_kernel.setGPUStream(stream.stream);
+    m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    float *m4_q = nullptr;
+    float *m4_k = nullptr;
+    float *m4_v = nullptr;
+    ASSERT_TRUE(m4_kernel.deinterleave_qkv_device(
+        d_merged_m4.ptr,
+        m4_q,
+        m4_k,
+        m4_v,
+        verifier_len,
+        n_k_heads,
+        n_v_heads,
+        d_k,
+        d_v,
+        /*global_v_head_offset=*/0));
+    ASSERT_TRUE(m4_kernel.chunk_forward(
+        m4_q, m4_k, m4_v, d_alpha_m4.ptr, d_beta_m4.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_m4_out.ptr, nullptr,
+        verifier_len, n_v_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(M4 merged-QKV recurrence)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    ROCmGatedDeltaNet step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *step_q = nullptr;
+        float *step_k = nullptr;
+        float *step_v = nullptr;
+        ASSERT_TRUE(step_kernel.deinterleave_qkv_device(
+            d_merged_step.ptr + static_cast<size_t>(row) * qkv_stride,
+            step_q,
+            step_k,
+            step_v,
+            1,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            /*global_v_head_offset=*/0));
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            step_q,
+            step_k,
+            step_v,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_dim,
+            nullptr,
+            n_v_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(stepwise merged-QKV recurrence)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 2e-4f);
+    EXPECT_LT(out_diff.second, 1e-4);
+    EXPECT_LT(state_diff.first, 2e-4f);
+    EXPECT_LT(state_diff.second, 1e-4)
+        << "ROCm merged-QKV M=4 recurrence must leave the same state as four decode steps";
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, MergedQKVM4Qwen36DenseShapeWithSnapshotsMatchesStepwiseReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int n_k_heads = 16;
+    constexpr int n_v_heads = 48;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 4;
+    constexpr int q_src_dim = n_k_heads * d_k;
+    constexpr int k_src_dim = n_k_heads * d_k;
+    constexpr int v_dim = n_v_heads * d_v;
+    constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
+    constexpr int qk_stride = n_v_heads * d_k;
+    constexpr int state_floats = n_v_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_dim);
+    constexpr size_t deinterleave_elems =
+        static_cast<size_t>(verifier_len) *
+        static_cast<size_t>(qk_stride + qk_stride + v_dim);
+
+    const auto Q_src = makeSequenceRows(verifier_len, q_src_dim, verifier_len, verifier_len, 0.0067f, 0.0f, 0.0067f);
+    const auto K_src = makeSequenceRows(verifier_len, k_src_dim, verifier_len, verifier_len, -0.0059f, 0.0f, -0.0059f);
+    const auto V_src = makeSequenceRows(verifier_len, v_dim, verifier_len, verifier_len, 0.0073f, 0.0f, 0.0073f);
+
+    std::vector<float> merged(static_cast<size_t>(verifier_len) * static_cast<size_t>(qkv_stride));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *dst = merged.data() + static_cast<size_t>(row) * qkv_stride;
+        std::copy_n(Q_src.data() + static_cast<size_t>(row) * q_src_dim, q_src_dim, dst);
+        std::copy_n(K_src.data() + static_cast<size_t>(row) * k_src_dim, k_src_dim, dst + q_src_dim);
+        std::copy_n(V_src.data() + static_cast<size_t>(row) * v_dim, v_dim, dst + q_src_dim + k_src_dim);
+    }
+
+    const auto alpha = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, 0.087f, 0.0f, 0.087f);
+    const auto beta = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, -0.071f, 0.0f, -0.071f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.021f);
+    const std::vector<float> A_log(static_cast<size_t>(n_v_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_v_heads), 0.1f);
+
+    HipFloatBuffer d_merged_m4(merged);
+    HipFloatBuffer d_merged_step(merged);
+    HipFloatBuffer d_alpha_m4(alpha);
+    HipFloatBuffer d_beta_m4(beta);
+    HipFloatBuffer d_alpha_step(alpha);
+    HipFloatBuffer d_beta_step(beta);
+    HipFloatBuffer d_A_log(A_log);
+    HipFloatBuffer d_dt_bias(dt_bias);
+    HipFloatBuffer d_m4_out(output_elems, 0.0f);
+    HipFloatBuffer d_step_out(output_elems, 0.0f);
+    HipFloatBuffer d_m4_scratch(deinterleave_elems, 0.0f);
+    HipFloatBuffer d_step_scratch(
+        static_cast<size_t>(qk_stride + qk_stride + v_dim),
+        0.0f);
+    HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -99.0f);
+    HipStreamHandle stream;
+
+    ROCmGatedDeltaNet m4_kernel(0);
+    m4_kernel.allocateGPUState(state_floats);
+    m4_kernel.setGPUStream(stream.stream);
+    m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
+    m4_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    float *m4_q = nullptr;
+    float *m4_k = nullptr;
+    float *m4_v = nullptr;
+    ASSERT_TRUE(m4_kernel.deinterleave_qkv_device(
+        d_merged_m4.ptr,
+        m4_q,
+        m4_k,
+        m4_v,
+        verifier_len,
+        n_k_heads,
+        n_v_heads,
+        d_k,
+        d_v,
+        /*global_v_head_offset=*/0));
+    ASSERT_TRUE(m4_kernel.chunk_forward(
+        m4_q, m4_k, m4_v, d_alpha_m4.ptr, d_beta_m4.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_m4_out.ptr, nullptr,
+        verifier_len, n_v_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(M4 Qwen3.6 dense-shape recurrence)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    ROCmGatedDeltaNet step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *step_q = nullptr;
+        float *step_k = nullptr;
+        float *step_v = nullptr;
+        ASSERT_TRUE(step_kernel.deinterleave_qkv_device(
+            d_merged_step.ptr + static_cast<size_t>(row) * qkv_stride,
+            step_q,
+            step_k,
+            step_v,
+            1,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            /*global_v_head_offset=*/0));
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            step_q,
+            step_k,
+            step_v,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_dim,
+            nullptr,
+            n_v_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(stepwise Qwen3.6 dense-shape recurrence)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 2e-4f);
+    EXPECT_LT(out_diff.second, 1e-4);
+    EXPECT_LT(state_diff.first, 2e-4f);
+    EXPECT_LT(state_diff.second, 1e-4)
+        << "ROCm Qwen3.6 dense-shape merged-QKV M=4 recurrence must match four decode steps";
+}
+
 TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcceptedRow)
 {
     if (!hasROCm())
@@ -578,6 +1057,255 @@ TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAccept
     const auto diff = diffStats(restored, ref, 0, restored.size());
     EXPECT_LT(diff.first, 1e-5f);
     EXPECT_LT(diff.second, 1e-5);
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int channels = 4096;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 4;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(verifier_len, channels, verifier_len, verifier_len, 0.015f, 0.0f, 0.015f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.0031f);
+
+    HipFloatBuffer d_input_m4(input);
+    HipFloatBuffer d_input_step(input);
+    HipFloatBuffer d_weight(weight);
+    HipFloatBuffer d_bias(bias);
+    HipFloatBuffer d_m4_out(output_elems, 0.0f);
+    HipFloatBuffer d_step_out(output_elems, 0.0f);
+    HipStreamHandle stream;
+
+    ROCmShortConvolution m4_kernel(0);
+    m4_kernel.allocateGPUState(state_floats);
+    m4_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m4_kernel.forward(
+        d_input_m4.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_m4_out.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(M4 short-conv)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    ROCmShortConvolution step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.forward(
+            d_input_step.ptr + static_cast<size_t>(row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(stepwise short-conv)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 1e-5f);
+    EXPECT_LT(out_diff.second, 1e-5);
+    EXPECT_LT(state_diff.first, 1e-5f);
+    EXPECT_LT(state_diff.second, 1e-5)
+        << "ROCm M=4 short-conv must leave the same kernel-owned state as four decode steps";
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 4;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(
+        verifier_len, channels, verifier_len, verifier_len,
+        0.0095f, 0.0f, 0.0095f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state =
+        makeInitialState(static_cast<size_t>(state_floats), 0.0027f);
+
+    HipFloatBuffer d_m4_inout(input);
+    HipFloatBuffer d_step_inout(input);
+    HipFloatBuffer d_weight(weight);
+    HipFloatBuffer d_bias(bias);
+    HipStreamHandle stream;
+
+    ROCmShortConvolution m4_kernel(0);
+    m4_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(m4_kernel.allocateGPUScratch(static_cast<int>(output_elems)));
+    m4_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m4_kernel.forward(
+        d_m4_inout.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_m4_inout.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(Qwen36 M4 in-place short-conv)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    ROCmShortConvolution step_kernel(0);
+    step_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.forward(
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(Qwen36 stepwise in-place short-conv)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_inout.toHost();
+    const auto step_out = d_step_inout.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 1e-5f);
+    EXPECT_LT(out_diff.second, 1e-5);
+    EXPECT_LT(state_diff.first, 1e-5f);
+    EXPECT_LT(state_diff.second, 1e-5)
+        << "ROCm Qwen3.6-shaped in-place M=4 short-conv must leave the same "
+           "kernel-owned state as four decode steps";
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiStepReplay)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    constexpr int channels = 64;
+    constexpr int kernel_size = 4;
+    constexpr int accepted_rows = 4;
+    constexpr int continuation_rows = 4;
+    constexpr int verifier_len = accepted_rows + continuation_rows;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t verifier_output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+    constexpr size_t continuation_output_elems =
+        static_cast<size_t>(continuation_rows) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(verifier_len, channels, verifier_len, verifier_len, 0.017f, 0.0f, 0.017f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.0029f);
+
+    HipFloatBuffer d_input(input);
+    HipFloatBuffer d_input_ref(input);
+    HipFloatBuffer d_weight(weight);
+    HipFloatBuffer d_bias(bias);
+    HipFloatBuffer d_verifier_out(verifier_output_elems, 0.0f);
+    HipFloatBuffer d_restored_continuation(continuation_output_elems, 0.0f);
+    HipFloatBuffer d_ref_prefix(static_cast<size_t>(accepted_rows) * static_cast<size_t>(channels), 0.0f);
+    HipFloatBuffer d_ref_continuation(continuation_output_elems, 0.0f);
+    HipFloatBuffer d_snapshots(static_cast<size_t>(verifier_len) * static_cast<size_t>(state_floats), -77.0f);
+    HipStreamHandle stream;
+
+    ROCmShortConvolution verifier_kernel(0);
+    verifier_kernel.allocateGPUState(state_floats);
+    verifier_kernel.setGPUStream(stream.stream);
+    verifier_kernel.bindVerifierStateCaptureWorkspace(d_snapshots.ptr, verifier_len, state_floats);
+    ASSERT_TRUE(verifier_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(verifier_kernel.forward(
+        d_input.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_verifier_out.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    ASSERT_TRUE(verifier_kernel.restoreVerifierStateCaptureRow(
+        nullptr, accepted_rows - 1, stream.stream));
+    for (int row = 0; row < continuation_rows; ++row)
+    {
+        const int source_row = accepted_rows + row;
+        ASSERT_TRUE(verifier_kernel.forward(
+            d_input.ptr + static_cast<size_t>(source_row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_restored_continuation.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(restored short-conv continuation)");
+    std::vector<float> restored_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(verifier_kernel.exportState(restored_state.data(), nullptr, nullptr));
+
+    ROCmShortConvolution ref_kernel(0);
+    ref_kernel.allocateGPUState(state_floats);
+    ref_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(ref_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(ref_kernel.forward(
+        d_input_ref.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_ref_prefix.ptr,
+        nullptr,
+        accepted_rows, channels, kernel_size,
+        /*apply_silu=*/true));
+    for (int row = 0; row < continuation_rows; ++row)
+    {
+        const int source_row = accepted_rows + row;
+        ASSERT_TRUE(ref_kernel.forward(
+            d_input_ref.ptr + static_cast<size_t>(source_row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_ref_continuation.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(reference short-conv continuation)");
+    std::vector<float> ref_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(ref_kernel.exportState(ref_state.data(), nullptr, nullptr));
+
+    const auto restored = d_restored_continuation.toHost();
+    const auto ref = d_ref_continuation.toHost();
+    const auto out_diff = diffStats(restored, ref, 0, restored.size());
+    const auto state_diff = diffStats(restored_state, ref_state, 0, restored_state.size());
+    EXPECT_LT(out_diff.first, 1e-5f);
+    EXPECT_LT(out_diff.second, 1e-5);
+    EXPECT_LT(state_diff.first, 1e-5f);
+    EXPECT_LT(state_diff.second, 1e-5);
 }
 
 #endif

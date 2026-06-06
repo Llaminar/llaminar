@@ -1355,6 +1355,82 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay
         << "CUDA M=4 short-conv must leave the same kernel-owned state as four decode steps";
 }
 
+TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int channels = 10240;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 2;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems =
+        static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(
+        verifier_len, channels, verifier_len, verifier_len,
+        0.0095f, 0.0f, 0.0095f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state =
+        makeInitialState(static_cast<size_t>(state_floats), 0.0027f);
+
+    CudaFloatBuffer d_m2_inout(input);
+    CudaFloatBuffer d_step_inout(input);
+    CudaFloatBuffer d_weight(weight);
+    CudaFloatBuffer d_bias(bias);
+    CudaStreamHandle stream;
+
+    CUDAShortConvolution m2_kernel(cuda_ordinal_);
+    m2_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(m2_kernel.allocateGPUScratch(
+        static_cast<int>(output_elems)));
+    m2_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(m2_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    ASSERT_TRUE(m2_kernel.forward(
+        d_m2_inout.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_m2_inout.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(Qwen36 M2 in-place short-conv)");
+    std::vector<float> m2_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m2_kernel.exportState(m2_state.data(), nullptr, stream.stream));
+
+    CUDAShortConvolution step_kernel(cuda_ordinal_);
+    step_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(step_kernel.allocateGPUScratch(channels));
+    step_kernel.setGPUStream(stream.stream);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, stream.stream));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.forward(
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_step_inout.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(Qwen36 stepwise in-place short-conv)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, stream.stream));
+
+    const auto m2_out = d_m2_inout.toHost();
+    const auto step_out = d_step_inout.toHost();
+    const auto out_diff = diffStats(m2_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m2_state, step_state, 0, m2_state.size());
+    EXPECT_LT(out_diff.first, 1e-5f);
+    EXPECT_LT(out_diff.second, 1e-5);
+    EXPECT_LT(state_diff.first, 1e-5f);
+    EXPECT_LT(state_diff.second, 1e-5)
+        << "CUDA Qwen3.6-shaped in-place M=2 short-conv must leave the same "
+           "kernel-owned state as two decode steps";
+}
+
 TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvTwoRowVerifierRowZeroRestoreMatchesOneRowReplay)
 {
     SKIP_IF_NO_CUDA();

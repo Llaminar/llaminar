@@ -5,6 +5,47 @@
 namespace llaminar2
 {
 
+    const char *toString(PrefixStateProvenance provenance)
+    {
+        switch (provenance)
+        {
+        case PrefixStateProvenance::Unknown:
+            return "unknown";
+        case PrefixStateProvenance::PayloadCheckpoint:
+            return "payload_checkpoint";
+        case PrefixStateProvenance::LogicalCheckpoint:
+            return "logical_checkpoint";
+        case PrefixStateProvenance::DecodeEquivalent:
+            return "decode_equivalent";
+        case PrefixStateProvenance::VerifierPrefillRows:
+            return "verifier_prefill_rows";
+        case PrefixStateProvenance::VerifierPrefillRowsDecodeEquivalent:
+            return "verifier_prefill_rows_decode_equivalent";
+        case PrefixStateProvenance::SidecarDraftOnly:
+            return "sidecar_draft_only";
+        default:
+            return "unknown";
+        }
+    }
+
+    bool isDecodeEquivalent(PrefixStateProvenance provenance)
+    {
+        switch (provenance)
+        {
+        case PrefixStateProvenance::PayloadCheckpoint:
+        case PrefixStateProvenance::LogicalCheckpoint:
+        case PrefixStateProvenance::DecodeEquivalent:
+        case PrefixStateProvenance::VerifierPrefillRowsDecodeEquivalent:
+            return true;
+        case PrefixStateProvenance::Unknown:
+        case PrefixStateProvenance::VerifierPrefillRows:
+        case PrefixStateProvenance::SidecarDraftOnly:
+            return false;
+        default:
+            return false;
+        }
+    }
+
     PrefixLookupResult PrefixLookupResult::clampedTo(int token_count) const
     {
         PrefixLookupResult result = *this;

@@ -453,19 +453,33 @@ namespace llaminar2
                 float alpha, float beta);
 
             /**
-             * @brief Small-M FP32 activations -> native-VNNI row-wise GEMV.
+             * @brief Small-M FP32 activations -> specialized native-VNNI GEMV.
              *
              * Greedy MTP verifier forwards commonly use M=2..4. The generic
              * native VNNI prefill path is tuned for larger prefill buckets and
-             * has separate dispatch regimes, so verifier rows stay on the
-             * decode-class GEMV path. This helper quantizes all rows once, then
-             * dispatches the tuned M=1 GEMV kernel per row on the caller-provided
-             * graph stream.
+             * has separate dispatch regimes, so verifier rows stay on the small-M
+             * decode-class GEMV path after one shared activation quantization.
              */
             bool multiply_fp32_to_fp32_small_m_gemv(
                 const float *d_A, float *d_C, const float *d_bias,
                 int m, int n, int k,
                 float alpha, float beta);
+
+            /**
+             * @brief Already-quantized small-M activations -> native-VNNI GEMV.
+             *
+             * Used by fused activation paths that quantize a derived activation
+             * once, for example silu(gate)*up. Tests may pass false for
+             * use_specialized_small_m_kernel to compare against serial M=1 GEMVs.
+             */
+            bool multiply_quantized_small_m_gemv(
+                const int8_t *d_A_int8,
+                const float *d_scales_A_blockwise,
+                float *d_C,
+                const float *d_bias,
+                int m, int n, int k,
+                float alpha, float beta,
+                bool use_specialized_small_m_kernel = true);
 
             /**
              * @brief FP32 activations → quantize → INT8 GEMM → Q8_1 output

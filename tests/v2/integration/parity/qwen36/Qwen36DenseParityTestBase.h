@@ -669,18 +669,23 @@ namespace llaminar2::test::parity::qwen36
         return snapshots;
     }
 
-    inline ::testing::AssertionResult denseM4FinalRowSnapshotsNear(
-        const std::map<std::string, DenseStageSnapshot> &m4_snapshots,
+    inline ::testing::AssertionResult denseVerifierRowSnapshotsNear(
+        const std::map<std::string, DenseStageSnapshot> &verifier_snapshots,
         const std::map<std::string, DenseStageSnapshot> &single_row_snapshots,
         const std::string &label,
-        int m4_row_index,
+        int verifier_rows,
+        int verifier_row_index,
         float abs_tolerance = 1.0e-6f,
         float rel_tolerance = 1.0e-6f)
     {
-        if (m4_row_index < 0 || m4_row_index >= 4)
+        if (verifier_rows <= 0 ||
+            verifier_row_index < 0 ||
+            verifier_row_index >= verifier_rows)
         {
             return ::testing::AssertionFailure()
-                   << label << " invalid M=4 row index " << m4_row_index;
+                   << label << " invalid verifier row index "
+                   << verifier_row_index << " for verifier rows "
+                   << verifier_rows;
         }
 
         struct Mismatch
@@ -698,7 +703,7 @@ namespace llaminar2::test::parity::qwen36
 
         std::vector<Mismatch> mismatches;
         size_t comparable = 0;
-        for (const auto &[key, m4] : m4_snapshots)
+        for (const auto &[key, verifier] : verifier_snapshots)
         {
             const auto single_it = single_row_snapshots.find(key);
             if (single_it == single_row_snapshots.end())
@@ -706,18 +711,20 @@ namespace llaminar2::test::parity::qwen36
                 continue;
             }
             const DenseStageSnapshot &single = single_it->second;
-            if (m4.rows != 4 || single.rows != 1 || m4.cols != single.cols)
+            if (static_cast<int>(verifier.rows) != verifier_rows ||
+                single.rows != 1 ||
+                verifier.cols != single.cols)
             {
                 continue;
             }
             ++comparable;
             Mismatch mismatch;
             mismatch.key = key;
-            const size_t m4_row_offset =
-                static_cast<size_t>(m4_row_index) * m4.cols;
-            for (size_t col = 0; col < m4.cols; ++col)
+            const size_t verifier_row_offset =
+                static_cast<size_t>(verifier_row_index) * verifier.cols;
+            for (size_t col = 0; col < verifier.cols; ++col)
             {
-                const float a = m4.data[m4_row_offset + col];
+                const float a = verifier.data[verifier_row_offset + col];
                 const float e = single.data[col];
                 const float abs_diff = std::fabs(a - e);
                 const float scale = std::max(std::fabs(a), std::fabs(e));
@@ -754,7 +761,7 @@ namespace llaminar2::test::parity::qwen36
             if (comparable == 0)
             {
                 return ::testing::AssertionFailure()
-                       << label << " found no comparable M=4/single-row "
+                       << label << " found no comparable verifier/single-row "
                        << "stage snapshots";
             }
             return ::testing::AssertionSuccess();
@@ -794,6 +801,8 @@ namespace llaminar2::test::parity::qwen36
                 {"Q_ROPE", 80},
                 {"K_ROPE", 90},
                 {"GDN_CONV1D_OUTPUT", 100},
+                {"GDN_ALPHA", 105},
+                {"GDN_BETA", 106},
                 {"GDN_DELTA_RULE_OUTPUT", 110},
                 {"GDN_NORM_GATE_OUTPUT", 120},
                 {"ATTENTION_CONTEXT", 130},
@@ -825,7 +834,7 @@ namespace llaminar2::test::parity::qwen36
                   });
 
         std::ostringstream oss;
-        oss << label << " stage snapshot final-row mismatch across "
+        oss << label << " stage snapshot row mismatch across "
             << mismatches.size() << " / " << comparable
             << " comparable stages";
         const size_t limit = std::min<size_t>(mismatches.size(), 24);
@@ -2714,12 +2723,357 @@ namespace llaminar2::test::parity::qwen36
         runner->setSkipLogitsGatherPrefill(false);
     }
 
-    inline void runDenseM4VerifierLongPrefixMatchesSequential(
+    inline void runDenseOneRowRestoreLongPrefixMatchesSequential(
         DensePrefixRestoreParityCase test_case)
     {
         ScopedDenseParityDeterministicMode deterministic_mode(
             shouldUseDenseParityDeterministicMode(test_case));
-        test_case.name += " dense long-prefix M=4 verifier parity";
+        test_case.name += " dense long-prefix one-row restore parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_METADATA",
+        };
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_benchmark_prompt_snapshots/metadata.txt";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "0"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        size_t first_token_index = expected_tokens.size();
+        for (size_t i = 1; i + 3 < expected_tokens.size(); ++i)
+        {
+            if (expected_tokens[i - 1] == 258 &&
+                expected_tokens[i] == 10608 &&
+                expected_tokens[i + 1] == 20271 &&
+                expected_tokens[i + 2] == 92217 &&
+                expected_tokens[i + 3] == 48567)
+            {
+                first_token_index = i;
+            }
+        }
+        ASSERT_LT(first_token_index + 1, expected_tokens.size())
+            << "Benchmark metadata no longer contains the known long-prefix "
+               "one-row restore window";
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size() + first_token_index + 2),
+            test_case.max_seq_len);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 3;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        for (size_t i = 0; i < first_token_index; ++i)
+        {
+            const int32_t token = expected_tokens[i];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Failed to replay expected token at index " << i;
+        }
+
+        const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(prefix_checkpoint.valid);
+        runner->enableSnapshotCapture();
+
+        const int32_t token = expected_tokens[first_token_index];
+        const int32_t expected_next = expected_tokens[first_token_index + 1];
+
+        runner->clearSnapshots();
+        ASSERT_TRUE(runner->forward(&token, 1));
+        const auto sequential_snapshots = captureDenseStageSnapshots(*runner);
+        const int32_t sequential_next = runner->sampleGreedyOnDevice();
+        ASSERT_EQ(sequential_next, expected_next)
+            << "Sequential one-row decode no longer matches PyTorch at the "
+               "known restore window";
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->clearSnapshots();
+        ASSERT_TRUE(runner->forward(&token, 1));
+        const auto restored_snapshots = captureDenseStageSnapshots(*runner);
+        const int32_t restored_next = runner->sampleGreedyOnDevice();
+
+        const ::testing::AssertionResult stage_match =
+            denseVerifierRowSnapshotsNear(
+                restored_snapshots,
+                sequential_snapshots,
+                "Restored one-row decode",
+                1,
+                0,
+                1.0e-5f,
+                1.0e-5f);
+        EXPECT_TRUE(stage_match)
+            << stage_match.message();
+        EXPECT_EQ(restored_next, sequential_next)
+            << "Restored one-row decode must produce the same token as the "
+               "original sequential decode"
+            << "\ncondition token: " << expected_tokens[first_token_index - 1]
+            << "\ninput token: " << token
+            << "\nrestored next: " << restored_next
+            << "\nsequential next: " << sequential_next
+            << "\nstage diff: " << stage_match.message();
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM2VerifierFinalStateLongPrefixIsNotDecodeEquivalent(
+        DensePrefixRestoreParityCase test_case)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " dense long-prefix M=2 verifier final-state non-equivalence";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_METADATA",
+        };
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_benchmark_prompt_snapshots/metadata.txt";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "0"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        size_t first_token_index = expected_tokens.size();
+        for (size_t i = 1; i + 2 < expected_tokens.size(); ++i)
+        {
+            if (expected_tokens[i - 1] == 20271 &&
+                expected_tokens[i] == 92217 &&
+                expected_tokens[i + 1] == 48567)
+            {
+                first_token_index = i;
+            }
+        }
+        ASSERT_LT(first_token_index + 2, expected_tokens.size())
+            << "Benchmark metadata no longer contains the known long-prefix "
+               "M=2 verifier final-state window";
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size() + first_token_index + 3),
+            test_case.max_seq_len);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        for (size_t i = 0; i < first_token_index; ++i)
+        {
+            const int32_t token = expected_tokens[i];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Failed to replay expected token at index " << i;
+        }
+
+        const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(prefix_checkpoint.valid);
+        runner->enableSnapshotCapture();
+
+        const int32_t verifier_inputs[2] = {
+            expected_tokens[first_token_index],
+            expected_tokens[first_token_index + 1],
+        };
+        const int32_t expected_after_terminal =
+            expected_tokens[first_token_index + 2];
+
+        std::vector<std::map<std::string, DenseStageSnapshot>> sequential_stage_snapshots;
+        sequential_stage_snapshots.reserve(2);
+        runner->clearSnapshots();
+        ASSERT_TRUE(runner->forward(&verifier_inputs[0], 1));
+        sequential_stage_snapshots.push_back(
+            captureDenseStageSnapshots(*runner));
+        const int32_t sequential_row0 = runner->sampleGreedyOnDevice();
+        ASSERT_EQ(sequential_row0, verifier_inputs[1])
+            << "Sequential row 0 no longer matches the benchmark metadata";
+        runner->clearSnapshots();
+        ASSERT_TRUE(runner->forward(&verifier_inputs[1], 1));
+        sequential_stage_snapshots.push_back(
+            captureDenseStageSnapshots(*runner));
+        const int32_t sequential_after_terminal = runner->sampleGreedyOnDevice();
+        ASSERT_EQ(sequential_after_terminal, expected_after_terminal)
+            << "Sequential terminal row no longer matches the benchmark metadata";
+        const PrefixStateSnapshot sequential_final_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(sequential_final_state.valid);
+        ASSERT_TRUE(runner->forward(&sequential_after_terminal, 1));
+        const int32_t sequential_continuation = runner->sampleGreedyOnDevice();
+        ASSERT_GE(sequential_continuation, 0);
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->clearSnapshots();
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs, 2));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        const auto all_position_stage_snapshots =
+            captureDenseStageSnapshots(*runner);
+        int32_t verifier_rows[2] = {-1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            2,
+            verifier_rows));
+        EXPECT_EQ(verifier_rows[0], verifier_inputs[1])
+            << "M=2 all-position verifier row 0 must match sequential decode";
+        EXPECT_EQ(verifier_rows[1], sequential_after_terminal)
+            << "M=2 all-position verifier row 1 must match sequential decode";
+        const PrefixStateSnapshot all_position_final_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(all_position_final_state.valid);
+        ASSERT_TRUE(runner->forward(&verifier_rows[1], 1));
+        const int32_t all_position_continuation = runner->sampleGreedyOnDevice();
+        ASSERT_GE(all_position_continuation, 0);
+
+        const int verifier_row1_target_cached_tokens =
+            prefix_checkpoint.cached_tokens + 2;
+        ASSERT_TRUE(runner->restoreMTPVerifierStateRow(
+            1,
+            verifier_row1_target_cached_tokens));
+        const PrefixStateSnapshot row1_restore_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(row1_restore_state.valid);
+        ASSERT_TRUE(runner->forward(&verifier_rows[1], 1));
+        const int32_t row1_restore_continuation = runner->sampleGreedyOnDevice();
+        ASSERT_GE(row1_restore_continuation, 0);
+
+        const ::testing::AssertionResult all_position_state_match =
+            prefixSnapshotPayloadsNear(
+            all_position_final_state,
+            sequential_final_state,
+            "M=2 verifier all-position final state");
+        const ::testing::AssertionResult row1_restore_state_match =
+            prefixSnapshotPayloadsNear(
+            row1_restore_state,
+            sequential_final_state,
+            "M=2 verifier row-1 restore state");
+        bool any_stage_row_diverged = false;
+        for (int row = 0; row < 2; ++row)
+        {
+            const ::testing::AssertionResult stage_match =
+                denseVerifierRowSnapshotsNear(
+                all_position_stage_snapshots,
+                sequential_stage_snapshots[static_cast<size_t>(row)],
+                "M=2 verifier row-" + std::to_string(row) + " stage snapshots",
+                2,
+                row);
+            if (!stage_match)
+            {
+                any_stage_row_diverged = true;
+                if (std::getenv("LLAMINAR_QWEN36_DUMP_M2_VERIFIER_DIVERGENCE"))
+                {
+                    std::cerr << stage_match.message() << std::endl;
+                }
+            }
+        }
+        EXPECT_TRUE(any_stage_row_diverged)
+            << "CUDA M=2 verifier rows unexpectedly matched sequential decode "
+               "stage snapshots; re-evaluate the verifier-row shortcut guard.";
+        EXPECT_FALSE(all_position_state_match)
+            << "M=2 verifier final state unexpectedly became decode-equivalent; "
+               "re-evaluate the CUDA depth-1 MTP verifier gate before enabling "
+               "the batched verifier path."
+            << "\ncondition token: " << expected_tokens[first_token_index - 1]
+            << "\nverifier inputs: " << verifier_inputs[0] << ','
+            << verifier_inputs[1]
+            << "\nverifier rows: " << verifier_rows[0] << ','
+            << verifier_rows[1]
+            << "\nstate diff: " << all_position_state_match.message();
+        EXPECT_FALSE(row1_restore_state_match)
+            << "M=2 verifier row-1 restore unexpectedly became "
+               "decode-equivalent; update the CUDA verifier-row shortcut "
+               "gate and this negative regression together."
+            << "\nstate diff: " << row1_restore_state_match.message();
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM4VerifierLongPrefixEquivalence(
+        DensePrefixRestoreParityCase test_case,
+        bool expect_decode_equivalent)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += expect_decode_equivalent
+                              ? " dense long-prefix M=4 verifier parity"
+                              : " dense long-prefix M=4 verifier non-equivalence";
         test_case.prompt = qwen36DefaultBenchmarkPrompt();
         test_case.decode_steps = 128;
         test_case.max_seq_len = 768;
@@ -2804,6 +3158,7 @@ namespace llaminar2::test::parity::qwen36
 
         const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
         ASSERT_TRUE(prefix_checkpoint.valid);
+        runner->enableSnapshotCapture();
 
         const int32_t verifier_inputs[4] = {
             expected_tokens[first_token_index],
@@ -2813,10 +3168,14 @@ namespace llaminar2::test::parity::qwen36
         };
 
         int32_t sequential_next[3] = {-1, -1, -1};
+        std::vector<std::map<std::string, DenseStageSnapshot>> sequential_snapshots(3);
         for (int row = 0; row < 3; ++row)
         {
+            runner->clearSnapshots();
             ASSERT_TRUE(runner->forward(&verifier_inputs[row], 1))
                 << "Sequential forward failed at verifier row " << row;
+            sequential_snapshots[static_cast<size_t>(row)] =
+                captureDenseStageSnapshots(*runner);
             sequential_next[row] = runner->sampleGreedyOnDevice();
             ASSERT_GE(sequential_next[row], 0)
                 << "Sequential sample failed at verifier row " << row;
@@ -2826,8 +3185,10 @@ namespace llaminar2::test::parity::qwen36
         }
 
         ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->clearSnapshots();
         ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
         ASSERT_TRUE(runner->forward(verifier_inputs, 4));
+        const auto verifier_snapshots = captureDenseStageSnapshots(*runner);
         ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
         int32_t verifier_rows[4] = {-1, -1, -1, -1};
         ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
@@ -2835,11 +3196,54 @@ namespace llaminar2::test::parity::qwen36
             4,
             verifier_rows));
 
+        bool any_stage_row_diverged = false;
+        bool any_token_row_diverged = false;
         for (int row = 0; row < 3; ++row)
         {
-            EXPECT_EQ(verifier_rows[row], sequential_next[row])
-                << "M=4 all-position verifier row must match sequential decode"
-                << "\nrow: " << row
+            auto stage_match = denseVerifierRowSnapshotsNear(
+                verifier_snapshots,
+                sequential_snapshots[static_cast<size_t>(row)],
+                "M=4 all-position verifier row " + std::to_string(row),
+                4,
+                row,
+                1.0e-5f,
+                1.0e-5f);
+            if (!stage_match)
+            {
+                any_stage_row_diverged = true;
+            }
+            if (verifier_rows[row] != sequential_next[row])
+            {
+                any_token_row_diverged = true;
+            }
+
+            if (expect_decode_equivalent)
+            {
+                EXPECT_TRUE(stage_match)
+                    << stage_match.message();
+                EXPECT_EQ(verifier_rows[row], sequential_next[row])
+                    << "M=4 all-position verifier row must match sequential decode"
+                    << "\nrow: " << row
+                    << "\ncondition token: " << expected_tokens[first_token_index - 1]
+                    << "\nverifier inputs: "
+                    << verifier_inputs[0] << ',' << verifier_inputs[1] << ','
+                    << verifier_inputs[2] << ',' << verifier_inputs[3]
+                    << "\nverifier rows: "
+                    << verifier_rows[0] << ',' << verifier_rows[1] << ','
+                    << verifier_rows[2] << ',' << verifier_rows[3]
+                    << "\nsequential next: "
+                    << sequential_next[0] << ',' << sequential_next[1] << ','
+                    << sequential_next[2]
+                    << "\nstage diff: " << stage_match.message();
+            }
+        }
+
+        if (!expect_decode_equivalent)
+        {
+            EXPECT_TRUE(any_stage_row_diverged || any_token_row_diverged)
+                << "M=4 all-position verifier unexpectedly became decode-equivalent; "
+                   "revisit the shared decode-equivalent verifier policy before "
+                   "enabling the batched verifier path for this backend"
                 << "\ncondition token: " << expected_tokens[first_token_index - 1]
                 << "\nverifier inputs: "
                 << verifier_inputs[0] << ',' << verifier_inputs[1] << ','
@@ -2855,6 +3259,22 @@ namespace llaminar2::test::parity::qwen36
         ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
         runner->setSkipLogitsGatherDecode(false);
         runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM4VerifierLongPrefixMatchesSequential(
+        DensePrefixRestoreParityCase test_case)
+    {
+        runDenseM4VerifierLongPrefixEquivalence(
+            std::move(test_case),
+            /*expect_decode_equivalent=*/true);
+    }
+
+    inline void runDenseM4VerifierLongPrefixIsNotDecodeEquivalent(
+        DensePrefixRestoreParityCase test_case)
+    {
+        runDenseM4VerifierLongPrefixEquivalence(
+            std::move(test_case),
+            /*expect_decode_equivalent=*/false);
     }
 
     inline void runDenseM4VerifierAfterSidecarChainMatchesSequential(
@@ -3369,10 +3789,11 @@ namespace llaminar2::test::parity::qwen36
         for (int row = 0; row < 4; ++row)
         {
             const ::testing::AssertionResult stage_match =
-                denseM4FinalRowSnapshotsNear(
+                denseVerifierRowSnapshotsNear(
                 all_position_stage_snapshots,
                 sequential_stage_snapshots[static_cast<size_t>(row)],
                 "M=4 verifier row-" + std::to_string(row) + " stage snapshots",
+                4,
                 row);
             if (!stage_match)
             {

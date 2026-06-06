@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -40,7 +41,9 @@
 #include "interfaces/IWorkspaceConsumer.h"
 #include "tensors/Tensors.h"
 #include "tensors/FP16Utils.h"
+#include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../../utils/TestTensorFactory.h"
 
 #ifdef HAVE_ROCM
@@ -48,6 +51,40 @@
 
 extern "C" void rocmGemv_native_vnni_set_tuning_overrides(int kb, int target_waves_per_cu);
 extern "C" void rocmGemv_native_vnni_reset_tuning_overrides();
+extern "C" bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+    const float *d_A_fp32,
+    int8_t *d_A_int8,
+    float *d_scales_blockwise,
+    int32_t *d_sums_blockwise,
+    int M, int K,
+    int rocm_device_id, void *stream,
+    int block_size);
+extern "C" bool rocmGemv_native_vnni_fp32(
+    const int8_t *d_A_int8,
+    const uint8_t *d_payload,
+    const void *d_block_scales,
+    const void *d_block_mins,
+    const void *d_block_emins,
+    float *d_C_fp32,
+    const float *d_scale_A,
+    float *d_partial_fp32,
+    int N, int K,
+    uint8_t codebook_id,
+    int device_id, void *stream,
+    const float *d_scale_A_blockwise);
+extern "C" bool rocmGemv_native_vnni_small_m_fp32_with_sums(
+    const int8_t *d_A_int8,
+    const uint8_t *d_payload,
+    const void *d_block_scales,
+    const void *d_block_mins,
+    const void *d_block_emins,
+    float *d_C_fp32,
+    const float *d_scale_A_blockwise,
+    const int32_t *d_sum_A_blockwise,
+    float *d_partial_fp32,
+    int M, int N, int K,
+    uint8_t codebook_id,
+    int device_id, void *stream);
 #endif
 
 using namespace llaminar2;
@@ -168,6 +205,39 @@ namespace
 
         return std::make_unique<Q4_KTensor>(std::vector<size_t>{N, K}, raw_data);
     }
+
+    class ScopedDebugEnvOverride
+    {
+    public:
+        ScopedDebugEnvOverride(const char *name, const char *value)
+            : name_(name)
+        {
+            if (const char *old = std::getenv(name))
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            setenv(name, value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedDebugEnvOverride()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedDebugEnvOverride(const ScopedDebugEnvOverride &) = delete;
+        ScopedDebugEnvOverride &operator=(const ScopedDebugEnvOverride &) = delete;
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
+    };
 
     void cpuQ4LikeNativeVNNIGemvFromPacked(const int8_t *a_int8,
                                           const float *a_scales_blockwise,
@@ -899,6 +969,254 @@ namespace
         }
 
         cleanupWorkspace(kernel);
+    }
+
+    TEST_F(NativeVNNIGEMVTest, DeterministicModeUsesSplitReduceEvenWhenGpuGraphsWouldForceAtomic)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
+        ScopedDebugEnvOverride graphs_env("LLAMINAR_GPU_GRAPHS", "1");
+        ScopedDebugEnvOverride atomic_env("LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "1");
+        ScopedDebugEnvOverride perf_env("LLAMINAR_PERF_STATS_JSON", "1");
+        NativeVNNITuningOverrideGuard force_kb(/*kb=*/4);
+        PerfStatsCollector::reset();
+        ASSERT_TRUE(PerfStatsCollector::isEnabled());
+        ASSERT_TRUE(debugEnv().gemm.deterministic);
+        EXPECT_FALSE(debugEnv().rocm.nvnni_atomic_reduce);
+
+        constexpr int M = 2;
+        constexpr int N = 512;
+        constexpr int K = 2048;
+
+        auto weights = TestTensorFactory::createQ4_0Random({N, K}, 94001u);
+        ROCmPackedWeights packed;
+        ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+        ASSERT_FALSE(packed.native_vnni_payload.empty());
+
+        ROCmQuantisedGemmKernel kernel(&packed, 0);
+        ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+        auto input = TestTensorFactory::createFP32Random({M, K}, -1.0f, 1.0f, 94002u);
+        auto output_gpu = TestTensorFactory::createFP32({M, N});
+        ASSERT_TRUE(runGemvOnGpu(kernel, input.get(), output_gpu.get(), M, N, K));
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        const auto records = PerfStatsCollector::snapshot({"kernel"});
+        bool found_split_reduce = false;
+        bool found_atomic_reduce = false;
+        for (const auto &record : records)
+        {
+            if (record.name != "rocm_native_vnni_small_m_launch")
+                continue;
+            auto tag = [&](const char *key) -> std::string
+            {
+                const auto it = record.tags.find(key);
+                return it == record.tags.end() ? std::string{} : it->second;
+            };
+            if (tag("m") != "2" || tag("n") != std::to_string(N) ||
+                tag("k") != std::to_string(K) || tag("codebook") != "0")
+            {
+                continue;
+            }
+            found_split_reduce = found_split_reduce || tag("path") == "split_reduce";
+            found_atomic_reduce = found_atomic_reduce || tag("path") == "atomic_reduce";
+        }
+
+        EXPECT_TRUE(found_split_reduce)
+            << "deterministic ROCm native-VNNI small-M GEMV must use ordered split-reduce"
+            << "\n"
+            << PerfStatsCollector::summaryString({"kernel"}, 0);
+        EXPECT_FALSE(found_atomic_reduce)
+            << "LLAMINAR_DETERMINISTIC must beat both GPU-graph and env-requested atomic reduce";
+
+        cleanupWorkspace(kernel);
+        PerfStatsCollector::reset();
+#endif
+    }
+
+    TEST_F(NativeVNNIGEMVTest, SpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_rocm_device_)
+        {
+            GTEST_SKIP() << "No ROCm device available";
+        }
+
+        ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
+        NativeVNNITuningOverrideGuard force_direct(/*kb=*/1);
+        constexpr int N = 384;
+        constexpr int K = 512;
+        const std::array<int, 3> verifier_rows = {2, 3, 4};
+        const auto device = DeviceId::rocm(0);
+
+        for (const auto &fmt : ALL_GEMV_FORMATS)
+        {
+            auto weights = fmt.create(N, K);
+            ASSERT_NE(weights, nullptr) << fmt.name << " weights";
+
+            ROCmPackedWeights packed;
+            ASSERT_TRUE(packForNativeVNNIGemv(fmt, weights.get(), packed))
+                << fmt.name << " native-VNNI pack";
+            ROCmQuantisedGemmKernel kernel(&packed, 0);
+            ASSERT_TRUE(setupWorkspace(kernel, 4, N, K))
+                << fmt.name << " workspace";
+
+            DeviceNativeVNNIMatrixDesc desc;
+            if (!kernel.exportNativeVNNIMatrixDesc(desc))
+            {
+                desc = {};
+                desc.payload = packed.d_native_vnni_payload;
+                desc.scales = packed.d_native_vnni_scales;
+                desc.mins = packed.d_native_vnni_mins;
+                desc.emins = packed.d_native_vnni_emins;
+                desc.n = N;
+                desc.k = K;
+                desc.blocks_per_row = packed.native_vnni_blocks_per_row;
+                desc.codebook_id = packed.native_vnni_codebook_id;
+            }
+            ASSERT_TRUE(desc.valid())
+                << fmt.name << " native-VNNI descriptor or packed upload descriptor";
+
+            hipStream_t stream = nullptr;
+            ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess)
+                << fmt.name << " explicit HIP stream";
+            kernel.setGPUStream(stream);
+
+            auto *d_A_int8 = static_cast<int8_t *>(
+                workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            auto *d_scales_A = static_cast<float *>(
+                workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+            auto *d_sums_A = static_cast<int32_t *>(
+                workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE));
+            auto *d_partial = static_cast<float *>(
+                workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL));
+            ASSERT_NE(d_A_int8, nullptr) << fmt.name << " quantized activation workspace";
+            ASSERT_NE(d_scales_A, nullptr) << fmt.name << " blockwise scale workspace";
+            ASSERT_NE(d_sums_A, nullptr) << fmt.name << " blockwise sum workspace";
+            ASSERT_NE(d_partial, nullptr) << fmt.name << " scatter partial workspace";
+
+            for (int M : verifier_rows)
+            {
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)},
+                    -1.0f,
+                    1.0f,
+                    55000u + static_cast<uint32_t>(M));
+                auto output_specialized = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(M), static_cast<size_t>(N)});
+                auto output_serial = TestTensorFactory::createFP32(
+                    {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(device))
+                    << fmt.name << " input upload M=" << M;
+                ASSERT_TRUE(output_specialized->ensureOnDevice(device))
+                    << fmt.name << " specialized output allocation M=" << M;
+                ASSERT_TRUE(output_serial->ensureOnDevice(device))
+                    << fmt.name << " serial output allocation M=" << M;
+
+                const float *d_input = static_cast<const float *>(input->gpu_data_ptr());
+                float *d_output_specialized = static_cast<float *>(output_specialized->gpu_data_ptr());
+                float *d_output_serial = static_cast<float *>(output_serial->gpu_data_ptr());
+                ASSERT_NE(d_input, nullptr);
+                ASSERT_NE(d_output_specialized, nullptr);
+                ASSERT_NE(d_output_serial, nullptr);
+
+                ASSERT_TRUE(rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+                    d_input,
+                    d_A_int8,
+                    d_scales_A,
+                    d_sums_A,
+                    M,
+                    K,
+                    0,
+                    stream,
+                    32))
+                    << fmt.name << " blockwise activation quantization M=" << M;
+
+                ASSERT_TRUE(rocmGemv_native_vnni_small_m_fp32_with_sums(
+                    d_A_int8,
+                    static_cast<const uint8_t *>(desc.payload),
+                    desc.scales,
+                    desc.mins,
+                    desc.emins,
+                    d_output_specialized,
+                    d_scales_A,
+                    d_sums_A,
+                    d_partial,
+                    M,
+                    N,
+                    K,
+                    desc.codebook_id,
+                    0,
+                    stream))
+                    << fmt.name << " specialized small-M GEMV M=" << M;
+
+                for (int row = 0; row < M; ++row)
+                {
+                    const int blocks_per_row = K / 32;
+                    const int8_t *row_A =
+                        d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(K);
+                    const float *row_scales =
+                        d_scales_A + static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row);
+                    float *row_output =
+                        d_output_serial + static_cast<size_t>(row) * static_cast<size_t>(N);
+                    ASSERT_TRUE(rocmGemv_native_vnni_fp32(
+                        row_A,
+                        static_cast<const uint8_t *>(desc.payload),
+                        desc.scales,
+                        desc.mins,
+                        desc.emins,
+                        row_output,
+                        nullptr,
+                        d_partial,
+                        N,
+                        K,
+                        desc.codebook_id,
+                        0,
+                        stream,
+                        row_scales))
+                        << fmt.name << " serial GEMV row " << row << " M=" << M;
+                }
+
+                ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess)
+                    << fmt.name << " stream sync M=" << M;
+                output_specialized->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+                output_serial->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+
+                const float *specialized = output_specialized->data();
+                const float *serial = output_serial->data();
+                const size_t count = static_cast<size_t>(M) * static_cast<size_t>(N);
+                const float rel_l2 = relativeL2Error(specialized, serial, count);
+                const float max_abs = maxAbsError(specialized, serial, count);
+                EXPECT_LE(rel_l2, 1e-5f)
+                    << fmt.name << " M=" << M << " relative L2 differs from serial GEMVs";
+                EXPECT_LE(max_abs, 1e-4f)
+                    << fmt.name << " M=" << M << " max abs differs from serial GEMVs";
+                if (max_abs > 0.0f)
+                {
+                    EXPECT_GE(cosineSimilarity(specialized, serial, count), 0.999999f)
+                        << fmt.name << " M=" << M
+                        << " specialized ROCm small-M GEMV diverges from serial GEMVs"
+                        << " rel_l2=" << rel_l2
+                        << " max_abs=" << max_abs;
+                }
+            }
+
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            kernel.setGPUStream(nullptr);
+            ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+            cleanupWorkspace(kernel);
+        }
+#endif
     }
 
     /**

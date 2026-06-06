@@ -181,6 +181,25 @@ namespace llaminar2
                 CUDAGemvContext *gemv_ctx,
                 CUDARowMajorWeights **rm_slot);
 
+            bool cudaNativeVNNIGemvTuned_small_m_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int M,
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                int cuda_device_id,
+                void *stream,
+                CUDAGemvContext *gemv_ctx,
+                CUDARowMajorWeights **rm_slot);
+
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
             // Unified prefill dispatch for all formats
@@ -521,6 +540,42 @@ namespace llaminar2
                             : nativeVNNIPrefillSupportsCodebook(impl->native_codebook_id));
             }
 
+            bool ensureNativeVNNIIQGridTablesInitialized(uint8_t codebook_id, int cuda_device_id, const char *context)
+            {
+                const bool needs_iq_tables = codebook_id >= 11 && codebook_id <= 17;
+                if (!needs_iq_tables)
+                {
+                    return true;
+                }
+
+                static std::mutex iq_table_mutex;
+                static std::unordered_set<int> iq_init_devices;
+
+                std::lock_guard<std::mutex> lock(iq_table_mutex);
+                if (iq_init_devices.count(cuda_device_id))
+                {
+                    return true;
+                }
+
+                if (!cudaQuantGemm_setDevice(cuda_device_id))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] " << context
+                                                           << " failed to set CUDA device " << cuda_device_id
+                                                           << " before IQ grid table initialization");
+                    return false;
+                }
+                if (!cudaNativeVNNIInitIQGridTables_tuned())
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] " << context
+                                                           << " failed to initialize IQ grid tables for CUDA device "
+                                                           << cuda_device_id);
+                    return false;
+                }
+
+                iq_init_devices.insert(cuda_device_id);
+                return true;
+            }
+
             template <typename ImplT>
             bool runNativeVNNIBlockwiseIfSupported(
                 const ImplT *impl,
@@ -542,28 +597,12 @@ namespace llaminar2
                     return false;
                 }
 
-                const bool needs_iq_tables = impl->native_codebook_id >= 11 && impl->native_codebook_id <= 17;
-                if (needs_iq_tables)
+                if (!ensureNativeVNNIIQGridTablesInitialized(
+                        impl->native_codebook_id,
+                        cuda_device_id,
+                        "NativeVNNI blockwise route"))
                 {
-                    static std::mutex iq_table_mutex;
-                    static std::unordered_set<int> iq_init_devices;
-
-                    std::lock_guard<std::mutex> lock(iq_table_mutex);
-                    if (!iq_init_devices.count(cuda_device_id))
-                    {
-                        if (!cudaQuantGemm_setDevice(cuda_device_id))
-                        {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to set CUDA device " << cuda_device_id
-                                                                                             << " before IQ grid table initialization");
-                            return false;
-                        }
-                        if (!cudaNativeVNNIInitIQGridTables_tuned())
-                        {
-                            LOG_ERROR("[CUDAQuantisedGemmKernel] Failed to initialize IQ grid tables for CUDA device " << cuda_device_id);
-                            return false;
-                        }
-                        iq_init_devices.insert(cuda_device_id);
-                    }
+                    return false;
                 }
 
                 if (impl->d_weights_native_vnni &&
@@ -1678,7 +1717,7 @@ namespace llaminar2
                             {"m", std::to_string(m)},
                             {"k", std::to_string(k)},
                             {"projections", std::to_string(projections.size())},
-                            {"route", m == 2 ? "m2" : "rowwise"}});
+                            {"route", "specialized"}});
                 }
 
                 return true;
@@ -2278,16 +2317,20 @@ namespace llaminar2
 
             ensureWeightsConverted();
 
+            const bool verifier_small_m =
+                (m > 1 && m <= 4) &&
+                (k % 32 == 0) &&
+                canUseNativeVNNIBlockwise(impl_.get(), 1, k);
             const bool use_blockwise =
                 (k % 32 == 0) &&
-                (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
+                (verifier_small_m || m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
 
             if (use_blockwise)
             {
                 float *d_scales_A_blockwise = static_cast<float *>(
                     workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
                 int32_t *d_sums_A_blockwise =
-                    (m > 1 && nativeVNNIUsesAsymmetricCorrection(impl_->native_codebook_id))
+                    (!verifier_small_m && m > 1 && nativeVNNIUsesAsymmetricCorrection(impl_->native_codebook_id))
                         ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
                         : nullptr;
 
@@ -2303,6 +2346,28 @@ namespace llaminar2
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU+quantize failed");
                     return false;
+                }
+
+                if (verifier_small_m)
+                {
+                    if (!multiply_quantized_small_m_gemv(
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            d_C,
+                            nullptr,
+                            m,
+                            n,
+                            k,
+                            alpha,
+                            beta,
+                            true))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU small-M NativeVNNI GEMV failed");
+                        return false;
+                    }
+
+                    LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (small-M native GEMV)");
+                    return true;
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
@@ -2439,6 +2504,55 @@ namespace llaminar2
                 return false;
             }
 
+            return multiply_quantized_small_m_gemv(
+                d_A_int8,
+                d_scales_A_blockwise,
+                d_C,
+                d_bias,
+                m,
+                n,
+                k,
+                alpha,
+                beta);
+        }
+
+        bool CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv(
+            const int8_t *d_A_int8,
+            const float *d_scales_A_blockwise,
+            float *d_C,
+            const float *d_bias,
+            int m, int n, int k,
+            float alpha, float beta,
+            bool use_specialized_small_m_kernel)
+        {
+            if (!d_A_int8 || !d_scales_A_blockwise || !d_C)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Null input, scale, or output");
+                return false;
+            }
+            if (m <= 1 || m > 4 || n <= 0 || k <= 0 || (k % 32) != 0)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] Invalid dimensions: M="
+                          << m << " N=" << n << " K=" << k);
+                return false;
+            }
+
+            ensureWeightsConverted();
+            if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_small_m_gemv] NativeVNNI GEMV unsupported for codebook "
+                          << static_cast<int>(impl_->native_codebook_id)
+                          << " N=" << n << " K=" << k);
+                return false;
+            }
+            if (!ensureNativeVNNIIQGridTablesInitialized(
+                    impl_->native_codebook_id,
+                    cuda_device_id_,
+                    "NativeVNNI small-M route"))
+            {
+                return false;
+            }
+
             const int blocks_per_row = k / 32;
             auto record_small_m_route = [&](const char *route)
             {
@@ -2474,12 +2588,12 @@ namespace llaminar2
                 }
             };
 
-            if (m == 2)
+            if (use_specialized_small_m_kernel)
             {
                 if (!impl_->gemv_ctx)
                     impl_->gemv_ctx = cudaGemvContext_create(cuda_device_id_);
 
-                const bool ok = cudaNativeVNNIGemvTuned_m2_fp32(
+                const bool ok = cudaNativeVNNIGemvTuned_small_m_fp32(
                     d_A_int8,
                     impl_->d_weights_native_vnni,
                     impl_->d_weights_native_scales,
@@ -2487,6 +2601,7 @@ namespace llaminar2
                     impl_->d_weights_native_emins,
                     d_C,
                     d_scales_A_blockwise,
+                    m,
                     n,
                     k,
                     alpha,
@@ -2501,7 +2616,8 @@ namespace llaminar2
                 if (!ok)
                 {
                     cudaError_t le = cudaPeekAtLastError();
-                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] NativeVNNI M=2 GEMV failed"
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] NativeVNNI small-M GEMV failed"
+                              << " M=" << m
                               << " codebook=" << static_cast<int>(impl_->native_codebook_id)
                               << " N=" << n << " K=" << k
                               << " stream=" << gpu_stream_
@@ -2511,7 +2627,7 @@ namespace llaminar2
                     return false;
                 }
 
-                record_small_m_route("m2");
+                record_small_m_route("specialized");
                 return true;
             }
 
@@ -2951,18 +3067,14 @@ namespace llaminar2
                 }
             }
 
-            // GEMV KPAR partials for verifier/decode reductions.
-            //
-            // The generated decode dispatcher is free to retune split-K/KPAR
-            // regimes for small-M verifier shapes. Declare the full k-group
-            // bound so graph-captured decode never discovers undersized scratch
-            // after capture. This is intentionally conservative: the workspace
-            // planner can reuse the buffer across stages, but the kernel must
-            // never fall back to an allocation or a smaller optional buffer.
-            if (m <= 4)
+            // GEMV KPAR partials for decode/verifier reductions. The caller's
+            // declared graph shape owns the bound; dynamic-depth graph users
+            // must request their max verifier M explicitly.
+            if (m > 0 && m <= 4)
             {
                 const int k_groups = (k + 31) / 32;
-                size_t kpar_bytes = static_cast<size_t>(k_groups) * n * sizeof(float);
+                const size_t kpar_bytes =
+                    static_cast<size_t>(k_groups) * static_cast<size_t>(m) * n * sizeof(float);
                 reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, true});
             }
 

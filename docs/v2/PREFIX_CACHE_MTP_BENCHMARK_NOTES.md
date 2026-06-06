@@ -7,24 +7,21 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 
 | Scope | Device | Model | Mode | Prefill tok/s | Decode tok/s | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 704.05 | 41.61 | decode restored after GEMV dispatch fix |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP, sequential verifier | 595.72 | 38.63 | correct, verifier still slower than baseline |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 595.50 | 32.06 | correct, deeper verifier overhead |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2460.26 | 111.30 | stable |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP, sequential verifier | 1824.38 | 102.05 | default, parity green |
-| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP, all-position verifier | 1825.91 | 89.59 | small-M router/shared fast routes |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 708.03 | 41.74 | current baseline |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP, sequential verifier | 598.97 | 38.33 | common safe policy, speed-negative |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 611.04 | 38.28 | 86.17% acceptance, same verifier wall |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 610.88 | 38.52 | holds depth 1; still below baseline |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | speed-positive, beats lcpp MTP d1 |
+| MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | dynamic MTP | 1943.69 | 145.36 | speed-positive |
 | Dense long `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP | n/a | 54.78 | 1.77x over 30.93 baseline |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | best MTP | n/a | 46.74 | depth-sensitive |
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
 | TP / PP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
 
 Artifacts:
-CUDA dense `benchmark_results/cuda_dense_mtp/20260606T070336Z-dense-cuda-stage-attribution`;
-CUDA MoE crash fix `benchmark_results/cuda_moe_mtp/20260606T111408Z-d1-crash-isolation`;
-CUDA MoE checkpoint pool `benchmark_results/cuda_moe_mtp/20260606T122032Z-checkpoint-pool`;
-CUDA MoE sequential default `benchmark_results/cuda_moe_mtp/20260606T124045Z-m2-route-sequential-sanity`;
-CUDA MoE all-position router small-M route `benchmark_results/cuda_moe_mtp/20260606T130551Z-router-cublas-smallm`;
-CUDA MoE attribution `benchmark_results/cuda_moe_mtp/20260606T125355Z-shared-smallm-attribution`.
+CUDA dense `benchmark_results/cuda_dense_mtp/20260606T170604Z-sidecar-preserve-skip-restore`;
+CUDA MoE `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`.
 
 ## llama.cpp CUDA Anchors
 
@@ -45,34 +42,28 @@ CUDA MoE attribution `benchmark_results/cuda_moe_mtp/20260606T125355Z-shared-sma
 ## Current Findings
 
 - CUDA dense no-MTP decode is restored by generated NativeVNNI GEMV dispatch
-  rules. CUDA verifier-row shortcuts remain disabled because full-graph
-  all-position verifier state still diverges, despite lower-level recurrence and
-  short-conv restore regressions passing.
-- CUDA MoE workspace rebind and graph-capture crashes are fixed. `CUDAMoEKernel`
-  invalidates stale scratch on bind, and `moe_combine` starts a fresh captured
-  segment so it is not fused with routing/shared/routed expert scratch stages.
-- Graph failure attribution is stricter: checked stream syncs, full segment
-  names in failure logs, optional CUDA embedding pointer validation, and passive
-  perf JSON export.
-- CUDA MoE MTP live hybrid checkpoints now reuse pooled storage. The measured
-  checkpoint storage timer dropped from about 25.9 ms/step to 0.002 ms/step,
-  lifting fixed d1 decode from 32.0 to 64.1 tok/s. The remaining CUDA MoE MTP
-  wall is verifier replay plus shifted-row commit, not checkpoint allocation.
-- CUDA greedy MTP now defaults to the sequential verifier path. On MoE fixed d1,
-  this lifts decode to 102.1 tok/s with parity green, close to but still below
-  the 111.3 tok/s no-MTP baseline.
-- CUDA small-M verifier work now uses the two-row NativeVNNI route directly;
-  shared-expert verifier rows M=2..4 use graph-native fused small-M; and FP32
-  router logits at M=2..4 use warmed, capture-safe cuBLAS. All-position MoE d1
-  is up from 69.5 to 89.6 tok/s. Remaining time is spread across GDN projection,
-  routed expert work, and residual/add glue.
+  rules. Dense MTP remains speed-negative because accepted speculative tokens
+  still pay decode-equivalent verifier forwards.
+- ROCm and CUDA now share the same GDN verifier policy. Long-prefix one-row
+  restore parity is green on both backends, but M=4 all-position verifier state
+  is explicitly not decode-equivalent on both. `MTPVerifierPolicy` therefore
+  routes stateful greedy GDN MTP through decode-equivalent sequential replay and
+  prevents all-position verifier rows from being committed as safe state.
+- CUDA transaction validation is green again: committed-state stamps are scalar,
+  payload-bearing snapshots are not cloned for metadata, and moved snapshots
+  leave nested payload handles empty.
+- CUDA MoE workspace rebind and graph-capture crashes are fixed. Current MoE
+  fixed d1 is 148.5 tok/s versus 119.9 no-MTP and 142.0 llama.cpp MTP d1.
 
 ## Retained Actions
 
-- CUDA: recover MTP speed after correctness fixes. Fixed d1 MoE is stable
-  at 102.1 tok/s versus 111.3 tok/s no-MTP; all-position d1 is now 89.6 tok/s.
-  Next target is routed MoE verifier work and GDN projection.
+- CUDA/ROCm dense: replace the sequential verifier wall with a proven
+  decode-equivalent multi-row verifier/catchup design. Do not re-enable raw
+  GDN all-position verifier-row shortcuts until continuation-equivalence tests
+  pass.
+- CUDA MoE: keep the 148.5 tok/s ratchet and extend long-prompt/controller
+  evidence without weakening parity.
 - ROCm: continue toward the 2x dense target by reducing captured verifier GPU
   work in GEMM, fused Gate/Up, GDN projection, recurrence, and LM head.
-- Shared: keep generated GEMM/GEMV dispatch tables aligned with prefill buckets,
-  GPU streams explicit, and parity tests in the normal suite.
+- Shared: CUDA/ROCm all-codebook M=2/3/4 GEMV equivalence is green;
+  keep dispatch tables bucket-aligned and parity tests in the normal suite.

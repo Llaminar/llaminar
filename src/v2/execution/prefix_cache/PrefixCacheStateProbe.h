@@ -99,6 +99,10 @@ namespace llaminar2
         uint64_t mtp_stochastic_accepts = 0;
         uint64_t mtp_stochastic_residual_samples = 0;
         uint64_t mtp_stochastic_terminal_samples = 0;
+        uint64_t mtp_transaction_commits = 0;
+        uint64_t mtp_transaction_rollbacks = 0;
+        uint64_t mtp_transaction_validation_failures = 0;
+        uint64_t mtp_unsafe_verifier_state_rejections = 0;
         uint64_t mtp_depth_policy_windows = 0;
         uint64_t mtp_depth_policy_updates = 0;
         uint64_t mtp_depth_policy_promotions = 0;

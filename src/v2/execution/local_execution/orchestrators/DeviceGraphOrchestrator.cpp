@@ -779,12 +779,7 @@ namespace llaminar2
             {
                 return handle.device_hybrid_storage->gpu_data_ptr();
             }
-            if (handle.layout.hybrid_device_state_bytes == 0 || !handle.hybrid_payload)
-            {
-                return nullptr;
-            }
-            auto *base = static_cast<uint8_t *>(handle.hybrid_payload);
-            return base + handle.layout.hybrid_host_state_bytes;
+            return nullptr;
         }
 
         const void *hybridPayloadDevicePtr(const PrefixBlockHandle &handle)
@@ -793,12 +788,7 @@ namespace llaminar2
             {
                 return handle.device_hybrid_storage->gpu_data_ptr();
             }
-            if (handle.layout.hybrid_device_state_bytes == 0 || !handle.hybrid_payload)
-            {
-                return nullptr;
-            }
-            const auto *base = static_cast<const uint8_t *>(handle.hybrid_payload);
-            return base + handle.layout.hybrid_host_state_bytes;
+            return nullptr;
         }
 
         bool exportHybridPrefixPayload(
@@ -814,9 +804,19 @@ namespace llaminar2
                 return true;
             }
             const auto *hybrid = dynamic_cast<const IHybridKVCache *>(&cache);
+            void *host_payload = hybridPayloadHostPtr(*handle);
+            void *device_payload = hybridPayloadDevicePtr(*handle);
+            if (!host_payload && handle->layout.hybrid_device_state_bytes > 0 && handle->hybrid_payload)
+                host_payload = handle->hybrid_payload;
+            const bool host_staged_device_state =
+                handle->layout.hybrid_device_state_bytes > 0 &&
+                !device_payload &&
+                host_payload != nullptr;
             if (!hybrid ||
-                (handle->layout.hybrid_host_state_bytes > 0 && !hybridPayloadHostPtr(*handle)) ||
-                (handle->layout.hybrid_device_state_bytes > 0 && !hybridPayloadDevicePtr(*handle)))
+                (handle->layout.hybrid_host_state_bytes > 0 && !host_payload) ||
+                (handle->layout.hybrid_device_state_bytes > 0 &&
+                 !device_payload &&
+                 !host_staged_device_state))
             {
                 return false;
             }
@@ -830,8 +830,8 @@ namespace llaminar2
             desc.include_device_state = handle->layout.hybrid_device_state_bytes > 0;
             if (!hybrid->exportHybridPrefixState(
                     desc,
-                    hybridPayloadHostPtr(*handle),
-                    hybridPayloadDevicePtr(*handle)))
+                    host_payload,
+                    device_payload))
             {
                 return false;
             }
@@ -851,9 +851,19 @@ namespace llaminar2
                 return true;
             }
             auto *hybrid = dynamic_cast<IHybridKVCache *>(&cache);
+            const void *host_payload = hybridPayloadHostPtr(handle);
+            const void *device_payload = hybridPayloadDevicePtr(handle);
+            if (!host_payload && handle.layout.hybrid_device_state_bytes > 0 && handle.hybrid_payload)
+                host_payload = handle.hybrid_payload;
+            const bool host_staged_device_state =
+                handle.layout.hybrid_device_state_bytes > 0 &&
+                !device_payload &&
+                host_payload != nullptr;
             if (!hybrid || !handle.has_hybrid_state ||
-                (handle.layout.hybrid_host_state_bytes > 0 && !hybridPayloadHostPtr(handle)) ||
-                (handle.layout.hybrid_device_state_bytes > 0 && !hybridPayloadDevicePtr(handle)))
+                (handle.layout.hybrid_host_state_bytes > 0 && !host_payload) ||
+                (handle.layout.hybrid_device_state_bytes > 0 &&
+                 !device_payload &&
+                 !host_staged_device_state))
             {
                 return false;
             }
@@ -867,8 +877,8 @@ namespace llaminar2
             desc.include_device_state = handle.layout.hybrid_device_state_bytes > 0;
             return hybrid->importHybridPrefixState(
                 desc,
-                hybridPayloadHostPtr(handle),
-                hybridPayloadDevicePtr(handle));
+                host_payload,
+                device_payload);
         }
 
         void resetHybridPrefixPayloadState(IKVCache &cache)
@@ -4748,9 +4758,9 @@ namespace llaminar2
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
-        if (already_appended_tokens < 1)
+        if (already_appended_tokens < 0)
         {
-            LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit expects at least one row already appended");
+            LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit received negative already_appended_tokens");
             return false;
         }
         if (state_.positions.empty())
@@ -4868,7 +4878,8 @@ namespace llaminar2
             1.0,
             perfPhaseName(),
             state_.device_id.toString(),
-            {{"already_appended", std::to_string(already_appended_tokens)}});
+            {{"already_appended", std::to_string(already_appended_tokens)},
+             {"rebuilt_first_row", already_appended_tokens == 0 ? "true" : "false"}});
 
         if (state_.device_id.is_gpu())
         {
@@ -6459,6 +6470,7 @@ namespace llaminar2
         }
 
         snapshot.valid = true;
+        snapshot.provenance = PrefixStateProvenance::PayloadCheckpoint;
         snapshot.cached_tokens = cached_tokens;
         if (cached_tokens > 0)
         {
@@ -6782,6 +6794,7 @@ namespace llaminar2
 
         snapshot.valid = true;
         snapshot.logical_checkpoint = true;
+        snapshot.provenance = PrefixStateProvenance::LogicalCheckpoint;
         snapshot.cached_tokens = cached_tokens;
         snapshot.mtp_cached_tokens.assign(state_.mtp_kv_caches.size(), -1);
 
@@ -7385,7 +7398,15 @@ namespace llaminar2
         {
             return false;
         }
-
+        if (state_.device_id.is_cuda())
+        {
+            // CUDA verifier prefill rows can match the immediate greedy token
+            // while still producing GDN/attention state that diverges from the
+            // one-row decode replay several tokens later. Keep CUDA on the
+            // decode-equivalent replay path until the dedicated equivalence
+            // regression can prove multi-token state parity.
+            return false;
+        }
         auto *hybrid = dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
         if (!hybrid)
         {
@@ -7410,6 +7431,29 @@ namespace llaminar2
         }
 
         return restorable_layers > 0;
+    }
+
+    bool DeviceGraphOrchestrator::requiresMTPDecodeEquivalentVerifierReplay() const
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled || !state_.kv_cache)
+        {
+            return false;
+        }
+
+        auto *hybrid = dynamic_cast<IHybridKVCache *>(state_.kv_cache.get());
+        if (!hybrid)
+        {
+            return false;
+        }
+
+        for (int layer = 0; layer < state_.kv_cache->n_layers(); ++layer)
+        {
+            if (hybrid->isGDNLayer(layer))
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     bool DeviceGraphOrchestrator::restoreMTPVerifierStateRow(

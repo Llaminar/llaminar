@@ -124,7 +124,8 @@ namespace
                        {
                            return record.name == name &&
                                   tag_equals(record, "source", "table") &&
-                                  tag_equals(record, "route", "kpart") &&
+                                  (tag_equals(record, "route", "serial") ||
+                                   tag_equals(record, "route", "kpart")) &&
                                   tag_equals(record, "active_slots", "1") &&
                                   tag_equals(record, "d_model", "2048") &&
                                   tag_equals(record, "intermediate", "512");
@@ -132,12 +133,12 @@ namespace
         };
 
         ASSERT_TRUE(has_shared_decode_record("cuda_moe_grouped_decode_gateup_calls"))
-            << "CUDA shared expert decode must use the grouped table gate/up path by default.\n"
+            << "CUDA shared expert decode must use the grouped table gate/up path.\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_moe_grouped_decode_gateup_calls",
                     "kernel.cuda_moe_grouped_decode_down_calls"});
         ASSERT_TRUE(has_shared_decode_record("cuda_moe_grouped_decode_down_calls"))
-            << "CUDA shared expert decode must use the grouped table down path by default.\n"
+            << "CUDA shared expert decode must use the grouped table down path.\n"
             << PerfStatsCollector::summaryString(
                    {"kernel.cuda_moe_grouped_decode_gateup_calls",
                     "kernel.cuda_moe_grouped_decode_down_calls"});
@@ -185,6 +186,27 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptSidecarStageBre
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleSkipGatherGreedyMatchesReference)
 {
     runMoEMTPBenchmarkStyleSkipGatherParity(
+        cudaSingleDeviceBenchmarkPromptCase(),
+        4);
+}
+
+TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleDepth1EightTokensMatchesReference)
+{
+    ScopedEnvironmentValues replay_check({
+        {"LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK", "1"},
+        {"LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_DEPTH", "4"},
+    });
+    runMoEMTPBenchmarkStyleSkipGatherParity(
+        cudaSingleDeviceBenchmarkPromptCase(),
+        8,
+        1,
+        {},
+        true);
+}
+
+TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBudgetLimitedOneTokenStepsMatchReference)
+{
+    runMoEMTPBudgetOneStepMatchesReference(
         cudaSingleDeviceBenchmarkPromptCase(),
         4);
 }

@@ -264,6 +264,9 @@ namespace llaminar2
     {
         return params_.seq_len > 1 &&
                prefill_replay_params_set_ &&
+               prefill_bucket_seq_len_ == params_.seq_len &&
+               prefill_effective_seq_len_ > 0 &&
+               prefill_effective_seq_len_ < params_.seq_len &&
                params_.kernel &&
                params_.kernel->supportsPaddedPrefillRealLength();
     }
@@ -994,8 +997,13 @@ namespace llaminar2
         // Use actual seq_len dimensions, not the buffer capacity
         const size_t rows = static_cast<size_t>(params_.seq_len);
         const size_t cols = static_cast<size_t>(params_.n_heads) * params_.d_v;
+        const size_t alpha_beta_cols = static_cast<size_t>(params_.n_heads);
         if (params_.output)
             info.addOutput("output", params_.output, rows, cols);
+        if (params_.alpha)
+            info.addOutput("alpha", params_.alpha, rows, alpha_beta_cols);
+        if (params_.beta)
+            info.addOutput("beta", params_.beta, rows, alpha_beta_cols);
 
         return info;
     }

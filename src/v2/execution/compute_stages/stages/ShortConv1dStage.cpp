@@ -174,6 +174,9 @@ namespace llaminar2
     {
         return params_.seq_len > 1 &&
                prefill_replay_params_set_ &&
+               prefill_bucket_seq_len_ == params_.seq_len &&
+               prefill_effective_seq_len_ > 0 &&
+               prefill_effective_seq_len_ < params_.seq_len &&
                params_.kernel &&
                params_.kernel->supportsPaddedPrefillRealLength();
     }

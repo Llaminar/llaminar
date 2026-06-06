@@ -27,6 +27,7 @@
 #include "../../../utils/TestModelHelper.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
+#include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/MPIContext.h"
 #ifdef HAVE_CUDA
@@ -104,6 +105,39 @@ namespace
         int bk256_ = 0;
         bool deterministic_ = false;
     };
+
+    class ScopedDebugEnvOverride
+    {
+    public:
+        ScopedDebugEnvOverride(const char *name, const char *value)
+            : name_(name)
+        {
+            if (const char *old = std::getenv(name))
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            setenv(name, value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedDebugEnvOverride()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedDebugEnvOverride(const ScopedDebugEnvOverride &) = delete;
+        ScopedDebugEnvOverride &operator=(const ScopedDebugEnvOverride &) = delete;
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
+    };
 #endif
 
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
@@ -164,6 +198,17 @@ namespace
         for (size_t i = 0; i < count; ++i)
             m = std::max(m, std::abs(a[i] - b[i]));
         return m;
+    }
+
+    void expectBitwiseEqual(const std::vector<float> &actual,
+                            const std::vector<float> &expected,
+                            const char *label)
+    {
+        ASSERT_EQ(actual.size(), expected.size()) << label;
+        EXPECT_EQ(countDiffs(actual.data(), expected.data(), actual.size()), 0u)
+            << label << " changed bitwise across deterministic repeated runs";
+        EXPECT_FLOAT_EQ(maxAbsDiff(actual.data(), expected.data(), actual.size()), 0.0f)
+            << label << " drifted across deterministic repeated runs";
     }
 
     int32_t orderedFloatBits(float value)
@@ -1635,6 +1680,200 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecod
     v_ws->unbindWorkspace();
     workspace_.reset();
     ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurrentPrefillAndRepeatsBitwise)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
+    ScopedDebugEnvOverride concurrent_env("LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
+    ScopedDebugEnvOverride force_decode_env("LLAMINAR_CUDA_CONCURRENT_DECODE", "1");
+    ASSERT_TRUE(debugEnv().gemm.deterministic);
+    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_prefill);
+    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
+
+    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w4x2=*/4, /*split_k=*/4);
+    cudaNativeVNNIPrefill_setStreamKMode(2);
+    cudaNativeVNNIPrefill_setBK256Mode(-1);
+    cudaNativeVNNIPrefill_setDeterministicMode(debugEnv().gemm.deterministic);
+
+    constexpr int M = 72;
+    constexpr int N = 1024;
+    constexpr int K = 896;
+
+    auto w_gate = TestTensorFactory::createQ4_0Random({N, K}, 9101u);
+    auto w_up = TestTensorFactory::createQ4_0Random({N, K}, 9102u);
+    ASSERT_TRUE(w_gate->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(w_up->ensureOnDevice(gpu_device_));
+
+    auto *gate_kernel = getPreparedKernel(w_gate.get(), gpu_device_);
+    auto *up_kernel = getPreparedKernel(w_up.get(), gpu_device_);
+    ASSERT_NE(gate_kernel, nullptr);
+    ASSERT_NE(up_kernel, nullptr);
+
+    ASSERT_TRUE(setupSharedWorkspace({gate_kernel, up_kernel}, M, {N, N}, K));
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
+    for (int i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = dist_(rng_);
+
+    std::vector<float> ref_gate;
+    std::vector<float> ref_up;
+    for (int rep = 0; rep < 3; ++rep)
+    {
+        auto out_gate = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N});
+        auto out_up = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N});
+        std::vector<TensorProjectionDesc> projections = {
+            {gate_kernel, out_gate.get(), N, nullptr, "gate"},
+            {up_kernel, out_up.get(), N, nullptr, "up"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {out_gate.get(), out_up.get()},
+            [&]
+            {
+                return gate_kernel->multiply_fused_tensor(
+                    input.get(), projections, M, K, nullptr, workspace_.get());
+            }))
+            << "deterministic fused prefill repetition " << rep;
+
+        int selected_tile = -1;
+        int selected_split_k = 0;
+        int used_bk256 = 0;
+        int used_streamk = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+        EXPECT_EQ(selected_split_k, 1)
+            << "LLAMINAR_DETERMINISTIC must clamp forced split-K prefill to serial K";
+        EXPECT_EQ(used_streamk, 0)
+            << "LLAMINAR_DETERMINISTIC must disable Stream-K prefill atomics";
+
+        const float *gate = out_gate->data();
+        const float *up = out_up->data();
+        std::vector<float> gate_snapshot(gate, gate + static_cast<size_t>(M) * N);
+        std::vector<float> up_snapshot(up, up + static_cast<size_t>(M) * N);
+        if (rep == 0)
+        {
+            ref_gate = std::move(gate_snapshot);
+            ref_up = std::move(up_snapshot);
+            continue;
+        }
+        expectBitwiseEqual(gate_snapshot, ref_gate, "deterministic fused prefill gate");
+        expectBitwiseEqual(up_snapshot, ref_up, "deterministic fused prefill up");
+    }
+
+    cleanupSharedWorkspace({gate_kernel, up_kernel});
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurrentDecodeAndRepeatsBitwise)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
+    ScopedDebugEnvOverride concurrent_prefill_env("LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
+    ScopedDebugEnvOverride concurrent_decode_env("LLAMINAR_CUDA_CONCURRENT_DECODE", "1");
+    ASSERT_TRUE(debugEnv().gemm.deterministic);
+    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
+
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(debugEnv().gemm.deterministic);
+
+    constexpr int M = 1;
+    constexpr int N_Q = 512;
+    constexpr int N_KV = 256;
+    constexpr int K = 2048;
+
+    auto wq = TestTensorFactory::createQ8_0Random({N_Q, K}, 9201u);
+    auto wk = TestTensorFactory::createQ8_0Random({N_KV, K}, 9202u);
+    auto wv = TestTensorFactory::createQ8_0Random({N_KV, K}, 9203u);
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_));
+
+    auto *q_kernel = getPreparedKernel(wq.get(), gpu_device_);
+    auto *k_kernel = getPreparedKernel(wk.get(), gpu_device_);
+    auto *v_kernel = getPreparedKernel(wv.get(), gpu_device_);
+    ASSERT_NE(q_kernel, nullptr);
+    ASSERT_NE(k_kernel, nullptr);
+    ASSERT_NE(v_kernel, nullptr);
+
+    WorkspaceRequirements reqs;
+    auto *q_ws = dynamic_cast<IWorkspaceConsumer *>(q_kernel);
+    auto *k_ws = dynamic_cast<IWorkspaceConsumer *>(k_kernel);
+    auto *v_ws = dynamic_cast<IWorkspaceConsumer *>(v_kernel);
+    ASSERT_NE(q_ws, nullptr);
+    ASSERT_NE(k_ws, nullptr);
+    ASSERT_NE(v_ws, nullptr);
+    reqs.merge(q_ws->getWorkspaceRequirements(M, N_Q, K));
+    reqs.merge(k_ws->getWorkspaceRequirements(M, N_KV, K));
+    reqs.merge(v_ws->getWorkspaceRequirements(M, N_KV, K));
+
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    q_ws->bindWorkspace(workspace_.get());
+    k_ws->bindWorkspace(workspace_.get());
+    v_ws->bindWorkspace(workspace_.get());
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
+    for (int i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = dist_(rng_);
+
+    std::vector<float> ref_q;
+    std::vector<float> ref_k;
+    std::vector<float> ref_v;
+    for (int rep = 0; rep < 4; ++rep)
+    {
+        auto q_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_Q});
+        auto k_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_KV});
+        auto v_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_KV});
+        std::vector<TensorProjectionDesc> projections = {
+            {q_kernel, q_output.get(), N_Q, nullptr, "Q"},
+            {k_kernel, k_output.get(), N_KV, nullptr, "K"},
+            {v_kernel, v_output.get(), N_KV, nullptr, "V"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {q_output.get(), k_output.get(), v_output.get()},
+            [&]
+            {
+                return q_kernel->multiply_fused_tensor(
+                    input.get(), projections, M, K, nullptr, workspace_.get());
+            }))
+            << "deterministic fused decode repetition " << rep;
+
+        const float *q = q_output->data();
+        const float *k = k_output->data();
+        const float *v = v_output->data();
+        std::vector<float> q_snapshot(q, q + N_Q);
+        std::vector<float> k_snapshot(k, k + N_KV);
+        std::vector<float> v_snapshot(v, v + N_KV);
+        if (rep == 0)
+        {
+            ref_q = std::move(q_snapshot);
+            ref_k = std::move(k_snapshot);
+            ref_v = std::move(v_snapshot);
+            continue;
+        }
+        expectBitwiseEqual(q_snapshot, ref_q, "deterministic fused decode Q");
+        expectBitwiseEqual(k_snapshot, ref_k, "deterministic fused decode K");
+        expectBitwiseEqual(v_snapshot, ref_v, "deterministic fused decode V");
+    }
+
+    q_ws->unbindWorkspace();
+    k_ws->unbindWorkspace();
+    v_ws->unbindWorkspace();
+    workspace_.reset();
 #endif
 }
 

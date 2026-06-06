@@ -1501,6 +1501,7 @@ namespace llaminar2
         bool forwardMTP(int32_t draft_condition_token) override;
         bool supportsChainedMTPDrafts() const override { return true; }
         bool supportsMTPSidecarSampleFusion() const override;
+        bool supportsMTPSidecarPreservesMainState() const override { return true; }
         bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override;
         bool forwardMTPFromLastDraftAndSampleGreedy(
@@ -2012,6 +2013,7 @@ namespace llaminar2
         PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
         bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
         bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
+        bool requiresMTPDecodeEquivalentVerifierReplay() const override;
         bool supportsMTPVerifierStateRowRestore() const override;
         bool restoreMTPVerifierStateRow(
             int verifier_row,

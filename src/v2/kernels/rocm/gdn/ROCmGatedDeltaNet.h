@@ -277,11 +277,16 @@ namespace llaminar2
             }
             float *effective_state = gpu_state_;
 
-            // All pointers are device pointers — pass directly to HIP kernel.
-            return rocmGDN_recurrent_step(
+            // Keep one-token decode on the same row-split recurrence path as
+            // verifier/prefill so decode replay and multi-row verifier replay
+            // are mathematically aligned across backends.
+            return rocmGDN_chunk_forward(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
-                n_heads, d_k, d_v, use_qk_l2norm,
+                /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
                 device_ordinal_, stream_);
         }
 

@@ -63,6 +63,26 @@ TEST(Qwen36SingleDevicePrefixMTPParity, MTPStochasticSamplingVerifierRuns)
     runDenseStochasticMTPVerifierParity(singleDeviceCase());
 }
 
+TEST(Qwen36SingleDevicePrefixMTPParity, MTPVerifierRowsPostSidecarMatchRestoredReplay)
+{
+    runDenseMTPVerifierRowsPostSidecarEquivalence(singleDeviceCase());
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, M2VerifierLongPrefixMatchesSequential)
+{
+    runDenseM2VerifierLongPrefixMatchesSequential(singleDeviceCase());
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, OneRowRestoreLongPrefixMatchesSequential)
+{
+    runDenseOneRowRestoreLongPrefixMatchesSequential(singleDeviceCase());
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, M4VerifierLongPrefixIsNotDecodeEquivalent)
+{
+    runDenseM4VerifierLongPrefixIsNotDecodeEquivalent(singleDeviceCase());
+}
+
 int main(int argc, char **argv)
 {
     int provided;
