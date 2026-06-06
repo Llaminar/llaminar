@@ -14,6 +14,7 @@
 #include "../factory/InferenceRunnerFactory.h"
 #include "../mtp/MTPStateTransaction.h"
 #include "../mtp/MTPDecodeCatchup.h"
+#include "../mtp/MTPSpecDecodeTransaction.h"
 #include "../mtp/MTPVerifierPolicy.h"
 #include "../mtp/MTPWeightManifest.h"
 #include "../prefix_cache/PrefixCacheCoordinator.h"
@@ -1360,6 +1361,120 @@ namespace llaminar2
             return std::nullopt;
         };
 
+        auto validate_spec_decode_transaction = [&](
+                                                        const char *path,
+                                                        const std::string &implementation,
+                                                        const std::vector<int32_t> &draft_tokens_for_tx,
+                                                        const std::vector<int32_t> &committed_output_tokens,
+                                                        std::optional<int32_t> ready_token,
+                                                        bool all_drafts_accepted,
+                                                        bool stopped_on_output,
+                                                        int accepted_mtp_draft_prefix)
+            -> std::optional<std::string>
+        {
+            if (draft_tokens_for_tx.empty())
+                return std::string("MTP spec-decode transaction has no draft tokens");
+            if (committed_output_tokens.empty())
+                return std::string("MTP spec-decode transaction has no committed output tokens");
+            if (!stopped_on_output && all_drafts_accepted && !ready_token.has_value())
+                return std::string("MTP spec-decode transaction accepted all drafts without a ready token");
+
+            const std::optional<int32_t> bonus_token =
+                (!stopped_on_output && all_drafts_accepted)
+                    ? ready_token
+                    : std::optional<int32_t>{};
+            MTPSpecDecodeTransaction tx =
+                buildMTPSpecDecodeTransactionFromVerifierOutput(
+                    /*request_id=*/0,
+                    vocab,
+                    draft_tokens_for_tx,
+                    committed_output_tokens,
+                    bonus_token,
+                    all_drafts_accepted,
+                    stopped_on_output);
+            if (!tx.ok)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "spec_decode_transaction_metadata_failures",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"path", path},
+                     {"implementation", implementation},
+                     {"reason", tx.error}});
+                return std::string("MTP spec-decode transaction metadata failed on ") +
+                       path + ": " + tx.error;
+            }
+
+            const int expected_accepted_draft_prefix =
+                std::min<int>(
+                    static_cast<int>(draft_tokens_for_tx.size()),
+                    accepted_mtp_draft_prefix + 1);
+            if (tx.accepted_speculative_prefix != expected_accepted_draft_prefix)
+            {
+                return std::string("MTP spec-decode accepted-prefix mismatch on ") +
+                       path + ": expected " +
+                       std::to_string(expected_accepted_draft_prefix) +
+                       " verifier input rows, got " +
+                       std::to_string(tx.accepted_speculative_prefix);
+            }
+
+            const bool expected_all_drafts_accepted =
+                all_drafts_accepted && !stopped_on_output;
+            if (tx.allDraftsAccepted() != expected_all_drafts_accepted)
+            {
+                return std::string("MTP spec-decode all-drafts-accepted mismatch on ") +
+                       path;
+            }
+
+            const int expected_valid_sampled_count =
+                static_cast<int>(committed_output_tokens.size()) +
+                (expected_all_drafts_accepted ? 1 : 0);
+            if (tx.valid_sampled_count != expected_valid_sampled_count)
+            {
+                return std::string("MTP spec-decode valid-sampled-count mismatch on ") +
+                       path + ": expected " +
+                       std::to_string(expected_valid_sampled_count) +
+                       ", got " + std::to_string(tx.valid_sampled_count);
+            }
+
+            const int32_t expected_next_condition_token =
+                expected_all_drafts_accepted
+                    ? *ready_token
+                    : committed_output_tokens.back();
+            if (tx.next_condition_token != expected_next_condition_token)
+            {
+                return std::string("MTP spec-decode next-condition-token mismatch on ") +
+                       path + ": expected " +
+                       std::to_string(expected_next_condition_token) +
+                       ", got " + std::to_string(tx.next_condition_token);
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "spec_decode_transaction_metadata",
+                1.0,
+                "decode",
+                {},
+                {{"path", path},
+                 {"implementation", implementation},
+                 {"target_query_len", std::to_string(tx.target_query_len)},
+                 {"valid_sampled_count", std::to_string(tx.valid_sampled_count)},
+                 {"accepted_verifier_input_prefix",
+                  std::to_string(tx.accepted_speculative_prefix)},
+                 {"accepted_mtp_draft_prefix",
+                  std::to_string(std::max(0, tx.accepted_speculative_prefix - 1))},
+                 {"rejected_token_count", std::to_string(tx.rejected_token_count)},
+                 {"token_index_to_sample", std::to_string(tx.token_index_to_sample)},
+                 {"next_condition_token", std::to_string(tx.next_condition_token)},
+                 {"all_drafts_accepted", tx.allDraftsAccepted() ? "true" : "false"},
+                 {"stopped_on_output", stopped_on_output ? "true" : "false"},
+                 {"draft_tokens", join_tokens(draft_tokens_for_tx)},
+                 {"committed_output_tokens", join_tokens(committed_output_tokens)}});
+            return std::nullopt;
+        };
+
         const int32_t condition_token = last_token_;
         if (!use_ready_logits)
         {
@@ -2424,6 +2539,21 @@ namespace llaminar2
             const bool stopped_on_output = catchup.stopped_on_output;
             const int main_forward_token_count = catchup.main_forward_token_count;
             result.is_complete = result.is_complete || stopped_on_output;
+
+            if (auto tx_error = validate_spec_decode_transaction(
+                    "decode_equivalent_sequential_verifier",
+                    catchup_implementation,
+                    draft_tokens,
+                    accepted_tokens,
+                    stopped_on_output || ready_token < 0
+                        ? std::optional<int32_t>{}
+                        : std::optional<int32_t>{ready_token},
+                    all_speculative_accepted,
+                    stopped_on_output,
+                    accepted_speculative_prefix))
+            {
+                return fail_after_checkpoint(*tx_error);
+            }
 
             ++mtp_stats_.verifier_runs;
             mtp_stats_.verifier_token_count +=

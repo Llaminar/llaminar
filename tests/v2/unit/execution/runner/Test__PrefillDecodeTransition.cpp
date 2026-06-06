@@ -1844,6 +1844,24 @@ namespace
                                         {"all_speculative_accepted", "true"}});
             ASSERT_NE(accept_trace, nullptr);
 
+            const PerfStatRecord *spec_tx =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "spec_decode_transaction_metadata",
+                                       {{"path", "decode_equivalent_sequential_verifier"},
+                                        {"implementation", "mock_optimized_catchup"},
+                                        {"target_query_len", "4"},
+                                        {"valid_sampled_count", "4"},
+                                        {"accepted_verifier_input_prefix", "3"},
+                                        {"accepted_mtp_draft_prefix", "2"},
+                                        {"rejected_token_count", "0"},
+                                        {"token_index_to_sample", "3"},
+                                        {"all_drafts_accepted", "true"},
+                                        {"stopped_on_output", "false"},
+                                        {"draft_tokens", "7,9,9"},
+                                        {"committed_output_tokens", "7,9,9"}});
+            ASSERT_NE(spec_tx, nullptr);
+
             const PerfStatRecord *oracle =
                 findPerfRecordWithTags(records,
                                        PerfStatRecord::Kind::Counter,
@@ -2481,6 +2499,25 @@ namespace
                                         {"decode_equivalent_replay_required", "true"},
                                         {"output_tokens", "3"}});
             ASSERT_NE(accept_trace, nullptr);
+
+            const PerfStatRecord *spec_tx =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "spec_decode_transaction_metadata",
+                                       {{"path", "decode_equivalent_sequential_verifier"},
+                                        {"implementation", "shared_stepwise"},
+                                        {"target_query_len", "5"},
+                                        {"valid_sampled_count", "3"},
+                                        {"accepted_verifier_input_prefix", "2"},
+                                        {"accepted_mtp_draft_prefix", "1"},
+                                        {"rejected_token_count", "2"},
+                                        {"token_index_to_sample", "2"},
+                                        {"next_condition_token", std::to_string(MockInferenceRunner::DECODE_ARGMAX_TOKEN)},
+                                        {"all_drafts_accepted", "false"},
+                                        {"stopped_on_output", "false"},
+                                        {"draft_tokens", "7,9,9,9"},
+                                        {"committed_output_tokens", "7,9,3"}});
+            ASSERT_NE(spec_tx, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

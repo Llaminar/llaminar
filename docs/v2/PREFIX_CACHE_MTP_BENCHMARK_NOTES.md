@@ -51,22 +51,24 @@ CUDA MoE artifact:
 - Naive Candidate B, selecting state from an all-position verifier, is retired.
   CUDA M=2 diagnostics drift before the GDN copy boundary, and ROCm/generic M=4
   state parity agrees. New commit-replay negative tests pin this.
-- llama.cpp and vLLM do not reveal a safe "commit final batched recurrent state"
-  trick. llama.cpp carries target nextn hidden rows into the drafter but still
-  truncates/restores target memory after verification. vLLM captures uniform
-  `1 + draft_count` decode graphs and passes accepted-token counts into
-  GDN/Mamba attention metadata.
-- The next clean Phase 13.8 target is an accepted-count-aware stateful verifier
-  only if its producer rows are serial-equivalent. Otherwise we should abandon
-  the batched-state shortcut framing for Qwen3.6 dense and optimize the shared
-  graph-captured serial row loop plus small-M kernels.
+- Phase 13.8 is now a vLLM-style spec-decode transaction port rather than a
+  free-form shortcut search. The target is a uniform `1 + draft_count` verifier
+  graph, shared valid-count / accepted-count / rejected-suffix metadata,
+  accepted-count-aware GDN/short-conv state commits, shifted MTP-row commit from
+  accepted target hidden rows, and atomic request publication.
+- First shared metadata slice is green: `MTPSpecDecodeTransaction` is in core,
+  `OrchestrationRunner` validates decode-equivalent catch-up results against it
+  before commit, and `mtp.spec_decode_transaction_metadata` counters describe
+  accepted/rejected verifier rows. Focused unit coverage passed for
+  `V2_Unit_MTPSpecDecodeTransaction`, `V2_Unit_MTPDecodeCatchup`, and
+  `V2_Unit_PrefillDecodeTransition`.
 
 ## Retained Actions
 
-- CUDA/ROCm dense: first prove whether an accepted-count-aware verifier can
-  produce serial-equivalent rows. If not, retire the shortcut premise and make
-  Candidate F, graph-captured serial-equivalent catch-up, the fast path. Do not
-  re-enable raw all-position verifier-row shortcuts.
+- CUDA/ROCm dense: implement graph-facing spec-decode metadata buffers and
+  accepted-count-aware GDN/short-conv kernels, then promote a named
+  `vllm_style_spec_decode` hook only after commit-replay parity and benchmarks.
+  Do not re-enable raw all-position verifier-row shortcuts.
 - CUDA MoE: keep the 148.5 tok/s ratchet and extend long-prompt/controller
   evidence without weakening parity.
 - ROCm: keep the 54.78 tok/s dense ratchet while aligning the state contract
