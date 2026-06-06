@@ -7,9 +7,9 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 
 | Scope | Device | Model | Mode | Prefill tok/s | Decode tok/s | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 708.03 | 41.74 | current baseline |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 707.92 | 41.73 | current baseline |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d1 MTP, sequential verifier | 598.97 | 38.33 | common safe policy, speed-negative |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 611.04 | 38.28 | 86.17% acceptance, same verifier wall |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 609.73 | 38.19 | 84.95% acceptance, same verifier wall |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | dynamic MTP | 610.88 | 38.52 | holds depth 1; still below baseline |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | fixed d1 MTP | 1946.82 | 148.50 | speed-positive, beats lcpp MTP d1 |
@@ -20,7 +20,7 @@ Phase 14 scoreboard for current CUDA/ROCm evidence. Raw history stays in
 | TP / PP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device lanes |
 
 Artifacts:
-CUDA dense `benchmark_results/cuda_dense_mtp/20260606T170604Z-sidecar-preserve-skip-restore`;
+CUDA dense `/tmp/llaminar-mtp-bench/dense-cuda-phase138-{nomtp,shared-d3}-default.json`;
 CUDA MoE `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`.
 
 ## llama.cpp CUDA Anchors
@@ -49,6 +49,10 @@ CUDA MoE `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`.
   shifted row, forward one decode row, sample, and repeat. Long-prefix one-row
   restore and M=2 sequential-equivalence parity are green on both backends, while
   raw all-position GDN verifier rows remain unpromoted.
+- Phase 13.8 now has an explicit optimized catch-up capability hook on
+  `IInferenceRunner`; no CUDA/ROCm backend advertises it yet. Any future fused
+  path must record a named implementation and prove equivalence to
+  `shared_stepwise`.
 - CUDA transaction validation is green again: committed-state stamps are scalar,
   payload-bearing snapshots are not cloned for metadata, and moved snapshots
   leave nested payload handles empty.

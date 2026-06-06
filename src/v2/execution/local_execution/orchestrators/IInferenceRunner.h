@@ -16,6 +16,7 @@
 #include <stdexcept>
 
 #include "../../../backends/DeviceId.h"
+#include "../../mtp/MTPDecodeCatchup.h"
 #include "../../prefix_cache/PrefixCacheStateProbe.h"
 #include "../../prefix_cache/PrefixStateSnapshot.h"
 
@@ -229,6 +230,45 @@ namespace llaminar2
          * path instead of the batched all-position verifier for greedy decode.
          */
         virtual bool requiresMTPDecodeEquivalentVerifierReplay() const { return false; }
+
+        /**
+         * @brief True when the runner provides a backend-native implementation
+         *        of the shared decode-equivalent catch-up contract.
+         *
+         * The optimized path must produce the same result and live-state
+         * effects as runSharedStepwiseMTPDecodeCatchupGreedy(). Returning true
+         * makes OrchestrationRunner call runOptimizedMTPDecodeCatchupGreedy()
+         * for greedy decode-equivalent verification.
+         */
+        virtual bool supportsOptimizedMTPDecodeCatchupGreedy() const { return false; }
+
+        /**
+         * @brief Stable counter tag for the optimized catch-up implementation.
+         */
+        virtual const char *optimizedMTPDecodeCatchupGreedyName() const
+        {
+            return "optimized";
+        }
+
+        /**
+         * @brief Run the backend-native optimized catch-up implementation.
+         *
+         * Implementations must preserve the MTPDecodeCatchupGreedyResult
+         * contract and leave runner state decode-equivalent to the shared
+         * stepwise oracle. The default body is a hard failure so an accidental
+         * capability advertisement cannot silently fall back inside the hook.
+         */
+        virtual MTPDecodeCatchupGreedyResult runOptimizedMTPDecodeCatchupGreedy(
+            const MTPDecodeCatchupGreedyRequest &request,
+            const MTPDecodeCatchupGreedySampler &sample_after_forward)
+        {
+            (void)request;
+            (void)sample_after_forward;
+            MTPDecodeCatchupGreedyResult result;
+            result.ok = false;
+            result.error = "runner advertised optimized MTP decode catch-up without implementation";
+            return result;
+        }
 
         /**
          * @brief Run a chained MTP sidecar step from the previous sidecar hidden.

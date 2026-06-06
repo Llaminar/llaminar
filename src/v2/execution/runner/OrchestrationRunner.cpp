@@ -2381,11 +2381,35 @@ namespace llaminar2
             catchup_request.allow_speculative_discard = true;
             catchup_request.verifier_path = "decode_equivalent_catchup";
 
-            MTPDecodeCatchupGreedyResult catchup =
-                runSharedStepwiseMTPDecodeCatchupGreedy(
-                    *runner_,
+            const bool use_optimized_catchup =
+                runner_->supportsOptimizedMTPDecodeCatchupGreedy();
+            std::string catchup_implementation = "shared_stepwise";
+            MTPDecodeCatchupGreedyResult catchup;
+            if (use_optimized_catchup)
+            {
+                const char *name = runner_->optimizedMTPDecodeCatchupGreedyName();
+                if (name && name[0] != '\0')
+                    catchup_implementation = name;
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "decode_equivalent_optimized_catchup_selected",
+                    1.0,
+                    "decode",
+                    {},
+                    {{"implementation", catchup_implementation},
+                     {"draft_tokens", std::to_string(draft_tokens.size())}});
+                catchup = runner_->runOptimizedMTPDecodeCatchupGreedy(
                     catchup_request,
                     sample_after_forward);
+            }
+            else
+            {
+                catchup =
+                    runSharedStepwiseMTPDecodeCatchupGreedy(
+                        *runner_,
+                        catchup_request,
+                        sample_after_forward);
+            }
             if (!catchup.ok)
             {
                 return fail_after_checkpoint(catchup.error);
@@ -2419,7 +2443,7 @@ namespace llaminar2
                 {{"forward_tokens", std::to_string(main_forward_token_count)},
                  {"draft_tokens", std::to_string(draft_tokens.size())},
                  {"restored_verifier_base", restored_verifier_base ? "true" : "false"},
-                 {"catchup_implementation", "shared_stepwise"}});
+                 {"catchup_implementation", catchup_implementation}});
 
             recordMTPDepthObservation(
                 requested_speculative_draft_count,
@@ -2468,7 +2492,7 @@ namespace llaminar2
                  {"all_speculative_accepted", all_speculative_accepted ? "true" : "false"},
                  {"verifier_state_matches_output", "true"},
                  {"verifier_path", "decode_equivalent_catchup"},
-                 {"catchup_implementation", "shared_stepwise"},
+                 {"catchup_implementation", catchup_implementation},
                  {"decode_equivalent_replay_required", "true"},
                  {"output_tokens", std::to_string(accepted_tokens.size())},
                  {"ready_token", std::to_string(ready_token)},

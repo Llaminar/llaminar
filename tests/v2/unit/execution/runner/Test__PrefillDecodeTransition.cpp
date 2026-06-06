@@ -360,6 +360,29 @@ namespace
             return requires_mtp_decode_equivalent_replay_;
         }
 
+        bool supportsOptimizedMTPDecodeCatchupGreedy() const override
+        {
+            return supports_optimized_mtp_decode_catchup_;
+        }
+
+        const char *optimizedMTPDecodeCatchupGreedyName() const override
+        {
+            return "mock_optimized_catchup";
+        }
+
+        MTPDecodeCatchupGreedyResult runOptimizedMTPDecodeCatchupGreedy(
+            const MTPDecodeCatchupGreedyRequest &request,
+            const MTPDecodeCatchupGreedySampler &sample_after_forward) override
+        {
+            ++optimized_mtp_decode_catchup_count_;
+            optimized_mtp_decode_catchup_draft_count_ =
+                static_cast<int>(request.draft_tokens.size());
+            return runSharedStepwiseMTPDecodeCatchupGreedy(
+                *this,
+                request,
+                sample_after_forward);
+        }
+
         bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override
         {
             ++forward_mtp_and_sample_count_;
@@ -625,6 +648,8 @@ namespace
         int lastChainedMTPConditionToken() const { return last_chained_mtp_condition_token_; }
         int lastChainedMTPPositionId() const { return last_chained_mtp_position_id_; }
         int commitMTPShiftedCount() const { return commit_mtp_shifted_count_; }
+        int optimizedMTPDecodeCatchupCount() const { return optimized_mtp_decode_catchup_count_; }
+        int optimizedMTPDecodeCatchupDraftCount() const { return optimized_mtp_decode_catchup_draft_count_; }
         int lastCommitMTPAlreadyAppended() const { return last_commit_mtp_already_appended_; }
         int lastCommitMTPMainForwardTokenCount() const { return last_commit_mtp_main_forward_token_count_; }
         bool lastCommitMTPAllowSpeculativeDiscard() const { return last_commit_mtp_allow_speculative_discard_; }
@@ -684,6 +709,10 @@ namespace
         void enableMTPSidecarPreservesMainState()
         {
             supports_mtp_sidecar_preserves_main_state_ = true;
+        }
+        void enableOptimizedMTPDecodeCatchup()
+        {
+            supports_optimized_mtp_decode_catchup_ = true;
         }
         void enableStochasticDeviceSampling()
         {
@@ -1050,6 +1079,8 @@ namespace
         int set_all_position_count_{0};
         int commit_mtp_shifted_count_{0};
         int sequential_commit_mtp_shifted_count_{0};
+        int optimized_mtp_decode_catchup_count_{0};
+        int optimized_mtp_decode_catchup_draft_count_{0};
         int restore_verifier_row_count_{0};
         int last_commit_mtp_already_appended_{0};
         int last_commit_mtp_main_forward_token_count_{0};
@@ -1081,6 +1112,7 @@ namespace
         bool supports_chained_mtp_drafts_{false};
         bool supports_mtp_sidecar_sample_fusion_{false};
         bool supports_mtp_sidecar_preserves_main_state_{false};
+        bool supports_optimized_mtp_decode_catchup_{false};
         bool supports_stochastic_device_sampling_{false};
         bool requires_mtp_decode_equivalent_replay_{false};
         bool hide_local_logits_{false};
@@ -1737,6 +1769,92 @@ namespace
                                "decode_equivalent_sequential_verifier_base_restore_skipped_sidecar_preserved");
             ASSERT_NE(skipped_restore, nullptr);
             EXPECT_DOUBLE_EQ(skipped_restore->value, 1.0);
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, DecodeEquivalentVerifierSelectsNamedOptimizedCatchupWhenAdvertised)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_optimized_catchup_unit.json";
+        {
+            ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/true);
+            mock->requireMTPDecodeEquivalentReplay();
+            mock->enableOptimizedMTPDecodeCatchup();
+            mock->setDecodeArgmaxScript({
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+            });
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->optimizedMTPDecodeCatchupCount(), 1);
+            EXPECT_EQ(mock->optimizedMTPDecodeCatchupDraftCount(), 3);
+            EXPECT_EQ(mock->setAllPositionCount(), 0)
+                << "optimized decode-equivalent catch-up must not re-enable all-position verifier replay";
+            EXPECT_EQ(mock->sequentialCommitMTPShiftedCount(), 3);
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *selected =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_optimized_catchup_selected",
+                                       {{"implementation", "mock_optimized_catchup"},
+                                        {"draft_tokens", "3"}});
+            ASSERT_NE(selected, nullptr);
+
+            const PerfStatRecord *legacy_run_counter =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_sequential_verifier_runs",
+                                       {{"forward_tokens", "3"},
+                                        {"draft_tokens", "3"},
+                                        {"catchup_implementation", "mock_optimized_catchup"}});
+            ASSERT_NE(legacy_run_counter, nullptr);
+
+            const PerfStatRecord *accept_trace =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "acceptance_trace",
+                                       {{"verifier_path", "decode_equivalent_catchup"},
+                                        {"catchup_implementation", "mock_optimized_catchup"},
+                                        {"decode_equivalent_replay_required", "true"},
+                                        {"all_speculative_accepted", "true"}});
+            ASSERT_NE(accept_trace, nullptr);
+
+            const PerfStatRecord *oracle =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "decode_equivalent_catchup_runs",
+                                       {{"implementation", "shared_stepwise"},
+                                        {"draft_tokens", "7,9,9"},
+                                        {"accepted_tokens", "7,9,9"},
+                                        {"verifier_tokens", "9,9"}});
+            ASSERT_NE(oracle, nullptr)
+                << "the mock optimized path delegates to the shared oracle; real backends "
+                   "must prove the same contract before promotion";
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

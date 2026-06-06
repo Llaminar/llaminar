@@ -197,3 +197,127 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWithoutDraftTokens)
     EXPECT_EQ(runner.commit_count, 0);
     EXPECT_EQ(sampler.calls(), 0u);
 }
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWithoutSamplerCallback)
+{
+    FakeCatchupRunner runner;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7};
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            MTPDecodeCatchupGreedySampler{});
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("no sampler callback"));
+    EXPECT_EQ(runner.forward_count, 0);
+    EXPECT_EQ(runner.commit_count, 0);
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWhenInitialShiftedCommitFails)
+{
+    FakeCatchupRunner runner;
+    runner.commit_ok = false;
+    ScriptedSampler sampler({9});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("initial shifted-cache commit failed"));
+    EXPECT_EQ(runner.commit_count, 0);
+    EXPECT_EQ(runner.forward_count, 0);
+    EXPECT_EQ(sampler.calls(), 0u);
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWhenForwardFails)
+{
+    FakeCatchupRunner runner;
+    runner.forward_ok = false;
+    ScriptedSampler sampler({9});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("failed to forward/sample first token"));
+    EXPECT_EQ(runner.commit_count, 1);
+    EXPECT_EQ(runner.forward_count, 1);
+    EXPECT_EQ(sampler.calls(), 0u);
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWhenSamplerFails)
+{
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("failed to forward/sample first token"));
+    EXPECT_EQ(runner.commit_count, 1);
+    EXPECT_EQ(runner.forward_count, 1);
+    EXPECT_EQ(sampler.calls(), 0u);
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseHardFailsWhenLaterShiftedCommitFails)
+{
+    class LaterCommitFailureRunner : public FakeCatchupRunner
+    {
+    public:
+        bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override
+        {
+            if (already_appended_tokens >= 1)
+                return false;
+            return FakeCatchupRunner::commitMTPShiftedRowFromCurrentTerminalHidden(
+                token,
+                already_appended_tokens,
+                allow_speculative_discard,
+                position_offset_override);
+        }
+    };
+
+    LaterCommitFailureRunner runner;
+    ScriptedSampler sampler({9});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_THAT(result.error, HasSubstr("shifted-cache commit failed"));
+    EXPECT_THAT(result.accepted_tokens, ElementsAre(7, 9));
+    EXPECT_EQ(result.main_forward_token_count, 1);
+    EXPECT_EQ(result.shifted_commit_count, 1);
+}
