@@ -79,20 +79,33 @@ namespace
         const float *h = hidden + static_cast<size_t>(token) * d_model;
         const float *g = gate_weights + static_cast<size_t>(expert) * d_model;
 
-        // Vectorized main loop: consecutive threads read consecutive float4 chunks
-        // (fully coalesced). gate rows are 16B-aligned (d_model is a multiple of 4
-        // for all supported models), so the float4 reinterpret is safe.
-        const int vec4 = d_model >> 2;
         float sum = 0.0f;
-        for (int v = threadIdx.x; v < vec4; v += blockDim.x)
+        const bool can_vectorize =
+            ((reinterpret_cast<std::uintptr_t>(h) |
+              reinterpret_cast<std::uintptr_t>(g)) &
+             0x0fu) == 0u;
+        if (can_vectorize)
         {
-            const float4 hv = reinterpret_cast<const float4 *>(h)[v];
-            const float4 gv = reinterpret_cast<const float4 *>(g)[v];
-            sum += hv.x * gv.x + hv.y * gv.y + hv.z * gv.z + hv.w * gv.w;
+            // Vectorized main loop: consecutive threads read consecutive float4 chunks
+            // (fully coalesced). The row width is a multiple of 4 for supported
+            // models, but graph/arena suballocations can still shift the base pointer.
+            // Only use float4 loads when both row pointers are actually 16B-aligned.
+            const int vec4 = d_model >> 2;
+            for (int v = threadIdx.x; v < vec4; v += blockDim.x)
+            {
+                const float4 hv = reinterpret_cast<const float4 *>(h)[v];
+                const float4 gv = reinterpret_cast<const float4 *>(g)[v];
+                sum += hv.x * gv.x + hv.y * gv.y + hv.z * gv.z + hv.w * gv.w;
+            }
+            // Scalar tail for any d_model not divisible by 4.
+            for (int j = (vec4 << 2) + threadIdx.x; j < d_model; j += blockDim.x)
+                sum += h[j] * g[j];
         }
-        // Scalar tail for any d_model not divisible by 4.
-        for (int j = (vec4 << 2) + threadIdx.x; j < d_model; j += blockDim.x)
-            sum += h[j] * g[j];
+        else
+        {
+            for (int j = threadIdx.x; j < d_model; j += blockDim.x)
+                sum += h[j] * g[j];
+        }
 
         // Intra-warp reduction via shuffle (no shared memory, no barriers).
         for (int offset = 16; offset > 0; offset >>= 1)
@@ -885,6 +898,7 @@ namespace
         int *__restrict__ expert_counts,
         int *__restrict__ grouped_token_indices,
         float *__restrict__ grouped_weights,
+        int *__restrict__ active_expert_ids,
         int seq_len)
     {
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -892,6 +906,7 @@ namespace
         {
             expert_offsets[0] = 0;
             expert_counts[0] = seq_len;
+            active_expert_ids[0] = 0;
         }
         if (idx < seq_len)
         {
@@ -1189,6 +1204,8 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ active_expert_ids,
+        int active_expert_slots,
         float *__restrict__ gate_output,
         float *__restrict__ up_output,
         int N,
@@ -1200,7 +1217,11 @@ namespace
         constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
-        const int expert_id = blockIdx.z;
+        const int expert_id = (active_expert_slots > 0)
+                                  ? active_expert_ids[blockIdx.z]
+                                  : static_cast<int>(blockIdx.z);
+        if (expert_id < 0)
+            return;
 
         const int count = expert_counts[expert_id];
         const int first_token = token_group * kTileM;
@@ -1329,6 +1350,8 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ up_descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ active_expert_ids,
+        int active_expert_slots,
         int8_t *__restrict__ swiglu_int8,
         float *__restrict__ swiglu_scales,
         int N,
@@ -1337,7 +1360,11 @@ namespace
         constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
-        const int expert_id = blockIdx.z;
+        const int expert_id = (active_expert_slots > 0)
+                                  ? active_expert_ids[blockIdx.z]
+                                  : static_cast<int>(blockIdx.z);
+        if (expert_id < 0)
+            return;
 
         const int count = expert_counts[expert_id];
         const int first_token = token_group * kTileM;
@@ -1491,6 +1518,8 @@ namespace
         const DeviceNativeVNNIMatrixDesc *__restrict__ descs,
         const int *__restrict__ expert_counts,
         const int *__restrict__ expert_offsets,
+        const int *__restrict__ active_expert_ids,
+        int active_expert_slots,
         float *__restrict__ output,
         int N,
         int K)
@@ -1499,7 +1528,11 @@ namespace
         constexpr int kTileN = 128;
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int token_group = blockIdx.y;
-        const int expert_id = blockIdx.z;
+        const int expert_id = (active_expert_slots > 0)
+                                  ? active_expert_ids[blockIdx.z]
+                                  : static_cast<int>(blockIdx.z);
+        if (expert_id < 0)
+            return;
 
         const int count = expert_counts[expert_id];
         const int first_token = token_group * kTileM;
@@ -2341,13 +2374,14 @@ extern "C"
         int *expert_counts,
         int *grouped_token_indices,
         float *grouped_weights,
+        int *active_expert_ids,
         int seq_len,
         int device_idx,
         void *stream)
     {
         cudaSetDevice(device_idx);
         prepare_shared_expert_group_kernel<<<blocksFor(seq_len), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            expert_offsets, expert_counts, grouped_token_indices, grouped_weights, seq_len);
+            expert_offsets, expert_counts, grouped_token_indices, grouped_weights, active_expert_ids, seq_len);
         return finishLaunch("cudaMoE_prepare_shared_expert_group");
     }
 
@@ -2705,6 +2739,7 @@ extern "C"
         const int *d_group_offsets,
         const int *d_group_token_indices,
         const int *d_original_to_grouped,
+        const int *d_active_expert_ids,
         const float *d_group_weights,
         int8_t *d_scratch_A_int8,
         float *d_scratch_scales,
@@ -2720,6 +2755,7 @@ extern "C"
         int max_tokens_per_expert,
         int total_slots,
         int top_k,
+        int active_expert_slots,
         uint8_t gateup_codebook_id,
         uint8_t down_codebook_id,
         int device_idx,
@@ -2731,11 +2767,19 @@ extern "C"
             !d_scratch_swiglu_int8 || !d_scratch_swiglu_scales || !d_scratch_down_out || !d_output ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
             max_tokens_per_expert <= 0 || total_slots <= 0 || top_k <= 0 ||
+            active_expert_slots < 0 ||
             (d_model % 32) != 0 || (intermediate % 32) != 0)
         {
             std::fprintf(stderr, "[cudaMoE_grouped_prefill_pipeline] invalid arguments\n");
             return false;
         }
+        const bool use_active_expert_grid = active_expert_slots > 0;
+        if (use_active_expert_grid &&
+            (!d_active_expert_ids ||
+             active_expert_slots > total_slots ||
+             active_expert_slots > num_experts))
+            return false;
+        const int expert_grid = use_active_expert_grid ? active_expert_slots : num_experts;
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
@@ -2764,17 +2808,19 @@ extern "C"
             const bool fuse_swiglu = llaminar2::debugEnv().gemm.cuda_moe_prefill_fuse_swiglu;
             dim3 grid((intermediate + kTileN - 1) / kTileN,
                       (max_tokens_per_expert + kTileM - 1) / kTileM,
-                      num_experts);
+                      expert_grid);
             dim3 block(kTileN);
 
 #define LAUNCH_GROUPED_GATEUP_PREFILL_TM(CB, TM)                                                   \
     grouped_native_vnni_gate_up_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(            \
         d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
-        d_group_counts, d_group_offsets, d_scratch_gate, d_scratch_up, intermediate, d_model)
+        d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
+        d_scratch_gate, d_scratch_up, intermediate, d_model)
 #define LAUNCH_GROUPED_GATEUP_SWIGLU_PREFILL_TM(CB, TM)                                            \
     grouped_native_vnni_gate_up_swiglu_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(     \
         d_scratch_A_int8, d_scratch_scales, d_gate_desc_table, d_up_desc_table,                     \
-        d_group_counts, d_group_offsets, d_scratch_swiglu_int8, d_scratch_swiglu_scales,            \
+        d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
+        d_scratch_swiglu_int8, d_scratch_swiglu_scales,                                            \
         intermediate, d_model)
 #define LAUNCH_GROUPED_GATEUP_PREFILL(CB)                                                          \
     do {                                                                                           \
@@ -2843,13 +2889,14 @@ extern "C"
                 max_tokens_per_expert);
             dim3 grid((d_model + kTileN - 1) / kTileN,
                       (max_tokens_per_expert + kTileM - 1) / kTileM,
-                      num_experts);
+                      expert_grid);
             dim3 block(kTileN);
 
 #define LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, TM)                                                     \
     grouped_native_vnni_down_prefill_kernel<CB, TM><<<grid, block, 0, cuda_stream>>>(               \
         d_scratch_swiglu_int8, d_scratch_swiglu_scales, d_down_desc_table,                          \
-        d_group_counts, d_group_offsets, d_scratch_down_out, d_model, intermediate)
+        d_group_counts, d_group_offsets, d_active_expert_ids, active_expert_slots,                  \
+        d_scratch_down_out, d_model, intermediate)
 #define LAUNCH_GROUPED_DOWN_PREFILL(CB)                                                            \
     do {                                                                                           \
         if (kTileM == 16)      LAUNCH_GROUPED_DOWN_PREFILL_TM(CB, 16);                              \

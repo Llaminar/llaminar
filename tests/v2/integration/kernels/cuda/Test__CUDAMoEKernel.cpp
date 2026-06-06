@@ -9,6 +9,7 @@
 #include "tensors/Tensors.h"
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/MoERuntimeTable.h"
@@ -74,6 +75,16 @@ extern "C" bool cudaMoE_group_tokens_small_float(
     int num_experts,
     int top_k,
     int max_active_experts,
+    int device_idx,
+    void *stream);
+
+extern "C" bool cudaMoE_route_logits(
+    const float *hidden,
+    const float *gate_weights,
+    float *logits,
+    int seq_len,
+    int d_model,
+    int num_experts,
     int device_idx,
     void *stream);
 
@@ -526,6 +537,99 @@ namespace
     };
 }
 
+TEST_F(Test__CUDAMoEKernel, RouteLogitsHandlesMisalignedFP32Rows)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    constexpr int seq_len = 2;
+    constexpr int d_model = 12;
+    constexpr int num_experts = 5;
+
+    std::vector<float> hidden(static_cast<size_t>(seq_len) * d_model);
+    std::vector<float> gate(static_cast<size_t>(num_experts) * d_model);
+    for (int i = 0; i < seq_len * d_model; ++i)
+        hidden[static_cast<size_t>(i)] = 0.05f * static_cast<float>((i % 7) - 3);
+    for (int i = 0; i < num_experts * d_model; ++i)
+        gate[static_cast<size_t>(i)] = 0.03f * static_cast<float>((i % 11) - 5);
+
+    CudaAllocation hidden_alloc((hidden.size() + 1) * sizeof(float));
+    CudaAllocation gate_alloc((gate.size() + 1) * sizeof(float));
+    CudaAllocation logits_alloc(hidden.size() * sizeof(float));
+
+    auto *d_hidden = static_cast<float *>(hidden_alloc.get()) + 1;
+    auto *d_gate = static_cast<float *>(gate_alloc.get()) + 1;
+    auto *d_logits = static_cast<float *>(logits_alloc.get());
+    ASSERT_NE(reinterpret_cast<std::uintptr_t>(d_hidden) & 0x0fu, 0u);
+    ASSERT_NE(reinterpret_cast<std::uintptr_t>(d_gate) & 0x0fu, 0u);
+
+    ASSERT_EQ(cudaMemcpyAsync(d_hidden, hidden.data(), hidden.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_gate, gate.data(), gate.size() * sizeof(float),
+                              cudaMemcpyHostToDevice, stream_),
+              cudaSuccess);
+
+    ASSERT_TRUE(cudaMoE_route_logits(
+        d_hidden, d_gate, d_logits, seq_len, d_model, num_experts, 0, stream_));
+
+    std::vector<float> actual(static_cast<size_t>(seq_len) * num_experts);
+    ASSERT_EQ(cudaMemcpyAsync(actual.data(), d_logits, actual.size() * sizeof(float),
+                              cudaMemcpyDeviceToHost, stream_),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    std::vector<float> expected(actual.size(), 0.0f);
+    for (int token = 0; token < seq_len; ++token)
+    {
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            float sum = 0.0f;
+            for (int dim = 0; dim < d_model; ++dim)
+            {
+                sum += hidden[static_cast<size_t>(token) * d_model + dim] *
+                       gate[static_cast<size_t>(expert) * d_model + dim];
+            }
+            expected[static_cast<size_t>(token) * num_experts + expert] = sum;
+        }
+    }
+
+    expectNearArray(actual.data(), expected.data(), actual.size(), 1.0e-6f);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, MoEWorkspaceBuffersAreDeviceAligned)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    auto reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
+        /*max_seq_len=*/4,
+        /*d_model=*/2048,
+        /*intermediate=*/512,
+        /*num_experts=*/256,
+        /*top_k=*/16);
+    llaminar2::DeviceWorkspaceManager workspace(
+        llaminar2::DeviceId::cuda(0),
+        reqs.total_bytes_with_alignment() + 1024 * 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    for (const auto &desc : reqs.buffers)
+    {
+        void *ptr = workspace.getBuffer(desc.name);
+        ASSERT_NE(ptr, nullptr) << desc.name;
+        EXPECT_EQ(reinterpret_cast<std::uintptr_t>(ptr) & (desc.alignment - 1), 0u)
+            << desc.name << " ptr=" << ptr << " alignment=" << desc.alignment;
+    }
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeTableMatchesCPU)
 {
 #ifndef HAVE_CUDA
@@ -610,6 +714,124 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeTableMatchesCPU)
     ASSERT_TRUE(cuda_table.syncDecodeHistogramToHost(runtime_histogram, stream_, true));
     for (int expert = 0; expert < num_experts; ++expert)
         EXPECT_EQ(runtime_histogram.activationCount(0, expert), static_cast<uint64_t>(expected_counts[expert]));
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectBF16GateMatchesCPU)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int num_layers = 1;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+    constexpr int d_model = 2048;
+    constexpr int seq_len = 1;
+
+    DeviceMoERuntimeTable::Config cuda_config;
+    cuda_config.device_id = llaminar2::DeviceId::cuda(0);
+    cuda_config.num_layers = num_layers;
+    cuda_config.num_experts = num_experts;
+    cuda_config.top_k = top_k;
+    cuda_config.mirror_to_device = true;
+    DeviceMoERuntimeTable cuda_table(cuda_config);
+
+    llaminar2::MoEPlacementUpdate update;
+    update.epoch = 1;
+    update.expert_count = num_experts;
+    update.experts.resize(num_experts);
+    update.local_compute_mask.assign(num_experts, 0);
+    update.replica_role.resize(num_experts, 0);
+    for (int expert = 0; expert < num_experts; ++expert)
+        update.experts[expert].logical_expert_id = expert;
+
+    ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
+
+    std::vector<float> hidden_values(static_cast<size_t>(d_model));
+    std::vector<float> gate_values(static_cast<size_t>(num_experts) * d_model);
+    for (int i = 0; i < d_model; ++i)
+        hidden_values[static_cast<size_t>(i)] =
+            0.07f * std::sin(static_cast<float>(i + 3) * 0.013f);
+    for (int i = 0; i < num_experts * d_model; ++i)
+        gate_values[static_cast<size_t>(i)] =
+            0.04f * std::cos(static_cast<float>(i + 11) * 0.007f) +
+            0.00002f * static_cast<float>(i % num_experts);
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto gate_bf16 = makeBF16Tensor({num_experts, d_model}, gate_values);
+    auto cuda_indices = makeZeros({seq_len, top_k});
+    auto cuda_weights = makeZeros({seq_len, top_k});
+    auto cpu_indices = makeZeros({seq_len, top_k});
+    auto cpu_weights = makeZeros({seq_len, top_k});
+
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        cuda_table.deviceLayerState(0), hidden.get(), gate_bf16.get(), d_model, num_experts, top_k,
+        true, cuda_indices.get(), cuda_weights.get(), true, true));
+    llaminar2::MoERoutingResult cpu_host_result;
+    ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate_bf16.get(), seq_len, d_model,
+                                              num_experts, top_k, true,
+                                              cpu_indices.get(), cpu_weights.get(), cpu_host_result));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    expectNearArray(cuda_indices->data(), cpu_indices->data(), seq_len * top_k, 0.0f);
+    expectNearArray(cuda_weights->data(), cpu_weights->data(), seq_len * top_k, 1.0e-4f);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRejectsUnsupportedGateType)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int num_layers = 1;
+    constexpr int num_experts = 16;
+    constexpr int top_k = 4;
+    constexpr int d_model = 32;
+    constexpr int seq_len = 1;
+
+    DeviceMoERuntimeTable::Config cuda_config;
+    cuda_config.device_id = llaminar2::DeviceId::cuda(0);
+    cuda_config.num_layers = num_layers;
+    cuda_config.num_experts = num_experts;
+    cuda_config.top_k = top_k;
+    cuda_config.mirror_to_device = true;
+    DeviceMoERuntimeTable cuda_table(cuda_config);
+
+    llaminar2::MoEPlacementUpdate update;
+    update.epoch = 1;
+    update.expert_count = num_experts;
+    update.experts.resize(num_experts);
+    update.local_compute_mask.assign(num_experts, 0);
+    update.replica_role.resize(num_experts, 0);
+    for (int expert = 0; expert < num_experts; ++expert)
+        update.experts[expert].logical_expert_id = expert;
+
+    ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
+
+    std::vector<float> hidden_values(static_cast<size_t>(d_model));
+    for (int i = 0; i < d_model; ++i)
+        hidden_values[static_cast<size_t>(i)] = 0.01f * static_cast<float>(i - 8);
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto gate_q8 = llaminar2::test::TestTensorFactory::createQ8_0Random(
+        {static_cast<size_t>(num_experts), static_cast<size_t>(d_model)}, /*seed=*/123);
+    auto cuda_indices = makeZeros({seq_len, top_k});
+    auto cuda_weights = makeZeros({seq_len, top_k});
+
+    EXPECT_FALSE(cuda_kernel_->decodeRouteSelect(
+        cuda_table.deviceLayerState(0), hidden.get(), gate_q8.get(), d_model, num_experts, top_k,
+        true, cuda_indices.get(), cuda_weights.get(), true, true));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 #endif
 }
 
@@ -806,6 +1028,181 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU)
         EXPECT_EQ(runtime_ids[k], static_cast<int32_t>(cpu_index_data[k]));
         EXPECT_NEAR(runtime_weights[k], cpu_weight_data[k], 1.0e-5f);
     }
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectUsesWorkspaceAcrossRebind)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoELayerRuntime;
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int num_layers = 1;
+    constexpr int num_experts = 256;
+    constexpr int top_k = 8;
+    constexpr int d_model = 2048;
+    constexpr int seq_len = 1;
+
+    DeviceMoERuntimeTable::Config cuda_config;
+    cuda_config.device_id = llaminar2::DeviceId::cuda(0);
+    cuda_config.num_layers = num_layers;
+    cuda_config.num_experts = num_experts;
+    cuda_config.top_k = top_k;
+    cuda_config.mirror_to_device = true;
+    DeviceMoERuntimeTable cuda_table(cuda_config);
+
+    llaminar2::MoEPlacementUpdate update;
+    update.epoch = 1;
+    update.expert_count = num_experts;
+    update.experts.resize(num_experts);
+    update.local_compute_mask.assign(num_experts, 0);
+    update.replica_role.resize(num_experts, 0);
+    for (int expert = 0; expert < num_experts; ++expert)
+        update.experts[expert].logical_expert_id = expert;
+
+    ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
+
+    std::vector<float> hidden_values(static_cast<size_t>(d_model));
+    for (int i = 0; i < d_model; ++i)
+        hidden_values[static_cast<size_t>(i)] =
+            0.05f * std::sin(static_cast<float>(i) * 0.017f);
+
+    std::vector<float> gate_values(static_cast<size_t>(num_experts) * d_model);
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        for (int i = 0; i < d_model; ++i)
+        {
+            gate_values[static_cast<size_t>(expert) * d_model + i] =
+                0.02f * std::cos(static_cast<float>((expert + 11) * (i + 7)) * 0.003f) +
+                0.0001f * static_cast<float>(expert);
+        }
+    }
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto gate = makeTensor({num_experts, d_model}, gate_values);
+    auto cuda_indices = makeZeros({seq_len, top_k});
+    auto cuda_weights = makeZeros({seq_len, top_k});
+    auto cpu_indices = makeZeros({seq_len, top_k});
+    auto cpu_weights = makeZeros({seq_len, top_k});
+
+    auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(cuda_kernel_);
+    ASSERT_NE(workspace_consumer, nullptr);
+
+    auto allocate_route_workspace = [&]()
+    {
+        auto reqs = llaminar2::MoEWorkspaceBuffers::routing(
+            /*max_seq_len=*/seq_len,
+            /*num_experts=*/num_experts,
+            /*top_k=*/top_k);
+        auto workspace = std::make_unique<llaminar2::DeviceWorkspaceManager>(
+            llaminar2::DeviceId::cuda(0),
+            reqs.total_bytes_with_alignment() + 1024 * 1024);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        return workspace;
+    };
+
+    auto first_workspace = allocate_route_workspace();
+    ASSERT_NE(first_workspace, nullptr);
+    workspace_consumer->bindWorkspace(first_workspace.get());
+
+    auto *cuda_layer = cuda_table.deviceLayerState(0);
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        cuda_layer, hidden.get(), gate.get(), d_model, num_experts, top_k,
+        true, cuda_indices.get(), cuda_weights.get(), true, true));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    workspace_consumer->unbindWorkspace();
+    first_workspace.reset();
+
+    auto second_workspace = allocate_route_workspace();
+    ASSERT_NE(second_workspace, nullptr);
+    workspace_consumer->bindWorkspace(second_workspace.get());
+
+    auto cuda_indices_second = makeZeros({seq_len, top_k});
+    auto cuda_weights_second = makeZeros({seq_len, top_k});
+
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        cuda_layer, hidden.get(), gate.get(), d_model, num_experts, top_k,
+        true, cuda_indices_second.get(), cuda_weights_second.get(), true, true));
+
+    llaminar2::MoERoutingResult cpu_host_result;
+    ASSERT_TRUE(cpu_kernel_->routeWithTensors(hidden.get(), gate.get(), seq_len, d_model,
+                                              num_experts, top_k, true,
+                                              cpu_indices.get(), cpu_weights.get(), cpu_host_result));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    expectNearArray(cuda_indices_second->data(), cpu_indices->data(), seq_len * top_k, 0.0f);
+    expectNearArray(cuda_weights_second->data(), cpu_weights->data(), seq_len * top_k, 1.0e-5f);
+#endif
+}
+
+TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRejectsGraphCaptureWithoutWorkspace)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoERuntimeTable;
+    constexpr int num_layers = 1;
+    constexpr int num_experts = 16;
+    constexpr int top_k = 4;
+    constexpr int d_model = 64;
+    constexpr int seq_len = 1;
+
+    auto *workspace_consumer = dynamic_cast<llaminar2::IWorkspaceConsumer *>(cuda_kernel_);
+    ASSERT_NE(workspace_consumer, nullptr);
+    workspace_consumer->unbindWorkspace();
+
+    DeviceMoERuntimeTable::Config cuda_config;
+    cuda_config.device_id = llaminar2::DeviceId::cuda(0);
+    cuda_config.num_layers = num_layers;
+    cuda_config.num_experts = num_experts;
+    cuda_config.top_k = top_k;
+    cuda_config.mirror_to_device = true;
+    DeviceMoERuntimeTable cuda_table(cuda_config);
+
+    llaminar2::MoEPlacementUpdate update;
+    update.epoch = 1;
+    update.expert_count = num_experts;
+    update.experts.resize(num_experts);
+    update.local_compute_mask.assign(num_experts, 0);
+    update.replica_role.resize(num_experts, 0);
+    for (int expert = 0; expert < num_experts; ++expert)
+        update.experts[expert].logical_expert_id = expert;
+
+    ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
+
+    std::vector<float> hidden_values(static_cast<size_t>(d_model));
+    std::vector<float> gate_values(static_cast<size_t>(num_experts) * d_model);
+    for (int i = 0; i < d_model; ++i)
+        hidden_values[static_cast<size_t>(i)] = 0.01f * static_cast<float>(i + 1);
+    for (int i = 0; i < num_experts * d_model; ++i)
+        gate_values[static_cast<size_t>(i)] = 0.001f * static_cast<float>((i % 17) - 8);
+
+    auto hidden = makeTensor({seq_len, d_model}, hidden_values);
+    auto gate = makeTensor({num_experts, d_model}, gate_values);
+    auto cuda_indices = makeZeros({seq_len, top_k});
+    auto cuda_weights = makeZeros({seq_len, top_k});
+
+    const auto cuda_device = llaminar2::DeviceId::cuda(0);
+    ASSERT_TRUE(hidden->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(gate->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(cuda_indices->ensureOnDevice(cuda_device, stream_));
+    ASSERT_TRUE(cuda_weights->ensureOnDevice(cuda_device, stream_));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    llaminar2::GraphCaptureGuard guard;
+    EXPECT_FALSE(cuda_kernel_->decodeRouteSelect(
+        cuda_table.deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
+        true, cuda_indices.get(), cuda_weights.get(), true, true));
 #endif
 }
 
@@ -2792,6 +3189,11 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPath
     if (!hasCudaDevice())
         GTEST_SKIP() << "No CUDA device available";
 
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_SUMMARY", "1");
+    ScopedCudaMoEPrefillConfig prefill_config;
+    prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
+    llaminar2::PerfStatsCollector::reset();
+
     constexpr int seq_len = 33;
     constexpr int top_k = 2;
     constexpr int num_experts = 128;
@@ -2865,6 +3267,15 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillLargeAllExpertPath
         hidden.get(), output.get(), gateup_table, down_table,
         seq_len, d_model, intermediate, num_experts, top_k));
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    const auto active_grid_records =
+        llaminar2::PerfStatsCollector::snapshot({"kernel.cuda_moe_grouped_prefill_active_expert_grid_calls"});
+    EXPECT_TRUE(active_grid_records.empty())
+        << "large prompt prefill must stay on the serial grouped-by-expert path; "
+           "the active-expert grid is only for verifier-sized MTP prefill";
+    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 16,
+                                  "serial", "serial", "slot_scatter",
+                                  /*expected_active_expert_slots=*/0);
 
     ASSERT_EQ(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal), cudaSuccess);
     const bool captured_grouping = cuda_kernel_->prepareExpertGroupsAsync(

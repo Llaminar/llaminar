@@ -111,7 +111,7 @@ namespace llaminar2
             add(reqs, GROUP_ORIGINAL_TO_GROUPED, total_slots * sizeof(int));
             add(reqs, GROUP_ORIGINAL_EXPERT_IDS, total_slots * sizeof(int));
             add(reqs, GROUP_WEIGHTS, total_slots * sizeof(float));
-            add(reqs, GROUP_ACTIVE_EXPERT_IDS, total_slots * sizeof(int));
+            add(reqs, GROUP_ACTIVE_EXPERT_IDS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_OFFSETS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_COUNTS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_WRITE_HEADS, static_cast<std::size_t>(num_experts) * sizeof(int));

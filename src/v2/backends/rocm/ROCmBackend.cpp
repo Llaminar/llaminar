@@ -27,6 +27,7 @@
 #include <deque>
 #include <limits>
 #include <thread>
+#include <cstdint>
 
 namespace llaminar2
 {
@@ -40,6 +41,8 @@ namespace llaminar2
 
     namespace
     {
+        constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
+
         // Immortal singletons: heap-allocated and never destroyed.
         // Prevents static destruction order fiasco when KernelFactory's static
         // caches (which hold GEMM kernels with shared_ptr<LoadOrchestrator>)
@@ -1166,6 +1169,16 @@ namespace llaminar2
                                                             << device_id << ": " << hipGetErrorString(err)
                                                             << " (free: " << (free_bytes / (1024 * 1024))
                                                             << " MB, total: " << (total_bytes / (1024 * 1024)) << " MB)");
+            return nullptr;
+        }
+
+        if ((reinterpret_cast<std::uintptr_t>(ptr) & (kDeviceAllocationAlignment - 1)) != 0)
+        {
+            LOG_ERROR("[ROCmBackend] hipMalloc returned unaligned pointer " << ptr
+                                                                            << " for " << bytes << " bytes on device "
+                                                                            << device_id << " (required "
+                                                                            << kDeviceAllocationAlignment << "-byte alignment)");
+            (void)hipFree(ptr);
             return nullptr;
         }
 

@@ -216,6 +216,18 @@ TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPGreedyDepth3MatchesBaselineTok
     runMoEMTPParity(cudaSingleDeviceDepth3Case(), false, 3);
 }
 
+TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, MTPBenchmarkStyleDepth3LongPromptGreedyMatchesReference)
+{
+    auto test_case = cudaSingleDeviceDepth3Case();
+    test_case.max_seq_len = 4096;
+    runMoEMTPBenchmarkStyleSkipGatherParity(
+        test_case,
+        16,
+        3,
+        {},
+        true);
+}
+
 TEST(Qwen36MoECUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleSkipGatherGreedyMatchesGatheredArgmax)
 {
     ScopedEnvironmentValues perf_stats_enabled({

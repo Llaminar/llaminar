@@ -19,6 +19,7 @@
 #include <gtest/gtest.h>
 #include <vector>
 #include <cstring>
+#include <cstdint>
 
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -80,6 +81,8 @@ TEST_F(Test__GPUBackendMemory_CUDA, AllocateAndFree)
     // Allocate GPU memory
     void *device_ptr = backend->allocate(bytes, device_id);
     ASSERT_NE(device_ptr, nullptr) << "Failed to allocate 1 MB on CUDA device 0";
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(device_ptr) & 0xffu, 0u)
+        << "CUDA backend allocations must be 256-byte aligned";
 
     // Free GPU memory
     backend->free(device_ptr, device_id);
@@ -303,6 +306,8 @@ TEST_F(Test__GPUBackendMemory_ROCm, AllocateAndFree)
 
     void *device_ptr = backend->allocate(bytes, device_id);
     ASSERT_NE(device_ptr, nullptr) << "Failed to allocate 1 MB on ROCm device 0";
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(device_ptr) & 0xffu, 0u)
+        << "ROCm backend allocations must be 256-byte aligned";
 
     backend->free(device_ptr, device_id);
 }

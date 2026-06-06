@@ -5,10 +5,13 @@
 
 #include <gtest/gtest.h>
 
+#include "execution/moe/MoEWorkspaceRequirements.h"
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -79,7 +82,111 @@ namespace
                 << label << " must use workspace/backend-owned buffers, not " << needle;
         }
     }
+
+    bool hasRawGpuAllocationCall(const std::string &source)
+    {
+        const std::vector<std::string> needles = {
+            "cudaMalloc(",
+            "cudaMallocAsync(",
+            "hipMalloc(",
+            "hipMallocAsync(",
+        };
+        for (const auto &needle : needles)
+        {
+            if (source.find(needle) != std::string::npos)
+                return true;
+        }
+        return false;
+    }
+
+    bool isSourceFile(const std::filesystem::path &path)
+    {
+        const auto extension = path.extension().string();
+        return extension == ".cpp" || extension == ".cu" || extension == ".cuh" ||
+               extension == ".h" || extension == ".hpp";
+    }
 } // namespace
+
+TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSourceOwners)
+{
+    const auto root = repoRoot();
+    const std::unordered_set<std::string> sanctioned = {
+        "src/v2/backends/ComputeBackend.cpp",
+        "src/v2/backends/IBackend.h",
+        "src/v2/backends/benchmarks/CUDABenchmark.cu",
+        "src/v2/backends/benchmarks/ROCmBenchmark.cpp",
+        "src/v2/backends/cuda/CUDABackend.cu",
+        "src/v2/backends/cuda/CUDATensorValidation.cu",
+        "src/v2/backends/rocm/ROCmBackend.cpp",
+        "src/v2/backends/rocm/ROCmTensorValidation.cpp",
+        "src/v2/collective/backends/NCCLBackendCUDA.cu",
+        "src/v2/collective/backends/RCCLBackendHIP.cpp",
+        "src/v2/collective/coordinators/RCCLCoordinator.cpp",
+        "src/v2/kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu",
+        "src/v2/kernels/cuda/gemm/CUDABatchGemmOps.cu",
+        "src/v2/kernels/cuda/gemm/CUDANativeVNNIGemvTuned.cu",
+        "src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu",
+        "src/v2/kernels/cuda/gemm/CUDAcuBLASQuantGemm.cu",
+        "src/v2/kernels/cuda/gemm/CuBLASGemmKernel.cu",
+        "src/v2/kernels/cuda/kvcache/CUDARingKVCache.cu",
+        "src/v2/kernels/cuda/kvcache/CUDARingKVCacheBase.cpp",
+        "src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu",
+        "src/v2/kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp",
+        "src/v2/kernels/cuda/kvcache/CUDATurboQuantKernels.cu",
+        "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp",
+        "src/v2/kernels/cuda/ops/CUDACastKernels.cu",
+        "src/v2/kernels/cuda/ops/CUDARoPEKernels.cu",
+        "src/v2/kernels/cuda/ops/CUDARowSelectKernels.cu",
+        "src/v2/kernels/rocm/ROCmWeightPacker.cpp",
+        "src/v2/kernels/rocm/gemm/HipBLASGemmKernel.cpp",
+        "src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp",
+        "src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp",
+        "src/v2/kernels/rocm/kvcache/ROCmRingKVCacheBase.cpp",
+        "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp",
+        "src/v2/kernels/rocm/ops/ROCmEmbeddingKernelT.cpp",
+    };
+
+    std::vector<std::string> failures;
+    const auto source_root = root / "src/v2";
+    for (const auto &entry : std::filesystem::recursive_directory_iterator(source_root))
+    {
+        if (!entry.is_regular_file() || !isSourceFile(entry.path()))
+            continue;
+        const auto relative = std::filesystem::relative(entry.path(), root).generic_string();
+        const auto source = readFile(entry.path());
+        if (!hasRawGpuAllocationCall(source))
+            continue;
+        if (sanctioned.find(relative) == sanctioned.end())
+            failures.push_back(relative);
+    }
+
+    EXPECT_TRUE(failures.empty()) << [&]
+    {
+        std::ostringstream out;
+        out << "Raw cudaMalloc/hipMalloc calls must stay in sanctioned low-level allocation owners. "
+               "Use DeviceWorkspaceManager/IWorkspaceConsumer or backend allocation APIs instead.\n";
+        for (const auto &failure : failures)
+            out << failure << '\n';
+        return out.str();
+    }();
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExperts)
+{
+    const int max_seq_len = 9;
+    const int d_model = 2048;
+    const int intermediate = 512;
+    const int num_experts = 256;
+    const int top_k = 8;
+
+    const auto reqs = llaminar2::MoEWorkspaceBuffers::cudaMoE(
+        max_seq_len, d_model, intermediate, num_experts, top_k);
+    const auto *active_ids = reqs.find(llaminar2::MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS);
+    ASSERT_NE(active_ids, nullptr);
+    EXPECT_GE(active_ids->size_bytes, static_cast<size_t>(num_experts) * sizeof(int));
+    EXPECT_GT(static_cast<size_t>(num_experts), static_cast<size_t>(max_seq_len) * top_k)
+        << "fixture must cover the small-token, many-expert regression";
+}
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDARingKVCacheGatherHasNoRawAllocationFallback)
 {
@@ -114,7 +221,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAMoEExecutionScratchUsesWorkspace)
     const auto route_scratch = sliceBetween(
         source,
         "bool CUDAMoEKernel::ensureStagingCapacity(",
-        "bool CUDAMoEKernel::routeLogitsCuBLAS(");
+        "bool CUDAMoEKernel::ensureGroupingBufferCapacity(");
     const auto grouped_scratch = sliceBetween(
         source,
         "bool CUDAMoEKernel::ensureGroupingBufferCapacity(",

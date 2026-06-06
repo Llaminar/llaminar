@@ -1428,7 +1428,7 @@ namespace llaminar2
         const bool first_token_is_stop =
             std::find(stop_tokens_.begin(), stop_tokens_.end(), first_token) != stop_tokens_.end();
         const bool allow_verifier_state_row_shortcut =
-            !(runner_ && runner_->primaryDeviceId().is_cuda());
+            runner_ && runner_->supportsMTPVerifierStateRowRestore();
         const bool can_skip_post_sidecar_checkpoint =
             speculative_draft_count == 1 &&
             !first_token_is_stop &&
@@ -1836,7 +1836,9 @@ namespace llaminar2
             runner_->primaryDeviceId().is_cuda() &&
             !stochastic_verify &&
             !use_sampling_penalties &&
-            active_sampling_params_.is_greedy();
+            active_sampling_params_.is_greedy() &&
+            DebugEnv::isTruthyEnvValue(
+                std::getenv("LLAMINAR_MTP_CUDA_SEQUENTIAL_GREEDY_VERIFIER"));
         if (use_cuda_sequential_greedy_verifier)
         {
             if (sidecar_checkpoints.empty())

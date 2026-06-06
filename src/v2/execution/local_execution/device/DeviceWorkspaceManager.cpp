@@ -14,6 +14,9 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 
+#include <algorithm>
+#include <cstdint>
+
 namespace llaminar2
 {
 
@@ -165,6 +168,25 @@ namespace llaminar2
         }
         block_size_ = total_size;
 
+        if (!device_.is_cpu())
+        {
+            size_t max_alignment = 1;
+            for (const auto *buf : buffers)
+                max_alignment = std::max(max_alignment, buf->alignment);
+            const auto block_addr = reinterpret_cast<std::uintptr_t>(block_);
+            if ((block_addr & (max_alignment - 1)) != 0)
+            {
+                LOG_ERROR("[DeviceWorkspaceManager] Backend allocation for " << device_.to_string()
+                                                                              << " returned block " << block_
+                                                                              << " not aligned to " << max_alignment
+                                                                              << " bytes");
+                backend->free(block_, device_ordinal);
+                block_ = nullptr;
+                block_size_ = 0;
+                return false;
+            }
+        }
+
         LOG_DEBUG("[WORKSPACE_ALLOC] block_ptr=" << block_
                                                  << " bytes=" << total_size
                                                  << " device=" << device_.to_string()
@@ -191,6 +213,24 @@ namespace llaminar2
             buffers_[buf->name] = info;
 
             void *buf_ptr = static_cast<char *>(block_) + current_offset;
+            if (!device_.is_cpu())
+            {
+                const auto addr = reinterpret_cast<std::uintptr_t>(buf_ptr);
+                if ((addr & (buf->alignment - 1)) != 0)
+                {
+                    LOG_ERROR("[DeviceWorkspaceManager] Workspace buffer '" << buf->name
+                                                                            << "' on " << device_.to_string()
+                                                                            << " is not aligned to " << buf->alignment
+                                                                            << " bytes (ptr=" << buf_ptr
+                                                                            << ", offset=" << current_offset << ")");
+                    backend->free(block_, device_ordinal);
+                    block_ = nullptr;
+                    block_size_ = 0;
+                    buffers_.clear();
+                    used_bytes_ = 0;
+                    return false;
+                }
+            }
             LOG_DEBUG("[WORKSPACE_SUBALLOC] '" << buf->name << "'"
                                                << " ptr=" << buf_ptr
                                                << " offset=" << current_offset

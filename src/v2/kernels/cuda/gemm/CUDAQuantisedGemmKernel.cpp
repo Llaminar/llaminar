@@ -560,7 +560,7 @@ namespace llaminar2
                     if (!impl->gemv_ctx)
                         impl->gemv_ctx = cudaGemvContext_create(cuda_device_id);
 
-                    return cudaNativeVNNIGemvTuned_fp32(
+                    const bool gemv_ok = cudaNativeVNNIGemvTuned_fp32(
                         d_A_int8,
                         impl->d_weights_native_vnni,
                         impl->d_weights_native_scales,
@@ -577,6 +577,18 @@ namespace llaminar2
                         stream,
                         impl->gemv_ctx,
                         rm_slot);
+                    if (!gemv_ok)
+                    {
+                        cudaError_t le = cudaPeekAtLastError();
+                        LOG_ERROR("[CUDAQuantisedGemmKernel] NativeVNNI GEMV dispatch failed"
+                                  << " codebook=" << static_cast<int>(impl->native_codebook_id)
+                                  << " M=" << m << " N=" << n << " K=" << k
+                                  << " stream=" << stream
+                                  << " cuda_error=" << cudaGetErrorName(le)
+                                  << " (" << cudaGetErrorString(le) << ")"
+                                  << " rowmajor_slot=" << (rm_slot && *rm_slot ? "present" : "absent"));
+                    }
+                    return gemv_ok;
                 }
 
                 // Unified native VNNI prefill for all supported codebooks
@@ -1808,7 +1820,17 @@ namespace llaminar2
                     // (it reduces directly into FP32 via the per-kernel GEMV context), so we
                     // skip accumulator selection there.
                     int32_t *proj_d_C_int32 = nullptr;
-                    if (!concurrent_decode)
+                    if (concurrent_decode)
+                    {
+                        if (!cuda_kernel->workspace_)
+                        {
+                            throw std::runtime_error(
+                                "[ConcurrentDecode] Projection " + std::to_string(pi) +
+                                " has no bound workspace for GEMV context binding");
+                        }
+                        cuda_kernel->validateWorkspace();
+                    }
+                    else
                     {
                         if (!cuda_kernel->workspace_)
                         {

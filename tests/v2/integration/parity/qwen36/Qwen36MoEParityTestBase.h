@@ -384,10 +384,11 @@ namespace llaminar2::test::parity::qwen36
 
     inline bool qwen36MoEDecodeSnapshotsLookUsable(
         const std::filesystem::path &metadata_path,
+        const std::string &expected_prompt,
         int decode_steps,
         bool require_mtp_sidecar_snapshots = false)
     {
-        if (!metadataLooksUsable(metadata_path, decode_steps))
+        if (!metadataLooksUsable(metadata_path, expected_prompt, decode_steps))
         {
             return false;
         }
@@ -454,6 +455,7 @@ namespace llaminar2::test::parity::qwen36
     {
         if (qwen36MoEDecodeSnapshotsLookUsable(
                 metadata_path,
+                test_case.prompt,
                 test_case.decode_steps,
                 require_mtp_sidecar_snapshots))
         {
@@ -474,6 +476,7 @@ namespace llaminar2::test::parity::qwen36
 
         ASSERT_TRUE(qwen36MoEDecodeSnapshotsLookUsable(
             metadata_path,
+            test_case.prompt,
             test_case.decode_steps,
             require_mtp_sidecar_snapshots))
             << test_case.name << " regenerated MoE decode snapshots are incomplete at "
@@ -486,7 +489,7 @@ namespace llaminar2::test::parity::qwen36
         const std::string &model_path,
         const std::filesystem::path &metadata_path)
     {
-        if (metadataLooksUsable(metadata_path, test_case.decode_steps))
+        if (metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
         {
             return;
         }
@@ -502,7 +505,7 @@ namespace llaminar2::test::parity::qwen36
             << metadata_path << "\n"
             << output;
 
-        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.decode_steps))
+        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
             << test_case.name << " regenerated MoE metadata is incomplete at "
             << metadata_path << "\n"
             << output;
@@ -2130,7 +2133,8 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case,
         int decode_token_budget,
         int mtp_draft_tokens = 1,
-        MTPDepthPolicyConfig mtp_depth_policy = {})
+        MTPDepthPolicyConfig mtp_depth_policy = {},
+        bool allow_reference_prefix_only = false)
     {
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
@@ -2252,16 +2256,36 @@ namespace llaminar2::test::parity::qwen36
             return tokens;
         };
 
-        ASSERT_GE(expected_tokens.size(), static_cast<size_t>(decode_token_budget));
+        ASSERT_FALSE(expected_tokens.empty());
+        const int compared_token_count =
+            allow_reference_prefix_only
+                ? std::min<int>(
+                      decode_token_budget,
+                      static_cast<int>(expected_tokens.size()))
+                : decode_token_budget;
+        ASSERT_GT(compared_token_count, 0);
+        if (!allow_reference_prefix_only)
+        {
+            ASSERT_GE(expected_tokens.size(), static_cast<size_t>(decode_token_budget));
+        }
         std::vector<int32_t> reference_tokens(
             expected_tokens.begin(),
-            expected_tokens.begin() + decode_token_budget);
+            expected_tokens.begin() + compared_token_count);
 
         const auto mtp_tokens = run_mtp_decode();
-        ASSERT_EQ(mtp_tokens.size(), reference_tokens.size())
+        ASSERT_EQ(mtp_tokens.size(), static_cast<size_t>(decode_token_budget))
+            << "reference prefix tokens: " << joinTokensMoEDiagnostic(reference_tokens)
+            << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
+
+        std::vector<int32_t> mtp_prefix(
+            mtp_tokens.begin(),
+            mtp_tokens.begin() + std::min<size_t>(
+                mtp_tokens.size(),
+                static_cast<size_t>(compared_token_count)));
+        ASSERT_EQ(mtp_prefix.size(), reference_tokens.size())
             << "reference tokens: " << joinTokensMoEDiagnostic(reference_tokens)
             << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);
-        EXPECT_EQ(mtp_tokens, reference_tokens)
+        EXPECT_EQ(mtp_prefix, reference_tokens)
             << "benchmark-style skip-gather decode diverged"
             << "\nreference tokens: " << joinTokensMoEDiagnostic(reference_tokens)
               << "\nmtp tokens: " << joinTokensMoEDiagnostic(mtp_tokens);

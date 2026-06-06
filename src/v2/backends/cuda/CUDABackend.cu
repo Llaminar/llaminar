@@ -19,9 +19,14 @@
 #include <memory>
 #include <stdexcept>
 #include <sstream>
+#include <cstdint>
 
 namespace llaminar2
 {
+    namespace
+    {
+        constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
+    }
 
     // ====================================================================
     // Helper Macros for CUDA Error Checking
@@ -432,6 +437,16 @@ namespace llaminar2
                                                              << device_id << ": " << cudaGetErrorString(err)
                                                              << " (free: " << (free_bytes / (1024 * 1024))
                                                              << " MB, total: " << (total_bytes / (1024 * 1024)) << " MB)");
+            return nullptr;
+        }
+
+        if ((reinterpret_cast<std::uintptr_t>(ptr) & (kDeviceAllocationAlignment - 1)) != 0)
+        {
+            LOG_ERROR("[CUDABackend] cudaMalloc returned unaligned pointer " << ptr
+                                                                             << " for " << bytes << " bytes on device "
+                                                                             << device_id << " (required "
+                                                                             << kDeviceAllocationAlignment << "-byte alignment)");
+            cudaFree(ptr);
             return nullptr;
         }
 

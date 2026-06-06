@@ -359,6 +359,7 @@ namespace llaminar2
         float *d_route_weights_ = nullptr;
         size_t route_logits_capacity_ = 0;
         size_t route_topk_capacity_ = 0;
+        bool route_buffers_workspace_bound_ = false;
 
         int *d_group_int_indices_ = nullptr;
         int *d_group_offsets_ = nullptr;

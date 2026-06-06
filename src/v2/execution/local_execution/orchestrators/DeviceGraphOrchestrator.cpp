@@ -7421,7 +7421,9 @@ namespace llaminar2
 
         state_.positions[seq_idx] = target_cached_tokens;
         state_.sequence_lengths[seq_idx] = target_cached_tokens;
-        handleLivePrefixReplayStateAfterMutation("restore_mtp_verifier_state_row");
+        handleLivePrefixReplayStateAfterMutation(
+            "restore_mtp_verifier_state_row",
+            /*preserve_gpu_replay_state=*/true);
         PerfStatsCollector::addCounter("mtp",
                                        "verifier_state_row_restores",
                                        1.0,
