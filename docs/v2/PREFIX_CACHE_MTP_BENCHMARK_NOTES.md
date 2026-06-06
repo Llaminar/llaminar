@@ -50,9 +50,11 @@ CUDA MoE `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`.
   restore and M=2 sequential-equivalence parity are green on both backends, while
   raw all-position GDN verifier rows remain unpromoted.
 - Phase 13.8 now has an explicit optimized catch-up capability hook on
-  `IInferenceRunner`; no CUDA/ROCm backend advertises it yet. Any future fused
-  path must record a named implementation and prove equivalence to
-  `shared_stepwise`.
+  `IInferenceRunner`; no CUDA/ROCm backend advertises it. The stats capture
+  `/tmp/llaminar-mtp-bench/dense-cuda-phase138-shared-d3-default-stats.csv`
+  shows why: `decode_equivalent_catchup_forward_one` is 9272.9 ms across 383
+  forwards, while shifted commits are 98.6 ms and sampling is 11.8 ms. A wrapper
+  cannot fuse away the full main decode required by the contract.
 - CUDA transaction validation is green again: committed-state stamps are scalar,
   payload-bearing snapshots are not cloned for metadata, and moved snapshots
   leave nested payload handles empty.
@@ -61,9 +63,9 @@ CUDA MoE `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`.
 
 ## Retained Actions
 
-- CUDA/ROCm dense: promote an optimized graph-captured catch-up only after it
-  proves equivalence to `MTPDecodeCatchup` and beats the `shared_stepwise`
-  verifier wall. Do not re-enable raw GDN all-position verifier-row shortcuts.
+- CUDA/ROCm dense: chase speedup through a proven state shortcut or lower
+  main-decode kernel cost. Do not re-enable raw GDN all-position verifier-row
+  shortcuts or call a wrapper around full decode replay an optimized catch-up.
 - CUDA MoE: keep the 148.5 tok/s ratchet and extend long-prompt/controller
   evidence without weakening parity.
 - ROCm: continue toward the 2x dense target by reducing captured verifier GPU
