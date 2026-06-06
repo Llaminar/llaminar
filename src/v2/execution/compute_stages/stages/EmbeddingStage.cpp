@@ -249,16 +249,17 @@ namespace llaminar2
             }
         }
 
-        // Mark output as device-dirty WITH EVENT immediately after GPU kernel launch.
-        // This ensures any subsequent read (e.g., DEBUG logging below) will properly
-        // sync via event wait rather than reading stale data. The DeviceGraphExecutor's
-        // markOutputsDirty() call is too late for reads inside execute().
-        if (params_.device_id.type != DeviceType::CPU)
+        // Direct/manual GPU execution owns its tensor event. Graph-managed
+        // execution owns coherence through BufferArena/DeviceGraphExecutor.
+        if (params_.device_id.type != DeviceType::CPU && !params_.output_buffer_id.has_value())
         {
             auto *output_base_tb = dynamic_cast<TensorBase *>(params_.output);
             if (output_base_tb)
             {
-                output_base_tb->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, gpuStream());
+                output_base_tb->transitionToWithEvent(
+                    TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                    params_.device_id,
+                    gpuStream());
             }
         }
 

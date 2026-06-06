@@ -1273,6 +1273,11 @@ namespace llaminar2
         {
             return;
         }
+        if (!gpu_stream_)
+        {
+            fprintf(stderr, "[CUDAEmbeddingKernelT] Dynamic token preload requires an explicit non-null stream\n");
+            return;
+        }
 
         int *d_token_ids = static_cast<int *>(workspace_->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
         if (!d_token_ids)
@@ -1372,6 +1377,23 @@ namespace llaminar2
                                          std::memcmp(h_token_ids_, token_ids, token_bytes) == 0;
         if (!token_ids_preloaded)
         {
+            if (isGraphCaptureActive())
+            {
+                fprintf(stderr,
+                        "[CUDAEmbeddingKernelT] Token IDs were not preloaded before graph capture "
+                        "(num_tokens=%d, stream=%p, active=%d, cached_tokens=%d, preload_stream=%p)\n",
+                        num_tokens,
+                        gpu_stream_,
+                        dynamic_params_active_ ? 1 : 0,
+                        dynamic_token_count_,
+                        preload_stream_);
+                return false;
+            }
+            if (!gpu_stream_)
+            {
+                fprintf(stderr, "[CUDAEmbeddingKernelT] Token ID upload requires an explicit non-null stream\n");
+                return false;
+            }
             dynamic_params_active_ = false;
             dynamic_token_count_ = 0;
             err = cudaMemcpyAsync(d_token_ids, token_ids, token_bytes, cudaMemcpyHostToDevice,

@@ -321,19 +321,27 @@ namespace llaminar2
         if (!ensureGpuParamStateInitialized())
             return false;
 
-        // Direct tests may bypass DeviceGraphExecutor coherence. These calls are
-        // no-ops after warmup when the arena has already prepared the buffers.
-        if (!input_base->ensureOnDevice(params_.device_id) || !output_base->ensureOnDevice(params_.device_id))
+        const bool graph_managed = params_.input_buffer_id.has_value() && params_.output_buffer_id.has_value();
+        if (!graph_managed)
         {
-            LOG_ERROR("[HiddenStateRowSelectStage] Failed to ensure tensors on " << params_.device_id.toString());
-            return false;
+            // Direct tests may bypass DeviceGraphExecutor coherence. Use the
+            // explicit stage stream, and allocate outputs without uploading
+            // stale host contents because this kernel overwrites the row.
+            if (!input_base->ensureOnDevice(params_.device_id, gpuStream()) ||
+                !output_base->allocateOnDevice(params_.device_id, gpuStream()))
+            {
+                LOG_ERROR("[HiddenStateRowSelectStage] Failed to prepare direct tensors on "
+                          << params_.device_id.toString());
+                return false;
+            }
         }
 
         const auto *input_device = static_cast<const float *>(input_base->gpu_data_ptr());
         auto *output_device = static_cast<float *>(output_base->gpu_data_ptr());
         if (!input_device || !output_device)
         {
-            LOG_ERROR("[HiddenStateRowSelectStage] Missing GPU data pointers");
+            LOG_ERROR("[HiddenStateRowSelectStage] Missing GPU data pointers"
+                      << (graph_managed ? " after graph-managed arena coherence" : " after direct tensor preparation"));
             return false;
         }
 
@@ -377,7 +385,13 @@ namespace llaminar2
             return false;
         }
 
-        output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, params_.device_id, gpuStream());
+        if (!graph_managed)
+        {
+            output_base->transitionToWithEvent(
+                TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                params_.device_id,
+                gpuStream());
+        }
         return true;
     }
 

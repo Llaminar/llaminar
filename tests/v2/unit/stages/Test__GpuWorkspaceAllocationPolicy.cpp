@@ -99,6 +99,126 @@ namespace
         return false;
     }
 
+    std::string stripCommentsAndStringLiterals(const std::string &source)
+    {
+        std::string stripped;
+        stripped.reserve(source.size());
+
+        enum class State
+        {
+            Normal,
+            LineComment,
+            BlockComment,
+            StringLiteral,
+            CharLiteral,
+        };
+
+        State state = State::Normal;
+        bool escaped = false;
+        for (size_t i = 0; i < source.size(); ++i)
+        {
+            const char c = source[i];
+            const char next = (i + 1 < source.size()) ? source[i + 1] : '\0';
+
+            switch (state)
+            {
+            case State::Normal:
+                if (c == '/' && next == '/')
+                {
+                    stripped.push_back(' ');
+                    stripped.push_back(' ');
+                    ++i;
+                    state = State::LineComment;
+                }
+                else if (c == '/' && next == '*')
+                {
+                    stripped.push_back(' ');
+                    stripped.push_back(' ');
+                    ++i;
+                    state = State::BlockComment;
+                }
+                else if (c == '"')
+                {
+                    stripped.push_back(' ');
+                    state = State::StringLiteral;
+                    escaped = false;
+                }
+                else if (c == '\'')
+                {
+                    stripped.push_back(' ');
+                    state = State::CharLiteral;
+                    escaped = false;
+                }
+                else
+                {
+                    stripped.push_back(c);
+                }
+                break;
+
+            case State::LineComment:
+                stripped.push_back(c == '\n' ? '\n' : ' ');
+                if (c == '\n')
+                    state = State::Normal;
+                break;
+
+            case State::BlockComment:
+                if (c == '*' && next == '/')
+                {
+                    stripped.push_back(' ');
+                    stripped.push_back(' ');
+                    ++i;
+                    state = State::Normal;
+                }
+                else
+                {
+                    stripped.push_back(c == '\n' ? '\n' : ' ');
+                }
+                break;
+
+            case State::StringLiteral:
+                stripped.push_back(c == '\n' ? '\n' : ' ');
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (c == '\\')
+                {
+                    escaped = true;
+                }
+                else if (c == '"')
+                {
+                    state = State::Normal;
+                }
+                break;
+
+            case State::CharLiteral:
+                stripped.push_back(c == '\n' ? '\n' : ' ');
+                if (escaped)
+                {
+                    escaped = false;
+                }
+                else if (c == '\\')
+                {
+                    escaped = true;
+                }
+                else if (c == '\'')
+                {
+                    state = State::Normal;
+                }
+                break;
+            }
+        }
+
+        return stripped;
+    }
+
+    bool hasExecutableEnsureOnDeviceCall(const std::string &source)
+    {
+        const auto executable_source = stripCommentsAndStringLiterals(source);
+        return executable_source.find("ensureOnDevice(") != std::string::npos ||
+               executable_source.find("ensureOnDevice (") != std::string::npos;
+    }
+
     bool isSourceFile(const std::filesystem::path &path)
     {
         const auto extension = path.extension().string();
@@ -316,4 +436,175 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAFlashAttentionDecodePartialsUseWork
         readFile(repoRoot() / "src/v2/utils/DebugEnv.h");
     EXPECT_EQ(debug_env_source.find("LLAMINAR_CUBLAS_ATTN"), std::string::npos);
     EXPECT_EQ(debug_env_source.find("cuda_cublas_attn"), std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, ProductionEnsureOnDeviceCallersStayExplicit)
+{
+    const auto root = repoRoot();
+    const std::unordered_set<std::string> sanctioned = {
+        // Tensor/coherence infrastructure owns the legacy tensor API while
+        // callers migrate to TransferEngine, BufferArena, or workspace bindings.
+        "src/v2/memory/CoherenceTracker.cpp",
+        "src/v2/execution/local_execution/coherence/GpuCoherence.h",
+        "src/v2/execution/local_execution/coherence/StageCoherence.cpp",
+        "src/v2/execution/local_execution/graph/DeviceGraphExecutor.cpp",
+        "src/v2/execution/local_execution/graph/DeviceGraphExecutor_GraphCapture.cpp",
+        "src/v2/tensors/TensorBase.cpp",
+        "src/v2/tensors/cpu/CPUTensors.h",
+        "src/v2/tensors/ITensor.h",
+        "src/v2/tensors/TensorClasses.h",
+        "src/v2/tensors/TensorSlice.h",
+
+        // Multi-domain and loader paths are existing migration debt. New data
+        // movement in these areas should go through TransferEngine.
+        "src/v2/collective/LocalPPContext.cpp",
+        "src/v2/collective/LocalTPContext.cpp",
+        "src/v2/loaders/WeightManager.cpp",
+        "src/v2/models/qwen/QwenGraphBase.cpp",
+
+        // Current compute-stage debt tracked more narrowly below.
+        "src/v2/execution/compute_stages/stages/AttentionOutputGateStage.cpp",
+        "src/v2/execution/compute_stages/stages/EmbeddingStage.cpp",
+        "src/v2/execution/compute_stages/stages/GDNRecurrenceStage.cpp",
+        "src/v2/execution/compute_stages/stages/HiddenStateRowSelectStage.cpp",
+        "src/v2/execution/compute_stages/stages/KVCacheAppendStage.cpp",
+        "src/v2/execution/compute_stages/stages/KVCacheAppendStage.snapshot.cpp",
+        "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp",
+        "src/v2/execution/compute_stages/stages/MoEExpertParallelReduceStage.cpp",
+        "src/v2/execution/compute_stages/stages/MoELocalExpertStage.cpp",
+        "src/v2/execution/compute_stages/stages/MoERoutingStage.cpp",
+        "src/v2/execution/compute_stages/stages/QGateSplitStage.cpp",
+        "src/v2/execution/compute_stages/stages/ResidualAddStage.cpp",
+        "src/v2/execution/compute_stages/stages/ShortConv1dStage.cpp",
+
+        // Kernel adapter debt where direct tensors still feed legacy entrypoints.
+        "src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel.cpp",
+        "src/v2/kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp",
+        "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp",
+        "src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp",
+        "src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp",
+        "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp",
+    };
+
+    std::vector<std::string> failures;
+    const auto source_root = root / "src/v2";
+    for (const auto &entry : std::filesystem::recursive_directory_iterator(source_root))
+    {
+        if (!entry.is_regular_file() || !isSourceFile(entry.path()))
+            continue;
+        const auto relative = std::filesystem::relative(entry.path(), root).generic_string();
+        const auto source = readFile(entry.path());
+        if (!hasExecutableEnsureOnDeviceCall(source))
+            continue;
+        if (sanctioned.find(relative) == sanctioned.end())
+            failures.push_back(relative);
+    }
+
+    EXPECT_TRUE(failures.empty()) << [&]
+    {
+        std::ostringstream out;
+        out << "New production ensureOnDevice() callers must not be added casually. "
+               "Use TransferEngine for tensor movement, BufferArena/StageBufferContract "
+               "coherence for graph stages, or IWorkspaceConsumer for graph-owned scratch. "
+               "If this is truly infrastructure-owned legacy debt, add it here with a rationale.\n";
+        for (const auto &failure : failures)
+            out << failure << '\n';
+        return out.str();
+    }();
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, ComputeStageEnsureOnDeviceDebtStaysExplicit)
+{
+    const auto root = repoRoot();
+    const std::unordered_set<std::string> sanctioned = {
+        "src/v2/execution/compute_stages/stages/AttentionOutputGateStage.cpp",
+        "src/v2/execution/compute_stages/stages/EmbeddingStage.cpp",
+        "src/v2/execution/compute_stages/stages/GDNRecurrenceStage.cpp",
+        "src/v2/execution/compute_stages/stages/HiddenStateRowSelectStage.cpp",
+        "src/v2/execution/compute_stages/stages/KVCacheAppendStage.cpp",
+        "src/v2/execution/compute_stages/stages/KVCacheAppendStage.snapshot.cpp",
+        "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp",
+        "src/v2/execution/compute_stages/stages/MoEExpertParallelReduceStage.cpp",
+        "src/v2/execution/compute_stages/stages/MoELocalExpertStage.cpp",
+        "src/v2/execution/compute_stages/stages/MoERoutingStage.cpp",
+        "src/v2/execution/compute_stages/stages/QGateSplitStage.cpp",
+        "src/v2/execution/compute_stages/stages/ResidualAddStage.cpp",
+        "src/v2/execution/compute_stages/stages/ShortConv1dStage.cpp",
+    };
+
+    std::vector<std::string> failures;
+    const auto stages_root = root / "src/v2/execution/compute_stages/stages";
+    for (const auto &entry : std::filesystem::recursive_directory_iterator(stages_root))
+    {
+        if (!entry.is_regular_file() || !isSourceFile(entry.path()))
+            continue;
+        const auto relative = std::filesystem::relative(entry.path(), root).generic_string();
+        const auto source = readFile(entry.path());
+        if (!hasExecutableEnsureOnDeviceCall(source))
+            continue;
+        if (sanctioned.find(relative) == sanctioned.end())
+            failures.push_back(relative);
+    }
+
+    EXPECT_TRUE(failures.empty()) << [&]
+    {
+        std::ostringstream out;
+        out << "New compute-stage ensureOnDevice() calls must not be added casually. "
+               "Prefer BufferArena/StageBufferContract coherence for graph stages, or add an explicit "
+               "sanction with rationale while migrating old debt.\n";
+        for (const auto &failure : failures)
+            out << failure << '\n';
+        return out.str();
+    }();
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, HiddenStateRowSelectGraphManagedPathDoesNotSelfCohereArenaBuffers)
+{
+    const auto source = readFile(repoRoot() / "src/v2/execution/compute_stages/stages/HiddenStateRowSelectStage.cpp");
+    const auto execute_gpu = sliceBetween(
+        source,
+        "bool HiddenStateRowSelectStage::executeGPU(",
+        "    void HiddenStateRowSelectStage::releaseGpuParamState()");
+    const auto launch_path = sliceBetween(
+        execute_gpu,
+        "        const auto *input_device =",
+        "        return true;");
+
+    EXPECT_NE(execute_gpu.find("const bool graph_managed"), std::string::npos);
+    EXPECT_NE(execute_gpu.find("if (!graph_managed)"), std::string::npos);
+    EXPECT_EQ(execute_gpu.find("output_base->ensureOnDevice("), std::string::npos)
+        << "Row-select writes must allocate outputs without uploading stale host contents";
+    EXPECT_EQ(launch_path.find("ensureOnDevice("), std::string::npos)
+        << "Graph-managed row-select execution must rely on executor/arena input coherence";
+    EXPECT_EQ(launch_path.find("allocateOnDevice("), std::string::npos)
+        << "Graph-managed row-select execution must rely on executor/arena output allocation";
+    EXPECT_NE(execute_gpu.find("if (!graph_managed)\n        {\n            output_base->transitionToWithEvent"), std::string::npos)
+        << "Only direct, non-arena row-select execution should record tensor completion events";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, EmbeddingGraphManagedPathDoesNotSelfMarkArenaOutput)
+{
+    const auto source = readFile(repoRoot() / "src/v2/execution/compute_stages/stages/EmbeddingStage.cpp");
+    const auto execute_body = sliceBetween(
+        source,
+        "bool EmbeddingStage::execute(IDeviceContext *ctx)",
+        "    size_t EmbeddingStage::estimatedFlops() const");
+
+    EXPECT_NE(execute_body.find("!params_.output_buffer_id.has_value()"), std::string::npos)
+        << "Graph-managed embedding outputs must be marked written by DeviceGraphExecutor";
+    EXPECT_EQ(execute_body.find("TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt"), std::string::npos)
+        << "Embedding must record completion events against the explicit stage device, never an unspecified device";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDAEmbeddingDoesNotUploadDynamicTokensDuringGraphCapture)
+{
+    const auto source = readFile(repoRoot() / "src/v2/kernels/cuda/ops/CUDAOpsKernels.cpp");
+    const auto apply_tensor = sliceBetween(
+        source,
+        "bool CUDAEmbeddingKernelT::apply_tensor(",
+        "    WorkspaceRequirements CUDAEmbeddingKernelT::getWorkspaceRequirements(");
+
+    EXPECT_NE(apply_tensor.find("isGraphCaptureActive()"), std::string::npos);
+    EXPECT_NE(apply_tensor.find("Token IDs were not preloaded before graph capture"), std::string::npos);
+    EXPECT_NE(apply_tensor.find("Token ID upload requires an explicit non-null stream"), std::string::npos);
 }
