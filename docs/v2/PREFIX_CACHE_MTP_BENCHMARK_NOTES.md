@@ -56,15 +56,16 @@ CUDA MoE artifact:
   truncates/restores target memory after verification. vLLM captures uniform
   `1 + draft_count` decode graphs and passes accepted-token counts into
   GDN/Mamba attention metadata.
-- The next clean Phase 13.8 target is an accepted-count-aware stateful verifier:
-  compute verifier rows in one graph-capturable path, but make GDN/short-conv
-  state commit depend explicitly on accepted rows, not on post-hoc final-row
-  selection.
+- The next clean Phase 13.8 target is an accepted-count-aware stateful verifier
+  only if its producer rows are serial-equivalent. Otherwise we should abandon
+  the batched-state shortcut framing for Qwen3.6 dense and optimize the shared
+  graph-captured serial row loop plus small-M kernels.
 
 ## Retained Actions
 
-- CUDA/ROCm dense: implement and prove accepted-count-aware stateful verification
-  or retire Phase 13.8 with a documented architectural replacement. Do not
+- CUDA/ROCm dense: first prove whether an accepted-count-aware verifier can
+  produce serial-equivalent rows. If not, retire the shortcut premise and make
+  Candidate F, graph-captured serial-equivalent catch-up, the fast path. Do not
   re-enable raw all-position verifier-row shortcuts.
 - CUDA MoE: keep the 148.5 tok/s ratchet and extend long-prompt/controller
   evidence without weakening parity.
