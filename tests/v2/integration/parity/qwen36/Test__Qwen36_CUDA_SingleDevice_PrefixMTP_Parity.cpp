@@ -59,7 +59,60 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, PrefixCacheMTPDynamicDepthRestore)
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptDynamicDepthMatchesPyTorchDecodeTokens)
 {
-    runDenseBenchmarkStyleDynamicMTPParity(cudaSingleDeviceCase());
+    runDenseBenchmarkStyleDynamicMTPParitySinglePass(cudaSingleDeviceCase());
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptFixedDepth1MatchesPyTorchDecodeTokens)
+{
+    runDenseBenchmarkStyleFixedMTPParity(cudaSingleDeviceCase(), 1);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPBenchmarkPromptFixedDepth3MatchesPyTorchDecodeTokens)
+{
+    runDenseBenchmarkStyleFixedMTPParity(cudaSingleDeviceCase(), 3);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleFreshRunnerDeterminism)
+{
+    runDenseNoMTPBenchmarkStyleFreshRunnerDeterminism(
+        cudaSingleDeviceCase(),
+        /*decode_token_budget=*/128,
+        /*reused_cycle_count=*/4);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPVerifierRowsPostSidecarMatchRestoredReplay)
+{
+    runDenseMTPVerifierRowsPostSidecarEquivalence(cudaSingleDeviceCase());
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, M2VerifierLongPrefixMatchesSequential)
+{
+    runDenseM2VerifierLongPrefixMatchesSequential(cudaSingleDeviceCase());
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierLongPrefixMatchesSequential)
+{
+    runDenseM4VerifierLongPrefixMatchesSequential(cudaSingleDeviceCase());
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierAfterSidecarChainMatchesSequential)
+{
+    runDenseM4VerifierAfterSidecarChainMatchesSequential(cudaSingleDeviceCase());
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierRow2RestoreLongPrefixMatchesSequential)
+{
+    runDenseM4VerifierRow2RestoreLongPrefixMatchesSequential(cudaSingleDeviceCase());
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierRow3RestoreIsNotDecodeEquivalent)
+{
+    runDenseM4VerifierRow3RestoreFeedsNextVerifierRows(cudaSingleDeviceCase());
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPEnabledForwardOnlyMatchesNoMTPDecode)
+{
+    runDenseMTPEnabledForwardOnlyMatchesNoMTP(cudaSingleDeviceCase());
 }
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPStochasticSamplingVerifierRuns)

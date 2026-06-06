@@ -254,6 +254,19 @@ namespace
         return values;
     }
 
+    /// @brief Creates deterministic nonzero recurrent/conv state.
+    std::vector<float> makeInitialState(size_t count, float scale)
+    {
+        std::vector<float> values(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const float wave = static_cast<float>(static_cast<int>(i % 23) - 11);
+            const float slow = static_cast<float>(static_cast<int>((i / 23) % 17) - 8);
+            values[i] = scale * (0.7f * wave + 0.13f * slow);
+        }
+        return values;
+    }
+
     /// @brief Computes maximum absolute difference and relative L2 over a contiguous span.
     std::pair<float, double> diffStats(
         const std::vector<float> &actual,
@@ -762,6 +775,219 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
     EXPECT_LT(diff.second, 1e-4);
 }
 
+TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceM4FinalStateMatchesStepwiseReplay)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int n_heads = 40;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 4;
+    constexpr int qk_stride = n_heads * d_k;
+    constexpr int v_stride = n_heads * d_v;
+    constexpr int state_floats = n_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_stride);
+
+    const auto Q = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, 0.0021f, 0.0f, 0.0021f);
+    const auto K = makeSequenceRows(verifier_len, qk_stride, verifier_len, verifier_len, -0.0019f, 0.0f, -0.0019f);
+    const auto V = makeSequenceRows(verifier_len, v_stride, verifier_len, verifier_len, 0.0025f, 0.0f, 0.0025f);
+    const auto alpha = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, 0.025f, 0.0f, 0.025f);
+    const auto beta = makeSequenceRows(verifier_len, n_heads, verifier_len, verifier_len, -0.021f, 0.0f, -0.021f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.00091f);
+    const std::vector<float> A_log(static_cast<size_t>(n_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_heads), 0.1f);
+
+    CudaFloatBuffer d_Q_m4(Q);
+    CudaFloatBuffer d_K_m4(K);
+    CudaFloatBuffer d_V_m4(V);
+    CudaFloatBuffer d_alpha_m4(alpha);
+    CudaFloatBuffer d_beta_m4(beta);
+    CudaFloatBuffer d_Q_step(Q);
+    CudaFloatBuffer d_K_step(K);
+    CudaFloatBuffer d_V_step(V);
+    CudaFloatBuffer d_alpha_step(alpha);
+    CudaFloatBuffer d_beta_step(beta);
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_m4_out(output_elems, 0.0f);
+    CudaFloatBuffer d_step_out(output_elems, 0.0f);
+
+    CUDAGatedDeltaNet m4_kernel(cuda_ordinal_);
+    m4_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, nullptr));
+    ASSERT_TRUE(m4_kernel.chunk_forward(
+        d_Q_m4.ptr, d_K_m4.ptr, d_V_m4.ptr, d_alpha_m4.ptr, d_beta_m4.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_m4_out.ptr, nullptr,
+        verifier_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(M4 recurrence)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
+    step_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, nullptr));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            d_Q_step.ptr + static_cast<size_t>(row) * qk_stride,
+            d_K_step.ptr + static_cast<size_t>(row) * qk_stride,
+            d_V_step.ptr + static_cast<size_t>(row) * v_stride,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(stepwise recurrence)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 2e-4f);
+    EXPECT_LT(out_diff.second, 1e-4);
+    EXPECT_LT(state_diff.first, 2e-4f);
+    EXPECT_LT(state_diff.second, 1e-4)
+        << "CUDA M=4 recurrence must leave the same kernel-owned state as four decode steps";
+}
+
+TEST_F(Test__CUDAGDNPaddedRealLength, MergedQKVM4FinalStateMatchesStepwiseReplay)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int n_k_heads = 16;
+    constexpr int n_v_heads = 40;
+    constexpr int d_k = 128;
+    constexpr int d_v = 128;
+    constexpr int verifier_len = 4;
+    constexpr int q_src_dim = n_k_heads * d_k;
+    constexpr int k_src_dim = n_k_heads * d_k;
+    constexpr int v_dim = n_v_heads * d_v;
+    constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
+    constexpr int qk_stride = n_v_heads * d_k;
+    constexpr int state_floats = n_v_heads * d_k * d_v;
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(v_dim);
+    constexpr size_t deinterleave_elems =
+        static_cast<size_t>(verifier_len) *
+        static_cast<size_t>(qk_stride + qk_stride + v_dim);
+
+    const auto Q_src = makeSequenceRows(verifier_len, q_src_dim, verifier_len, verifier_len, 0.0021f, 0.0f, 0.0021f);
+    const auto K_src = makeSequenceRows(verifier_len, k_src_dim, verifier_len, verifier_len, -0.0019f, 0.0f, -0.0019f);
+    const auto V_src = makeSequenceRows(verifier_len, v_dim, verifier_len, verifier_len, 0.0025f, 0.0f, 0.0025f);
+
+    std::vector<float> merged(static_cast<size_t>(verifier_len) * static_cast<size_t>(qkv_stride));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *dst = merged.data() + static_cast<size_t>(row) * qkv_stride;
+        std::copy_n(Q_src.data() + static_cast<size_t>(row) * q_src_dim, q_src_dim, dst);
+        std::copy_n(K_src.data() + static_cast<size_t>(row) * k_src_dim, k_src_dim, dst + q_src_dim);
+        std::copy_n(V_src.data() + static_cast<size_t>(row) * v_dim, v_dim, dst + q_src_dim + k_src_dim);
+    }
+
+    const auto alpha = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, 0.025f, 0.0f, 0.025f);
+    const auto beta = makeSequenceRows(verifier_len, n_v_heads, verifier_len, verifier_len, -0.021f, 0.0f, -0.021f);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.00091f);
+    const std::vector<float> A_log(static_cast<size_t>(n_v_heads), -0.5f);
+    const std::vector<float> dt_bias(static_cast<size_t>(n_v_heads), 0.1f);
+
+    CudaFloatBuffer d_merged_m4(merged);
+    CudaFloatBuffer d_merged_step(merged);
+    CudaFloatBuffer d_alpha_m4(alpha);
+    CudaFloatBuffer d_beta_m4(beta);
+    CudaFloatBuffer d_alpha_step(alpha);
+    CudaFloatBuffer d_beta_step(beta);
+    CudaFloatBuffer d_A_log(A_log);
+    CudaFloatBuffer d_dt_bias(dt_bias);
+    CudaFloatBuffer d_m4_out(output_elems, 0.0f);
+    CudaFloatBuffer d_step_out(output_elems, 0.0f);
+    CudaFloatBuffer d_m4_scratch(deinterleave_elems, 0.0f);
+    CudaFloatBuffer d_step_scratch(
+        static_cast<size_t>(qk_stride + qk_stride + v_dim),
+        0.0f);
+
+    CUDAGatedDeltaNet m4_kernel(cuda_ordinal_);
+    m4_kernel.allocateGPUState(state_floats);
+    m4_kernel.bindDeinterleaveWorkspace(d_m4_scratch.ptr, d_m4_scratch.count);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, nullptr));
+    float *m4_q = nullptr;
+    float *m4_k = nullptr;
+    float *m4_v = nullptr;
+    ASSERT_TRUE(m4_kernel.deinterleave_qkv_device(
+        d_merged_m4.ptr,
+        m4_q,
+        m4_k,
+        m4_v,
+        verifier_len,
+        n_k_heads,
+        n_v_heads,
+        d_k,
+        d_v,
+        /*global_v_head_offset=*/0));
+    ASSERT_TRUE(m4_kernel.chunk_forward(
+        m4_q, m4_k, m4_v, d_alpha_m4.ptr, d_beta_m4.ptr, d_A_log.ptr, d_dt_bias.ptr,
+        d_m4_out.ptr, nullptr,
+        verifier_len, n_v_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(M4 merged-QKV recurrence)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    CUDAGatedDeltaNet step_kernel(cuda_ordinal_);
+    step_kernel.allocateGPUState(state_floats);
+    step_kernel.bindDeinterleaveWorkspace(d_step_scratch.ptr, d_step_scratch.count);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, nullptr));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        float *step_q = nullptr;
+        float *step_k = nullptr;
+        float *step_v = nullptr;
+        ASSERT_TRUE(step_kernel.deinterleave_qkv_device(
+            d_merged_step.ptr + static_cast<size_t>(row) * qkv_stride,
+            step_q,
+            step_k,
+            step_v,
+            1,
+            n_k_heads,
+            n_v_heads,
+            d_k,
+            d_v,
+            /*global_v_head_offset=*/0));
+        ASSERT_TRUE(step_kernel.recurrent_step(
+            step_q,
+            step_k,
+            step_v,
+            d_alpha_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_beta_step.ptr + static_cast<size_t>(row) * n_v_heads,
+            d_A_log.ptr,
+            d_dt_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * v_dim,
+            nullptr,
+            n_v_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(stepwise merged-QKV recurrence)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 2e-4f);
+    EXPECT_LT(out_diff.second, 1e-4);
+    EXPECT_LT(state_diff.first, 2e-4f);
+    EXPECT_LT(state_diff.second, 1e-4)
+        << "CUDA merged-QKV M=4 recurrence must leave the same state as four decode steps";
+}
+
 TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceTwoRowVerifierRowZeroRestoreMatchesOneRowReplay)
 {
     SKIP_IF_NO_CUDA();
@@ -937,6 +1163,73 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierStateSnapshotRestoresAcce
     const auto diff = diffStats(restored, ref, 0, restored.size());
     EXPECT_LT(diff.first, 1e-5f);
     EXPECT_LT(diff.second, 1e-5);
+}
+
+TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvM4FinalStateMatchesStepwiseReplay)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    constexpr int channels = 4096;
+    constexpr int kernel_size = 4;
+    constexpr int verifier_len = 4;
+    constexpr int state_floats = channels * (kernel_size - 1);
+    constexpr size_t output_elems = static_cast<size_t>(verifier_len) * static_cast<size_t>(channels);
+
+    const auto input = makeSequenceRows(verifier_len, channels, verifier_len, verifier_len, 0.015f, 0.0f, 0.015f);
+    const auto weight = makeShortConvWeights(channels, kernel_size);
+    const auto bias = makeBias(channels);
+    const auto initial_state = makeInitialState(static_cast<size_t>(state_floats), 0.0031f);
+
+    CudaFloatBuffer d_input_m4(input);
+    CudaFloatBuffer d_input_step(input);
+    CudaFloatBuffer d_weight(weight);
+    CudaFloatBuffer d_bias(bias);
+    CudaFloatBuffer d_m4_out(output_elems, 0.0f);
+    CudaFloatBuffer d_step_out(output_elems, 0.0f);
+
+    CUDAShortConvolution m4_kernel(cuda_ordinal_);
+    m4_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(m4_kernel.importState(initial_state.data(), nullptr, nullptr));
+    ASSERT_TRUE(m4_kernel.forward(
+        d_input_m4.ptr,
+        d_weight.ptr,
+        d_bias.ptr,
+        d_m4_out.ptr,
+        nullptr,
+        verifier_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(M4 short-conv)");
+    std::vector<float> m4_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(m4_kernel.exportState(m4_state.data(), nullptr, nullptr));
+
+    CUDAShortConvolution step_kernel(cuda_ordinal_);
+    step_kernel.allocateGPUState(state_floats);
+    ASSERT_TRUE(step_kernel.importState(initial_state.data(), nullptr, nullptr));
+    for (int row = 0; row < verifier_len; ++row)
+    {
+        ASSERT_TRUE(step_kernel.forward(
+            d_input_step.ptr + static_cast<size_t>(row) * channels,
+            d_weight.ptr,
+            d_bias.ptr,
+            d_step_out.ptr + static_cast<size_t>(row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkCuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(stepwise short-conv)");
+    std::vector<float> step_state(static_cast<size_t>(state_floats));
+    ASSERT_TRUE(step_kernel.exportState(step_state.data(), nullptr, nullptr));
+
+    const auto m4_out = d_m4_out.toHost();
+    const auto step_out = d_step_out.toHost();
+    const auto out_diff = diffStats(m4_out, step_out, 0, output_elems);
+    const auto state_diff = diffStats(m4_state, step_state, 0, m4_state.size());
+    EXPECT_LT(out_diff.first, 1e-5f);
+    EXPECT_LT(out_diff.second, 1e-5);
+    EXPECT_LT(state_diff.first, 1e-5f);
+    EXPECT_LT(state_diff.second, 1e-5)
+        << "CUDA M=4 short-conv must leave the same kernel-owned state as four decode steps";
 }
 
 TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvTwoRowVerifierRowZeroRestoreMatchesOneRowReplay)

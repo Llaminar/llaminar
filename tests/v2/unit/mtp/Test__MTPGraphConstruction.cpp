@@ -2775,17 +2775,15 @@ TEST(Test__MTPGraphConstruction, ChainedSidecarSuffixCommitAllowsCommittedVerifi
         /*allow_speculative_discard=*/true,
         /*position_offset_override=*/prefix_position));
 
-    ASSERT_NE(orchestrator.forward(&accepted_tokens[2], 1, 1), nullptr);
-
-    ASSERT_TRUE(orchestrator.commitMTPShiftedRowsFromPartialForward(
-        accepted_tokens.data(),
-        static_cast<int>(accepted_tokens.size()),
+    ASSERT_TRUE(orchestrator.commitMTPShiftedRowFromCurrentTerminalHidden(
+        accepted_tokens[2],
         /*already_appended_tokens=*/accepted_verifier_input_count,
-        /*main_forward_token_count=*/1,
         /*allow_speculative_discard=*/true,
         /*position_offset_override=*/prefix_position))
         << "Depth>1 MTP suffix commit must allow accepted_tokens to include "
            "the already-committed verifier prefix.";
+
+    ASSERT_NE(orchestrator.forward(&accepted_tokens[2], 1, 1), nullptr);
 
     const auto after_commit = orchestrator.prefixStateProbe();
     EXPECT_GE(maxCachedTokens(after_commit.mtp_kv_caches),
@@ -2915,7 +2913,9 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     PrefixStateSnapshot checkpoint = orchestrator.captureLivePrefixCheckpoint();
     ASSERT_TRUE(checkpoint.valid);
     EXPECT_TRUE(checkpoint.logical_checkpoint);
-    EXPECT_TRUE(checkpoint.blocks.empty());
+    ASSERT_EQ(checkpoint.blocks.size(), 1u);
+    EXPECT_TRUE(checkpoint.blocks[0].has_terminal_hidden);
+    EXPECT_FALSE(checkpoint.blocks[0].layout.includes_hybrid_state);
     EXPECT_TRUE(checkpoint.mtp_blocks.empty());
     ASSERT_EQ(checkpoint.mtp_cached_tokens.size(), 1u);
     EXPECT_EQ(checkpoint.cached_tokens, static_cast<int>(prefix_tokens.size()));

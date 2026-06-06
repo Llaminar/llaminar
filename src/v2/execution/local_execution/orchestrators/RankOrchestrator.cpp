@@ -2481,6 +2481,175 @@ namespace llaminar2
         return all_success;
     }
 
+    bool RankOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        PerfStatsCollector::ScopedTimer total_timer(
+            "mtp",
+            "rank_mtp_shifted_sequential_commit_total",
+            "decode",
+            "rank",
+            {{"participants", std::to_string(device_runners_.size())}});
+        if (already_appended_tokens < 1 || device_runners_.empty())
+            return false;
+
+        if (device_runners_.size() == 1)
+        {
+            return device_runners_[0] &&
+                   device_runners_[0]->commitMTPShiftedRowFromCurrentTerminalHidden(
+                       token,
+                       already_appended_tokens,
+                       allow_speculative_discard,
+                       position_offset_override);
+        }
+
+        if (!tp_worker_pool_)
+        {
+            tp_worker_pool_ = std::make_unique<TPWorkerPool>(device_runners_.size());
+            if (tp_ctx_)
+            {
+                tp_worker_pool_->setFailureCallback([this]()
+                                                    {
+                    LOG_WARN("[TPWorkerPool] MTP sequential shifted-row commit failure detected - aborting collective backend");
+                    tp_ctx_->requestAbort(); });
+            }
+        }
+
+        auto kernel_phase = KernelProfiler::getCurrentPhase();
+        auto rocm_phase = ROCmKernelProfiler::getCurrentPhase();
+        auto cuda_phase = CUDAKernelProfiler::getCurrentPhase();
+        auto kv_phase = KVCacheProfiler::getCurrentPhase();
+        auto executor_phase = GraphExecutorStats::currentPhase();
+
+        {
+            PerfStatsCollector::ScopedTimer dispatch_timer(
+                "mtp",
+                "rank_mtp_shifted_sequential_commit_dispatch",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())}});
+            tp_worker_pool_->dispatch(
+                [this, token, already_appended_tokens, allow_speculative_discard,
+                 position_offset_override, kernel_phase, rocm_phase, cuda_phase,
+                 kv_phase, executor_phase](size_t i) -> bool
+                {
+                    KernelProfiler::setCurrentPhase(kernel_phase);
+                    ROCmKernelProfiler::setCurrentPhase(rocm_phase);
+                    CUDAKernelProfiler::setCurrentPhase(cuda_phase);
+                    KVCacheProfiler::setCurrentPhase(kv_phase);
+                    GraphExecutorStats::setCurrentPhase(executor_phase);
+
+                    auto device_id = device_runners_[i]->primaryDeviceId();
+                    ROCmKernelProfiler::setCurrentDevice(device_id.ordinal);
+                    CUDAKernelProfiler::setCurrentDevice(device_id.ordinal);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=mtp_shifted_sequential_commit_enter"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " token=" << token
+                                  << " already_appended=" << already_appended_tokens);
+                    }
+
+                    const bool ok = device_runners_[i] &&
+                                    device_runners_[i]->commitMTPShiftedRowFromCurrentTerminalHidden(
+                                        token,
+                                        already_appended_tokens,
+                                        allow_speculative_discard,
+                                        position_offset_override);
+
+                    if (debugEnv().tp_collective_contract_trace)
+                    {
+                        LOG_DEBUG("[TP_WORKER_CONTRACT] event=mtp_shifted_sequential_commit_leave"
+                                  << " worker=" << i
+                                  << " device=" << device_id.toString()
+                                  << " success=" << (ok ? 1 : 0));
+                    }
+                    return ok;
+                });
+        }
+
+        bool all_success = true;
+        std::exception_ptr first_exception = nullptr;
+        size_t first_exception_device = 0;
+        std::vector<TPWorkerPool::WorkerResult> results;
+        {
+            PerfStatsCollector::ScopedTimer collect_timer(
+                "mtp",
+                "rank_mtp_shifted_sequential_commit_collect",
+                "decode",
+                "rank",
+                {{"participants", std::to_string(device_runners_.size())}});
+            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+        }
+
+        bool worker_timeout = false;
+        for (auto &r : results)
+        {
+            if (!r.completed)
+            {
+                LOG_ERROR("RankOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden: Device "
+                          << r.worker_index << " did not complete (stuck)");
+                worker_timeout = true;
+                all_success = false;
+                if (debugEnv().tp_collect_timeout_ms > 0)
+                {
+                    abortAfterTPWorkerTimeout(
+                        "commitMTPShiftedRowFromCurrentTerminalHidden",
+                        debugEnv().tp_collect_timeout_ms,
+                        tp_worker_pool_->completedCount(),
+                        tp_worker_pool_->numWorkers());
+                }
+                if (tp_ctx_)
+                {
+                    LOG_WARN("RankOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden: requesting TP context abort after worker timeout");
+                    tp_ctx_->requestAbort();
+                }
+                continue;
+            }
+
+            if (r.exception)
+            {
+                all_success = false;
+                if (!first_exception)
+                {
+                    first_exception = r.exception;
+                    first_exception_device = r.worker_index;
+                }
+                continue;
+            }
+
+            if (!r.success)
+            {
+                LOG_ERROR("RankOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden: Device "
+                          << r.worker_index << " shifted-row commit failed");
+                all_success = false;
+            }
+        }
+
+        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        {
+            abortAfterTPWorkerTimeout(
+                "commitMTPShiftedRowFromCurrentTerminalHidden",
+                debugEnv().tp_collect_timeout_ms,
+                tp_worker_pool_->completedCount(),
+                tp_worker_pool_->numWorkers());
+        }
+
+        if (first_exception)
+        {
+            LOG_ERROR("RankOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden: Re-throwing primary exception from device "
+                      << first_exception_device);
+            std::rethrow_exception(first_exception);
+        }
+
+        return all_success;
+    }
+
     bool RankOrchestrator::flushPendingMTPWork()
     {
         bool ok = true;

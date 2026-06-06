@@ -1245,6 +1245,10 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesS
                 EXPECT_EQ(tag("split_k"), std::to_string(shape.expected_split_k));
                 EXPECT_EQ(tag("bk256"), "0");
                 EXPECT_EQ(tag("streamk"), "0");
+                EXPECT_EQ(tag("sums_a"), "1")
+                    << "Qwen3.6 dense asymmetric NativeVNNI prefill must consume the "
+                       "workspace-owned activation block sums instead of recomputing them "
+                       "inside every output tile.";
                 EXPECT_EQ(record.device, "cuda:" + std::to_string(gpu_device_.ordinal));
                 EXPECT_EQ(record.phase, "gemm");
                 break;

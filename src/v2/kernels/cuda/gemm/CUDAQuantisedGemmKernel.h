@@ -256,6 +256,8 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
+            bool supports_fused_projection() const override { return true; }
+
             /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *
@@ -410,7 +412,8 @@ namespace llaminar2
                 const TensorBase *gate, const TensorBase *up,
                 TensorBase *output,
                 int m, int n, int k,
-                float alpha = 1.0f, float beta = 0.0f);
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
         private:
             // =========================================================================
@@ -452,11 +455,12 @@ namespace llaminar2
             /**
              * @brief Small-M FP32 activations -> native-VNNI row-wise GEMV.
              *
-             * Greedy MTP verifier forwards commonly use M=2. The generic native
-             * VNNI prefill path is correct for that shape, but it is much slower
-             * than the decode-class GEMV path. This helper quantizes all rows
-             * once, then dispatches the tuned M=1 GEMV kernel per row on the
-             * caller-provided graph stream.
+             * Greedy MTP verifier forwards commonly use M=2..4. The generic
+             * native VNNI prefill path is tuned for larger prefill buckets and
+             * has separate dispatch regimes, so verifier rows stay on the
+             * decode-class GEMV path. This helper quantizes all rows once, then
+             * dispatches the tuned M=1 GEMV kernel per row on the caller-provided
+             * graph stream.
              */
             bool multiply_fp32_to_fp32_small_m_gemv(
                 const float *d_A, float *d_C, const float *d_bias,

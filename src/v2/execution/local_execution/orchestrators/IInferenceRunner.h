@@ -323,6 +323,27 @@ namespace llaminar2
                 already_appended_tokens);
         }
 
+        /**
+         * @brief Append one shifted MTP KV row using the current terminal hidden.
+         *
+         * This is used by decode-equivalent replay paths that advance the main
+         * model one token at a time. The shifted sidecar row for tokens[i] must
+         * be produced before tokens[i] is forwarded by the main model, while
+         * the current terminal hidden still represents tokens[i - 1].
+         */
+        virtual bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1)
+        {
+            (void)token;
+            (void)already_appended_tokens;
+            (void)allow_speculative_discard;
+            (void)position_offset_override;
+            return false;
+        }
+
         virtual const float *mtpLogits() const
         {
             return nullptr;

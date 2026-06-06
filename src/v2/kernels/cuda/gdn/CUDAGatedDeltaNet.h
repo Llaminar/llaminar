@@ -291,11 +291,18 @@ namespace llaminar2
             }
             float *effective_state = gpu_state_;
 
-            // All pointers are device pointers — pass directly to CUDA kernel.
-            return cudaGDN_recurrent_step(
+            // Keep one-token decode on the same row-split recurrence path as
+            // verifier/prefill. The old dedicated decode kernel accumulated
+            // slightly different GDN state over long generations, which made
+            // no-MTP CUDA decode diverge from PyTorch while MTP verifier rows
+            // remained correct.
+            return cudaGDN_chunk_forward(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
-                n_heads, d_k, d_v, use_qk_l2norm,
+                /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
+                verifier_state_capture_,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
                 device_ordinal_, stream_);
         }
 

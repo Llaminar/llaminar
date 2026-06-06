@@ -4740,6 +4740,149 @@ namespace llaminar2
             token_count);
     }
 
+    bool DeviceGraphOrchestrator::commitMTPShiftedRowFromCurrentTerminalHidden(
+        int32_t token,
+        int already_appended_tokens,
+        bool allow_speculative_discard,
+        int position_offset_override)
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+            return true;
+        if (already_appended_tokens < 1)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit expects at least one row already appended");
+            return false;
+        }
+        if (state_.positions.empty())
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit requires position state");
+            return false;
+        }
+
+        const int position_offset =
+            position_offset_override >= 0
+                ? position_offset_override
+                : state_.positions[0] - already_appended_tokens;
+        if (position_offset < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Invalid sequential MTP shifted-row commit position_offset="
+                      << position_offset << " already_appended=" << already_appended_tokens
+                      << " override=" << position_offset_override);
+            return false;
+        }
+
+        IKVCache *cache = state_.mtp_kv_caches.empty() ? nullptr : state_.mtp_kv_caches[0].get();
+        if (!cache)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit requires an initialized MTP KV cache");
+            return false;
+        }
+
+        const int expected_cached_tokens =
+            std::max(0, position_offset - 1 + already_appended_tokens);
+        int current_cached_tokens =
+            cache->get_cached_tokens(cache->first_layer_index(), 0);
+        if (current_cached_tokens > expected_cached_tokens)
+        {
+            if (!allow_speculative_discard)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit cache has unexpected extra rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens
+                          << " position_offset=" << position_offset
+                          << " already_appended=" << already_appended_tokens);
+                return false;
+            }
+            void *stream = explicitGPUStreamForOperation("commitMTPShiftedRowFromCurrentTerminalHidden");
+            if (state_.device_id.is_gpu() && !stream)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit requires an explicit GPU stream");
+                return false;
+            }
+            if (!cache->truncateSequence(0, expected_cached_tokens, stream))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit failed to discard speculative rows: current="
+                          << current_cached_tokens << " expected=" << expected_cached_tokens);
+                return false;
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "speculative_shifted_rows_discarded",
+                static_cast<double>(current_cached_tokens - expected_cached_tokens),
+                perfPhaseName(),
+                state_.device_id.toString());
+            current_cached_tokens = expected_cached_tokens;
+        }
+        if (current_cached_tokens < expected_cached_tokens)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit cache mismatch: current="
+                      << current_cached_tokens << " expected=" << expected_cached_tokens
+                      << " position_offset=" << position_offset
+                      << " already_appended=" << already_appended_tokens);
+            return false;
+        }
+
+        TensorBase *terminal_hidden = nullptr;
+        BufferId terminal_hidden_buffer_id = BufferId::HIDDEN_STATE;
+        if (state_.prefix_terminal_hidden)
+        {
+            terminal_hidden = state_.prefix_terminal_hidden.get();
+            terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN;
+        }
+        else
+        {
+            terminal_hidden = state_.hidden.get();
+        }
+        if (!terminal_hidden)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Sequential MTP shifted-row commit requires a terminal hidden row");
+            return false;
+        }
+
+        PerfStatsCollector::ScopedTimer timer(
+            "mtp",
+            "shifted_row_sequential_commit",
+            perfPhaseName(),
+            state_.device_id.toString());
+        const uint64_t workspace_generation_before_commit =
+            state_.device_id.is_gpu() ? workspaceGeneration(state_.device_id) : 0;
+
+        if (!executeMTPDepth0(token,
+                              terminal_hidden,
+                              position_offset + already_appended_tokens,
+                              "mtp_decode_sequential_catchup",
+                              true,
+                              terminal_hidden_buffer_id))
+        {
+            return false;
+        }
+
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_rows_committed",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString());
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "shifted_row_sequential_commits",
+            1.0,
+            perfPhaseName(),
+            state_.device_id.toString(),
+            {{"already_appended", std::to_string(already_appended_tokens)}});
+
+        if (state_.device_id.is_gpu())
+        {
+            const uint64_t workspace_generation_after_commit =
+                workspaceGeneration(state_.device_id);
+            if (workspace_generation_after_commit != workspace_generation_before_commit)
+            {
+                handleLivePrefixReplayStateAfterMutation(
+                    "mtp_shifted_row_sequential_commit_workspace_rebind");
+            }
+        }
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::commitMTPShiftedRowsFromPartialForward(
         const int32_t *tokens,
         int token_count,
@@ -4773,14 +4916,19 @@ namespace llaminar2
             return false;
         }
         const int catchup_token_count = token_count - already_appended_tokens;
+        const int hidden_source_row_start = already_appended_tokens - 1;
+        const int hidden_source_row_end = hidden_source_row_start + catchup_token_count;
         if (main_forward_token_count <= 0 ||
             main_forward_token_count > token_count ||
-            catchup_token_count > main_forward_token_count)
+            hidden_source_row_start < 0 ||
+            hidden_source_row_end > main_forward_token_count)
         {
             LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row commit received invalid main_forward_token_count="
                       << main_forward_token_count << " token_count=" << token_count
                       << " already_appended_tokens=" << already_appended_tokens
-                      << " catchup_token_count=" << catchup_token_count);
+                      << " catchup_token_count=" << catchup_token_count
+                      << " hidden_source_row_start=" << hidden_source_row_start
+                      << " hidden_source_row_end=" << hidden_source_row_end);
             return false;
         }
 
@@ -4854,6 +5002,8 @@ namespace llaminar2
             "shifted_row_commit",
             perfPhaseName(),
             state_.device_id.toString());
+        const uint64_t workspace_generation_before_commit =
+            state_.device_id.is_gpu() ? workspaceGeneration(state_.device_id) : 0;
 
         if (catchup_token_count > 0)
         {
@@ -4869,30 +5019,55 @@ namespace llaminar2
                           << catchup_token_count << " > " << main_forward_token_count);
                 return false;
             }
-            if (!executeMTPDepth0Batched(tokens + already_appended_tokens,
-                                         catchup_token_count,
-                                         state_.hidden.get(),
-                                         position_offset + already_appended_tokens,
-                                         "mtp_decode_catchup",
-                                         true,
-                                         BufferId::HIDDEN_STATE))
+            for (int row = 0; row < catchup_token_count; ++row)
             {
-                return false;
+                const int hidden_source_row = hidden_source_row_start + row;
+                if (!selectMTPTerminalHiddenRow(hidden_source_row, main_forward_token_count))
+                {
+                    LOG_ERROR("[DeviceGraphOrchestrator] MTP shifted-row catchup failed to select verifier hidden row "
+                              << hidden_source_row << " of " << main_forward_token_count);
+                    return false;
+                }
+                if (!executeMTPDepth0(tokens[already_appended_tokens + row],
+                                      state_.prefix_terminal_hidden.get(),
+                                      position_offset + already_appended_tokens + row,
+                                      "mtp_decode_catchup",
+                                      true,
+                                      BufferId::PREFIX_TERMINAL_HIDDEN))
+                {
+                    return false;
+                }
             }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "shifted_row_catchup_hidden_row_selects",
+                static_cast<double>(catchup_token_count),
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"source_row_start", std::to_string(hidden_source_row_start)},
+                 {"main_forward_token_count", std::to_string(main_forward_token_count)}});
         }
-
         if (!refreshMTPTerminalHiddenState(main_forward_token_count, 1))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to restore terminal hidden after MTP shifted-row commit");
             return false;
         }
-
         PerfStatsCollector::addCounter(
             "mtp",
             "shifted_rows_committed",
             static_cast<double>(token_count - already_appended_tokens),
             perfPhaseName(),
             state_.device_id.toString());
+        if (state_.device_id.is_gpu())
+        {
+            const uint64_t workspace_generation_after_commit =
+                workspaceGeneration(state_.device_id);
+            if (workspace_generation_after_commit != workspace_generation_before_commit)
+            {
+                handleLivePrefixReplayStateAfterMutation(
+                    "mtp_shifted_row_commit_workspace_rebind");
+            }
+        }
         return true;
     }
 
@@ -6287,10 +6462,21 @@ namespace llaminar2
         snapshot.cached_tokens = cached_tokens;
         if (cached_tokens > 0)
         {
+            size_t live_terminal_hidden_bytes = 0;
+            if (graph_builder_ &&
+                graph_builder_->config().mtp.enabled &&
+                state_.prefix_terminal_hidden &&
+                state_.d_model > 0)
+            {
+                live_terminal_hidden_bytes =
+                    static_cast<size_t>(state_.d_model) * sizeof(float);
+            }
+
             PrefixPayloadLayout layout = buildDensePrefixPayloadLayout(
                 *state_.kv_cache,
                 state_.device_id,
-                cached_tokens);
+                cached_tokens,
+                live_terminal_hidden_bytes);
 
             PrefixBlockHandle handle;
             handle.key.fingerprint = prefix_fingerprint_ != 0 ? prefix_fingerprint_ : 1;
@@ -6346,6 +6532,39 @@ namespace llaminar2
                     stream))
             {
                 return {};
+            }
+
+            if (live_terminal_hidden_bytes > 0)
+            {
+                handle.terminal_hidden_storage =
+                    std::make_shared<std::vector<uint8_t>>(live_terminal_hidden_bytes, 0);
+                handle.terminal_hidden = handle.terminal_hidden_storage->data();
+                if (!handle.terminal_hidden)
+                {
+                    return {};
+                }
+                if (state_.device_id.is_gpu())
+                {
+                    auto download = TransferEngine::instance().downloadFull(
+                        state_.prefix_terminal_hidden.get(),
+                        stream);
+                    if (!download.success)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to download payload checkpoint terminal hidden: "
+                                  << download.error);
+                        return {};
+                    }
+                }
+                const void *hidden = state_.prefix_terminal_hidden->raw_data();
+                if (!hidden)
+                {
+                    return {};
+                }
+                std::memcpy(
+                    handle.terminal_hidden,
+                    hidden,
+                    live_terminal_hidden_bytes);
+                handle.has_terminal_hidden = true;
             }
 
             snapshot.blocks.push_back(std::move(handle));
@@ -6523,7 +6742,19 @@ namespace llaminar2
                 cached_tokens);
         }
 
-        if (main_layout.includes_hybrid_state && main_layout.hybrid_state_bytes > 0)
+        size_t live_terminal_hidden_bytes = 0;
+        if (graph_builder_ &&
+            graph_builder_->config().mtp.enabled &&
+            state_.prefix_terminal_hidden &&
+            cached_tokens > 0 &&
+            state_.d_model > 0)
+        {
+            live_terminal_hidden_bytes =
+                static_cast<size_t>(state_.d_model) * sizeof(float);
+        }
+
+        if ((main_layout.includes_hybrid_state && main_layout.hybrid_state_bytes > 0) ||
+            live_terminal_hidden_bytes > 0)
         {
             PrefixBlockHandle handle;
             handle.key.fingerprint = prefix_fingerprint_ != 0 ? prefix_fingerprint_ : 1;
@@ -6533,6 +6764,11 @@ namespace llaminar2
             const bool device_only_checkpoint =
                 state_.device_id.is_gpu() && main_layout.hybrid_device_state_bytes > 0;
             handle.layout = liveHybridCheckpointLayout(main_layout, device_only_checkpoint);
+            if (live_terminal_hidden_bytes > 0)
+            {
+                handle.layout.terminal_hidden_bytes = live_terminal_hidden_bytes;
+                handle.layout.includes_terminal_hidden = true;
+            }
             handle.total_bytes = handle.layout.totalBytes();
             PerfStatsCollector::addCounter("mtp",
                                            "live_prefix_checkpoint_hybrid_host_bytes",
@@ -6560,6 +6796,7 @@ namespace llaminar2
                 if (!ensureLiveHybridCheckpointStorage(handle))
                     return {};
             }
+            if (handle.layout.includes_hybrid_state && handle.layout.hybrid_state_bytes > 0)
             {
                 PerfStatsCollector::ScopedTimer timer("mtp",
                                                       "live_prefix_checkpoint_hybrid_export",
@@ -6575,14 +6812,56 @@ namespace llaminar2
                 {
                     return {};
                 }
+                if (!handle.has_hybrid_state)
+                {
+                    return {};
+                }
             }
-            if (!handle.has_hybrid_state)
+            if (live_terminal_hidden_bytes > 0)
             {
-                return {};
+                handle.terminal_hidden_storage =
+                    std::make_shared<std::vector<uint8_t>>(live_terminal_hidden_bytes, 0);
+                handle.terminal_hidden = handle.terminal_hidden_storage->data();
+                if (!handle.terminal_hidden)
+                {
+                    return {};
+                }
+                if (state_.device_id.is_gpu())
+                {
+                    auto download = TransferEngine::instance().downloadFull(
+                        state_.prefix_terminal_hidden.get(),
+                        stream);
+                    if (!download.success)
+                    {
+                        LOG_ERROR("[DeviceGraphOrchestrator] Failed to download live checkpoint terminal hidden: "
+                                  << download.error);
+                        return {};
+                    }
+                }
+                const void *hidden = state_.prefix_terminal_hidden->raw_data();
+                if (!hidden)
+                {
+                    return {};
+                }
+                std::memcpy(
+                    handle.terminal_hidden,
+                    hidden,
+                    live_terminal_hidden_bytes);
+                handle.has_terminal_hidden = true;
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "live_prefix_checkpoint_terminal_hidden_captures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"bytes", std::to_string(live_terminal_hidden_bytes)}});
             }
             snapshot.blocks.push_back(std::move(handle));
-            PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_hybrid_state_captures", 1.0, "decode",
-                                           state_.device_id.toString());
+            if (main_layout.includes_hybrid_state && main_layout.hybrid_state_bytes > 0)
+            {
+                PerfStatsCollector::addCounter("mtp", "live_prefix_checkpoint_hybrid_state_captures", 1.0, "decode",
+                                               state_.device_id.toString());
+            }
         }
 
         for (size_t depth = 0; depth < state_.mtp_kv_caches.size(); ++depth)
@@ -6671,14 +6950,23 @@ namespace llaminar2
             if (!snapshot.blocks.empty())
             {
                 hybrid_handle = &snapshot.blocks.front();
-                if (!hybrid_handle->layout.includes_hybrid_state ||
-                    !hybrid_handle->has_hybrid_state ||
-                    (hybrid_handle->layout.hybrid_host_state_bytes > 0 && !hybrid_handle->hybrid_payload) ||
-                    (hybrid_handle->layout.hybrid_device_state_bytes > 0 && !hybridPayloadDevicePtr(*hybrid_handle)) ||
+                const bool includes_hybrid_state =
+                    hybrid_handle->layout.includes_hybrid_state &&
+                    hybrid_handle->layout.hybrid_state_bytes > 0;
+                const bool includes_terminal_hidden =
+                    hybrid_handle->layout.includes_terminal_hidden &&
+                    hybrid_handle->layout.terminal_hidden_bytes > 0;
+                if ((!includes_hybrid_state && !includes_terminal_hidden) ||
+                    (includes_hybrid_state &&
+                     (!hybrid_handle->has_hybrid_state ||
+                      (hybrid_handle->layout.hybrid_host_state_bytes > 0 && !hybrid_handle->hybrid_payload) ||
+                      (hybrid_handle->layout.hybrid_device_state_bytes > 0 && !hybridPayloadDevicePtr(*hybrid_handle)))) ||
+                    (includes_terminal_hidden &&
+                     (!hybrid_handle->has_terminal_hidden || !hybrid_handle->terminal_hidden)) ||
                     hybrid_handle->key.token_start != 0 ||
                     hybrid_handle->key.token_count != snapshot.cached_tokens)
                 {
-                    return fail("logical checkpoint hybrid payload block is invalid");
+                    return fail("logical checkpoint payload block is invalid");
                 }
             }
             if (snapshot.mtp_cached_tokens.size() != state_.mtp_kv_caches.size())
@@ -6701,18 +6989,67 @@ namespace llaminar2
             }
             else if (hybrid_handle)
             {
-                PerfStatsCollector::ScopedTimer timer("mtp",
-                                                      "restore_live_prefix_checkpoint_hybrid_import",
-                                                      "decode",
-                                                      state_.device_id.toString());
-                if (!importHybridPrefixPayload(
-                        *state_.kv_cache,
-                        *hybrid_handle,
-                        seq_idx,
-                        /*synchronize=*/false,
-                        stream))
+                if (hybrid_handle->layout.includes_hybrid_state &&
+                    hybrid_handle->layout.hybrid_state_bytes > 0)
                 {
-                    return fail("logical checkpoint hybrid payload import failed");
+                    PerfStatsCollector::ScopedTimer timer("mtp",
+                                                          "restore_live_prefix_checkpoint_hybrid_import",
+                                                          "decode",
+                                                          state_.device_id.toString());
+                    if (!importHybridPrefixPayload(
+                            *state_.kv_cache,
+                            *hybrid_handle,
+                            seq_idx,
+                            /*synchronize=*/false,
+                            stream))
+                    {
+                        return fail("logical checkpoint hybrid payload import failed");
+                    }
+                }
+                if (hybrid_handle->layout.includes_terminal_hidden &&
+                    hybrid_handle->layout.terminal_hidden_bytes > 0)
+                {
+                    if (!ensureMTPTerminalHiddenBuffer())
+                    {
+                        return fail("logical checkpoint terminal hidden buffer allocation failed");
+                    }
+                    void *hidden_dst = state_.prefix_terminal_hidden
+                                           ? state_.prefix_terminal_hidden->raw_mutable_data()
+                                           : nullptr;
+                    if (!hidden_dst || !hybrid_handle->terminal_hidden)
+                    {
+                        return fail("logical checkpoint terminal hidden payload is unavailable");
+                    }
+                    std::memcpy(
+                        hidden_dst,
+                        hybrid_handle->terminal_hidden,
+                        hybrid_handle->layout.terminal_hidden_bytes);
+                    state_.prefix_terminal_hidden->mark_host_dirty();
+                    if (state_.device_id.is_gpu())
+                    {
+                        auto upload = TransferEngine::instance().uploadFull(
+                            state_.prefix_terminal_hidden.get(),
+                            state_.device_id,
+                            stream);
+                        if (!upload.success)
+                        {
+                            return fail("logical checkpoint terminal hidden upload failed: " +
+                                        upload.error);
+                        }
+                    }
+                    if (arena_ && arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
+                    {
+                        arena_->markWrittenFlagsOnly(
+                            BufferId::PREFIX_TERMINAL_HIDDEN,
+                            state_.device_id.is_gpu() ? state_.device_id : DeviceId::cpu());
+                    }
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "restore_live_prefix_checkpoint_terminal_hidden",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"bytes", std::to_string(hybrid_handle->layout.terminal_hidden_bytes)}});
                 }
             }
 
@@ -6791,7 +7128,9 @@ namespace llaminar2
             PrefixPayloadLayout expected = buildDensePrefixPayloadLayout(
                 *state_.kv_cache,
                 state_.device_id,
-                handle.key.token_count);
+                handle.key.token_count,
+                handle.layout.terminal_hidden_bytes,
+                handle.layout.terminal_logits_bytes);
             if (!handle.layout.compatiblePayloadShape(expected))
             {
                 return fail("main KV block layout is incompatible");
@@ -6833,6 +7172,54 @@ namespace llaminar2
                 stream))
         {
             return fail("hybrid payload import failed");
+        }
+
+        if (!snapshot.blocks.empty())
+        {
+            const PrefixBlockHandle &terminal_handle = snapshot.blocks.back();
+            if (terminal_handle.layout.includes_terminal_hidden &&
+                terminal_handle.layout.terminal_hidden_bytes > 0)
+            {
+                if (!terminal_handle.has_terminal_hidden ||
+                    !terminal_handle.terminal_hidden)
+                {
+                    return fail("payload checkpoint terminal hidden payload is unavailable");
+                }
+                if (!ensureMTPTerminalHiddenBuffer())
+                {
+                    return fail("payload checkpoint terminal hidden buffer allocation failed");
+                }
+                void *hidden_dst = state_.prefix_terminal_hidden
+                                       ? state_.prefix_terminal_hidden->raw_mutable_data()
+                                       : nullptr;
+                if (!hidden_dst)
+                {
+                    return fail("payload checkpoint terminal hidden destination is unavailable");
+                }
+                std::memcpy(
+                    hidden_dst,
+                    terminal_handle.terminal_hidden,
+                    terminal_handle.layout.terminal_hidden_bytes);
+                state_.prefix_terminal_hidden->mark_host_dirty();
+                if (state_.device_id.is_gpu())
+                {
+                    auto upload = TransferEngine::instance().uploadFull(
+                        state_.prefix_terminal_hidden.get(),
+                        state_.device_id,
+                        stream);
+                    if (!upload.success)
+                    {
+                        return fail("payload checkpoint terminal hidden upload failed: " +
+                                    upload.error);
+                    }
+                }
+                if (arena_ && arena_->isRegistered(BufferId::PREFIX_TERMINAL_HIDDEN))
+                {
+                    arena_->markWrittenFlagsOnly(
+                        BufferId::PREFIX_TERMINAL_HIDDEN,
+                        state_.device_id.is_gpu() ? state_.device_id : DeviceId::cpu());
+                }
+            }
         }
 
         for (const auto &handle : snapshot.mtp_blocks)
@@ -7050,9 +7437,7 @@ namespace llaminar2
 
         state_.positions[seq_idx] = target_cached_tokens;
         state_.sequence_lengths[seq_idx] = target_cached_tokens;
-        handleLivePrefixReplayStateAfterMutation(
-            "restore_mtp_verifier_state_row",
-            /*preserve_gpu_replay_state=*/true);
+        handleLivePrefixReplayStateAfterMutation("restore_mtp_verifier_state_row");
         PerfStatsCollector::addCounter("mtp",
                                        "verifier_state_row_restores",
                                        1.0,

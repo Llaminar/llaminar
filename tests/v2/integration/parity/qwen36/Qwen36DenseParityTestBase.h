@@ -6,22 +6,43 @@
 #include "backends/ComputeBackend.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
+#include "execution/config/RuntimeConfig.h"
+#include "execution/factory/InferenceRunnerFactory.h"
+#include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
+#include "utils/DebugEnv.h"
 #include "utils/Sampler.h"
 #include "utils/Tokenizer.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
+#include <map>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
+
+#ifdef HAVE_CUDA
+extern "C"
+{
+    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
+    bool cudaNativeVNNIPrefill_getDeterministicMode();
+}
+#endif
 
 namespace llaminar2::test::parity::qwen36
 {
@@ -94,6 +115,7 @@ namespace llaminar2::test::parity::qwen36
                 entries_.push_back(std::move(entry));
                 setenv(name, value, 1);
             }
+            mutableDebugEnv().reload();
         }
 
         ~ScopedEnvironmentValues()
@@ -109,6 +131,7 @@ namespace llaminar2::test::parity::qwen36
                     unsetenv(it->name.c_str());
                 }
             }
+            mutableDebugEnv().reload();
         }
 
         ScopedEnvironmentValues(const ScopedEnvironmentValues &) = delete;
@@ -124,6 +147,85 @@ namespace llaminar2::test::parity::qwen36
 
         std::vector<Entry> entries_;
     };
+
+    class ScopedDenseParityDeterministicMode
+    {
+    public:
+        explicit ScopedDenseParityDeterministicMode(bool enabled)
+            : enabled_(enabled)
+        {
+            if (!enabled_)
+            {
+                return;
+            }
+
+            if (const char *old_value = std::getenv("LLAMINAR_DETERMINISTIC"))
+            {
+                had_old_deterministic_env_ = true;
+                old_deterministic_env_ = old_value;
+            }
+
+#ifdef HAVE_CUDA
+            old_cuda_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
+#endif
+
+            setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+            mutableDebugEnv().reload();
+#ifdef HAVE_CUDA
+            cudaNativeVNNIPrefill_setDeterministicMode(true);
+#endif
+            llaminar::v2::kernels::KernelFactory::clearCache();
+        }
+
+        ~ScopedDenseParityDeterministicMode()
+        {
+            if (!enabled_)
+            {
+                return;
+            }
+
+#ifdef HAVE_CUDA
+            cudaNativeVNNIPrefill_setDeterministicMode(old_cuda_prefill_deterministic_);
+#endif
+            if (had_old_deterministic_env_)
+            {
+                setenv("LLAMINAR_DETERMINISTIC", old_deterministic_env_.c_str(), 1);
+            }
+            else
+            {
+                unsetenv("LLAMINAR_DETERMINISTIC");
+            }
+            mutableDebugEnv().reload();
+            llaminar::v2::kernels::KernelFactory::clearCache();
+        }
+
+        ScopedDenseParityDeterministicMode(const ScopedDenseParityDeterministicMode &) = delete;
+        ScopedDenseParityDeterministicMode &operator=(const ScopedDenseParityDeterministicMode &) = delete;
+
+    private:
+        bool enabled_ = false;
+        bool had_old_deterministic_env_ = false;
+        std::string old_deterministic_env_;
+#ifdef HAVE_CUDA
+        bool old_cuda_prefill_deterministic_ = false;
+#endif
+    };
+
+    inline bool shouldUseDenseParityDeterministicMode(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        if (test_case.required_cuda_devices > 0)
+        {
+            return true;
+        }
+        return std::any_of(
+            test_case.devices.begin(),
+            test_case.devices.end(),
+            [](const GlobalDeviceAddress &device)
+            {
+                return device.device_type == DeviceType::CUDA;
+            });
+    }
 
     inline std::string firstEnvOrDefault(
         const std::vector<std::string> &names,
@@ -181,6 +283,65 @@ namespace llaminar2::test::parity::qwen36
         return oss.str();
     }
 
+    inline int denseArgmaxToken(const float *logits, int vocab_size)
+    {
+        if (!logits || vocab_size <= 0)
+        {
+            return -1;
+        }
+        return static_cast<int>(std::max_element(logits, logits + vocab_size) - logits);
+    }
+
+    inline std::string denseTopKSummary(const float *logits, int vocab_size, int k = 8)
+    {
+        if (!logits || vocab_size <= 0 || k <= 0)
+        {
+            return "<no logits>";
+        }
+
+        std::vector<int> indices(static_cast<size_t>(vocab_size));
+        std::iota(indices.begin(), indices.end(), 0);
+        const int limit = std::min(k, vocab_size);
+        std::partial_sort(
+            indices.begin(),
+            indices.begin() + limit,
+            indices.end(),
+            [logits](int lhs, int rhs)
+            {
+                if (logits[lhs] == logits[rhs])
+                {
+                    return lhs < rhs;
+                }
+                return logits[lhs] > logits[rhs];
+            });
+
+        std::ostringstream oss;
+        for (int i = 0; i < limit; ++i)
+        {
+            if (i > 0)
+            {
+                oss << ", ";
+            }
+            const int token = indices[static_cast<size_t>(i)];
+            oss << token << ":" << logits[token];
+        }
+        return oss.str();
+    }
+
+    inline std::string denseJoinTokens(const std::vector<int32_t> &tokens)
+    {
+        std::ostringstream oss;
+        for (size_t i = 0; i < tokens.size(); ++i)
+        {
+            if (i > 0)
+            {
+                oss << ' ';
+            }
+            oss << tokens[i];
+        }
+        return oss.str();
+    }
+
     inline ::testing::AssertionResult tokenSequencesMatch(
         const std::vector<int32_t> &actual,
         const std::vector<int32_t> &expected,
@@ -230,6 +391,457 @@ namespace llaminar2::test::parity::qwen36
                 << formatTokenWindow(expected, common > 0 ? common - 1 : 0);
         }
 
+        return ::testing::AssertionFailure() << oss.str();
+    }
+
+    inline ::testing::AssertionResult floatBytePayloadsNear(
+        const std::vector<uint8_t> &actual,
+        const std::vector<uint8_t> &expected,
+        const std::string &label,
+        float abs_tolerance = 1.0e-5f,
+        float rel_tolerance = 1.0e-4f)
+    {
+        if (actual.size() != expected.size())
+        {
+            return ::testing::AssertionFailure()
+                   << label << " payload size mismatch: actual="
+                   << actual.size() << " expected=" << expected.size();
+        }
+        if (actual.empty())
+        {
+            return ::testing::AssertionSuccess();
+        }
+        if (actual.size() % sizeof(float) != 0)
+        {
+            if (actual == expected)
+            {
+                return ::testing::AssertionSuccess();
+            }
+            size_t first_mismatch = 0;
+            while (first_mismatch < actual.size() &&
+                   actual[first_mismatch] == expected[first_mismatch])
+            {
+                ++first_mismatch;
+            }
+            return ::testing::AssertionFailure()
+                   << label << " byte payload mismatch at byte "
+                   << first_mismatch << ": actual="
+                   << static_cast<int>(actual[first_mismatch])
+                   << " expected="
+                   << static_cast<int>(expected[first_mismatch]);
+        }
+
+        const size_t float_count = actual.size() / sizeof(float);
+        size_t mismatch_count = 0;
+        size_t first_mismatch_index = std::numeric_limits<size_t>::max();
+        float first_actual = 0.0f;
+        float first_expected = 0.0f;
+        float first_abs = 0.0f;
+        float first_rel = 0.0f;
+        size_t worst_index = 0;
+        float worst_actual = 0.0f;
+        float worst_expected = 0.0f;
+        float worst_abs = 0.0f;
+        float worst_rel = 0.0f;
+        for (size_t i = 0; i < float_count; ++i)
+        {
+            float a = 0.0f;
+            float e = 0.0f;
+            std::memcpy(&a, actual.data() + i * sizeof(float), sizeof(float));
+            std::memcpy(&e, expected.data() + i * sizeof(float), sizeof(float));
+            const float abs_diff = std::fabs(a - e);
+            const float scale = std::max(std::fabs(a), std::fabs(e));
+            const float rel_diff = scale > 0.0f ? abs_diff / scale : 0.0f;
+            const bool finite_match = std::isfinite(a) && std::isfinite(e);
+            const bool within_tolerance =
+                finite_match &&
+                abs_diff <= abs_tolerance + rel_tolerance * scale;
+            if (!within_tolerance)
+            {
+                ++mismatch_count;
+                if (first_mismatch_index == std::numeric_limits<size_t>::max())
+                {
+                    first_mismatch_index = i;
+                    first_actual = a;
+                    first_expected = e;
+                    first_abs = abs_diff;
+                    first_rel = rel_diff;
+                }
+                if (abs_diff > worst_abs)
+                {
+                    worst_index = i;
+                    worst_actual = a;
+                    worst_expected = e;
+                    worst_abs = abs_diff;
+                    worst_rel = rel_diff;
+                }
+            }
+        }
+
+        if (mismatch_count == 0)
+        {
+            return ::testing::AssertionSuccess();
+        }
+
+        return ::testing::AssertionFailure()
+               << label << " payload differs in " << mismatch_count
+               << " / " << float_count << " floats; first index="
+               << first_mismatch_index << " actual=" << first_actual
+               << " expected=" << first_expected
+               << " abs_diff=" << first_abs
+               << " rel_diff=" << first_rel
+               << "; worst index="
+               << worst_index << " actual=" << worst_actual
+               << " expected=" << worst_expected
+               << " abs_diff=" << worst_abs
+               << " rel_diff=" << worst_rel
+               << " tolerances(abs=" << abs_tolerance
+               << ", rel=" << rel_tolerance << ")";
+    }
+
+    inline std::vector<uint8_t> byteSlice(
+        const std::vector<uint8_t> &bytes,
+        size_t offset,
+        size_t count)
+    {
+        if (offset > bytes.size() || count > bytes.size() - offset)
+        {
+            return {};
+        }
+        return std::vector<uint8_t>(
+            bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+            bytes.begin() + static_cast<std::ptrdiff_t>(offset + count));
+    }
+
+    inline ::testing::AssertionResult prefixSnapshotPayloadsNear(
+        const PrefixStateSnapshot &actual,
+        const PrefixStateSnapshot &expected,
+        const std::string &label)
+    {
+        if (!actual.valid || !expected.valid)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " invalid snapshot: actual="
+                   << actual.valid << " expected=" << expected.valid;
+        }
+        if (actual.cached_tokens != expected.cached_tokens)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " cached token mismatch: actual="
+                   << actual.cached_tokens << " expected="
+                   << expected.cached_tokens;
+        }
+        if (actual.blocks.empty() || expected.blocks.empty())
+        {
+            return ::testing::AssertionFailure()
+                   << label << " missing main prefix block: actual="
+                   << actual.blocks.size() << " expected="
+                   << expected.blocks.size();
+        }
+
+        const PrefixBlockHandle &actual_block = actual.blocks.back();
+        const PrefixBlockHandle &expected_block = expected.blocks.back();
+        if (actual_block.layout.hybrid_host_state_bytes !=
+                expected_block.layout.hybrid_host_state_bytes ||
+            actual_block.layout.hybrid_device_state_bytes !=
+                expected_block.layout.hybrid_device_state_bytes ||
+            actual_block.layout.terminal_hidden_bytes !=
+                expected_block.layout.terminal_hidden_bytes)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " layout mismatch"
+                   << " hybrid_host actual="
+                   << actual_block.layout.hybrid_host_state_bytes
+                   << " expected="
+                   << expected_block.layout.hybrid_host_state_bytes
+                   << " hybrid_device actual="
+                   << actual_block.layout.hybrid_device_state_bytes
+                   << " expected="
+                   << expected_block.layout.hybrid_device_state_bytes
+                   << " terminal_hidden actual="
+                   << actual_block.layout.terminal_hidden_bytes
+                   << " expected="
+                   << expected_block.layout.terminal_hidden_bytes;
+        }
+
+        if (actual_block.layout.hybrid_state_bytes > 0)
+        {
+            if (!actual_block.has_hybrid_state ||
+                !expected_block.has_hybrid_state ||
+                !actual_block.hybrid_storage ||
+                !expected_block.hybrid_storage)
+            {
+                return ::testing::AssertionFailure()
+                       << label << " missing hybrid state payload";
+            }
+            const size_t host_bytes =
+                actual_block.layout.hybrid_host_state_bytes;
+            const size_t device_bytes =
+                actual_block.layout.hybrid_device_state_bytes;
+            if (host_bytes > 0)
+            {
+                auto host_result = floatBytePayloadsNear(
+                    byteSlice(*actual_block.hybrid_storage, 0, host_bytes),
+                    byteSlice(*expected_block.hybrid_storage, 0, host_bytes),
+                    label + " hybrid host");
+                if (!host_result)
+                {
+                    return host_result;
+                }
+            }
+            if (device_bytes > 0)
+            {
+                std::string device_label = label + " hybrid device";
+                if (actual_block.layout.gdn_layers > 0 &&
+                    device_bytes % static_cast<size_t>(actual_block.layout.gdn_layers) == 0)
+                {
+                    device_label += " (gdn_layers=" +
+                                    std::to_string(actual_block.layout.gdn_layers) +
+                                    ", per_gdn_layer_device_bytes=" +
+                                    std::to_string(
+                                        device_bytes /
+                                        static_cast<size_t>(actual_block.layout.gdn_layers)) +
+                                    ")";
+                }
+                auto device_result = floatBytePayloadsNear(
+                    byteSlice(*actual_block.hybrid_storage, host_bytes, device_bytes),
+                    byteSlice(*expected_block.hybrid_storage, host_bytes, device_bytes),
+                    device_label);
+                if (!device_result)
+                {
+                    return device_result;
+                }
+            }
+        }
+
+        if (actual_block.layout.terminal_hidden_bytes > 0)
+        {
+            if (!actual_block.has_terminal_hidden ||
+                !expected_block.has_terminal_hidden ||
+                !actual_block.terminal_hidden_storage ||
+                !expected_block.terminal_hidden_storage)
+            {
+                return ::testing::AssertionFailure()
+                       << label << " missing terminal-hidden payload";
+            }
+            auto hidden_result = floatBytePayloadsNear(
+                *actual_block.terminal_hidden_storage,
+                *expected_block.terminal_hidden_storage,
+                label + " terminal hidden");
+            if (!hidden_result)
+            {
+                return hidden_result;
+            }
+        }
+
+        return ::testing::AssertionSuccess();
+    }
+
+    struct DenseStageSnapshot
+    {
+        std::string key;
+        std::vector<float> data;
+        size_t rows = 0;
+        size_t cols = 0;
+    };
+
+    inline std::map<std::string, DenseStageSnapshot> captureDenseStageSnapshots(
+        IInferenceRunner &runner)
+    {
+        std::map<std::string, DenseStageSnapshot> snapshots;
+        auto keys = runner.getSnapshotKeys();
+        std::sort(keys.begin(), keys.end());
+        for (const auto &key : keys)
+        {
+            SnapshotInfo info = runner.getSnapshotWithShape(key);
+            if (!info || info.rows == 0 || info.cols == 0 ||
+                info.size != info.rows * info.cols)
+            {
+                continue;
+            }
+            DenseStageSnapshot snapshot;
+            snapshot.key = key;
+            snapshot.rows = info.rows;
+            snapshot.cols = info.cols;
+            snapshot.data.assign(info.data, info.data + info.size);
+            snapshots.emplace(key, std::move(snapshot));
+        }
+        return snapshots;
+    }
+
+    inline ::testing::AssertionResult denseM4FinalRowSnapshotsNear(
+        const std::map<std::string, DenseStageSnapshot> &m4_snapshots,
+        const std::map<std::string, DenseStageSnapshot> &single_row_snapshots,
+        const std::string &label,
+        int m4_row_index,
+        float abs_tolerance = 1.0e-6f,
+        float rel_tolerance = 1.0e-6f)
+    {
+        if (m4_row_index < 0 || m4_row_index >= 4)
+        {
+            return ::testing::AssertionFailure()
+                   << label << " invalid M=4 row index " << m4_row_index;
+        }
+
+        struct Mismatch
+        {
+            std::string key;
+            size_t col = 0;
+            size_t mismatches = 0;
+            float first_actual = 0.0f;
+            float first_expected = 0.0f;
+            float first_abs = 0.0f;
+            float first_rel = 0.0f;
+            float max_abs = 0.0f;
+            float max_rel = 0.0f;
+        };
+
+        std::vector<Mismatch> mismatches;
+        size_t comparable = 0;
+        for (const auto &[key, m4] : m4_snapshots)
+        {
+            const auto single_it = single_row_snapshots.find(key);
+            if (single_it == single_row_snapshots.end())
+            {
+                continue;
+            }
+            const DenseStageSnapshot &single = single_it->second;
+            if (m4.rows != 4 || single.rows != 1 || m4.cols != single.cols)
+            {
+                continue;
+            }
+            ++comparable;
+            Mismatch mismatch;
+            mismatch.key = key;
+            const size_t m4_row_offset =
+                static_cast<size_t>(m4_row_index) * m4.cols;
+            for (size_t col = 0; col < m4.cols; ++col)
+            {
+                const float a = m4.data[m4_row_offset + col];
+                const float e = single.data[col];
+                const float abs_diff = std::fabs(a - e);
+                const float scale = std::max(std::fabs(a), std::fabs(e));
+                const float rel_diff = scale > 0.0f ? abs_diff / scale : 0.0f;
+                const bool within_tolerance =
+                    std::isfinite(a) && std::isfinite(e) &&
+                    abs_diff <= abs_tolerance + rel_tolerance * scale;
+                if (!within_tolerance)
+                {
+                    if (mismatch.mismatches == 0)
+                    {
+                        mismatch.col = col;
+                        mismatch.first_actual = a;
+                        mismatch.first_expected = e;
+                        mismatch.first_abs = abs_diff;
+                        mismatch.first_rel = rel_diff;
+                    }
+                    ++mismatch.mismatches;
+                    if (abs_diff > mismatch.max_abs)
+                    {
+                        mismatch.max_abs = abs_diff;
+                        mismatch.max_rel = rel_diff;
+                    }
+                }
+            }
+            if (mismatch.mismatches > 0)
+            {
+                mismatches.push_back(std::move(mismatch));
+            }
+        }
+
+        if (mismatches.empty())
+        {
+            if (comparable == 0)
+            {
+                return ::testing::AssertionFailure()
+                       << label << " found no comparable M=4/single-row "
+                       << "stage snapshots";
+            }
+            return ::testing::AssertionSuccess();
+        }
+
+        auto stage_sort_key = [](const std::string &key)
+        {
+            int layer = 100000;
+            int stage = 100000;
+            if (key.rfind("layer", 0) == 0)
+            {
+                size_t digit_end = 5;
+                while (digit_end < key.size() &&
+                       std::isdigit(static_cast<unsigned char>(key[digit_end])))
+                {
+                    ++digit_end;
+                }
+                try
+                {
+                    layer = std::stoi(key.substr(5, digit_end - 5));
+                }
+                catch (...)
+                {
+                    layer = 99999;
+                }
+            }
+
+            static const std::vector<std::pair<std::string, int>> stage_order = {
+                {"ATTENTION_NORM", 10},
+                {"QKV_PROJECTION", 20},
+                {"GDN_Z_PROJECTION", 25},
+                {"Q_PROJECTION", 30},
+                {"K_PROJECTION", 40},
+                {"V_PROJECTION", 50},
+                {"Q_NORM", 60},
+                {"K_NORM", 70},
+                {"Q_ROPE", 80},
+                {"K_ROPE", 90},
+                {"GDN_CONV1D_OUTPUT", 100},
+                {"GDN_DELTA_RULE_OUTPUT", 110},
+                {"GDN_NORM_GATE_OUTPUT", 120},
+                {"ATTENTION_CONTEXT", 130},
+                {"ATTENTION_CONTEXT_GATED", 140},
+                {"ATTENTION_OUTPUT", 150},
+                {"ATTENTION_RESIDUAL", 160},
+                {"FFN_NORM", 170},
+                {"FFN_GATE", 180},
+                {"FFN_UP", 190},
+                {"FFN_SWIGLU", 200},
+                {"FFN_DOWN", 210},
+                {"FFN_RESIDUAL", 220},
+            };
+            for (const auto &[needle, order] : stage_order)
+            {
+                if (key.find(needle) != std::string::npos)
+                {
+                    stage = order;
+                    break;
+                }
+            }
+            return std::tuple<int, int, std::string>(layer, stage, key);
+        };
+        std::sort(mismatches.begin(),
+                  mismatches.end(),
+                  [&](const Mismatch &a, const Mismatch &b)
+                  {
+                      return stage_sort_key(a.key) < stage_sort_key(b.key);
+                  });
+
+        std::ostringstream oss;
+        oss << label << " stage snapshot final-row mismatch across "
+            << mismatches.size() << " / " << comparable
+            << " comparable stages";
+        const size_t limit = std::min<size_t>(mismatches.size(), 24);
+        for (size_t i = 0; i < limit; ++i)
+        {
+            const auto &m = mismatches[i];
+            oss << "\n  " << m.key
+                << ": mismatches=" << m.mismatches
+                << " first_col=" << m.col
+                << " actual=" << m.first_actual
+                << " expected=" << m.first_expected
+                << " abs=" << m.first_abs
+                << " rel=" << m.first_rel
+                << " max_abs=" << m.max_abs
+                << " max_rel=" << m.max_rel;
+        }
         return ::testing::AssertionFailure() << oss.str();
     }
 
@@ -285,13 +897,49 @@ namespace llaminar2::test::parity::qwen36
         return {};
     }
 
+    inline std::optional<std::string> readStringFromMetadata(
+        const std::filesystem::path &metadata_path,
+        const std::string &key)
+    {
+        std::ifstream file(metadata_path);
+        if (!file.is_open())
+        {
+            return std::nullopt;
+        }
+
+        const std::string prefix = key + ":";
+        std::string line;
+        while (std::getline(file, line))
+        {
+            if (line.rfind(prefix, 0) != 0)
+            {
+                continue;
+            }
+
+            std::string value = line.substr(prefix.size());
+            const size_t start = value.find_first_not_of(" \t");
+            if (start == std::string::npos)
+            {
+                return std::string{};
+            }
+            const size_t end = value.find_last_not_of(" \t\r\n");
+            return value.substr(start, end - start + 1);
+        }
+
+        return std::nullopt;
+    }
+
     inline bool metadataLooksUsable(
         const std::filesystem::path &metadata_path,
+        const std::string &expected_prompt,
         int required_decode_steps)
     {
+        const auto prompt = readStringFromMetadata(metadata_path, "prompt");
         const auto token_ids = readTokenListFromMetadata(metadata_path, "token_ids");
         const auto decode_tokens = readTokenListFromMetadata(metadata_path, "decode_tokens");
-        return !token_ids.empty() &&
+        return prompt.has_value() &&
+               *prompt == expected_prompt &&
+               !token_ids.empty() &&
                decode_tokens.size() >= static_cast<size_t>(required_decode_steps);
     }
 
@@ -347,7 +995,7 @@ namespace llaminar2::test::parity::qwen36
         const std::string &model_path,
         const std::filesystem::path &metadata_path)
     {
-        if (metadataLooksUsable(metadata_path, test_case.decode_steps))
+        if (metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
         {
             return;
         }
@@ -363,7 +1011,7 @@ namespace llaminar2::test::parity::qwen36
             << metadata_path << "\n"
             << output;
 
-        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.decode_steps))
+        ASSERT_TRUE(metadataLooksUsable(metadata_path, test_case.prompt, test_case.decode_steps))
             << test_case.name << " regenerated metadata is incomplete at "
             << metadata_path << "\n"
             << output;
@@ -676,6 +1324,8 @@ namespace llaminar2::test::parity::qwen36
         const DensePrefixRestoreParityCase &test_case,
         PrefixRestoreParityMode mode)
     {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -756,6 +1406,8 @@ namespace llaminar2::test::parity::qwen36
         const DensePrefixRestoreParityCase &test_case,
         int split_tokens)
     {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -814,6 +1466,8 @@ namespace llaminar2::test::parity::qwen36
         int mtp_draft_tokens = 1,
         MTPDepthPolicyConfig depth_policy = {})
     {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
         ASSERT_GE(mtp_draft_tokens, 1);
         ASSERT_LE(mtp_draft_tokens, 3);
 
@@ -912,6 +1566,8 @@ namespace llaminar2::test::parity::qwen36
         DensePrefixRestoreParityCase test_case,
         bool enable_prefix_cache = false)
     {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
         const int adaptive_max_depth = enable_prefix_cache ? 1 : 2;
         MTPDepthPolicyConfig depth_policy;
         depth_policy.mode = MTPDepthPolicyMode::Dynamic;
@@ -992,16 +1648,311 @@ namespace llaminar2::test::parity::qwen36
         EXPECT_GE(after_second.mtp_depth_policy_windows, 1u);
     }
 
+    inline void runDenseNoMTPBenchmarkStyleFreshRunnerDeterminism(
+        DensePrefixRestoreParityCase test_case,
+        int decode_token_budget = 16,
+        int reused_cycle_count = 2)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        ASSERT_GT(decode_token_budget, 0);
+        ASSERT_GT(reused_cycle_count, 0);
+
+        test_case.name += " benchmark-style no-MTP fresh-runner determinism";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = std::max(test_case.decode_steps, decode_token_budget);
+        test_case.max_seq_len = 768;
+
+        const char *gpu_graphs_override =
+            std::getenv("LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_GPU_GRAPHS");
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS",
+             (gpu_graphs_override && *gpu_graphs_override) ? gpu_graphs_override : "1"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        const std::string model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        auto model_context = ModelContext::create(model_path);
+        ASSERT_NE(model_context, nullptr);
+        auto tokenizer = createTokenizer(model_context);
+        ASSERT_NE(tokenizer, nullptr);
+        const std::vector<int> encoded_prompt =
+            tokenizer->encode(test_case.prompt, /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded_prompt.empty());
+        std::vector<int32_t> prompt_tokens(encoded_prompt.begin(), encoded_prompt.end());
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size()) + decode_token_budget,
+            test_case.max_seq_len);
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        greedy.seed = 42;
+
+        struct Trace
+        {
+            std::vector<int32_t> tokens;
+            std::vector<int> gathered_argmax;
+            std::vector<std::string> topk;
+            std::string error;
+        };
+
+        auto trace_string = [](const Trace &trace) -> std::string
+        {
+            std::ostringstream oss;
+            oss << "tokens={" << denseJoinTokens(trace.tokens) << "}";
+            for (size_t i = 0; i < trace.topk.size(); ++i)
+            {
+                oss << "\n  step " << i
+                    << " sampled="
+                    << (i < trace.tokens.size() ? trace.tokens[i] : -1)
+                    << " gathered_argmax="
+                    << (i < trace.gathered_argmax.size() ? trace.gathered_argmax[i] : -1)
+                    << " topk=[" << trace.topk[i] << "]";
+            }
+            return oss.str();
+        };
+
+        auto run_once = [&](int repetition, bool gather_logits) -> Trace
+        {
+            Trace trace;
+            auto runner = factory->createFromOrchestrationConfig(
+                makeDensePrefixRestoreConfig(test_case, model_path, false, 2, false));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                trace.error = "failed to create runner";
+                return trace;
+            }
+
+            if (!runner->initialize())
+            {
+                trace.error = runner->lastError();
+                return trace;
+            }
+            runner->setSamplingParams(greedy);
+            runner->setSkipLogitsGatherPrefill(true);
+            runner->setSkipLogitsGatherDecode(true);
+
+            if (!runner->prefill(prompt_tokens))
+            {
+                trace.error = runner->lastError();
+                runner->shutdown();
+                return trace;
+            }
+
+            const int vocab_size = runner->vocabSize();
+            if (vocab_size <= 0)
+            {
+                trace.error = "invalid vocab size";
+                runner->shutdown();
+                return trace;
+            }
+
+            for (int produced = 0; produced < decode_token_budget; ++produced)
+            {
+                runner->setDecodeStepTokenBudget(decode_token_budget - produced);
+                GenerationResult step = runner->decodeStep();
+                runner->setDecodeStepTokenBudget(0);
+                if (!step.error.empty())
+                {
+                    trace.error = step.error;
+                    break;
+                }
+                if (step.tokens.size() != 1u)
+                {
+                    std::ostringstream oss;
+                    oss << "repetition " << repetition
+                        << " produced " << step.tokens.size()
+                        << " tokens for one no-MTP decode step";
+                    trace.error = oss.str();
+                    break;
+                }
+                const int32_t token = step.tokens.front();
+                trace.tokens.push_back(token);
+
+                if (gather_logits)
+                {
+                    const float *logits = runner->lastLogits();
+                    if (!logits)
+                    {
+                        trace.error = "benchmark-style no-MTP decode produced no gathered logits";
+                        break;
+                    }
+                    const int gathered_argmax = denseArgmaxToken(logits, vocab_size);
+                    trace.gathered_argmax.push_back(gathered_argmax);
+                    trace.topk.push_back(denseTopKSummary(logits, vocab_size));
+                    if (token != gathered_argmax)
+                    {
+                        std::ostringstream oss;
+                        oss << "GPU greedy sample does not match gathered logits argmax"
+                            << " at repetition " << repetition
+                            << " step " << produced
+                            << ": sampled=" << token
+                            << " gathered_argmax=" << gathered_argmax
+                            << "\ntop-k: " << trace.topk.back();
+                        trace.error = oss.str();
+                        break;
+                    }
+                }
+            }
+
+            runner->setSkipLogitsGatherDecode(false);
+            runner->setSkipLogitsGatherPrefill(false);
+            runner->shutdown();
+            return trace;
+        };
+
+        auto run_reused_cycles = [&]() -> std::vector<Trace>
+        {
+            std::vector<Trace> traces;
+            auto runner = factory->createFromOrchestrationConfig(
+                makeDensePrefixRestoreConfig(test_case, model_path, false, 2, false));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                return traces;
+            }
+
+            if (!runner->initialize())
+            {
+                Trace trace;
+                trace.error = runner->lastError();
+                traces.push_back(std::move(trace));
+                return traces;
+            }
+
+            runner->setSamplingParams(greedy);
+            runner->setSkipLogitsGatherPrefill(true);
+            runner->setSkipLogitsGatherDecode(true);
+
+            for (int cycle = 0; cycle < reused_cycle_count; ++cycle)
+            {
+                runner->clearCache();
+                Trace trace;
+                if (!runner->prefill(prompt_tokens))
+                {
+                    trace.error = runner->lastError();
+                    traces.push_back(std::move(trace));
+                    break;
+                }
+
+                while (static_cast<int>(trace.tokens.size()) < decode_token_budget)
+                {
+                    const int remaining = decode_token_budget - static_cast<int>(trace.tokens.size());
+                    runner->setDecodeStepTokenBudget(remaining);
+                    GenerationResult step = runner->decodeStep();
+                    runner->setDecodeStepTokenBudget(0);
+                    if (!step.error.empty())
+                    {
+                        trace.error = step.error;
+                        break;
+                    }
+                    if (step.tokens.empty())
+                    {
+                        trace.error = "reused no-MTP production decode produced no tokens";
+                        break;
+                    }
+                    if (step.tokens.size() > static_cast<size_t>(remaining))
+                    {
+                        std::ostringstream oss;
+                        oss << "reused no-MTP production decode exceeded budget: "
+                            << step.tokens.size() << " > " << remaining;
+                        trace.error = oss.str();
+                        break;
+                    }
+                    trace.tokens.insert(trace.tokens.end(), step.tokens.begin(), step.tokens.end());
+                }
+                traces.push_back(std::move(trace));
+            }
+
+            runner->setSkipLogitsGatherDecode(false);
+            runner->setSkipLogitsGatherPrefill(false);
+            runner->shutdown();
+            return traces;
+        };
+
+        const Trace first = run_once(0, /*gather_logits=*/false);
+        ASSERT_TRUE(first.error.empty()) << first.error << "\n" << trace_string(first);
+        ASSERT_EQ(first.tokens.size(), static_cast<size_t>(decode_token_budget))
+            << trace_string(first);
+
+        const Trace second = run_once(1, /*gather_logits=*/false);
+        ASSERT_TRUE(second.error.empty()) << second.error << "\n" << trace_string(second);
+        ASSERT_EQ(second.tokens.size(), first.tokens.size())
+            << "first:\n"
+            << trace_string(first)
+            << "\nsecond:\n"
+            << trace_string(second);
+        EXPECT_EQ(second.tokens, first.tokens)
+            << "Qwen3.6 dense CUDA benchmark-style no-MTP decode must be "
+            << "fresh-runner deterministic before MTP parity can be trusted."
+            << "\nfirst:\n"
+            << trace_string(first)
+            << "\nsecond:\n"
+            << trace_string(second);
+
+        const Trace gathered = run_once(2, /*gather_logits=*/true);
+        ASSERT_TRUE(gathered.error.empty()) << gathered.error << "\n" << trace_string(gathered);
+        ASSERT_EQ(gathered.tokens.size(), first.tokens.size())
+            << "first:\n"
+            << trace_string(first)
+            << "\ngathered:\n"
+            << trace_string(gathered);
+        EXPECT_EQ(gathered.tokens, first.tokens)
+            << "Gathering logits for diagnostics must not change CUDA no-MTP decode tokens."
+            << "\nfirst:\n"
+            << trace_string(first)
+            << "\ngathered:\n"
+            << trace_string(gathered);
+
+        const auto reused_cycles = run_reused_cycles();
+        ASSERT_EQ(reused_cycles.size(), static_cast<size_t>(reused_cycle_count));
+        for (size_t i = 0; i < reused_cycles.size(); ++i)
+        {
+            ASSERT_TRUE(reused_cycles[i].error.empty())
+                << reused_cycles[i].error << "\n" << trace_string(reused_cycles[i]);
+            ASSERT_EQ(reused_cycles[i].tokens.size(), first.tokens.size())
+                << "first:\n"
+                << trace_string(first)
+                << "\ncycle:\n"
+                << trace_string(reused_cycles[i]);
+            EXPECT_EQ(reused_cycles[i].tokens, first.tokens)
+                << "clearCache() must reset CUDA no-MTP production decode state "
+                << "without relying on logits gather."
+                << "\nfirst:\n"
+                << trace_string(first)
+                << "\ncycle " << i << ":\n"
+                << trace_string(reused_cycles[i]);
+        }
+    }
+
     inline void runDenseBenchmarkStyleDynamicMTPParity(
         DensePrefixRestoreParityCase test_case)
     {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
         test_case.name += " benchmark-style dynamic MTP parity";
         test_case.prompt = qwen36DefaultBenchmarkPrompt();
         test_case.decode_steps = 128;
         test_case.max_seq_len = 768;
 
+        const char *gpu_graphs_override =
+            std::getenv("LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_GPU_GRAPHS");
         ScopedEnvironmentValues graph_env({
-            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_GPU_GRAPHS",
+             (gpu_graphs_override && *gpu_graphs_override) ? gpu_graphs_override : "1"},
         });
 
         std::string model_path;
@@ -1274,9 +2225,1318 @@ namespace llaminar2::test::parity::qwen36
             << reused_dynamic_state.mtp_bypass_reason;
     }
 
+    inline void runDenseBenchmarkStyleMTPParitySinglePass(
+        DensePrefixRestoreParityCase test_case,
+        int mtp_draft_tokens,
+        MTPDepthPolicyConfig depth_policy,
+        const std::string &label)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " benchmark-style " + label + " MTP parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_METADATA",
+        };
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_benchmark_prompt_snapshots/metadata.txt";
+
+        const char *gpu_graphs_override =
+            std::getenv("LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_GPU_GRAPHS");
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS",
+             (gpu_graphs_override && *gpu_graphs_override) ? gpu_graphs_override : "1"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size()) + test_case.decode_steps,
+            test_case.max_seq_len);
+
+        auto factory = createOrchestrationRunnerFactory();
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        greedy.seed = 42;
+
+        auto run_decode = [&](bool enable_mtp,
+                              int draft_tokens,
+                              const MTPDepthPolicyConfig &policy,
+                              PrefixRuntimeStateSnapshot *out_state) -> std::vector<int32_t>
+        {
+            std::vector<int32_t> tokens;
+            auto runner = factory->createFromOrchestrationConfig(
+                makeDensePrefixRestoreConfig(
+                    test_case,
+                    model_path,
+                    false,
+                    2,
+                    enable_mtp,
+                    draft_tokens,
+                    policy));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                return tokens;
+            }
+
+            if (!runner->initialize())
+            {
+                ADD_FAILURE() << runner->lastError();
+                return tokens;
+            }
+
+            runner->setSamplingParams(greedy);
+            runner->setSkipLogitsGatherPrefill(true);
+            runner->setSkipLogitsGatherDecode(true);
+
+            if (!runner->prefill(prompt_tokens))
+            {
+                ADD_FAILURE() << runner->lastError();
+                runner->shutdown();
+                return tokens;
+            }
+
+            while (static_cast<int>(tokens.size()) < test_case.decode_steps)
+            {
+                const int remaining = test_case.decode_steps - static_cast<int>(tokens.size());
+                runner->setDecodeStepTokenBudget(remaining);
+                GenerationResult step = runner->decodeStep();
+                runner->setDecodeStepTokenBudget(0);
+                if (!step.error.empty())
+                {
+                    ADD_FAILURE() << step.error;
+                    break;
+                }
+                if (step.tokens.empty())
+                {
+                    ADD_FAILURE() << label << " benchmark-style decode produced no tokens";
+                    break;
+                }
+                if (step.tokens.size() > static_cast<size_t>(remaining))
+                {
+                    ADD_FAILURE()
+                        << label
+                        << " benchmark-style decode exceeded remaining token budget: "
+                        << step.tokens.size() << " > " << remaining;
+                    break;
+                }
+                tokens.insert(tokens.end(), step.tokens.begin(), step.tokens.end());
+            }
+
+            if (out_state)
+            {
+                *out_state = runner->prefixStateProbe();
+            }
+            runner->setSkipLogitsGatherDecode(false);
+            runner->setSkipLogitsGatherPrefill(false);
+            runner->shutdown();
+            return tokens;
+        };
+
+        PrefixRuntimeStateSnapshot baseline_state;
+        const auto baseline_tokens =
+            run_decode(false, 1, {}, &baseline_state);
+        ASSERT_EQ(baseline_tokens.size(), static_cast<size_t>(test_case.decode_steps));
+        EXPECT_TRUE(tokenSequencesMatch(
+            baseline_tokens,
+            expected_tokens,
+            "fresh no-MTP benchmark-style baseline"));
+        EXPECT_EQ(baseline_state.mtp_draft_steps, 0u);
+
+        PrefixRuntimeStateSnapshot mtp_state;
+        const auto mtp_tokens =
+            run_decode(true, mtp_draft_tokens, depth_policy, &mtp_state);
+        ASSERT_EQ(mtp_tokens.size(), expected_tokens.size());
+        EXPECT_TRUE(tokenSequencesMatch(
+            mtp_tokens,
+            expected_tokens,
+            "fresh " + label + " MTP"));
+        EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
+        if (depth_policy.mode == MTPDepthPolicyMode::Dynamic)
+        {
+            EXPECT_TRUE(mtp_state.mtp_request.adaptive_depth_enabled);
+            EXPECT_EQ(mtp_state.mtp_request.depth_policy_mode, "dynamic");
+        }
+    }
+
+    inline void runDenseBenchmarkStyleFixedMTPParity(
+        DensePrefixRestoreParityCase test_case,
+        int mtp_draft_tokens)
+    {
+        runDenseBenchmarkStyleMTPParitySinglePass(
+            std::move(test_case),
+            mtp_draft_tokens,
+            {},
+            "fixed-depth-" + std::to_string(mtp_draft_tokens));
+    }
+
+    inline void runDenseBenchmarkStyleDynamicMTPParitySinglePass(
+        DensePrefixRestoreParityCase test_case)
+    {
+        MTPDepthPolicyConfig depth_policy;
+        depth_policy.mode = MTPDepthPolicyMode::Dynamic;
+        runDenseBenchmarkStyleMTPParitySinglePass(
+            std::move(test_case),
+            3,
+            depth_policy,
+            "dynamic-depth");
+    }
+
+    inline void runDenseMTPVerifierRowsPostSidecarEquivalence(
+        DensePrefixRestoreParityCase test_case)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " dense MTP verifier-row post-sidecar equivalence";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 3;
+        test_case.max_seq_len = 768;
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        const std::string model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        auto tokenizer = createTokenizer(model_ctx);
+        ASSERT_NE(tokenizer, nullptr);
+        const std::vector<int> encoded_prompt =
+            tokenizer->encode(test_case.prompt, /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded_prompt.empty());
+        std::vector<int32_t> prompt_tokens(
+            encoded_prompt.begin(),
+            encoded_prompt.end());
+        ASSERT_LT(static_cast<int>(prompt_tokens.size()) + 4, test_case.max_seq_len);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        const PrefixStateSnapshot prompt_checkpoint = runner->captureLivePrefixCheckpoint();
+        ASSERT_TRUE(prompt_checkpoint.valid);
+
+        const int32_t condition_token = prompt_tokens.back();
+        ASSERT_TRUE(runner->forward(&condition_token, 1));
+        const int32_t first_token = runner->sampleGreedyOnDevice();
+        ASSERT_GE(first_token, 0);
+        const PrefixStateSnapshot post_condition_checkpoint =
+            runner->captureLivePrefixCheckpoint();
+        ASSERT_TRUE(post_condition_checkpoint.valid);
+
+        int32_t draft_token = -1;
+        ASSERT_TRUE(runner->forwardMTPAndSampleGreedy(first_token, &draft_token));
+        ASSERT_GE(draft_token, 0);
+        ASSERT_TRUE(runner->flushPendingMTPWork());
+
+        const int32_t verifier_inputs[2] = {first_token, draft_token};
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs, 2));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t post_sidecar_rows[2] = {-1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            2,
+            post_sidecar_rows));
+        ASSERT_GE(post_sidecar_rows[1], 0);
+        ASSERT_TRUE(runner->forward(&post_sidecar_rows[1], 1));
+        const int32_t post_sidecar_continuation_token =
+            runner->sampleGreedyOnDevice();
+        ASSERT_GE(post_sidecar_continuation_token, 0);
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(post_condition_checkpoint));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs, 2));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t restored_rows[2] = {-1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            2,
+            restored_rows));
+
+        const int verifier_row1_target_cached_tokens =
+            post_condition_checkpoint.cached_tokens + 2;
+        ASSERT_TRUE(runner->restoreMTPVerifierStateRow(
+            1,
+            verifier_row1_target_cached_tokens));
+        ASSERT_TRUE(runner->forward(&restored_rows[1], 1));
+        const int32_t verifier_row1_restore_continuation_token =
+            runner->sampleGreedyOnDevice();
+        ASSERT_GE(verifier_row1_restore_continuation_token, 0);
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(post_condition_checkpoint));
+        ASSERT_TRUE(runner->forward(&first_token, 1));
+        const int32_t one_row_next_token = runner->sampleGreedyOnDevice();
+        ASSERT_GE(one_row_next_token, 0);
+        ASSERT_TRUE(runner->forward(&draft_token, 1));
+        const int32_t sequential_terminal_next_token =
+            runner->sampleGreedyOnDevice();
+        ASSERT_GE(sequential_terminal_next_token, 0);
+        ASSERT_TRUE(runner->forward(&sequential_terminal_next_token, 1));
+        const int32_t sequential_continuation_token =
+            runner->sampleGreedyOnDevice();
+        ASSERT_GE(sequential_continuation_token, 0);
+
+        EXPECT_EQ(post_sidecar_rows[0], restored_rows[0])
+            << "MTP sidecar execution must not contaminate main verifier row 0 state"
+            << "\ncondition token: " << condition_token
+            << "\nfirst token: " << first_token
+            << "\ndraft token: " << draft_token
+            << "\npost-sidecar rows: "
+            << post_sidecar_rows[0] << ',' << post_sidecar_rows[1]
+            << "\nrestored rows: "
+            << restored_rows[0] << ',' << restored_rows[1];
+        EXPECT_EQ(restored_rows[0], one_row_next_token)
+            << "All-position verifier row 0 must match a normal one-row decode "
+               "from the same post-condition checkpoint"
+            << "\ncondition token: " << condition_token
+            << "\nfirst token: " << first_token
+            << "\ndraft token: " << draft_token
+            << "\nrestored rows: "
+            << restored_rows[0] << ',' << restored_rows[1]
+            << "\none-row next token: " << one_row_next_token;
+        EXPECT_EQ(restored_rows[1], sequential_terminal_next_token)
+            << "All-position verifier row 1 must match sequential decode "
+               "after consuming the draft token"
+            << "\ncondition token: " << condition_token
+            << "\nfirst token: " << first_token
+            << "\ndraft token: " << draft_token
+            << "\nrestored rows: "
+            << restored_rows[0] << ',' << restored_rows[1]
+            << "\nsequential terminal next token: "
+            << sequential_terminal_next_token;
+        EXPECT_EQ(post_sidecar_continuation_token, sequential_continuation_token)
+            << "State left by a two-row verifier must match sequential decode "
+               "after consuming the verifier terminal token"
+            << "\ncondition token: " << condition_token
+            << "\nfirst token: " << first_token
+            << "\ndraft token: " << draft_token
+            << "\nterminal token: " << post_sidecar_rows[1]
+            << "\npost-sidecar continuation: "
+            << post_sidecar_continuation_token
+            << "\nsequential continuation: "
+            << sequential_continuation_token;
+        EXPECT_EQ(verifier_row1_restore_continuation_token, sequential_continuation_token)
+            << "Restoring verifier row 1 must match sequential decode after "
+               "consuming the verifier terminal token"
+            << "\ncondition token: " << condition_token
+            << "\nfirst token: " << first_token
+            << "\ndraft token: " << draft_token
+            << "\nterminal token: " << restored_rows[1]
+            << "\nrow1-restore continuation: "
+            << verifier_row1_restore_continuation_token
+            << "\nsequential continuation: "
+            << sequential_continuation_token;
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prompt_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM2VerifierLongPrefixMatchesSequential(
+        DensePrefixRestoreParityCase test_case)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " dense long-prefix M=2 verifier parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_METADATA",
+        };
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_benchmark_prompt_snapshots/metadata.txt";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "0"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        size_t first_token_index = expected_tokens.size();
+        for (size_t i = 1; i + 1 < expected_tokens.size(); ++i)
+        {
+            if (expected_tokens[i - 1] == 20271 &&
+                expected_tokens[i] == 92217 &&
+                expected_tokens[i + 1] == 48567)
+            {
+                first_token_index = i;
+            }
+        }
+        ASSERT_LT(first_token_index + 1, expected_tokens.size())
+            << "Benchmark metadata no longer contains the known long-prefix "
+               "M=2 verifier regression window";
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size() + first_token_index + 2),
+            test_case.max_seq_len);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 1;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        for (size_t i = 0; i < first_token_index; ++i)
+        {
+            const int32_t token = expected_tokens[i];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Failed to replay expected token at index " << i;
+        }
+
+        const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(prefix_checkpoint.valid);
+
+        const int32_t first_token = expected_tokens[first_token_index];
+        const int32_t expected_next = expected_tokens[first_token_index + 1];
+
+        ASSERT_TRUE(runner->forward(&first_token, 1));
+        const int32_t sequential_next = runner->sampleGreedyOnDevice();
+        ASSERT_GE(sequential_next, 0);
+        EXPECT_EQ(sequential_next, expected_next)
+            << "Sequential one-token decode no longer matches PyTorch at the "
+               "known M=2 verifier window";
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        int32_t sidecar_token = -1;
+        ASSERT_TRUE(runner->forwardMTPAndSampleGreedy(first_token, &sidecar_token));
+        ASSERT_TRUE(runner->flushPendingMTPWork());
+        ASSERT_EQ(sidecar_token, expected_next)
+            << "The MTP sidecar must draft the same token used by the "
+               "known long-prefix verifier window";
+
+        const int32_t verifier_inputs[2] = {first_token, sidecar_token};
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs, 2));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t verifier_rows[2] = {-1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            2,
+            verifier_rows));
+
+        EXPECT_EQ(verifier_rows[0], sequential_next)
+            << "M=2 all-position verifier row 0 must match one-token "
+               "sequential decode after a sidecar draft at a long Qwen3.6 GDN prefix"
+            << "\ncondition token: " << expected_tokens[first_token_index - 1]
+            << "\nfirst token: " << first_token
+            << "\nexpected next: " << expected_next
+            << "\nverifier rows: " << verifier_rows[0] << ','
+            << verifier_rows[1];
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM4VerifierLongPrefixMatchesSequential(
+        DensePrefixRestoreParityCase test_case)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " dense long-prefix M=4 verifier parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_METADATA",
+        };
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_benchmark_prompt_snapshots/metadata.txt";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "0"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        size_t first_token_index = expected_tokens.size();
+        for (size_t i = 1; i + 3 < expected_tokens.size(); ++i)
+        {
+            if (expected_tokens[i - 1] == 258 &&
+                expected_tokens[i] == 10608 &&
+                expected_tokens[i + 1] == 20271 &&
+                expected_tokens[i + 2] == 92217 &&
+                expected_tokens[i + 3] == 48567)
+            {
+                first_token_index = i;
+            }
+        }
+        ASSERT_LT(first_token_index + 3, expected_tokens.size())
+            << "Benchmark metadata no longer contains the known long-prefix "
+               "M=4 verifier regression window";
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size() + first_token_index + 4),
+            test_case.max_seq_len);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 3;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        for (size_t i = 0; i < first_token_index; ++i)
+        {
+            const int32_t token = expected_tokens[i];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Failed to replay expected token at index " << i;
+        }
+
+        const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(prefix_checkpoint.valid);
+
+        const int32_t verifier_inputs[4] = {
+            expected_tokens[first_token_index],
+            expected_tokens[first_token_index + 1],
+            expected_tokens[first_token_index + 2],
+            expected_tokens[first_token_index + 3],
+        };
+
+        int32_t sequential_next[3] = {-1, -1, -1};
+        for (int row = 0; row < 3; ++row)
+        {
+            ASSERT_TRUE(runner->forward(&verifier_inputs[row], 1))
+                << "Sequential forward failed at verifier row " << row;
+            sequential_next[row] = runner->sampleGreedyOnDevice();
+            ASSERT_GE(sequential_next[row], 0)
+                << "Sequential sample failed at verifier row " << row;
+            ASSERT_EQ(sequential_next[row], verifier_inputs[row + 1])
+                << "Sequential decode no longer matches PyTorch at verifier row "
+                << row;
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs, 4));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t verifier_rows[4] = {-1, -1, -1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            4,
+            verifier_rows));
+
+        for (int row = 0; row < 3; ++row)
+        {
+            EXPECT_EQ(verifier_rows[row], sequential_next[row])
+                << "M=4 all-position verifier row must match sequential decode"
+                << "\nrow: " << row
+                << "\ncondition token: " << expected_tokens[first_token_index - 1]
+                << "\nverifier inputs: "
+                << verifier_inputs[0] << ',' << verifier_inputs[1] << ','
+                << verifier_inputs[2] << ',' << verifier_inputs[3]
+                << "\nverifier rows: "
+                << verifier_rows[0] << ',' << verifier_rows[1] << ','
+                << verifier_rows[2] << ',' << verifier_rows[3]
+                << "\nsequential next: "
+                << sequential_next[0] << ',' << sequential_next[1] << ','
+                << sequential_next[2];
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM4VerifierAfterSidecarChainMatchesSequential(
+        DensePrefixRestoreParityCase test_case)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " dense long-prefix M=4 verifier after sidecar parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_METADATA",
+        };
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_benchmark_prompt_snapshots/metadata.txt";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "0"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        size_t first_token_index = expected_tokens.size();
+        for (size_t i = 1; i + 3 < expected_tokens.size(); ++i)
+        {
+            if (expected_tokens[i - 1] == 258 &&
+                expected_tokens[i] == 10608 &&
+                expected_tokens[i + 1] == 20271 &&
+                expected_tokens[i + 2] == 92217 &&
+                expected_tokens[i + 3] == 48567)
+            {
+                first_token_index = i;
+            }
+        }
+        ASSERT_LT(first_token_index + 3, expected_tokens.size())
+            << "Benchmark metadata no longer contains the known long-prefix "
+               "M=4 verifier regression window";
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size() + first_token_index + 4),
+            test_case.max_seq_len);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 3;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        for (size_t i = 0; i < first_token_index; ++i)
+        {
+            const int32_t token = expected_tokens[i];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Failed to replay expected token at index " << i;
+        }
+
+        const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(prefix_checkpoint.valid);
+        const int base_sidecar_position = runner->get_position();
+
+        auto run_sidecar_chain = [&]() -> std::vector<int32_t>
+        {
+            std::vector<int32_t> verifier_inputs;
+            verifier_inputs.reserve(4);
+            verifier_inputs.push_back(expected_tokens[first_token_index]);
+
+            int32_t sidecar_token = -1;
+            EXPECT_TRUE(runner->forwardMTPAndSampleGreedy(
+                verifier_inputs.back(),
+                &sidecar_token));
+            EXPECT_TRUE(runner->flushPendingMTPWork());
+            verifier_inputs.push_back(sidecar_token);
+
+            for (int draft_idx = 1; draft_idx < 3; ++draft_idx)
+            {
+                sidecar_token = -1;
+                EXPECT_TRUE(runner->forwardMTPFromLastDraftAndSampleGreedy(
+                    verifier_inputs.back(),
+                    base_sidecar_position + draft_idx,
+                    &sidecar_token));
+                EXPECT_TRUE(runner->flushPendingMTPWork());
+                verifier_inputs.push_back(sidecar_token);
+            }
+            return verifier_inputs;
+        };
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        const std::vector<int32_t> verifier_inputs = run_sidecar_chain();
+        ASSERT_EQ(verifier_inputs.size(), 4u);
+        for (int token : verifier_inputs)
+        {
+            ASSERT_GE(token, 0);
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        int32_t sequential_next[3] = {-1, -1, -1};
+        for (int row = 0; row < 3; ++row)
+        {
+            ASSERT_TRUE(runner->forward(&verifier_inputs[static_cast<size_t>(row)], 1))
+                << "Sequential forward failed at verifier row " << row;
+            sequential_next[row] = runner->sampleGreedyOnDevice();
+            ASSERT_GE(sequential_next[row], 0)
+                << "Sequential sample failed at verifier row " << row;
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        const std::vector<int32_t> verifier_inputs_rerun = run_sidecar_chain();
+        ASSERT_EQ(verifier_inputs_rerun, verifier_inputs)
+            << "Chained sidecar draft must be reproducible from a restored prefix checkpoint";
+
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs.data(), 4));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t verifier_rows[4] = {-1, -1, -1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            4,
+            verifier_rows));
+
+        for (int row = 0; row < 3; ++row)
+        {
+            EXPECT_EQ(verifier_rows[row], sequential_next[row])
+                << "M=4 all-position verifier row must match sequential decode "
+                   "after a chained MTP sidecar draft"
+                << "\nrow: " << row
+                << "\ncondition token: " << expected_tokens[first_token_index - 1]
+                << "\nverifier inputs: "
+                << verifier_inputs[0] << ',' << verifier_inputs[1] << ','
+                << verifier_inputs[2] << ',' << verifier_inputs[3]
+                << "\nverifier rows: "
+                << verifier_rows[0] << ',' << verifier_rows[1] << ','
+                << verifier_rows[2] << ',' << verifier_rows[3]
+                << "\nsequential next: "
+                << sequential_next[0] << ',' << sequential_next[1] << ','
+                << sequential_next[2];
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM4VerifierRow2RestoreLongPrefixMatchesSequential(
+        DensePrefixRestoreParityCase test_case)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " dense long-prefix M=4 verifier row-2 restore parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_METADATA",
+        };
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_benchmark_prompt_snapshots/metadata.txt";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "0"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        size_t first_token_index = expected_tokens.size();
+        for (size_t i = 1; i + 4 < expected_tokens.size(); ++i)
+        {
+            if (expected_tokens[i - 1] == 258 &&
+                expected_tokens[i] == 10608 &&
+                expected_tokens[i + 1] == 20271 &&
+                expected_tokens[i + 2] == 92217 &&
+                expected_tokens[i + 3] == 48567)
+            {
+                first_token_index = i;
+            }
+        }
+        ASSERT_LT(first_token_index + 4, expected_tokens.size())
+            << "Benchmark metadata no longer contains the known long-prefix "
+               "M=4 verifier row-2 restore regression window";
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size() + first_token_index + 5),
+            test_case.max_seq_len);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 3;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        for (size_t i = 0; i < first_token_index; ++i)
+        {
+            const int32_t token = expected_tokens[i];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Failed to replay expected token at index " << i;
+        }
+
+        const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(prefix_checkpoint.valid);
+
+        const int32_t verifier_inputs[4] = {
+            expected_tokens[first_token_index],
+            expected_tokens[first_token_index + 1],
+            expected_tokens[first_token_index + 2],
+            expected_tokens[first_token_index + 3],
+        };
+        const int32_t expected_after_terminal =
+            expected_tokens[first_token_index + 4];
+
+        ASSERT_TRUE(runner->forward(&verifier_inputs[0], 1));
+        ASSERT_TRUE(runner->forward(&verifier_inputs[1], 1));
+        ASSERT_TRUE(runner->forward(&verifier_inputs[2], 1));
+        ASSERT_TRUE(runner->forward(&verifier_inputs[3], 1));
+        const int32_t sequential_after_terminal = runner->sampleGreedyOnDevice();
+        ASSERT_EQ(sequential_after_terminal, expected_after_terminal);
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs, 4));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t verifier_rows[4] = {-1, -1, -1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            4,
+            verifier_rows));
+        ASSERT_EQ(verifier_rows[0], verifier_inputs[1]);
+        ASSERT_EQ(verifier_rows[1], verifier_inputs[2]);
+        ASSERT_EQ(verifier_rows[2], verifier_inputs[3]);
+
+        const int verifier_row2_target_cached_tokens =
+            prefix_checkpoint.cached_tokens + 3;
+        ASSERT_TRUE(runner->restoreMTPVerifierStateRow(
+            2,
+            verifier_row2_target_cached_tokens));
+        ASSERT_TRUE(runner->forward(&verifier_inputs[3], 1));
+        const int32_t row2_restore_after_terminal = runner->sampleGreedyOnDevice();
+        EXPECT_EQ(row2_restore_after_terminal, sequential_after_terminal)
+            << "Restoring verifier row 2 must match sequential decode after "
+               "consuming the verifier terminal token"
+            << "\ncondition token: " << expected_tokens[first_token_index - 1]
+            << "\nverifier inputs: "
+            << verifier_inputs[0] << ',' << verifier_inputs[1] << ','
+            << verifier_inputs[2] << ',' << verifier_inputs[3]
+            << "\nrow2-restore continuation: "
+            << row2_restore_after_terminal
+            << "\nsequential continuation: "
+            << sequential_after_terminal;
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM4VerifierRow3RestoreFeedsNextVerifierRows(
+        DensePrefixRestoreParityCase test_case)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " dense long-prefix M=4 verifier row-3 restore feeds next verifier parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 128;
+        test_case.max_seq_len = 768;
+        test_case.metadata_envs = {
+            "LLAMINAR_QWEN36_DENSE_BENCHMARK_PARITY_METADATA",
+        };
+        test_case.default_metadata_path =
+            "pytorch_qwen36_dense_benchmark_prompt_snapshots/metadata.txt";
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "0"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        std::string model_path;
+        std::vector<int32_t> prompt_tokens;
+        std::vector<int32_t> expected_tokens;
+        loadReferenceInputs(test_case, &model_path, &prompt_tokens, &expected_tokens);
+
+        size_t first_token_index = expected_tokens.size();
+        for (size_t i = 1; i + 7 < expected_tokens.size(); ++i)
+        {
+            if (expected_tokens[i - 1] == 13 &&
+                expected_tokens[i] == 220 &&
+                expected_tokens[i + 1] == 2972 &&
+                expected_tokens[i + 2] == 674 &&
+                expected_tokens[i + 3] == 258 &&
+                expected_tokens[i + 4] == 10608 &&
+                expected_tokens[i + 5] == 20271 &&
+                expected_tokens[i + 6] == 92217 &&
+                expected_tokens[i + 7] == 48567)
+            {
+                first_token_index = i;
+            }
+        }
+        ASSERT_LT(first_token_index + 7, expected_tokens.size())
+            << "Benchmark metadata no longer contains the accepted M=4 "
+               "verifier row-3 restore regression window";
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size() + first_token_index + 8),
+            test_case.max_seq_len);
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 3;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        for (size_t i = 0; i < first_token_index; ++i)
+        {
+            const int32_t token = expected_tokens[i];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Failed to replay expected token at index " << i;
+        }
+
+        const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(prefix_checkpoint.valid);
+        runner->enableSnapshotCapture();
+
+        const int32_t accepted_verifier_inputs[4] = {
+            expected_tokens[first_token_index],
+            expected_tokens[first_token_index + 1],
+            expected_tokens[first_token_index + 2],
+            expected_tokens[first_token_index + 3],
+        };
+        const int32_t next_verifier_inputs[4] = {
+            expected_tokens[first_token_index + 4],
+            expected_tokens[first_token_index + 5],
+            expected_tokens[first_token_index + 6],
+            expected_tokens[first_token_index + 7],
+        };
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->clearSnapshots();
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(accepted_verifier_inputs, 4));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        const auto all_position_stage_snapshots =
+            captureDenseStageSnapshots(*runner);
+        int32_t accepted_rows[4] = {-1, -1, -1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            4,
+            accepted_rows));
+        ASSERT_EQ(accepted_rows[0], accepted_verifier_inputs[1]);
+        ASSERT_EQ(accepted_rows[1], accepted_verifier_inputs[2]);
+        ASSERT_EQ(accepted_rows[2], accepted_verifier_inputs[3]);
+        ASSERT_EQ(accepted_rows[3], next_verifier_inputs[0]);
+        const PrefixStateSnapshot all_position_final_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(all_position_final_state.valid);
+
+        const int row3_target_cached_tokens =
+            prefix_checkpoint.cached_tokens + 4;
+        ASSERT_TRUE(runner->restoreMTPVerifierStateRow(
+            3,
+            row3_target_cached_tokens));
+        const PrefixStateSnapshot restored_row3_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(restored_row3_state.valid);
+
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(next_verifier_inputs, 4));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t restored_next_rows[4] = {-1, -1, -1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            4,
+            restored_next_rows));
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        std::vector<std::map<std::string, DenseStageSnapshot>> sequential_stage_snapshots;
+        sequential_stage_snapshots.reserve(4);
+        for (int row = 0; row < 4; ++row)
+        {
+            runner->clearSnapshots();
+            ASSERT_TRUE(runner->forward(&accepted_verifier_inputs[row], 1))
+                << "Sequential accepted-window replay failed at row " << row;
+            sequential_stage_snapshots.push_back(
+                captureDenseStageSnapshots(*runner));
+        }
+        const PrefixStateSnapshot sequential_row3_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(sequential_row3_state.valid);
+        bool any_stage_row_diverged = false;
+        for (int row = 0; row < 4; ++row)
+        {
+            const ::testing::AssertionResult stage_match =
+                denseM4FinalRowSnapshotsNear(
+                all_position_stage_snapshots,
+                sequential_stage_snapshots[static_cast<size_t>(row)],
+                "M=4 verifier row-" + std::to_string(row) + " stage snapshots",
+                row);
+            if (!stage_match)
+            {
+                any_stage_row_diverged = true;
+            }
+        }
+        EXPECT_TRUE(any_stage_row_diverged)
+            << "CUDA M=4 verifier rows unexpectedly matched sequential decode "
+               "stage snapshots; re-evaluate the verifier-row shortcut guard.";
+        EXPECT_FALSE(prefixSnapshotPayloadsNear(
+            all_position_final_state,
+            sequential_row3_state,
+            "M=4 verifier all-position final state"));
+        EXPECT_FALSE(prefixSnapshotPayloadsNear(
+            restored_row3_state,
+            sequential_row3_state,
+            "M=4 verifier row-3 restore state"));
+
+        int32_t sequential_next_rows[4] = {-1, -1, -1, -1};
+        for (int row = 0; row < 3; ++row)
+        {
+            ASSERT_TRUE(runner->forward(&next_verifier_inputs[row], 1))
+                << "Sequential next verifier replay failed at row " << row;
+            sequential_next_rows[row] = runner->sampleGreedyOnDevice();
+            ASSERT_GE(sequential_next_rows[row], 0);
+            ASSERT_EQ(sequential_next_rows[row], next_verifier_inputs[row + 1]);
+        }
+
+        // The immediate greedy token stream can still match despite the
+        // restored recurrent payload diverging. Keep this test focused on the
+        // state-level non-equivalence that makes CUDA verifier rows unsafe as
+        // shifted-cache commit inputs.
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseMTPEnabledForwardOnlyMatchesNoMTP(
+        DensePrefixRestoreParityCase test_case,
+        int decode_steps = 128)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " dense MTP-enabled forward-only parity";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = decode_steps;
+        test_case.max_seq_len = 768;
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        const std::string model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        auto tokenizer = createTokenizer(model_ctx);
+        ASSERT_NE(tokenizer, nullptr);
+        const std::vector<int> encoded_prompt =
+            tokenizer->encode(test_case.prompt, /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded_prompt.empty());
+        std::vector<int32_t> prompt_tokens(
+            encoded_prompt.begin(),
+            encoded_prompt.end());
+        ASSERT_LT(static_cast<int>(prompt_tokens.size()) + decode_steps, test_case.max_seq_len);
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+
+        auto make_config = [&](bool enable_mtp)
+        {
+            InferenceRunnerConfig config;
+            config.max_seq_len = test_case.max_seq_len;
+            config.batch_size = 1;
+            config.force_graph = true;
+            config.activation_precision = ActivationPrecision::FP32;
+            config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+            config.use_mapped_memory = false;
+            config.mtp.enabled = enable_mtp;
+            config.mtp.draft_tokens = 1;
+            return config;
+        };
+
+        auto run_forward_only = [&](bool enable_mtp,
+                                    const std::vector<int32_t> *teacher_tokens)
+            -> std::vector<int32_t>
+        {
+            std::vector<int32_t> generated;
+            auto runner_model_ctx = ModelContext::create(
+                model_path,
+                nullptr,
+                nullptr,
+                nullptr,
+                WeightDistributionStrategy::REPLICATED);
+            EXPECT_NE(runner_model_ctx, nullptr);
+            if (!runner_model_ctx)
+            {
+                return generated;
+            }
+            auto runner = createInferenceRunner(
+                runner_model_ctx,
+                nullptr,
+                device,
+                make_config(enable_mtp));
+            EXPECT_NE(runner, nullptr);
+            if (!runner)
+            {
+                return generated;
+            }
+            if (auto *device_runner =
+                    dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+            {
+                device_runner->setHostResidentReleaseEnabled(false);
+            }
+            runner->setSuppressTimeline(true);
+            runner->setSkipLogitsGatherPrefill(true);
+            runner->setSkipLogitsGatherDecode(true);
+
+            if (!runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())))
+            {
+                ADD_FAILURE() << "prefill failed with mtp=" << enable_mtp;
+                return generated;
+            }
+
+            int32_t driver = prompt_tokens.back();
+            for (int step = 0; step < decode_steps; ++step)
+            {
+                if (!runner->forward(&driver, 1))
+                {
+                    ADD_FAILURE() << "forward failed at step " << step
+                                  << " with mtp=" << enable_mtp;
+                    break;
+                }
+                const int32_t sampled = runner->sampleGreedyOnDevice();
+                if (sampled < 0)
+                {
+                    ADD_FAILURE() << "sampling failed at step " << step
+                                  << " with mtp=" << enable_mtp;
+                    break;
+                }
+                generated.push_back(sampled);
+                if (teacher_tokens && step < static_cast<int>(teacher_tokens->size()))
+                {
+                    driver = (*teacher_tokens)[static_cast<size_t>(step)];
+                }
+                else
+                {
+                    driver = sampled;
+                }
+            }
+
+            runner->setSkipLogitsGatherDecode(false);
+            runner->setSkipLogitsGatherPrefill(false);
+            return generated;
+        };
+
+        const std::vector<int32_t> baseline =
+            run_forward_only(/*enable_mtp=*/false, nullptr);
+        ASSERT_EQ(baseline.size(), static_cast<size_t>(decode_steps));
+        const std::vector<int32_t> mtp_enabled =
+            run_forward_only(/*enable_mtp=*/true, &baseline);
+        ASSERT_EQ(mtp_enabled.size(), baseline.size());
+        EXPECT_TRUE(tokenSequencesMatch(
+            mtp_enabled,
+            baseline,
+            "MTP-enabled forward-only"));
+    }
+
     inline void runDenseStochasticMTPVerifierParity(
         const DensePrefixRestoreParityCase &test_case)
     {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
         ASSERT_EQ(test_case.topology, DensePrefixParityTopology::SingleDevice)
             << "Phase 13.7 stochastic MTP verifier parity is currently single-device only";
 

@@ -340,12 +340,11 @@ namespace llaminar2
          *
          * Session clears reset KV/GDN/conv recurrence but intentionally preserve graph
          * objects so host-resident weights do not need to be reloaded. Captured GPU
-         * decode graphs are more stateful: they encode a specific replay lifecycle
-         * over the previous request. Dropping segment captures forces the next
-         * decode to warm up/capture again against the freshly cleared model state.
-         * Monolithic prefill graph entries are keyed by stable request shape and
-         * refresh token ids, positions, stage dynamic params, and prefill replay
-         * params before launch, so they can survive ordinary request clears.
+         * graphs are request-stateful: decode segment captures encode a specific
+         * replay lifecycle, and monolithic prefill captures encode recurrent/KV
+         * state mutation order from the previous request. Dropping executable
+         * captures forces the next request to warm up/capture against the freshly
+         * cleared model state while preserving the reusable ComputeGraph topology.
          *
          * The capture stream itself is retained because cached stages store that
          * stream pointer internally. Destroying it here would leave dynamic-param
@@ -393,6 +392,9 @@ namespace llaminar2
         void resetSessionState()
         {
             resetReplayState();
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll(PrefillGraphRejectReason::SessionReset);
+            last_prefill_graph_observation = {};
 
             if (graph)
             {

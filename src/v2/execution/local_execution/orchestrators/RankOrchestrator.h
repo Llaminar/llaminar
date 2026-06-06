@@ -437,6 +437,11 @@ namespace llaminar2
             int main_forward_token_count,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
         bool flushPendingMTPWork() override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;

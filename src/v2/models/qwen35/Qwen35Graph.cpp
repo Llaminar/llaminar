@@ -748,7 +748,7 @@ namespace llaminar2
             config_.mtp.enabled &&
             (device.is_cpu() || device.is_cuda() || device.is_rocm());
         const int verifier_state_capture_rows =
-            verifier_state_capture_supported ? std::max(0, config_.mtp.draft_tokens) : 0;
+            verifier_state_capture_supported ? std::max(0, config_.mtp.draft_tokens + 1) : 0;
 
         // =====================================================================
         // Stage 1: Pre-attention RMSNorm

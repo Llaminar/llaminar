@@ -61,19 +61,19 @@ Fresh checks:
 - `stage_gpu`, CUDA NativeVNNI route, and GPU workspace counters export through
   perf stats; CUDA/ROCm request scratch binds through `DeviceWorkspaceManager`.
 - CUDA dense prefill is generated-table driven for Qwen3.6 Q4_K-family `M=600`;
-  temporary selector overrides are gone and `M=595` bucket routing is covered.
-- CUDA concurrent fused prefill binds split-K/stream-K scratch per side-stream.
-- NativeVNNI trainers share one codebook map and bucket policy across CUDA/ROCm.
-  ROCm decode/prefill dispatch came from:
-  `benchmark_results/rocm_native_vnni/20260605T211640Z-decode-prefill-generated-pipeline`;
-  refresh sweeps use `LLAMINAR_ROCM_NVNNI_DISABLE_GENERATED=1` to avoid AUTO
-  learning the previous generated table.
-- ROCm Q4_K GDN-time decode cosine `0.999840` is a full native-VNNI-vs-FP32
-  benchmark artifact, not dispatch divergence. Exact packed-contract regression
-  passes with native cosine `1.0`; the asymmetric-format perf gate is `0.9998`.
-- Focused coverage green: codebook/generated-dispatch validators, ROCm trainer
-  generator/CSV validators, CUDA GEMM route/workspace regressions, CUDA graph
-  stochastic smoke, and CUDA dense prefix/MTP parity.
+  temporary selector overrides are gone, `M=595` bucket routing is covered, and
+  concurrent fused prefill binds split-K/stream-K scratch per side-stream.
+- CUDA MTP no longer uses verifier-row recurrent state as a decode shortcut:
+  the diagnostic now proves M=4 row state is not decode-equivalent, while depth
+  1/3 parity with strict commit-replay checking and prefix+MTP restore parity
+  pass. CUDA small-M KPAR scratch is required/max-sized for graph capture, and
+  quantized GEMM advertises fused projection support for GDN batching.
+- NativeVNNI trainers share one codebook map and bucket policy across CUDA/ROCm;
+  ROCm decode/prefill dispatch came from `20260605T211640Z-decode-prefill-generated-pipeline`.
+- ROCm Q4_K GDN-time decode cosine `0.999840` is a native-VNNI-vs-FP32
+  artifact, not dispatch divergence; packed-contract regression is cosine `1.0`.
+- Focused coverage green: generated-dispatch validators, CUDA/ROCm GEMM route
+  regressions, CUDA graph stochastic smoke, and CUDA dense prefix/MTP parity.
 
 ## Retained Actions
 

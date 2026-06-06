@@ -36,6 +36,7 @@
 #include "utils/Logger.h"
 #include "utils/CUDAKernelProfiler.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <cuda_runtime.h>
 
@@ -83,6 +84,15 @@ namespace llaminar2
                 int cuda_device_id,
                 void *stream = nullptr);
 
+            bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+                const float *d_A_fp32,       // [M x K]
+                int8_t *d_A_int8,            // [M x K] output
+                float *d_scales_A_blockwise, // [M x (K/32)] output
+                int32_t *d_sums_A_blockwise, // [M x (K/32)] output
+                int M, int K,
+                int cuda_device_id,
+                void *stream = nullptr);
+
             // Free device memory
             void cudaQuantGemm_freeDevice(void *d_ptr);
 
@@ -92,6 +102,16 @@ namespace llaminar2
                 const float *up,
                 int8_t *A_int8,
                 float *scales_A_blockwise,
+                int M, int K,
+                int device_idx,
+                void *stream);
+
+            bool cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+                const float *gate,
+                const float *up,
+                int8_t *A_int8,
+                float *scales_A_blockwise,
+                int32_t *sums_A_blockwise,
                 int M, int K,
                 int device_idx,
                 void *stream);
@@ -154,6 +174,7 @@ namespace llaminar2
                 const uint32_t *d_emins,
                 float *d_C_fp32,
                 const float *d_scales_A_block,
+                const int32_t *d_sums_A_block,
                 int M, int N, int K,
                 float alpha, float beta,
                 const float *d_C_existing,
@@ -455,6 +476,19 @@ namespace llaminar2
                 }
             }
 
+            bool nativeVNNIUsesAsymmetricCorrection(uint8_t cb)
+            {
+                switch (cb)
+                {
+                case 5:  // Q4_1 / Q4_K
+                case 7:  // Q5_1 / Q5_K
+                case 16: // IQ1_S
+                    return true;
+                default:
+                    return false;
+                }
+            }
+
             template <typename ImplT>
             bool canUseNativeVNNIBlockwise(const ImplT *impl, int m, int k)
             {
@@ -482,7 +516,8 @@ namespace llaminar2
                 const float *d_bias,
                 int cuda_device_id,
                 void *stream,
-                CUDARowMajorWeights **rm_slot = nullptr)
+                CUDARowMajorWeights **rm_slot = nullptr,
+                const int32_t *d_sums_A_blockwise = nullptr)
             {
                 if (!impl || m <= 0 || k <= 0 || (k % 32) != 0)
                 {
@@ -565,6 +600,7 @@ namespace llaminar2
                             impl->d_weights_native_emins,
                             d_C_fp32,
                             d_scales_A_blockwise,
+                            d_sums_A_blockwise,
                             m, n, k,
                             alpha, beta,
                             d_C_existing,
@@ -1032,16 +1068,44 @@ namespace llaminar2
                     "[CUDAQuantisedGemmKernel] Workspace missing required buffer: " +
                     std::string(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
             }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
+            {
+                throw std::runtime_error(
+                    "[CUDAQuantisedGemmKernel] Workspace missing required buffer: " +
+                    std::string(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE));
+            }
 
             LOG_TRACE("[CUDAQuantisedGemmKernel::validateWorkspace] Workspace validated"
                       << " A_int8=" << workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A)
                       << " scales_A=" << workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A)
                       << " scales_A_blockwise=" << workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)
+                      << " sums_A_blockwise=" << workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE)
                       << " C_int32=" << workspace_->getBuffer(GemmWorkspaceBuffers::ACC_INT32));
 
             if (!impl_->prefill_ctx)
             {
                 impl_->prefill_ctx = cudaPrefillContext_create(cuda_device_id_);
+            }
+            if (!impl_->gemv_ctx)
+            {
+                impl_->gemv_ctx = cudaGemvContext_create(cuda_device_id_);
+            }
+            if (impl_->gemv_ctx)
+            {
+                float *kpar_partials = nullptr;
+                size_t kpar_partials_bytes = 0;
+                if (workspace_->hasBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS))
+                {
+                    kpar_partials = static_cast<float *>(
+                        workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+                    kpar_partials_bytes =
+                        workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+                }
+
+                cudaGemvContext_bindWorkspace(
+                    impl_->gemv_ctx,
+                    kpar_partials,
+                    kpar_partials_bytes);
             }
             if (impl_->prefill_ctx)
             {
@@ -1477,7 +1541,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (m > 1 && m <= 2)
+            if (m > 1 && m <= 4)
             {
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
                           << m << " projections=" << projections.size());
@@ -1572,6 +1636,21 @@ namespace llaminar2
                     }
                 }
 
+                if (PerfStatsCollector::isEnabled())
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cuda_native_vnni_small_m_fused_projection_calls",
+                        1.0,
+                        "gemm",
+                        "cuda:" + std::to_string(cuda_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"m", std::to_string(m)},
+                            {"k", std::to_string(k)},
+                            {"projections", std::to_string(projections.size())},
+                            {"route", m == 2 ? "m2_or_rowwise" : "rowwise"}});
+                }
+
                 return true;
             }
 
@@ -1585,10 +1664,28 @@ namespace llaminar2
             // d_weights_native_vnni which is only populated after ensureWeightsConverted().
             ensureWeightsConverted();
 
+            bool needs_block_sums = (m > 1) && nativeVNNIUsesAsymmetricCorrection(impl_->native_codebook_id);
+            if (m > 1)
+            {
+                for (const auto &proj : projections)
+                {
+                    auto *cuda_kernel = dynamic_cast<CUDAQuantisedGemmKernel *>(proj.kernel);
+                    if (!cuda_kernel)
+                        continue;
+                    cuda_kernel->ensureWeightsConverted();
+                    if (cuda_kernel->impl_ &&
+                        nativeVNNIUsesAsymmetricCorrection(cuda_kernel->impl_->native_codebook_id))
+                    {
+                        needs_block_sums = true;
+                    }
+                }
+            }
+
             // Use blockwise quantization for prefill and for decode when a native
             // payload GEMV path is available.
             const bool use_blockwise = (k % 32 == 0) && (m > 1 || canUseNativeVNNIBlockwise(impl_.get(), m, k));
             float *d_scales_A_blockwise = nullptr;
+            int32_t *d_sums_A_blockwise = nullptr;
 
             if (!use_blockwise)
             {
@@ -1599,11 +1696,20 @@ namespace llaminar2
 
             {
                 d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+                d_sums_A_blockwise = needs_block_sums
+                                         ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
+                                         : nullptr;
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise quantizing activations once, m=" << m << " k=" << k);
 
                 // Blockwise quantize activations ONCE (shared across all projections)
-                if (!cudaQuantGemm_quantizeActivationsBlockwise(
-                        d_input, d_A_int8, d_scales_A_blockwise, m, k, cuda_device_id_, gpu_stream_))
+                const bool quantized = d_sums_A_blockwise
+                                           ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+                                                 d_input, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
+                                                 m, k, cuda_device_id_, gpu_stream_)
+                                           : cudaQuantGemm_quantizeActivationsBlockwise(
+                                                 d_input, d_A_int8, d_scales_A_blockwise,
+                                                 m, k, cuda_device_id_, gpu_stream_);
+                if (!quantized)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Blockwise activation quantization failed");
                     return false;
@@ -1810,7 +1916,11 @@ namespace llaminar2
                         cuda_kernel->impl_.get(),
                         d_A_int8, proj_d_C_int32, d_output, d_scales_A_blockwise,
                         m, n, k, 1.0f, 0.0f, nullptr, d_bias,
-                        cuda_device_id_, pool.streams[stream_idx]);
+                        cuda_device_id_, pool.streams[stream_idx],
+                        nullptr,
+                        nativeVNNIUsesAsymmetricCorrection(cuda_kernel->impl_->native_codebook_id)
+                            ? d_sums_A_blockwise
+                            : nullptr);
 
                     if (!proj_ok)
                     {
@@ -2013,7 +2123,11 @@ namespace llaminar2
                         1.0f, 0.0f,
                         nullptr,
                         d_bias,
-                        cuda_device_id_, gpu_stream_);
+                        cuda_device_id_, gpu_stream_,
+                        nullptr,
+                        nativeVNNIUsesAsymmetricCorrection(cuda_kernel->impl_->native_codebook_id)
+                            ? d_sums_A_blockwise
+                            : nullptr);
 
                     if (trace_fused)
                     {
@@ -2132,11 +2246,20 @@ namespace llaminar2
             {
                 float *d_scales_A_blockwise = static_cast<float *>(
                     workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+                int32_t *d_sums_A_blockwise =
+                    (m > 1 && nativeVNNIUsesAsymmetricCorrection(impl_->native_codebook_id))
+                        ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
+                        : nullptr;
 
                 // Fused SwiGLU + blockwise quantization: replaces separate SwiGLU + quant kernels
-                if (!cudaOps_fused_swiglu_quantize_blockwise(
-                        d_gate, d_up, d_A_int8, d_scales_A_blockwise,
-                        m, k, cuda_device_id_, gpu_stream_))
+                const bool quantized = d_sums_A_blockwise
+                                           ? cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
+                                                 m, k, cuda_device_id_, gpu_stream_)
+                                           : cudaOps_fused_swiglu_quantize_blockwise(
+                                                 d_gate, d_up, d_A_int8, d_scales_A_blockwise,
+                                                 m, k, cuda_device_id_, gpu_stream_);
+                if (!quantized)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] Fused SwiGLU+quantize failed");
                     return false;
@@ -2150,7 +2273,8 @@ namespace llaminar2
                         d_A_int8, nullptr, d_C, d_scales_A_blockwise,
                         m, n, k, alpha, beta, d_C_existing, nullptr,
                         cuda_device_id_, gpu_stream_,
-                        packed_ ? &packed_->rowmajor_ : nullptr))
+                        packed_ ? &packed_->rowmajor_ : nullptr,
+                        d_sums_A_blockwise))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_with_fused_swiglu] Complete (native GEMV)");
 
@@ -2199,8 +2323,21 @@ namespace llaminar2
             const TensorBase *gate, const TensorBase *up,
             TensorBase *output,
             int m, int n, int k,
-            float alpha, float beta)
+            float alpha,
+            float beta,
+            DeviceWorkspaceManager *workspace)
         {
+            DeviceWorkspaceManager *effective_ws = workspace ? workspace : workspace_;
+            if (effective_ws != workspace_)
+            {
+                DeviceWorkspaceManager *saved_ws = workspace_;
+                workspace_ = effective_ws;
+                const bool result = multiply_tensor_with_fused_swiglu(
+                    gate, up, output, m, n, k, alpha, beta, nullptr);
+                workspace_ = saved_ws;
+                return result;
+            }
+
             // Get device pointers (tensors must already be on GPU via DeviceGraphExecutor coherence)
             const float *d_gate = static_cast<const float *>(gate->gpu_data_ptr());
             const float *d_up = static_cast<const float *>(up->gpu_data_ptr());
@@ -2228,7 +2365,7 @@ namespace llaminar2
                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] Null input or output");
                 return false;
             }
-            if (m <= 1 || m > 2 || n <= 0 || k <= 0)
+            if (m <= 1 || m > 4 || n <= 0 || k <= 0)
             {
                 return false;
             }
@@ -2263,6 +2400,40 @@ namespace llaminar2
             }
 
             const int blocks_per_row = k / 32;
+            auto record_small_m_route = [&](const char *route)
+            {
+                if (!PerfStatsCollector::isEnabled())
+                    return;
+
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cuda_native_vnni_small_m_calls",
+                    1.0,
+                    "gemm",
+                    "cuda:" + std::to_string(cuda_device_id_),
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"codebook", std::to_string(static_cast<int>(impl_->native_codebook_id))},
+                        {"n", std::to_string(n)},
+                        {"k", std::to_string(k)},
+                        {"route", route}});
+
+                if (m == 2)
+                {
+                    PerfStatsCollector::addCounter(
+                        "kernel",
+                        "cuda_native_vnni_m2_calls",
+                        1.0,
+                        "gemm",
+                        "cuda:" + std::to_string(cuda_device_id_),
+                        PerfStatsCollector::Tags{
+                            {"codebook", std::to_string(static_cast<int>(impl_->native_codebook_id))},
+                            {"n", std::to_string(n)},
+                            {"k", std::to_string(k)},
+                            {"route", route}});
+                }
+            };
+
             for (int row = 0; row < m; ++row)
             {
                 const int8_t *row_A = d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(k);
@@ -2293,6 +2464,8 @@ namespace llaminar2
                     return false;
                 }
             }
+
+            record_small_m_route("rowwise");
 
             return true;
         }
@@ -2355,7 +2528,7 @@ namespace llaminar2
                 LOG_WARN("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM failed, falling back");
             }
 
-            if (m > 1 && m <= 2 &&
+            if (m > 1 && m <= 4 &&
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, nullptr, m, n, k, alpha, beta))
             {
@@ -2372,10 +2545,20 @@ namespace llaminar2
             if (use_blockwise)
             {
                 float *d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+                int32_t *d_sums_A_blockwise =
+                    (m > 1 && nativeVNNIUsesAsymmetricCorrection(impl_->native_codebook_id))
+                        ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
+                        : nullptr;
 
                 // Step 1: Blockwise quantize activations
-                if (!cudaQuantGemm_quantizeActivationsBlockwise(
-                        d_A, d_A_int8, d_scales_A_blockwise, m, k, cuda_device_id_, gpu_stream_))
+                const bool quantized = d_sums_A_blockwise
+                                           ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+                                                 d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
+                                                 m, k, cuda_device_id_, gpu_stream_)
+                                           : cudaQuantGemm_quantizeActivationsBlockwise(
+                                                 d_A, d_A_int8, d_scales_A_blockwise,
+                                                 m, k, cuda_device_id_, gpu_stream_);
+                if (!quantized)
                 {
                     LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise activation quantization failed");
                     return false;
@@ -2393,7 +2576,8 @@ namespace llaminar2
                         d_C_existing,
                         nullptr,
                         cuda_device_id_, gpu_stream_,
-                        packed_ ? &packed_->rowmajor_ : nullptr))
+                        packed_ ? &packed_->rowmajor_ : nullptr,
+                        d_sums_A_blockwise))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (native payload GEMV)");
                     return true;
@@ -2425,7 +2609,7 @@ namespace llaminar2
             // Ensure weights converted
             ensureWeightsConverted();
 
-            if (m > 1 && m <= 2 &&
+            if (m > 1 && m <= 4 &&
                 multiply_fp32_to_fp32_small_m_gemv(
                     d_A, d_C, d_bias, m, n, k, alpha, beta))
             {
@@ -2440,12 +2624,22 @@ namespace llaminar2
             if (use_blockwise)
             {
                 float *d_scales_A_blockwise = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+                int32_t *d_sums_A_blockwise =
+                    (m > 1 && nativeVNNIUsesAsymmetricCorrection(impl_->native_codebook_id))
+                        ? static_cast<int32_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))
+                        : nullptr;
 
                 // Step 1: Blockwise quantize activations
                 {
                     CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::QUANTIZE_ACTIVATIONS);
-                    if (!cudaQuantGemm_quantizeActivationsBlockwise(
-                            d_A, d_A_int8, d_scales_A_blockwise, m, k, cuda_device_id_, gpu_stream_))
+                    const bool quantized = d_sums_A_blockwise
+                                               ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+                                                     d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,
+                                                     m, k, cuda_device_id_, gpu_stream_)
+                                               : cudaQuantGemm_quantizeActivationsBlockwise(
+                                                     d_A, d_A_int8, d_scales_A_blockwise,
+                                                     m, k, cuda_device_id_, gpu_stream_);
+                    if (!quantized)
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel] Blockwise activation quantization failed");
                         return false;
@@ -2464,7 +2658,8 @@ namespace llaminar2
                         d_C_existing,
                         d_bias,
                         cuda_device_id_, gpu_stream_,
-                        packed_ ? &packed_->rowmajor_ : nullptr))
+                        packed_ ? &packed_->rowmajor_ : nullptr,
+                        d_sums_A_blockwise))
                 {
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (native payload GEMV)");
                     return true;
@@ -2596,7 +2791,9 @@ namespace llaminar2
             // Blockwise activation quantization scales: one float per 32-element block
             size_t num_blocks_per_row = static_cast<size_t>((k + 31) / 32);
             size_t scales_a_blockwise_bytes = static_cast<size_t>(workspace_m) * num_blocks_per_row * sizeof(float);
+            size_t sums_a_blockwise_bytes = static_cast<size_t>(workspace_m) * num_blocks_per_row * sizeof(int32_t);
             reqs.buffers.push_back({GemmWorkspaceBuffers::SCALES_A_BLOCKWISE, scales_a_blockwise_bytes, 256, true});
+            reqs.buffers.push_back({GemmWorkspaceBuffers::SUMS_A_BLOCKWISE, sums_a_blockwise_bytes, 256, true});
 
             // FP32 output workspace for mapped memory redirect
             // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
@@ -2673,14 +2870,19 @@ namespace llaminar2
                 }
             }
 
-            // GEMV kpar partials for decode (M=1): two-phase K-parallel reduction
-            // Size: kpar_factor × N floats. kpar_factor ≈ ceil(K/tile_k) capped by SM count.
-            // Use conservative estimate: min(ceil(K/128), 84) × N × sizeof(float)
+            // GEMV KPAR partials for verifier/decode reductions.
+            //
+            // The generated decode dispatcher is free to retune split-K/KPAR
+            // regimes for small-M verifier shapes. Declare the full k-group
+            // bound so graph-captured decode never discovers undersized scratch
+            // after capture. This is intentionally conservative: the workspace
+            // planner can reuse the buffer across stages, but the kernel must
+            // never fall back to an allocation or a smaller optional buffer.
             if (m <= 4)
             {
-                int kpar_factor = std::min((k + 127) / 128, 84); // 84 SMs is RTX 3090
-                size_t kpar_bytes = static_cast<size_t>(kpar_factor) * n * sizeof(float);
-                reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, false});
+                const int k_groups = (k + 31) / 32;
+                size_t kpar_bytes = static_cast<size_t>(k_groups) * n * sizeof(float);
+                reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, true});
             }
 
             LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] INT8 path: "

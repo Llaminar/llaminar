@@ -149,6 +149,49 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       SumsABlockwiseSize_MatchesPaddedPrefillRows)
+{
+    auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/14);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+
+    constexpr int kM = 17;
+    constexpr int kN = 64;
+    constexpr int kK = 256;
+    auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+
+    const WorkspaceDescriptor *sums_a =
+        reqs.find(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE);
+    ASSERT_NE(sums_a, nullptr)
+        << "Asymmetric NativeVNNI prefill consumes precomputed activation block sums "
+           "from declared workspace, not ad hoc scratch.";
+
+    constexpr int kBlocksPerRow = kK / 32;
+    EXPECT_EQ(sums_a->size_bytes,
+              static_cast<size_t>(paddedPrefillM(kM)) * kBlocksPerRow * sizeof(int32_t));
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       GemvKparPartialsWorkspace_CoversQwen36LmHeadDeterministicDecode)
+{
+    auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/15);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+
+    constexpr int kM = 1;
+    constexpr int kN = 248320;
+    constexpr int kK = 5120;
+    auto reqs = kernel.getWorkspaceRequirements(kM, kN, kK);
+
+    const WorkspaceDescriptor *partials =
+        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    ASSERT_NE(partials, nullptr)
+        << "CUDA deterministic parity routes KPAR GEMV through workspace-owned "
+           "two-phase partials; LM head must not rely on hidden allocations.";
+
+    EXPECT_GE(partials->size_bytes,
+              static_cast<size_t>(kN) * sizeof(float));
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        NativeVNNIPrefillSplitKWorkspace_DeclaredForQwenLikeQ4KShape)
 {
     auto weights = TestTensorFactory::createQ4_KRandom({64, 256}, /*seed=*/10);

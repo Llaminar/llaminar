@@ -698,6 +698,7 @@ namespace
         const uint32_t *__restrict__ emins_B,
         float *__restrict__ C,
         const float *__restrict__ scales_A,
+        const int32_t *__restrict__ sums_A,
         const float *__restrict__ C_existing,
         const float *__restrict__ bias,
         int M,
@@ -1264,17 +1265,29 @@ namespace
 
                     if constexpr (IS_ASYMMETRIC)
                     {
-                        const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
-                        const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                        int32_t s0 = 0, s1 = 0;
-#pragma unroll
-                        for (int w = 0; w < 8; ++w)
+                        const int grow0 = block_m + a_row_base + gid;
+                        const int grow1 = grow0 + 8;
+                        if (sums_A)
                         {
-                            s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
-                            s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
+                            sum_A_row0_all[wi] = static_cast<float>(
+                                sums_A[static_cast<size_t>(grow0) * num_q40_blocks + kb]);
+                            sum_A_row1_all[wi] = static_cast<float>(
+                                sums_A[static_cast<size_t>(grow1) * num_q40_blocks + kb]);
                         }
-                        sum_A_row0_all[wi] = static_cast<float>(s0);
-                        sum_A_row1_all[wi] = static_cast<float>(s1);
+                        else
+                        {
+                            const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
+                            const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
+                            int32_t s0 = 0, s1 = 0;
+#pragma unroll
+                            for (int w = 0; w < 8; ++w)
+                            {
+                                s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
+                                s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
+                            }
+                            sum_A_row0_all[wi] = static_cast<float>(s0);
+                            sum_A_row1_all[wi] = static_cast<float>(s1);
+                        }
                     }
 
                     if constexpr (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
@@ -1469,7 +1482,16 @@ namespace
                     [[maybe_unused]] float sum_A_row0 = 0.0f, sum_A_row1 = 0.0f;
                     if constexpr (IS_ASYMMETRIC)
                     {
-                        if (grow0 < M)
+                        if (sums_A)
+                        {
+                            if (grow0 < M)
+                                sum_A_row0 = static_cast<float>(
+                                    sums_A[static_cast<size_t>(grow0) * num_q40_blocks + kb]);
+                            if (grow1 < M)
+                                sum_A_row1 = static_cast<float>(
+                                    sums_A[static_cast<size_t>(grow1) * num_q40_blocks + kb]);
+                        }
+                        else if (grow0 < M)
                         {
                             const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
                             int32_t s0 = 0;
@@ -1477,8 +1499,17 @@ namespace
                             for (int w = 0; w < 8; ++w)
                                 s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
                             sum_A_row0 = static_cast<float>(s0);
+                            if (grow1 < M)
+                            {
+                                const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
+                                int32_t s1 = 0;
+#pragma unroll
+                                for (int w = 0; w < 8; ++w)
+                                    s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
+                                sum_A_row1 = static_cast<float>(s1);
+                            }
                         }
-                        if (grow1 < M)
+                        else if (grow1 < M)
                         {
                             const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
                             int32_t s1 = 0;
@@ -2790,6 +2821,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M,
         int N,
         int K,
@@ -2832,6 +2864,7 @@ namespace
             d_emins,
             d_kernel_C,
             d_scales_A_block,
+            d_sums_A_block,
             d_C_existing,
             d_bias,
             M,
@@ -2868,6 +2901,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M,
         int N,
         int K,
@@ -2910,6 +2944,7 @@ namespace
             d_emins,
             d_kernel_C,
             d_scales_A_block,
+            d_sums_A_block,
             d_C_existing,
             d_bias,
             M,
@@ -2974,6 +3009,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M,
         int N,
         int K,
@@ -3024,6 +3060,7 @@ namespace
             d_emins,
             d_C_fp32,
             d_scales_A_block,
+            d_sums_A_block,
             nullptr, // d_C_existing: not supported with stream-K
             nullptr, // d_bias: applied post-hoc below
             M, N, K,
@@ -3109,6 +3146,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M,
         int N,
         int K,
@@ -3160,6 +3198,7 @@ namespace
             d_emins,
             d_C_fp32,
             d_scales_A_block,
+            d_sums_A_block,
             d_C_existing,
             d_bias,
             M, N, K,
@@ -3487,6 +3526,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing,
@@ -3600,7 +3640,7 @@ namespace
                 recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 2);      \
                 return launchNativeVNNITC_BK64_StreamK_TwoPass<CB, BM_, BN_, WM_, WN_>( \
                     d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
-                    d_C_fp32, d_scales_A_block,                                         \
+                    d_C_fp32, d_scales_A_block, d_sums_A_block,                         \
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
                     prefill_ctx);                                                       \
             }                                                                           \
@@ -3609,7 +3649,7 @@ namespace
                 recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 1);      \
                 return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>(         \
                     d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
-                    d_C_fp32, d_scales_A_block,                                         \
+                    d_C_fp32, d_scales_A_block, d_sums_A_block,                         \
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
                     prefill_ctx);                                                       \
             }                                                                           \
@@ -3620,25 +3660,25 @@ namespace
             recordLastLaunchSelection(static_cast<int>(tc.tile), 8, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
                 cuda_stream, prefill_ctx);                                              \
         case 4:                                                                         \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 4, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
                 cuda_stream, prefill_ctx);                                              \
         case 2:                                                                         \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 2, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
                 cuda_stream, prefill_ctx);                                              \
         default:                                                                        \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
                 cuda_stream, prefill_ctx);                                              \
         }                                                                               \
     } while (0)
@@ -3901,6 +3941,7 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     const uint32_t *d_emins,
     float *d_C_fp32,
     const float *d_scales_A_block,
+    const int32_t *d_sums_A_block,
     int M,
     int N,
     int K,
@@ -3933,32 +3974,32 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     case 0:
         ok = launchGenericPrefillBK64<0>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 4:
         ok = launchGenericPrefillBK64<4>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 6: // Q5_0
         ok = launchGenericPrefillBK64<6>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 11: // IQ3_S
         ok = launchGenericPrefillBK64<11>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 12: // IQ3_XXS
         ok = launchGenericPrefillBK64<12>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 15: // IQ2_XXS
         ok = launchGenericPrefillBK64<15>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
 
     // --- Asymmetric formats (need min correction, d_mins required) ---
@@ -3967,21 +4008,21 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             return false;
         ok = launchGenericPrefillBK64<5>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 7: // Q5_1 / Q5_K
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<7>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 16: // IQ1_S
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<16>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
 
     // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
@@ -3990,49 +4031,49 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
             return false;
         ok = launchGenericPrefillBK64<8>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 9: // Q3_K
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<9>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 10: // Q2_K (dual-scale + asymmetric via emins)
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<10>(
             d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 13: // IQ2_S
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<13>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 14: // IQ2_XS
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<14>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
     case 17: // IQ1_M (dual-scale + delta correction)
         if (!d_mins)
             return false;
         ok = launchGenericPrefillBK64<17>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
 
     // --- 8-bit format (no decode overhead, single-scale) ---
     case 19: // Q8_0
         ok = launchGenericPrefillBK64<19>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
         break;
 
     default:
@@ -4061,7 +4102,8 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
                 {"tile_id", std::to_string(tile_id)},
                 {"split_k", std::to_string(split_k)},
                 {"bk256", used_bk256 ? "1" : "0"},
-                {"streamk", std::to_string(used_streamk)}});
+                {"streamk", std::to_string(used_streamk)},
+                {"sums_a", d_sums_A_block ? "1" : "0"}});
     }
     return ok;
 }
@@ -4113,19 +4155,19 @@ namespace
         case 8:
             return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 8>(
                 A, payload, scales, nullptr, nullptr, C, scales_A,
-                M, N, K, alpha, beta, C_existing, bias, stream);
+                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
         case 4:
             return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 4>(
                 A, payload, scales, nullptr, nullptr, C, scales_A,
-                M, N, K, alpha, beta, C_existing, bias, stream);
+                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
         case 2:
             return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 2>(
                 A, payload, scales, nullptr, nullptr, C, scales_A,
-                M, N, K, alpha, beta, C_existing, bias, stream);
+                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
         default:
             return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 1>(
                 A, payload, scales, nullptr, nullptr, C, scales_A,
-                M, N, K, alpha, beta, C_existing, bias, stream);
+                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
         }
     }
 
@@ -4236,29 +4278,29 @@ extern "C"
         switch (config_idx)
         {
         case 0:
-            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 1:
-            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 2:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 3:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 4:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 5:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 6:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 7:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 4, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 4, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 8:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 9:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 10:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 11:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         default:
             return false;
         }

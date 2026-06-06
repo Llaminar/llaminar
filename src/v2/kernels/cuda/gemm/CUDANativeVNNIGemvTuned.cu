@@ -1410,16 +1410,14 @@ namespace
         const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
-        const int kb_capped = (max_kb > 0) ? std::min(kb, max_kb) : kb;
+        const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
+        const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
         // Choose two-phase vs atomic based on partials buffer size.
         // Deterministic mode always uses two-phase to avoid atomicAdd non-determinism.
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * N * sizeof(float);
-        static const bool s_deterministic = []()
-        {
-            return llaminar2::debugEnv().gemm.deterministic;
-        }();
-        const bool use_two_phase = s_deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
+        const bool use_two_phase = deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
 
         dim3 grid(grid_n, kb_capped);
 
@@ -1489,14 +1487,12 @@ namespace
         const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
-        const int kb_capped = (max_kb > 0) ? std::min(kb, max_kb) : kb;
+        const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
+        const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * 2 * N * sizeof(float);
-        static const bool s_deterministic = []()
-        {
-            return llaminar2::debugEnv().gemm.deterministic;
-        }();
-        const bool use_two_phase = s_deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
+        const bool use_two_phase = deterministic || (partials_bytes <= kTwoPhaseMaxBytes);
 
         dim3 grid(grid_n, kb_capped);
 
@@ -2141,11 +2137,15 @@ namespace
         const int num_sms = querySmCount(gemv_ctx);
         const int kb = selectKSplit(grid_n, k_groups, num_sms,
                                     target_waves, min_kgroups_per_cta);
-        const int kb_capped = (max_kb > 0) ? std::min(kb, max_kb) : kb;
+        const bool deterministic = llaminar2::debugEnv().gemm.deterministic;
+        const int kb_capped_auto = (max_kb > 0) ? std::min(kb, max_kb) : kb;
+        const int kb_capped = deterministic ? 1 : kb_capped_auto;
 
         const size_t partials_bytes = static_cast<size_t>(kb_capped) * N * sizeof(float);
         bool use_two_phase;
-        if (force_two_phase == 1)
+        if (deterministic)
+            use_two_phase = true;
+        else if (force_two_phase == 1)
             use_two_phase = true;
         else if (force_two_phase == 2)
             use_two_phase = false;

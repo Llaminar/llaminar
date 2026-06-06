@@ -39,6 +39,7 @@ __global__ void fused_swiglu_quantize_blockwise_kernel(
     const float *__restrict__ up,           // [M × K]
     int8_t *__restrict__ A_int8,            // [M × K] output
     float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
+    int32_t *__restrict__ sums_A_blockwise, // [M × num_blocks] optional quantized sums
     int M, int K)
 {
     const int row = blockIdx.y;
@@ -85,10 +86,22 @@ __global__ void fused_swiglu_quantize_blockwise_kernel(
         if (lane == 0)
             row_scales[b] = scale;
 
-        // Quantize and coalesced write
+        // Quantize, coalesced write, and optionally record the quantized
+        // block sum for asymmetric NativeVNNI min correction.
         float qval = val * inv_scale;
-        row_int8[k_start + lane] = static_cast<int8_t>(
+        const int32_t q = static_cast<int32_t>(
             rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+        row_int8[k_start + lane] = static_cast<int8_t>(q);
+
+        if (sums_A_blockwise)
+        {
+            int32_t sum_q = q;
+#pragma unroll
+            for (int mask = 16; mask > 0; mask >>= 1)
+                sum_q += __shfl_xor_sync(0xFFFFFFFF, sum_q, mask);
+            if (lane == 0)
+                sums_A_blockwise[row * num_blocks + b] = sum_q;
+        }
     }
 }
 
@@ -337,11 +350,36 @@ extern "C"
     // Fused SwiGLU + Blockwise Quantization
     // =====================================================================
 
+    bool cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+        const float *gate,
+        const float *up,
+        int8_t *A_int8,
+        float *scales_A_blockwise,
+        int32_t *sums_A_blockwise,
+        int M, int K,
+        int device_idx,
+        void *stream);
+
     bool cudaOps_fused_swiglu_quantize_blockwise(
         const float *gate,
         const float *up,
         int8_t *A_int8,
         float *scales_A_blockwise,
+        int M, int K,
+        int device_idx,
+        void *stream)
+    {
+        return cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+            gate, up, A_int8, scales_A_blockwise, nullptr,
+            M, K, device_idx, stream);
+    }
+
+    bool cudaOps_fused_swiglu_quantize_blockwise_with_sums(
+        const float *gate,
+        const float *up,
+        int8_t *A_int8,
+        float *scales_A_blockwise,
+        int32_t *sums_A_blockwise,
         int M, int K,
         int device_idx,
         void *stream)
@@ -362,7 +400,7 @@ extern "C"
         dim3 block(BLOCK_SIZE);
 
         fused_swiglu_quantize_blockwise_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
-            gate, up, A_int8, scales_A_blockwise, M, K);
+            gate, up, A_int8, scales_A_blockwise, sums_A_blockwise, M, K);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
