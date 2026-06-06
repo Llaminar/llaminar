@@ -1433,13 +1433,13 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesGraphNativeRowwiseRoute)
         });
 
     ASSERT_NE(route_record, records.end())
-        << "Q4_K M=2 verifier GEMM must use the graph-native rowwise native route";
+        << "Q4_K M=2 verifier GEMM must use the graph-native two-row native route";
     EXPECT_GE(route_record->value, 1.0);
     EXPECT_EQ(route_record->device, "cuda:" + std::to_string(gpu_device_.ordinal));
     EXPECT_EQ(route_record->tags.at("codebook"), "5");
     EXPECT_EQ(route_record->tags.at("n"), std::to_string(N));
     EXPECT_EQ(route_record->tags.at("k"), std::to_string(K));
-    EXPECT_EQ(route_record->tags.at("route"), "rowwise");
+    EXPECT_EQ(route_record->tags.at("route"), "m2");
 
     PerfStatsCollector::reset();
     cleanupWorkspaceIfNeeded(cuda_kernel);

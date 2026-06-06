@@ -163,6 +163,24 @@ namespace llaminar2
                 CUDAGemvContext *gemv_ctx,
                 CUDARowMajorWeights **rm_slot);
 
+            bool cudaNativeVNNIGemvTuned_m2_fp32(
+                const int8_t *d_A_int8,
+                const uint8_t *d_payload,
+                const uint16_t *d_scales,
+                const uint16_t *d_mins,
+                const uint32_t *d_emins,
+                float *d_C_fp32,
+                const float *d_scales_A_block,
+                int N, int K,
+                float alpha, float beta,
+                const float *d_C_existing,
+                const float *d_bias,
+                uint8_t codebook_id,
+                int cuda_device_id,
+                void *stream,
+                CUDAGemvContext *gemv_ctx,
+                CUDARowMajorWeights **rm_slot);
+
             bool cudaNativeVNNIInitIQGridTables_tuned();
 
             // Unified prefill dispatch for all formats
@@ -1660,7 +1678,7 @@ namespace llaminar2
                             {"m", std::to_string(m)},
                             {"k", std::to_string(k)},
                             {"projections", std::to_string(projections.size())},
-                            {"route", m == 2 ? "m2_or_rowwise" : "rowwise"}});
+                            {"route", m == 2 ? "m2" : "rowwise"}});
                 }
 
                 return true;
@@ -2455,6 +2473,47 @@ namespace llaminar2
                             {"route", route}});
                 }
             };
+
+            if (m == 2)
+            {
+                if (!impl_->gemv_ctx)
+                    impl_->gemv_ctx = cudaGemvContext_create(cuda_device_id_);
+
+                const bool ok = cudaNativeVNNIGemvTuned_m2_fp32(
+                    d_A_int8,
+                    impl_->d_weights_native_vnni,
+                    impl_->d_weights_native_scales,
+                    impl_->d_weights_native_mins,
+                    impl_->d_weights_native_emins,
+                    d_C,
+                    d_scales_A_blockwise,
+                    n,
+                    k,
+                    alpha,
+                    beta,
+                    beta != 0.0f ? d_C : nullptr,
+                    d_bias,
+                    impl_->native_codebook_id,
+                    cuda_device_id_,
+                    gpu_stream_,
+                    impl_->gemv_ctx,
+                    packed_ ? &packed_->rowmajor_ : nullptr);
+                if (!ok)
+                {
+                    cudaError_t le = cudaPeekAtLastError();
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_small_m_gemv] NativeVNNI M=2 GEMV failed"
+                              << " codebook=" << static_cast<int>(impl_->native_codebook_id)
+                              << " N=" << n << " K=" << k
+                              << " stream=" << gpu_stream_
+                              << " cuda_error=" << cudaGetErrorName(le)
+                              << " (" << cudaGetErrorString(le) << ")"
+                              << " rowmajor_slot=" << (packed_ && packed_->rowmajor_ ? "present" : "absent"));
+                    return false;
+                }
+
+                record_small_m_route("m2");
+                return true;
+            }
 
             for (int row = 0; row < m; ++row)
             {
