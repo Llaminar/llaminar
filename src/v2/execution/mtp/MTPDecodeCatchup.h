@@ -20,6 +20,7 @@ namespace llaminar2
         int base_sidecar_position = 0;
         bool allow_speculative_discard = true;
         std::string verifier_path = "decode_equivalent_catchup";
+        std::string implementation_name = "shared_stepwise";
     };
 
     struct MTPDecodeCatchupGreedyResult

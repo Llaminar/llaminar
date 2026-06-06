@@ -17,6 +17,7 @@
 #include "utils/Tokenizer.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cctype>
@@ -2402,6 +2403,105 @@ namespace llaminar2::test::parity::qwen36
             "dynamic-depth");
     }
 
+    inline void runDenseAllPositionCatchupCandidateFailsCommitReplay(
+        DensePrefixRestoreParityCase test_case,
+        bool use_benchmark_prompt)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += " all-position catch-up candidate negative ledger";
+        if (use_benchmark_prompt)
+        {
+            test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        }
+        test_case.decode_steps = std::max(test_case.decode_steps, 8);
+        test_case.max_seq_len = std::max(test_case.max_seq_len, 768);
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "all_position"},
+            {"LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_CHECK", "1"},
+            {"LLAMINAR_MTP_VERIFY_COMMIT_REPLAY_DEPTH", "4"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        const std::string model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        auto model_context = ModelContext::create(model_path);
+        ASSERT_NE(model_context, nullptr);
+        auto tokenizer = createTokenizer(model_context);
+        ASSERT_NE(tokenizer, nullptr);
+        const std::vector<int> encoded_prompt =
+            tokenizer->encode(test_case.prompt, /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded_prompt.empty());
+        std::vector<int32_t> prompt_tokens(
+            encoded_prompt.begin(),
+            encoded_prompt.end());
+        ASSERT_LT(
+            static_cast<int>(prompt_tokens.size()) + test_case.decode_steps,
+            test_case.max_seq_len);
+
+        auto factory = createOrchestrationRunnerFactory();
+        auto runner = factory->createFromOrchestrationConfig(
+            makeDensePrefixRestoreConfig(
+                test_case,
+                model_path,
+                false,
+                2,
+                true,
+                3));
+        ASSERT_NE(runner, nullptr);
+        ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+        SamplingParams greedy;
+        greedy.temperature = 0.0f;
+        greedy.seed = 42;
+        runner->setSamplingParams(greedy);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->prefill(prompt_tokens)) << runner->lastError();
+
+        std::string failure;
+        int emitted_tokens = 0;
+        while (emitted_tokens < test_case.decode_steps)
+        {
+            const int remaining = test_case.decode_steps - emitted_tokens;
+            runner->setDecodeStepTokenBudget(remaining);
+            GenerationResult step = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
+            if (!step.error.empty())
+            {
+                failure = step.error;
+                break;
+            }
+            ASSERT_FALSE(step.tokens.empty())
+                << "all-position catch-up candidate produced no token and no error";
+            emitted_tokens += static_cast<int>(step.tokens.size());
+        }
+
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+        runner->shutdown();
+
+        ASSERT_FALSE(failure.empty())
+            << "All-position catch-up candidate unexpectedly passed "
+            << emitted_tokens
+            << " token(s). Update Phase 13.8 promotion gates before enabling it.";
+        EXPECT_NE(failure.find("MTP committed state"), std::string::npos)
+            << failure;
+    }
+
     inline void runDenseMTPVerifierRowsPostSidecarEquivalence(
         DensePrefixRestoreParityCase test_case)
     {
@@ -3444,6 +3544,261 @@ namespace llaminar2::test::parity::qwen36
                 << "\nsequential next: "
                 << sequential_next[0] << ',' << sequential_next[1] << ','
                 << sequential_next[2];
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        runner->setSkipLogitsGatherDecode(false);
+        runner->setSkipLogitsGatherPrefill(false);
+    }
+
+    inline void runDenseM4SidecarChainVerifierStateShortcutCandidate(
+        DensePrefixRestoreParityCase test_case,
+        bool expect_decode_equivalent)
+    {
+        ScopedDenseParityDeterministicMode deterministic_mode(
+            shouldUseDenseParityDeterministicMode(test_case));
+        test_case.name += expect_decode_equivalent
+                              ? " dense M=4 sidecar-chain verifier state shortcut candidate"
+                              : " dense M=4 sidecar-chain verifier state shortcut negative";
+        test_case.prompt = qwen36DefaultBenchmarkPrompt();
+        test_case.decode_steps = 8;
+        test_case.max_seq_len = 768;
+
+        ScopedEnvironmentValues graph_env({
+            {"LLAMINAR_GPU_GRAPHS", "1"},
+        });
+
+        if (auto skip_reason = densePrefixParitySkipReason(test_case))
+        {
+            GTEST_SKIP() << *skip_reason;
+        }
+
+        const std::string model_path = firstEnvOrDefault(
+            test_case.model_envs,
+            test_case.default_model_path);
+        if (!std::filesystem::exists(model_path))
+        {
+            GTEST_SKIP() << test_case.name << " model not found: " << model_path;
+        }
+
+        DeviceManager::instance().initialize(-1);
+        auto model_ctx = ModelContext::create(
+            model_path,
+            nullptr,
+            nullptr,
+            nullptr,
+            WeightDistributionStrategy::REPLICATED);
+        ASSERT_NE(model_ctx, nullptr);
+
+        auto tokenizer = createTokenizer(model_ctx);
+        ASSERT_NE(tokenizer, nullptr);
+        const std::vector<int> encoded_prompt =
+            tokenizer->encode(test_case.prompt, /*add_bos=*/false, /*add_eos=*/false);
+        ASSERT_FALSE(encoded_prompt.empty());
+        std::vector<int32_t> prompt_tokens(
+            encoded_prompt.begin(),
+            encoded_prompt.end());
+        ASSERT_LT(static_cast<int>(prompt_tokens.size()) + 12, test_case.max_seq_len);
+
+        InferenceRunnerConfig config;
+        config.max_seq_len = test_case.max_seq_len;
+        config.batch_size = 1;
+        config.force_graph = true;
+        config.activation_precision = ActivationPrecision::FP32;
+        config.kv_cache_precision = parseKVCachePrecision(test_case.kv_cache_precision);
+        config.use_mapped_memory = false;
+        config.mtp.enabled = true;
+        config.mtp.draft_tokens = 3;
+
+        const DeviceId device = test_case.devices.empty()
+                                    ? DeviceId::cuda(0)
+                                    : test_case.devices.front().toLocalDeviceId();
+        auto runner = createInferenceRunner(
+            model_ctx,
+            nullptr,
+            device,
+            config);
+        ASSERT_NE(runner, nullptr);
+        runner->setSuppressTimeline(true);
+        runner->setSkipLogitsGatherPrefill(true);
+        runner->setSkipLogitsGatherDecode(true);
+
+        ASSERT_TRUE(runner->forward(prompt_tokens.data(), static_cast<int>(prompt_tokens.size())));
+        const PrefixStateSnapshot prefix_checkpoint = runner->captureLivePrefixState();
+        ASSERT_TRUE(prefix_checkpoint.valid);
+        const int base_sidecar_position = runner->get_position();
+
+        int32_t first_token = runner->sampleGreedyOnDevice();
+        ASSERT_GE(first_token, 0);
+
+        auto build_sidecar_chain = [&]() -> std::array<int32_t, 4>
+        {
+            std::array<int32_t, 4> verifier_inputs = {
+                first_token,
+                -1,
+                -1,
+                -1,
+            };
+
+            int32_t draft_token = -1;
+            EXPECT_TRUE(runner->forwardMTPAndSampleGreedy(
+                verifier_inputs[0],
+                &draft_token));
+            EXPECT_TRUE(runner->flushPendingMTPWork());
+            verifier_inputs[1] = draft_token;
+
+            for (int draft_idx = 1; draft_idx < 3; ++draft_idx)
+            {
+                draft_token = -1;
+                EXPECT_TRUE(runner->forwardMTPFromLastDraftAndSampleGreedy(
+                    verifier_inputs[static_cast<size_t>(draft_idx)],
+                    base_sidecar_position + draft_idx,
+                    &draft_token));
+                EXPECT_TRUE(runner->flushPendingMTPWork());
+                verifier_inputs[static_cast<size_t>(draft_idx + 1)] = draft_token;
+            }
+            return verifier_inputs;
+        };
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        const std::array<int32_t, 4> verifier_inputs = build_sidecar_chain();
+        for (int32_t token : verifier_inputs)
+        {
+            ASSERT_GE(token, 0);
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        int32_t sequential_next[4] = {-1, -1, -1, -1};
+        for (int row = 0; row < 4; ++row)
+        {
+            ASSERT_TRUE(runner->forward(&verifier_inputs[static_cast<size_t>(row)], 1))
+                << "Sequential decode failed at sidecar-chain verifier row " << row;
+            sequential_next[row] = runner->sampleGreedyOnDevice();
+            ASSERT_GE(sequential_next[row], 0);
+        }
+        const PrefixStateSnapshot sequential_final_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(sequential_final_state.valid);
+
+        std::array<int32_t, 4> sequential_future = {-1, -1, -1, -1};
+        for (int row = 0; row < 4; ++row)
+        {
+            const int32_t token = row == 0
+                                      ? sequential_next[3]
+                                      : sequential_future[static_cast<size_t>(row - 1)];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Sequential future decode failed at row " << row;
+            sequential_future[static_cast<size_t>(row)] = runner->sampleGreedyOnDevice();
+            ASSERT_GE(sequential_future[static_cast<size_t>(row)], 0);
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs.data(), 4));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t all_position_rows[4] = {-1, -1, -1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            4,
+            all_position_rows));
+        const PrefixStateSnapshot all_position_final_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(all_position_final_state.valid);
+
+        std::array<int32_t, 4> all_position_future = {-1, -1, -1, -1};
+        for (int row = 0; row < 4; ++row)
+        {
+            const int32_t token = row == 0
+                                      ? all_position_rows[3]
+                                      : all_position_future[static_cast<size_t>(row - 1)];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "All-position future decode failed at row " << row;
+            all_position_future[static_cast<size_t>(row)] = runner->sampleGreedyOnDevice();
+            ASSERT_GE(all_position_future[static_cast<size_t>(row)], 0);
+        }
+
+        ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(true));
+        ASSERT_TRUE(runner->forward(verifier_inputs.data(), 4));
+        ASSERT_TRUE(runner->setComputeAllPositionLogits(false));
+        int32_t restored_rows[4] = {-1, -1, -1, -1};
+        ASSERT_TRUE(runner->sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            0,
+            4,
+            restored_rows));
+        const int row3_target_cached_tokens =
+            prefix_checkpoint.cached_tokens + 4;
+        ASSERT_TRUE(runner->restoreMTPVerifierStateRow(
+            3,
+            row3_target_cached_tokens));
+        const PrefixStateSnapshot restored_row3_state =
+            runner->captureLivePrefixState();
+        ASSERT_TRUE(restored_row3_state.valid);
+
+        std::array<int32_t, 4> restored_future = {-1, -1, -1, -1};
+        for (int row = 0; row < 4; ++row)
+        {
+            const int32_t token = row == 0
+                                      ? restored_rows[3]
+                                      : restored_future[static_cast<size_t>(row - 1)];
+            ASSERT_TRUE(runner->forward(&token, 1))
+                << "Restored-row future decode failed at row " << row;
+            restored_future[static_cast<size_t>(row)] = runner->sampleGreedyOnDevice();
+            ASSERT_GE(restored_future[static_cast<size_t>(row)], 0);
+        }
+
+        const ::testing::AssertionResult all_position_state_match =
+            prefixSnapshotPayloadsNear(
+            all_position_final_state,
+            sequential_final_state,
+            "sidecar-chain all-position verifier final state");
+        const ::testing::AssertionResult restored_row3_state_match =
+            prefixSnapshotPayloadsNear(
+            restored_row3_state,
+            sequential_final_state,
+            "sidecar-chain verifier row-3 restore state");
+        const bool row_tokens_match =
+            std::equal(
+                std::begin(all_position_rows),
+                std::end(all_position_rows),
+                std::begin(sequential_next));
+        const bool all_position_future_match = (all_position_future == sequential_future);
+        const bool restored_future_match = (restored_future == sequential_future);
+        const bool candidate_equivalent =
+            row_tokens_match &&
+            static_cast<bool>(all_position_state_match) &&
+            static_cast<bool>(restored_row3_state_match) &&
+            all_position_future_match &&
+            restored_future_match;
+
+        if (expect_decode_equivalent)
+        {
+            EXPECT_TRUE(candidate_equivalent)
+                << "Sidecar-chain verifier shortcut candidate is not "
+                   "decode-equivalent"
+                << "\nverifier inputs: "
+                << verifier_inputs[0] << ',' << verifier_inputs[1] << ','
+                << verifier_inputs[2] << ',' << verifier_inputs[3]
+                << "\nsequential next: "
+                << sequential_next[0] << ',' << sequential_next[1] << ','
+                << sequential_next[2] << ',' << sequential_next[3]
+                << "\nall-position rows: "
+                << all_position_rows[0] << ',' << all_position_rows[1] << ','
+                << all_position_rows[2] << ',' << all_position_rows[3]
+                << "\nall-position state: " << all_position_state_match.message()
+                << "\nrow3 state: " << restored_row3_state_match.message()
+                << "\nall-position future match: " << all_position_future_match
+                << "\nrestored future match: " << restored_future_match;
+        }
+        else
+        {
+            EXPECT_FALSE(candidate_equivalent)
+                << "Sidecar-chain verifier shortcut unexpectedly became "
+                   "decode-equivalent; update Phase 13.8 promotion gates before "
+                   "enabling it."
+                << "\nverifier inputs: "
+                << verifier_inputs[0] << ',' << verifier_inputs[1] << ','
+                << verifier_inputs[2] << ',' << verifier_inputs[3];
         }
 
         ASSERT_TRUE(runner->restoreLivePrefixState(prefix_checkpoint));

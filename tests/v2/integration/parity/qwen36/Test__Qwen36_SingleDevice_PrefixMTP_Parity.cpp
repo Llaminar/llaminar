@@ -83,6 +83,20 @@ TEST(Qwen36SingleDevicePrefixMTPParity, M4VerifierLongPrefixIsNotDecodeEquivalen
     runDenseM4VerifierLongPrefixIsNotDecodeEquivalent(singleDeviceCase());
 }
 
+TEST(Qwen36SingleDevicePrefixMTPParity, SidecarChainVerifierStateShortcutCandidateIsNotDecodeEquivalent)
+{
+    runDenseM4SidecarChainVerifierStateShortcutCandidate(
+        singleDeviceCase(),
+        /*expect_decode_equivalent=*/false);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, AllPositionCatchupCandidateFailsCommitReplay)
+{
+    runDenseAllPositionCatchupCandidateFailsCommitReplay(
+        singleDeviceCase(),
+        /*use_benchmark_prompt=*/true);
+}
+
 int main(int argc, char **argv)
 {
     int provided;

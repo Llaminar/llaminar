@@ -44,6 +44,10 @@ namespace llaminar2
         MTPDecodeCatchupGreedyResult result;
         result.accepted_tokens.reserve(request.draft_tokens.size() + 1);
         result.verifier_tokens.reserve(request.draft_tokens.size());
+        const std::string implementation =
+            request.implementation_name.empty()
+                ? std::string("shared_stepwise")
+                : request.implementation_name;
 
         auto fail = [&](std::string reason) -> MTPDecodeCatchupGreedyResult
         {
@@ -55,7 +59,7 @@ namespace llaminar2
                 1.0,
                 "decode",
                 {},
-                {{"implementation", "shared_stepwise"},
+                {{"implementation", implementation},
                  {"reason", result.error}});
             return result;
         };
@@ -75,7 +79,7 @@ namespace llaminar2
                     "decode_equivalent_catchup_forward_one",
                     "decode",
                     {},
-                    {{"implementation", "shared_stepwise"}});
+                    {{"implementation", implementation}});
                 ok = runner.forward(&forward_token, 1);
             }
             if (!ok)
@@ -90,7 +94,7 @@ namespace llaminar2
                     "decode_equivalent_catchup_sample_one",
                     "decode",
                     {},
-                    {{"implementation", "shared_stepwise"}});
+                    {{"implementation", implementation}});
                 sampled = sample_after_forward();
             }
             return sampled;
@@ -105,7 +109,7 @@ namespace llaminar2
                     "decode_equivalent_catchup_shifted_commit",
                     "decode",
                     {},
-                    {{"implementation", "shared_stepwise"}});
+                    {{"implementation", implementation}});
                 ok = runner.commitMTPShiftedRowFromCurrentTerminalHidden(
                     token,
                     token_index,
@@ -144,7 +148,7 @@ namespace llaminar2
                  {"draft_token", std::to_string(draft_token)},
                  {"verified_token", std::to_string(verifier_sample)},
                  {"verifier_path", request.verifier_path},
-                 {"implementation", "shared_stepwise"}});
+                 {"implementation", implementation}});
 
             const bool accepted = verifier_sample == draft_token;
             const int32_t output_token = accepted ? draft_token : verifier_sample;
@@ -187,7 +191,7 @@ namespace llaminar2
             1.0,
             "decode",
             {},
-            {{"implementation", "shared_stepwise"},
+            {{"implementation", implementation},
              {"draft_tokens", joinTokens(request.draft_tokens)},
              {"accepted_tokens", joinTokens(result.accepted_tokens)},
              {"verifier_tokens", joinTokens(result.verifier_tokens)},
@@ -202,7 +206,7 @@ namespace llaminar2
             static_cast<double>(result.main_forward_token_count),
             "decode",
             {},
-            {{"implementation", "shared_stepwise"}});
+            {{"implementation", implementation}});
         return result;
     }
 

@@ -3,9 +3,12 @@
 
 #include "execution/mtp/MTPDecodeCatchup.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -90,6 +93,31 @@ namespace
         size_t index_ = 0;
     };
 
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name),
+              had_old_(std::getenv(name) != nullptr),
+              old_value_(had_old_ ? std::getenv(name) : "")
+        {
+            setenv(name_.c_str(), value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
+    };
+
 } // namespace
 
 TEST(Test__MTPDecodeCatchup, SharedStepwiseAcceptsMultiRowDraftAndReturnsReadyToken)
@@ -123,6 +151,42 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseAcceptsMultiRowDraftAndReturnsReadyTo
         runner.committed_allow_discard.begin(),
         runner.committed_allow_discard.end(),
         [](bool v) { return v; }));
+}
+
+TEST(Test__MTPDecodeCatchup, SharedStepwiseUsesRequestImplementationNameForCounters)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    FakeCatchupRunner runner;
+    ScriptedSampler sampler({9, 4});
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9};
+    request.implementation_name = "device_graph_stepwise";
+
+    MTPDecodeCatchupGreedyResult result =
+        runSharedStepwiseMTPDecodeCatchupGreedy(
+            runner,
+            request,
+            [&]() { return sampler(); });
+
+    ASSERT_TRUE(result.ok) << result.error;
+
+    const auto records = PerfStatsCollector::snapshot({"mtp"});
+    bool found_custom_run_counter = false;
+    for (const auto &record : records)
+    {
+        if (record.name != "decode_equivalent_catchup_runs")
+            continue;
+        auto it = record.tags.find("implementation");
+        if (it != record.tags.end() && it->second == "device_graph_stepwise")
+        {
+            found_custom_run_counter = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_custom_run_counter);
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__MTPDecodeCatchup, SharedStepwiseRejectsAndForwardsCorrectionForReadyToken)

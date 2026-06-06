@@ -110,6 +110,20 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierRow3RestoreIsNotDecodeEqui
     runDenseM4VerifierRow3RestoreFeedsNextVerifierRows(cudaSingleDeviceCase());
 }
 
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, SidecarChainVerifierStateShortcutCandidateIsNotDecodeEquivalent)
+{
+    runDenseM4SidecarChainVerifierStateShortcutCandidate(
+        cudaSingleDeviceCase(),
+        /*expect_decode_equivalent=*/false);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, AllPositionCatchupCandidateFailsCommitReplay)
+{
+    runDenseAllPositionCatchupCandidateFailsCommitReplay(
+        cudaSingleDeviceCase(),
+        /*use_benchmark_prompt=*/true);
+}
+
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPEnabledForwardOnlyMatchesNoMTPDecode)
 {
     runDenseMTPEnabledForwardOnlyMatchesNoMTP(cudaSingleDeviceCase());

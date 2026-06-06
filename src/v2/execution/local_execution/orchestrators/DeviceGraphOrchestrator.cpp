@@ -7433,6 +7433,276 @@ namespace llaminar2
         return restorable_layers > 0;
     }
 
+    bool DeviceGraphOrchestrator::supportsOptimizedMTPDecodeCatchupGreedy() const
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+        if (!state_.device_id.is_gpu() || state_.batch_size != 1)
+        {
+            return false;
+        }
+        if (!requiresMTPDecodeEquivalentVerifierReplay())
+        {
+            return false;
+        }
+
+        const char *candidate =
+            std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
+        if (!candidate || !*candidate)
+        {
+            return false;
+        }
+        return std::strcmp(candidate, "stepwise") == 0 ||
+               std::strcmp(candidate, "all_position") == 0;
+    }
+
+    const char *DeviceGraphOrchestrator::optimizedMTPDecodeCatchupGreedyName() const
+    {
+        const char *candidate =
+            std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
+        if (candidate && std::strcmp(candidate, "all_position") == 0)
+        {
+            return "all_position_state_candidate";
+        }
+        return "device_graph_stepwise";
+    }
+
+    MTPDecodeCatchupGreedyResult DeviceGraphOrchestrator::runOptimizedMTPDecodeCatchupGreedy(
+        const MTPDecodeCatchupGreedyRequest &request,
+        const MTPDecodeCatchupGreedySampler &sample_after_forward)
+    {
+        const char *candidate =
+            std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
+        if (candidate && std::strcmp(candidate, "all_position") == 0)
+        {
+            MTPDecodeCatchupGreedyResult result;
+            result.accepted_tokens.reserve(request.draft_tokens.size() + 1);
+            result.verifier_tokens.reserve(request.draft_tokens.size());
+
+            auto fail = [&](std::string reason) -> MTPDecodeCatchupGreedyResult
+            {
+                (void)setComputeAllPositionLogits(false);
+                result.ok = false;
+                result.error = std::move(reason);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "phase138_all_position_catchup_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"reason", result.error}});
+                return result;
+            };
+
+            if (request.draft_tokens.empty())
+                return fail("all-position catch-up candidate received no draft tokens");
+            if (!sample_after_forward)
+                return fail("all-position catch-up candidate received no sampler callback");
+            if (request.draft_tokens.size() > 4)
+                return fail("all-position catch-up candidate supports at most four verifier rows");
+
+            const int verifier_rows = static_cast<int>(request.draft_tokens.size());
+            if (!setComputeAllPositionLogits(true))
+                return fail("all-position catch-up candidate could not enable all-position logits");
+
+            bool verifier_ok = false;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_all_position_catchup_forward",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"implementation", "all_position_state_candidate"},
+                     {"rows", std::to_string(verifier_rows)}});
+                verifier_ok =
+                    DeviceGraphOrchestrator::forward(
+                        request.draft_tokens.data(),
+                        verifier_rows,
+                        1) != nullptr;
+            }
+            if (!setComputeAllPositionLogits(false))
+                return fail("all-position catch-up candidate could not disable all-position logits");
+            if (!verifier_ok)
+                return fail("all-position catch-up candidate verifier forward failed");
+
+            result.main_forward_token_count = verifier_rows;
+            std::vector<int32_t> verifier_tokens(
+                static_cast<size_t>(verifier_rows),
+                -1);
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_all_position_catchup_sample_rows",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"implementation", "all_position_state_candidate"},
+                     {"rows", std::to_string(verifier_rows)}});
+                if (!sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                        0,
+                        verifier_rows,
+                        verifier_tokens.data()))
+                {
+                    return fail("all-position catch-up candidate could not sample verifier rows");
+                }
+            }
+
+            result.accepted_tokens.push_back(request.draft_tokens.front());
+            int accepted_input_count = 1;
+            for (int draft_idx = 1; draft_idx < verifier_rows; ++draft_idx)
+            {
+                const int32_t verifier_token =
+                    verifier_tokens[static_cast<size_t>(draft_idx - 1)];
+                result.verifier_tokens.push_back(verifier_token);
+                const int32_t draft_token =
+                    request.draft_tokens[static_cast<size_t>(draft_idx)];
+                if (verifier_token == draft_token)
+                {
+                    ++result.accepted_speculative_prefix;
+                    ++accepted_input_count;
+                    result.accepted_tokens.push_back(draft_token);
+                    continue;
+                }
+
+                result.all_speculative_accepted = false;
+                result.rejected_verified_token = verifier_token;
+                result.accepted_tokens.push_back(verifier_token);
+                break;
+            }
+
+            const int restore_row = accepted_input_count - 1;
+            const int target_cached_tokens =
+                request.base_sidecar_position + accepted_input_count;
+            bool restored = false;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_all_position_restore_row",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"implementation", "all_position_state_candidate"},
+                     {"row", std::to_string(restore_row)},
+                     {"target_cached_tokens", std::to_string(target_cached_tokens)}});
+                restored = restoreMTPVerifierStateRow(
+                    restore_row,
+                    target_cached_tokens);
+            }
+            if (!restored)
+                return fail("all-position catch-up candidate verifier-row restore failed");
+
+            if (!commitMTPShiftedRowsFromPartialForward(
+                    result.accepted_tokens.data(),
+                    accepted_input_count,
+                    /*already_appended_tokens=*/1,
+                    accepted_input_count,
+                    request.allow_speculative_discard,
+                    request.base_sidecar_position))
+            {
+                return fail("all-position catch-up candidate shifted-prefix commit failed");
+            }
+            result.shifted_commit_count = accepted_input_count;
+
+            auto outputIsStop = [&](int32_t token)
+            {
+                return std::find(
+                           request.stop_tokens.begin(),
+                           request.stop_tokens.end(),
+                           token) != request.stop_tokens.end();
+            };
+
+            if (!result.all_speculative_accepted)
+            {
+                const int32_t correction = result.rejected_verified_token;
+                if (correction < 0)
+                    return fail("all-position catch-up candidate produced invalid correction token");
+
+                if (!commitMTPShiftedRowFromCurrentTerminalHidden(
+                        correction,
+                        static_cast<int>(result.accepted_tokens.size()) - 1,
+                        request.allow_speculative_discard,
+                        request.base_sidecar_position))
+                {
+                    return fail("all-position catch-up candidate shifted correction commit failed");
+                }
+                ++result.shifted_commit_count;
+
+                int forward_token = static_cast<int>(correction);
+                bool correction_forward_ok = false;
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "phase138_all_position_correction_forward",
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"implementation", "all_position_state_candidate"}});
+                    correction_forward_ok =
+                        DeviceGraphOrchestrator::forward(
+                            &forward_token,
+                            1,
+                            1) != nullptr;
+                }
+                if (!correction_forward_ok)
+                    return fail("all-position catch-up candidate correction forward failed");
+                ++result.main_forward_token_count;
+
+                if (outputIsStop(correction))
+                {
+                    result.stopped_on_output = true;
+                }
+                else
+                {
+                    result.ready_token = sample_after_forward();
+                    if (result.ready_token < 0)
+                        return fail("all-position catch-up candidate correction sample failed");
+                }
+            }
+            else
+            {
+                result.ready_token =
+                    verifier_tokens[static_cast<size_t>(verifier_rows - 1)];
+                if (result.ready_token < 0)
+                    return fail("all-position catch-up candidate terminal row sample unavailable");
+                if (outputIsStop(result.accepted_tokens.back()))
+                {
+                    result.stopped_on_output = true;
+                    result.ready_token = -1;
+                }
+            }
+
+            result.ok = true;
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "phase138_all_position_catchup_runs",
+                1.0,
+                "decode",
+                state_.device_id.toString(),
+                {{"accepted_speculative_prefix", std::to_string(result.accepted_speculative_prefix)},
+                 {"all_speculative_accepted", result.all_speculative_accepted ? "true" : "false"},
+                 {"forward_tokens", std::to_string(result.main_forward_token_count)},
+                 {"verifier_rows", std::to_string(verifier_rows)}});
+            return result;
+        }
+
+        MTPDecodeCatchupGreedyRequest tagged_request = request;
+        tagged_request.implementation_name = optimizedMTPDecodeCatchupGreedyName();
+
+        auto sample_on_runner = [&]() -> int32_t
+        {
+            const int32_t sampled = sampleGreedyOnDevice();
+            if (sampled >= 0)
+            {
+                return sampled;
+            }
+            return sample_after_forward ? sample_after_forward() : -1;
+        };
+
+        return runSharedStepwiseMTPDecodeCatchupGreedy(
+            *this,
+            tagged_request,
+            sample_on_runner);
+    }
+
     bool DeviceGraphOrchestrator::requiresMTPDecodeEquivalentVerifierReplay() const
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled || !state_.kv_cache)
