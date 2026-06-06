@@ -2498,7 +2498,7 @@ namespace llaminar2::test::parity::qwen36
             << "All-position catch-up candidate unexpectedly passed "
             << emitted_tokens
             << " token(s). Update Phase 13.8 promotion gates before enabling it.";
-        EXPECT_NE(failure.find("MTP committed state"), std::string::npos)
+        EXPECT_NE(failure.find("retired"), std::string::npos)
             << failure;
     }
 
