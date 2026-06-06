@@ -59,9 +59,11 @@ CUDA MoE artifact:
 - First shared metadata slice is green: `MTPSpecDecodeTransaction` is in core,
   `OrchestrationRunner` validates decode-equivalent catch-up results against it
   before commit, and `mtp.spec_decode_transaction_metadata` counters describe
-  accepted/rejected verifier rows. Focused unit coverage passed for
-  `V2_Unit_MTPSpecDecodeTransaction`, `V2_Unit_MTPDecodeCatchup`, and
-  `V2_Unit_PrefillDecodeTransition`.
+  accepted/rejected verifier rows. `MTPSpecDecodeMetadata` now declares the
+  graph-facing int32 workspace buffers and padded host metadata arrays for the
+  future CUDA/ROCm hook. Focused unit coverage passed for
+  `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
+  `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`.
 
 ## Retained Actions
 

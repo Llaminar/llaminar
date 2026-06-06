@@ -6232,6 +6232,18 @@ add_v2_test(V2_Unit_MTPSpecDecodeTransaction
     MPI_PROCS 1
 )
 
+# Test: vLLM-style MTP spec-decode graph-facing metadata buffers
+add_executable(v2_test_mtp_spec_decode_metadata unit/mtp/Test__MTPSpecDecodeMetadata.cpp)
+target_link_libraries(v2_test_mtp_spec_decode_metadata llaminar2_core GTest::gtest GTest::gmock GTest::gtest_main)
+target_include_directories(v2_test_mtp_spec_decode_metadata PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_v2_test(V2_Unit_MTPSpecDecodeMetadata
+    COMMAND $<TARGET_FILE:v2_test_mtp_spec_decode_metadata>
+    LABELS "V2;Unit;MTP;SpecDecode;Metadata;Workspace"
+    MPI_PROCS 1
+)
+
 # Test: MTP transaction state and rollback invariants
 add_executable(v2_test_mtp_state_transaction unit/mtp/Test__MTPStateTransaction.cpp)
 target_link_libraries(v2_test_mtp_state_transaction llaminar2_core GTest::gtest GTest::gtest_main)
