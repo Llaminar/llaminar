@@ -335,7 +335,7 @@ namespace llaminar2
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
             if (d_bias)
             {
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
+                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
                 bool success = cublas_kernel_->execute_with_bias(
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
@@ -357,7 +357,7 @@ namespace llaminar2
             }
             else
             {
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
+                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
                 bool success = cublas_kernel_->execute(
                     d_A,                                    // d_A
                     static_cast<const float *>(d_weights_), // d_B
@@ -519,7 +519,7 @@ namespace llaminar2
                 d_mapped_outputs.push_back(d_mapped_output);
             }
 
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM_CUBLAS);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM_CUBLAS, gpu_stream_);
             bool success = cublas_kernel_->execute_batched_same_a(
                 d_A,
                 d_B_matrices,

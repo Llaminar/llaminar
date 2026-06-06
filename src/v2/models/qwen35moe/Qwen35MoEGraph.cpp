@@ -1505,6 +1505,7 @@ namespace llaminar2
                 add_params.input_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
                 add_params.residual_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
                 add_params.output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+                add_params.graph_capture_boundary_before = true;
 
                 graph.addNode(prefix + "moe_combine",
                               ComputeStageFactory::createResidualAdd(add_params),
@@ -1527,6 +1528,7 @@ namespace llaminar2
                     copy_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                     copy_params.input_buffer_id = buffers.idFor(BufferId::MOE_COMBINED_OUTPUT);
                     copy_params.output_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+                    copy_params.graph_capture_boundary_before = true;
 
                     graph.addNode(prefix + "moe_combine",
                                   ComputeStageFactory::createResidualAdd(copy_params),

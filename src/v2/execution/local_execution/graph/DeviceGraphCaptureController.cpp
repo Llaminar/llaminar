@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <vector>
 
 namespace llaminar2
@@ -26,6 +27,20 @@ namespace llaminar2
         const char *segmentTypeName(const DeviceGraphExecutor::GraphSegment &segment)
         {
             return segment.capturable ? "capturable" : "manual";
+        }
+
+        std::string describeSegmentStages(const DeviceGraphExecutor::GraphSegment &segment)
+        {
+            std::ostringstream out;
+            out << '[';
+            for (size_t i = 0; i < segment.stage_names.size(); ++i)
+            {
+                if (i > 0)
+                    out << ", ";
+                out << segment.stage_names[i];
+            }
+            out << ']';
+            return out.str();
         }
 
         void addContextTag(PerfStatsCollector::Tags &tags, const std::string &perf_context)
@@ -719,7 +734,11 @@ namespace llaminar2
             }
         }
 
-        gpu_ctx->synchronizeStream(use_stream);
+        if (!gpu_ctx->synchronizeStreamChecked(use_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Stream-only replay sync failed");
+            return false;
+        }
         return true;
     }
 
@@ -899,12 +918,27 @@ namespace llaminar2
                 // Collective stages ran on compute_stream (defaultStream),
                 // non-collective stages ran on capture_stream. Sync both
                 // instead of using device-wide hipDeviceSynchronize.
-                gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
-                gpu_ctx->synchronizeStream(capture_stream);
+                if (!gpu_ctx->synchronizeStreamChecked(gpu_ctx->defaultStream()))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Manual replay default-stream sync failed after segment starting at "
+                              << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front()));
+                    return false;
+                }
+                if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Manual replay capture-stream sync failed after segment starting at "
+                              << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front()));
+                    return false;
+                }
             }
             else
             {
-                gpu_ctx->synchronizeStream(capture_stream);
+                if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Manual replay capture-stream sync failed after segment starting at "
+                              << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front()));
+                    return false;
+                }
             }
         }
 
@@ -981,7 +1015,12 @@ namespace llaminar2
 
         if (needs_segment_sync)
         {
-            gpu_ctx->synchronizeStream(capture_stream);
+            if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Captured replay stream sync failed after segment starting at "
+                          << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front()));
+                return false;
+            }
         }
 
         return true;
@@ -1056,7 +1095,7 @@ namespace llaminar2
         {
             if (capture_stream)
             {
-                gpu_ctx->synchronizeStream(capture_stream);
+                (void)gpu_ctx->synchronizeStreamChecked(capture_stream);
             }
             gpu_ctx->clearLastError();
             if (!exec_ok)
@@ -1095,7 +1134,11 @@ namespace llaminar2
         }
 
         post_launch_cb(segment, capture_stream);
-        gpu_ctx->synchronizeStream(capture_stream);
+        if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Re-capture stream sync failed after seg " << segment_index);
+            return false;
+        }
 
         for (const auto &stage_name : segment.stage_names)
         {
@@ -1143,7 +1186,11 @@ namespace llaminar2
 
             if (needs_segment_sync)
             {
-                gpu_ctx->synchronizeStream(capture_stream);
+                if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Verify-skip stream sync failed after seg " << segment_index);
+                    return result;
+                }
             }
 
             fprintf(stderr,
@@ -1166,7 +1213,11 @@ namespace llaminar2
             return result;
         }
         post_launch_cb(segment, capture_stream);
-        gpu_ctx->synchronizeStream(capture_stream);
+        if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Verify stream sync failed after seg " << segment_index);
+            return result;
+        }
 
         void *default_stream = gpu_ctx->defaultStream();
 
@@ -1226,7 +1277,11 @@ namespace llaminar2
                 return result;
             }
         }
-        gpu_ctx->synchronizeStream(default_stream);
+        if (!gpu_ctx->synchronizeStreamChecked(default_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Verify direct-exec stream sync failed");
+            return result;
+        }
 
         std::vector<StageOutput> direct_outputs(segment.stage_names.size());
         for (size_t s = 0; s < segment.stage_names.size(); s++)
@@ -1399,7 +1454,13 @@ namespace llaminar2
             segment.last_executed_step = current_step;
             // Use stream-level sync (not device-wide) to avoid conflict with
             // hipStreamCaptureModeGlobal on other TP devices.
-            gpu_ctx->synchronizeStream(capture_stream);
+            if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Capture-phase stream sync failed after segment starting at "
+                          << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front())
+                          << " stages=" << describeSegmentStages(segment));
+                return false;
+            }
             LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+executed (Phase-2 semantics): "
                       << segment.capture->nodeCount() << " nodes, " << segment.stage_names.size() << " stages");
             return true;
@@ -1419,7 +1480,13 @@ namespace llaminar2
         // Use stream-level sync (not device-wide) — capture_stream is where
         // the graph was launched, and hipDeviceSynchronize is illegal during
         // global capture mode if another TP device is still capturing.
-        gpu_ctx->synchronizeStream(capture_stream);
+        if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Initial captured launch stream sync failed after segment starting at "
+                      << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front())
+                      << " stages=" << describeSegmentStages(segment));
+            return false;
+        }
         LOG_DEBUG("[DeviceGraphCaptureController] Segment captured+launched: "
                   << segment.capture->nodeCount() << " nodes, " << segment.stage_names.size() << " stages");
         return true;
@@ -1461,7 +1528,11 @@ namespace llaminar2
         // sync. hipDeviceSynchronize() is always illegal during global capture mode
         // (returns hipErrorStreamCaptureUnsupported), but hipStreamSynchronize()
         // on a non-captured stream is safe.
-        gpu_ctx->synchronizeStream(compute_stream);
+        if (!gpu_ctx->synchronizeStreamChecked(compute_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Capture manual pre-sync failed");
+            return false;
+        }
 
         for (const auto &stage_name : segment.stage_names)
         {
@@ -1501,7 +1572,12 @@ namespace llaminar2
         }
 
         segment.last_executed_step = current_step;
-        gpu_ctx->synchronizeStream(compute_stream);
+        if (!gpu_ctx->synchronizeStreamChecked(compute_stream))
+        {
+            LOG_ERROR("[DeviceGraphCaptureController] Capture manual post-sync failed after segment starting at "
+                      << (segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front()));
+            return false;
+        }
         return true;
     }
 
@@ -1717,7 +1793,14 @@ namespace llaminar2
                 // Use stream-level sync (not device-wide) because
                 // hipDeviceSynchronize() is illegal under global capture mode
                 // if another TP device has already started capturing.
-                gpu_ctx->synchronizeStream(capture_stream);
+                if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Capture warmup stream sync failed before segment starting at "
+                              << (seg.stage_names.empty() ? std::string("<empty>") : seg.stage_names.front()));
+                    result.reset_cache = true;
+                    result.fallback_to_fast_decode = true;
+                    return result;
+                }
 
                 seg.capture = gpu_ctx->createGraphCapture(capture_stream);
                 if (!seg.capture)
@@ -1811,9 +1894,9 @@ namespace llaminar2
                     // the remaining stages can execute normally.
                     // Use stream-level sync (not device-wide) to avoid conflict
                     // with hipStreamCaptureModeGlobal on other TP devices.
-                    gpu_ctx->synchronizeStream(capture_stream);
+                    (void)gpu_ctx->synchronizeStreamChecked(capture_stream);
                     void *default_stream = gpu_ctx->defaultStream();
-                    gpu_ctx->synchronizeStream(default_stream);
+                    (void)gpu_ctx->synchronizeStreamChecked(default_stream);
                     gpu_ctx->clearLastError();
                     // Re-execute the remaining un-completed stages of this segment
                     // without capture. Stages that completed before the failure already
@@ -2121,9 +2204,17 @@ namespace llaminar2
         }
         {
             auto sync_t0 = std::chrono::high_resolution_clock::now();
-            gpu_ctx->synchronizeStream(capture_stream);
+            if (!gpu_ctx->synchronizeStreamChecked(capture_stream))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Final replay capture-stream sync failed");
+                return result;
+            }
             auto sync_capture_t1 = std::chrono::high_resolution_clock::now();
-            gpu_ctx->synchronizeStream(gpu_ctx->defaultStream());
+            if (!gpu_ctx->synchronizeStreamChecked(gpu_ctx->defaultStream()))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Final replay default-stream sync failed");
+                return result;
+            }
             auto sync_t1 = std::chrono::high_resolution_clock::now();
             if (profiling)
             {

@@ -607,10 +607,15 @@ namespace llaminar2
 
     void AMDDeviceContext::synchronizeStream(void *stream)
     {
+        (void)synchronizeStreamChecked(stream);
+    }
+
+    bool AMDDeviceContext::synchronizeStreamChecked(void *stream)
+    {
         // During graph capture, stream sync is illegal on the capture stream.
         if (capture_active_.load(std::memory_order_acquire))
         {
-            return;
+            return true;
         }
 
         hipStream_t hip_stream = stream ? static_cast<hipStream_t>(stream) : hipStream_t(0);
@@ -624,11 +629,13 @@ namespace llaminar2
                 LOG_DEBUG("[AMDDeviceContext] Skipping hipStreamSynchronize during "
                           "concurrent graph capture (ordinal="
                           << device_ordinal_ << ")");
-                return;
+                return true;
             }
             LOG_ERROR("[AMDDeviceContext] hipStreamSynchronize failed: "
                       << hipGetErrorString(err));
+            return false;
         }
+        return true;
     }
 
     void AMDDeviceContext::insertStreamDependency(void *dependent_stream, void *dependency_stream)

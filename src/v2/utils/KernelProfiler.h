@@ -674,8 +674,11 @@ namespace llaminar2
          */
         static bool isEnabled()
         {
-            // Use DebugEnv for centralized configuration
-            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
+            // Structured perf export alone must stay passive. Kernel/forward
+            // timing changes hot execution paths and is opt-in through
+            // LLAMINAR_PROFILING, LLAMINAR_GPU_STAGE_TIMING, or the explicit
+            // perf-stats GPU timing request.
+            return debugEnv().profile.enabled || PerfStatsCollector::gpuStageEventTimingEnabled();
         }
 
         /**

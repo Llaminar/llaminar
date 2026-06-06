@@ -21,6 +21,7 @@
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../common/EmbedQ8Repack.h"
 #include "../../common/PreparedEmbeddingWeights.h"
 #include "../../KernelFactory.h"
@@ -28,8 +29,11 @@
 #include "../../rope/RoPEDeviceParams.h"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <string>
 
 // =========================================================================
 // Extern "C" declarations for CUDA kernel wrappers
@@ -119,6 +123,111 @@ extern "C"
 
 namespace
 {
+    bool validateCudaPointerForDevice(const void *ptr,
+                                      int expected_device,
+                                      const char *ptr_name,
+                                      bool fail_on_query_error)
+    {
+        if (!ptr)
+        {
+            LOG_ERROR("[CUDAEmbeddingKernelT] " << ptr_name << " is null");
+            return false;
+        }
+
+        cudaPointerAttributes attr{};
+        const cudaError_t attr_err = cudaPointerGetAttributes(&attr, ptr);
+        if (attr_err != cudaSuccess)
+        {
+            cudaGetLastError();
+            if (fail_on_query_error)
+            {
+                LOG_ERROR("[CUDAEmbeddingKernelT] Failed to query pointer attributes for "
+                          << ptr_name
+                          << " ptr=" << ptr
+                          << " err=" << cudaGetErrorString(attr_err)
+                          << " expected_device=" << expected_device);
+                return false;
+            }
+            return true;
+        }
+
+        const bool memory_type_ok =
+            attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged;
+        if (!memory_type_ok || attr.device != expected_device)
+        {
+            LOG_ERROR("[CUDAEmbeddingKernelT] " << ptr_name
+                                                << " buffer has incompatible CUDA pointer attributes: ptr=" << ptr
+                                                << " attr.device=" << attr.device
+                                                << " expected=" << expected_device
+                                                << " attr.type=" << static_cast<int>(attr.type)
+                                                << " device_ptr=" << attr.devicePointer
+                                                << " host_ptr=" << attr.hostPointer);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool validateCudaTokenIdsHost(const int *token_ids,
+                                  int num_tokens,
+                                  int vocab_size,
+                                  bool fail_on_invalid)
+    {
+        if (!token_ids || num_tokens <= 0)
+        {
+            LOG_ERROR("[CUDAEmbeddingKernelT] Invalid token buffer on host: token_ids="
+                      << token_ids << " num_tokens=" << num_tokens);
+            return false;
+        }
+
+        int min_id = std::numeric_limits<int>::max();
+        int max_id = std::numeric_limits<int>::min();
+        int first_invalid_pos = -1;
+        int first_invalid_id = -1;
+
+        for (int i = 0; i < num_tokens; ++i)
+        {
+            const int value = token_ids[i];
+            min_id = std::min(min_id, value);
+            max_id = std::max(max_id, value);
+            const bool has_upper_bound = vocab_size > 0;
+            if ((value < 0 || (has_upper_bound && value >= vocab_size)) && first_invalid_pos < 0)
+            {
+                first_invalid_pos = i;
+                first_invalid_id = value;
+            }
+        }
+
+        LOG_DEBUG("[CUDAEmbeddingKernelT] Host token stats: num_tokens=" << num_tokens
+                                                                         << " vocab_size=" << (vocab_size > 0 ? std::to_string(vocab_size) : std::string("unchecked"))
+                                                                         << " min_id=" << min_id
+                                                                         << " max_id=" << max_id
+                                                                         << " first_id=" << token_ids[0]
+                                                                         << " last_id=" << token_ids[num_tokens - 1]);
+
+        if (first_invalid_pos >= 0)
+        {
+            LOG_ERROR("[CUDAEmbeddingKernelT] Host token out of range at pos="
+                      << first_invalid_pos
+                      << " token_id=" << first_invalid_id
+                      << " vocab_size=" << vocab_size);
+            return !fail_on_invalid;
+        }
+
+        return true;
+    }
+
+    bool checkCudaNoPriorError(const char *context)
+    {
+        const cudaError_t prior = cudaPeekAtLastError();
+        if (prior == cudaSuccess)
+            return true;
+
+        LOG_ERROR("[CUDAEmbeddingKernelT] Pre-existing CUDA error before "
+                  << context << ": " << cudaGetErrorString(prior));
+        return false;
+    }
+
     bool isCudaStreamCapturing(cudaStream_t stream, const char *context)
     {
         if (llaminar2::isGraphCaptureActive())
@@ -256,7 +365,7 @@ namespace llaminar2
 
             // Launch kernel asynchronously - no sync needed since all ops are on default stream
             // Stream ordering guarantees subsequent kernels wait for this one
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RMS_NORM);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::RMS_NORM, gpu_stream_);
             return cudaOps_rmsnorm_fp32(d_input, d_weight, d_output, rows, cols, epsilon, dev, gpu_stream_);
         }
 
@@ -457,7 +566,7 @@ namespace llaminar2
 
             int size = rows * cols;
             // Launch kernel asynchronously - stream ordering handles dependencies
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::SWIGLU);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::SWIGLU, gpu_stream_);
             return cudaOps_swiglu_fp32(d_gate, d_up, d_output, size, dev, gpu_stream_);
         }
 
@@ -656,7 +765,7 @@ namespace llaminar2
             int rotary_dim)
         {
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::ROPE);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::ROPE, gpu_stream_);
             cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
             const bool sync_after = (stream == nullptr);
 
@@ -1163,7 +1272,7 @@ namespace llaminar2
             }
         }
 
-        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
+        CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::EMBEDDING_LOOKUP, gpu_stream_);
         cudaError_t err = launch_embedding_lookup(embed_data, token_ids, output,
                                                   num_tokens, d_model,
                                                   INT_MAX, 0,
@@ -1362,6 +1471,18 @@ namespace llaminar2
             return false;
         }
 
+        const bool validate_gpu_ptrs = debugEnv().validation.validate_gpu_ptrs;
+        if (validate_gpu_ptrs &&
+            !validateCudaTokenIdsHost(token_ids, num_tokens, /*vocab_size=*/0, /*fail_on_invalid=*/true))
+        {
+            return false;
+        }
+        if (validate_gpu_ptrs &&
+            !validateCudaPointerForDevice(d_token_ids, dev, "TOKEN_IDS", /*fail_on_query_error=*/true))
+        {
+            return false;
+        }
+
         size_t token_bytes = static_cast<size_t>(num_tokens) * sizeof(int);
         cudaError_t err = cudaSuccess;
         // Verify preloaded data matches current request to prevent stale tokens
@@ -1415,6 +1536,11 @@ namespace llaminar2
             fprintf(stderr, "[CUDAEmbeddingKernelT] Output GPU pointer is null\n");
             return false;
         }
+        if (validate_gpu_ptrs &&
+            !validateCudaPointerForDevice(d_output, dev, "OUTPUT", /*fail_on_query_error=*/true))
+        {
+            return false;
+        }
 
         // =====================================================================
         // Step 3: Route by embedding table format
@@ -1425,6 +1551,15 @@ namespace llaminar2
         if (embed_fp32 && embed_fp32->isOnGPU())
         {
             float *d_embed = const_cast<float *>(static_cast<const float *>(embed_fp32->gpu_data_ptr()));
+            if (validate_gpu_ptrs &&
+                !validateCudaPointerForDevice(d_embed, dev, "EMBED_FP32", /*fail_on_query_error=*/true))
+            {
+                return false;
+            }
+            if (validate_gpu_ptrs && !checkCudaNoPriorError("EmbedFP32 launch"))
+            {
+                return false;
+            }
             return apply(d_embed, d_token_ids, num_tokens, d_model, d_output, mpi_ctx, device_idx);
         }
 
@@ -1509,8 +1644,30 @@ namespace llaminar2
                 }
             }
 
+            if (validate_gpu_ptrs)
+            {
+                if (!validateCudaPointerForDevice(d_embed_q8, dev, "EMBED_TABLE", /*fail_on_query_error=*/true))
+                {
+                    return false;
+                }
+                if (!checkCudaNoPriorError("EmbedQ8 launch"))
+                {
+                    LOG_ERROR("[CUDAEmbeddingKernelT] EmbedQ8 launch context: dev=" << dev
+                                                                                    << " stream=" << gpu_stream_
+                                                                                    << " d_embed_q8=" << d_embed_q8
+                                                                                    << " d_token_ids=" << static_cast<void *>(d_token_ids)
+                                                                                    << " d_output=" << static_cast<void *>(d_output)
+                                                                                    << " num_tokens=" << num_tokens
+                                                                                    << " d_model=" << d_model
+                                                                                    << " blocks_per_row=" << blocks_per_row
+                                                                                    << " local_vocab_size=" << local_vocab_size
+                                                                                    << " vocab_offset=" << vocab_offset);
+                    return false;
+                }
+            }
+
             // Launch EmbedQ8 kernel
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::EMBEDDING_LOOKUP);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::EMBEDDING_LOOKUP, gpu_stream_);
             err = launch_embedding_lookup_q8(d_embed_q8, d_token_ids, d_output,
                                              num_tokens, d_model,
                                              static_cast<int>(blocks_per_row),
@@ -1520,6 +1677,19 @@ namespace llaminar2
             {
                 fprintf(stderr, "[CUDAEmbeddingKernelT] EmbedQ8 kernel failed: %s\n",
                         cudaGetErrorString(err));
+                if (validate_gpu_ptrs)
+                {
+                    LOG_ERROR("[CUDAEmbeddingKernelT] EmbedQ8 failure context: dev=" << dev
+                                                                                     << " stream=" << gpu_stream_
+                                                                                     << " d_embed_q8=" << d_embed_q8
+                                                                                     << " d_token_ids=" << static_cast<void *>(d_token_ids)
+                                                                                     << " d_output=" << static_cast<void *>(d_output)
+                                                                                     << " num_tokens=" << num_tokens
+                                                                                     << " d_model=" << d_model
+                                                                                     << " blocks_per_row=" << blocks_per_row
+                                                                                     << " local_vocab_size=" << local_vocab_size
+                                                                                     << " vocab_offset=" << vocab_offset);
+                }
                 return false;
             }
             return true;

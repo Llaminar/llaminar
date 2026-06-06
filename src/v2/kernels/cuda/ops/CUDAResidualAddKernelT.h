@@ -78,7 +78,7 @@ namespace llaminar2::cuda
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::FP32] Executing on device " << dev);
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::RESIDUAL_ADD, gpu_stream_);
             return cudaOps_residual_add_fp32(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
         }
 
@@ -171,7 +171,7 @@ namespace llaminar2::cuda
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::BF16] Executing on device " << dev);
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::RESIDUAL_ADD, gpu_stream_);
             return cudaOps_residual_add_bf16(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
         }
 
@@ -263,7 +263,7 @@ namespace llaminar2::cuda
             (void)mpi_ctx;
             int dev = (device_idx >= 0) ? device_idx : device_idx_;
             LOG_DEBUG("[CUDAResidualAddKernelT::FP16] Executing on device " << dev);
-            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::RESIDUAL_ADD);
+            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::RESIDUAL_ADD, gpu_stream_);
             return cudaOps_residual_add_fp16(input, residual, output, static_cast<int>(num_elements), dev, gpu_stream_);
         }
 

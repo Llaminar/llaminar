@@ -319,6 +319,24 @@ namespace llaminar2
         virtual void synchronizeStream(void *stream) = 0;
 
         /**
+         * @brief Synchronize a stream and report whether the synchronization succeeded.
+         *
+         * This is the status-bearing companion to synchronizeStream(). Graph replay
+         * paths should prefer this form so a failed CUDA/HIP stream sync stops
+         * execution at the segment that poisoned the context instead of allowing
+         * a later sampler or transfer to surface the stale error.
+         *
+         * @param stream Stream handle to synchronize. nullptr = legacy default stream (stream 0).
+         * @return true when the stream completed successfully, false when the backend reported an error.
+         * @thread_safety Thread-safe, can be called from any thread
+         */
+        virtual bool synchronizeStreamChecked(void *stream)
+        {
+            synchronizeStream(stream);
+            return true;
+        }
+
+        /**
          * @brief Insert a GPU-side dependency between two streams (non-blocking from CPU)
          * @param dependent_stream Stream that should wait (nullptr = legacy stream 0)
          * @param dependency_stream Stream to wait for (nullptr = legacy stream 0)

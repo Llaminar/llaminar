@@ -568,6 +568,11 @@ namespace llaminar2
 
     void NvidiaDeviceContext::synchronizeStream(void *stream)
     {
+        (void)synchronizeStreamChecked(stream);
+    }
+
+    bool NvidiaDeviceContext::synchronizeStreamChecked(void *stream)
+    {
         // Synchronize a specific stream. nullptr = legacy default stream (stream 0).
         // This is ~10× cheaper than cudaDeviceSynchronize() since it only waits
         // for one stream's work, not all streams on the device.
@@ -577,7 +582,9 @@ namespace llaminar2
         {
             LOG_ERROR("[NvidiaDeviceContext] cudaStreamSynchronize failed: "
                       << cudaGetErrorString(err));
+            return false;
         }
+        return true;
     }
 
     void NvidiaDeviceContext::insertStreamDependency(void *dependent_stream, void *dependency_stream)

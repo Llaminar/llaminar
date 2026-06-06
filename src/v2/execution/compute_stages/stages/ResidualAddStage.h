@@ -48,6 +48,12 @@ namespace llaminar2
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> residual_buffer_id;
             std::optional<BufferId> output_buffer_id;
+
+            // Some graph joins need a capture boundary even though residual add
+            // itself is graph-capturable. MoE combine uses this to keep routed
+            // expert/shared-expert runtime scratch in a preceding segment while
+            // still capturing the combine kernel.
+            bool graph_capture_boundary_before = false;
         };
 
         explicit ResidualAddStage(Params params);
@@ -57,6 +63,10 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
+        bool requiresGraphCaptureSegmentBoundaryBefore() const override
+        {
+            return params_.graph_capture_boundary_before;
+        }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;

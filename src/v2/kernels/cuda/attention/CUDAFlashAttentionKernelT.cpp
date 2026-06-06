@@ -524,7 +524,7 @@ namespace llaminar2
                                                                                             << " num_splits=" << num_splits);
 
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
                     result = cudaFlashAttn_decode_fp32(
                         Q, K, V, output,
                         static_cast<float *>(partial_output_buf_),
@@ -545,7 +545,7 @@ namespace llaminar2
                           << "batch=" << batch_size << " seq_len=" << seq_len << " kv_len=" << kv_len);
 
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_PREFILL, stream_);
                     result = cudaFlashAttn_prefill_fa2(
                         Q, K, V, output,
                         batch_size, seq_len, kv_len,
@@ -881,7 +881,7 @@ namespace llaminar2
 
                     int result;
                     {
-                        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                        CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
                         result = cudaFlashAttn_decode_fp16kv(
                             Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
                             static_cast<float *>(partial_output_buf_),
@@ -935,7 +935,7 @@ namespace llaminar2
 
                         int result;
                         {
-                            CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
                             result = cudaFlashAttn_decode_fp16kv(
                                 Q_ptr + static_cast<size_t>(row) * row_stride,
                                 K_fp16_ptr, V_fp16_ptr,
@@ -962,7 +962,7 @@ namespace llaminar2
 
                 int result;
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_PREFILL, stream_);
                     result = cudaFlashAttn_prefill_fa2_fp16kv(
                         Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
                         batch_size, seq_len, kv_len,
@@ -1000,7 +1000,7 @@ namespace llaminar2
 
                 int result;
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
                     result = cudaFlashAttn_decode_q8_1(
                         Q_ptr, K_q8_ptr, V_q8_ptr, output_ptr,
                         static_cast<float *>(partial_output_buf_),

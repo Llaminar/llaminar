@@ -2528,7 +2528,7 @@ namespace llaminar2
                                { LOG_DEBUG("[CUDAQuantisedGemmKernel] cuBLAS FP16 GEMM path active (Q4_0 native dequant)"); });
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
-                CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::GEMM);
+                CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::GEMM, gpu_stream_);
                 // Lazy-create per-device cuBLAS context
                 if (!impl_->cublas_ctx)
                     impl_->cublas_ctx = cudaCuBLASContext_create(cuda_device_id_);
@@ -2653,7 +2653,7 @@ namespace llaminar2
 
                 // Step 1: Blockwise quantize activations
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::QUANTIZE_ACTIVATIONS);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::QUANTIZE_ACTIVATIONS, gpu_stream_);
                     const bool quantized = d_sums_A_blockwise
                                                ? cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
                                                      d_A, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise,

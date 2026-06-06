@@ -219,6 +219,20 @@ namespace
                executable_source.find("ensureOnDevice (") != std::string::npos;
     }
 
+    bool hasNullStreamCudaKernelProfileScope(const std::string &source)
+    {
+        const auto executable_source = stripCommentsAndStringLiterals(source);
+        return executable_source.find("CUDA_KERNEL_PROFILE_SCOPE(") != std::string::npos ||
+               executable_source.find("CUDA_KERNEL_PROFILE_SCOPE (") != std::string::npos;
+    }
+
+    bool hasUncheckedSynchronizeStreamCall(const std::string &source)
+    {
+        const auto executable_source = stripCommentsAndStringLiterals(source);
+        return executable_source.find("->synchronizeStream(") != std::string::npos ||
+               executable_source.find("->synchronizeStream (") != std::string::npos;
+    }
+
     bool isSourceFile(const std::filesystem::path &path)
     {
         const auto extension = path.extension().string();
@@ -306,6 +320,62 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExp
     EXPECT_GE(active_ids->size_bytes, static_cast<size_t>(num_experts) * sizeof(int));
     EXPECT_GT(static_cast<size_t>(num_experts), static_cast<size_t>(max_seq_len) * top_k)
         << "fixture must cover the small-token, many-expert regression";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDAKernelProfilingScopesUseExplicitStreams)
+{
+    const auto root = repoRoot();
+    std::vector<std::string> failures;
+    const std::vector<std::filesystem::path> scan_roots = {
+        root / "src/v2/kernels/cuda",
+        root / "src/v2/backends/cuda",
+    };
+
+    for (const auto &scan_root : scan_roots)
+    {
+        for (const auto &entry : std::filesystem::recursive_directory_iterator(scan_root))
+        {
+            if (!entry.is_regular_file() || !isSourceFile(entry.path()))
+                continue;
+            const auto source = readFile(entry.path());
+            if (!hasNullStreamCudaKernelProfileScope(source))
+                continue;
+            failures.push_back(std::filesystem::relative(entry.path(), root).generic_string());
+        }
+    }
+
+    EXPECT_TRUE(failures.empty()) << [&]
+    {
+        std::ostringstream out;
+        out << "CUDA kernel profiling scopes must use CUDA_KERNEL_PROFILE_SCOPE_STREAM(..., stream). "
+               "The null-stream macro records events on CUDA's legacy default stream and can race "
+               "graph-captured stage streams.\n";
+        for (const auto &failure : failures)
+            out << failure << '\n';
+        return out.str();
+    }();
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, PerfStatsExportDoesNotEnableKernelTimingGate)
+{
+    const auto source = readFile(repoRoot() / "src/v2/utils/KernelProfiler.h");
+    const auto kernel_profiler = sliceBetween(source, "class KernelProfiler", "static void setCurrentDevice");
+
+    EXPECT_NE(kernel_profiler.find("PerfStatsCollector::gpuStageEventTimingEnabled()"), std::string::npos)
+        << "KernelProfiler::isEnabled() must use the explicit GPU timing gate.";
+    EXPECT_EQ(kernel_profiler.find("PerfStatsCollector::isEnabled()"), std::string::npos)
+        << "Generic perf JSON/CSV export must stay passive and must not enable kernel/forward timing.";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, GraphCaptureControllerChecksStreamSynchronizeFailures)
+{
+    const auto source = readFile(repoRoot() / "src/v2/execution/local_execution/graph/DeviceGraphCaptureController.cpp");
+
+    EXPECT_EQ(hasUncheckedSynchronizeStreamCall(source), false)
+        << "Graph replay/capture synchronization must use synchronizeStreamChecked() so async "
+           "GPU failures are attributed to the graph segment that surfaced them.";
+    EXPECT_NE(source.find("synchronizeStreamChecked("), std::string::npos);
+    EXPECT_NE(source.find("Initial captured launch stream sync failed after segment starting at"), std::string::npos);
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDARingKVCacheGatherHasNoRawAllocationFallback)
@@ -607,4 +677,24 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDAEmbeddingDoesNotUploadDynamicTokens
     EXPECT_NE(apply_tensor.find("isGraphCaptureActive()"), std::string::npos);
     EXPECT_NE(apply_tensor.find("Token IDs were not preloaded before graph capture"), std::string::npos);
     EXPECT_NE(apply_tensor.find("Token ID upload requires an explicit non-null stream"), std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineStartsFreshGraphSegment)
+{
+    const auto residual_source = readFile(repoRoot() / "src/v2/execution/compute_stages/stages/ResidualAddStage.h");
+    EXPECT_NE(residual_source.find("graph_capture_boundary_before"), std::string::npos)
+        << "ResidualAddStage needs an opt-in graph-capture boundary for graph joins such as MoE combine.";
+    EXPECT_NE(residual_source.find("requiresGraphCaptureSegmentBoundaryBefore()"), std::string::npos);
+
+    const auto graph_source = readFile(repoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp");
+    const auto combine_section = sliceBetween(
+        graph_source,
+        "// Stage 5: Combine expert output + shared expert output",
+        "// Stage 6: Explicit residual");
+
+    EXPECT_NE(combine_section.find("add_params.graph_capture_boundary_before = true"), std::string::npos)
+        << "MoE combine joins routed and shared expert branches and must not be fused into "
+           "the same captured segment as the preceding MoE runtime/scratch stages.";
+    EXPECT_NE(combine_section.find("copy_params.graph_capture_boundary_before = true"), std::string::npos)
+        << "The no-shared-expert copy form of MoE combine has the same graph-boundary contract.";
 }
