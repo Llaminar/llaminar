@@ -48,6 +48,8 @@ Current CUDA dense artifacts:
 - Direct CUDA recurrence and short-conv verifier-row restore regressions now
   pass multi-step replay checks. The remaining blocker is full-graph all-position
   verifier state decode-equivalence, not the low-level restore primitive alone.
+- Focused CUDA stage regressions also prove Q5_1/Q5_K Qwen3.6 gate/up,
+  fused-SwiGLU down, and FP16-KV M=4 attention match single-row decode.
 - CUDA therefore keeps verifier-row shortcuts disabled and uses a
   decode-equivalent sequential greedy verifier. It is correctness-green but still
   slower than baseline because each accepted verifier row pays one-token main

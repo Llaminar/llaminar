@@ -684,8 +684,8 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierStateSnapshotRestoresAcc
     constexpr int n_heads = 2;
     constexpr int d_k = 128;
     constexpr int d_v = 128;
-    constexpr int verifier_len = 4;
-    constexpr int accepted_rows = 2;
+    constexpr int verifier_len = 5;
+    constexpr int accepted_rows = 4;
     constexpr int continuation_row = accepted_rows;
     constexpr int qk_stride = n_heads * d_k;
     constexpr int v_stride = n_heads * d_v;
@@ -1097,7 +1097,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceVerifierRowRestoreMatchesMultiSt
     constexpr int n_heads = 2;
     constexpr int d_k = 128;
     constexpr int d_v = 128;
-    constexpr int accepted_rows = 2;
+    constexpr int accepted_rows = 4;
     constexpr int continuation_rows = 4;
     constexpr int verifier_len = accepted_rows + continuation_rows;
     constexpr int qk_stride = n_heads * d_k;
@@ -1440,7 +1440,7 @@ TEST_F(Test__CUDAGDNPaddedRealLength, ShortConvVerifierRowRestoreMatchesMultiSte
 
     constexpr int channels = 64;
     constexpr int kernel_size = 4;
-    constexpr int accepted_rows = 2;
+    constexpr int accepted_rows = 4;
     constexpr int continuation_rows = 4;
     constexpr int verifier_len = accepted_rows + continuation_rows;
     constexpr int state_floats = channels * (kernel_size - 1);
