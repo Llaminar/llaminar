@@ -70,9 +70,20 @@ CUDA MoE artifact:
   `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
   `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`.
 - The named `vllm_style_spec_decode` hook is now selectable for Phase 13.8
-  development, but deliberately hard-fails until the live target-verifier graph
-  transaction and commit-replay equivalence harness are present. This keeps
-  benchmark counters honest.
+  development. It still hard-fails outside
+  `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`, but under the equivalence harness
+  `DeviceGraphOrchestrator` now runs the live target-verifier candidate:
+  first shifted-row commit, uniform all-position verifier forward, device row
+  sampling, shared metadata build, accepted shifted-row commit, metadata-driven
+  GDN/short-conv restore, and correction-suffix replay. It remains
+  non-promoted until real CUDA/ROCm equivalence/parity/benchmark evidence lands.
+  First dense evidence landed on 2026-06-07: CUDA and ROCm
+  `MTPGreedyMatchesPyTorchDecodeTokens` pass under the candidate/equivalence
+  env, their perf JSON contains `phase138_vllm_style_spec_decode_runs` and
+  `phase138_spec_decode_equivalence_matches`, and CUDA/ROCm
+  `PrefixCacheMTPRestore` also pass under the same env. Benchmark numbers should
+  not be quoted yet because the equivalence harness still runs the stepwise
+  oracle after the candidate.
 - Device-metadata state publication is now green for the first backend slice:
   CUDA and ROCm short-conv/GDN kernels can restore live state from verifier
   snapshot rows selected by graph-facing `committed_state_rows[request_index]`.

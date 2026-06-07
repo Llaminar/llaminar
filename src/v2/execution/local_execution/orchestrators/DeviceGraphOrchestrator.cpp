@@ -7529,19 +7529,308 @@ namespace llaminar2
         }
         if (candidate && std::strcmp(candidate, "vllm_style_spec_decode") == 0)
         {
+            const bool equivalence_check =
+                DebugEnv::isTruthyEnvValue(
+                    std::getenv("LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK"));
+            auto fail_vllm = [&](std::string reason) -> MTPDecodeCatchupGreedyResult
+            {
+                MTPDecodeCatchupGreedyResult result;
+                result.ok = false;
+                result.error = std::move(reason);
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "phase138_vllm_style_spec_decode_failures",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"reason", result.error}});
+                return result;
+            };
+
+            if (!equivalence_check)
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode is not promoted: "
+                    "live target-verifier graph integration and commit-replay "
+                    "equivalence are still required");
+            }
+            if (!state_.isInitialized() ||
+                !state_.device_id.is_gpu() ||
+                state_.batch_size != 1 ||
+                state_.positions.empty())
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode requires initialized single-request GPU state");
+            }
+            if (request.draft_tokens.empty())
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode received no draft tokens");
+            }
+            if (!graph_builder_ || graph_builder_->config().vocab_size <= 0)
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode requires graph config vocab size");
+            }
+
+            const int verifier_base_position = state_.positions[0];
+            if (request.base_sidecar_position >= 0 &&
+                request.base_sidecar_position != verifier_base_position)
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode base position mismatch: request=" +
+                    std::to_string(request.base_sidecar_position) +
+                    " runner=" + std::to_string(verifier_base_position));
+            }
+
             MTPDecodeCatchupGreedyResult result;
-            result.ok = false;
-            result.error =
-                "Phase 13.8 vllm_style_spec_decode is not promoted: "
-                "live target-verifier graph integration and commit-replay "
-                "equivalence are still required";
+            bool all_position_enabled = false;
+            auto disable_all_position = [&]() -> bool
+            {
+                if (!all_position_enabled)
+                    return true;
+                const bool disabled = setComputeAllPositionLogits(false);
+                if (disabled)
+                    all_position_enabled = false;
+                return disabled;
+            };
+            auto fail_after_enable = [&](std::string reason) -> MTPDecodeCatchupGreedyResult
+            {
+                (void)disable_all_position();
+                return fail_vllm(std::move(reason));
+            };
+
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_initial_shifted_commit",
+                    "decode",
+                    state_.device_id.toString());
+                if (!commitMTPShiftedRowFromCurrentTerminalHidden(
+                        request.draft_tokens.front(),
+                        /*already_appended_tokens=*/0,
+                        request.allow_speculative_discard,
+                        verifier_base_position))
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode initial shifted-cache commit failed");
+                }
+            }
+
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_enable_all_position_logits",
+                    "decode",
+                    state_.device_id.toString());
+                all_position_enabled = setComputeAllPositionLogits(true);
+            }
+            if (!all_position_enabled)
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode could not enable all-position logits");
+            }
+
+            bool verifier_forward_ok = false;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_verifier_forward",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"tokens", std::to_string(request.draft_tokens.size())}});
+                verifier_forward_ok = forward(
+                                          request.draft_tokens.data(),
+                                          static_cast<int>(request.draft_tokens.size()),
+                                          1) != nullptr;
+            }
+            if (!verifier_forward_ok)
+            {
+                return fail_after_enable(
+                    "Phase 13.8 vllm_style_spec_decode verifier forward failed");
+            }
+
+            std::vector<int32_t> sampled_verifier_tokens(
+                request.draft_tokens.size(),
+                -1);
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_verifier_sample_rows",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"rows", std::to_string(sampled_verifier_tokens.size())}});
+                if (!sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                        0,
+                        static_cast<int>(sampled_verifier_tokens.size()),
+                        sampled_verifier_tokens.data()))
+                {
+                    return fail_after_enable(
+                        "Phase 13.8 vllm_style_spec_decode verifier-row sampling failed");
+                }
+            }
+            if (!disable_all_position())
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode could not disable all-position logits");
+            }
+
+            result = buildMTPDecodeCatchupGreedyResultFromVerifierRows(
+                request,
+                sampled_verifier_tokens);
+            if (!result.ok)
+            {
+                return fail_vllm(result.error);
+            }
+
+            MTPSpecDecodeMetadataShape metadata_shape;
+            metadata_shape.max_requests = 1;
+            metadata_shape.max_draft_tokens =
+                static_cast<int>(request.draft_tokens.size());
+            MTPSpecDecodeMetadataBatch metadata =
+                buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+                    metadata_shape,
+                    /*request_id=*/0,
+                    graph_builder_->config().vocab_size,
+                    request,
+                    result);
+            if (!metadata.ok || metadata.committed_state_rows.empty())
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode metadata build failed: " +
+                    metadata.error);
+            }
+
+            const int target_verifier_state_commit_count =
+                result.target_verifier_state_commit_count >= 0
+                    ? result.target_verifier_state_commit_count
+                    : static_cast<int>(result.accepted_tokens.size());
+            if (target_verifier_state_commit_count <= 0 ||
+                target_verifier_state_commit_count >
+                    static_cast<int>(request.draft_tokens.size()) ||
+                target_verifier_state_commit_count >
+                    static_cast<int>(result.accepted_tokens.size()))
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode selected invalid verifier state commit count");
+            }
+
+            if (target_verifier_state_commit_count > 1)
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_shifted_prefix_commit",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"tokens", std::to_string(target_verifier_state_commit_count)}});
+                if (!commitMTPShiftedRowsFromPartialForward(
+                        result.accepted_tokens.data(),
+                        target_verifier_state_commit_count,
+                        /*already_appended_tokens=*/1,
+                        /*main_forward_token_count=*/
+                        static_cast<int>(request.draft_tokens.size()),
+                        request.allow_speculative_discard,
+                        verifier_base_position))
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode shifted prefix commit failed");
+                }
+            }
+
+            const int target_cached_tokens =
+                verifier_base_position + target_verifier_state_commit_count;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_restore_metadata_state",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"target_cached_tokens", std::to_string(target_cached_tokens)},
+                     {"state_commit_count",
+                      std::to_string(target_verifier_state_commit_count)}});
+                if (!restoreMTPVerifierStateFromSpecDecodeMetadata(
+                        metadata,
+                        /*request_index=*/0,
+                        target_cached_tokens))
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode metadata state restore failed");
+                }
+            }
+
+            const int suffix_start = target_verifier_state_commit_count;
+            const int suffix_count =
+                static_cast<int>(result.accepted_tokens.size()) - suffix_start;
+            if (suffix_count < 0)
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode selected invalid suffix replay range");
+            }
+            if (suffix_count > 0)
+            {
+                if (!selectMTPTerminalHiddenRow(
+                        target_verifier_state_commit_count - 1,
+                        static_cast<int>(request.draft_tokens.size())))
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode failed to select suffix base hidden row");
+                }
+
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_suffix_replay",
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"tokens", std::to_string(suffix_count)}});
+                for (int i = suffix_start;
+                     i < static_cast<int>(result.accepted_tokens.size());
+                     ++i)
+                {
+                    const int32_t token =
+                        result.accepted_tokens[static_cast<size_t>(i)];
+                    if (!commitMTPShiftedRowFromCurrentTerminalHidden(
+                            token,
+                            i,
+                            request.allow_speculative_discard,
+                            verifier_base_position))
+                    {
+                        return fail_vllm(
+                            "Phase 13.8 vllm_style_spec_decode shifted suffix commit failed");
+                    }
+                    if (!forward(&token, 1, 1))
+                    {
+                        return fail_vllm(
+                            "Phase 13.8 vllm_style_spec_decode suffix replay forward failed");
+                    }
+                    ++result.main_forward_token_count;
+                }
+
+                if (!result.stopped_on_output)
+                {
+                    int32_t ready = sampleGreedyOnDevice();
+                    if (ready < 0 && sample_after_forward)
+                        ready = sample_after_forward();
+                    if (ready < 0)
+                    {
+                        return fail_vllm(
+                            "Phase 13.8 vllm_style_spec_decode suffix ready-token sample failed");
+                    }
+                    result.ready_token = ready;
+                }
+            }
+
             PerfStatsCollector::addCounter(
                 "mtp",
-                "phase138_vllm_style_spec_decode_not_promoted",
+                "phase138_vllm_style_spec_decode_runs",
                 1.0,
                 "decode",
                 state_.device_id.toString(),
-                {{"reason", "live_verifier_transaction_missing"}});
+                {{"draft_tokens", std::to_string(request.draft_tokens.size())},
+                 {"accepted_tokens", std::to_string(result.accepted_tokens.size())},
+                 {"state_commit_count",
+                  std::to_string(target_verifier_state_commit_count)},
+                 {"suffix_replay_tokens", std::to_string(suffix_count)}});
+
             return result;
         }
 

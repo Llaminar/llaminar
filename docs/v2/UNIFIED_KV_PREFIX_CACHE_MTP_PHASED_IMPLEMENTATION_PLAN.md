@@ -2371,7 +2371,7 @@ falling back or partially publishing state.
 
 - The design pivot is accepted. Phase 13.8 is now a vLLM-style transaction port, not a free-form shortcut search.
 - Tier 0 is already implemented: `MTPDecodeCatchup` owns the common sequential accept/reject oracle and `OrchestrationRunner` routes stateful CUDA/ROCm verification through `shared_stepwise`.
-- The named optimized-hook scaffold already exists on `IInferenceRunner`. `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` now selects the explicit Phase 13.8 hook name, but the hook hard-fails as not promoted until the live target-verifier graph path and commit-replay equivalence harness are in place.
+- The named optimized-hook scaffold already exists on `IInferenceRunner`. `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` now selects the explicit Phase 13.8 hook name. Outside `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1` it still hard-fails as not promoted; inside the equivalence harness, `DeviceGraphOrchestrator` runs the live target-verifier candidate so it can be compared against `shared_stepwise` before any production promotion.
 - Retired candidate evidence remains binding:
   - sidecar-chain verifier state is not decode-equivalent on focused ROCm/generic and CUDA Qwen3.6 dense tests;
   - naive all-position selected-state restore is unsafe because CUDA and ROCm long-prefix tests prove continuation drift even when row logits/tokens look plausible.
@@ -2394,6 +2394,30 @@ falling back or partially publishing state.
   through the accepted input prefix until the correction suffix is replayed.
   Focused validation passed on 2026-06-07 for `V2_Unit_MTPDecodeCatchup` and
   `V2_Unit_MTPSpecDecodeMetadata`.
+- First live target-verifier DGO candidate is implemented behind the equivalence
+  gate: it commits the first shifted MTP row from the condition terminal hidden,
+  enables all-position logits, runs the uniform verifier forward over `D + 1`
+  rows, samples verifier rows on the device, builds shared spec-decode metadata,
+  commits accepted shifted MTP rows from verifier hidden rows, restores GDN /
+  short-conv state from graph-facing committed-state metadata, replays any
+  correction suffix before publishing decode-equivalent state, and records
+  `mtp.phase138_vllm_style_spec_decode_runs`. It is still non-promoted and must
+  pass real CUDA/ROCm equivalence, parity, and benchmark gates before becoming a
+  production path. Focused validation passed on 2026-06-07 for
+  `V2_Unit_DeviceGraphOrchestrator`, `V2_Unit_PrefillDecodeTransition`,
+  `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
+  `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_MTPStateTransaction`.
+- Real dense SingleDevice parity has first candidate-equivalence evidence:
+  with `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` and
+  `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1`, CUDA and ROCm
+  `MTPGreedyMatchesPyTorchDecodeTokens` both pass and their perf JSON contains
+  `decode_equivalent_optimized_catchup_selected`,
+  `phase138_vllm_style_spec_decode_runs`, and
+  `phase138_spec_decode_equivalence_matches`. Prefix+MTP restore also passes for
+  CUDA and ROCm under the same env. This proves the non-promoted live candidate
+  can match the stepwise oracle on the first dense parity cells; remaining work
+  is broader accept/reject/stop/depth coverage, promotion safety, and benchmark
+  measurement without the oracle replay.
 - Next implementation gate: build the live target-verifier transaction path and
   equivalence harness. The metadata/state-publication primitives are now present,
   so remaining blockers are graph integration, shifted MTP KV commit from
