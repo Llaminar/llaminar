@@ -55,6 +55,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <cstdlib>
 #include <fstream>
 #include <print>
@@ -1893,9 +1894,22 @@ namespace llaminar2
         sidecar_checkpoints.reserve(1);
         bool post_sidecar_checkpoint_requires_verifier_row_restore = false;
         std::optional<PrefixStateSnapshot> optimized_catchup_verifier_base_payload;
+        const bool runner_supports_phase138_optimized_catchup =
+            runner_->supportsOptimizedMTPDecodeCatchupGreedy();
+        const char *phase138_optimized_catchup_name =
+            runner_supports_phase138_optimized_catchup
+                ? runner_->optimizedMTPDecodeCatchupGreedyName()
+                : nullptr;
+        const bool phase138_vllm_style_candidate =
+            phase138_optimized_catchup_name &&
+            std::strcmp(phase138_optimized_catchup_name, "vllm_style_spec_decode") == 0;
+        const bool use_phase138_stochastic_accepted_count_publish =
+            stochastic_verify &&
+            stochastic_device_verify &&
+            phase138_vllm_style_candidate;
         if (!stochastic_verify &&
             !use_sampling_penalties &&
-            runner_->supportsOptimizedMTPDecodeCatchupGreedy())
+            runner_supports_phase138_optimized_catchup)
         {
             PerfStatsCollector::ScopedTimer timer(
                 "mtp",
@@ -1915,6 +1929,18 @@ namespace llaminar2
                 {},
                 {{"cached_tokens",
                   std::to_string(optimized_catchup_verifier_base_payload->cached_tokens)}});
+        }
+        if (use_phase138_stochastic_accepted_count_publish)
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "phase138_stochastic_preserve_base_terminal_hidden",
+                "decode");
+            if (!runner_->preserveMTPBaseTerminalHiddenForSpecDecode())
+            {
+                return fail_after_checkpoint(
+                    "MTP Phase 13.8 stochastic accepted-count path could not preserve base terminal hidden");
+            }
         }
         std::vector<std::vector<SamplingDistributionEntry>> draft_distributions;
         draft_distributions.reserve(static_cast<size_t>(speculative_draft_count));
@@ -3517,6 +3543,251 @@ namespace llaminar2
                 "decode");
         }
         PerfStatsCollector::addCounter("mtp", "output_tokens", static_cast<double>(accepted_tokens.size()), "decode");
+
+        if (use_phase138_stochastic_accepted_count_publish)
+        {
+            if (original_accepted_count != accepted_tokens.size())
+            {
+                return fail_after_checkpoint(
+                    "MTP Phase 13.8 stochastic accepted-count path does not support token-budget truncation");
+            }
+
+            MTPDecodeCatchupGreedyRequest phase138_request;
+            phase138_request.draft_tokens = draft_tokens;
+            phase138_request.stop_tokens = stop_tokens_;
+            phase138_request.base_sidecar_position = base_sidecar_position;
+            phase138_request.allow_speculative_discard = true;
+            phase138_request.verifier_path = "phase138_stochastic_spec_decode";
+            phase138_request.implementation_name = "vllm_style_spec_decode";
+            phase138_request.verifier_base_checkpoint = &verifier_base_checkpoint;
+
+            MTPDecodeCatchupGreedyResult phase138_result;
+            phase138_result.ok = true;
+            phase138_result.accepted_tokens = accepted_tokens;
+            phase138_result.verifier_tokens = verifier_tokens;
+            phase138_result.all_speculative_accepted = all_speculative_accepted;
+            phase138_result.stopped_on_output = result.is_complete;
+            phase138_result.accepted_speculative_prefix =
+                accepted_speculative_prefix;
+            phase138_result.rejected_verified_token = rejected_verified_token;
+            phase138_result.main_forward_token_count =
+                static_cast<int>(draft_tokens.size());
+            phase138_result.shifted_commit_count =
+                static_cast<int>(accepted_tokens.size());
+            phase138_result.target_verifier_state_commit_count =
+                std::min<int>(
+                    static_cast<int>(draft_tokens.size()),
+                    std::max(1, accepted_speculative_prefix + 1));
+
+            if (all_speculative_accepted && !result.is_complete)
+            {
+                const int terminal_row = static_cast<int>(draft_tokens.size()) - 1;
+                phase138_result.ready_token =
+                    terminal_row >= 0 &&
+                            terminal_row < static_cast<int>(sampled_verifier_tokens.size())
+                        ? sampled_verifier_tokens[static_cast<size_t>(terminal_row)]
+                        : -1;
+                if (phase138_result.ready_token < 0)
+                {
+                    return fail_after_checkpoint(
+                        "MTP Phase 13.8 stochastic accepted-count path could not read terminal ready token");
+                }
+            }
+
+            MTPSpecDecodeMetadataShape metadata_shape;
+            metadata_shape.max_requests = 1;
+            metadata_shape.max_draft_tokens =
+                static_cast<int>(draft_tokens.size());
+            MTPSpecDecodeMetadataBatch metadata =
+                buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+                    metadata_shape,
+                    /*request_id=*/0,
+                    vocab,
+                    phase138_request,
+                    phase138_result);
+            if (!metadata.ok || metadata.accepted_state_slot_indices.empty())
+            {
+                return fail_after_checkpoint(
+                    std::string("MTP Phase 13.8 stochastic metadata build failed: ") +
+                    metadata.error);
+            }
+
+            const int target_verifier_state_commit_count =
+                phase138_result.target_verifier_state_commit_count;
+            const int target_cached_tokens =
+                base_sidecar_position + target_verifier_state_commit_count;
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_stochastic_restore_metadata_state",
+                    "decode",
+                    {},
+                    {{"target_cached_tokens", std::to_string(target_cached_tokens)},
+                     {"state_commit_count",
+                      std::to_string(target_verifier_state_commit_count)}});
+                if (!runner_->restoreMTPVerifierStateFromSpecDecodeMetadata(
+                        metadata,
+                        /*request_index=*/0,
+                        target_cached_tokens))
+                {
+                    return fail_after_checkpoint(
+                        "MTP Phase 13.8 stochastic metadata state publication failed");
+                }
+            }
+
+            if (!runner_->commitMTPShiftedRowFromPreservedBaseTerminalHidden(
+                    accepted_tokens.front(),
+                    /*allow_speculative_discard=*/true,
+                    base_sidecar_position))
+            {
+                return fail_after_checkpoint(
+                    "MTP Phase 13.8 stochastic preserved-base shifted commit failed");
+            }
+
+            if (target_verifier_state_commit_count > 1)
+            {
+                if (!runner_->commitMTPShiftedRowsFromPartialForward(
+                        accepted_tokens.data(),
+                        target_verifier_state_commit_count,
+                        /*already_appended_tokens=*/1,
+                        /*main_forward_token_count=*/target_verifier_state_commit_count,
+                        /*allow_speculative_discard=*/true,
+                        base_sidecar_position))
+                {
+                    return fail_after_checkpoint(
+                        "MTP Phase 13.8 stochastic shifted prefix commit failed");
+                }
+            }
+
+            if (metadata.correction_replay_start_indices.empty() ||
+                metadata.correction_replay_counts.empty())
+            {
+                return fail_after_checkpoint(
+                    "MTP Phase 13.8 stochastic metadata did not provide correction suffix plan");
+            }
+            const int suffix_start = metadata.correction_replay_start_indices.front();
+            const int suffix_count = metadata.correction_replay_counts.front();
+            if (suffix_count < 0 ||
+                suffix_count > static_cast<int>(accepted_tokens.size()) ||
+                (suffix_count > 0 &&
+                 (suffix_start < 0 ||
+                  suffix_start + suffix_count >
+                      static_cast<int>(accepted_tokens.size()))))
+            {
+                return fail_after_checkpoint(
+                    "MTP Phase 13.8 stochastic metadata selected invalid correction suffix");
+            }
+
+            std::optional<int32_t> phase138_ready_token;
+            if (suffix_count > 0 && !result.is_complete)
+            {
+                for (int suffix_row = 0; suffix_row < suffix_count; ++suffix_row)
+                {
+                    const int token_index = suffix_start + suffix_row;
+                    const int32_t suffix_token =
+                        accepted_tokens[static_cast<size_t>(token_index)];
+                    if (!runner_->commitMTPShiftedRowFromCurrentTerminalHidden(
+                            suffix_token,
+                            token_index,
+                            /*allow_speculative_discard=*/true,
+                            base_sidecar_position))
+                    {
+                        return fail_after_checkpoint(
+                            "MTP Phase 13.8 stochastic shifted correction commit failed");
+                    }
+                    int suffix_forward_token = static_cast<int>(suffix_token);
+                    if (!runner_->forward(&suffix_forward_token, 1))
+                    {
+                        return fail_after_checkpoint(
+                            "MTP Phase 13.8 stochastic correction suffix forward failed");
+                    }
+                    ++phase138_result.main_forward_token_count;
+                }
+
+                Sampler ready_penalty_sampler = sampler_;
+                for (int32_t token : accepted_tokens)
+                    ready_penalty_sampler.record_token(token);
+                auto penalty_map =
+                    ready_penalty_sampler.compute_penalty_map(
+                        active_sampling_params_,
+                        vocab);
+                if (!runner_->applyPenaltiesOnDevice(penalty_map, vocab))
+                {
+                    return fail_after_checkpoint(
+                        "MTP Phase 13.8 stochastic ready-token penalty application failed");
+                }
+                if (!runner_->buildStochasticDistributionOnDevice(
+                        DeviceLogitsSource::Main,
+                        0,
+                        DeviceDistributionBuffer::Target,
+                        0,
+                        active_sampling_params_,
+                        vocab))
+                {
+                    return fail_after_checkpoint(
+                        "MTP Phase 13.8 stochastic ready-token distribution build failed");
+                }
+                const int32_t sampled_ready =
+                    runner_->sampleStochasticDistributionOnDevice(
+                        DeviceDistributionBuffer::Target,
+                        0,
+                        sampler_.random_uniform_01());
+                if (sampled_ready < 0)
+                {
+                    return fail_after_checkpoint(
+                        "MTP Phase 13.8 stochastic ready-token sample failed");
+                }
+                phase138_ready_token = sampled_ready;
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "phase138_stochastic_correction_ready_samples",
+                    1.0,
+                    "decode");
+            }
+            else if (!result.is_complete && phase138_result.ready_token >= 0)
+            {
+                phase138_ready_token = phase138_result.ready_token;
+            }
+
+            if (auto tx_error = validate_spec_decode_transaction(
+                    "phase138_stochastic_spec_decode",
+                    "vllm_style_spec_decode",
+                    draft_tokens,
+                    accepted_tokens,
+                    phase138_ready_token,
+                    all_speculative_accepted,
+                    result.is_complete,
+                    accepted_speculative_prefix))
+            {
+                return fail_after_checkpoint(*tx_error);
+            }
+            if (auto commit_error = commit_mtp_transaction_outputs(
+                    "phase138_stochastic_spec_decode",
+                    verifier_base_checkpoint,
+                    accepted_tokens,
+                    phase138_ready_token,
+                    /*terminal_logits_ready=*/!result.is_complete &&
+                        phase138_ready_token.has_value(),
+                    result.is_complete,
+                    PrefixStateProvenance::DecodeEquivalent,
+                    /*state_advanced=*/true))
+            {
+                return fail_after_checkpoint(*commit_error);
+            }
+
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "phase138_stochastic_spec_decode_runs",
+                1.0,
+                "decode",
+                {},
+                {{"draft_tokens", std::to_string(draft_tokens.size())},
+                 {"accepted_tokens", std::to_string(accepted_tokens.size())},
+                 {"state_commit_count",
+                  std::to_string(target_verifier_state_commit_count)},
+                 {"suffix_tokens", std::to_string(suffix_count)}});
+            return result;
+        }
 
         if (verifier_state_matches_output)
         {

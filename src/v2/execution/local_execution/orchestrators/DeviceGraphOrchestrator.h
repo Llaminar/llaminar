@@ -1528,6 +1528,11 @@ namespace llaminar2
             int already_appended_tokens,
             bool allow_speculative_discard = false,
             int position_offset_override = -1) override;
+        bool preserveMTPBaseTerminalHiddenForSpecDecode() override;
+        bool commitMTPShiftedRowFromPreservedBaseTerminalHidden(
+            int32_t token,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
         const float *mtpLogits() const override;
         bool setComputeAllPositionLogits(bool enabled) override;
         const float *getAllPositionLogits() const override;
@@ -2733,15 +2738,6 @@ namespace llaminar2
 
         /// Execute the cached graph-native row select used for MTP terminal hidden refresh.
         bool executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len);
-
-        /// Preserve PREFIX_TERMINAL_HIDDEN into an isolated sidecar input row.
-        bool preserveMTPBaseTerminalHidden();
-
-        /// Commit one shifted row using the preserved base terminal hidden row.
-        bool commitMTPShiftedRowFromPreservedBaseTerminalHidden(
-            int32_t token,
-            bool allow_speculative_discard,
-            int position_offset_override);
 
         /// Execute a cached graph-native hidden row select into an MTP buffer.
         bool executeMTPHiddenRowSelect(

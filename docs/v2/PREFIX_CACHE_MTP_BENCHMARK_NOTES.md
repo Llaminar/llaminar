@@ -47,10 +47,11 @@ plan carries detailed implementation status.
   accepted-prefix state, committing shifted rows, forwarding the correction
   suffix, and sampling a ready token. Rejected/no-ready results hard-fail, and
   the removed shared-stepwise fallback path is gone.
-- Source-owned parity covers CUDA/ROCm depth-3 normal decode, stochastic MTP,
-  depth-1 prefix restore, stop-token, continuation, reject, and benchmark-style
-  Phase 13.8 cells. MoE, TP/PP, chained-prefix, and stochastic benchmark
-  evidence remain pending.
+- Source-owned parity covers CUDA/ROCm depth-3 normal decode, depth-1 prefix
+  restore, stop-token, continuation, reject, benchmark-style, and stochastic
+  Phase 13.8 cells. Stochastic parity explicitly selects the accepted-count
+  candidate and records `phase138_stochastic_spec_decode_runs`; stochastic
+  benchmark evidence, MoE, TP/PP, and chained-prefix remain pending.
 
 ## llama.cpp CUDA Anchors
 

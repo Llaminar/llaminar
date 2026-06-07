@@ -3962,7 +3962,7 @@ namespace llaminar2
             seq_len);
     }
 
-    bool DeviceGraphOrchestrator::preserveMTPBaseTerminalHidden()
+    bool DeviceGraphOrchestrator::preserveMTPBaseTerminalHiddenForSpecDecode()
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
             return true;
@@ -7966,7 +7966,7 @@ namespace llaminar2
                     "phase138_vllm_style_preserve_base_terminal_hidden",
                     "decode",
                     state_.device_id.toString());
-                if (!preserveMTPBaseTerminalHidden())
+                if (!preserveMTPBaseTerminalHiddenForSpecDecode())
                 {
                     return fail_vllm(
                         "Phase 13.8 vllm_style_spec_decode could not preserve base terminal hidden");

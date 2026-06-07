@@ -3950,6 +3950,8 @@ namespace llaminar2::test::parity::qwen36
             {"LLAMINAR_GPU_GRAPHS", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "0"},
             {"LLAMINAR_ROCM_CONCURRENT_M2_ROWS", "0"},
+            {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
 
         std::string model_path;
@@ -3990,8 +3992,12 @@ namespace llaminar2::test::parity::qwen36
         auto mtp = factory->createFromOrchestrationConfig(mtp_config);
         ASSERT_NE(mtp, nullptr);
         ASSERT_TRUE(mtp->initialize()) << mtp->lastError();
+        PerfStatsCollector::reset();
+        ASSERT_TRUE(PerfStatsCollector::isEnabled())
+            << "Phase 13.8 stochastic candidate parity requires perf stats";
         auto mtp_result = mtp->generate(prompt_tokens, stochastic_decode_steps, stochastic);
         const auto after_mtp = mtp->prefixStateProbe();
+        const auto phase138_records = PerfStatsCollector::snapshot({"mtp"});
         mtp->shutdown();
 
         ASSERT_TRUE(mtp_result.error.empty()) << mtp_result.error;
@@ -4033,6 +4039,21 @@ namespace llaminar2::test::parity::qwen36
                         expected_rate,
                         1e-12);
         }
+
+        const bool used_phase138_stochastic_candidate =
+            std::any_of(
+                phase138_records.begin(),
+                phase138_records.end(),
+                [](const PerfStatRecord &record)
+                {
+                    return record.kind == PerfStatRecord::Kind::Counter &&
+                           record.domain == "mtp" &&
+                           record.name == "phase138_stochastic_spec_decode_runs";
+                });
+        EXPECT_TRUE(used_phase138_stochastic_candidate)
+            << "Stochastic MTP parity must exercise the Phase 13.8 "
+               "accepted-count candidate\n"
+            << PerfStatsCollector::summaryString({"mtp"});
     }
 
 } // namespace llaminar2::test::parity::qwen36

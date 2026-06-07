@@ -411,6 +411,34 @@ namespace llaminar2
             return false;
         }
 
+        /**
+         * @brief Preserve the current target terminal hidden for accepted-count
+         *        spec-decode publication.
+         *
+         * The vLLM-style accepted-count path may run a verifier graph before it
+         * knows how many rows will be committed. It needs an isolated copy of the
+         * base terminal hidden so it can rebuild the first shifted MTP row after
+         * publishing accepted target state and discarding speculative shifted rows.
+         */
+        virtual bool preserveMTPBaseTerminalHiddenForSpecDecode()
+        {
+            return false;
+        }
+
+        /**
+         * @brief Append the first shifted MTP row from the preserved base hidden.
+         */
+        virtual bool commitMTPShiftedRowFromPreservedBaseTerminalHidden(
+            int32_t token,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1)
+        {
+            (void)token;
+            (void)allow_speculative_discard;
+            (void)position_offset_override;
+            return false;
+        }
+
         virtual const float *mtpLogits() const
         {
             return nullptr;
