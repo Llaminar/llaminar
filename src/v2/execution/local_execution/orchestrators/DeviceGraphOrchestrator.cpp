@@ -7918,25 +7918,6 @@ namespace llaminar2
                     " runner=" + std::to_string(verifier_base_position));
             }
 
-            PrefixStateSnapshot local_rejection_replay_base;
-            const PrefixStateSnapshot *rejection_replay_base =
-                request.verifier_base_checkpoint;
-            if (!rejection_replay_base || !rejection_replay_base->valid)
-            {
-                PerfStatsCollector::ScopedTimer timer(
-                    "mtp",
-                    "phase138_vllm_style_capture_base_for_rejection_replay",
-                    "decode",
-                    state_.device_id.toString());
-                local_rejection_replay_base = captureLivePrefixState();
-                rejection_replay_base = &local_rejection_replay_base;
-            }
-            if (!rejection_replay_base || !rejection_replay_base->valid)
-            {
-                return fail_vllm(
-                    "Phase 13.8 vllm_style_spec_decode could not capture verifier base for rejection replay");
-            }
-
             MTPDecodeCatchupGreedyResult result;
             std::ostringstream debug_trace;
             auto append_debug_state = [&](const char *label)
@@ -8058,81 +8039,6 @@ namespace llaminar2
             {
                 return fail_vllm(result.error);
             }
-            if (!result.all_speculative_accepted)
-            {
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "phase138_vllm_style_rejections_replayed_stepwise",
-                    1.0,
-                    "decode",
-                    state_.device_id.toString(),
-                    {{"draft_tokens", std::to_string(request.draft_tokens.size())},
-                     {"accepted_prefix",
-                      std::to_string(result.accepted_speculative_prefix)}});
-                if (!restoreLivePrefixState(*rejection_replay_base))
-                {
-                    return fail_vllm(
-                        "Phase 13.8 vllm_style_spec_decode could not restore verifier base for rejection replay");
-                }
-                if (forward_engine_)
-                {
-                    forward_engine_->discardAllCachedGraphs();
-                    PerfStatsCollector::addCounter(
-                        "mtp",
-                        "phase138_vllm_style_rejection_replay_forward_graph_discards",
-                        1.0,
-                        "decode",
-                        state_.device_id.toString());
-                }
-                resetKernelDynamicState();
-                PerfStatsCollector::addCounter(
-                    "mtp",
-                    "phase138_vllm_style_rejection_replay_dynamic_state_resets",
-                    1.0,
-                    "decode",
-                    state_.device_id.toString());
-
-                MTPDecodeCatchupGreedyRequest replay_request = request;
-                replay_request.implementation_name =
-                    "vllm_style_spec_decode_rejection_replay";
-                replay_request.verifier_path =
-                    "phase138_vllm_style_rejection_replay";
-                auto replay_sample_on_device = [&]() -> int32_t
-                {
-                    return sampleGreedyOnDevice();
-                };
-                MTPDecodeCatchupGreedyResult replay =
-                    runSharedStepwiseMTPDecodeCatchupGreedy(
-                        *this,
-                        replay_request,
-                        replay_sample_on_device);
-                if (!replay.ok)
-                {
-                    return fail_vllm(replay.error);
-                }
-
-                std::ostringstream replay_trace;
-                replay_trace
-                    << "batched_candidate_rejected=true"
-                    << "; batched_verifier_tokens="
-                    << [&]()
-                       {
-                           std::string out;
-                           for (size_t i = 0; i < result.verifier_tokens.size(); ++i)
-                           {
-                               if (i > 0)
-                                   out += ",";
-                               out += std::to_string(result.verifier_tokens[i]);
-                           }
-                           return out;
-                       }()
-                    << "; replayed_stepwise=true";
-                if (!debug_trace.str().empty())
-                    replay_trace << "; batched_debug={" << debug_trace.str() << "}";
-                replay.debug_trace = replay_trace.str();
-                return replay;
-            }
-
             MTPSpecDecodeMetadataShape metadata_shape;
             metadata_shape.max_requests = 1;
             metadata_shape.max_draft_tokens =
@@ -8251,31 +8157,87 @@ namespace llaminar2
             }
             if (suffix_count > 0)
             {
-                {
-                    PerfStatsCollector::ScopedTimer timer(
-                        "mtp",
-                        "phase138_vllm_style_shifted_correction_commit",
-                        "decode",
-                        state_.device_id.toString(),
-                        {{"suffix_start", std::to_string(suffix_start)},
-                         {"suffix_tokens", std::to_string(suffix_count)}});
-                    for (int suffix_row = 0; suffix_row < suffix_count; ++suffix_row)
-                    {
-                        const int token_index = suffix_start + suffix_row;
-                        if (!commitMTPShiftedRowFromCurrentTerminalHidden(
-                                result.accepted_tokens[static_cast<size_t>(token_index)],
-                                token_index,
-                                request.allow_speculative_discard,
-                                verifier_base_position))
-                        {
-                            return fail_vllm(
-                                "Phase 13.8 vllm_style_spec_decode shifted correction commit failed");
-                        }
-                    }
-                }
                 result.ready_token = -1;
                 result.shifted_commit_count =
                     target_verifier_state_commit_count + suffix_count;
+                if (!result.stopped_on_output)
+                {
+                    for (int suffix_row = 0; suffix_row < suffix_count; ++suffix_row)
+                    {
+                        const int token_index = suffix_start + suffix_row;
+                        int32_t suffix_token =
+                            result.accepted_tokens[static_cast<size_t>(token_index)];
+                        {
+                            PerfStatsCollector::ScopedTimer timer(
+                                "mtp",
+                                "phase138_vllm_style_shifted_correction_commit",
+                                "decode",
+                                state_.device_id.toString(),
+                                {{"token_index", std::to_string(token_index)},
+                                 {"suffix_row", std::to_string(suffix_row)}});
+                            if (!commitMTPShiftedRowFromCurrentTerminalHidden(
+                                    suffix_token,
+                                    token_index,
+                                    request.allow_speculative_discard,
+                                    verifier_base_position))
+                            {
+                                return fail_vllm(
+                                    "Phase 13.8 vllm_style_spec_decode shifted correction commit failed");
+                            }
+                        }
+                        if (PerfStatsCollector::isEnabled())
+                        {
+                            PerfStatsCollector::addCounter(
+                                "mtp",
+                                "phase138_vllm_style_correction_forward_tokens",
+                                1.0,
+                                "decode",
+                                state_.device_id.toString(),
+                                {{"token_index", std::to_string(token_index)},
+                                 {"suffix_row", std::to_string(suffix_row)}});
+                        }
+                        bool suffix_forward_ok = false;
+                        {
+                            PerfStatsCollector::ScopedTimer timer(
+                                "mtp",
+                                "phase138_vllm_style_correction_forward",
+                                "decode",
+                                state_.device_id.toString(),
+                                {{"token_index", std::to_string(token_index)}});
+                            const int suffix_forward_token =
+                                static_cast<int>(suffix_token);
+                            suffix_forward_ok =
+                                DeviceGraphOrchestrator::forward(
+                                    &suffix_forward_token,
+                                    1,
+                                    1) != nullptr;
+                        }
+                        if (!suffix_forward_ok)
+                        {
+                            return fail_vllm(
+                                "Phase 13.8 vllm_style_spec_decode correction suffix forward failed");
+                        }
+                        ++result.main_forward_token_count;
+                    }
+                    int32_t correction_ready = -1;
+                    {
+                        PerfStatsCollector::ScopedTimer timer(
+                            "mtp",
+                            "phase138_vllm_style_correction_ready_sample",
+                            "decode",
+                            state_.device_id.toString());
+                        correction_ready = sample_after_forward
+                                               ? sample_after_forward()
+                                               : sampleGreedyOnDevice();
+                    }
+                    if (correction_ready < 0)
+                    {
+                        return fail_vllm(
+                            "Phase 13.8 vllm_style_spec_decode correction ready-token sample failed");
+                    }
+                    result.ready_token = correction_ready;
+                    debug_trace << "; correction_ready_token=" << correction_ready;
+                }
                 PerfStatsCollector::addCounter(
                     "mtp",
                     "phase138_vllm_style_rejection_deferred_correction_commits",

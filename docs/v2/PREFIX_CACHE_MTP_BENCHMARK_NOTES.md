@@ -21,14 +21,6 @@ plan carries detailed implementation status.
 | MoE default, 595p/64d | ROCm | Qwen3.6 35B A3B | fixed d1 MTP | n/a | 42.04 | 2.13x ratchet |
 | TP / PP / EP overlay | Mixed | Dense and MoE | MTP | Pending | Pending | after single-device promotion |
 
-Artifacts:
-
-- CUDA dense: `/tmp/llaminar-mtp-bench/phase138-accept/dense-cuda-{nomtp,promoted-d3}.json`
-- ROCm dense: `/tmp/llaminar-mtp-bench/phase138-accept/dense-rocm-{nomtp,promoted-d3}.json`
-- Prior direct-gate dense: `/tmp/llaminar-mtp-bench/dense-{cuda,rocm}-phase138-direct-*`
-- ROCm qbf: `/tmp/llaminar-mtp-bench/dense-rocm-phase138-direct-{nomtp,d3}-qbf-c64-n48.json`
-- CUDA MoE: `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`
-
 ## Current Findings
 
 - Phase 13.8 vLLM-style transaction is the active dense SingleDevice GPU
@@ -51,13 +43,14 @@ Artifacts:
   `gdn_speculative_state_slots*` backing buffers plus explicit accepted-count
   publication, with CPU prefix mutation counters distinguishing replay-state
   preservation from kernel-dynamic-state reset.
-- Source-owned parity covers CUDA/ROCm depth-3 normal decode, CUDA
-  benchmark-prompt depth-3, CUDA/ROCm depth-1 prefix restore, and normal
-  CUDA/ROCm stochastic MTP verifier cells through the shared Phase 13.8
-  transaction gate. The latest focused cleanup gate passed the MTP graph/GDN
-  units, CUDA/ROCm GDN padded-length integrations, and CUDA/ROCm candidate
-  equivalence cells. MoE, TP/PP, chained-prefix, stop-token, broader
-  continuation coverage, and stochastic benchmark evidence remain pending.
+- The accepted-count candidate now handles rejected transactions by publishing
+  accepted-prefix state, committing shifted rows, forwarding the correction
+  suffix, and sampling a ready token. Rejected/no-ready results hard-fail, and
+  the removed shared-stepwise fallback path is gone.
+- Source-owned parity covers CUDA/ROCm depth-3 normal decode, stochastic MTP,
+  depth-1 prefix restore, stop-token, continuation, reject, and benchmark-style
+  Phase 13.8 cells. MoE, TP/PP, chained-prefix, and stochastic benchmark
+  evidence remain pending.
 
 ## llama.cpp CUDA Anchors
 

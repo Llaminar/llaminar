@@ -2724,21 +2724,15 @@ namespace llaminar2
                     }
                     else
                     {
-                        const bool candidate_deferred_rejection =
+                        const bool candidate_rejected_without_ready =
                             !candidate.all_speculative_accepted &&
                             !candidate.stopped_on_output &&
                             candidate.ready_token < 0;
-                        PrefixStateSnapshot candidate_live_checkpoint;
-                        if (candidate_deferred_rejection)
+                        if (candidate_rejected_without_ready)
                         {
-                            candidate_live_checkpoint =
-                                runner_->captureLivePrefixState();
-                            if (!candidate_live_checkpoint.valid)
-                            {
-                                catchup.ok = false;
-                                catchup.error =
-                                    "MTP Phase 13.8 equivalence check could not capture vLLM-style candidate state";
-                            }
+                            catchup.ok = false;
+                            catchup.error =
+                                "MTP Phase 13.8 optimized catch-up returned a rejected transaction without a ready token";
                         }
                         if (catchup.error.empty())
                         {
@@ -2773,119 +2767,43 @@ namespace llaminar2
                                 }
                                 else
                                 {
-                                    if (candidate_deferred_rejection)
+                                    MTPDecodeCatchupGreedyEquivalence result_eq =
+                                        compareMTPDecodeCatchupGreedyResults(
+                                            oracle,
+                                            candidate);
+                                    MTPStateValidationResult state_eq =
+                                        compareMTPRuntimeStateSnapshots(
+                                            oracle_state,
+                                            candidate_state);
+                                    if (!result_eq.ok)
                                     {
-                                        auto fail_deferred = [&](std::string reason)
-                                        {
-                                            catchup.ok = false;
-                                            catchup.error =
-                                                std::string("MTP Phase 13.8 vLLM-style deferred-rejection check failed: ") +
-                                                std::move(reason);
-                                        };
-
-                                        const int expected_candidate_position =
-                                            equivalence_base->cached_tokens +
-                                            std::max(0, candidate.target_verifier_state_commit_count);
-                                        if (candidate.accepted_tokens != oracle.accepted_tokens)
-                                        {
-                                            fail_deferred(
-                                                "committed output tokens mismatch: oracle=[" +
-                                                join_tokens(oracle.accepted_tokens) +
-                                                "] candidate=[" +
-                                                join_tokens(candidate.accepted_tokens) + "]");
-                                        }
-                                        else if (candidate.verifier_tokens != oracle.verifier_tokens)
-                                        {
-                                            fail_deferred(
-                                                "verifier tokens mismatch: oracle=[" +
-                                                join_tokens(oracle.verifier_tokens) +
-                                                "] candidate=[" +
-                                                join_tokens(candidate.verifier_tokens) + "]");
-                                        }
-                                        else if (candidate.accepted_speculative_prefix !=
-                                                 oracle.accepted_speculative_prefix)
-                                        {
-                                            fail_deferred("accepted speculative prefix mismatch");
-                                        }
-                                        else if (candidate.rejected_verified_token !=
-                                                 oracle.rejected_verified_token)
-                                        {
-                                            fail_deferred("rejected verified token mismatch");
-                                        }
-                                        else if (candidate.target_verifier_state_commit_count < 0)
-                                        {
-                                            fail_deferred("candidate did not report accepted state commit count");
-                                        }
-                                        else if (candidate_state.current_position !=
-                                                 expected_candidate_position)
-                                        {
-                                            fail_deferred(
-                                                "candidate state position mismatch: expected=" +
-                                                std::to_string(expected_candidate_position) +
-                                                " actual=" +
-                                                std::to_string(candidate_state.current_position));
-                                        }
-                                        else if (!runner_->restoreLivePrefixState(candidate_live_checkpoint))
-                                        {
-                                            fail_deferred(
-                                                "could not restore vLLM-style candidate state after oracle check");
-                                        }
-                                        else
-                                        {
-                                            PerfStatsCollector::addCounter(
-                                                "mtp",
-                                                "phase138_vllm_style_deferred_rejection_matches",
-                                                1.0,
-                                                "decode",
-                                                {},
-                                                {{"implementation", catchup_implementation},
-                                                 {"draft_tokens", std::to_string(draft_tokens.size())},
-                                                 {"candidate_forward_tokens", std::to_string(candidate.main_forward_token_count)},
-                                                 {"oracle_forward_tokens", std::to_string(oracle.main_forward_token_count)},
-                                                 {"state_commit_count", std::to_string(candidate.target_verifier_state_commit_count)}});
-                                            catchup = std::move(candidate);
-                                        }
+                                        catchup.ok = false;
+                                        catchup.error =
+                                            std::string("MTP Phase 13.8 catch-up result equivalence failed: ") +
+                                            result_eq.error +
+                                            "; runtime_state_equivalence=" +
+                                            (state_eq.ok ? std::string("ok") : state_eq.reason);
+                                    }
+                                    else if (!state_eq.ok)
+                                    {
+                                        catchup.ok = false;
+                                        catchup.error =
+                                            std::string("MTP Phase 13.8 runtime state equivalence failed: ") +
+                                            state_eq.reason;
                                     }
                                     else
                                     {
-                                        MTPDecodeCatchupGreedyEquivalence result_eq =
-                                            compareMTPDecodeCatchupGreedyResults(
-                                                oracle,
-                                                candidate);
-                                        MTPStateValidationResult state_eq =
-                                            compareMTPRuntimeStateSnapshots(
-                                                oracle_state,
-                                                candidate_state);
-                                        if (!result_eq.ok)
-                                        {
-                                            catchup.ok = false;
-                                            catchup.error =
-                                                std::string("MTP Phase 13.8 catch-up result equivalence failed: ") +
-                                                result_eq.error +
-                                                "; runtime_state_equivalence=" +
-                                                (state_eq.ok ? std::string("ok") : state_eq.reason);
-                                        }
-                                        else if (!state_eq.ok)
-                                        {
-                                            catchup.ok = false;
-                                            catchup.error =
-                                                std::string("MTP Phase 13.8 runtime state equivalence failed: ") +
-                                                state_eq.reason;
-                                        }
-                                        else
-                                        {
-                                            PerfStatsCollector::addCounter(
-                                                "mtp",
-                                                "phase138_spec_decode_equivalence_matches",
-                                                1.0,
-                                                "decode",
-                                                {},
-                                                {{"implementation", catchup_implementation},
-                                                 {"draft_tokens", std::to_string(draft_tokens.size())},
-                                                 {"candidate_forward_tokens", std::to_string(candidate.main_forward_token_count)},
-                                                 {"oracle_forward_tokens", std::to_string(oracle.main_forward_token_count)}});
-                                            catchup = std::move(oracle);
-                                        }
+                                        PerfStatsCollector::addCounter(
+                                            "mtp",
+                                            "phase138_spec_decode_equivalence_matches",
+                                            1.0,
+                                            "decode",
+                                            {},
+                                            {{"implementation", catchup_implementation},
+                                             {"draft_tokens", std::to_string(draft_tokens.size())},
+                                             {"candidate_forward_tokens", std::to_string(candidate.main_forward_token_count)},
+                                             {"oracle_forward_tokens", std::to_string(oracle.main_forward_token_count)}});
+                                        catchup = std::move(oracle);
                                     }
                                 }
                             }
@@ -2920,11 +2838,15 @@ namespace llaminar2
             const int32_t ready_token = catchup.ready_token;
             const bool stopped_on_output = catchup.stopped_on_output;
             const int main_forward_token_count = catchup.main_forward_token_count;
-            const bool deferred_rejection_without_ready_token =
-                !all_speculative_accepted &&
-                !stopped_on_output &&
-                ready_token < 0;
             result.is_complete = result.is_complete || stopped_on_output;
+
+            if (!all_speculative_accepted &&
+                !stopped_on_output &&
+                ready_token < 0)
+            {
+                return fail_after_checkpoint(
+                    "MTP optimized catch-up returned a rejected transaction without advancing correction state or producing a ready token");
+            }
 
             if (auto tx_error = validate_spec_decode_transaction(
                     "decode_equivalent_sequential_verifier",
@@ -3009,8 +2931,7 @@ namespace llaminar2
                  {"verifier_state_matches_output", "true"},
                  {"verifier_path", "decode_equivalent_catchup"},
                  {"catchup_implementation", catchup_implementation},
-                 {"decode_equivalent_replay_required",
-                  deferred_rejection_without_ready_token ? "deferred_next_step" : "true"},
+                 {"decode_equivalent_replay_required", "true"},
                  {"output_tokens", std::to_string(accepted_tokens.size())},
                  {"ready_token", std::to_string(ready_token)},
                  {"used_ready_logits", use_ready_logits ? "true" : "false"}});
@@ -3036,7 +2957,7 @@ namespace llaminar2
                     /*terminal_logits_ready=*/!stopped_on_output && ready_token >= 0,
                     /*is_complete=*/stopped_on_output,
                     PrefixStateProvenance::DecodeEquivalent,
-                    /*state_advanced=*/!deferred_rejection_without_ready_token))
+                    /*state_advanced=*/true))
             {
                 return fail_after_checkpoint(*commit_error);
             }

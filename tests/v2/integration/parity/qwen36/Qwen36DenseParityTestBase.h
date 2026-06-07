@@ -15,6 +15,7 @@
 #include "kernels/KernelFactory.h"
 #include "loaders/ModelContext.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/Sampler.h"
 #include "utils/Tokenizer.h"
 
@@ -2445,6 +2446,7 @@ namespace llaminar2::test::parity::qwen36
 
         ScopedEnvironmentValues graph_env({
             {"LLAMINAR_GPU_GRAPHS", "1"},
+            {"LLAMINAR_PERF_STATS_SUMMARY", "1"},
         });
 
         std::string model_path;
@@ -2527,6 +2529,9 @@ namespace llaminar2::test::parity::qwen36
                "same state as sequential decode after the first transaction";
 
         ASSERT_TRUE(runner->restoreLivePrefixState(base_checkpoint));
+        PerfStatsCollector::reset();
+        ASSERT_TRUE(PerfStatsCollector::isEnabled())
+            << "Phase 13.8 fallback-counter regression requires perf stats";
         {
             ScopedEnvironmentValues candidate_env({
                 {"LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE", "vllm_style_spec_decode"},
@@ -2544,14 +2549,48 @@ namespace llaminar2::test::parity::qwen36
             const int32_t candidate_next = runner->sampleGreedyOnDevice();
             EXPECT_EQ(candidate_next, expected_tokens[4])
                 << "vLLM-style candidate wrapper must leave the main runner "
-                   "in the same state as sequential decode after replaying a "
-                   "rejected first transaction"
+                   "in the same state as sequential decode after publishing "
+                   "accepted-count state and forwarding the rejected "
+                   "correction suffix"
                 << "\naccepted: "
                 << candidate.accepted_tokens[0] << ','
                 << candidate.accepted_tokens[1] << ','
                 << candidate.accepted_tokens[2]
                 << "\nready token: " << candidate.ready_token
                 << "\nnext after ready: " << candidate_next;
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            auto has_counter = [&](const char *name,
+                                   const char *tag_key = nullptr,
+                                   const char *tag_value = nullptr) -> bool
+            {
+                return std::any_of(
+                    records.begin(),
+                    records.end(),
+                    [&](const PerfStatRecord &record)
+                    {
+                        if (record.kind != PerfStatRecord::Kind::Counter ||
+                            record.domain != "mtp" ||
+                            record.name != name)
+                        {
+                            return false;
+                        }
+                        if (!tag_key)
+                            return true;
+                        auto it = record.tags.find(tag_key);
+                        return it != record.tags.end() &&
+                               it->second == tag_value;
+                    });
+            };
+            EXPECT_TRUE(has_counter("phase138_vllm_style_correction_forward_tokens"))
+                << "Rejected Phase 13.8 transactions must advance main state by "
+                   "forwarding the correction suffix, not by deferring it to "
+                   "the next outer decode step\n"
+                << PerfStatsCollector::summaryString({"mtp"});
+            EXPECT_TRUE(has_counter("phase138_vllm_style_spec_decode_runs",
+                                    "suffix_replay_tokens",
+                                    "1"))
+                << PerfStatsCollector::summaryString({"mtp"});
         }
 
         ASSERT_TRUE(runner->restoreLivePrefixState(base_checkpoint));
