@@ -7464,6 +7464,57 @@ namespace llaminar2
         return restorable_layers > 0;
     }
 
+    bool DeviceGraphOrchestrator::supportsPromotedVllmStyleSpecDecodeSingleDeviceDense() const
+    {
+        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        {
+            return false;
+        }
+        if (!state_.device_id.is_gpu() || state_.batch_size != 1)
+        {
+            return false;
+        }
+        if (!requiresMTPDecodeEquivalentVerifierReplay())
+        {
+            return false;
+        }
+
+        const GraphConfig &cfg = graph_builder_->config();
+        if (cfg.isMoE())
+        {
+            return false;
+        }
+        if (cfg.tp_ctx ||
+            cfg.tp_config ||
+            cfg.multi_domain_tp_config ||
+            cfg.pipeline_config ||
+            !cfg.pp_contexts.empty() ||
+            !cfg.domain_tp_contexts.empty())
+        {
+            return false;
+        }
+        if (cfg.qkv_column_parallel ||
+            cfg.ffn_column_parallel ||
+            cfg.lm_head_column_parallel)
+        {
+            return false;
+        }
+        if (cfg.local_n_heads > 0 && cfg.local_n_heads != cfg.n_heads)
+        {
+            return false;
+        }
+        if (cfg.local_n_kv_heads > 0 && cfg.local_n_kv_heads != cfg.n_kv_heads)
+        {
+            return false;
+        }
+        if (cfg.vocab_local > 0 && cfg.vocab_local != cfg.vocab_size)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
     bool DeviceGraphOrchestrator::supportsOptimizedMTPDecodeCatchupGreedy() const
     {
         if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
@@ -7483,7 +7534,7 @@ namespace llaminar2
             std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
         if (!candidate || !*candidate)
         {
-            return false;
+            return supportsPromotedVllmStyleSpecDecodeSingleDeviceDense();
         }
         return std::strcmp(candidate, "stepwise") == 0 ||
                std::strcmp(candidate, "all_position") == 0 ||
@@ -7501,6 +7552,11 @@ namespace llaminar2
         if (candidate && std::strcmp(candidate, "all_position") == 0)
         {
             return "retired_all_position_state_candidate";
+        }
+        if ((!candidate || !*candidate) &&
+            supportsPromotedVllmStyleSpecDecodeSingleDeviceDense())
+        {
+            return "vllm_style_spec_decode";
         }
         return "device_graph_stepwise";
     }
@@ -7527,7 +7583,11 @@ namespace llaminar2
                 {{"reason", "retired"}});
             return result;
         }
-        if (candidate && std::strcmp(candidate, "vllm_style_spec_decode") == 0)
+        const bool default_promoted_vllm =
+            (!candidate || !*candidate) &&
+            supportsPromotedVllmStyleSpecDecodeSingleDeviceDense();
+        if ((candidate && std::strcmp(candidate, "vllm_style_spec_decode") == 0) ||
+            default_promoted_vllm)
         {
             const bool equivalence_check =
                 DebugEnv::isTruthyEnvValue(
@@ -7550,13 +7610,12 @@ namespace llaminar2
                 return result;
             };
 
-            if (!equivalence_check && !direct_candidate)
+            if (!supportsPromotedVllmStyleSpecDecodeSingleDeviceDense())
             {
                 return fail_vllm(
-                    "Phase 13.8 vllm_style_spec_decode is not promoted: "
-                    "set LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1 for "
-                    "oracle comparison or LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE=1 "
-                    "for explicit benchmark-only direct execution");
+                    "Phase 13.8 vllm_style_spec_decode is promoted only for "
+                    "initialized dense SingleDevice GPU hybrid decode; TP, PP, MoE, "
+                    "multi-request, CPU, and non-hybrid paths remain unsupported");
             }
             if (!state_.isInitialized() ||
                 !state_.device_id.is_gpu() ||
@@ -7866,7 +7925,10 @@ namespace llaminar2
                  {"state_commit_count",
                   std::to_string(target_verifier_state_commit_count)},
                  {"suffix_replay_tokens", std::to_string(suffix_count)},
-                 {"mode", equivalence_check ? "equivalence" : "direct"}});
+                 {"mode",
+                  equivalence_check
+                      ? "equivalence"
+                      : (direct_candidate ? "direct" : "promoted")}});
 
             return result;
         }

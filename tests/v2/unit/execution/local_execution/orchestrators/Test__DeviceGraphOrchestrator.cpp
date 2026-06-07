@@ -890,7 +890,7 @@ TEST_F(Test__DeviceGraphOrchestrator, LogitsReturnsNullptrWhenNotInitialized)
     EXPECT_EQ(orchestrator->logits(), nullptr);
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, VllmStyleSpecDecodeCandidateHardFailsUntilPromoted)
+TEST_F(Test__DeviceGraphOrchestrator, VllmStyleSpecDecodeCandidateHardFailsOutsidePromotedPolicy)
 {
     ScopedEnv candidate(
         "LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE",
@@ -908,11 +908,11 @@ TEST_F(Test__DeviceGraphOrchestrator, VllmStyleSpecDecodeCandidateHardFailsUntil
             []() -> int32_t { return 9; });
 
     EXPECT_FALSE(result.ok);
-    EXPECT_NE(result.error.find("vllm_style_spec_decode is not promoted"),
+    EXPECT_NE(result.error.find("vllm_style_spec_decode is promoted only for"),
               std::string::npos);
-    EXPECT_NE(result.error.find("LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK"),
+    EXPECT_NE(result.error.find("dense SingleDevice GPU hybrid decode"),
               std::string::npos);
-    EXPECT_NE(result.error.find("LLAMINAR_MTP_PHASE138_DIRECT_CANDIDATE"),
+    EXPECT_NE(result.error.find("TP, PP, MoE"),
               std::string::npos);
 }
 
