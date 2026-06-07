@@ -547,9 +547,9 @@ TEST(Test__GDNKernels, ShortConv_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
     merged.merge(rebuilt.getWorkspaceRequirements(/*m=*/2));
 
     EXPECT_NE(merged.find("gdn_shortconv_effective_seq_len_scalar_layer17"), nullptr);
-    EXPECT_NE(merged.find("gdn_shortconv_verifier_state_capture_layer17"), nullptr);
+    EXPECT_NE(merged.find("gdn_shortconv_speculative_state_slots_layer17"), nullptr);
     EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_EFFECTIVE_SEQ_LEN_SCALAR), 1);
-    EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_VERIFIER_STATE_CAPTURE), 1);
+    EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_SPECULATIVE_STATE_SLOTS), 1);
 }
 
 TEST(Test__GDNKernels, Recurrence_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
@@ -583,9 +583,9 @@ TEST(Test__GDNKernels, Recurrence_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
     merged.merge(rebuilt.getWorkspaceRequirements(/*m=*/2));
 
     EXPECT_NE(merged.find("gdn_effective_seq_len_scalar_layer17"), nullptr);
-    EXPECT_NE(merged.find("gdn_verifier_state_capture_layer17"), nullptr);
+    EXPECT_NE(merged.find("gdn_speculative_state_slots_layer17"), nullptr);
     EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_EFFECTIVE_SEQ_LEN_SCALAR), 1);
-    EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_VERIFIER_STATE_CAPTURE), 1);
+    EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_SPECULATIVE_STATE_SLOTS), 1);
 }
 
 TEST(Test__GDNKernels, Projection_WorkspaceRequirementsUsePerProjectionN)
@@ -730,10 +730,9 @@ public:
     }
 };
 
-TEST(Test__GDNKernels, NonVerifierShortConvStageDoesNotClearSharedVerifierCaptureWorkspace)
+TEST(Test__GDNKernels, NonVerifierShortConvStageClearsStaleSpeculativeStateBinding)
 {
     RecordingShortConvolution kernel;
-    float *const existing_capture = kernel.capture_workspace;
 
     ShortConv1dStage::Params p;
     p.device_id = DeviceId::cpu();
@@ -746,16 +745,15 @@ TEST(Test__GDNKernels, NonVerifierShortConvStageDoesNotClearSharedVerifierCaptur
     ShortConv1dStage stage(p);
     stage.bindWorkspace(nullptr);
 
-    EXPECT_EQ(kernel.capture_bind_calls, 0);
-    EXPECT_EQ(kernel.capture_workspace, existing_capture);
-    EXPECT_EQ(kernel.capture_rows, 7);
-    EXPECT_EQ(kernel.capture_state_size, 9);
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
+    EXPECT_EQ(kernel.capture_state_size, 48);
 }
 
-TEST(Test__GDNKernels, NonVerifierRecurrenceStageDoesNotClearSharedVerifierCaptureWorkspace)
+TEST(Test__GDNKernels, NonVerifierRecurrenceStageClearsStaleSpeculativeStateBinding)
 {
     RecordingGatedDeltaNet kernel;
-    float *const existing_capture = kernel.capture_workspace;
 
     GDNRecurrenceStage::Params p;
     p.device_id = DeviceId::cpu();
@@ -770,10 +768,10 @@ TEST(Test__GDNKernels, NonVerifierRecurrenceStageDoesNotClearSharedVerifierCaptu
     GDNRecurrenceStage stage(p);
     stage.bindWorkspace(nullptr);
 
-    EXPECT_EQ(kernel.capture_bind_calls, 0);
-    EXPECT_EQ(kernel.capture_workspace, existing_capture);
-    EXPECT_EQ(kernel.capture_rows, 11);
-    EXPECT_EQ(kernel.capture_state_size, 13);
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
+    EXPECT_EQ(kernel.capture_state_size, 32);
 }
 
 TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch)

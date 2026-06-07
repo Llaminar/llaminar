@@ -1543,7 +1543,7 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
         << "Phase 13.8 graph construction must request speculative state slots explicitly";
     const WorkspaceRequirements short_conv_reqs =
         short_conv->getWorkspaceRequirements(/*m=*/2);
-    EXPECT_NE(short_conv_reqs.find("gdn_shortconv_verifier_state_capture_layer0"), nullptr)
+    EXPECT_NE(short_conv_reqs.find("gdn_shortconv_speculative_state_slots_layer0"), nullptr)
         << "CUDA verifier GDN graphs must snapshot short-conv state rows for cheap MTP rollback";
 
     const auto *recurrence_node = graph.getNode("layer0_gdn_recurrence");
@@ -1554,7 +1554,7 @@ TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspa
         << "Phase 13.8 graph construction must request speculative state slots explicitly";
     const WorkspaceRequirements recurrence_reqs =
         recurrence->getWorkspaceRequirements(/*m=*/2);
-    EXPECT_NE(recurrence_reqs.find("gdn_verifier_state_capture_layer0"), nullptr)
+    EXPECT_NE(recurrence_reqs.find("gdn_speculative_state_slots_layer0"), nullptr)
         << "CUDA verifier GDN graphs must snapshot recurrence state rows for cheap MTP rollback";
 }
 
@@ -2865,10 +2865,12 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto restore_tags = PerfStatsCollector::Tags{
         {"operation", "restore_payload_checkpoint"},
+        {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
     const auto truncate_tags = PerfStatsCollector::Tags{
         {"operation", "truncate_live_prefix"},
+        {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
     const PerfStatRecord *restore_preserved =
@@ -2886,6 +2888,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixSnapshotRestoresDenseCPUState)
               nullptr);
     const auto structured_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_payload_checkpoint"},
+        {"kernel_dynamic_state", "reset"},
         {"replay_state", "reset"},
         {"sidecar_replay_state", "reset"}};
     EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
@@ -2944,6 +2947,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto restore_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
+        {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
     const PerfStatRecord *restore_preserved =
@@ -2957,6 +2961,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixCheckpointRestoresDenseCPUStateByLogi
               nullptr);
     const auto structured_reset_tags = PerfStatsCollector::Tags{
         {"operation", "restore_logical_checkpoint"},
+        {"kernel_dynamic_state", "reset"},
         {"replay_state", "reset"},
         {"sidecar_replay_state", "reset"}};
     EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),
@@ -2993,6 +2998,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState
         {"model", "moe"},
         {"moe_placement_epoch", "0"},
         {"operation", "restore_logical_checkpoint"},
+        {"kernel_dynamic_state", "reset"},
         {"replay_state", "preserved"},
         {"sidecar_replay_state", "preserved"}};
     const PerfStatRecord *preserved =
@@ -3008,6 +3014,7 @@ TEST(Test__MTPGraphConstruction, LivePrefixLogicalRestorePreservesMoEReplayState
         {"model", "moe"},
         {"moe_placement_epoch", "0"},
         {"operation", "restore_logical_checkpoint"},
+        {"kernel_dynamic_state", "reset"},
         {"replay_state", "reset"},
         {"sidecar_replay_state", "reset"}};
     EXPECT_EQ(findMTPRecord(records, PerfStatRecord::Kind::Counter, "live_prefix_replay_state_after_mutation", structured_reset_tags),

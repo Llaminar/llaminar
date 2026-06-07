@@ -159,7 +159,7 @@ namespace llaminar2
                 static_cast<size_t>(params_.n_heads) *
                 static_cast<size_t>(params_.d_k) *
                 static_cast<size_t>(params_.d_v);
-            reqs.buffers.push_back({verifierStateCaptureBufferName(),
+            reqs.buffers.push_back({speculativeStateSlotsBufferName(),
                                     static_cast<size_t>(rows) * state_floats * sizeof(float),
                                     256,
                                     true});
@@ -252,9 +252,9 @@ namespace llaminar2
 
         float *capture = nullptr;
         int capture_rows = 0;
-        if (bound_workspace_ && bound_workspace_->hasBuffer(verifierStateCaptureBufferName()))
+        if (bound_workspace_ && bound_workspace_->hasBuffer(speculativeStateSlotsBufferName()))
         {
-            const std::string capture_name = verifierStateCaptureBufferName();
+            const std::string capture_name = speculativeStateSlotsBufferName();
             capture = static_cast<float *>(bound_workspace_->getBuffer(capture_name));
             const size_t available_floats =
                 bound_workspace_->getBufferSize(capture_name) / sizeof(float);
@@ -323,9 +323,9 @@ namespace llaminar2
         return std::string(WS_EFFECTIVE_SEQ_LEN_SCALAR) + "_" + workspaceStableId();
     }
 
-    std::string GDNRecurrenceStage::verifierStateCaptureBufferName() const
+    std::string GDNRecurrenceStage::speculativeStateSlotsBufferName() const
     {
-        return std::string(WS_VERIFIER_STATE_CAPTURE) + "_" + workspaceStableId();
+        return std::string(WS_SPECULATIVE_STATE_SLOTS) + "_" + workspaceStableId();
     }
 
     std::string GDNRecurrenceStage::speculativeStateWorkBufferName() const
@@ -363,7 +363,7 @@ namespace llaminar2
             return true;
 
         LOG_ERROR("[GDNRecurrenceStage] Missing required verifier state capture workspace '"
-                  << verifierStateCaptureBufferName()
+                  << speculativeStateSlotsBufferName()
                   << "' or speculative state workspace '"
                   << speculativeStateWorkBufferName()
                   << "' (requested_rows=" << requestedSpeculativeStateSlotRows()

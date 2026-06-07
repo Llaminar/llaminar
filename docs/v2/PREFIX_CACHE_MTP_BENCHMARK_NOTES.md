@@ -46,13 +46,18 @@ Artifacts:
   decode-equivalent verifier forwards.
 - The raw all-position and sidecar-chain shortcut code/tests have been removed;
   live work must go through accepted-count speculative state slots.
+- The verifier-capture workspace spelling has also been removed from the active
+  GDN/short-conv stage surface. Current stateful verifier work uses
+  `gdn_speculative_state_slots*` backing buffers plus explicit accepted-count
+  publication, with CPU prefix mutation counters distinguishing replay-state
+  preservation from kernel-dynamic-state reset.
 - Source-owned parity covers CUDA/ROCm depth-3 normal decode, CUDA
   benchmark-prompt depth-3, CUDA/ROCm depth-1 prefix restore, and normal
   CUDA/ROCm stochastic MTP verifier cells through the shared Phase 13.8
-  transaction gate. The latest focused Phase 13.8 gate passed 9/9 including the
-  prefix-flow verifier-row restore regression. MoE, TP/PP, chained-prefix,
-  stop-token, broader continuation coverage, and stochastic benchmark evidence
-  remain pending.
+  transaction gate. The latest focused cleanup gate passed the MTP graph/GDN
+  units, CUDA/ROCm GDN padded-length integrations, and CUDA/ROCm candidate
+  equivalence cells. MoE, TP/PP, chained-prefix, stop-token, broader
+  continuation coverage, and stochastic benchmark evidence remain pending.
 
 ## llama.cpp CUDA Anchors
 

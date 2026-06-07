@@ -45,8 +45,7 @@ namespace llaminar2
     public:
         static constexpr const char *WS_INPLACE_PREFILL_SCRATCH = "gdn_shortconv_inplace_scratch";
         static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_shortconv_effective_seq_len_scalar";
-        static constexpr const char *WS_VERIFIER_STATE_CAPTURE = "gdn_shortconv_verifier_state_capture";
-        static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_shortconv_verifier_state_capture";
+        static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_shortconv_speculative_state_slots";
         static constexpr const char *WS_SPECULATIVE_STATE_WORK = "gdn_shortconv_speculative_state_work";
 
         struct Params
@@ -144,7 +143,7 @@ namespace llaminar2
         bool shouldUseRealLengthContract() const;
         std::string workspaceStableId() const;
         std::string effectiveSeqLenScalarBufferName() const;
-        std::string verifierStateCaptureBufferName() const;
+        std::string speculativeStateSlotsBufferName() const;
         std::string speculativeStateWorkBufferName() const;
         int requestedSpeculativeStateSlotRows() const;
         bool verifierStateCaptureWorkspaceRequired() const;
