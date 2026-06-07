@@ -115,7 +115,10 @@ namespace llaminar2
                 storeOutput(prefix + "_QKV_PROJECTION", dump.outputs[0]);
             if (dump.outputs.size() >= 2 && dump.outputs[1].data)
                 storeOutput(prefix + "_GDN_Z_PROJECTION", dump.outputs[1]);
-            // alpha and beta are small per-head tensors, skip for now
+            if (dump.outputs.size() >= 3 && dump.outputs[2].data)
+                storeOutput(prefix + "_GDN_ALPHA", dump.outputs[2]);
+            if (dump.outputs.size() >= 4 && dump.outputs[3].data)
+                storeOutput(prefix + "_GDN_BETA", dump.outputs[3]);
             return;
         }
 

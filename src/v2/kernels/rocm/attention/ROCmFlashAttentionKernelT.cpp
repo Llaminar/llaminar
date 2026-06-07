@@ -121,6 +121,20 @@ namespace llaminar2
         constexpr int DEFAULT_NUM_SPLITS = 8;
         constexpr int MAX_SMALL_DECODE_ROWS = 2;
 
+        static int selectFlashDecodeNumSplits(int kv_len)
+        {
+            if (debugEnv().gemm.deterministic)
+                return 1;
+
+            if (kv_len <= 64)
+                return 1;
+            if (kv_len < 128)
+                return 2;
+            if (kv_len < 256)
+                return 4;
+            return DEFAULT_NUM_SPLITS;
+        }
+
         // =====================================================================
         // FP32 Specialization Implementation
         // =====================================================================
@@ -571,13 +585,7 @@ namespace llaminar2
             if (seq_len == 1 && !decode_via_prefill)
             {
                 // Flash Decoding for single-token decode
-                int num_splits = DEFAULT_NUM_SPLITS;
-                if (kv_len <= 64)
-                    num_splits = 1; // No splitting for very short KV
-                else if (kv_len < 128)
-                    num_splits = 2;
-                else if (kv_len < 256)
-                    num_splits = 4;
+                const int num_splits = selectFlashDecodeNumSplits(kv_len);
 
                 allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -1006,13 +1014,7 @@ namespace llaminar2
                 int result;
                 if (small_decode_rows_ > 1)
                 {
-                    int max_num_splits = DEFAULT_NUM_SPLITS;
-                    if (kv_len <= 64)
-                        max_num_splits = 1;
-                    else if (kv_len < 128)
-                        max_num_splits = 2;
-                    else if (kv_len < 256)
-                        max_num_splits = 4;
+                    const int max_num_splits = selectFlashDecodeNumSplits(kv_len);
 
                     allocateWorkspace(n_heads, head_dim, max_num_splits);
 
@@ -1028,8 +1030,7 @@ namespace llaminar2
                     for (int row = 0; row < small_decode_rows_; ++row)
                     {
                         const int row_kv_len = std::max(1, kv_len - (small_decode_rows_ - 1 - row));
-                        const int row_num_splits =
-                            row_kv_len <= 64 ? 1 : (row_kv_len < 128 ? 2 : (row_kv_len < 256 ? 4 : DEFAULT_NUM_SPLITS));
+                        const int row_num_splits = selectFlashDecodeNumSplits(row_kv_len);
                         const float *row_q =
                             Q_ptr + static_cast<size_t>(row) * static_cast<size_t>(n_heads) *
                                         static_cast<size_t>(head_dim);
@@ -1070,13 +1071,7 @@ namespace llaminar2
                 else if (seq_len == 1 && !decode_via_prefill)
                 {
                     // Flash Decoding with native KV cache
-                    int num_splits = DEFAULT_NUM_SPLITS;
-                    if (kv_len <= 64)
-                        num_splits = 1;
-                    else if (kv_len < 128)
-                        num_splits = 2;
-                    else if (kv_len < 256)
-                        num_splits = 4;
+                    const int num_splits = selectFlashDecodeNumSplits(kv_len);
 
                     allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -1456,13 +1451,7 @@ namespace llaminar2
                 return false;
             }
 
-            int num_splits = DEFAULT_NUM_SPLITS;
-            if (kv_len <= 64)
-                num_splits = 1;
-            else if (kv_len < 128)
-                num_splits = 2;
-            else if (kv_len < 256)
-                num_splits = 4;
+            const int num_splits = selectFlashDecodeNumSplits(kv_len);
 
             allocateWorkspace(n_heads, head_dim, num_splits);
 
@@ -1816,13 +1805,7 @@ namespace llaminar2
                 return false;
             }
 
-            int num_splits = DEFAULT_NUM_SPLITS;
-            if (kv_len <= 64)
-                num_splits = 1;
-            else if (kv_len < 128)
-                num_splits = 2;
-            else if (kv_len < 256)
-                num_splits = 4;
+            const int num_splits = selectFlashDecodeNumSplits(kv_len);
 
             allocateWorkspace(n_heads, head_dim, num_splits);
 

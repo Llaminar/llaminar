@@ -516,6 +516,63 @@ namespace
         freeDevice(d_ptr);
     }
 
+    TEST_P(GPUSamplingTest, Argmax_BatchedRowsQwen36VocabMatchesSerialRows)
+    {
+        // Phase 13.8 MTP verifier rows sample a compact [M, vocab] logits
+        // tensor. Keep the Qwen3.6-sized batched-row argmax honest against the
+        // serial row path so a sampler bug cannot masquerade as state drift.
+        constexpr int rows = 3;
+        constexpr int cols = 248320;
+        const int expected[rows] = {271, 33075, 248068};
+
+        std::vector<float> logits(
+            static_cast<size_t>(rows) * static_cast<size_t>(cols),
+            -9.0f);
+        for (int row = 0; row < rows; ++row)
+        {
+            const size_t base = static_cast<size_t>(row) * static_cast<size_t>(cols);
+            logits[base + static_cast<size_t>(expected[row])] =
+                25.0f + static_cast<float>(row);
+            logits[base + static_cast<size_t>(expected[row] + 1)] =
+                24.0f + static_cast<float>(row);
+        }
+        logits[static_cast<size_t>(2) * static_cast<size_t>(cols) + 248100] =
+            logits[static_cast<size_t>(2) * static_cast<size_t>(cols) +
+                   static_cast<size_t>(expected[2])];
+
+        void *d_ptr = uploadLogits(logits);
+        ASSERT_NE(d_ptr, nullptr);
+
+        float batched_values[rows] = {};
+        int batched_indices[rows] = {-1, -1, -1};
+        ASSERT_TRUE(argmaxF32BatchedRows(
+            d_ptr,
+            rows,
+            cols,
+            device_id_,
+            batched_values,
+            batched_indices))
+            << "argmaxF32BatchedRows not supported on " << GetParam();
+
+        const auto *base = static_cast<const char *>(d_ptr);
+        for (int row = 0; row < rows; ++row)
+        {
+            float serial_value = 0.0f;
+            int serial_index = -1;
+            void *row_ptr = const_cast<char *>(
+                base + static_cast<size_t>(row) *
+                           static_cast<size_t>(cols) * sizeof(float));
+            ASSERT_TRUE(argmaxF32(row_ptr, cols, device_id_, &serial_value, &serial_index))
+                << "serial argmaxF32 failed for row " << row << " on " << GetParam();
+
+            EXPECT_EQ(batched_indices[row], serial_index) << "row=" << row;
+            EXPECT_FLOAT_EQ(batched_values[row], serial_value) << "row=" << row;
+            EXPECT_EQ(batched_indices[row], expected[row]) << "row=" << row;
+        }
+
+        freeDevice(d_ptr);
+    }
+
     TEST_P(GPUSamplingTest, Argmax_PeakAtLastElement)
     {
         // Edge case: max at end of large array

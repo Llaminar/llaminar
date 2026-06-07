@@ -53,6 +53,36 @@ TEST(Qwen36SingleDevicePrefixMTPParity, Phase138VllmStyleCandidatePrefixRestoreE
     runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(singleDeviceCase(), 1);
 }
 
+TEST(Qwen36SingleDevicePrefixMTPParity, Phase138VllmStyleCandidateStopTokenEquivalence)
+{
+    runDensePhase138VllmStyleCandidateStopTokenEquivalence(singleDeviceCase(), 2);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, NoMTPPhase138ContinuationMatchesPyTorch)
+{
+    runDenseNoMTPPhase138ContinuationMatchesPyTorch(singleDeviceCase(), 8);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, NoMTPPhase138ThinkContinuationStageParity)
+{
+    runDenseNoMTPPhase138ThinkContinuationStageParity(singleDeviceCase());
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, Phase138VllmStyleCandidateContinuationEquivalence)
+{
+    runDensePhase138VllmStyleCandidateContinuationEquivalence(singleDeviceCase(), 3, 8);
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, MTPShiftedRowCommitPreservesVerifierForward)
+{
+    runDenseMTPShiftedRowCommitPreservesVerifierForward(singleDeviceCase());
+}
+
+TEST(Qwen36SingleDevicePrefixMTPParity, MTPFirstTransactionLeavesSequentialState)
+{
+    runDenseMTPFirstTransactionLeavesSequentialState(singleDeviceCase());
+}
+
 TEST(Qwen36SingleDevicePrefixMTPParity, MTPGreedyDynamicDepthMatchesPyTorchDecodeTokens)
 {
     runDenseDynamicMTPParity(singleDeviceCase(), false);
@@ -73,38 +103,9 @@ TEST(Qwen36SingleDevicePrefixMTPParity, MTPStochasticSamplingVerifierRuns)
     runDenseStochasticMTPVerifierParity(singleDeviceCase());
 }
 
-TEST(Qwen36SingleDevicePrefixMTPParity, MTPVerifierRowsPostSidecarMatchRestoredReplay)
-{
-    runDenseMTPVerifierRowsPostSidecarEquivalence(singleDeviceCase());
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, M2VerifierLongPrefixMatchesSequential)
-{
-    runDenseM2VerifierLongPrefixMatchesSequential(singleDeviceCase());
-}
-
 TEST(Qwen36SingleDevicePrefixMTPParity, OneRowRestoreLongPrefixMatchesSequential)
 {
     runDenseOneRowRestoreLongPrefixMatchesSequential(singleDeviceCase());
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, M4VerifierLongPrefixIsNotDecodeEquivalent)
-{
-    runDenseM4VerifierLongPrefixIsNotDecodeEquivalent(singleDeviceCase());
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, SidecarChainVerifierStateShortcutCandidateIsNotDecodeEquivalent)
-{
-    runDenseM4SidecarChainVerifierStateShortcutCandidate(
-        singleDeviceCase(),
-        /*expect_decode_equivalent=*/false);
-}
-
-TEST(Qwen36SingleDevicePrefixMTPParity, AllPositionCatchupCandidateFailsCommitReplay)
-{
-    runDenseAllPositionCatchupCandidateFailsCommitReplay(
-        singleDeviceCase(),
-        /*use_benchmark_prompt=*/true);
 }
 
 int main(int argc, char **argv)

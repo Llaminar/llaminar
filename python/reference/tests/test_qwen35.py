@@ -443,12 +443,16 @@ class TestQwen35PipelineStages:
     def test_gdn_stages_exist_in_enum(self):
         """GDN pipeline stages should be defined in PipelineStage enum."""
         assert hasattr(PipelineStage, 'GDN_CONV1D_OUTPUT')
+        assert hasattr(PipelineStage, 'GDN_ALPHA')
+        assert hasattr(PipelineStage, 'GDN_BETA')
         assert hasattr(PipelineStage, 'GDN_DELTA_RULE_OUTPUT')
         assert hasattr(PipelineStage, 'GDN_NORM_GATE_OUTPUT')
 
     def test_gdn_stages_have_string_mapping(self):
         """GDN stages should have string representations."""
         assert stage_to_string(PipelineStage.GDN_CONV1D_OUTPUT) == 'GDN_CONV1D_OUTPUT'
+        assert stage_to_string(PipelineStage.GDN_ALPHA) == 'GDN_ALPHA'
+        assert stage_to_string(PipelineStage.GDN_BETA) == 'GDN_BETA'
         assert stage_to_string(PipelineStage.GDN_DELTA_RULE_OUTPUT) == 'GDN_DELTA_RULE_OUTPUT'
         assert stage_to_string(PipelineStage.GDN_NORM_GATE_OUTPUT) == 'GDN_NORM_GATE_OUTPUT'
 
@@ -593,6 +597,8 @@ class TestQwen35HookRegistration:
         # Layers 0,1,2 are linear; layer 3 is full attention
         for stage in [PipelineStage.QKV_PROJECTION,
                       PipelineStage.GDN_CONV1D_OUTPUT,
+                      PipelineStage.GDN_ALPHA,
+                      PipelineStage.GDN_BETA,
                       PipelineStage.GDN_DELTA_RULE_OUTPUT,
                       PipelineStage.GDN_NORM_GATE_OUTPUT]:
             captured_layers = sorted([k[1] for k in snapshots if k[0] == stage])
@@ -795,6 +801,8 @@ class TestQwen35Inference:
                 PipelineStage.LM_HEAD,
                 # GDN-specific
                 PipelineStage.GDN_CONV1D_OUTPUT,
+                PipelineStage.GDN_ALPHA,
+                PipelineStage.GDN_BETA,
                 PipelineStage.GDN_DELTA_RULE_OUTPUT,
                 PipelineStage.GDN_NORM_GATE_OUTPUT,
             ],

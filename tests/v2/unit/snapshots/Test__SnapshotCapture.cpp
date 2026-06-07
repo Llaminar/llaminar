@@ -316,6 +316,37 @@ TEST(Test__SnapshotCapture_Capture, MTPSidecarFusedQKVUsesMTPKeys)
     EXPECT_EQ(v_snapshot->data, v);
 }
 
+TEST(Test__SnapshotCapture_Capture, GDNProjectionSplitsAlphaAndBeta)
+{
+    std::vector<float> qkv = {1.0f, 2.0f};
+    std::vector<float> z = {3.0f, 4.0f};
+    std::vector<float> alpha = {5.0f, 6.0f};
+    std::vector<float> beta = {7.0f, 8.0f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("qkv", qkv.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("z", z.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("alpha", alpha.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("beta", beta.data(), 1, 2));
+
+    SnapshotCapture capture;
+    capture.captureStage("layer0_gdn_proj", dump);
+
+    const auto *qkv_snapshot = capture.get("layer0_QKV_PROJECTION");
+    const auto *z_snapshot = capture.get("layer0_GDN_Z_PROJECTION");
+    const auto *alpha_snapshot = capture.get("layer0_GDN_ALPHA");
+    const auto *beta_snapshot = capture.get("layer0_GDN_BETA");
+
+    ASSERT_NE(qkv_snapshot, nullptr);
+    ASSERT_NE(z_snapshot, nullptr);
+    ASSERT_NE(alpha_snapshot, nullptr);
+    ASSERT_NE(beta_snapshot, nullptr);
+    EXPECT_EQ(qkv_snapshot->data, qkv);
+    EXPECT_EQ(z_snapshot->data, z);
+    EXPECT_EQ(alpha_snapshot->data, alpha);
+    EXPECT_EQ(beta_snapshot->data, beta);
+}
+
 TEST(Test__SnapshotCapture_Capture, MTPSidecarMoERoutingUsesMTPKeys)
 {
     std::vector<float> logits = {1.0f, 2.0f, 3.0f};

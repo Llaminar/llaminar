@@ -70,9 +70,6 @@ static std::atomic<int> g_int8_vnni_wide_vec_load_override{-1};
 static std::atomic<int> g_int8_vnni_skip_memset_override{0};  // 1 = skip hipMemsetAsync (for benchmarking)
 static std::atomic<int> g_int8_vnni_force_pair_override{0};  // 1 = force batched pair path (skip split-to-singles)
 
-static float* s_blockwise_single_partial[8] = {};
-static size_t s_blockwise_single_partial_elems[8] = {};
-
 static inline int select_blockwise_split_count(int grid_n, int act_blocks, int kb_override)
 {
     constexpr int NUM_CUS = 60;
@@ -285,44 +282,6 @@ static inline int select_blockwise_qwo_outer_splits(int grid_n, int act_blocks, 
     ideal_kb = min(ideal_kb, kb_max);
 
     return max(1, min(ideal_kb, act_blocks));
-}
-
-static inline bool ensure_blockwise_single_partial_buffer(
-    int device_id,
-    size_t required_elements,
-    float** out_buffer)
-{
-    const int dev_slot = device_id & 7;
-    if (s_blockwise_single_partial[dev_slot] && s_blockwise_single_partial_elems[dev_slot] >= required_elements)
-    {
-        *out_buffer = s_blockwise_single_partial[dev_slot];
-        return true;
-    }
-
-    if (s_blockwise_single_partial[dev_slot])
-    {
-        hipError_t free_err = hipFree(s_blockwise_single_partial[dev_slot]);
-        if (free_err != hipSuccess)
-        {
-            fprintf(stderr, "[ensure_blockwise_single_partial_buffer] hipFree failed: %s\n",
-                    hipGetErrorString(free_err));
-            return false;
-        }
-        s_blockwise_single_partial[dev_slot] = nullptr;
-        s_blockwise_single_partial_elems[dev_slot] = 0;
-    }
-
-    hipError_t alloc_err = hipMalloc(&s_blockwise_single_partial[dev_slot], required_elements * sizeof(float));
-    if (alloc_err != hipSuccess)
-    {
-        fprintf(stderr, "[ensure_blockwise_single_partial_buffer] hipMalloc failed: %s (elements=%zu)\n",
-                hipGetErrorString(alloc_err), required_elements);
-        return false;
-    }
-
-    s_blockwise_single_partial_elems[dev_slot] = required_elements;
-    *out_buffer = s_blockwise_single_partial[dev_slot];
-    return true;
 }
 
 constexpr int GEMV_INT8_VNNI_ACT_BLOCK_K = 32;
@@ -4188,6 +4147,7 @@ bool rocmGemv_int8_scatter_vnni_blockwise(
     const float* d_scales_B,
     const float* d_bias,
     float* d_partial_buf,
+    int* d_counter,
     int N, int K,
     float alpha, float beta,
     const float* d_C_existing,
@@ -4836,34 +4796,12 @@ bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
 
         // For tiny-grid decode shapes, the direct/scatter family is structurally better
         // than atomic grid_kpar because it avoids repeated output updates and can reduce
-        // once per tile. Keep grid_kpar as the broad/default path for wider shapes.
+        // once per tile. Returning false asks the higher-level GEMM wrapper to use
+        // its explicit workspace-backed scatter path instead of allocating scratch
+        // inside this HIP translation unit.
         if (grid_n <= 8)
         {
-            const int kb_small = select_blockwise_split_count(grid_n, act_blocks, int8_kb_override);
-            float* d_partial_small = nullptr;
-            if (!ensure_blockwise_single_partial_buffer(
-                    device_id,
-                    static_cast<size_t>(kb_small) * static_cast<size_t>(N),
-                    &d_partial_small))
-            {
-                return false;
-            }
-
-            return rocmGemv_int8_scatter_vnni_blockwise(
-                d_A_int8,
-                d_B_int8_vnni,
-                d_C_fp32,
-                d_scales_A_blockwise,
-                d_scale_B,
-                d_bias,
-                d_partial_small,
-                N,
-                K,
-                alpha,
-                beta,
-                d_C_existing,
-                device_id,
-                stream);
+            return false;
         }
 
         const int kb = select_blockwise_split_count(grid_n, act_blocks, int8_kb_override);
@@ -5575,6 +5513,7 @@ bool rocmGemv_fused_scatter_fp32_int8_vnni(
     const float* d_scales_B,         // [N] per-column weight scales
     const float* d_bias,             // [N] optional bias (nullable)
     float* d_partial_buf,            // [KB_MAX × N] pre-allocated partial buffer
+    int* d_counter,                  // [ceil(N / TN)] pre-allocated self-reduce counters
     int N, int K,
     float alpha, float beta,
     const float* d_C_existing,       // [N] used when beta != 0
@@ -5668,19 +5607,12 @@ bool rocmGemv_fused_scatter_fp32_int8_vnni(
 
         if (grid_n < SELFREDUCE_GRID_N_THRESHOLD)
         {
-            // Self-reducing path: use a small persistent counter buffer.
-            // Max grid_n for self-reduce is SELFREDUCE_GRID_N_THRESHOLD-1 = 15,
-            // so we need at most 15 ints = 60 bytes.
-            constexpr int MAX_SELFREDUCE_BLOCKS = 16;
-            static int* s_selfreduce_counters[8] = {};  // per device_id
-
-            int dev_slot = device_id & 7;  // clamp to array bounds
-            if (!s_selfreduce_counters[dev_slot])
+            if (!d_counter)
             {
-                hipMalloc(&s_selfreduce_counters[dev_slot],
-                          MAX_SELFREDUCE_BLOCKS * sizeof(int));
+                fprintf(stderr, "[rocmGemv_fused_scatter] self-reduce counter workspace is required (N=%d K=%d)\n",
+                        N, K);
+                return false;
             }
-            int* d_counter = s_selfreduce_counters[dev_slot];
 
             int k_per_block = (k_groups + kb - 1) / kb;
             int valid_kb = (k_groups + k_per_block - 1) / k_per_block;
@@ -5869,6 +5801,7 @@ bool rocmGemv_int8_scatter_vnni_blockwise(
     const float* d_scales_B,
     const float* d_bias,
     float* d_partial_buf,
+    int* d_counter,
     int N, int K,
     float alpha, float beta,
     const float* d_C_existing,
@@ -5911,16 +5844,12 @@ bool rocmGemv_int8_scatter_vnni_blockwise(
 
         if (grid_n < SELFREDUCE_GRID_N_THRESHOLD)
         {
-            constexpr int MAX_SELFREDUCE_BLOCKS = 16;
-            static int* s_int8_selfreduce_counters[8] = {};
-
-            int dev_slot = device_id & 7;
-            if (!s_int8_selfreduce_counters[dev_slot])
+            if (!d_counter)
             {
-                hipMalloc(&s_int8_selfreduce_counters[dev_slot],
-                          MAX_SELFREDUCE_BLOCKS * sizeof(int));
+                fprintf(stderr, "[rocmGemv_int8_scatter_blockwise] self-reduce counter workspace is required (N=%d K=%d)\n",
+                        N, K);
+                return false;
             }
-            int* d_counter = s_int8_selfreduce_counters[dev_slot];
 
             int act_blocks_per_block = (act_blocks + kb - 1) / kb;
             int valid_kb = (act_blocks + act_blocks_per_block - 1) / act_blocks_per_block;

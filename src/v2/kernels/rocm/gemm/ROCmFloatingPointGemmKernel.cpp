@@ -44,6 +44,17 @@ extern "C" bool rocmFp32_tiny_batched_projection(
     int device_id,
     void *stream);
 
+extern "C" bool rocmFp32_stage_batched_projection_pointers(
+    const float **d_A_array,
+    const float **d_B_array,
+    float **d_C_array,
+    const float *const *h_A_ptrs,
+    const float *const *h_B_ptrs,
+    float *const *h_C_ptrs,
+    int batch_count,
+    int device_id,
+    void *stream);
+
 namespace llaminar2
 {
     namespace rocm
@@ -179,10 +190,7 @@ namespace llaminar2
               slice_id_(other.slice_id_),
               d_batch_A_ptrs_(other.d_batch_A_ptrs_),
               d_batch_B_ptrs_(other.d_batch_B_ptrs_),
-              d_batch_C_ptrs_(other.d_batch_C_ptrs_),
-              cached_batch_A_ptrs_(std::move(other.cached_batch_A_ptrs_)),
-              cached_batch_B_ptrs_(std::move(other.cached_batch_B_ptrs_)),
-              cached_batch_C_ptrs_(std::move(other.cached_batch_C_ptrs_))
+              d_batch_C_ptrs_(other.d_batch_C_ptrs_)
         {
             other.weights_ = nullptr;
             other.d_weights_ = nullptr;
@@ -214,9 +222,6 @@ namespace llaminar2
                 d_batch_A_ptrs_ = other.d_batch_A_ptrs_;
                 d_batch_B_ptrs_ = other.d_batch_B_ptrs_;
                 d_batch_C_ptrs_ = other.d_batch_C_ptrs_;
-                cached_batch_A_ptrs_ = std::move(other.cached_batch_A_ptrs_);
-                cached_batch_B_ptrs_ = std::move(other.cached_batch_B_ptrs_);
-                cached_batch_C_ptrs_ = std::move(other.cached_batch_C_ptrs_);
                 other.d_batch_A_ptrs_ = nullptr;
                 other.d_batch_B_ptrs_ = nullptr;
                 other.d_batch_C_ptrs_ = nullptr;
@@ -455,7 +460,7 @@ namespace llaminar2
             return d_batch_A_ptrs_ && d_batch_B_ptrs_ && d_batch_C_ptrs_;
         }
 
-        bool ROCmFloatingPointGemmKernel::uploadBatchedPointersIfChanged(
+        bool ROCmFloatingPointGemmKernel::stageBatchedPointers(
             const std::vector<const float *> &a_ptrs,
             const std::vector<const float *> &b_ptrs,
             const std::vector<float *> &c_ptrs,
@@ -473,45 +478,26 @@ namespace llaminar2
             if (!validateBatchedPointerWorkspace(workspace, count))
                 return false;
 
-            if (cached_batch_A_ptrs_ == a_ptrs &&
-                cached_batch_B_ptrs_ == b_ptrs &&
-                cached_batch_C_ptrs_ == c_ptrs)
+            if (!gpu_stream_)
             {
-                return true;
-            }
-
-            auto *stream = static_cast<hipStream_t>(gpu_stream_);
-            hipError_t err = hipMemcpyAsync(
-                d_batch_A_ptrs_, a_ptrs.data(), count * sizeof(float *),
-                hipMemcpyHostToDevice, stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel] Failed to upload batched A pointers: "
-                          << hipGetErrorString(err));
-                return false;
-            }
-            err = hipMemcpyAsync(
-                d_batch_B_ptrs_, b_ptrs.data(), count * sizeof(float *),
-                hipMemcpyHostToDevice, stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel] Failed to upload batched B pointers: "
-                          << hipGetErrorString(err));
-                return false;
-            }
-            err = hipMemcpyAsync(
-                d_batch_C_ptrs_, c_ptrs.data(), count * sizeof(float *),
-                hipMemcpyHostToDevice, stream);
-            if (err != hipSuccess)
-            {
-                LOG_ERROR("[ROCmFloatingPointGemmKernel] Failed to upload batched C pointers: "
-                          << hipGetErrorString(err));
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] Batched FP32 projection requires an explicit non-null ROCm stream");
                 return false;
             }
 
-            cached_batch_A_ptrs_ = a_ptrs;
-            cached_batch_B_ptrs_ = b_ptrs;
-            cached_batch_C_ptrs_ = c_ptrs;
+            if (!rocmFp32_stage_batched_projection_pointers(
+                    d_batch_A_ptrs_,
+                    d_batch_B_ptrs_,
+                    d_batch_C_ptrs_,
+                    a_ptrs.data(),
+                    b_ptrs.data(),
+                    c_ptrs.data(),
+                    static_cast<int>(count),
+                    rocm_device_id_,
+                    gpu_stream_))
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel] Failed to stage batched FP32 projection pointers");
+                return false;
+            }
             return true;
         }
 
@@ -619,7 +605,7 @@ namespace llaminar2
                     return false;
                 }
 
-                if (!uploadBatchedPointersIfChanged(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
+                if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
                     return false;
 
                 const int batch_count = static_cast<int>(group_indices.size());
@@ -797,9 +783,6 @@ namespace llaminar2
             d_batch_A_ptrs_ = nullptr;
             d_batch_B_ptrs_ = nullptr;
             d_batch_C_ptrs_ = nullptr;
-            cached_batch_A_ptrs_.clear();
-            cached_batch_B_ptrs_.clear();
-            cached_batch_C_ptrs_.clear();
         }
 
         bool ROCmFloatingPointGemmKernel::hasWorkspace() const

@@ -481,6 +481,14 @@ namespace llaminar2
                 float alpha, float beta,
                 bool use_specialized_small_m_kernel = true);
 
+            bool multiply_quantized_m1_via_small_m_gemv(
+                const int8_t *d_A_int8,
+                const float *d_scales_A_blockwise,
+                float *d_C,
+                const float *d_bias,
+                int n, int k,
+                float alpha, float beta);
+
             /**
              * @brief FP32 activations → quantize → INT8 GEMM → Q8_1 output
              */

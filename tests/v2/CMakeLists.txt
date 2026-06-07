@@ -260,6 +260,16 @@ if(NOT V2_PERF_TESTS_ONLY)
         LABELS "V2;Unit;StaticAnalysis;GPU;CUDA;ROCm;Streams"
         TIMEOUT 30
     )
+
+    add_test(
+        NAME V2_Unit_Static_NoROCmHotpathHiddenAllocations
+        COMMAND bash ${PROJECT_ROOT}/scripts/check_no_rocm_hotpath_hidden_allocations.sh ${PROJECT_ROOT}
+        WORKING_DIRECTORY ${PROJECT_ROOT}
+    )
+    set_tests_properties(V2_Unit_Static_NoROCmHotpathHiddenAllocations PROPERTIES
+        LABELS "V2;Unit;StaticAnalysis;GPU;ROCm;Workspace;GraphCapture"
+        TIMEOUT 30
+    )
 endif()
 
 # =============================================================================
@@ -5266,11 +5276,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_SingleDevice_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36_single_device_prefix_mtp
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36_single_device_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36_single_device_prefix_mtp
@@ -5303,11 +5315,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_CPU_SingleDevice_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36_cpu_single_device_prefix_mtp
@@ -5319,11 +5333,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36_cuda_single_device_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_CUDA_SingleDevice_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36_cuda_single_device_prefix_mtp
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36_cuda_single_device_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36_cuda_single_device_prefix_mtp
@@ -5348,11 +5364,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36_local_tp_prefix_mtp
         integration/parity/qwen36/Test__Qwen36_LocalTP_PrefixMTP_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36_local_tp_prefix_mtp
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36_local_tp_prefix_mtp PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36_local_tp_prefix_mtp
@@ -5364,11 +5382,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36_local_pp_prefix
         integration/parity/qwen36/Test__Qwen36_LocalPP_Prefix_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36_local_pp_prefix
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36_local_pp_prefix PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36_local_pp_prefix
@@ -5380,11 +5400,13 @@ if(ZLIB_FOUND)
 
     add_executable(v2_integration_parity_qwen36_node_local_tp_prefix
         integration/parity/qwen36/Test__Qwen36_NodeLocalTP_Prefix_Parity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
     )
     target_link_libraries(v2_integration_parity_qwen36_node_local_tp_prefix
-        llaminar2_core GTest::gtest
+        llaminar2_core GTest::gtest ZLIB::ZLIB
     )
     target_include_directories(v2_integration_parity_qwen36_node_local_tp_prefix PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36_node_local_tp_prefix

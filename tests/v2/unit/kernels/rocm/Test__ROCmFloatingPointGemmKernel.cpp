@@ -586,6 +586,205 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedBatchedFusedProjectionAlp
     EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
+TEST_F(Test__ROCmFloatingPointGemmKernel, GraphCapturedQwen36AlphaBetaM1MatchesReference)
+{
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    const size_t M = 1, N = 48, K = 5120;
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
+    auto weights_alpha = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+    auto weights_beta = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+    auto output_alpha = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N});
+    auto output_beta = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N});
+
+    std::mt19937 rng(138);
+    std::uniform_real_distribution<float> input_dist(-0.5f, 0.5f);
+    std::uniform_real_distribution<float> weight_dist(-0.25f, 0.25f);
+    for (size_t i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = input_dist(rng);
+    for (size_t i = 0; i < N * K; ++i)
+    {
+        weights_alpha->mutable_data()[i] = weight_dist(rng);
+        weights_beta->mutable_data()[i] = weight_dist(rng);
+    }
+
+    std::vector<float> ref_alpha(M * N);
+    std::vector<float> ref_beta(M * N);
+    reference_gemm(input->data(), weights_alpha->data(), ref_alpha.data(),
+                   static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), true);
+    reference_gemm(input->data(), weights_beta->data(), ref_beta.data(),
+                   static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), true);
+
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(output_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(output_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+    ROCmFloatingPointGemmKernel alpha_kernel(weights_alpha.get(), rocm_device_id_);
+    ROCmFloatingPointGemmKernel beta_kernel(weights_beta.get(), rocm_device_id_);
+
+    WorkspaceRequirements reqs;
+    reqs.merge(alpha_kernel.getWorkspaceRequirements(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)));
+    reqs.merge(beta_kernel.getWorkspaceRequirements(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)));
+    DeviceWorkspaceManager workspace(DeviceId::rocm(rocm_device_id_), reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(workspace.allocate(reqs));
+    alpha_kernel.bindWorkspace(&workspace);
+    beta_kernel.bindWorkspace(&workspace);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    alpha_kernel.setGPUStream(stream);
+    beta_kernel.setGPUStream(stream);
+
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&alpha_kernel, output_alpha.get(), static_cast<int>(N), nullptr, "alpha"},
+        {&beta_kernel, output_beta.get(), static_cast<int>(N), nullptr, "beta"}};
+
+    ASSERT_TRUE(alpha_kernel.multiply_fused_tensor(
+        input.get(), projections, static_cast<int>(M), static_cast<int>(K), nullptr, &workspace));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    ASSERT_EQ(hipMemsetAsync(output_alpha->gpu_data_ptr(), 0, M * N * sizeof(float), stream), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(output_beta->gpu_data_ptr(), 0, M * N * sizeof(float), stream), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    hipGraph_t graph = nullptr;
+    hipGraphExec_t exec = nullptr;
+    ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+    ASSERT_TRUE(alpha_kernel.multiply_fused_tensor(
+        input.get(), projections, static_cast<int>(M), static_cast<int>(K), nullptr, &workspace));
+    ASSERT_EQ(hipStreamEndCapture(stream, &graph), hipSuccess);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
+    ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    const float *actual_alpha = output_alpha->data();
+    const float *actual_beta = output_beta->data();
+    std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
+    std::vector<float> got_beta(actual_beta, actual_beta + M * N);
+
+    EXPECT_GT(compute_cosine_similarity(ref_alpha, got_alpha), 0.9999f);
+    EXPECT_GT(compute_cosine_similarity(ref_beta, got_beta), 0.9999f);
+
+    const auto records = PerfStatsCollector::snapshot({"kernel"});
+    const auto tiny_route = std::find_if(
+        records.begin(),
+        records.end(),
+        [](const PerfStatRecord &record)
+        {
+            return record.kind == PerfStatRecord::Kind::Counter &&
+                   record.domain == "kernel" &&
+                   record.name == "rocm_fp32_tiny_batched_projection_calls" &&
+                   record.tags.count("m") != 0 &&
+                   record.tags.at("m") == "1" &&
+                   record.tags.count("n") != 0 &&
+                   record.tags.at("n") == "48" &&
+                   record.tags.count("k") != 0 &&
+                   record.tags.at("k") == "5120" &&
+                   record.tags.count("batch") != 0 &&
+                   record.tags.at("batch") == "2";
+        });
+    ASSERT_NE(tiny_route, records.end())
+        << "Qwen3.6 alpha/beta decode projections should use the ROCm tiny FP32 batched route";
+
+    EXPECT_EQ(hipGraphExecDestroy(exec), hipSuccess);
+    EXPECT_EQ(hipGraphDestroy(graph), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionRestagesPointersAfterWorkspaceClobber)
+{
+    const size_t M = 1, N = 48, K = 5120;
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
+    auto weights_alpha = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+    auto weights_beta = std::make_unique<FP32Tensor>(std::vector<size_t>{N, K});
+    auto output_alpha = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N});
+    auto output_beta = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N});
+
+    std::mt19937 rng(139);
+    std::uniform_real_distribution<float> input_dist(-0.5f, 0.5f);
+    std::uniform_real_distribution<float> weight_dist(-0.25f, 0.25f);
+    for (size_t i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = input_dist(rng);
+    for (size_t i = 0; i < N * K; ++i)
+    {
+        weights_alpha->mutable_data()[i] = weight_dist(rng);
+        weights_beta->mutable_data()[i] = weight_dist(rng);
+    }
+
+    std::vector<float> ref_alpha(M * N);
+    std::vector<float> ref_beta(M * N);
+    reference_gemm(input->data(), weights_alpha->data(), ref_alpha.data(),
+                   static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), true);
+    reference_gemm(input->data(), weights_beta->data(), ref_beta.data(),
+                   static_cast<int>(M), static_cast<int>(N), static_cast<int>(K), true);
+
+    ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(output_alpha->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+    ASSERT_TRUE(output_beta->ensureOnDevice(DeviceId::rocm(rocm_device_id_)));
+
+    ROCmFloatingPointGemmKernel alpha_kernel(weights_alpha.get(), rocm_device_id_);
+    ROCmFloatingPointGemmKernel beta_kernel(weights_beta.get(), rocm_device_id_);
+
+    WorkspaceRequirements reqs;
+    reqs.merge(alpha_kernel.getWorkspaceRequirements(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)));
+    reqs.merge(beta_kernel.getWorkspaceRequirements(static_cast<int>(M), static_cast<int>(N), static_cast<int>(K)));
+    DeviceWorkspaceManager workspace(DeviceId::rocm(rocm_device_id_), reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(workspace.allocate(reqs));
+    alpha_kernel.bindWorkspace(&workspace);
+    beta_kernel.bindWorkspace(&workspace);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    alpha_kernel.setGPUStream(stream);
+    beta_kernel.setGPUStream(stream);
+
+    std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        {&alpha_kernel, output_alpha.get(), static_cast<int>(N), nullptr, "alpha"},
+        {&beta_kernel, output_beta.get(), static_cast<int>(N), nullptr, "beta"}};
+
+    ASSERT_TRUE(alpha_kernel.multiply_fused_tensor(
+        input.get(), projections, static_cast<int>(M), static_cast<int>(K), nullptr, &workspace));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    for (const char *name : {
+             GemmWorkspaceBuffers::ROCM_FP32_BATCH_A_PTRS,
+             GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS,
+             GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS})
+    {
+        ASSERT_TRUE(workspace.hasBuffer(name));
+        ASSERT_EQ(hipMemsetAsync(workspace.getBuffer(name), 0, workspace.getBufferSize(name), stream), hipSuccess);
+    }
+    ASSERT_EQ(hipMemsetAsync(output_alpha->gpu_data_ptr(), 0, M * N * sizeof(float), stream), hipSuccess);
+    ASSERT_EQ(hipMemsetAsync(output_beta->gpu_data_ptr(), 0, M * N * sizeof(float), stream), hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    ASSERT_TRUE(alpha_kernel.multiply_fused_tensor(
+        input.get(), projections, static_cast<int>(M), static_cast<int>(K), nullptr, &workspace));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    const float *actual_alpha = output_alpha->data();
+    const float *actual_beta = output_beta->data();
+    std::vector<float> got_alpha(actual_alpha, actual_alpha + M * N);
+    std::vector<float> got_beta(actual_beta, actual_beta + M * N);
+
+    EXPECT_GT(compute_cosine_similarity(ref_alpha, got_alpha), 0.9999f);
+    EXPECT_GT(compute_cosine_similarity(ref_beta, got_beta), 0.9999f);
+
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
 TEST_F(Test__ROCmFloatingPointGemmKernel, BatchedFusedProjectionRequiresWorkspace)
 {
     const size_t M = 2, N = 8, K = 16;

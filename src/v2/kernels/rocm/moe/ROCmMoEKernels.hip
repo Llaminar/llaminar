@@ -91,6 +91,42 @@ namespace
         uint32_t reserved_u32[2];
     };
 
+    constexpr int kMoEPointerStageMax = 16;
+
+    struct MoEPointerStagePayload
+    {
+        const float *const_ptrs_a[kMoEPointerStageMax];
+        const float *const_ptrs_b[kMoEPointerStageMax];
+        float *mutable_ptrs_a[kMoEPointerStageMax];
+        float *mutable_ptrs_b[kMoEPointerStageMax];
+    };
+
+    __global__ void moe_stage_const_pointer_arrays_kernel(
+        MoEPointerStagePayload payload,
+        const float **dst_a,
+        const float **dst_b,
+        int count)
+    {
+        const int i = static_cast<int>(threadIdx.x);
+        if (i >= count)
+            return;
+        dst_a[i] = payload.const_ptrs_a[i];
+        dst_b[i] = payload.const_ptrs_b[i];
+    }
+
+    __global__ void moe_stage_mutable_pointer_arrays_kernel(
+        MoEPointerStagePayload payload,
+        float **dst_a,
+        float **dst_b,
+        int count)
+    {
+        const int i = static_cast<int>(threadIdx.x);
+        if (i >= count)
+            return;
+        dst_a[i] = payload.mutable_ptrs_a[i];
+        dst_b[i] = payload.mutable_ptrs_b[i];
+    }
+
     __device__ __forceinline__ bool moe_topk_pair_better(
         float candidate_value,
         int candidate_id,
@@ -3045,6 +3081,92 @@ __global__ void rocm_moe_float_to_int_kernel(
 }
 
 extern "C" {
+
+bool hipMoE_stage_mutable_pointer_arrays(
+    float **d_a,
+    float **d_b,
+    float *const *h_a,
+    float *const *h_b,
+    int count,
+    int device_idx,
+    void *stream)
+{
+    if (!d_a || !d_b || !h_a || !h_b || count <= 0 ||
+        count > kMoEPointerStageMax || !stream)
+    {
+        fprintf(stderr, "HIP MoE mutable pointer staging invalid arguments: count=%d stream=%p\n", count, stream);
+        return false;
+    }
+
+    MoEPointerStagePayload payload{};
+    for (int i = 0; i < count; ++i)
+    {
+        if (!h_a[i] || !h_b[i])
+        {
+            fprintf(stderr, "HIP MoE mutable pointer staging null pointer at slot %d\n", i);
+            return false;
+        }
+        payload.mutable_ptrs_a[i] = h_a[i];
+        payload.mutable_ptrs_b[i] = h_b[i];
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+    hipLaunchKernelGGL(moe_stage_mutable_pointer_arrays_kernel,
+        dim3(1), dim3(kMoEPointerStageMax), 0, static_cast<hipStream_t>(stream),
+        payload, d_a, d_b, count);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE mutable pointer staging launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_stage_const_pointer_arrays(
+    const float **d_a,
+    const float **d_b,
+    const float *const *h_a,
+    const float *const *h_b,
+    int count,
+    int device_idx,
+    void *stream)
+{
+    if (!d_a || !d_b || !h_a || !h_b || count <= 0 ||
+        count > kMoEPointerStageMax || !stream)
+    {
+        fprintf(stderr, "HIP MoE const pointer staging invalid arguments: count=%d stream=%p\n", count, stream);
+        return false;
+    }
+
+    MoEPointerStagePayload payload{};
+    for (int i = 0; i < count; ++i)
+    {
+        if (!h_a[i] || !h_b[i])
+        {
+            fprintf(stderr, "HIP MoE const pointer staging null pointer at slot %d\n", i);
+            return false;
+        }
+        payload.const_ptrs_a[i] = h_a[i];
+        payload.const_ptrs_b[i] = h_b[i];
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+    hipLaunchKernelGGL(moe_stage_const_pointer_arrays_kernel,
+        dim3(1), dim3(kMoEPointerStageMax), 0, static_cast<hipStream_t>(stream),
+        payload, d_a, d_b, count);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE const pointer staging launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
 
 bool hipMoE_int_to_float(
     const int *d_input, float *d_output, int count,

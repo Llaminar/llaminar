@@ -40,9 +40,11 @@
 #include "PreparedWeightTestHarness.h"
 
 #ifdef HAVE_CUDA
+#include "kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #endif
 #ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #endif
 
@@ -217,6 +219,125 @@ namespace llaminar2::test
         out.kernel = out.store->gemmKernel(out.ref);
         if (!out.kernel)
             throw std::runtime_error("makeGpuPreparedGemm: gemmKernel returned null after registration");
+
+        return out;
+    }
+
+    /**
+     * @brief Build a real GPU floating-point GEMM kernel through the production
+     * RAW_FP upload path.
+     *
+     * This mirrors the floating-point branch in WeightManager's GPU pipeline:
+     * the weight is copied into a WeightVRAMPool slot without repacking, then a
+     * CUDA/ROCm floating-point GEMM kernel is bound to that persistent device
+     * pointer and registered in a PreparedWeightStore. Keep the returned object
+     * alive while using the borrowed kernel pointer.
+     */
+    inline GpuPreparedGemm makeGpuPreparedFloatingPointGemm(
+        TensorBase *weights,
+        DeviceId device,
+        const std::string &canonical_name = "test.gpu_prepared_fp_gemm.weight",
+        ModelContextId model_id = ModelContextId{9900})
+    {
+        namespace kf = llaminar::v2::kernels;
+
+        if (!weights)
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: null weight tensor");
+        if (!device.is_cuda() && !device.is_rocm())
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: device must be CUDA or ROCm");
+
+        const TensorType type = weights->native_type();
+        if (type != TensorType::FP32 && type != TensorType::FP16 && type != TensorType::BF16)
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: weight tensor must be FP32, FP16, or BF16");
+        if (!weights->raw_data())
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: weight host data is missing");
+
+        const int N = static_cast<int>(weights->rows());
+        const int K = static_cast<int>(weights->cols());
+        const size_t raw_bytes = weights->size_bytes();
+
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: no GPU backend available for device");
+
+        GpuPreparedGemm out;
+        out.orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        out.orchestrator->addDevice(device.ordinal);
+        out.orchestrator->planRawWeight(device.ordinal, canonical_name, N, K, raw_bytes);
+
+        constexpr int kNumStreams = 3;
+        out.orchestrator->allocate(raw_bytes, kNumStreams);
+
+        WeightJob job;
+        job.name = canonical_name;
+        job.host_raw_data = weights->raw_data();
+        job.raw_bytes = raw_bytes;
+        job.format = RepackFormat::RAW_FP;
+        job.N = N;
+        job.K = K;
+        job.is_asymmetric = false;
+        out.orchestrator->addWeightJob(device.ordinal, job);
+        out.orchestrator->load();
+
+        WeightVRAMPool *pool = out.orchestrator->getPool(device.ordinal);
+        if (!pool)
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: pool not found after load");
+        auto slot = pool->getSlot(canonical_name);
+        if (!slot)
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: weight slot missing after load");
+
+        std::unique_ptr<ITensorGemm> kernel;
+#ifdef HAVE_CUDA
+        if (device.is_cuda())
+        {
+            auto precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
+            if (type == TensorType::FP16)
+                precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
+            else if (type == TensorType::BF16)
+                precision = llaminar2::cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
+            kernel = std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
+                slot->d_native_vnni_payload, N, K, device.ordinal, precision, out.orchestrator);
+        }
+#endif
+#ifdef HAVE_ROCM
+        if (device.is_rocm())
+        {
+            auto precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
+            if (type == TensorType::FP16)
+                precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
+            else if (type == TensorType::BF16)
+                precision = llaminar2::rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
+            kernel = std::make_unique<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
+                slot->d_native_vnni_payload, N, K, device.ordinal, precision, out.orchestrator);
+        }
+#endif
+        if (!kernel)
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: failed to construct GPU FP GEMM kernel");
+
+        auto owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
+        auto prepared_weights = std::make_shared<kf::KernelFactory::PreparedGemmWeights>();
+        prepared_weights->kind = kf::KernelFactory::GemmPreparationKind::FLOATING_POINT;
+        prepared_weights->owned_kernel = owned_kernel;
+        prepared_weights->kernel = owned_kernel.get();
+
+        auto handle = std::make_shared<kf::KernelFactory::PreparedGemmHandle>();
+        handle->tensor = weights;
+        handle->device_id = device;
+        handle->kind = kf::KernelFactory::GemmPreparationKind::FLOATING_POINT;
+        handle->variant = static_cast<int>(weights->native_type());
+        handle->prepared_weights = std::move(prepared_weights);
+
+        out.store = std::make_unique<PreparedWeightStore>(model_id);
+        out.binding = makePreparedWeightTestBinding(weights, device, canonical_name, model_id);
+        out.ref = out.store->registerPreparedGemmHandle(
+            out.binding,
+            preparedKindForDevice(device),
+            device,
+            std::move(handle));
+
+        out.kernel = out.store->gemmKernel(out.ref);
+        if (!out.kernel)
+            throw std::runtime_error("makeGpuPreparedFloatingPointGemm: gemmKernel returned null after registration");
 
         return out;
     }

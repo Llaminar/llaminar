@@ -332,16 +332,15 @@ namespace llaminar2
             if (!effective_state)
                 return false;
 
-            // Keep one-token decode on the same row-split recurrence path as
-            // verifier/prefill so decode replay and multi-row verifier replay
-            // are mathematically aligned across backends.
-            return rocmGDN_chunk_forward(
+            // One-token decode must use the recurrent-step contract.  The
+            // multi-row verifier path remains chunk-based and publishes state
+            // through accepted-count metadata, but forcing ordinary decode
+            // through the chunk kernel changes the Qwen3.6 GDN trajectory on
+            // control-token continuations such as <think>.
+            return rocmGDN_recurrent_step(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,
-                /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
-                verifier_state_capture_,
-                verifier_state_capture_size_,
-                verifier_state_capture_rows_,
+                n_heads, d_k, d_v, use_qk_l2norm,
                 device_ordinal_, stream_);
         }
 

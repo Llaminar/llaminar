@@ -9,11 +9,11 @@ plan carries detailed implementation status.
 | Scope | Device | Model | Mode | Prefill tok/s | Decode tok/s | Status |
 |---|---|---|---|---:|---:|---|
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 708.33 | 41.73 | current promoted-path baseline |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 promoted | 602.79 | 67.92 | 1.63x, 83.70% acceptance |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 direct candidate | 602.79 | 67.92 | historical target, not accepted |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 609.73 | 38.19 | old blocker, 84.95% acceptance |
 | Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.21 | 31.10 | current promoted-path baseline |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 promoted | 218.27 | 36.14 | 1.16x, needs tuning |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | fixed d1 MTP, Phase 13.8 promoted | 218.24 | 39.84 | 1.28x, still short |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 direct candidate | 218.27 | 36.14 | historical target, not accepted |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | fixed d1 MTP, Phase 13.8 direct candidate | 218.24 | 39.84 | historical target, not accepted |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 76.35 | 31.92 | short-lane baseline |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 direct | 73.05 | 54.23 | 1.70x, 88.57% acceptance |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
@@ -31,24 +31,21 @@ Artifacts:
 
 ## Current Findings
 
-- Phase 13.8 vLLM-style transaction is now the promoted dense SingleDevice GPU
-  greedy catch-up path for correctness, after direct-mode evidence turned it
-  into real decode speedup on both CUDA and ROCm.
-- CUDA default-lane depth 3 is the best current dense signal: 67.92 tok/s versus
-  41.73 no-MTP, with 36 verifier runs, 159 verifier tokens, and zero transaction
-  validation failures.
-- ROCm proves the same strategy but is not benchmark-accepted yet: default
-  prompt is only 1.16x at 58.82% acceptance, while the high-acceptance `qbf`
-  lane is 1.70x at 88.57% acceptance. Depth 1 improves the default prompt to
-  39.84 tok/s, 1.28x, which points at both acceptance/depth policy and ROCm
-  verifier overhead. The ROCm default lane needs a tuning pass until it is in
-  the same win class as CUDA or the gap is trace-backed.
+- Phase 13.8 vLLM-style transaction is the active dense SingleDevice GPU
+  design, but the direct-candidate benchmark numbers above are historical
+  targets until the accepted-count speculative state-slot path is fully proven.
+- CUDA default-lane depth 3 is the best historical dense target: 67.92 tok/s
+  versus 41.73 no-MTP, with 36 verifier runs, 159 verifier tokens, and zero
+  transaction validation failures.
+- ROCm demonstrates a smaller historical direct-candidate win: default prompt
+  was 1.16x at 58.82% acceptance, while the high-acceptance `qbf` lane reached
+  1.70x at 88.57% acceptance. After acceptance, ROCm must post wins comparable
+  to CUDA or get a trace-backed tuning pass before Phase 14 claims.
 - Sequential verifier MTP remains documented as the old blocker. It was correct
   but speed-negative because accepted speculative tokens paid repeated
   decode-equivalent verifier forwards.
-- The retired shortcut ledger still stands: sidecar-chain verifier state and raw
-  all-position selected-state restore are not decode-equivalent for Qwen3.6
-  dense.
+- The raw all-position and sidecar-chain shortcut code/tests have been removed;
+  live work must go through accepted-count speculative state slots.
 - Source-owned parity covers CUDA/ROCm depth-3 normal decode, CUDA
   benchmark-prompt depth-3, CUDA/ROCm depth-1 prefix restore, and normal
   CUDA/ROCm stochastic MTP verifier cells through the shared Phase 13.8
@@ -74,8 +71,8 @@ Artifacts:
 ## Retained Actions
 
 - Finish Phase 13.8 by broadening the shared transaction path across stop,
-  prefix, continuation, MoE, and TP/PP cases, then tune ROCm default-lane
-  greedy/stochastic MTP until its win is comparable to CUDA or the remaining gap
-  is trace-backed. Do not re-enable raw all-position verifier shortcuts.
+  prefix, continuation, MoE, and TP/PP cases, then tune CUDA and ROCm
+  greedy/stochastic MTP until both post comparable wins or any remaining gap is
+  trace-backed. Do not restore raw all-position verifier shortcut code.
 - Keep CUDA MoE 148.5 tok/s and ROCm MoE 42.04 tok/s as current ratchets.
 - Return to TP/PP/EP overlay MTP after SingleDevice dense promotion is stable.

@@ -861,6 +861,9 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
     int seq_len, int n_k_heads, int n_v_heads,
     int d_k, int d_v, int global_v_offset)
 {
+    if (n_k_heads <= 0 || n_v_heads <= 0 || d_k <= 0 || d_v <= 0)
+        return;
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     int q_src_dim = n_k_heads * d_k;
@@ -886,6 +889,8 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
         int j = rem / d_k;
         int d = rem % d_k;
         int k_idx = (j + global_v_offset) % n_k_heads;
+        if (k_idx < 0)
+            k_idx += n_k_heads;
         out_q[idx] = merged[t * stride + k_idx * d_k + d];
     }
     else if (idx < q_total + k_total)
@@ -896,6 +901,8 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
         int j = rem / d_k;
         int d = rem % d_k;
         int k_idx = (j + global_v_offset) % n_k_heads;
+        if (k_idx < 0)
+            k_idx += n_k_heads;
         out_k[local] = merged[t * stride + q_src_dim + k_idx * d_k + d];
     }
     else

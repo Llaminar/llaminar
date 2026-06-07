@@ -2192,6 +2192,36 @@ namespace llaminar2
                         }
                     }
 
+                    if (m == 1 && debugEnv().gemm.deterministic)
+                    {
+                        const bool canonical_ok = cuda_kernel->multiply_quantized_m1_via_small_m_gemv(
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            d_output,
+                            d_bias,
+                            n,
+                            k,
+                            1.0f,
+                            0.0f);
+                        if (!canonical_ok)
+                        {
+                            LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Deterministic canonical M=1 small-M GEMV failed for projection "
+                                      << i << " (" << (proj.name ? proj.name : "unnamed") << ")");
+                            all_success = false;
+                            break;
+                        }
+
+                        if (trace_fused)
+                        {
+                            LOG_WARN("[GEMM_PATH] proj=" << i
+                                                         << " name=" << (proj.name ? proj.name : "?")
+                                                         << " backend=canonical_m1_small_m"
+                                                         << " m=" << m << " n=" << n << " k=" << k
+                                                         << " output=" << static_cast<void *>(d_output));
+                        }
+                        continue;
+                    }
+
                     const bool used_native = runNativeVNNIBlockwiseIfSupported(
                         cuda_kernel->impl_.get(),
                         d_A_int8,
@@ -2667,6 +2697,116 @@ namespace llaminar2
             return true;
         }
 
+        bool CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv(
+            const int8_t *d_A_int8,
+            const float *d_scales_A_blockwise,
+            float *d_C,
+            const float *d_bias,
+            int n, int k,
+            float alpha, float beta)
+        {
+            if (!debugEnv().gemm.deterministic)
+                return false;
+            if (!d_A_int8 || !d_scales_A_blockwise || !d_C || n <= 0 || k <= 0 || (k % 32) != 0)
+                return false;
+            if (beta != 0.0f)
+                return false;
+            if (!gpu_stream_)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] "
+                          "Deterministic canonical M=1 GEMV requires an explicit CUDA stream");
+                return false;
+            }
+
+            validateWorkspace();
+            ensureWeightsConverted();
+            if (!canUseNativeVNNIBlockwise(impl_.get(), 1, k))
+                return false;
+
+            auto *scratch = static_cast<float *>(workspace_->getBuffer(tempCFp32BufferName()));
+            const size_t scratch_bytes = workspace_->getBufferSize(tempCFp32BufferName());
+            const size_t required_scratch_bytes = static_cast<size_t>(2) * static_cast<size_t>(n) * sizeof(float);
+            if (!scratch || scratch_bytes < required_scratch_bytes)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] "
+                          << tempCFp32BufferName() << " workspace is missing or undersized: need "
+                          << required_scratch_bytes << " bytes, have " << scratch_bytes);
+                return false;
+            }
+
+            const int blocks_per_row = k / 32;
+            auto *mutable_A = const_cast<int8_t *>(d_A_int8);
+            auto *mutable_scales = const_cast<float *>(d_scales_A_blockwise);
+            cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream_);
+            cudaError_t err = cudaMemsetAsync(
+                mutable_A + static_cast<size_t>(k),
+                0,
+                static_cast<size_t>(k) * sizeof(int8_t),
+                stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to clear padded A row: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
+
+            err = cudaMemsetAsync(
+                mutable_scales + static_cast<size_t>(blocks_per_row),
+                0,
+                static_cast<size_t>(blocks_per_row) * sizeof(float),
+                stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to clear padded scale row: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
+
+            if (!multiply_quantized_small_m_gemv(
+                    d_A_int8,
+                    d_scales_A_blockwise,
+                    scratch,
+                    d_bias,
+                    2,
+                    n,
+                    k,
+                    alpha,
+                    0.0f,
+                    true))
+            {
+                return false;
+            }
+
+            err = cudaMemcpyAsync(
+                d_C,
+                scratch,
+                static_cast<size_t>(n) * sizeof(float),
+                cudaMemcpyDeviceToDevice,
+                stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_quantized_m1_via_small_m_gemv] Failed to copy canonical row output: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cuda_native_vnni_m1_canonical_small_m_calls",
+                    1.0,
+                    "gemm",
+                    "cuda:" + std::to_string(cuda_device_id_),
+                    PerfStatsCollector::Tags{
+                        {"codebook", std::to_string(static_cast<int>(impl_->native_codebook_id))},
+                        {"n", std::to_string(n)},
+                        {"k", std::to_string(k)}});
+            }
+
+            return true;
+        }
+
         bool CUDAQuantisedGemmKernel::multiply_fp32_to_fp32(
             const float *d_A, float *d_C,
             int m, int n, int k,
@@ -2762,6 +2902,26 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+                if (m == 1 && debugEnv().gemm.deterministic)
+                {
+                    if (multiply_quantized_m1_via_small_m_gemv(
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            d_C,
+                            nullptr,
+                            n,
+                            k,
+                            alpha,
+                            beta))
+                    {
+                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32] Complete (deterministic canonical M=1 small-M GEMV)");
+                        return true;
+                    }
+
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Deterministic M=1 native-VNNI canonical small-M GEMV failed");
+                    return false;
+                }
+
                 if (runNativeVNNIBlockwiseIfSupported(
                         impl_.get(),
                         d_A_int8,
@@ -2844,6 +3004,26 @@ namespace llaminar2
                 }
 
                 const float *d_C_existing = (beta != 0.0f) ? d_C : nullptr;
+                if (m == 1 && debugEnv().gemm.deterministic)
+                {
+                    if (multiply_quantized_m1_via_small_m_gemv(
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            d_C,
+                            d_bias,
+                            n,
+                            k,
+                            alpha,
+                            beta))
+                    {
+                        LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] Complete (deterministic canonical M=1 small-M GEMV)");
+                        return true;
+                    }
+
+                    LOG_ERROR("[CUDAQuantisedGemmKernel] Deterministic M=1 native-VNNI canonical small-M GEMV with bias failed");
+                    return false;
+                }
+
                 if (runNativeVNNIBlockwiseIfSupported(
                         impl_.get(),
                         d_A_int8,
@@ -2968,7 +3148,8 @@ namespace llaminar2
             // the same buffers as full tiles. Size by tile-padded M so a short
             // prompt cannot leave the CUDA workspace under-provisioned while
             // keeping active/bucket sizing for the rest of the graph.
-            const int workspace_m = (m > 1) ? ((m + 127) & ~127) : m;
+            const bool deterministic_m1 = (m == 1 && debugEnv().gemm.deterministic);
+            const int workspace_m = deterministic_m1 ? 2 : ((m > 1) ? ((m + 127) & ~127) : m);
 
             // INT8 path needs quantization + accumulator buffers
             size_t quant_a_bytes = static_cast<size_t>(workspace_m) * k * sizeof(int8_t);
@@ -3070,11 +3251,12 @@ namespace llaminar2
             // GEMV KPAR partials for decode/verifier reductions. The caller's
             // declared graph shape owns the bound; dynamic-depth graph users
             // must request their max verifier M explicitly.
-            if (m > 0 && m <= 4)
+            const int gemv_workspace_m = (m == 1 && debugEnv().gemm.deterministic) ? 2 : m;
+            if (gemv_workspace_m > 0 && gemv_workspace_m <= 4)
             {
                 const int k_groups = (k + 31) / 32;
                 const size_t kpar_bytes =
-                    static_cast<size_t>(k_groups) * static_cast<size_t>(m) * n * sizeof(float);
+                    static_cast<size_t>(k_groups) * static_cast<size_t>(gemv_workspace_m) * n * sizeof(float);
                 reqs.buffers.push_back({GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS, kpar_bytes, 256, true});
             }
 

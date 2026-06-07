@@ -5930,6 +5930,15 @@ namespace llaminar2
                 tags["gpu_replay_preserve_reason"] = "verifier_row_restore";
             }
         }
+        if (!preserve_gpu_replay_state)
+        {
+            resetKernelDynamicState();
+            tags["kernel_dynamic_state"] = "reset";
+        }
+        else
+        {
+            tags["kernel_dynamic_state"] = "preserved";
+        }
         PerfStatsCollector::addCounter("mtp",
                                        "live_prefix_replay_state_after_mutation",
                                        1.0,
@@ -7817,7 +7826,6 @@ namespace llaminar2
             return supportsPromotedVllmStyleSpecDecodeSingleDeviceDense();
         }
         return std::strcmp(candidate, "stepwise") == 0 ||
-               std::strcmp(candidate, "all_position") == 0 ||
                std::strcmp(candidate, "vllm_style_spec_decode") == 0;
     }
 
@@ -7828,10 +7836,6 @@ namespace llaminar2
         if (candidate && std::strcmp(candidate, "vllm_style_spec_decode") == 0)
         {
             return "vllm_style_spec_decode";
-        }
-        if (candidate && std::strcmp(candidate, "all_position") == 0)
-        {
-            return "retired_all_position_state_candidate";
         }
         if ((!candidate || !*candidate) &&
             supportsPromotedVllmStyleSpecDecodeSingleDeviceDense())
@@ -7847,22 +7851,6 @@ namespace llaminar2
     {
         const char *candidate =
             std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
-        if (candidate && std::strcmp(candidate, "all_position") == 0)
-        {
-            MTPDecodeCatchupGreedyResult result;
-            result.ok = false;
-            result.error =
-                "Phase 13.8 all-position catch-up candidate is retired; "
-                "use shared_stepwise until vllm_style_spec_decode is implemented";
-            PerfStatsCollector::addCounter(
-                "mtp",
-                "phase138_retired_all_position_catchup_rejections",
-                1.0,
-                "decode",
-                state_.device_id.toString(),
-                {{"reason", "retired"}});
-            return result;
-        }
         const bool default_promoted_vllm =
             (!candidate || !*candidate) &&
             supportsPromotedVllmStyleSpecDecodeSingleDeviceDense();
@@ -7928,6 +7916,25 @@ namespace llaminar2
                     "Phase 13.8 vllm_style_spec_decode base position mismatch: request=" +
                     std::to_string(request.base_sidecar_position) +
                     " runner=" + std::to_string(verifier_base_position));
+            }
+
+            PrefixStateSnapshot local_rejection_replay_base;
+            const PrefixStateSnapshot *rejection_replay_base =
+                request.verifier_base_checkpoint;
+            if (!rejection_replay_base || !rejection_replay_base->valid)
+            {
+                PerfStatsCollector::ScopedTimer timer(
+                    "mtp",
+                    "phase138_vllm_style_capture_base_for_rejection_replay",
+                    "decode",
+                    state_.device_id.toString());
+                local_rejection_replay_base = captureLivePrefixState();
+                rejection_replay_base = &local_rejection_replay_base;
+            }
+            if (!rejection_replay_base || !rejection_replay_base->valid)
+            {
+                return fail_vllm(
+                    "Phase 13.8 vllm_style_spec_decode could not capture verifier base for rejection replay");
             }
 
             MTPDecodeCatchupGreedyResult result;
@@ -8050,6 +8057,80 @@ namespace llaminar2
             if (!result.ok)
             {
                 return fail_vllm(result.error);
+            }
+            if (!result.all_speculative_accepted)
+            {
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "phase138_vllm_style_rejections_replayed_stepwise",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString(),
+                    {{"draft_tokens", std::to_string(request.draft_tokens.size())},
+                     {"accepted_prefix",
+                      std::to_string(result.accepted_speculative_prefix)}});
+                if (!restoreLivePrefixState(*rejection_replay_base))
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode could not restore verifier base for rejection replay");
+                }
+                if (forward_engine_)
+                {
+                    forward_engine_->discardAllCachedGraphs();
+                    PerfStatsCollector::addCounter(
+                        "mtp",
+                        "phase138_vllm_style_rejection_replay_forward_graph_discards",
+                        1.0,
+                        "decode",
+                        state_.device_id.toString());
+                }
+                resetKernelDynamicState();
+                PerfStatsCollector::addCounter(
+                    "mtp",
+                    "phase138_vllm_style_rejection_replay_dynamic_state_resets",
+                    1.0,
+                    "decode",
+                    state_.device_id.toString());
+
+                MTPDecodeCatchupGreedyRequest replay_request = request;
+                replay_request.implementation_name =
+                    "vllm_style_spec_decode_rejection_replay";
+                replay_request.verifier_path =
+                    "phase138_vllm_style_rejection_replay";
+                auto replay_sample_on_device = [&]() -> int32_t
+                {
+                    return sampleGreedyOnDevice();
+                };
+                MTPDecodeCatchupGreedyResult replay =
+                    runSharedStepwiseMTPDecodeCatchupGreedy(
+                        *this,
+                        replay_request,
+                        replay_sample_on_device);
+                if (!replay.ok)
+                {
+                    return fail_vllm(replay.error);
+                }
+
+                std::ostringstream replay_trace;
+                replay_trace
+                    << "batched_candidate_rejected=true"
+                    << "; batched_verifier_tokens="
+                    << [&]()
+                       {
+                           std::string out;
+                           for (size_t i = 0; i < result.verifier_tokens.size(); ++i)
+                           {
+                               if (i > 0)
+                                   out += ",";
+                               out += std::to_string(result.verifier_tokens[i]);
+                           }
+                           return out;
+                       }()
+                    << "; replayed_stepwise=true";
+                if (!debug_trace.str().empty())
+                    replay_trace << "; batched_debug={" << debug_trace.str() << "}";
+                replay.debug_trace = replay_trace.str();
+                return replay;
             }
 
             MTPSpecDecodeMetadataShape metadata_shape;

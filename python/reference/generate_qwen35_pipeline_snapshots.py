@@ -116,7 +116,8 @@ def write_metadata(
         #   v1: original format
         #   v2: MoE-only V-head reversal (dense models skip reversal)
         #   v3: Qwen3.5 prefill GDN conv and Q/K norm snapshots match C++ layout
-        f.write(f"snapshot_version: 3\n")
+        #   v4: GDN alpha/beta projection snapshots are emitted for recurrence debugging
+        f.write(f"snapshot_version: 4\n")
         f.write(f"Model: {model_path}\n")
         arch = getattr(config, "architectures", [config.__class__.__name__])
         f.write(f"Architecture: {arch[0] if arch else config.__class__.__name__}\n")

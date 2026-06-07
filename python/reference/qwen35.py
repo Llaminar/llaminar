@@ -319,6 +319,20 @@ class Qwen35ReferenceModel(HuggingFaceReferenceModel):
                     gdn.in_proj_z.register_forward_hook(_z_proj)
                 )
 
+                def _alpha_proj(mod, inp, out, i=idx):
+                    if self._should_capture(PipelineStage.GDN_ALPHA):
+                        self.capture_stage(PipelineStage.GDN_ALPHA, out, i)
+                self._hook_handles.append(
+                    gdn.in_proj_a.register_forward_hook(_alpha_proj)
+                )
+
+                def _beta_proj(mod, inp, out, i=idx):
+                    if self._should_capture(PipelineStage.GDN_BETA):
+                        self.capture_stage(PipelineStage.GDN_BETA, out, i)
+                self._hook_handles.append(
+                    gdn.in_proj_b.register_forward_hook(_beta_proj)
+                )
+
                 # RMSNormGated input = delta rule output (before norm+gate)
                 def _delta_rule_out(mod, inp, i=idx):
                     if self._should_capture(PipelineStage.GDN_DELTA_RULE_OUTPUT):

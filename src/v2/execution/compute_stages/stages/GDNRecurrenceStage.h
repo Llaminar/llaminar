@@ -94,11 +94,9 @@ namespace llaminar2
             bool use_qk_l2norm = true; ///< Apply L2 normalization to Q and K
 
             /// Global V-head offset for TP-aware Q/K selection.
-            /// Under tensor parallelism with GDN modular repeat (repeat_type=1),
-            /// Q/K are replicated across ranks while V is sharded. Each local
-            /// v_head j maps to k_head (j + global_v_head_offset) % n_k_heads.
-            /// Set to rank * n_v_heads_local by the graph builder. Default 0
-            /// (single-device or TP=1).
+            /// Global V-head offset for TP-aware Q/K selection. Qwen GDN uses
+            /// modular Q/K tiling: local V-head j maps to
+            /// (j + global_v_head_offset) % n_k_heads.
             int global_v_head_offset = 0;
 
             int layer_idx = -1; ///< Layer index for logging

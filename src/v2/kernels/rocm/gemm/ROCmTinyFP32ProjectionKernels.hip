@@ -5,6 +5,30 @@
 namespace
 {
     constexpr int TINY_FP32_BLOCK = 256;
+    constexpr int TINY_FP32_MAX_BATCH = 8;
+
+    struct Fp32BatchedProjectionPointers
+    {
+        const float *A[TINY_FP32_MAX_BATCH];
+        const float *B[TINY_FP32_MAX_BATCH];
+        float *C[TINY_FP32_MAX_BATCH];
+    };
+
+    __global__ void fp32_stage_batched_projection_pointers_kernel(
+        const Fp32BatchedProjectionPointers ptrs,
+        const float **__restrict__ d_A_array,
+        const float **__restrict__ d_B_array,
+        float **__restrict__ d_C_array,
+        int batch_count)
+    {
+        const int batch = static_cast<int>(threadIdx.x);
+        if (batch >= batch_count)
+            return;
+
+        d_A_array[batch] = ptrs.A[batch];
+        d_B_array[batch] = ptrs.B[batch];
+        d_C_array[batch] = ptrs.C[batch];
+    }
 
     __global__ __launch_bounds__(TINY_FP32_BLOCK)
         void fp32_tiny_batched_projection_kernel(
@@ -49,6 +73,81 @@ namespace
             C[static_cast<size_t>(m) * N + n] = scratch[0];
     }
 } // namespace
+
+extern "C" bool rocmFp32_stage_batched_projection_pointers(
+    const float **d_A_array,
+    const float **d_B_array,
+    float **d_C_array,
+    const float *const *h_A_ptrs,
+    const float *const *h_B_ptrs,
+    float *const *h_C_ptrs,
+    int batch_count,
+    int device_id,
+    void *stream)
+{
+    if (!d_A_array || !d_B_array || !d_C_array ||
+        !h_A_ptrs || !h_B_ptrs || !h_C_ptrs ||
+        batch_count <= 0 || batch_count > TINY_FP32_MAX_BATCH ||
+        !stream)
+    {
+        std::fprintf(
+            stderr,
+            "[rocmFp32_stage_batched_projection_pointers] invalid arguments: batch=%d stream=%p\n",
+            batch_count,
+            stream);
+        return false;
+    }
+
+    Fp32BatchedProjectionPointers ptrs{};
+    for (int i = 0; i < batch_count; ++i)
+    {
+        if (!h_A_ptrs[i] || !h_B_ptrs[i] || !h_C_ptrs[i])
+        {
+            std::fprintf(
+                stderr,
+                "[rocmFp32_stage_batched_projection_pointers] null pointer in batch %d\n",
+                i);
+            return false;
+        }
+        ptrs.A[i] = h_A_ptrs[i];
+        ptrs.B[i] = h_B_ptrs[i];
+        ptrs.C[i] = h_C_ptrs[i];
+    }
+
+    hipError_t err = hipSetDevice(device_id);
+    if (err != hipSuccess)
+    {
+        std::fprintf(
+            stderr,
+            "[rocmFp32_stage_batched_projection_pointers] hipSetDevice failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    hipLaunchKernelGGL(
+        fp32_stage_batched_projection_pointers_kernel,
+        dim3(1),
+        dim3(TINY_FP32_MAX_BATCH),
+        0,
+        hip_stream,
+        ptrs,
+        d_A_array,
+        d_B_array,
+        d_C_array,
+        batch_count);
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        std::fprintf(
+            stderr,
+            "[rocmFp32_stage_batched_projection_pointers] launch failed: %s\n",
+            hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
 
 extern "C" bool rocmFp32_tiny_batched_projection(
     const float *const *d_A_array,

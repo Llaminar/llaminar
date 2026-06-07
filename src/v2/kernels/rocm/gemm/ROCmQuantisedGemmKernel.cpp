@@ -503,6 +503,7 @@ namespace llaminar2
                 const float *d_scales_B,     // [N] per-column weight scales
                 const float *d_bias,         // [N] optional bias (nullable)
                 float *d_partial_buf,        // [KB_MAX × N] pre-allocated partial buffer
+                int *d_counter,              // [ceil(N/128)] pre-allocated self-reduce counters
                 int N, int K,
                 float alpha, float beta,
                 const float *d_C_existing, // [N] used when beta != 0
@@ -517,6 +518,7 @@ namespace llaminar2
                 const float *d_scales_B,
                 const float *d_bias,
                 float *d_partial_buf,
+                int *d_counter,
                 int N, int K,
                 float alpha, float beta,
                 const float *d_C_existing,
@@ -752,6 +754,7 @@ namespace llaminar2
             // Scatter+reduce partial buffer (from workspace)
             float *d_scatter_partial = nullptr; // [KB_MAX × N] FP32 scatter partials
             float *d_scatter_partial_batched = nullptr; // [batch × KB_MAX × N] FP32 scatter partials
+            int *d_selfreduce_counters = nullptr; // [ceil(N / 128)] INT32 self-reduce counters
 
             // Capacity tracking for workspace buffers (set during validateWorkspace)
             size_t d_A_fp32_capacity = 0;
@@ -2718,7 +2721,7 @@ namespace llaminar2
                         {
                             int8_decode_ok = rocmGemv_int8_scatter_vnni_blockwise(
                                 impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A_blockwise, d_scales_B, d_bias,
-                                impl_->d_scatter_partial,
+                                impl_->d_scatter_partial, impl_->d_selfreduce_counters,
                                 n, k, alpha, beta, d_existing,
                                 rocm_device_id_, gpu_stream_);
                         }
@@ -2938,7 +2941,7 @@ namespace llaminar2
                         {
                             int8_decode_ok = rocmGemv_int8_scatter_vnni_blockwise(
                                 impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A_blockwise, d_scales_B, d_bias,
-                                impl_->d_scatter_partial,
+                                impl_->d_scatter_partial, impl_->d_selfreduce_counters,
                                 n, k, alpha, beta, d_existing,
                                 rocm_device_id_, gpu_stream_);
                         }
@@ -4511,7 +4514,7 @@ namespace llaminar2
                             projection_ok = rocmGemv_int8_scatter_vnni_blockwise(
                                 impl_->d_A_int8, d_vnni, d_output,
                                 impl_->d_scales_A_blockwise, d_scales_B, d_bias,
-                                rocm_kernel->impl_->d_scatter_partial,
+                                rocm_kernel->impl_->d_scatter_partial, rocm_kernel->impl_->d_selfreduce_counters,
                                 n, k, 1.0f, 0.0f, nullptr,
                                 rocm_device_id_, gpu_stream_);
                         }
@@ -4905,6 +4908,15 @@ namespace llaminar2
             reqs.buffers.push_back({
                 scatterPartialBatchedBufferName(),
                 scatter_partial_bytes * ROCM_NATIVE_SMALL_M_WORKSPACE_BATCH_PROJECTIONS,
+                256,
+                true});
+
+            constexpr int SCATTER_TILE_N = 128;
+            const size_t selfreduce_counter_bytes =
+                static_cast<size_t>((n + SCATTER_TILE_N - 1) / SCATTER_TILE_N) * sizeof(int);
+            reqs.buffers.push_back({
+                GemmWorkspaceBuffers::ROCM_SELFREDUCE_COUNTERS,
+                selfreduce_counter_bytes,
                 256,
                 true});
 
@@ -5596,6 +5608,11 @@ namespace llaminar2
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: " +
                     batched_scatter_partial_name);
             }
+            if (!workspace_->hasBuffer(GemmWorkspaceBuffers::ROCM_SELFREDUCE_COUNTERS))
+            {
+                throw std::runtime_error(
+                    "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ROCM_SELFREDUCE_COUNTERS");
+            }
 
             // Populate impl_ pointers from workspace
             impl_->d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
@@ -5607,6 +5624,8 @@ namespace llaminar2
             impl_->d_C_fp32 = static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::TEMP_C_FP32));
             impl_->d_scatter_partial = static_cast<float *>(workspace_->getBuffer(scatter_partial_name));
             impl_->d_scatter_partial_batched = static_cast<float *>(workspace_->getBuffer(batched_scatter_partial_name));
+            impl_->d_selfreduce_counters =
+                static_cast<int *>(workspace_->getBuffer(GemmWorkspaceBuffers::ROCM_SELFREDUCE_COUNTERS));
 
             // Set capacity values to max (workspace is pre-sized for maximum dimensions)
             // These are used by code paths that check capacity before use
@@ -6025,7 +6044,7 @@ namespace llaminar2
                         {
                             ok = rocmGemv_int8_scatter_vnni_blockwise(
                                 impl_->d_A_int8, d_vnni, d_C, impl_->d_scales_A_blockwise, d_s, d_bias,
-                                impl_->d_scatter_partial,
+                                impl_->d_scatter_partial, impl_->d_selfreduce_counters,
                                 n, k, alpha, beta, nullptr,
                                 rocm_device_id_, gpu_stream_);
                         }
@@ -6057,7 +6076,7 @@ namespace llaminar2
                         {
                             ok = rocmGemv_int8_scatter_vnni_blockwise(
                                 impl_->d_A_int8, d_vnni, d_int8_output, impl_->d_scales_A_blockwise, d_s, d_bias,
-                                impl_->d_scatter_partial,
+                                impl_->d_scatter_partial, impl_->d_selfreduce_counters,
                                 n, k, alpha, beta, d_existing,
                                 rocm_device_id_, gpu_stream_);
                         }

@@ -82,6 +82,26 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidatePrefixRest
     runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(cudaSingleDeviceCase(), 1);
 }
 
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidateStopTokenEquivalence)
+{
+    runDensePhase138VllmStyleCandidateStopTokenEquivalence(cudaSingleDeviceCase(), 2);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPPhase138ContinuationMatchesPyTorch)
+{
+    runDenseNoMTPPhase138ContinuationMatchesPyTorch(cudaSingleDeviceCase(), 8);
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPPhase138ThinkContinuationStageParity)
+{
+    runDenseNoMTPPhase138ThinkContinuationStageParity(cudaSingleDeviceCase());
+}
+
+TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidateContinuationEquivalence)
+{
+    runDensePhase138VllmStyleCandidateContinuationEquivalence(cudaSingleDeviceCase(), 3, 8);
+}
+
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleFreshRunnerDeterminism)
 {
     runDenseNoMTPBenchmarkStyleFreshRunnerDeterminism(
@@ -90,48 +110,9 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, NoMTPBenchmarkStyleFreshRunnerDeterm
         /*reused_cycle_count=*/4);
 }
 
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPVerifierRowsPostSidecarMatchRestoredReplay)
-{
-    runDenseMTPVerifierRowsPostSidecarEquivalence(cudaSingleDeviceCase());
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, M2VerifierLongPrefixMatchesSequential)
-{
-    runDenseM2VerifierLongPrefixMatchesSequential(cudaSingleDeviceCase());
-}
-
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, OneRowRestoreLongPrefixMatchesSequential)
 {
     runDenseOneRowRestoreLongPrefixMatchesSequential(cudaSingleDeviceCase());
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, M2VerifierFinalStateLongPrefixIsNotDecodeEquivalent)
-{
-    runDenseM2VerifierFinalStateLongPrefixIsNotDecodeEquivalent(cudaSingleDeviceCase());
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierLongPrefixIsNotDecodeEquivalent)
-{
-    runDenseM4VerifierLongPrefixIsNotDecodeEquivalent(cudaSingleDeviceCase());
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, M4VerifierRow3RestoreIsNotDecodeEquivalent)
-{
-    runDenseM4VerifierRow3RestoreFeedsNextVerifierRows(cudaSingleDeviceCase());
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, SidecarChainVerifierStateShortcutCandidateIsNotDecodeEquivalent)
-{
-    runDenseM4SidecarChainVerifierStateShortcutCandidate(
-        cudaSingleDeviceCase(),
-        /*expect_decode_equivalent=*/false);
-}
-
-TEST(Qwen36CUDASingleDevicePrefixMTPParity, AllPositionCatchupCandidateFailsCommitReplay)
-{
-    runDenseAllPositionCatchupCandidateFailsCommitReplay(
-        cudaSingleDeviceCase(),
-        /*use_benchmark_prompt=*/true);
 }
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, MTPEnabledForwardOnlyMatchesNoMTPDecode)

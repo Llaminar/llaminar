@@ -354,14 +354,14 @@ namespace llaminar2
         bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
         bool ensureGroupedGateUpCapacity(int num_active, int d_model);
         bool ensureGroupedGateUpKPartScratchCapacity(int num_active, int k_partitions, int intermediate);
-        bool ensureRuntimeGateUpPointerArrays(
+        bool stageRuntimeGateUpPointerArrays(
             int descriptor_table_id,
             int top_k,
             const std::array<float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
             const std::array<float *, kRuntimePointerArrayMaxTopK> &up_ptrs,
             float ***d_gate_ptrs,
             float ***d_up_ptrs);
-        bool ensureRuntimeDownPointerArrays(
+        bool stageRuntimeDownPointerArrays(
             int descriptor_table_id,
             int top_k,
             const std::array<const float *, kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -424,26 +424,6 @@ namespace llaminar2
             bool valid = false;
         };
 
-        struct RuntimeGateUpPointerCacheEntry
-        {
-            int descriptor_table_id = -1;
-            int top_k = 0;
-            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> gate_ptr_values = {};
-            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
-            float **d_gate_ptrs = nullptr;
-            float **d_up_ptrs = nullptr;
-        };
-
-        struct RuntimeDownPointerCacheEntry
-        {
-            int descriptor_table_id = -1;
-            int top_k = 0;
-            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> gate_ptr_values = {};
-            std::array<std::uintptr_t, kRuntimePointerArrayMaxTopK> up_ptr_values = {};
-            const float **d_gate_ptrs = nullptr;
-            const float **d_up_ptrs = nullptr;
-        };
-
         struct RouterFP16GateCacheEntry
         {
             std::uintptr_t source_tensor = 0;
@@ -496,7 +476,6 @@ namespace llaminar2
         int grouped_decode_active_cap_ = 0;
         int grouped_decode_intermediate_cap_ = 0;
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
-        std::vector<RuntimeDownPointerCacheEntry> runtime_down_pointer_cache_;
 
         // Grouped decode staging for ROCm native-VNNI MoE gate/up path.
         float **d_grouped_gate_output_ptrs_ = nullptr;
@@ -512,7 +491,6 @@ namespace llaminar2
         int grouped_gateup_kpart_partitions_cap_ = 0;
         int grouped_gateup_kpart_intermediate_cap_ = 0;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
-        std::vector<RuntimeGateUpPointerCacheEntry> runtime_gateup_pointer_cache_;
         std::vector<float *> host_grouped_gate_output_ptrs_;
         std::vector<float *> host_grouped_up_output_ptrs_;
         std::vector<int> host_grouped_gateup_expert_ids_;

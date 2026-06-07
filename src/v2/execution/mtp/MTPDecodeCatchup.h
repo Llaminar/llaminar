@@ -12,6 +12,7 @@
 namespace llaminar2
 {
     class IInferenceRunner;
+    struct PrefixStateSnapshot;
 
     struct MTPDecodeCatchupGreedyRequest
     {
@@ -21,6 +22,15 @@ namespace llaminar2
         bool allow_speculative_discard = true;
         std::string verifier_path = "decode_equivalent_catchup";
         std::string implementation_name = "shared_stepwise";
+
+        /**
+         * Optional decode-equivalent verifier base captured before sidecar
+         * drafting. Optimized hooks that discover a rejection after a batched
+         * verifier attempt must restore this exact base before replaying the
+         * correction path; a post-sidecar checkpoint can already contain
+         * shifted-MTP cache mutations.
+         */
+        const PrefixStateSnapshot *verifier_base_checkpoint = nullptr;
     };
 
     struct MTPDecodeCatchupGreedyResult

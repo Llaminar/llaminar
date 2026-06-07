@@ -62,11 +62,8 @@ namespace llaminar2
          *   q_dst[t, j] = q_src[t, k_idx]
          *   k_dst[t, j] = k_src[t, k_idx]
          *
-         * This single modular formula correctly covers all three regimes:
-         *   - nkh > n_v_heads_local  (selection, e.g. high-degree TP)
-         *   - nkh == n_v_heads_local (identity or rotation)
-         *   - nkh < n_v_heads_local  (expansion / modular GQA repeat)
-         * including non-integer ratios (e.g. 27B under TP=2: nkh=16, n_v_local=24).
+         * This mirrors the Qwen3.5/Qwen3.6 reference implementation, which
+         * tiles Q/K heads with repeat() rather than contiguous repeat_interleave().
          *
          * Fast path: when global_v_offset == 0 AND nkh == n_v_heads_local, the
          * Q and K regions become a contiguous copy of the source buffer — emitted
@@ -106,7 +103,9 @@ namespace llaminar2
                 {
                     for (int j = 0; j < n_v_heads_local; ++j)
                     {
-                        const int k_idx = (j + global_v_offset) % nkh;
+                        int k_idx = (j + global_v_offset) % nkh;
+                        if (k_idx < 0)
+                            k_idx += nkh;
                         std::memcpy(q_dst + j * d_k,
                                     q_src + k_idx * d_k,
                                     d_k * sizeof(float));
@@ -236,6 +235,11 @@ namespace llaminar2
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
         if (speculative_slot_rows <= 0)
         {
+            // The recurrence kernel instance is shared through the hybrid KV
+            // cache across graph shapes. Normal decode graphs must explicitly
+            // clear verifier capture state that may have been bound by an
+            // all-position speculative verifier graph; otherwise decode keeps
+            // updating scratch state instead of the live recurrent state.
             params_.kernel->bindVerifierStateCaptureWorkspace(
                 nullptr,
                 0,

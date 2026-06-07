@@ -1892,6 +1892,30 @@ namespace llaminar2
         std::vector<PrefixStateSnapshot> sidecar_checkpoints;
         sidecar_checkpoints.reserve(1);
         bool post_sidecar_checkpoint_requires_verifier_row_restore = false;
+        std::optional<PrefixStateSnapshot> optimized_catchup_verifier_base_payload;
+        if (!stochastic_verify &&
+            !use_sampling_penalties &&
+            runner_->supportsOptimizedMTPDecodeCatchupGreedy())
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "mtp",
+                "capture_phase138_optimized_catchup_payload_base",
+                "decode");
+            optimized_catchup_verifier_base_payload = runner_->captureLivePrefixState();
+            if (!optimized_catchup_verifier_base_payload->valid)
+            {
+                return fail_after_checkpoint(
+                    "MTP Phase 13.8 optimized catch-up could not capture payload verifier base");
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "phase138_optimized_catchup_payload_base_captures",
+                1.0,
+                "decode",
+                {},
+                {{"cached_tokens",
+                  std::to_string(optimized_catchup_verifier_base_payload->cached_tokens)}});
+        }
         std::vector<std::vector<SamplingDistributionEntry>> draft_distributions;
         draft_distributions.reserve(static_cast<size_t>(speculative_draft_count));
 
@@ -2658,6 +2682,10 @@ namespace llaminar2
             catchup_request.base_sidecar_position = base_sidecar_position;
             catchup_request.allow_speculative_discard = true;
             catchup_request.verifier_path = "decode_equivalent_catchup";
+            catchup_request.verifier_base_checkpoint =
+                optimized_catchup_verifier_base_payload
+                    ? &*optimized_catchup_verifier_base_payload
+                    : &verifier_base_checkpoint;
 
             const bool use_optimized_catchup =
                 runner_->supportsOptimizedMTPDecodeCatchupGreedy();
@@ -2714,13 +2742,17 @@ namespace llaminar2
                         }
                         if (catchup.error.empty())
                         {
+                            const PrefixStateSnapshot *equivalence_base =
+                                catchup_request.verifier_base_checkpoint
+                                    ? catchup_request.verifier_base_checkpoint
+                                    : &verifier_base_checkpoint;
                             PrefixRuntimeStateSnapshot candidate_state =
                                 runner_->prefixStateProbe();
-                            if (!runner_->restoreLivePrefixState(verifier_base_checkpoint))
+                            if (!runner_->restoreLivePrefixState(*equivalence_base))
                             {
                                 catchup.ok = false;
                                 catchup.error =
-                                    "MTP Phase 13.8 equivalence check could not restore verifier base after candidate";
+                                    "MTP Phase 13.8 equivalence check could not restore exact verifier base after candidate";
                             }
                             else
                             {
@@ -2752,7 +2784,7 @@ namespace llaminar2
                                         };
 
                                         const int expected_candidate_position =
-                                            verifier_base_checkpoint.cached_tokens +
+                                            equivalence_base->cached_tokens +
                                             std::max(0, candidate.target_verifier_state_commit_count);
                                         if (candidate.accepted_tokens != oracle.accepted_tokens)
                                         {

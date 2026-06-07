@@ -345,10 +345,10 @@ namespace llaminar2
                 return false;
 
             // Keep one-token decode on the same row-split recurrence path as
-            // verifier/prefill. The old dedicated decode kernel accumulated
-            // slightly different GDN state over long generations, which made
-            // no-MTP CUDA decode diverge from PyTorch while MTP verifier rows
-            // remained correct.
+            // verifier/prefill. The dedicated decode kernel accumulates a
+            // slightly different GDN state over long generations, which can
+            // flip near-tie Qwen3.6 tokens while the chunk-style verifier path
+            // remains aligned with PyTorch.
             return cudaGDN_chunk_forward(
                 q, k, v, alpha, beta_raw, A_log, dt_bias,
                 output, effective_state,

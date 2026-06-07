@@ -252,15 +252,12 @@ namespace llaminar2
             const float **d_batch_A_ptrs_ = nullptr;
             const float **d_batch_B_ptrs_ = nullptr;
             float **d_batch_C_ptrs_ = nullptr;
-            std::vector<const float *> cached_batch_A_ptrs_;
-            std::vector<const float *> cached_batch_B_ptrs_;
-            std::vector<float *> cached_batch_C_ptrs_;
 
             std::string batchAPtrsBufferName() const;
             std::string batchBPtrsBufferName() const;
             std::string batchCPtrsBufferName() const;
             bool validateBatchedPointerWorkspace(DeviceWorkspaceManager *workspace, size_t required_count);
-            bool uploadBatchedPointersIfChanged(
+            bool stageBatchedPointers(
                 const std::vector<const float *> &a_ptrs,
                 const std::vector<const float *> &b_ptrs,
                 const std::vector<float *> &c_ptrs,

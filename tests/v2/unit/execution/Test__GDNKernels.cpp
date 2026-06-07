@@ -48,6 +48,10 @@
 #include "kernels/rocm/gdn/ROCmShortConvolution.h"
 #include <hip/hip_runtime.h>
 #endif
+#if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
+#include "kernels/cuda/gdn/CUDAGatedDeltaNet.h"
+#include <cuda_runtime.h>
+#endif
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "utils/DebugEnv.h"
@@ -121,6 +125,93 @@ namespace
     // CPU kernel instances for end-to-end stage tests
     CPUShortConvolution g_cpu_conv;
     CPUGatedDeltaNet g_cpu_gdn;
+
+    struct GDNReferenceResult
+    {
+        std::vector<float> output;
+        std::vector<float> state;
+    };
+
+    bool computeCPUSequentialGDNReference(
+        const FP32Tensor &Q,
+        const FP32Tensor &K,
+        const FP32Tensor &V,
+        const FP32Tensor &alpha,
+        const FP32Tensor &beta,
+        const FP32Tensor &A_log,
+        const FP32Tensor &dt_bias,
+        int seq_len,
+        int n_heads,
+        int d_k,
+        int d_v,
+        bool use_qk_l2norm,
+        GDNReferenceResult &result)
+    {
+        const int qk_stride = n_heads * d_k;
+        const int v_stride = n_heads * d_v;
+        result.output.assign(static_cast<size_t>(seq_len) * static_cast<size_t>(v_stride), 0.0f);
+        result.state.assign(static_cast<size_t>(n_heads) * static_cast<size_t>(d_k) * static_cast<size_t>(d_v), 0.0f);
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            if (!g_cpu_gdn.recurrent_step(
+                    Q.data() + static_cast<size_t>(t) * static_cast<size_t>(qk_stride),
+                    K.data() + static_cast<size_t>(t) * static_cast<size_t>(qk_stride),
+                    V.data() + static_cast<size_t>(t) * static_cast<size_t>(v_stride),
+                    alpha.data() + static_cast<size_t>(t) * static_cast<size_t>(n_heads),
+                    beta.data() + static_cast<size_t>(t) * static_cast<size_t>(n_heads),
+                    A_log.data(),
+                    dt_bias.data(),
+                    result.output.data() + static_cast<size_t>(t) * static_cast<size_t>(v_stride),
+                    result.state.data(),
+                    n_heads,
+                    d_k,
+                    d_v,
+                    use_qk_l2norm))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void expectVectorsNear(
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        const std::string &label,
+        float max_abs_threshold,
+        double rel_l2_threshold)
+    {
+        ASSERT_EQ(actual.size(), expected.size()) << label << " vector size mismatch";
+
+        float max_abs_diff = 0.0f;
+        size_t max_abs_index = 0;
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            const float diff = std::abs(actual[i] - expected[i]);
+            if (diff > max_abs_diff)
+            {
+                max_abs_diff = diff;
+                max_abs_index = i;
+            }
+            sum_sq_diff += static_cast<double>(diff) * diff;
+            sum_sq_ref += static_cast<double>(expected[i]) * expected[i];
+        }
+
+        const double rel_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30));
+        EXPECT_LT(max_abs_diff, max_abs_threshold)
+            << label << " max_abs mismatch at index " << max_abs_index
+            << " actual=" << actual[max_abs_index]
+            << " expected=" << expected[max_abs_index]
+            << " rel_l2=" << rel_l2;
+        EXPECT_LT(rel_l2, rel_l2_threshold)
+            << label << " relative L2 mismatch"
+            << " max_abs=" << max_abs_diff
+            << " max_abs_index=" << max_abs_index;
+    }
 
     class ScopedEnvVar
     {
@@ -2272,6 +2363,328 @@ TEST(Test__GDNKernels, Recurrence_PaddedPrefillStateMatchesUnpaddedDecode)
 }
 
 #ifdef HAVE_ROCM
+TEST(Test__GDNKernels, ROCmMergedQKVDeinterleaveUsesModularQKTiling)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    struct StreamGuard
+    {
+        hipStream_t stream = nullptr;
+        ~StreamGuard()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+    } stream_guard{stream};
+
+    constexpr int seq_len = 1;
+    constexpr int n_k_heads = 2;
+    constexpr int n_v_heads = 6;
+    constexpr int d_k = 2;
+    constexpr int d_v = 2;
+    constexpr int q_src_dim = n_k_heads * d_k;
+    constexpr int k_src_dim = n_k_heads * d_k;
+    constexpr int v_dim = n_v_heads * d_v;
+    constexpr int qkv_cols = q_src_dim + k_src_dim + v_dim;
+    constexpr int q_dst_dim = n_v_heads * d_k;
+    constexpr int k_dst_dim = n_v_heads * d_k;
+    constexpr int scratch_elems = q_dst_dim + k_dst_dim + v_dim;
+
+    std::vector<float> merged_host(static_cast<size_t>(qkv_cols), 0.0f);
+    // Q heads: [10, 11], [20, 21]
+    merged_host[0] = 10.0f;
+    merged_host[1] = 11.0f;
+    merged_host[2] = 20.0f;
+    merged_host[3] = 21.0f;
+    // K heads: [30, 31], [40, 41]
+    merged_host[4] = 30.0f;
+    merged_host[5] = 31.0f;
+    merged_host[6] = 40.0f;
+    merged_host[7] = 41.0f;
+    for (int i = 0; i < v_dim; ++i)
+        merged_host[static_cast<size_t>(q_src_dim + k_src_dim + i)] = 100.0f + static_cast<float>(i);
+
+    auto merged = makeFP32({seq_len, qkv_cols}, merged_host.data());
+    auto scratch = makeFP32({static_cast<size_t>(scratch_elems)});
+    ASSERT_TRUE(merged->ensureOnDevice(device, stream));
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    auto *d_merged = static_cast<const float *>(merged->gpu_data_ptr());
+    auto *d_scratch = static_cast<float *>(scratch->gpu_data_ptr());
+    ASSERT_NE(d_merged, nullptr);
+    ASSERT_NE(d_scratch, nullptr);
+
+    ROCmGatedDeltaNet kernel(0);
+    kernel.setGPUStream(stream);
+    kernel.bindDeinterleaveWorkspace(d_scratch, scratch_elems);
+
+    float *d_q = nullptr;
+    float *d_k_out = nullptr;
+    float *d_v_out = nullptr;
+    ASSERT_TRUE(kernel.deinterleave_qkv_device(
+        d_merged, d_q, d_k_out, d_v_out,
+        seq_len, n_k_heads, n_v_heads, d_k, d_v,
+        /*global_v_head_offset=*/0));
+    ASSERT_EQ(d_q, d_scratch);
+    ASSERT_EQ(d_k_out, d_scratch + q_dst_dim);
+    ASSERT_EQ(d_v_out, d_scratch + q_dst_dim + k_dst_dim);
+
+    scratch->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(scratch->ensureOnHost(stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    const std::vector<float> expected_q = {
+        10.0f, 11.0f,
+        20.0f, 21.0f,
+        10.0f, 11.0f,
+        20.0f, 21.0f,
+        10.0f, 11.0f,
+        20.0f, 21.0f,
+    };
+    const std::vector<float> expected_k = {
+        30.0f, 31.0f,
+        40.0f, 41.0f,
+        30.0f, 31.0f,
+        40.0f, 41.0f,
+        30.0f, 31.0f,
+        40.0f, 41.0f,
+    };
+
+    const float *data = scratch->data();
+    for (size_t i = 0; i < expected_q.size(); ++i)
+        EXPECT_FLOAT_EQ(data[i], expected_q[i]) << "Q modular tiling mismatch at " << i;
+    for (size_t i = 0; i < expected_k.size(); ++i)
+        EXPECT_FLOAT_EQ(data[static_cast<size_t>(q_dst_dim) + i], expected_k[i])
+            << "K modular tiling mismatch at " << i;
+    for (int i = 0; i < v_dim; ++i)
+        EXPECT_FLOAT_EQ(data[static_cast<size_t>(q_dst_dim + k_dst_dim + i)],
+                        100.0f + static_cast<float>(i))
+            << "V straight-copy mismatch at " << i;
+}
+
+TEST(Test__GDNKernels, ROCmSequentialDecodeMatchesCPUReferenceQwen36Shape)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    struct StreamGuard
+    {
+        hipStream_t stream = nullptr;
+        ~StreamGuard()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+    } stream_guard{stream};
+
+    const int seq_len = 4;
+    const int n_heads = 16;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const size_t state_elems = static_cast<size_t>(n_heads) * d_k * d_v;
+
+    auto Q = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.08f, 1901);
+    auto K = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.08f, 1902);
+    auto V = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(v_stride)}, 0.0f, 0.08f, 1903);
+    auto alpha = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads)}, -0.2f, 0.25f, 1904);
+    auto beta = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads)}, 0.0f, 0.25f, 1905);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto output = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(v_stride)});
+
+    GDNReferenceResult reference;
+    ASSERT_TRUE(computeCPUSequentialGDNReference(
+        *Q, *K, *V, *alpha, *beta, *A_log, *dt_bias,
+        seq_len, n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true,
+        reference));
+
+    ASSERT_TRUE(Q->ensureOnDevice(device, stream));
+    ASSERT_TRUE(K->ensureOnDevice(device, stream));
+    ASSERT_TRUE(V->ensureOnDevice(device, stream));
+    ASSERT_TRUE(alpha->ensureOnDevice(device, stream));
+    ASSERT_TRUE(beta->ensureOnDevice(device, stream));
+    ASSERT_TRUE(A_log->ensureOnDevice(device, stream));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device, stream));
+    ASSERT_TRUE(output->allocateOnDevice(device, stream));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_output = static_cast<float *>(output->gpu_data_ptr());
+
+    ASSERT_NE(d_Q, nullptr);
+    ASSERT_NE(d_K, nullptr);
+    ASSERT_NE(d_V, nullptr);
+    ASSERT_NE(d_alpha, nullptr);
+    ASSERT_NE(d_beta, nullptr);
+    ASSERT_NE(d_A_log, nullptr);
+    ASSERT_NE(d_dt_bias, nullptr);
+    ASSERT_NE(d_output, nullptr);
+
+    ROCmGatedDeltaNet kernel(0);
+    kernel.setGPUStream(stream);
+    for (int t = 0; t < seq_len; ++t)
+    {
+        ASSERT_TRUE(kernel.recurrent_step(
+            d_Q + static_cast<size_t>(t) * qk_stride,
+            d_K + static_cast<size_t>(t) * qk_stride,
+            d_V + static_cast<size_t>(t) * v_stride,
+            d_alpha + static_cast<size_t>(t) * n_heads,
+            d_beta + static_cast<size_t>(t) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_output + static_cast<size_t>(t) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(output->ensureOnHost(stream));
+    std::vector<float> device_state(state_elems, 0.0f);
+    ASSERT_TRUE(kernel.exportState(device_state.data(), nullptr, stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    const float *out_data = output->data();
+    std::vector<float> device_output(out_data, out_data + static_cast<size_t>(seq_len) * v_stride);
+    expectVectorsNear(device_output, reference.output, "ROCm GDN sequential output", 5e-4f, 5e-4);
+    expectVectorsNear(device_state, reference.state, "ROCm GDN sequential state", 5e-4f, 5e-4);
+}
+
+TEST(Test__GDNKernels, ROCmPrefillThenDecodeMatchesCPUReferenceQwen36DenseShape)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    struct StreamGuard
+    {
+        hipStream_t stream = nullptr;
+        ~StreamGuard()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+    } stream_guard{stream};
+
+    const int prefill_len = 9;
+    const int decode_len = 3;
+    const int total_len = prefill_len + decode_len;
+    const int n_heads = 48;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const size_t output_elems =
+        static_cast<size_t>(total_len) * static_cast<size_t>(v_stride);
+    const size_t state_elems = static_cast<size_t>(n_heads) * d_k * d_v;
+
+    auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.08f, 2901);
+    auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.08f, 2902);
+    auto V = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)}, 0.0f, 0.08f, 2903);
+    auto alpha = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, -0.2f, 0.25f, 2904);
+    auto beta = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.25f, 2905);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto output = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
+
+    GDNReferenceResult reference;
+    ASSERT_TRUE(computeCPUSequentialGDNReference(
+        *Q, *K, *V, *alpha, *beta, *A_log, *dt_bias,
+        total_len, n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true,
+        reference));
+
+    ASSERT_TRUE(Q->ensureOnDevice(device, stream));
+    ASSERT_TRUE(K->ensureOnDevice(device, stream));
+    ASSERT_TRUE(V->ensureOnDevice(device, stream));
+    ASSERT_TRUE(alpha->ensureOnDevice(device, stream));
+    ASSERT_TRUE(beta->ensureOnDevice(device, stream));
+    ASSERT_TRUE(A_log->ensureOnDevice(device, stream));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device, stream));
+    ASSERT_TRUE(output->allocateOnDevice(device, stream));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_output = static_cast<float *>(output->gpu_data_ptr());
+
+    ASSERT_NE(d_Q, nullptr);
+    ASSERT_NE(d_K, nullptr);
+    ASSERT_NE(d_V, nullptr);
+    ASSERT_NE(d_alpha, nullptr);
+    ASSERT_NE(d_beta, nullptr);
+    ASSERT_NE(d_A_log, nullptr);
+    ASSERT_NE(d_dt_bias, nullptr);
+    ASSERT_NE(d_output, nullptr);
+
+    ROCmGatedDeltaNet kernel(0);
+    kernel.setGPUStream(stream);
+    ASSERT_TRUE(kernel.chunk_forward(
+        d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+        d_output, nullptr,
+        prefill_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    for (int t = prefill_len; t < total_len; ++t)
+    {
+        ASSERT_TRUE(kernel.recurrent_step(
+            d_Q + static_cast<size_t>(t) * qk_stride,
+            d_K + static_cast<size_t>(t) * qk_stride,
+            d_V + static_cast<size_t>(t) * v_stride,
+            d_alpha + static_cast<size_t>(t) * n_heads,
+            d_beta + static_cast<size_t>(t) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_output + static_cast<size_t>(t) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(output->ensureOnHost(stream));
+    std::vector<float> device_state(state_elems, 0.0f);
+    ASSERT_TRUE(kernel.exportState(device_state.data(), nullptr, stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    const float *out_data = output->data();
+    std::vector<float> device_output(out_data, out_data + output_elems);
+    expectVectorsNear(device_output, reference.output, "ROCm GDN prefill+decode output Qwen3.6 dense shape", 7e-4f, 7e-4);
+    expectVectorsNear(device_state, reference.state, "ROCm GDN prefill+decode state Qwen3.6 dense shape", 7e-4f, 7e-4);
+}
+
 TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
 {
     int device_count = 0;

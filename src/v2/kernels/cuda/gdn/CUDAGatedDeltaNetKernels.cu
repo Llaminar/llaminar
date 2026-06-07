@@ -845,7 +845,8 @@ namespace
      * stride = q_src_dim + k_src_dim + v_dim
      *
      * Output Q/K: [seq_len, n_v_heads * d_k], V: [seq_len, n_v_heads * d_v]
-     * Head mapping: k_head_for_v_head_j = (j + global_v_offset) % n_k_heads
+     * Head mapping:
+     *   k_head_for_v_head_j = (j + global_v_offset) % n_k_heads
      */
     __global__ void cuda_gdn_deinterleave_qkv_kernel(
         const float *__restrict__ merged,
@@ -855,6 +856,9 @@ namespace
         int seq_len, int n_k_heads, int n_v_heads,
         int d_k, int d_v, int global_v_offset)
     {
+        if (n_k_heads <= 0 || n_v_heads <= 0 || d_k <= 0 || d_v <= 0)
+            return;
+
         int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
         // Layout sizes
@@ -883,6 +887,8 @@ namespace
             int j = rem / d_k; // output head index
             int d = rem % d_k; // element within head
             int k_idx = (j + global_v_offset) % n_k_heads;
+            if (k_idx < 0)
+                k_idx += n_k_heads;
             out_q[idx] = merged[t * stride + k_idx * d_k + d];
         }
         else if (idx < q_total + k_total)
@@ -894,6 +900,8 @@ namespace
             int j = rem / d_k;
             int d = rem % d_k;
             int k_idx = (j + global_v_offset) % n_k_heads;
+            if (k_idx < 0)
+                k_idx += n_k_heads;
             out_k[local] = merged[t * stride + q_src_dim + k_idx * d_k + d];
         }
         else
@@ -1116,7 +1124,7 @@ extern "C"
         return true;
     }
 
-    bool cudaGDN_chunk_forward(
+    bool cudaGDN_chunk_forward_kernel_route(
         const float *Q, const float *K, const float *V,
         const float *alpha, const float *beta_raw,
         const float *A_log, const float *dt_bias,
@@ -1126,6 +1134,7 @@ extern "C"
         float *state_snapshots,
         int snapshot_stride_floats,
         int max_snapshot_rows,
+        const int *device_effective_seq_len,
         int device_idx, void *stream)
     {
         cudaSetDevice(device_idx);
@@ -1159,7 +1168,7 @@ extern "C"
         cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
-            nullptr,
+            device_effective_seq_len,
             state_snapshots,
             snapshot_stride_floats,
             max_snapshot_rows,
@@ -1173,6 +1182,116 @@ extern "C"
             return false;
         }
         return true;
+    }
+
+    bool cudaGDN_chunk_forward_via_single_row_chunks(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream)
+    {
+        if (!Q || !K || !V || !alpha || !beta_raw || !A_log || !dt_bias ||
+            !output || !state ||
+            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+            (state_snapshots && max_snapshot_rows <= 0))
+        {
+            return false;
+        }
+
+        const int qk_stride = n_heads * d_k;
+        const int v_stride = n_heads * d_v;
+        const int state_floats = n_heads * d_k * d_v;
+        if (state_snapshots && snapshot_stride_floats < state_floats)
+            return false;
+
+        for (int row = 0; row < seq_len; ++row)
+        {
+            if (!cudaGDN_chunk_forward_kernel_route(
+                    Q + static_cast<size_t>(row) * qk_stride,
+                    K + static_cast<size_t>(row) * qk_stride,
+                    V + static_cast<size_t>(row) * v_stride,
+                    alpha + static_cast<size_t>(row) * n_heads,
+                    beta_raw + static_cast<size_t>(row) * n_heads,
+                    A_log,
+                    dt_bias,
+                    output + static_cast<size_t>(row) * v_stride,
+                    state,
+                    /*seq_len=*/1, n_heads, d_k, d_v, use_qk_l2norm,
+                    nullptr,
+                    0,
+                    0,
+                    nullptr,
+                    device_idx, stream))
+            {
+                return false;
+            }
+
+            if (state_snapshots && row < max_snapshot_rows)
+            {
+                float *snapshot =
+                    state_snapshots +
+                    static_cast<size_t>(row) *
+                        static_cast<size_t>(snapshot_stride_floats);
+                cudaMemcpyAsync(
+                    snapshot,
+                    state,
+                    static_cast<size_t>(state_floats) * sizeof(float),
+                    cudaMemcpyDeviceToDevice,
+                    static_cast<cudaStream_t>(stream));
+                const cudaError_t err = cudaGetLastError();
+                if (err != cudaSuccess)
+                {
+                    fprintf(stderr, "[cudaGDN_chunk_forward_snapshot] %s\n",
+                            cudaGetErrorString(err));
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    bool cudaGDN_chunk_forward(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream)
+    {
+        cudaSetDevice(device_idx);
+
+        if (seq_len > 0 && seq_len <= 4)
+        {
+            return cudaGDN_chunk_forward_via_single_row_chunks(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias,
+                output, state,
+                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                state_snapshots,
+                snapshot_stride_floats,
+                max_snapshot_rows,
+                device_idx, stream);
+        }
+
+        return cudaGDN_chunk_forward_kernel_route(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias,
+            output, state,
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            nullptr,
+            device_idx, stream);
     }
 
     bool cudaGDN_chunk_forward_effective(
@@ -1190,46 +1309,16 @@ extern "C"
     {
         cudaSetDevice(device_idx);
 
-        int col_threads = 256;
-        int cols_per_block = col_threads / 8;
-        if (d_v <= 64)
-        {
-            col_threads = 128;
-            cols_per_block = col_threads / 8;
-        }
-        int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
-        int smem_size = (2 * d_k + 16 + 2 * col_threads) * sizeof(float);
-
-        cuda_gdn_prefill_preprocess_kernel<<<dim3(n_heads, seq_len), 64, 0, (cudaStream_t)stream>>>(
-            const_cast<float *>(Q), const_cast<float *>(K),
-            const_cast<float *>(alpha), const_cast<float *>(beta_raw),
-            A_log, dt_bias,
-            seq_len, n_heads, d_k, use_qk_l2norm);
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[cudaGDN_prefill_preprocess_effective] %s\n", cudaGetErrorString(err));
-            return false;
-        }
-
-        dim3 grid(n_heads, num_col_blocks);
-        cuda_gdn_chunk_forward_kernel<<<grid, col_threads, smem_size, (cudaStream_t)stream>>>(
+        const bool ok = cudaGDN_chunk_forward_kernel_route(
             Q, K, V, alpha, beta_raw, A_log, dt_bias,
             output, state,
-            device_effective_seq_len,
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
             state_snapshots,
             snapshot_stride_floats,
             max_snapshot_rows,
-            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
-            true);
-
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[cudaGDN_chunk_forward_effective] %s\n", cudaGetErrorString(err));
-            return false;
-        }
-        return true;
+            device_effective_seq_len,
+            device_idx, stream);
+        return ok;
     }
 
     bool cudaGDN_short_conv1d(

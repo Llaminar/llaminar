@@ -3131,8 +3131,8 @@ namespace llaminar2
          * @brief Deinterleave merged QKV buffer on device (GPU-only)
          *
          * Splits a merged [seq_len, q_dim + k_dim + v_dim] device buffer into
-         * separate contiguous Q, K, V device arrays. Handles GQA expansion,
-         * identity deinterleave, and TP head selection via the modular formula:
+         * separate contiguous Q, K, V device arrays. Handles Qwen GDN modular
+         * Q/K tiling:
          *   k_head_for_v_head_j = (j + global_v_head_offset) % n_k_heads
          *
          * GPU implementations allocate persistent grow-only scratch internally.

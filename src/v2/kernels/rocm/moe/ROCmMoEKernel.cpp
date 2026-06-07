@@ -334,6 +334,24 @@ extern "C"
         const float *d_input, int *d_output, int count,
         int device_idx, void *stream);
 
+    bool hipMoE_stage_mutable_pointer_arrays(
+        float **d_a,
+        float **d_b,
+        float *const *h_a,
+        float *const *h_b,
+        int count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_stage_const_pointer_arrays(
+        const float **d_a,
+        const float **d_b,
+        const float *const *h_a,
+        const float *const *h_b,
+        int count,
+        int device_idx,
+        void *stream);
+
     bool hipMoE_group_prefill_routes_runtime(
         const float *routing_indices, const float *routing_weights,
         void *runtime,
@@ -909,32 +927,6 @@ namespace llaminar2
             }
         }
         router_q8_gate_cache_.clear();
-        for (auto &entry : runtime_down_pointer_cache_)
-        {
-            if (entry.d_gate_ptrs)
-            {
-                (void)hipFree(entry.d_gate_ptrs);
-                entry.d_gate_ptrs = nullptr;
-            }
-            if (entry.d_up_ptrs)
-            {
-                (void)hipFree(entry.d_up_ptrs);
-                entry.d_up_ptrs = nullptr;
-            }
-        }
-        for (auto &entry : runtime_gateup_pointer_cache_)
-        {
-            if (entry.d_gate_ptrs)
-            {
-                (void)hipFree(entry.d_gate_ptrs);
-                entry.d_gate_ptrs = nullptr;
-            }
-            if (entry.d_up_ptrs)
-            {
-                (void)hipFree(entry.d_up_ptrs);
-                entry.d_up_ptrs = nullptr;
-            }
-        }
         for (auto &table : grouped_down_desc_tables_)
         {
             if (table.device_descs)
@@ -2131,7 +2123,7 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::ensureRuntimeGateUpPointerArrays(
+    bool ROCmMoEKernel::stageRuntimeGateUpPointerArrays(
         int descriptor_table_id,
         int top_k,
         const std::array<float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -2145,74 +2137,44 @@ namespace llaminar2
             return false;
         }
 
-        if (!setMoEDevice(device_ordinal_, "ensureRuntimeGateUpPointerArrays"))
+        if (!setMoEDevice(device_ordinal_, "stageRuntimeGateUpPointerArrays"))
             return false;
 
-        for (auto &entry : runtime_gateup_pointer_cache_)
+        if (!d_grouped_gate_output_ptrs_ || !d_grouped_up_output_ptrs_)
         {
-            if (entry.descriptor_table_id != descriptor_table_id || entry.top_k != top_k)
-                continue;
-
-            bool matches = true;
-            for (int slot = 0; slot < top_k; ++slot)
-            {
-                if (entry.gate_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]) ||
-                    entry.up_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(up_ptrs[slot]))
-                {
-                    matches = false;
-                    break;
-                }
-            }
-            if (matches && entry.d_gate_ptrs && entry.d_up_ptrs)
-            {
-                *d_gate_ptrs = entry.d_gate_ptrs;
-                *d_up_ptrs = entry.d_up_ptrs;
-                return true;
-            }
+            LOG_ERROR("[ROCmMoEKernel::stageRuntimeGateUpPointerArrays] Grouped gate/up workspace is not bound");
+            return false;
         }
 
-        RuntimeGateUpPointerCacheEntry entry;
-        entry.descriptor_table_id = descriptor_table_id;
-        entry.top_k = top_k;
         for (int slot = 0; slot < top_k; ++slot)
         {
-            entry.gate_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]);
-            entry.up_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(up_ptrs[slot]);
+            if (!gate_ptrs[slot] || !up_ptrs[slot])
+            {
+                LOG_ERROR("[ROCmMoEKernel::stageRuntimeGateUpPointerArrays] Null gate/up output pointer for slot "
+                          << slot << " descriptor_table_id=" << descriptor_table_id);
+                return false;
+            }
         }
 
-        hipError_t err = hipMalloc(&entry.d_gate_ptrs, static_cast<size_t>(top_k) * sizeof(float *));
-        if (err == hipSuccess)
-            err = hipMalloc(&entry.d_up_ptrs, static_cast<size_t>(top_k) * sizeof(float *));
-        if (err == hipSuccess)
+        if (!hipMoE_stage_mutable_pointer_arrays(
+                d_grouped_gate_output_ptrs_,
+                d_grouped_up_output_ptrs_,
+                gate_ptrs.data(),
+                up_ptrs.data(),
+                top_k,
+                device_ordinal_,
+                getStream()))
         {
-            hipStream_t stream = static_cast<hipStream_t>(getStream());
-            err = hipMemcpyAsync(entry.d_gate_ptrs, gate_ptrs.data(),
-                                 static_cast<size_t>(top_k) * sizeof(float *),
-                                 hipMemcpyHostToDevice, stream);
-            if (err == hipSuccess)
-                err = hipMemcpyAsync(entry.d_up_ptrs, up_ptrs.data(),
-                                     static_cast<size_t>(top_k) * sizeof(float *),
-                                     hipMemcpyHostToDevice, stream);
-        }
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::ensureRuntimeGateUpPointerArrays] H2D pointer cache upload failed: "
-                      << hipGetErrorString(err));
-            if (entry.d_gate_ptrs)
-                (void)hipFree(entry.d_gate_ptrs);
-            if (entry.d_up_ptrs)
-                (void)hipFree(entry.d_up_ptrs);
+            LOG_ERROR("[ROCmMoEKernel::stageRuntimeGateUpPointerArrays] Pointer staging failed");
             return false;
         }
 
-        runtime_gateup_pointer_cache_.push_back(entry);
-        auto &cached = runtime_gateup_pointer_cache_.back();
-        *d_gate_ptrs = cached.d_gate_ptrs;
-        *d_up_ptrs = cached.d_up_ptrs;
+        *d_gate_ptrs = d_grouped_gate_output_ptrs_;
+        *d_up_ptrs = d_grouped_up_output_ptrs_;
         return true;
     }
 
-    bool ROCmMoEKernel::ensureRuntimeDownPointerArrays(
+    bool ROCmMoEKernel::stageRuntimeDownPointerArrays(
         int descriptor_table_id,
         int top_k,
         const std::array<const float *, ROCmMoEKernel::kRuntimePointerArrayMaxTopK> &gate_ptrs,
@@ -2226,70 +2188,40 @@ namespace llaminar2
             return false;
         }
 
-        if (!setMoEDevice(device_ordinal_, "ensureRuntimeDownPointerArrays"))
+        if (!setMoEDevice(device_ordinal_, "stageRuntimeDownPointerArrays"))
             return false;
 
-        for (auto &entry : runtime_down_pointer_cache_)
+        if (!d_grouped_gate_ptrs_ || !d_grouped_up_ptrs_)
         {
-            if (entry.descriptor_table_id != descriptor_table_id || entry.top_k != top_k)
-                continue;
-
-            bool matches = true;
-            for (int slot = 0; slot < top_k; ++slot)
-            {
-                if (entry.gate_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]) ||
-                    entry.up_ptr_values[slot] != reinterpret_cast<std::uintptr_t>(up_ptrs[slot]))
-                {
-                    matches = false;
-                    break;
-                }
-            }
-            if (matches && entry.d_gate_ptrs && entry.d_up_ptrs)
-            {
-                *d_gate_ptrs = entry.d_gate_ptrs;
-                *d_up_ptrs = entry.d_up_ptrs;
-                return true;
-            }
+            LOG_ERROR("[ROCmMoEKernel::stageRuntimeDownPointerArrays] Grouped down workspace is not bound");
+            return false;
         }
 
-        RuntimeDownPointerCacheEntry entry;
-        entry.descriptor_table_id = descriptor_table_id;
-        entry.top_k = top_k;
         for (int slot = 0; slot < top_k; ++slot)
         {
-            entry.gate_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(gate_ptrs[slot]);
-            entry.up_ptr_values[slot] = reinterpret_cast<std::uintptr_t>(up_ptrs[slot]);
+            if (!gate_ptrs[slot] || !up_ptrs[slot])
+            {
+                LOG_ERROR("[ROCmMoEKernel::stageRuntimeDownPointerArrays] Null gate/up pointer for slot "
+                          << slot << " descriptor_table_id=" << descriptor_table_id);
+                return false;
+            }
         }
 
-        hipError_t err = hipMalloc(&entry.d_gate_ptrs, static_cast<size_t>(top_k) * sizeof(float *));
-        if (err == hipSuccess)
-            err = hipMalloc(&entry.d_up_ptrs, static_cast<size_t>(top_k) * sizeof(float *));
-        if (err == hipSuccess)
+        if (!hipMoE_stage_const_pointer_arrays(
+                d_grouped_gate_ptrs_,
+                d_grouped_up_ptrs_,
+                gate_ptrs.data(),
+                up_ptrs.data(),
+                top_k,
+                device_ordinal_,
+                getStream()))
         {
-            hipStream_t stream = static_cast<hipStream_t>(getStream());
-            err = hipMemcpyAsync(entry.d_gate_ptrs, gate_ptrs.data(),
-                                 static_cast<size_t>(top_k) * sizeof(float *),
-                                 hipMemcpyHostToDevice, stream);
-            if (err == hipSuccess)
-                err = hipMemcpyAsync(entry.d_up_ptrs, up_ptrs.data(),
-                                     static_cast<size_t>(top_k) * sizeof(float *),
-                                     hipMemcpyHostToDevice, stream);
-        }
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::ensureRuntimeDownPointerArrays] H2D pointer cache upload failed: "
-                      << hipGetErrorString(err));
-            if (entry.d_gate_ptrs)
-                (void)hipFree(entry.d_gate_ptrs);
-            if (entry.d_up_ptrs)
-                (void)hipFree(entry.d_up_ptrs);
+            LOG_ERROR("[ROCmMoEKernel::stageRuntimeDownPointerArrays] Pointer staging failed");
             return false;
         }
 
-        runtime_down_pointer_cache_.push_back(entry);
-        auto &cached = runtime_down_pointer_cache_.back();
-        *d_gate_ptrs = cached.d_gate_ptrs;
-        *d_up_ptrs = cached.d_up_ptrs;
+        *d_gate_ptrs = d_grouped_gate_ptrs_;
+        *d_up_ptrs = d_grouped_up_ptrs_;
         return true;
     }
 
@@ -3325,7 +3257,7 @@ namespace llaminar2
 
         float **d_gate_output_ptrs = nullptr;
         float **d_up_output_ptrs = nullptr;
-        if (!ensureRuntimeGateUpPointerArrays(
+        if (!stageRuntimeGateUpPointerArrays(
                 descriptor_table_id, top_k, gate_output_ptrs, up_output_ptrs,
                 &d_gate_output_ptrs, &d_up_output_ptrs))
         {
@@ -3674,7 +3606,7 @@ namespace llaminar2
 
         const float **d_gate_ptrs = nullptr;
         const float **d_up_ptrs = nullptr;
-        if (!ensureRuntimeDownPointerArrays(
+        if (!stageRuntimeDownPointerArrays(
                 descriptor_table_id, top_k, gate_ptrs, up_ptrs,
                 &d_gate_ptrs, &d_up_ptrs))
         {

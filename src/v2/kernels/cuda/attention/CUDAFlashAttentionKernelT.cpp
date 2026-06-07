@@ -148,6 +148,9 @@ namespace llaminar2
          */
         static int computeNumSplitsForDevice(int kv_len, int n_heads, int device_idx)
         {
+            if (debugEnv().gemm.deterministic)
+                return 1;
+
             if (kv_len <= 1)
                 return 1;
 
@@ -1370,7 +1373,9 @@ namespace llaminar2
             int head_start,
             int gqa_n_rep)
         {
-            const int num_splits = std::max(1, std::min(kv_count / 64, 32));
+            const int num_splits = debugEnv().gemm.deterministic
+                                       ? 1
+                                       : std::max(1, std::min(kv_count / 64, 32));
 
             // Ensure workspace is allocated
             if (workspace_)

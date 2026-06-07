@@ -146,6 +146,12 @@ namespace llaminar2
         const int speculative_slot_rows = requestedSpeculativeStateSlotRows();
         if (speculative_slot_rows <= 0)
         {
+            // GDN kernels are owned by the hybrid KV cache and reused across
+            // verifier and normal decode graphs. A normal decode graph must
+            // actively clear verifier workspaces that may have been bound by a
+            // previous all-position verifier graph; otherwise the shared
+            // kernel keeps running against speculative state scratch and stops
+            // publishing real recurrent state.
             params_.kernel->bindVerifierStateCaptureWorkspace(
                 nullptr,
                 0,
