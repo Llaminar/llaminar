@@ -1,6 +1,7 @@
 #pragma once
 
 #include "execution/prefix_cache/PrefixStateSnapshot.h"
+#include "execution/prefix_cache/PrefixCacheStateProbe.h"
 
 #include <string>
 
@@ -57,5 +58,9 @@ namespace llaminar2
         int emitted_tokens,
         PrefixStateProvenance verifier_source,
         const MTPCommitValidationOptions &options = {});
+
+    MTPStateValidationResult compareMTPRuntimeStateSnapshots(
+        const PrefixRuntimeStateSnapshot &oracle,
+        const PrefixRuntimeStateSnapshot &candidate);
 
 } // namespace llaminar2

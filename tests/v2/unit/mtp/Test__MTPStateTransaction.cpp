@@ -24,6 +24,48 @@ namespace
         return state;
     }
 
+    PrefixRuntimeStateSnapshot makeRuntimeSnapshot(int logical_tokens)
+    {
+        PrefixRuntimeStateSnapshot snapshot;
+        snapshot.initialized = true;
+        snapshot.current_position = logical_tokens;
+        snapshot.has_hidden = true;
+        snapshot.has_logits = true;
+        snapshot.positions = {logical_tokens};
+        snapshot.sequence_lengths = {logical_tokens};
+
+        PrefixKVCacheProbe main_kv;
+        main_kv.owner = "main";
+        main_kv.layers.push_back({
+            /*cache_layer=*/0,
+            /*global_layer=*/0,
+            /*seq_idx=*/0,
+            /*cached_tokens=*/logical_tokens,
+            /*ring_head=*/0});
+        snapshot.kv_caches.push_back(main_kv);
+
+        PrefixKVCacheProbe mtp_kv;
+        mtp_kv.owner = "mtp";
+        mtp_kv.layers.push_back({
+            /*cache_layer=*/0,
+            /*global_layer=*/0,
+            /*seq_idx=*/0,
+            /*cached_tokens=*/expectedShiftedMTPTokens(logical_tokens),
+            /*ring_head=*/0});
+        snapshot.mtp_kv_caches.push_back(mtp_kv);
+
+        PrefixGDNLayerProbe gdn;
+        gdn.global_layer = 4;
+        gdn.recurrence_values = 64;
+        gdn.conv_values = 12;
+        gdn.recurrence_hash = 0x1234;
+        gdn.conv_hash = 0x5678;
+        gdn.recurrence_all_zero = false;
+        gdn.conv_all_zero = false;
+        snapshot.gdn_layers.push_back(gdn);
+        return snapshot;
+    }
+
 } // namespace
 
 TEST(Test__MTPStateTransaction, ExpectedShiftedTokensLagMainByOne)
@@ -105,6 +147,37 @@ TEST(Test__MTPStateTransaction, AtomicCommitRequiresTerminalReadyState)
         PrefixStateProvenance::DecodeEquivalent);
     ASSERT_FALSE(result);
     EXPECT_NE(result.reason.find("terminal hidden"), std::string::npos);
+}
+
+TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceAcceptsMatchingState)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+
+    auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+    EXPECT_TRUE(result) << result.reason;
+}
+
+TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsShiftedKVDrift)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    candidate.mtp_kv_caches.front().layers.front().cached_tokens -= 1;
+
+    auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("shifted MTP"), std::string::npos);
+}
+
+TEST(Test__MTPStateTransaction, RuntimeSnapshotEquivalenceRejectsGDNHashDrift)
+{
+    PrefixRuntimeStateSnapshot oracle = makeRuntimeSnapshot(7);
+    PrefixRuntimeStateSnapshot candidate = oracle;
+    candidate.gdn_layers.front().recurrence_hash ^= 0x1;
+
+    auto result = compareMTPRuntimeStateSnapshots(oracle, candidate);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.reason.find("GDN recurrence hash"), std::string::npos);
 }
 
 } // namespace llaminar2

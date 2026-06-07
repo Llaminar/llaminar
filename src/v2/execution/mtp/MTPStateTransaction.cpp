@@ -1,6 +1,7 @@
 #include "MTPStateTransaction.h"
 
 #include <algorithm>
+#include <sstream>
 #include <utility>
 
 namespace llaminar2
@@ -91,6 +92,69 @@ namespace llaminar2
         {
             return MTPStateValidationResult::failure("committed state moved KV token counts backwards");
         }
+        return MTPStateValidationResult::success();
+    }
+
+    MTPStateValidationResult compareMTPRuntimeStateSnapshots(
+        const PrefixRuntimeStateSnapshot &oracle,
+        const PrefixRuntimeStateSnapshot &candidate)
+    {
+        auto mismatch = [](std::string reason)
+        {
+            return MTPStateValidationResult::failure(std::move(reason));
+        };
+
+        if (oracle.initialized != candidate.initialized)
+            return mismatch("initialized flag mismatch");
+        if (!oracle.initialized)
+            return MTPStateValidationResult::success();
+        if (oracle.current_position != candidate.current_position)
+            return mismatch("current position mismatch");
+        if (oracle.positions != candidate.positions)
+            return mismatch("per-sequence position vector mismatch");
+        if (oracle.sequence_lengths != candidate.sequence_lengths)
+            return mismatch("per-sequence length vector mismatch");
+        if (oracle.totalCachedTokens() != candidate.totalCachedTokens())
+            return mismatch("main KV cached token count mismatch");
+        if (oracle.totalMTPCachedTokens() != candidate.totalMTPCachedTokens())
+            return mismatch("shifted MTP cached token count mismatch");
+        if (oracle.has_hidden != candidate.has_hidden)
+            return mismatch("terminal hidden availability mismatch");
+        if (oracle.has_logits != candidate.has_logits)
+            return mismatch("terminal logits availability mismatch");
+        if (oracle.gdn_layers.size() != candidate.gdn_layers.size())
+            return mismatch("GDN layer count mismatch");
+
+        for (size_t i = 0; i < oracle.gdn_layers.size(); ++i)
+        {
+            const PrefixGDNLayerProbe &lhs = oracle.gdn_layers[i];
+            const PrefixGDNLayerProbe &rhs = candidate.gdn_layers[i];
+            if (lhs.global_layer != rhs.global_layer)
+                return mismatch("GDN layer id mismatch");
+            if (lhs.recurrence_values != rhs.recurrence_values)
+                return mismatch("GDN recurrence value count mismatch");
+            if (lhs.conv_values != rhs.conv_values)
+                return mismatch("GDN short-conv value count mismatch");
+            if (lhs.recurrence_hash != rhs.recurrence_hash)
+            {
+                std::ostringstream msg;
+                msg << "GDN recurrence hash mismatch at layer "
+                    << lhs.global_layer;
+                return mismatch(msg.str());
+            }
+            if (lhs.conv_hash != rhs.conv_hash)
+            {
+                std::ostringstream msg;
+                msg << "GDN short-conv hash mismatch at layer "
+                    << lhs.global_layer;
+                return mismatch(msg.str());
+            }
+            if (lhs.recurrence_all_zero != rhs.recurrence_all_zero)
+                return mismatch("GDN recurrence zero-state flag mismatch");
+            if (lhs.conv_all_zero != rhs.conv_all_zero)
+                return mismatch("GDN short-conv zero-state flag mismatch");
+        }
+
         return MTPStateValidationResult::success();
     }
 

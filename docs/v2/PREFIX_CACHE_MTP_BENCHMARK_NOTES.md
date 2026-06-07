@@ -95,6 +95,10 @@ CUDA MoE artifact:
   `compareMTPDecodeCatchupGreedyResults()` allows fewer candidate main forwards
   but requires identical committed tokens, ready/reject semantics, and shifted
   MTP commit count before any optimized path can be trusted.
+- State equivalence is also explicit now:
+  `compareMTPRuntimeStateSnapshots()` checks decode position, KV/MTP token
+  counts, terminal state availability, and GDN state hashes for oracle versus
+  candidate transaction runs.
 
 ## Retained Actions
 
