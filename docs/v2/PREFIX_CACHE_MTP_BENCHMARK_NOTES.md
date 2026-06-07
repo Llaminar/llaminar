@@ -8,11 +8,11 @@ plan carries detailed implementation status.
 
 | Scope | Device | Model | Mode | Prefill tok/s | Decode tok/s | Status |
 |---|---|---|---|---:|---:|---|
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 707.17 | 41.72 | current direct-candidate baseline |
-| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 promoted | 602.15 | 74.54 | 1.79x, 96.84% acceptance |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | no MTP | 708.33 | 41.73 | current promoted-path baseline |
+| Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 promoted | 602.79 | 67.92 | 1.63x, 83.70% acceptance |
 | Dense default, 595p/128d | CUDA | Qwen3.6 27B Q4_K_S | fixed d3 MTP, sequential verifier | 609.73 | 38.19 | old blocker, 84.95% acceptance |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.97 | 31.22 | current direct-candidate baseline |
-| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 promoted | 218.20 | 35.64 | 1.14x, 55.29% acceptance |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 233.21 | 31.10 | current promoted-path baseline |
+| Dense default, 595p/128d | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 promoted | 218.27 | 36.14 | 1.16x, 58.82% acceptance |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | no MTP | 76.35 | 31.92 | short-lane baseline |
 | Dense `qbf`, `-c64 -n48` | ROCm | Qwen3.6 27B Q4_K_S | fixed d3 MTP, Phase 13.8 direct | 73.05 | 54.23 | 1.70x, 88.57% acceptance |
 | MoE default, 595p/128d | CUDA | Qwen3.6 35B A3B | no MTP | 2707.70 | 119.91 | current baseline |
@@ -22,8 +22,8 @@ plan carries detailed implementation status.
 
 Artifacts:
 
-- CUDA dense: `/tmp/llaminar-mtp-bench/dense-cuda-phase138-promoted-d3-default.json`
-- ROCm dense: `/tmp/llaminar-mtp-bench/dense-rocm-phase138-promoted-d3-default.json`
+- CUDA dense: `/tmp/llaminar-mtp-bench/phase138-accept/dense-cuda-{nomtp,promoted-d3}.json`
+- ROCm dense: `/tmp/llaminar-mtp-bench/phase138-accept/dense-rocm-{nomtp,promoted-d3}.json`
 - Prior direct-gate dense: `/tmp/llaminar-mtp-bench/dense-{cuda,rocm}-phase138-direct-*`
 - ROCm qbf: `/tmp/llaminar-mtp-bench/dense-rocm-phase138-direct-{nomtp,d3}-qbf-c64-n48.json`
 - CUDA MoE: `benchmark_results/cuda_moe_mtp/20260605T070628Z-iq4nl-word-decode`
@@ -33,11 +33,11 @@ Artifacts:
 - Phase 13.8 vLLM-style transaction is now the promoted dense SingleDevice GPU
   greedy catch-up path, after direct-mode evidence turned it into real decode
   speedup on both CUDA and ROCm.
-- CUDA default-lane depth 3 is the best current dense signal: 74.54 tok/s versus
-  41.72 no-MTP, with 33 verifier runs, 134 verifier tokens, and zero transaction
+- CUDA default-lane depth 3 is the best current dense signal: 67.92 tok/s versus
+  41.73 no-MTP, with 36 verifier runs, 159 verifier tokens, and zero transaction
   validation failures.
 - ROCm proves the same strategy but remains acceptance-sensitive: default prompt
-  is only 1.14x at 55.29% acceptance, while the high-acceptance `qbf` lane is
+  is only 1.16x at 58.82% acceptance, while the high-acceptance `qbf` lane is
   1.70x at 88.57% acceptance.
 - Sequential verifier MTP remains documented as the old blocker. It was correct
   but speed-negative because accepted speculative tokens paid repeated

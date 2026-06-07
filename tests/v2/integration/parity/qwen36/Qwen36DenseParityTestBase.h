@@ -163,18 +163,36 @@ namespace llaminar2::test::parity::qwen36
                 std::strcmp(direct, "TRUE") == 0);
     }
 
-    inline void expectPhase138DirectTransactionUsed(
+    inline bool densePhase138PromotedTransactionExpected(
+        const DensePrefixRestoreParityCase &test_case)
+    {
+        const char *candidate =
+            std::getenv("LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE");
+        if (candidate && *candidate)
+        {
+            return densePhase138DirectCandidateEnabled();
+        }
+        if (test_case.topology != DensePrefixParityTopology::SingleDevice ||
+            test_case.devices.size() != 1)
+        {
+            return false;
+        }
+        return test_case.devices.front().isGPU();
+    }
+
+    inline void expectPhase138TransactionUsed(
+        const DensePrefixRestoreParityCase &test_case,
         const PrefixRuntimeStateSnapshot &snapshot,
         const std::string &context)
     {
-        if (!densePhase138DirectCandidateEnabled())
+        if (!densePhase138PromotedTransactionExpected(test_case))
         {
             return;
         }
         EXPECT_GT(snapshot.mtp_transaction_commits, 0u)
             << context << " did not commit any MTP transactions";
         EXPECT_EQ(snapshot.mtp_transaction_rollbacks, 0u)
-            << context << " should not roll back under the direct candidate";
+            << context << " should not roll back under the Phase 13.8 transaction";
         EXPECT_EQ(snapshot.mtp_transaction_validation_failures, 0u)
             << context << " hit MTP transaction validation failures";
     }
@@ -1564,7 +1582,10 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_GE(after_first.mtp_verifier_runs, 1u);
             EXPECT_GE(after_first.mtp_verifier_token_count, expected_first_step_drafts + 1);
         }
-        expectPhase138DirectTransactionUsed(after_first, test_case.name + " first request");
+        expectPhase138TransactionUsed(
+            test_case,
+            after_first,
+            test_case.name + " first request");
 
         if (!enable_prefix_cache)
         {
@@ -1601,7 +1622,10 @@ namespace llaminar2::test::parity::qwen36
             EXPECT_GE(after_second.mtp_verifier_runs, 1u);
             EXPECT_GE(after_second.mtp_verifier_token_count, expected_first_step_drafts + 1);
         }
-        expectPhase138DirectTransactionUsed(after_second, test_case.name + " restored request");
+        expectPhase138TransactionUsed(
+            test_case,
+            after_second,
+            test_case.name + " restored request");
     }
 
     inline void runDenseDynamicMTPParity(
@@ -2405,7 +2429,10 @@ namespace llaminar2::test::parity::qwen36
             expected_tokens,
             "fresh " + label + " MTP"));
         EXPECT_FALSE(mtp_state.mtp_bypassed) << mtp_state.mtp_bypass_reason;
-        expectPhase138DirectTransactionUsed(mtp_state, test_case.name + " " + label);
+        expectPhase138TransactionUsed(
+            test_case,
+            mtp_state,
+            test_case.name + " " + label);
         if (depth_policy.mode == MTPDepthPolicyMode::Dynamic)
         {
             EXPECT_TRUE(mtp_state.mtp_request.adaptive_depth_enabled);
