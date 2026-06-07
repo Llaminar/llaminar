@@ -33,6 +33,19 @@ namespace llaminar2
             return batch;
         }
 
+        MTPSpecDecodeStateCommitPlan statePlanFailure(
+            const MTPSpecDecodeMetadataShape &shape,
+            int request_count,
+            std::string reason)
+        {
+            MTPSpecDecodeStateCommitPlan plan;
+            plan.shape = shape;
+            plan.request_count = request_count;
+            plan.ok = false;
+            plan.error = std::move(reason);
+            return plan;
+        }
+
         void fillInvalid(std::vector<int32_t> &values, int count)
         {
             values.assign(
@@ -68,9 +81,135 @@ namespace llaminar2
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::STOPPED_FLAGS, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS, requests + 1));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::STATE_INDICES, target_slots));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_ROWS, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_INDICES, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_ROWS, requests));
+        reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_INDICES, requests));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS, draft_slots));
         reqs.buffers.push_back(int32Buffer(MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS, target_slots));
         return reqs;
+    }
+
+    MTPSpecDecodeStateCommitPlan buildMTPSpecDecodeStateCommitPlan(
+        const MTPSpecDecodeMetadataBatch &batch)
+    {
+        const MTPSpecDecodeMetadataShape &shape = batch.shape;
+        if (!batch.ok)
+            return statePlanFailure(
+                shape,
+                batch.request_count,
+                std::string("cannot build state commit plan from invalid batch: ") +
+                    batch.error);
+        if (!shape.valid())
+            return statePlanFailure(shape, batch.request_count, "invalid MTP spec-decode metadata shape");
+        if (batch.request_count < 0 || batch.request_count > shape.max_requests)
+            return statePlanFailure(shape, batch.request_count, "request count exceeds metadata shape");
+
+        const int requests = shape.max_requests;
+        const int target_slots = requests * shape.maxTargetQueryLen();
+        auto has_size = [](const std::vector<int32_t> &values, int required)
+        {
+            return static_cast<int>(values.size()) >= required;
+        };
+        if (!has_size(batch.draft_counts, requests) ||
+            !has_size(batch.target_query_lens, requests) ||
+            !has_size(batch.valid_sampled_counts, requests) ||
+            !has_size(batch.committed_output_counts, requests) ||
+            !has_size(batch.rejected_token_counts, requests) ||
+            !has_size(batch.all_drafts_accepted_flags, requests) ||
+            !has_size(batch.stopped_flags, requests) ||
+            !has_size(batch.state_indices, target_slots))
+        {
+            return statePlanFailure(shape, batch.request_count, "metadata batch arrays are undersized");
+        }
+
+        MTPSpecDecodeStateCommitPlan plan;
+        plan.ok = true;
+        plan.shape = shape;
+        plan.request_count = batch.request_count;
+        fillInvalid(plan.committed_state_rows, requests);
+        fillInvalid(plan.committed_state_indices, requests);
+        fillInvalid(plan.bonus_ready_token_rows, requests);
+        fillInvalid(plan.bonus_ready_token_indices, requests);
+
+        for (int i = 0; i < batch.request_count; ++i)
+        {
+            const int draft_count = batch.draft_counts[static_cast<size_t>(i)];
+            const int target_query_len = batch.target_query_lens[static_cast<size_t>(i)];
+            const int valid_sampled_count = batch.valid_sampled_counts[static_cast<size_t>(i)];
+            const int committed_count = batch.committed_output_counts[static_cast<size_t>(i)];
+            const int rejected_count = batch.rejected_token_counts[static_cast<size_t>(i)];
+            const bool all_drafts_accepted =
+                batch.all_drafts_accepted_flags[static_cast<size_t>(i)] != 0;
+            const bool stopped =
+                batch.stopped_flags[static_cast<size_t>(i)] != 0;
+            const int target_offset = i * shape.maxTargetQueryLen();
+
+            auto fail_request = [&](const char *reason)
+            {
+                std::ostringstream msg;
+                msg << "request " << i << ": " << reason;
+                return statePlanFailure(shape, batch.request_count, msg.str());
+            };
+
+            if (draft_count < 0 || draft_count > shape.max_draft_tokens)
+                return fail_request("draft count is outside metadata shape");
+            if (target_query_len != draft_count + 1 ||
+                target_query_len <= 0 ||
+                target_query_len > shape.maxTargetQueryLen())
+            {
+                return fail_request("target query length does not match draft count");
+            }
+            if (valid_sampled_count < 0 ||
+                valid_sampled_count > target_query_len)
+            {
+                return fail_request("valid sampled count is outside target query");
+            }
+            if (committed_count < 0 ||
+                committed_count > valid_sampled_count ||
+                committed_count > target_query_len)
+            {
+                return fail_request("committed output count is outside valid sampled prefix");
+            }
+            if (rejected_count != target_query_len - valid_sampled_count)
+                return fail_request("rejected token count does not match valid sampled prefix");
+
+            const int extra_valid_sampled = valid_sampled_count - committed_count;
+            if (extra_valid_sampled > 0)
+            {
+                if (extra_valid_sampled != 1 ||
+                    !all_drafts_accepted ||
+                    stopped ||
+                    committed_count != draft_count)
+                {
+                    return fail_request(
+                        "valid sampled suffix beyond committed outputs is only allowed for an all-accepted bonus ready token");
+                }
+                const int bonus_row = valid_sampled_count - 1;
+                const int32_t bonus_index =
+                    batch.state_indices[static_cast<size_t>(target_offset + bonus_row)];
+                if (bonus_index < 0)
+                    return fail_request("bonus ready-token row has no state index");
+                plan.bonus_ready_token_rows[static_cast<size_t>(i)] = bonus_row;
+                plan.bonus_ready_token_indices[static_cast<size_t>(i)] =
+                    bonus_index;
+            }
+
+            if (committed_count > 0)
+            {
+                const int committed_row = committed_count - 1;
+                const int32_t committed_index =
+                    batch.state_indices[static_cast<size_t>(target_offset + committed_row)];
+                if (committed_index < 0)
+                    return fail_request("committed state row has no state index");
+                plan.committed_state_rows[static_cast<size_t>(i)] =
+                    committed_row;
+                plan.committed_state_indices[static_cast<size_t>(i)] =
+                    committed_index;
+            }
+        }
+
+        return plan;
     }
 
     MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatch(
@@ -111,6 +250,10 @@ namespace llaminar2
         fillZero(batch.stopped_flags, requests_slots);
         fillZero(batch.query_start_locs, requests_slots + 1);
         fillInvalid(batch.state_indices, target_slots);
+        fillInvalid(batch.committed_state_rows, requests_slots);
+        fillInvalid(batch.committed_state_indices, requests_slots);
+        fillInvalid(batch.bonus_ready_token_rows, requests_slots);
+        fillInvalid(batch.bonus_ready_token_indices, requests_slots);
         fillInvalid(batch.draft_tokens, draft_slots);
         fillInvalid(batch.sampled_tokens, target_slots);
 
@@ -186,6 +329,19 @@ namespace llaminar2
 
         batch.query_start_locs[requests.size()] = query_cursor;
         batch.total_target_query_tokens = query_cursor;
+
+        MTPSpecDecodeStateCommitPlan commit_plan =
+            buildMTPSpecDecodeStateCommitPlan(batch);
+        if (!commit_plan.ok)
+            return metadataFailure(shape, commit_plan.error);
+        batch.committed_state_rows =
+            std::move(commit_plan.committed_state_rows);
+        batch.committed_state_indices =
+            std::move(commit_plan.committed_state_indices);
+        batch.bonus_ready_token_rows =
+            std::move(commit_plan.bonus_ready_token_rows);
+        batch.bonus_ready_token_indices =
+            std::move(commit_plan.bonus_ready_token_indices);
         return batch;
     }
 
@@ -203,6 +359,10 @@ namespace llaminar2
                stopped_flags &&
                query_start_locs &&
                state_indices &&
+               committed_state_rows &&
+               committed_state_indices &&
+               bonus_ready_token_rows &&
+               bonus_ready_token_indices &&
                draft_tokens &&
                sampled_tokens;
     }
@@ -339,6 +499,18 @@ namespace llaminar2
                 MTPSpecDecodeWorkspaceBuffers::STATE_INDICES,
                 &device_pointers_.state_indices) ||
             !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_ROWS,
+                &device_pointers_.committed_state_rows) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_INDICES,
+                &device_pointers_.committed_state_indices) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_ROWS,
+                &device_pointers_.bonus_ready_token_rows) ||
+            !bind_int32(
+                MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_INDICES,
+                &device_pointers_.bonus_ready_token_indices) ||
+            !bind_int32(
                 MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS,
                 &device_pointers_.draft_tokens) ||
             !bind_int32(
@@ -448,6 +620,14 @@ namespace llaminar2
                     MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS) ||
             !upload(ptrs.state_indices, batch.state_indices,
                     MTPSpecDecodeWorkspaceBuffers::STATE_INDICES) ||
+            !upload(ptrs.committed_state_rows, batch.committed_state_rows,
+                    MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_ROWS) ||
+            !upload(ptrs.committed_state_indices, batch.committed_state_indices,
+                    MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_INDICES) ||
+            !upload(ptrs.bonus_ready_token_rows, batch.bonus_ready_token_rows,
+                    MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_ROWS) ||
+            !upload(ptrs.bonus_ready_token_indices, batch.bonus_ready_token_indices,
+                    MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_INDICES) ||
             !upload(ptrs.draft_tokens, batch.draft_tokens,
                     MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS) ||
             !upload(ptrs.sampled_tokens, batch.sampled_tokens,

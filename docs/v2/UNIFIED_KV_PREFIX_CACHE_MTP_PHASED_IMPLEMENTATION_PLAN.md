@@ -2257,10 +2257,14 @@ For one request and greedy MTP depth `D`:
    - `rejected_token_count = D + 1 - valid_sampled_count`;
    - `token_index_to_sample = valid_sampled_count - 1`;
    - `next_condition_token = last valid sampled token`, or a backup token for discarded requests.
-5. Stateful GDN/short-conv stages consume accepted-token count and state indices. They may compute all verifier rows, but only the accepted prefix becomes the live conv/recurrent state.
-6. Full-attention KV is truncated/committed to the accepted prefix, and shifted MTP KV commits accepted target hidden rows only.
-7. `MTPStateTransaction` publishes terminal hidden/logits, ready token, logical token count, main KV count, shifted MTP KV count, sampler history, and stats together.
-8. Any failure before commit restores the checkpoint. Any failure after partial commit is a hard failure until the transaction has a rollback proof.
+5. Shared state-commit metadata computes the one live state row separately from any bonus ready-token row:
+   - `committed_state_row = committed_output_count - 1` when at least one output token is committed;
+   - `bonus_ready_token_row = valid_sampled_count - 1` only for the all-drafts-accepted terminal row that supplies the next condition token;
+   - the bonus ready-token row must never be published as live GDN/short-conv state, because it has not been committed as an output token.
+6. Stateful GDN/short-conv stages consume accepted-token count, committed-state row/index metadata, and full state indices. They may compute all verifier rows, but only the committed output prefix becomes the live conv/recurrent state.
+7. Full-attention KV is truncated/committed to the accepted prefix, and shifted MTP KV commits accepted target hidden rows only.
+8. `MTPStateTransaction` publishes terminal hidden/logits, ready token, logical token count, main KV count, shifted MTP KV count, sampler history, and stats together.
+9. Any failure before commit restores the checkpoint. Any failure after partial commit is a hard failure until the transaction has a rollback proof.
 
 ### Implementation Tiers
 
@@ -2278,6 +2282,7 @@ For one request and greedy MTP depth `D`:
 
 2. Graph-facing metadata buffers.
    - Add device buffers for draft counts, accepted-token counts, rejected-token counts, token indices to sample, query start locations, and state indices.
+   - Add per-request committed-state row/index and bonus-ready-token row/index buffers so kernels can distinguish live state publication from the terminal all-accepted bonus sample.
    - Stage dynamic metadata before graph capture/replay on explicit non-null streams.
    - Captured replay must not include H2D uploads, lazy allocations, or default/null stream operations.
    - Metadata storage must use declared workspace or persistent runner-owned buffers, not ad hoc GPU allocations.
@@ -2316,7 +2321,7 @@ For one request and greedy MTP depth `D`:
   - naive all-position selected-state restore is unsafe because CUDA and ROCm long-prefix tests prove continuation drift even when row logits/tokens look plausible.
 - The old `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=all_position` runtime path now hard-fails as retired instead of executing the unsafe candidate.
 - Fresh CUDA dense evidence records the current blocker: no-MTP default lane 707.92 prefill / 41.73 decode tok/s, fixed depth-3 shared catch-up 609.73 / 38.19 with 84.95% acceptance, and `decode_equivalent_catchup_forward_one` at 9272.9 ms / 383 forwards.
-- First implementation slices are focused-green: `MTPSpecDecodeTransaction` provides the shared request, transaction, and batch-summary metadata contract for valid sampled count, accepted speculative prefix, rejected suffix count, sample index, next condition token, committed output tokens, and rejected draft tokens. `OrchestrationRunner` now builds the padded metadata batch for the live decode-equivalent catch-up result, validates that transaction contract before commit, and emits structured `mtp.spec_decode_transaction_metadata` counters for all-accepted and rejected-prefix paths. `MTPSpecDecodeMetadata` defines the graph-facing int32 workspace buffers and host-side padded metadata arrays for draft counts, target query lengths, valid sampled counts, accepted draft prefixes, committed output counts, rejected counts, sample indices, next condition tokens, flags, query starts, state indices, draft tokens, and sampled tokens. `MTPSpecDecodeMetadataWorkspaceBinding` now binds those buffers through `DeviceWorkspaceManager`, the GPU `DeviceGraphOrchestrator` declares the binding as runner-owned extra workspace when MTP is enabled, and metadata upload has a hard explicit non-null stream guard for GPU H2D. The unsafe `all_position` candidate code path has been removed from execution and replaced by an explicit retired-candidate hard failure. Focused validation passed on 2026-06-06: `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`; build validation also covered `v2_integration_parity_qwen36_single_device_prefix_mtp` and `v2_integration_parity_qwen36_cuda_single_device_prefix_mtp`.
+- First implementation slices are focused-green: `MTPSpecDecodeTransaction` provides the shared request, transaction, and batch-summary metadata contract for valid sampled count, accepted speculative prefix, rejected suffix count, sample index, next condition token, committed output tokens, and rejected draft tokens. `OrchestrationRunner` now builds the padded metadata batch for the live decode-equivalent catch-up result, validates that transaction contract before commit, and emits structured `mtp.spec_decode_transaction_metadata` counters for all-accepted and rejected-prefix paths. `MTPSpecDecodeMetadata` defines the graph-facing int32 workspace buffers and host-side padded metadata arrays for draft counts, target query lengths, valid sampled counts, accepted draft prefixes, committed output counts, rejected counts, sample indices, next condition tokens, flags, query starts, state indices, committed-state row/index, bonus-ready-token row/index, draft tokens, and sampled tokens. `MTPSpecDecodeStateCommitPlan` makes the key Phase 13.8 invariant explicit: an all-accepted bonus ready-token row can be sampled and carried forward as the next drafter condition, but it is not the live GDN/short-conv state row because it was not committed as output. `MTPSpecDecodeMetadataWorkspaceBinding` now binds those buffers through `DeviceWorkspaceManager`, the GPU `DeviceGraphOrchestrator` declares the binding as runner-owned extra workspace when MTP is enabled, and metadata upload has a hard explicit non-null stream guard for GPU H2D. The unsafe `all_position` candidate code path has been removed from execution and replaced by an explicit retired-candidate hard failure. Focused validation passed on 2026-06-06: `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`; build validation also covered `v2_integration_parity_qwen36_single_device_prefix_mtp` and `v2_integration_parity_qwen36_cuda_single_device_prefix_mtp`.
 
 ### Files
 
@@ -2343,7 +2348,7 @@ For one request and greedy MTP depth `D`:
 
 - Unit tests for `MTPSpecDecodeTransaction` metadata semantics.
 - Unit tests for `shared_stepwise` oracle behavior and optimized-hook selection counters.
-- Unit tests for any graph-facing metadata buffer builder, including discarded requests and rejected suffix rows.
+- Unit tests for any graph-facing metadata buffer builder, including discarded requests, rejected suffix rows, all-accepted bonus rows, and the rule that bonus ready-token rows are not committed as live state.
 - CUDA and ROCm direct short-conv accepted-count state tests for accepted counts 1..4.
 - CUDA and ROCm direct GDN recurrence accepted-count state tests for accepted counts 1..4.
 - Integration tests proving the named `vllm_style_spec_decode` hook hard-fails unless all required metadata/state kernels are available.
@@ -2369,7 +2374,7 @@ cmake --build build_v2_release --target llaminar2 --parallel
 
 - The plan no longer depends on raw all-position verifier-row restore for Qwen3.6 dense.
 - `MTPSpecDecodeTransaction` is the shared metadata contract for accepted counts, rejected suffixes, sample indices, next condition tokens, and committed output rows.
-- `MTPSpecDecodeMetadata` declares graph-facing metadata buffers and deterministic padded host arrays for backend upload/binding.
+- `MTPSpecDecodeMetadata` declares graph-facing metadata buffers and deterministic padded host arrays for backend upload/binding, including committed-state row/index and bonus-ready-token row/index metadata.
 - CUDA and ROCm stateful short-conv/GDN kernels consume accepted-token metadata and prove accepted-count state equivalence against serial decode.
 - `vllm_style_spec_decode` is selected only through a named runner capability and records its implementation name in structured counters.
 - CUDA and ROCm SingleDevice Qwen3.6 dense parity pass for prefix+MTP restore and greedy depth-3 MTP under the new transaction.

@@ -27,6 +27,10 @@ namespace llaminar2
         constexpr const char *STOPPED_FLAGS = "mtp_spec_decode_stopped_flags";
         constexpr const char *QUERY_START_LOCS = "mtp_spec_decode_query_start_locs";
         constexpr const char *STATE_INDICES = "mtp_spec_decode_state_indices";
+        constexpr const char *COMMITTED_STATE_ROWS = "mtp_spec_decode_committed_state_rows";
+        constexpr const char *COMMITTED_STATE_INDICES = "mtp_spec_decode_committed_state_indices";
+        constexpr const char *BONUS_READY_TOKEN_ROWS = "mtp_spec_decode_bonus_ready_token_rows";
+        constexpr const char *BONUS_READY_TOKEN_INDICES = "mtp_spec_decode_bonus_ready_token_indices";
         constexpr const char *DRAFT_TOKENS = "mtp_spec_decode_draft_tokens";
         constexpr const char *SAMPLED_TOKENS = "mtp_spec_decode_sampled_tokens";
     } // namespace MTPSpecDecodeWorkspaceBuffers
@@ -61,9 +65,27 @@ namespace llaminar2
         std::vector<int32_t> stopped_flags;
         std::vector<int32_t> query_start_locs;
         std::vector<int32_t> state_indices;
+        std::vector<int32_t> committed_state_rows;
+        std::vector<int32_t> committed_state_indices;
+        std::vector<int32_t> bonus_ready_token_rows;
+        std::vector<int32_t> bonus_ready_token_indices;
         std::vector<int32_t> draft_tokens;
         std::vector<int32_t> sampled_tokens;
         std::vector<MTPSpecDecodeTransaction> transactions;
+    };
+
+    struct MTPSpecDecodeStateCommitPlan
+    {
+        bool ok = false;
+        std::string error;
+
+        MTPSpecDecodeMetadataShape shape;
+        int request_count = 0;
+
+        std::vector<int32_t> committed_state_rows;
+        std::vector<int32_t> committed_state_indices;
+        std::vector<int32_t> bonus_ready_token_rows;
+        std::vector<int32_t> bonus_ready_token_indices;
     };
 
     WorkspaceRequirements buildMTPSpecDecodeWorkspaceRequirements(
@@ -74,6 +96,9 @@ namespace llaminar2
         const std::vector<MTPSpecDecodeRequest> &requests,
         const std::vector<int32_t> &committed_output_counts,
         const std::vector<int32_t> &stopped_flags);
+
+    MTPSpecDecodeStateCommitPlan buildMTPSpecDecodeStateCommitPlan(
+        const MTPSpecDecodeMetadataBatch &batch);
 
     struct MTPSpecDecodeMetadataDevicePointers
     {
@@ -89,6 +114,10 @@ namespace llaminar2
         int32_t *stopped_flags = nullptr;
         int32_t *query_start_locs = nullptr;
         int32_t *state_indices = nullptr;
+        int32_t *committed_state_rows = nullptr;
+        int32_t *committed_state_indices = nullptr;
+        int32_t *bonus_ready_token_rows = nullptr;
+        int32_t *bonus_ready_token_indices = nullptr;
         int32_t *draft_tokens = nullptr;
         int32_t *sampled_tokens = nullptr;
 

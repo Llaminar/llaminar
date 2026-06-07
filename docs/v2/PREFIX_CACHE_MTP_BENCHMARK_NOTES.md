@@ -63,7 +63,10 @@ CUDA MoE artifact:
   binds the graph-facing int32 workspace buffers through `DeviceWorkspaceManager`,
   `DeviceGraphOrchestrator` requests them as runner-owned extra workspace when
   MTP is enabled on GPU, and GPU metadata upload hard-fails without an explicit
-  non-null stream. Focused unit coverage passed for
+  non-null stream. The metadata now carries committed-state row/index and
+  bonus-ready-token row/index fields too, pinning that an all-accepted bonus
+  row may feed the next drafter condition but must not become live
+  GDN/short-conv state. Focused unit coverage passed for
   `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
   `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`.
 

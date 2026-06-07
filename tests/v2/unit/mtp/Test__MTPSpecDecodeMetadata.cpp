@@ -27,7 +27,7 @@ TEST(Test__MTPSpecDecodeMetadata, DeclaresGraphFacingWorkspaceBuffers)
     WorkspaceRequirements reqs =
         buildMTPSpecDecodeWorkspaceRequirements(shape);
 
-    ASSERT_THAT(reqs.buffers, SizeIs(14));
+    ASSERT_THAT(reqs.buffers, SizeIs(18));
     const WorkspaceDescriptor *draft_counts =
         findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::DRAFT_COUNTS);
     ASSERT_NE(draft_counts, nullptr);
@@ -44,6 +44,16 @@ TEST(Test__MTPSpecDecodeMetadata, DeclaresGraphFacingWorkspaceBuffers)
         findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::STATE_INDICES);
     ASSERT_NE(state_indices, nullptr);
     EXPECT_EQ(state_indices->size_bytes, 8u * sizeof(int32_t));
+
+    const WorkspaceDescriptor *committed_state_rows =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_ROWS);
+    ASSERT_NE(committed_state_rows, nullptr);
+    EXPECT_EQ(committed_state_rows->size_bytes, 2u * sizeof(int32_t));
+
+    const WorkspaceDescriptor *bonus_ready_indices =
+        findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_INDICES);
+    ASSERT_NE(bonus_ready_indices, nullptr);
+    EXPECT_EQ(bonus_ready_indices->size_bytes, 2u * sizeof(int32_t));
 
     const WorkspaceDescriptor *draft_tokens =
         findBuffer(reqs, MTPSpecDecodeWorkspaceBuffers::DRAFT_TOKENS);
@@ -84,12 +94,18 @@ TEST(Test__MTPSpecDecodeMetadata, WorkspaceBindingBindsEveryDeclaredBuffer)
               workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::ACCEPTED_DRAFT_PREFIXES));
     EXPECT_EQ(ptrs.query_start_locs,
               workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::QUERY_START_LOCS));
+    EXPECT_EQ(ptrs.committed_state_indices,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::COMMITTED_STATE_INDICES));
+    EXPECT_EQ(ptrs.bonus_ready_token_rows,
+              workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::BONUS_READY_TOKEN_ROWS));
     EXPECT_EQ(ptrs.sampled_tokens,
               workspace.getBuffer(MTPSpecDecodeWorkspaceBuffers::SAMPLED_TOKENS));
 
     ptrs.accepted_draft_prefixes[0] = 2;
+    ptrs.committed_state_rows[0] = 1;
     ptrs.sampled_tokens[3] = 42;
     EXPECT_EQ(ptrs.accepted_draft_prefixes[0], 2);
+    EXPECT_EQ(ptrs.committed_state_rows[0], 1);
     EXPECT_EQ(ptrs.sampled_tokens[3], 42);
 
     binding.unbindWorkspace();
@@ -213,6 +229,10 @@ TEST(Test__MTPSpecDecodeMetadata, UploadBatchCopiesToBoundWorkspace)
     add_bytes(batch.stopped_flags);
     add_bytes(batch.query_start_locs);
     add_bytes(batch.state_indices);
+    add_bytes(batch.committed_state_rows);
+    add_bytes(batch.committed_state_indices);
+    add_bytes(batch.bonus_ready_token_rows);
+    add_bytes(batch.bonus_ready_token_indices);
     add_bytes(batch.draft_tokens);
     add_bytes(batch.sampled_tokens);
     EXPECT_EQ(upload.bytes_uploaded, expected_bytes);
@@ -228,6 +248,22 @@ TEST(Test__MTPSpecDecodeMetadata, UploadBatchCopiesToBoundWorkspace)
                 ElementsAre(0, 1));
     EXPECT_THAT(std::vector<int32_t>(ptrs.state_indices, ptrs.state_indices + 8),
                 ElementsAre(0, 1, 2, 3, 4, 5, 6, 7));
+    EXPECT_THAT(std::vector<int32_t>(
+                    ptrs.committed_state_rows,
+                    ptrs.committed_state_rows + 2),
+                ElementsAre(2, 1));
+    EXPECT_THAT(std::vector<int32_t>(
+                    ptrs.committed_state_indices,
+                    ptrs.committed_state_indices + 2),
+                ElementsAre(2, 5));
+    EXPECT_THAT(std::vector<int32_t>(
+                    ptrs.bonus_ready_token_rows,
+                    ptrs.bonus_ready_token_rows + 2),
+                ElementsAre(3, kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(std::vector<int32_t>(
+                    ptrs.bonus_ready_token_indices,
+                    ptrs.bonus_ready_token_indices + 2),
+                ElementsAre(3, kMTPSpecDecodeInvalidToken));
     EXPECT_THAT(std::vector<int32_t>(ptrs.sampled_tokens, ptrs.sampled_tokens + 8),
                 ElementsAre(7, 9, 8, 4,
                             11, 77,
@@ -318,6 +354,12 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsPaddedBatchMetadataForAcceptAndReject)
     EXPECT_THAT(batch.stopped_flags, ElementsAre(0, 0));
     EXPECT_THAT(batch.query_start_locs, ElementsAre(0, 4, 8));
     EXPECT_THAT(batch.state_indices, ElementsAre(0, 1, 2, 3, 4, 5, 6, 7));
+    EXPECT_THAT(batch.committed_state_rows, ElementsAre(2, 1));
+    EXPECT_THAT(batch.committed_state_indices, ElementsAre(2, 5));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(3, kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.bonus_ready_token_indices,
+                ElementsAre(3, kMTPSpecDecodeInvalidToken));
     EXPECT_THAT(batch.draft_tokens, ElementsAre(7, 9, 8, 11, 12, 13));
     EXPECT_THAT(batch.sampled_tokens,
                 ElementsAre(7, 9, 8, 4,
@@ -327,6 +369,103 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsPaddedBatchMetadataForAcceptAndReject)
     ASSERT_THAT(batch.transactions, SizeIs(2));
     EXPECT_TRUE(batch.transactions[0].allDraftsAccepted());
     EXPECT_FALSE(batch.transactions[1].allDraftsAccepted());
+}
+
+TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanDoesNotCommitBonusReadyTokenRow)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeRequest accept_all;
+    accept_all.vocab_size = 100;
+    accept_all.draft_tokens = {7, 9, 8};
+    accept_all.sampled_tokens = {7, 9, 8, 4};
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {accept_all},
+            /*committed_output_counts=*/{3},
+            /*stopped_flags=*/{0});
+    ASSERT_TRUE(batch.ok) << batch.error;
+
+    MTPSpecDecodeStateCommitPlan plan =
+        buildMTPSpecDecodeStateCommitPlan(batch);
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_THAT(plan.committed_state_rows, ElementsAre(2));
+    EXPECT_THAT(plan.committed_state_indices, ElementsAre(2));
+    EXPECT_THAT(plan.bonus_ready_token_rows, ElementsAre(3));
+    EXPECT_THAT(plan.bonus_ready_token_indices, ElementsAre(3));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanUsesCorrectionRowAfterReject)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeRequest reject_after_prefix;
+    reject_after_prefix.vocab_size = 100;
+    reject_after_prefix.draft_tokens = {7, 9, 9};
+    reject_after_prefix.sampled_tokens = {
+        7,
+        9,
+        3,
+        kMTPSpecDecodeInvalidToken};
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {reject_after_prefix},
+            /*committed_output_counts=*/{3},
+            /*stopped_flags=*/{0});
+    ASSERT_TRUE(batch.ok) << batch.error;
+
+    MTPSpecDecodeStateCommitPlan plan =
+        buildMTPSpecDecodeStateCommitPlan(batch);
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_THAT(plan.committed_state_rows, ElementsAre(2));
+    EXPECT_THAT(plan.committed_state_indices, ElementsAre(2));
+    EXPECT_THAT(plan.bonus_ready_token_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(plan.bonus_ready_token_indices,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanAllowsDiscardedRequestWithoutStateCommit)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 2;
+
+    MTPSpecDecodeRequest discarded;
+    discarded.vocab_size = 100;
+    discarded.draft_tokens = {7, 9};
+    discarded.sampled_tokens = {
+        kMTPSpecDecodeInvalidToken,
+        kMTPSpecDecodeInvalidToken,
+        kMTPSpecDecodeInvalidToken};
+    discarded.discarded = true;
+    discarded.backup_next_token = 42;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {discarded},
+            /*committed_output_counts=*/{0},
+            /*stopped_flags=*/{0});
+    ASSERT_TRUE(batch.ok) << batch.error;
+
+    MTPSpecDecodeStateCommitPlan plan =
+        buildMTPSpecDecodeStateCommitPlan(batch);
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_THAT(plan.committed_state_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(plan.committed_state_indices,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(plan.bonus_ready_token_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
 }
 
 TEST(Test__MTPSpecDecodeMetadata, PadsUnusedRequestAndTokenSlots)
@@ -350,6 +489,14 @@ TEST(Test__MTPSpecDecodeMetadata, PadsUnusedRequestAndTokenSlots)
     ASSERT_TRUE(batch.ok) << batch.error;
     EXPECT_THAT(batch.draft_counts, ElementsAre(2, 0));
     EXPECT_THAT(batch.query_start_locs, ElementsAre(0, 3, 0));
+    EXPECT_THAT(batch.committed_state_rows,
+                ElementsAre(1, kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.committed_state_indices,
+                ElementsAre(1, kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(2, kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.bonus_ready_token_indices,
+                ElementsAre(2, kMTPSpecDecodeInvalidToken));
     EXPECT_THAT(batch.draft_tokens,
                 ElementsAre(7, 9,
                             kMTPSpecDecodeInvalidToken,
@@ -420,4 +567,30 @@ TEST(Test__MTPSpecDecodeMetadata, RejectsCommittedOutputCountPastValidPrefix)
 
     EXPECT_FALSE(batch.ok);
     EXPECT_THAT(batch.error, HasSubstr("committed output count"));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, RejectsBonusReadyRowUnlessAllDraftsAccepted)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPSpecDecodeRequest reject_after_prefix;
+    reject_after_prefix.vocab_size = 100;
+    reject_after_prefix.draft_tokens = {7, 9, 8};
+    reject_after_prefix.sampled_tokens = {
+        7,
+        99,
+        kMTPSpecDecodeInvalidToken,
+        kMTPSpecDecodeInvalidToken};
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatch(
+            shape,
+            {reject_after_prefix},
+            /*committed_output_counts=*/{1},
+            /*stopped_flags=*/{0});
+
+    EXPECT_FALSE(batch.ok);
+    EXPECT_THAT(batch.error, HasSubstr("bonus ready token"));
 }
