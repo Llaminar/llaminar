@@ -7728,7 +7728,7 @@ namespace llaminar2
                         target_verifier_state_commit_count,
                         /*already_appended_tokens=*/1,
                         /*main_forward_token_count=*/
-                        static_cast<int>(request.draft_tokens.size()),
+                        target_verifier_state_commit_count,
                         request.allow_speculative_discard,
                         verifier_base_position))
                 {
@@ -7776,6 +7776,21 @@ namespace llaminar2
                         "Phase 13.8 vllm_style_spec_decode failed to select suffix base hidden row");
                 }
 
+                {
+                    PerfStatsCollector::ScopedTimer timer(
+                        "mtp",
+                        "phase138_vllm_style_enable_suffix_all_position_logits",
+                        "decode",
+                        state_.device_id.toString(),
+                        {{"tokens", std::to_string(suffix_count)}});
+                    all_position_enabled = setComputeAllPositionLogits(true);
+                }
+                if (!all_position_enabled)
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode could not enable suffix all-position logits");
+                }
+
                 PerfStatsCollector::ScopedTimer timer(
                     "mtp",
                     "phase138_vllm_style_suffix_replay",
@@ -7794,12 +7809,12 @@ namespace llaminar2
                             request.allow_speculative_discard,
                             verifier_base_position))
                     {
-                        return fail_vllm(
+                        return fail_after_enable(
                             "Phase 13.8 vllm_style_spec_decode shifted suffix commit failed");
                     }
                     if (!forward(&token, 1, 1))
                     {
-                        return fail_vllm(
+                        return fail_after_enable(
                             "Phase 13.8 vllm_style_spec_decode suffix replay forward failed");
                     }
                     ++result.main_forward_token_count;
@@ -7807,15 +7822,32 @@ namespace llaminar2
 
                 if (!result.stopped_on_output)
                 {
-                    int32_t ready = sampleGreedyOnDevice();
-                    if (ready < 0 && sample_after_forward)
-                        ready = sample_after_forward();
+                    int32_t ready = -1;
+                    {
+                        PerfStatsCollector::ScopedTimer sample_timer(
+                            "mtp",
+                            "phase138_vllm_style_suffix_ready_sample_all_position",
+                            "decode",
+                            state_.device_id.toString());
+                        if (!sampleGreedyFromAllPositionLogitsOnDeviceRows(
+                                0,
+                                1,
+                                &ready))
+                        {
+                            ready = -1;
+                        }
+                    }
                     if (ready < 0)
                     {
-                        return fail_vllm(
+                        return fail_after_enable(
                             "Phase 13.8 vllm_style_spec_decode suffix ready-token sample failed");
                     }
                     result.ready_token = ready;
+                }
+                if (!disable_all_position())
+                {
+                    return fail_vllm(
+                        "Phase 13.8 vllm_style_spec_decode could not disable suffix all-position logits");
                 }
             }
 

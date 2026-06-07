@@ -52,10 +52,12 @@ CUDA MoE artifact:
   CUDA M=2 diagnostics drift before the GDN copy boundary, and ROCm/generic M=4
   state parity agrees. New commit-replay negative tests pin this.
 - Phase 13.8 is now a vLLM-style spec-decode transaction port rather than a
-  free-form shortcut search. The target is a uniform `1 + draft_count` verifier
-  graph, shared valid-count / accepted-count / rejected-suffix metadata,
-  accepted-count-aware GDN/short-conv state commits, shifted MTP-row commit from
-  accepted target hidden rows, and atomic request publication.
+  free-form shortcut search. The target is shared valid-count / accepted-count /
+  rejected-suffix metadata, accepted-count-aware GDN/short-conv state commits,
+  shifted MTP-row commit from accepted target hidden rows, and atomic request
+  publication. The current Llaminar greedy candidate starts after the live
+  terminal condition, so draft depth `D` forwards `D` target rows; the last row
+  is a bonus ready-token row only when all drafts are accepted.
 - First shared metadata slice is green: `MTPSpecDecodeTransaction` is in core,
   `OrchestrationRunner` validates decode-equivalent catch-up results against it
   before commit, and `mtp.spec_decode_transaction_metadata` counters describe
@@ -84,6 +86,13 @@ CUDA MoE artifact:
   `PrefixCacheMTPRestore` also pass under the same env. Benchmark numbers should
   not be quoted yet because the equivalence harness still runs the stepwise
   oracle after the candidate.
+- A reject-after-prefix ROCm depth-3 candidate failure is fixed: runtime state
+  matched the oracle, but the candidate sampled the correction-suffix ready token
+  from stale normal logits. The candidate now re-enables all-position logits for
+  suffix replay and samples row 0 from the explicit suffix output. Focused
+  validation passed under the candidate/equivalence env for ROCm depth-3 greedy,
+  CUDA depth-3 benchmark-prompt greedy, CUDA regular greedy, CUDA/ROCm
+  prefix+MTP restore, and the Phase 13.8 unit guard set.
 - Device-metadata state publication is now green for the first backend slice:
   CUDA and ROCm short-conv/GDN kernels can restore live state from verifier
   snapshot rows selected by graph-facing `committed_state_rows[request_index]`.

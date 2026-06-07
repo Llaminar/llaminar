@@ -2571,7 +2571,9 @@ namespace llaminar2
                                     catchup.ok = false;
                                     catchup.error =
                                         std::string("MTP Phase 13.8 catch-up result equivalence failed: ") +
-                                        result_eq.error;
+                                        result_eq.error +
+                                        "; runtime_state_equivalence=" +
+                                        (state_eq.ok ? std::string("ok") : state_eq.reason);
                                 }
                                 else if (!state_eq.ok)
                                 {

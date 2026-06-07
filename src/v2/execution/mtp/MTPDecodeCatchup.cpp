@@ -114,7 +114,18 @@ namespace llaminar2
             return equivalenceFailure("rejected verified token mismatch");
         }
         if (oracle.ready_token != candidate.ready_token)
-            return equivalenceFailure("ready token mismatch");
+        {
+            std::ostringstream msg;
+            msg << "ready token mismatch: oracle=" << oracle.ready_token
+                << ", candidate=" << candidate.ready_token
+                << ", accepted=[" << joinTokens(oracle.accepted_tokens)
+                << "], verifier=[" << joinTokens(oracle.verifier_tokens)
+                << "], oracle_forwards=" << oracle.main_forward_token_count
+                << ", candidate_forwards=" << candidate.main_forward_token_count
+                << ", candidate_state_commit_count="
+                << candidate.target_verifier_state_commit_count;
+            return equivalenceFailure(msg.str());
+        }
         if (oracle.shifted_commit_count != candidate.shifted_commit_count)
             return equivalenceFailure("shifted MTP commit count mismatch");
 
