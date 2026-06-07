@@ -50,7 +50,7 @@ TEST(Qwen36SingleDevicePrefixMTPParity, Phase138VllmStyleCandidateEquivalence)
 
 TEST(Qwen36SingleDevicePrefixMTPParity, Phase138VllmStyleCandidatePrefixRestoreEquivalence)
 {
-    runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(singleDeviceCase(), 1);
+    runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(singleDeviceCase(), 3);
 }
 
 TEST(Qwen36SingleDevicePrefixMTPParity, Phase138VllmStyleCandidateStopTokenEquivalence)

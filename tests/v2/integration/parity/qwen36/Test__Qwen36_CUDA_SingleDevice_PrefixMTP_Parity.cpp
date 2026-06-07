@@ -79,7 +79,7 @@ TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidateEquivalenc
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidatePrefixRestoreEquivalence)
 {
-    runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(cudaSingleDeviceCase(), 1);
+    runDensePhase138VllmStyleCandidatePrefixRestoreEquivalence(cudaSingleDeviceCase(), 3);
 }
 
 TEST(Qwen36CUDASingleDevicePrefixMTPParity, Phase138VllmStyleCandidateStopTokenEquivalence)

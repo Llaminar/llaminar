@@ -794,17 +794,6 @@ namespace llaminar2
                 prefix_request_summary_.bypassed = !coordinated_hit.supported;
                 prefix_request_summary_.bypass_reason = coordinated_hit.bypass_reason;
                 if (active_mtp.enabled &&
-                    effectiveMTPMaxDraftDepth(active_mtp) > 1 &&
-                    matched_tokens == static_cast<int>(prompt_tokens.size()) &&
-                    common_hit.has_terminal_logits &&
-                    (!mtp_full_hit_requires_terminal_hidden || common_hit.has_terminal_hidden))
-                {
-                    return setError(
-                        "Prefix cache terminal restore with chained MTP drafts is not supported; "
-                        "use --mtp-draft-tokens 1 or disable prefix cache until chained MTP prefix "
-                        "state parity is implemented");
-                }
-                if (active_mtp.enabled &&
                     matched_tokens > 0 &&
                     matched_tokens < static_cast<int>(prompt_tokens.size()) &&
                     !common_hit.has_terminal_hidden)

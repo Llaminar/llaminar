@@ -733,7 +733,7 @@ TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeComm
     EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
 }
 
-TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreHardFailsForChainedMTPDrafts)
+TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreSupportsChainedMTPDraftDepthThree)
 {
     auto mock = std::make_unique<PrefixFlowMockRunner>();
     auto *mock_ptr = mock.get();
@@ -743,14 +743,40 @@ TEST(Test__PrefixCachePrefillFlow, FullPrefixTerminalRestoreHardFailsForChainedM
     mock_ptr->lookup_result.cached_tokens = 4;
     mock_ptr->lookup_result.has_terminal_logits = true;
     mock_ptr->lookup_result.has_terminal_hidden = true;
+    mock_ptr->mtp_argmax_tokens = {11, 12, 13};
+    mock_ptr->verify_argmax_tokens = {11, 12, 13, 14};
 
-    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true, /*mtp_draft_tokens=*/2);
-    ASSERT_FALSE(runner->prefill({1, 2, 3, 4}));
-    EXPECT_THAT(runner->lastError(),
-                HasSubstr("Prefix cache terminal restore with chained MTP drafts is not supported"));
-    EXPECT_EQ(mock_ptr->restore_terminal_calls, 0);
-    EXPECT_EQ(mock_ptr->forward_mtp_calls, 0);
-    EXPECT_EQ(mock_ptr->harvest_calls, 0);
+    auto runner = makeRunner(std::move(mock), /*mtp_enabled=*/true, /*mtp_draft_tokens=*/3);
+    ASSERT_TRUE(runner->prefill({1, 2, 3, 4})) << runner->lastError();
+
+    EXPECT_EQ(mock_ptr->restore_terminal_calls, 1);
+    EXPECT_EQ(mock_ptr->forward_calls, 0);
+    EXPECT_EQ(mock_ptr->populate_calls, 1);
+    EXPECT_THAT(mock_ptr->populated_tokens, ElementsAre(4));
+    EXPECT_EQ(mock_ptr->harvest_calls, 1);
+
+    auto step = runner->decodeStep();
+    ASSERT_TRUE(step.success()) << step.error;
+    EXPECT_THAT(step.tokens, ElementsAre(9, 11, 12, 13));
+
+    EXPECT_EQ(mock_ptr->forward_mtp_calls, 3);
+    EXPECT_EQ(mock_ptr->chained_mtp_calls, 2);
+    EXPECT_THAT(mock_ptr->chained_mtp_positions, ElementsAre(5, 6));
+    EXPECT_EQ(mock_ptr->restore_live_calls, 0);
+    EXPECT_EQ(mock_ptr->commit_mtp_calls, 1);
+    EXPECT_EQ(mock_ptr->last_commit_already_appended, 1);
+    EXPECT_THAT(mock_ptr->last_commit_tokens, ElementsAre(9, 11, 12, 13));
+
+    const auto probe = runner->prefixStateProbe();
+    EXPECT_TRUE(probe.prefix_request.hit);
+    EXPECT_TRUE(probe.prefix_request.terminal_logits_restored);
+    EXPECT_TRUE(probe.prefix_request.terminal_hidden_restored);
+    EXPECT_EQ(probe.mtp_draft_steps, 3u);
+    EXPECT_EQ(probe.mtp_accepted_tokens, 3u);
+    EXPECT_EQ(probe.mtp_rejected_tokens, 0u);
+    EXPECT_EQ(probe.mtp_rollbacks, 0u);
+    EXPECT_EQ(probe.mtp_verifier_runs, 1u);
+    EXPECT_EQ(probe.mtp_verifier_token_count, 4u);
 }
 
 TEST(Test__PrefixCachePrefillFlow, PartialPrefixHitChainedMTPDraftDepthThreeUsesVerifierRowRestoreOnReject)
