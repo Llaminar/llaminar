@@ -217,6 +217,88 @@ TEST(Test__MTPDecodeCatchup, SharedStepwiseRejectsAndForwardsCorrectionForReadyT
     EXPECT_THAT(runner.committed_indices, ElementsAre(0, 1, 2));
 }
 
+TEST(Test__MTPDecodeCatchup, EquivalenceAllowsCandidateWithFewerMainForwards)
+{
+    MTPDecodeCatchupGreedyResult oracle;
+    oracle.ok = true;
+    oracle.accepted_tokens = {7, 9, 8};
+    oracle.verifier_tokens = {9, 8};
+    oracle.all_speculative_accepted = true;
+    oracle.stopped_on_output = false;
+    oracle.accepted_speculative_prefix = 2;
+    oracle.ready_token = 4;
+    oracle.main_forward_token_count = 3;
+    oracle.shifted_commit_count = 3;
+
+    MTPDecodeCatchupGreedyResult candidate = oracle;
+    candidate.main_forward_token_count = 1;
+
+    MTPDecodeCatchupGreedyEquivalence eq =
+        compareMTPDecodeCatchupGreedyResults(oracle, candidate);
+    EXPECT_TRUE(eq.ok) << eq.error;
+}
+
+TEST(Test__MTPDecodeCatchup, EquivalenceRejectsCommittedTokenDrift)
+{
+    MTPDecodeCatchupGreedyResult oracle;
+    oracle.ok = true;
+    oracle.accepted_tokens = {7, 9, 8};
+    oracle.verifier_tokens = {9, 8};
+    oracle.all_speculative_accepted = true;
+    oracle.accepted_speculative_prefix = 2;
+    oracle.ready_token = 4;
+    oracle.shifted_commit_count = 3;
+
+    MTPDecodeCatchupGreedyResult candidate = oracle;
+    candidate.accepted_tokens = {7, 9, 3};
+
+    MTPDecodeCatchupGreedyEquivalence eq =
+        compareMTPDecodeCatchupGreedyResults(oracle, candidate);
+    EXPECT_FALSE(eq.ok);
+    EXPECT_THAT(eq.error, HasSubstr("accepted tokens mismatch"));
+}
+
+TEST(Test__MTPDecodeCatchup, EquivalenceRejectsReadyTokenDrift)
+{
+    MTPDecodeCatchupGreedyResult oracle;
+    oracle.ok = true;
+    oracle.accepted_tokens = {7, 9};
+    oracle.verifier_tokens = {9};
+    oracle.all_speculative_accepted = true;
+    oracle.accepted_speculative_prefix = 1;
+    oracle.ready_token = 4;
+    oracle.shifted_commit_count = 2;
+
+    MTPDecodeCatchupGreedyResult candidate = oracle;
+    candidate.ready_token = 5;
+
+    MTPDecodeCatchupGreedyEquivalence eq =
+        compareMTPDecodeCatchupGreedyResults(oracle, candidate);
+    EXPECT_FALSE(eq.ok);
+    EXPECT_THAT(eq.error, HasSubstr("ready token mismatch"));
+}
+
+TEST(Test__MTPDecodeCatchup, EquivalenceRejectsShiftedCommitCountDrift)
+{
+    MTPDecodeCatchupGreedyResult oracle;
+    oracle.ok = true;
+    oracle.accepted_tokens = {7, 77};
+    oracle.verifier_tokens = {77};
+    oracle.all_speculative_accepted = false;
+    oracle.accepted_speculative_prefix = 0;
+    oracle.rejected_verified_token = 77;
+    oracle.ready_token = 5;
+    oracle.shifted_commit_count = 2;
+
+    MTPDecodeCatchupGreedyResult candidate = oracle;
+    candidate.shifted_commit_count = 1;
+
+    MTPDecodeCatchupGreedyEquivalence eq =
+        compareMTPDecodeCatchupGreedyResults(oracle, candidate);
+    EXPECT_FALSE(eq.ok);
+    EXPECT_THAT(eq.error, HasSubstr("shifted MTP commit count mismatch"));
+}
+
 TEST(Test__MTPDecodeCatchup, SharedStepwiseStopTokenDiscardsReadyToken)
 {
     FakeCatchupRunner runner;

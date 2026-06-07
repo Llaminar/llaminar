@@ -41,7 +41,17 @@ namespace llaminar2
         int shifted_commit_count = 0;
     };
 
+    struct MTPDecodeCatchupGreedyEquivalence
+    {
+        bool ok = false;
+        std::string error;
+    };
+
     using MTPDecodeCatchupGreedySampler = std::function<int32_t()>;
+
+    MTPDecodeCatchupGreedyEquivalence compareMTPDecodeCatchupGreedyResults(
+        const MTPDecodeCatchupGreedyResult &oracle,
+        const MTPDecodeCatchupGreedyResult &candidate);
 
     /**
      * @brief Run greedy MTP verification through normal one-token decode.

@@ -91,6 +91,10 @@ CUDA MoE artifact:
   accepted-prefix drift. `OrchestrationRunner` uses this bridge for its current
   transaction validation, so the live verifier path has a single contract to
   match.
+- The first equivalence harness primitive is in place:
+  `compareMTPDecodeCatchupGreedyResults()` allows fewer candidate main forwards
+  but requires identical committed tokens, ready/reject semantics, and shifted
+  MTP commit count before any optimized path can be trusted.
 
 ## Retained Actions
 

@@ -9,6 +9,8 @@
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <sstream>
+#include <utility>
 
 namespace llaminar2
 {
@@ -34,7 +36,90 @@ namespace llaminar2
             return out;
         }
 
+        MTPDecodeCatchupGreedyEquivalence equivalenceFailure(
+            std::string reason)
+        {
+            MTPDecodeCatchupGreedyEquivalence result;
+            result.ok = false;
+            result.error = std::move(reason);
+            return result;
+        }
+
+        MTPDecodeCatchupGreedyEquivalence equivalenceSuccess()
+        {
+            MTPDecodeCatchupGreedyEquivalence result;
+            result.ok = true;
+            return result;
+        }
+
+        MTPDecodeCatchupGreedyEquivalence compareTokenVector(
+            const char *name,
+            const std::vector<int32_t> &oracle,
+            const std::vector<int32_t> &candidate)
+        {
+            if (oracle == candidate)
+                return equivalenceSuccess();
+            std::ostringstream msg;
+            msg << name << " mismatch: oracle=[" << joinTokens(oracle)
+                << "], candidate=[" << joinTokens(candidate) << "]";
+            return equivalenceFailure(msg.str());
+        }
+
     } // namespace
+
+    MTPDecodeCatchupGreedyEquivalence compareMTPDecodeCatchupGreedyResults(
+        const MTPDecodeCatchupGreedyResult &oracle,
+        const MTPDecodeCatchupGreedyResult &candidate)
+    {
+        if (!oracle.ok)
+            return equivalenceFailure(
+                std::string("oracle catch-up failed: ") + oracle.error);
+        if (!candidate.ok)
+            return equivalenceFailure(
+                std::string("candidate catch-up failed: ") + candidate.error);
+
+        if (auto eq = compareTokenVector(
+                "accepted tokens",
+                oracle.accepted_tokens,
+                candidate.accepted_tokens);
+            !eq.ok)
+        {
+            return eq;
+        }
+        if (auto eq = compareTokenVector(
+                "verifier tokens",
+                oracle.verifier_tokens,
+                candidate.verifier_tokens);
+            !eq.ok)
+        {
+            return eq;
+        }
+        if (oracle.all_speculative_accepted !=
+            candidate.all_speculative_accepted)
+        {
+            return equivalenceFailure(
+                "all-speculative-accepted flag mismatch");
+        }
+        if (oracle.stopped_on_output != candidate.stopped_on_output)
+            return equivalenceFailure("stopped-on-output flag mismatch");
+        if (oracle.accepted_speculative_prefix !=
+            candidate.accepted_speculative_prefix)
+        {
+            return equivalenceFailure(
+                "accepted speculative prefix mismatch");
+        }
+        if (oracle.rejected_verified_token !=
+            candidate.rejected_verified_token)
+        {
+            return equivalenceFailure("rejected verified token mismatch");
+        }
+        if (oracle.ready_token != candidate.ready_token)
+            return equivalenceFailure("ready token mismatch");
+        if (oracle.shifted_commit_count != candidate.shifted_commit_count)
+            return equivalenceFailure("shifted MTP commit count mismatch");
+
+        return equivalenceSuccess();
+    }
 
     MTPDecodeCatchupGreedyResult runSharedStepwiseMTPDecodeCatchupGreedy(
         IInferenceRunner &runner,
