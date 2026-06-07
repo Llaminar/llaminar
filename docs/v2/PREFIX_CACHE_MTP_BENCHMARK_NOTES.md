@@ -99,6 +99,10 @@ CUDA MoE artifact:
   `compareMTPRuntimeStateSnapshots()` checks decode position, KV/MTP token
   counts, terminal state availability, and GDN state hashes for oracle versus
   candidate transaction runs.
+- `LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK=1` now enables a non-promoted
+  runner harness: run the selected optimized candidate, restore the verifier
+  base, run `shared_stepwise`, compare result plus runtime state, and emit
+  `mtp.phase138_spec_decode_equivalence_matches` only on a clean match.
 
 ## Retained Actions
 

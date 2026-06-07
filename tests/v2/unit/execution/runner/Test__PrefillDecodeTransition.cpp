@@ -1795,6 +1795,7 @@ namespace
                 /*sidecar_sample_fusion=*/true);
             mock->requireMTPDecodeEquivalentReplay();
             mock->enableOptimizedMTPDecodeCatchup();
+            mock->enableMTPSidecarPreservesMainState();
             mock->setDecodeArgmaxScript({
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
                 MockInferenceRunner::MTP_ARGMAX_TOKEN,
@@ -1878,6 +1879,65 @@ namespace
             ASSERT_NE(oracle, nullptr)
                 << "the mock optimized path delegates to the shared oracle; real backends "
                    "must prove the same contract before promotion";
+        }
+        std::filesystem::remove(export_path);
+        PerfStatsCollector::reset();
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, Phase138EquivalenceCheckComparesOptimizedCatchupWithOracle)
+    {
+        const std::filesystem::path export_path =
+            std::filesystem::temp_directory_path() / "llaminar_mtp_phase138_equivalence_unit.json";
+        {
+            ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", export_path.string().c_str());
+            ScopedEnv enable_equivalence("LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK", "1");
+            PerfStatsCollector::reset();
+
+            auto [runner, mock] = createRunner(
+                /*mtp_enabled=*/true,
+                /*mtp_accept=*/true,
+                /*mtp_unsupported_reason=*/{},
+                /*mpi_ctx=*/nullptr,
+                /*mtp_token_coordination=*/true,
+                /*hide_local_logits=*/false,
+                DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/2,
+                /*chained_mtp_support=*/true,
+                /*sidecar_sample_fusion=*/true);
+            mock->requireMTPDecodeEquivalentReplay();
+            mock->enableOptimizedMTPDecodeCatchup();
+            mock->setDecodeArgmaxScript({
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                MockInferenceRunner::DECODE_ARGMAX_TOKEN,
+            });
+
+            ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+            GenerationResult step1 = runner->decodeStep();
+            ASSERT_TRUE(step1.success()) << step1.error;
+            EXPECT_THAT(step1.tokens,
+                        ElementsAre(MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN,
+                                    MockInferenceRunner::MTP_ARGMAX_TOKEN));
+
+            EXPECT_EQ(mock->optimizedMTPDecodeCatchupCount(), 1);
+            EXPECT_GE(mock->restoreCount(), 1)
+                << "equivalence mode restores the verifier base between candidate and oracle";
+
+            const auto records = PerfStatsCollector::snapshot({"mtp"});
+            const PerfStatRecord *match =
+                findPerfRecordWithTags(records,
+                                       PerfStatRecord::Kind::Counter,
+                                       "phase138_spec_decode_equivalence_matches",
+                                       {{"implementation", "mock_optimized_catchup"},
+                                        {"draft_tokens", "3"},
+                                        {"candidate_forward_tokens", "3"},
+                                        {"oracle_forward_tokens", "3"}});
+            ASSERT_NE(match, nullptr);
         }
         std::filesystem::remove(export_path);
         PerfStatsCollector::reset();

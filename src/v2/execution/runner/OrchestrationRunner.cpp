@@ -2496,6 +2496,14 @@ namespace llaminar2
 
             const bool use_optimized_catchup =
                 runner_->supportsOptimizedMTPDecodeCatchupGreedy();
+            const char *phase138_equivalence_env =
+                std::getenv("LLAMINAR_MTP_PHASE138_EQUIVALENCE_CHECK");
+            const bool phase138_equivalence_check =
+                use_optimized_catchup &&
+                phase138_equivalence_env &&
+                (std::string(phase138_equivalence_env) == "1" ||
+                 std::string(phase138_equivalence_env) == "true" ||
+                 std::string(phase138_equivalence_env) == "TRUE");
             std::string catchup_implementation = "shared_stepwise";
             MTPDecodeCatchupGreedyResult catchup;
             if (use_optimized_catchup)
@@ -2511,9 +2519,91 @@ namespace llaminar2
                     {},
                     {{"implementation", catchup_implementation},
                      {"draft_tokens", std::to_string(draft_tokens.size())}});
-                catchup = runner_->runOptimizedMTPDecodeCatchupGreedy(
-                    catchup_request,
-                    sample_after_forward);
+                if (phase138_equivalence_check)
+                {
+                    MTPDecodeCatchupGreedyResult candidate =
+                        runner_->runOptimizedMTPDecodeCatchupGreedy(
+                            catchup_request,
+                            sample_after_forward);
+                    if (!candidate.ok)
+                    {
+                        catchup = std::move(candidate);
+                    }
+                    else
+                    {
+                        PrefixRuntimeStateSnapshot candidate_state =
+                            runner_->prefixStateProbe();
+                        if (!runner_->restoreLivePrefixState(verifier_base_checkpoint))
+                        {
+                            catchup.ok = false;
+                            catchup.error =
+                                "MTP Phase 13.8 equivalence check could not restore verifier base after candidate";
+                        }
+                        else
+                        {
+                            MTPDecodeCatchupGreedyRequest oracle_request =
+                                catchup_request;
+                            oracle_request.implementation_name =
+                                "shared_stepwise_equivalence_oracle";
+                            MTPDecodeCatchupGreedyResult oracle =
+                                runSharedStepwiseMTPDecodeCatchupGreedy(
+                                    *runner_,
+                                    oracle_request,
+                                    sample_after_forward);
+                            PrefixRuntimeStateSnapshot oracle_state =
+                                runner_->prefixStateProbe();
+                            if (!oracle.ok)
+                            {
+                                catchup = std::move(oracle);
+                            }
+                            else
+                            {
+                                MTPDecodeCatchupGreedyEquivalence result_eq =
+                                    compareMTPDecodeCatchupGreedyResults(
+                                        oracle,
+                                        candidate);
+                                MTPStateValidationResult state_eq =
+                                    compareMTPRuntimeStateSnapshots(
+                                        oracle_state,
+                                        candidate_state);
+                                if (!result_eq.ok)
+                                {
+                                    catchup.ok = false;
+                                    catchup.error =
+                                        std::string("MTP Phase 13.8 catch-up result equivalence failed: ") +
+                                        result_eq.error;
+                                }
+                                else if (!state_eq.ok)
+                                {
+                                    catchup.ok = false;
+                                    catchup.error =
+                                        std::string("MTP Phase 13.8 runtime state equivalence failed: ") +
+                                        state_eq.reason;
+                                }
+                                else
+                                {
+                                    PerfStatsCollector::addCounter(
+                                        "mtp",
+                                        "phase138_spec_decode_equivalence_matches",
+                                        1.0,
+                                        "decode",
+                                        {},
+                                        {{"implementation", catchup_implementation},
+                                         {"draft_tokens", std::to_string(draft_tokens.size())},
+                                         {"candidate_forward_tokens", std::to_string(candidate.main_forward_token_count)},
+                                         {"oracle_forward_tokens", std::to_string(oracle.main_forward_token_count)}});
+                                    catchup = std::move(oracle);
+                                }
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    catchup = runner_->runOptimizedMTPDecodeCatchupGreedy(
+                        catchup_request,
+                        sample_after_forward);
+                }
             }
             else
             {
