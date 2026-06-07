@@ -2926,6 +2926,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restore conv state from a verifier snapshot row read from device metadata.
+         *
+         * This is the graph-capturable companion to restoreStateFromSnapshot().
+         * The selected row lives in device_committed_state_rows[request_index],
+         * so replay can commit the accepted MTP prefix without a host-selected
+         * row or any captured H2D node. GPU implementations must require a
+         * non-null explicit stream.
+         */
+        virtual bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+            float *state,
+            const int32_t *device_committed_state_rows,
+            int request_index,
+            void *stream)
+        {
+            (void)state;
+            (void)device_committed_state_rows;
+            (void)request_index;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Prefill variant whose state commit length is read from device memory.
          *
          * GPU graph replay reads the current real length from device memory.
@@ -3190,6 +3212,28 @@ namespace llaminar2
             (void)snapshot_row;
             (void)snapshot_stride_floats;
             (void)state_floats;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Restore recurrence state from a verifier snapshot row read from device metadata.
+         *
+         * This is the graph-capturable companion to restoreStateFromSnapshot().
+         * The selected row lives in device_committed_state_rows[request_index],
+         * which lets the Phase 13.8 spec-decode transaction publish accepted
+         * state inside a captured graph without host row selection. GPU
+         * implementations must require a non-null explicit stream.
+         */
+        virtual bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+            float *state,
+            const int32_t *device_committed_state_rows,
+            int request_index,
+            void *stream)
+        {
+            (void)state;
+            (void)device_committed_state_rows;
+            (void)request_index;
             (void)stream;
             return false;
         }

@@ -72,6 +72,13 @@ CUDA MoE artifact:
 - The named `vllm_style_spec_decode` hook is now selectable for Phase 13.8
   development, but deliberately hard-fails until accepted-count state kernels
   and commit-replay parity are present. This keeps benchmark counters honest.
+- Device-metadata state publication is now green for the first backend slice:
+  CUDA and ROCm short-conv/GDN kernels can restore live state from verifier
+  snapshot rows selected by graph-facing `committed_state_rows[request_index]`.
+  CUDA regression coverage captures metadata restore plus continuation into a
+  CUDA graph; ROCm regression coverage proves the same explicit-stream path.
+  The promoted hook is still hard-failed until full accepted-count kernel
+  commit/replay parity and runner integration are done.
 
 ## Retained Actions
 

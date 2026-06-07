@@ -256,6 +256,23 @@ namespace llaminar2
             stream ? stream : gpuStream());
     }
 
+    bool ShortConv1dStage::restoreVerifierStateCaptureRowFromDeviceMetadata(
+        const int32_t *device_committed_state_rows,
+        int request_index,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() || !params_.kernel || !device_committed_state_rows ||
+            request_index < 0 || !stream)
+        {
+            return false;
+        }
+        return params_.kernel->restoreVerifierStateCaptureRowFromDeviceMetadata(
+            params_.conv_state,
+            device_committed_state_rows,
+            request_index,
+            stream);
+    }
+
     bool ShortConv1dStage::ensureGpuEffectiveSeqLenStateInitialized()
     {
         const std::string scalar_buffer = effectiveSeqLenScalarBufferName();

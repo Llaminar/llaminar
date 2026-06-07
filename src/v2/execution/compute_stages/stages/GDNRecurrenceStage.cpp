@@ -330,6 +330,23 @@ namespace llaminar2
             stream ? stream : gpuStream());
     }
 
+    bool GDNRecurrenceStage::restoreVerifierStateCaptureRowFromDeviceMetadata(
+        const int32_t *device_committed_state_rows,
+        int request_index,
+        void *stream)
+    {
+        if (!hasVerifierStateCapture() || !params_.kernel || !device_committed_state_rows ||
+            request_index < 0 || !stream)
+        {
+            return false;
+        }
+        return params_.kernel->restoreVerifierStateCaptureRowFromDeviceMetadata(
+            params_.recurrence_state,
+            device_committed_state_rows,
+            request_index,
+            stream);
+    }
+
     size_t GDNRecurrenceStage::deinterleaveScratchFloats(int seq_len) const
     {
         if (seq_len <= 0 || params_.n_heads <= 0 || params_.d_k <= 0 || params_.d_v <= 0)

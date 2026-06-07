@@ -2322,6 +2322,7 @@ For one request and greedy MTP depth `D`:
 - The old `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=all_position` runtime path now hard-fails as retired instead of executing the unsafe candidate.
 - Fresh CUDA dense evidence records the current blocker: no-MTP default lane 707.92 prefill / 41.73 decode tok/s, fixed depth-3 shared catch-up 609.73 / 38.19 with 84.95% acceptance, and `decode_equivalent_catchup_forward_one` at 9272.9 ms / 383 forwards.
 - First implementation slices are focused-green: `MTPSpecDecodeTransaction` provides the shared request, transaction, and batch-summary metadata contract for valid sampled count, accepted speculative prefix, rejected suffix count, sample index, next condition token, committed output tokens, and rejected draft tokens. `OrchestrationRunner` now builds the padded metadata batch for the live decode-equivalent catch-up result, validates that transaction contract before commit, and emits structured `mtp.spec_decode_transaction_metadata` counters for all-accepted and rejected-prefix paths. `MTPSpecDecodeMetadata` defines the graph-facing int32 workspace buffers and host-side padded metadata arrays for draft counts, target query lengths, valid sampled counts, accepted draft prefixes, committed output counts, rejected counts, sample indices, next condition tokens, flags, query starts, state indices, committed-state row/index, bonus-ready-token row/index, draft tokens, and sampled tokens. `MTPSpecDecodeStateCommitPlan` makes the key Phase 13.8 invariant explicit: an all-accepted bonus ready-token row can be sampled and carried forward as the next drafter condition, but it is not the live GDN/short-conv state row because it was not committed as output. `MTPSpecDecodeMetadataWorkspaceBinding` now binds those buffers through `DeviceWorkspaceManager`, the GPU `DeviceGraphOrchestrator` declares the binding as runner-owned extra workspace when MTP is enabled, and metadata upload has a hard explicit non-null stream guard for GPU H2D. The unsafe `all_position` candidate code path has been removed from execution and replaced by an explicit retired-candidate hard failure. Focused validation passed on 2026-06-06: `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`; build validation also covered `v2_integration_parity_qwen36_single_device_prefix_mtp` and `v2_integration_parity_qwen36_cuda_single_device_prefix_mtp`.
+- Device-metadata state publication slice is focused-green: `ITensorShortConvolution`, `ITensorGatedDeltaNet`, and `IComputeStage` now expose `restoreVerifierStateCaptureRowFromDeviceMetadata()`. CUDA and ROCm short-conv/GDN kernels implement a graph-capturable device-side copy from verifier snapshot rows selected by `committed_state_rows[request_index]`, require explicit non-null streams, and use the already declared verifier-state capture workspace rather than ad hoc allocations. CUDA integration coverage captures metadata restore plus continuation work into a CUDA graph for both recurrence and short-conv; ROCm integration coverage proves the same committed-row metadata path on an explicit HIP stream. Focused validation passed on 2026-06-06 for `V2_Integration_CUDAGDNPaddedRealLength`, `V2_Integration_ROCmGDNPaddedRealLength`, and the Phase 13.8 unit guard set.
 
 ### Files
 
@@ -2341,6 +2342,8 @@ For one request and greedy MTP depth `D`:
 - `tests/v2/unit/mtp/Test__MTPSpecDecodeTransaction.cpp`
 - `tests/v2/unit/mtp/Test__MTPDecodeCatchup.cpp`
 - `tests/v2/unit/execution/runner/Test__PrefillDecodeTransition.cpp`
+- `tests/v2/integration/kernels/cuda/Test__CUDAGDNPaddedRealLength.cpp`
+- `tests/v2/integration/kernels/rocm/Test__ROCmGDNPaddedRealLength.cpp`
 - `tests/v2/integration/parity/qwen36/`
 - `docs/v2/PREFIX_CACHE_MTP_BENCHMARK_NOTES.md`
 
@@ -2359,7 +2362,7 @@ Focused command shape:
 
 ```bash
 cmake --build build_v2_integration --parallel
-ctest --test-dir build_v2_integration -R "^V2_Unit_MTPSpecDecodeMetadata$|^V2_Unit_MTPSpecDecodeTransaction$|^V2_Unit_MTPDecodeCatchup$|^V2_Unit_PrefillDecodeTransition$|^V2_Integration_Parity_Qwen36_.*(MTPGreedyDepth3MatchesPyTorchDecodeTokens|PrefixCacheMTPRestore|M2VerifierLongPrefixMatchesSequential|OneRowRestoreLongPrefixMatchesSequential)" --output-on-failure --parallel
+ctest --test-dir build_v2_integration -R "^V2_Unit_MTPSpecDecodeMetadata$|^V2_Unit_MTPSpecDecodeTransaction$|^V2_Unit_MTPDecodeCatchup$|^V2_Unit_PrefillDecodeTransition$|^V2_Integration_CUDAGDNPaddedRealLength$|^V2_Integration_ROCmGDNPaddedRealLength$|^V2_Integration_Parity_Qwen36_.*(MTPGreedyDepth3MatchesPyTorchDecodeTokens|PrefixCacheMTPRestore|M2VerifierLongPrefixMatchesSequential|OneRowRestoreLongPrefixMatchesSequential)" --output-on-failure --parallel
 ```
 
 Benchmark command shape:

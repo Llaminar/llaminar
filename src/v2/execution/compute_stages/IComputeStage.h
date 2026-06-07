@@ -676,6 +676,26 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restore mutable verifier state using a device-side committed-row buffer.
+         *
+         * Phase 13.8 spec-decode transactions compute the accepted state row as
+         * graph-visible metadata. Stateful stages use this hook to publish that
+         * row during graph replay without any host-selected row or captured H2D.
+         * Implementations must use the supplied explicit stream and fail if it
+         * is null.
+         */
+        virtual bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+            const int32_t *device_committed_state_rows,
+            int request_index,
+            void *stream)
+        {
+            (void)device_committed_state_rows;
+            (void)request_index;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Whether this stage allows all-zero output tensors
          *
          * By default, all-zero outputs are treated as bugs (likely uninitialized

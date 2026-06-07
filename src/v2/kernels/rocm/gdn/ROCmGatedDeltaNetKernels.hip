@@ -909,6 +909,33 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
 
 } // anonymous namespace (deinterleave kernel)
 
+namespace {
+
+__global__ void rocm_gdn_restore_state_from_capture_metadata_kernel(
+    float *__restrict__ dst_state,
+    const float *__restrict__ state_snapshots,
+    const int32_t *__restrict__ device_committed_state_rows,
+    int request_index,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int state_floats)
+{
+    const int row = device_committed_state_rows[request_index];
+    if (row < 0 || row >= max_snapshot_rows)
+        return;
+
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= state_floats)
+        return;
+
+    dst_state[idx] =
+        state_snapshots[static_cast<size_t>(row) *
+                            static_cast<size_t>(snapshot_stride_floats) +
+                        static_cast<size_t>(idx)];
+}
+
+} // anonymous namespace (state metadata restore kernel)
+
 // =========================================================================
 // GPU Memory Management Helpers (called from headers via extern "C")
 // =========================================================================
@@ -964,6 +991,47 @@ void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size
 void rocmGDN_stream_synchronize(void *stream)
 {
     hipStreamSynchronize((hipStream_t)stream);
+}
+
+bool rocmGDN_restore_state_from_capture_metadata(
+    float *dst_state,
+    const float *state_snapshots,
+    const int32_t *device_committed_state_rows,
+    int request_index,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int state_floats,
+    int device_idx,
+    void *stream)
+{
+    if (!dst_state || !state_snapshots || !device_committed_state_rows ||
+        request_index < 0 || snapshot_stride_floats < state_floats ||
+        max_snapshot_rows <= 0 || state_floats <= 0 || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    const int blocks = (state_floats + threads - 1) / threads;
+    hipLaunchKernelGGL(rocm_gdn_restore_state_from_capture_metadata_kernel,
+        dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+        dst_state,
+        state_snapshots,
+        device_committed_state_rows,
+        request_index,
+        snapshot_stride_floats,
+        max_snapshot_rows,
+        state_floats);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGDN_restore_state_from_capture_metadata] %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
 }
 
 } // extern "C" (memory helpers)

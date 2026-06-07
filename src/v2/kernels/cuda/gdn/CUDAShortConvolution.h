@@ -53,6 +53,16 @@ extern "C"
     void cudaGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream);
     void cudaGDN_gpu_set_device(int ordinal);
     void cudaGDN_stream_synchronize(void *stream);
+    bool cudaGDN_restore_state_from_capture_metadata(
+        float *dst_state,
+        const float *state_snapshots,
+        const int32_t *device_committed_state_rows,
+        int request_index,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int state_floats,
+        int device_idx,
+        void *stream);
 }
 
 namespace llaminar2
@@ -100,6 +110,34 @@ namespace llaminar2
             else
                 cudaGDN_gpu_memcpy(gpu_state_, src, static_cast<size_t>(state_size_));
             return true;
+        }
+
+        bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+            float *dst_state,
+            const int32_t *device_committed_state_rows,
+            int request_index,
+            void *stream) override
+        {
+            (void)dst_state;
+            if (!gpu_state_ || !verifier_state_capture_ || !device_committed_state_rows ||
+                request_index < 0 || !stream ||
+                verifier_state_capture_rows_ <= 0 ||
+                verifier_state_capture_size_ != state_size_)
+            {
+                return false;
+            }
+
+            cudaGDN_gpu_set_device(device_ordinal_);
+            return cudaGDN_restore_state_from_capture_metadata(
+                gpu_state_,
+                verifier_state_capture_,
+                device_committed_state_rows,
+                request_index,
+                verifier_state_capture_size_,
+                verifier_state_capture_rows_,
+                state_size_,
+                device_ordinal_,
+                stream);
         }
 
         bool supportsPaddedPrefillRealLength() const override { return true; }

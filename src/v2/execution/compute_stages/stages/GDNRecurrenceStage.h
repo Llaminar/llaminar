@@ -153,6 +153,10 @@ namespace llaminar2
         bool supportsPaddedPrefillRealLengthContract() const override;
         bool hasVerifierStateCapture() const override;
         bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool restoreVerifierStateCaptureRowFromDeviceMetadata(
+            const int32_t *device_committed_state_rows,
+            int request_index,
+            void *stream) override;
         /// @brief Allows cold GPU padded-prefill graph preflight before warmup allocates recurrence state.
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
 
