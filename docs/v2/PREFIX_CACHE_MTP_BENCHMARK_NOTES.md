@@ -70,8 +70,9 @@ CUDA MoE artifact:
   `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`,
   `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`.
 - The named `vllm_style_spec_decode` hook is now selectable for Phase 13.8
-  development, but deliberately hard-fails until accepted-count state kernels
-  and commit-replay parity are present. This keeps benchmark counters honest.
+  development, but deliberately hard-fails until the live target-verifier graph
+  transaction and commit-replay equivalence harness are present. This keeps
+  benchmark counters honest.
 - Device-metadata state publication is now green for the first backend slice:
   CUDA and ROCm short-conv/GDN kernels can restore live state from verifier
   snapshot rows selected by graph-facing `committed_state_rows[request_index]`.
@@ -88,8 +89,9 @@ CUDA MoE artifact:
 ## Retained Actions
 
 - CUDA/ROCm dense: consume the graph-facing spec-decode metadata buffers from
-  accepted-count-aware GDN/short-conv kernels, then promote a named
-  `vllm_style_spec_decode` hook only after commit-replay parity and benchmarks.
+  the live target-verifier transaction, then promote a named
+  `vllm_style_spec_decode` hook only after commit-replay equivalence, PyTorch
+  parity, and benchmarks.
   Do not re-enable raw all-position verifier-row shortcuts.
 - CUDA MoE: keep the 148.5 tok/s ratchet and extend long-prompt/controller
   evidence without weakening parity.

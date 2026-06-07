@@ -2266,6 +2266,58 @@ For one request and greedy MTP depth `D`:
 8. `MTPStateTransaction` publishes terminal hidden/logits, ready token, logical token count, main KV count, shifted MTP KV count, sampler history, and stats together.
 9. Any failure before commit restores the checkpoint. Any failure after partial commit is a hard failure until the transaction has a rollback proof.
 
+### Concrete Llaminar Implementation Design
+
+The promoted Phase 13.8 path is a transaction boundary in `OrchestrationRunner`,
+with backend runners providing only graph-capturable execution and state-publication
+primitives. Do not hide acceptance, rollback, or fallback decisions inside CUDA or
+ROCm-specific code.
+
+Layering:
+
+- `MTPDecodeCatchup` stays the sequential oracle. It remains the source of truth
+  for accept/reject semantics, stop-token behavior, ready-token handling, and
+  rollback expectations until the new path proves equivalence.
+- `MTPSpecDecodeTransaction` and `MTPSpecDecodeMetadata` are the shared contract.
+  They own padded host metadata, graph-facing int32 buffers, committed-state row
+  selection, bonus-ready-token row separation, and batch-level counters.
+- `OrchestrationRunner` builds the request transaction from verifier output,
+  validates it against the oracle in debug/equivalence mode, and performs the
+  single atomic publication through `MTPStateTransaction`.
+- `DeviceGraphOrchestrator` and later `RankOrchestrator` expose narrow
+  primitives:
+  - run the uniform target verifier graph for `D + 1` rows;
+  - upload/bind spec-decode metadata on an explicit non-null stream before graph
+    replay;
+  - publish live GDN/short-conv state from `committed_state_rows`;
+  - truncate/commit main KV and shifted MTP KV to the transaction's committed
+    output count.
+- Backend kernels may read device metadata and verifier-state capture buffers,
+  but they must not allocate, upload host data, mutate tensor residency flags, or
+  use the default/null GPU stream inside captured work.
+
+Promotion sequence:
+
+1. Keep `vllm_style_spec_decode` hard-failed while the target verifier graph is
+   not wired into the live runner path.
+2. Add a non-promoted equivalence harness that runs the new target-verifier
+   transaction from a checkpoint, then restores the checkpoint and runs
+   `shared_stepwise`; compare committed tokens, ready token, main KV count,
+   shifted MTP KV count, terminal hidden/logits provenance, and GDN/short-conv
+   state before any benchmark number is accepted.
+3. Promote CUDA SingleDevice dense only after the equivalence harness and
+   PyTorch parity pass for accept-all, reject-first, reject-after-prefix,
+   stop-token, prefix-restore, and continuation-token cases.
+4. Promote ROCm SingleDevice dense through the same tests and metadata contract;
+   ROCm may not keep a backend-specific shortcut that CUDA cannot reason about.
+5. Only then extend the same transaction to LocalTP/GlobalTP, PP, MoE, and
+   stochastic sampling.
+
+The current named hook therefore has a narrow meaning: it is a selectable
+development gate and counter tag. Until the live verifier graph and commit-replay
+equivalence harness are green, selecting it must hard-fail rather than silently
+falling back or partially publishing state.
+
 ### Implementation Tiers
 
 0. Preserve the oracle and retired-candidate ledger.
@@ -2315,7 +2367,7 @@ For one request and greedy MTP depth `D`:
 
 - The design pivot is accepted. Phase 13.8 is now a vLLM-style transaction port, not a free-form shortcut search.
 - Tier 0 is already implemented: `MTPDecodeCatchup` owns the common sequential accept/reject oracle and `OrchestrationRunner` routes stateful CUDA/ROCm verification through `shared_stepwise`.
-- The named optimized-hook scaffold already exists on `IInferenceRunner`. `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` now selects the explicit Phase 13.8 hook name, but the hook hard-fails as not promoted until accepted-count GDN/short-conv state kernels and commit-replay parity are in place.
+- The named optimized-hook scaffold already exists on `IInferenceRunner`. `LLAMINAR_MTP_PHASE138_CATCHUP_CANDIDATE=vllm_style_spec_decode` now selects the explicit Phase 13.8 hook name, but the hook hard-fails as not promoted until the live target-verifier graph path and commit-replay equivalence harness are in place.
 - Retired candidate evidence remains binding:
   - sidecar-chain verifier state is not decode-equivalent on focused ROCm/generic and CUDA Qwen3.6 dense tests;
   - naive all-position selected-state restore is unsafe because CUDA and ROCm long-prefix tests prove continuation drift even when row logits/tokens look plausible.
@@ -2324,6 +2376,11 @@ For one request and greedy MTP depth `D`:
 - First implementation slices are focused-green: `MTPSpecDecodeTransaction` provides the shared request, transaction, and batch-summary metadata contract for valid sampled count, accepted speculative prefix, rejected suffix count, sample index, next condition token, committed output tokens, and rejected draft tokens. `OrchestrationRunner` now builds the padded metadata batch for the live decode-equivalent catch-up result, validates that transaction contract before commit, and emits structured `mtp.spec_decode_transaction_metadata` counters for all-accepted and rejected-prefix paths. `MTPSpecDecodeMetadata` defines the graph-facing int32 workspace buffers and host-side padded metadata arrays for draft counts, target query lengths, valid sampled counts, accepted draft prefixes, committed output counts, rejected counts, sample indices, next condition tokens, flags, query starts, state indices, committed-state row/index, bonus-ready-token row/index, draft tokens, and sampled tokens. `MTPSpecDecodeStateCommitPlan` makes the key Phase 13.8 invariant explicit: an all-accepted bonus ready-token row can be sampled and carried forward as the next drafter condition, but it is not the live GDN/short-conv state row because it was not committed as output. `MTPSpecDecodeMetadataWorkspaceBinding` now binds those buffers through `DeviceWorkspaceManager`, the GPU `DeviceGraphOrchestrator` declares the binding as runner-owned extra workspace when MTP is enabled, and metadata upload has a hard explicit non-null stream guard for GPU H2D. The unsafe `all_position` candidate code path has been removed from execution and replaced by an explicit retired-candidate hard failure. Focused validation passed on 2026-06-06: `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, `V2_Unit_MTPDecodeCatchup`, and `V2_Unit_PrefillDecodeTransition`; build validation also covered `v2_integration_parity_qwen36_single_device_prefix_mtp` and `v2_integration_parity_qwen36_cuda_single_device_prefix_mtp`.
 - Device-metadata state publication slice is focused-green: `ITensorShortConvolution`, `ITensorGatedDeltaNet`, and `IComputeStage` now expose `restoreVerifierStateCaptureRowFromDeviceMetadata()`. CUDA and ROCm short-conv/GDN kernels implement a graph-capturable device-side copy from verifier snapshot rows selected by `committed_state_rows[request_index]`, require explicit non-null streams, and use the already declared verifier-state capture workspace rather than ad hoc allocations. CUDA integration coverage captures metadata restore plus continuation work into a CUDA graph for both recurrence and short-conv; ROCm integration coverage proves the same committed-row metadata path on an explicit HIP stream. Focused validation passed on 2026-06-06 for `V2_Integration_CUDAGDNPaddedRealLength`, `V2_Integration_ROCmGDNPaddedRealLength`, and the Phase 13.8 unit guard set.
 - Runner-facing metadata restore is scaffolded: `IInferenceRunner` and `DeviceGraphOrchestrator` expose `restoreMTPVerifierStateFromSpecDecodeMetadata()`, which uploads a validated `MTPSpecDecodeMetadataBatch` to the runner-owned workspace on an explicit GPU stream, restores every local GDN short-conv/recurrent state from the device `committed_state_rows` buffer, truncates main KV/bookkeeping to the requested accepted token count, and hard-fails on missing workspace, missing backend, invalid metadata, or absent GDN participants. Focused validation passed on 2026-06-07 for `V2_Unit_DeviceGraphOrchestrator`, `V2_Unit_PrefillDecodeTransition`, `V2_Unit_MTPSpecDecodeMetadata`, `V2_Unit_MTPSpecDecodeTransaction`, and `V2_Unit_MTPDecodeCatchup`.
+- Next implementation gate: build the live target-verifier transaction path and
+  equivalence harness. The metadata/state-publication primitives are now present,
+  so remaining blockers are graph integration, shifted MTP KV commit from
+  accepted target hidden rows, atomic `MTPStateTransaction` publication, and
+  parity/benchmark proof.
 
 ### Files
 

@@ -7533,15 +7533,15 @@ namespace llaminar2
             result.ok = false;
             result.error =
                 "Phase 13.8 vllm_style_spec_decode is not promoted: "
-                "accepted-count GDN/short-conv state kernels and commit-replay "
-                "parity are still required";
+                "live target-verifier graph integration and commit-replay "
+                "equivalence are still required";
             PerfStatsCollector::addCounter(
                 "mtp",
                 "phase138_vllm_style_spec_decode_not_promoted",
                 1.0,
                 "decode",
                 state_.device_id.toString(),
-                {{"reason", "accepted_count_state_kernels_missing"}});
+                {{"reason", "live_verifier_transaction_missing"}});
             return result;
         }
 

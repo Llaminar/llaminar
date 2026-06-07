@@ -910,7 +910,9 @@ TEST_F(Test__DeviceGraphOrchestrator, VllmStyleSpecDecodeCandidateHardFailsUntil
     EXPECT_FALSE(result.ok);
     EXPECT_NE(result.error.find("vllm_style_spec_decode is not promoted"),
               std::string::npos);
-    EXPECT_NE(result.error.find("accepted-count"),
+    EXPECT_NE(result.error.find("live target-verifier graph"),
+              std::string::npos);
+    EXPECT_NE(result.error.find("commit-replay equivalence"),
               std::string::npos);
 }
 
