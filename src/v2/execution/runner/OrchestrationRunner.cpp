@@ -1380,29 +1380,30 @@ namespace llaminar2
             if (!stopped_on_output && all_drafts_accepted && !ready_token.has_value())
                 return std::string("MTP spec-decode transaction accepted all drafts without a ready token");
 
-            const std::optional<int32_t> bonus_token =
-                (!stopped_on_output && all_drafts_accepted)
-                    ? ready_token
-                    : std::optional<int32_t>{};
-            MTPSpecDecodeRequest spec_request =
-                buildMTPSpecDecodeRequestFromVerifierOutput(
-                    /*request_id=*/0,
-                    vocab,
-                    draft_tokens_for_tx,
-                    committed_output_tokens,
-                    bonus_token,
-                    all_drafts_accepted,
-                    stopped_on_output);
             MTPSpecDecodeMetadataShape metadata_shape;
             metadata_shape.max_requests = 1;
             metadata_shape.max_draft_tokens =
                 static_cast<int>(draft_tokens_for_tx.size());
+
+            MTPDecodeCatchupGreedyRequest catchup_request_for_tx;
+            catchup_request_for_tx.draft_tokens = draft_tokens_for_tx;
+            MTPDecodeCatchupGreedyResult catchup_result_for_tx;
+            catchup_result_for_tx.ok = true;
+            catchup_result_for_tx.accepted_tokens = committed_output_tokens;
+            catchup_result_for_tx.all_speculative_accepted = all_drafts_accepted;
+            catchup_result_for_tx.stopped_on_output = stopped_on_output;
+            catchup_result_for_tx.accepted_speculative_prefix =
+                accepted_mtp_draft_prefix;
+            catchup_result_for_tx.ready_token =
+                ready_token.value_or(kMTPSpecDecodeInvalidToken);
+
             MTPSpecDecodeMetadataBatch metadata =
-                buildMTPSpecDecodeMetadataBatch(
+                buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
                     metadata_shape,
-                    {spec_request},
-                    {static_cast<int32_t>(committed_output_tokens.size())},
-                    {stopped_on_output ? 1 : 0});
+                    /*request_id=*/0,
+                    vocab,
+                    catchup_request_for_tx,
+                    catchup_result_for_tx);
             if (!metadata.ok)
             {
                 PerfStatsCollector::addCounter(
@@ -1434,50 +1435,6 @@ namespace llaminar2
                      {"reason", tx.error}});
                 return std::string("MTP spec-decode transaction metadata failed on ") +
                        path + ": " + tx.error;
-            }
-
-            const int expected_accepted_draft_prefix =
-                std::min<int>(
-                    static_cast<int>(draft_tokens_for_tx.size()),
-                    accepted_mtp_draft_prefix + 1);
-            if (tx.accepted_speculative_prefix != expected_accepted_draft_prefix)
-            {
-                return std::string("MTP spec-decode accepted-prefix mismatch on ") +
-                       path + ": expected " +
-                       std::to_string(expected_accepted_draft_prefix) +
-                       " verifier input rows, got " +
-                       std::to_string(tx.accepted_speculative_prefix);
-            }
-
-            const bool expected_all_drafts_accepted =
-                all_drafts_accepted && !stopped_on_output;
-            if (tx.allDraftsAccepted() != expected_all_drafts_accepted)
-            {
-                return std::string("MTP spec-decode all-drafts-accepted mismatch on ") +
-                       path;
-            }
-
-            const int expected_valid_sampled_count =
-                static_cast<int>(committed_output_tokens.size()) +
-                (expected_all_drafts_accepted ? 1 : 0);
-            if (tx.valid_sampled_count != expected_valid_sampled_count)
-            {
-                return std::string("MTP spec-decode valid-sampled-count mismatch on ") +
-                       path + ": expected " +
-                       std::to_string(expected_valid_sampled_count) +
-                       ", got " + std::to_string(tx.valid_sampled_count);
-            }
-
-            const int32_t expected_next_condition_token =
-                expected_all_drafts_accepted
-                    ? *ready_token
-                    : committed_output_tokens.back();
-            if (tx.next_condition_token != expected_next_condition_token)
-            {
-                return std::string("MTP spec-decode next-condition-token mismatch on ") +
-                       path + ": expected " +
-                       std::to_string(expected_next_condition_token) +
-                       ", got " + std::to_string(tx.next_condition_token);
             }
 
             PerfStatsCollector::addCounter(

@@ -3,6 +3,7 @@
 
 #include "backends/BackendManager.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/mtp/MTPDecodeCatchup.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 
 using namespace llaminar2;
@@ -369,6 +370,113 @@ TEST(Test__MTPSpecDecodeMetadata, BuildsPaddedBatchMetadataForAcceptAndReject)
     ASSERT_THAT(batch.transactions, SizeIs(2));
     EXPECT_TRUE(batch.transactions[0].allDraftsAccepted());
     EXPECT_FALSE(batch.transactions[1].allDraftsAccepted());
+}
+
+TEST(Test__MTPSpecDecodeMetadata, BuildsMetadataFromGreedyCatchupAcceptAll)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyResult result;
+    result.ok = true;
+    result.accepted_tokens = {7, 9, 8};
+    result.all_speculative_accepted = true;
+    result.stopped_on_output = false;
+    result.accepted_speculative_prefix = 2;
+    result.ready_token = 4;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+            shape,
+            /*request_id=*/0,
+            /*vocab_size=*/100,
+            request,
+            result);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.transactions, SizeIs(1));
+    EXPECT_TRUE(batch.transactions.front().allDraftsAccepted());
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(4));
+    EXPECT_THAT(batch.accepted_draft_prefixes, ElementsAre(3));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(3));
+    EXPECT_THAT(batch.next_condition_tokens, ElementsAre(4));
+    EXPECT_THAT(batch.committed_state_rows, ElementsAre(2));
+    EXPECT_THAT(batch.bonus_ready_token_rows, ElementsAre(3));
+    EXPECT_THAT(batch.sampled_tokens, ElementsAre(7, 9, 8, 4));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, BuildsMetadataFromGreedyCatchupRejectAfterPrefix)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyResult result;
+    result.ok = true;
+    result.accepted_tokens = {7, 9, 3};
+    result.all_speculative_accepted = false;
+    result.stopped_on_output = false;
+    result.accepted_speculative_prefix = 1;
+    result.rejected_verified_token = 3;
+    result.ready_token = 11;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+            shape,
+            /*request_id=*/0,
+            /*vocab_size=*/100,
+            request,
+            result);
+
+    ASSERT_TRUE(batch.ok) << batch.error;
+    ASSERT_THAT(batch.transactions, SizeIs(1));
+    EXPECT_FALSE(batch.transactions.front().allDraftsAccepted());
+    EXPECT_THAT(batch.valid_sampled_counts, ElementsAre(3));
+    EXPECT_THAT(batch.accepted_draft_prefixes, ElementsAre(2));
+    EXPECT_THAT(batch.committed_output_counts, ElementsAre(3));
+    EXPECT_THAT(batch.next_condition_tokens, ElementsAre(3));
+    EXPECT_THAT(batch.committed_state_rows, ElementsAre(2));
+    EXPECT_THAT(batch.bonus_ready_token_rows,
+                ElementsAre(kMTPSpecDecodeInvalidToken));
+    EXPECT_THAT(batch.sampled_tokens,
+                ElementsAre(7, 9, 3, kMTPSpecDecodeInvalidToken));
+}
+
+TEST(Test__MTPSpecDecodeMetadata, RejectsGreedyCatchupAcceptedPrefixDrift)
+{
+    MTPSpecDecodeMetadataShape shape;
+    shape.max_requests = 1;
+    shape.max_draft_tokens = 3;
+
+    MTPDecodeCatchupGreedyRequest request;
+    request.draft_tokens = {7, 9, 8};
+
+    MTPDecodeCatchupGreedyResult result;
+    result.ok = true;
+    result.accepted_tokens = {7, 77};
+    result.all_speculative_accepted = false;
+    result.stopped_on_output = false;
+    result.accepted_speculative_prefix = 2;
+    result.rejected_verified_token = 77;
+    result.ready_token = 11;
+
+    MTPSpecDecodeMetadataBatch batch =
+        buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+            shape,
+            /*request_id=*/0,
+            /*vocab_size=*/100,
+            request,
+            result);
+
+    EXPECT_FALSE(batch.ok);
+    EXPECT_THAT(batch.error, HasSubstr("accepted-prefix mismatch"));
 }
 
 TEST(Test__MTPSpecDecodeMetadata, StateCommitPlanDoesNotCommitBonusReadyTokenRow)

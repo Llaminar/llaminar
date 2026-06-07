@@ -12,6 +12,8 @@
 namespace llaminar2
 {
     class IBackend;
+    struct MTPDecodeCatchupGreedyRequest;
+    struct MTPDecodeCatchupGreedyResult;
 
     namespace MTPSpecDecodeWorkspaceBuffers
     {
@@ -96,6 +98,13 @@ namespace llaminar2
         const std::vector<MTPSpecDecodeRequest> &requests,
         const std::vector<int32_t> &committed_output_counts,
         const std::vector<int32_t> &stopped_flags);
+
+    MTPSpecDecodeMetadataBatch buildMTPSpecDecodeMetadataBatchFromGreedyCatchup(
+        const MTPSpecDecodeMetadataShape &shape,
+        int request_id,
+        int vocab_size,
+        const MTPDecodeCatchupGreedyRequest &request,
+        const MTPDecodeCatchupGreedyResult &result);
 
     MTPSpecDecodeStateCommitPlan buildMTPSpecDecodeStateCommitPlan(
         const MTPSpecDecodeMetadataBatch &batch);

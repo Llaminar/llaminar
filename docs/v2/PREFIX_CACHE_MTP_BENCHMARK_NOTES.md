@@ -85,6 +85,12 @@ CUDA MoE artifact:
   all local GDN state from `committed_state_rows` before truncating KV/bookkeeping.
   This is still scaffolding: `vllm_style_spec_decode` remains hard-failed until
   the verifier graph builds the batch live and commit-replay parity is green.
+- The oracle-to-transaction bridge is now shared:
+  `buildMTPSpecDecodeMetadataBatchFromGreedyCatchup()` converts
+  `shared_stepwise` results into the graph-facing metadata batch and rejects
+  accepted-prefix drift. `OrchestrationRunner` uses this bridge for its current
+  transaction validation, so the live verifier path has a single contract to
+  match.
 
 ## Retained Actions
 
